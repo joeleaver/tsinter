@@ -6873,7 +6873,7 @@ On the wasm lane node:tls, node:https and node:dgram are built in the module (`p
 A secured socket and a dgram socket are net-lane handles for event ordering: S087 (c) applies unchanged, so which of two sockets' events comes first when both are ready at one poll (a client's `'end'` and the server's `'close'`, datagrams arriving on two different sockets; sends still leave in call order) follows the host's reads; each socket's own events keep Node's order.
 
 - **(a) An error carries name, message and code only.** A verification error (`DEPTH_ZERO_SELF_SIGNED_CERT`, ...), `ERR_TLS_CERT_ALTNAME_INVALID` (no `reason`, `host` or `cert`), an engine error (no `library` or `reason`), a dgram `ExceptionWithHostPort` (no `errno`, `syscall`, `address` or `port`). The same shape as S087 (a).
-- **(b) The engine's own failures carry the host engine's text.** A TLS protocol failure (`ERR_SSL_*`, reported as the host's TLS_ERROR event) and a context material failure (a certificate or key that does not parse, a key that does not match: `ERR_OSSL_*`, thrown by `createServer` / `createSecureContext`) carry the message and code the host's engine gives. The harness host is Node's own OpenSSL, so they are Node's there; a host on another engine (mbedTLS) gives its own. Verification codes are OpenSSL's numbers, which the module maps to Node's codes and texts; a host on another engine maps its own verdict to those numbers (abi.ts lists mbedTLS's), and where it cannot tell OpenSSL's cases apart, or reports a different first error of a chain, the code and text differ from Node's. The wasm-native lane's host reaches its verdict with Node's own OpenSSL (S117 (g)), so its codes are Node's.
+- **(b) The engine's own failures carry the host engine's text.** A TLS protocol failure (`ERR_SSL_*`, reported as the host's TLS_ERROR event) and a context material failure (a certificate or key that does not parse, a key that does not match: `ERR_OSSL_*`, thrown by `createServer` / `createSecureContext`) carry the message and code the host's engine gives. The harness host is Node's own OpenSSL, so they are Node's there; a host on another engine (mbedTLS) gives its own. Verification codes are OpenSSL's numbers, which the module maps to Node's codes and texts; a host on another engine maps its own verdict to those numbers (abi.ts lists mbedTLS's), and where it cannot tell OpenSSL's cases apart, or reports a different first error of a chain, the code and text differ from Node's. The wasm-native lane's host is Node's own OpenSSL (S117 (g)), so its verdicts, its protocol failures and its material failures are Node's (an OpenSSL error line's leading thread id is the process's own).
 - **(c) Some PEM forms are fenced.** `setDefaultCACertificates` reads PEM as OpenSSL does (names, stray text, CRLF, a BOM, base64 errors, a bad end line, `X509 CERTIFICATE`, skipped blocks of other names, all Node's), except a block with PEM header lines (a `:` line, or a blank line before the end line) and a line of over 253 bytes (which OpenSSL reads in pieces): both are a named Error ("tls.setDefaultCACertificates of a PEM block with header lines or a line over 253 bytes is not supported yet"), where Node answers PEM_R_NOT_PROC_TYPE's error or parses the long line. A block that decodes to no bytes ends the read, as OpenSSL's does. A certificate is read at its outer DER structure (SEQUENCE of tbsCertificate, signatureAlgorithm, BIT STRING) and the tbsCertificate's fields by tag (version, serial, signature, issuer, two times, subject, subjectPublicKeyInfo, the optional [1], [2], [3]): one OpenSSL rejects deeper inside (an OID's or a time's contents, an extension) is accepted here and fails when a handshake uses it. A non-minimal or indefinite outer length is re-encoded as OpenSSL's i2d does; a non-minimal or indefinite length in the signatureAlgorithm or signature, or an indefinite one in the tbsCertificate, which OpenSSL would also re-encode or accept, is a named Error ("tls.setDefaultCACertificates of a certificate whose DER OpenSSL would re-encode (a non-minimal or indefinite length inside it) is not supported yet").
 - **(d) The CA store's arrays are not frozen; its defaults are the host's.** `getCACertificates` answers Node's strings and Node's caching, but the arrays can be written (Node freezes them). `'system'` and `'extra'` are the host's (the harness host answers its Node's); `'default'` is the bundled roots alone (Node adds `NODE_EXTRA_CA_CERTS`'s certificates, and with `--use-system-ca` the system's), so a module that reads only `'bundled'`, `'default'` or `rootCertificates` needs no TLS host; a client that has not replaced the store asks the host for its default trust, which carries the extra certificates.
 - **(e) The handshake timeout is not armed.** `handshakeTimeout` is validated as Node does and has no timer: a peer that stalls a server's handshake is waited for, where Node emits `ERR_TLS_HANDSHAKE_TIMEOUT` after 120 s.
@@ -8361,11 +8361,14 @@ process does — and so, for S086, as Node does:
   that Node sees in its first poll phase can arrive after this lane's
   (U3-ORD-01, measured).
 
-(g) **TLS: the trust and the verdict are Node's own OpenSSL; the handshake
-is still vendored mbedTLS 3.6** (OpenSSL unit O2). The host links the
-OpenSSL Node v24.18.1 bundles (3.5.7, `packages/runtime/vendor/openssl`,
-built by `backend/openssl-build.ts`) and starts it as Node starts it
-(`wn_trust.c`, from `src/node.cc` and `crypto_util.cc`: `OPENSSL_CONF`, or
+(g) **TLS is Node's own OpenSSL, driven as Node's C++ drives it**
+(OpenSSL units O2, O3). The host links the OpenSSL Node v24.18.1 bundles
+(3.5.7, `packages/runtime/vendor/openssl`, built by
+`backend/openssl-build.ts` with Node's defines, its error records naming
+files as Node's do — `../deps/openssl/openssl/...` — and, for Linux,
+`__LINE__` as gcc, Node's Linux compiler, reads a macro call that spans
+lines) and nothing else. It starts OpenSSL as Node starts it (`wn_trust.c`,
+from `src/node.cc` and `crypto_util.cc`: `OPENSSL_CONF`, or
 `--openssl-config` in `NODE_OPTIONS`, read for its `nodejs_conf` section —
 `openssl_conf` under `--openssl-shared-config` — missing files ignored;
 `--openssl-legacy-provider` loads the legacy provider), but at the
@@ -8374,41 +8377,43 @@ configuration error ends the process there, with Node's text
 ("<argv[0]>: OpenSSL configuration error:" and OpenSSL's error lines) under
 the executable's own name and Node's exit status (the error's reason), and
 a program that uses no TLS never reads the configuration (Node refuses to
-start). Each context is a Node SecureContext — an SSL_CTX built as
-`SecureContext::Init` and `configSecureContext`'s defaults build one — and
-its store is Node's (`crypto_context.cc`): CTX_ROOTS shares the one root
-store `NewRootCertStore` builds — Node's bundled roots, the very bytes the
-module carries for `tls.rootCertificates` (`backend/wasm/tls-roots.ts`,
-compiled into the runner from that module), then the system store with
-`--use-system-ca` (`NODE_OPTIONS`) or `NODE_USE_SYSTEM_CA=1`, then
-`NODE_EXTRA_CA_CERTS`'s certificates; `--use-openssl-ca` puts OpenSSL's
-default locations in place of the bundled and system sets; no
-`X509_V_FLAG_*` is set — and a `ca` adds to the context's own copy, as
-`GetCertStoreOwnedByThisSecureContext` makes one. `getCACertificates("system")`
-is what Node's Linux loader reads: `SSL_CERT_FILE`, else OpenSSL's default
-file `/etc/ssl/cert.pem`, then every regular file of `SSL_CERT_DIR`, else
-`/etc/ssl/certs`, in name order (a directory that cannot be opened prints
-Node's "Cannot open directory ... to load OpenSSL certificates."); `"extra"`
-is `NODE_EXTRA_CA_CERTS`'s file, and one that cannot be read prints Node's
-"Warning: Ignoring extra certs from `<file>`, load failed: <OpenSSL's
-error>" when the host first loads it (Node loads it on a thread when
-node:tls loads, its timing against the program's output a race). The
-verdict on a peer's chain is OpenSSL's `X509_verify_cert`, run as
-OpenSSL's handshake runs it (`ssl_cert.c` `ssl_verify_internal`: the
-context's store, the SSL-server defaults, the auth level of the context's
-security level, the chain as the peer sent it) with Node's verify
-callback, which lets every check run — Node's verdict, code for code, on
-every chain OpenSSL decodes. mbedTLS still carries the handshake, so a
-certificate mbedTLS accepts and OpenSSL cannot decode (a name string that
-is not valid UTF-8, BMP or Universal, a time without its `Z`) is reported
-UNSPECIFIED, where Node's handshake fails with OpenSSL's decoding error;
-material errors answer OpenSSL's texts for the shapes Node meets (`no start
-line`, `wrong tag`, `DECODER routines::unsupported`, `key values
-mismatch`); a protocol failure answers OpenSSL's `wrong version number`,
-`sslv3 alert handshake failure` or `unsupported protocol` where mbedTLS's
-error maps to one, and otherwise mbedTLS's own text under
-`ERR_SSL_SSL_HANDSHAKE_FAILURE`. The engine checks no name (the module's
-checkServerIdentity runs over the certificate).
+start). Each context is a Node SecureContext (`crypto_context.cc`): an
+SSL_CTX made as `SecureContext::Init` makes one (TLS 1.2 to 1.3, Node's
+options, modes, session-cache mode and ticket-key callback) with
+`configSecureContext`'s defaults (Node's TLS 1.3 suites and cipher list;
+`ecdhCurve` `auto`, so OpenSSL's groups, X25519MLKEM768 first); a `cert`
+is Node's `SSL_CTX_use_certificate_chain` and a `key`
+`PEM_read_bio_PrivateKey` + `SSL_CTX_use_PrivateKey`, their failures
+OpenSSL's own error with Node's code (`ERR_OSSL_PEM_NO_START_LINE`,
+`ERR_OSSL_X509_KEY_VALUES_MISMATCH`, ...). The trust is Node's: CTX_ROOTS
+shares the one root store `NewRootCertStore` builds — Node's bundled
+roots, the very bytes the module carries for `tls.rootCertificates`
+(`backend/wasm/tls-roots.ts`, compiled into the runner from that module),
+then the system store with `--use-system-ca` (`NODE_OPTIONS`) or
+`NODE_USE_SYSTEM_CA=1`, then `NODE_EXTRA_CA_CERTS`'s certificates;
+`--use-openssl-ca` puts OpenSSL's default locations in place of the bundled
+and system sets; no `X509_V_FLAG_*` is set — and a `ca` adds to the
+context's own copy (`SetCACert`, `GetCertStoreOwnedByThisSecureContext`).
+`getCACertificates("system")` is what Node's Linux loader reads:
+`SSL_CERT_FILE`, else OpenSSL's default file `/etc/ssl/cert.pem`, then
+every regular file of `SSL_CERT_DIR`, else `/etc/ssl/certs`, in name order
+(a directory that cannot be opened prints Node's "Cannot open directory
+... to load OpenSSL certificates."); `"extra"` is `NODE_EXTRA_CA_CERTS`'s
+file, and one that cannot be read prints Node's "Warning: Ignoring extra
+certs from `<file>`, load failed: <OpenSSL's error>" when the host first
+loads it (Node loads it on a thread when node:tls loads, its timing against
+the program's output a race). A secured socket is Node's TLSWrap
+(`crypto_tls.cc`): an SSL over two memory BIOs fed from the socket's reads
+(libuv's) and drained into its writes, the always-accepting verify
+callback, SNI from the module's servername, the handshake's completion
+reported from OpenSSL's handshake-done callback with
+`SSL_get_verify_result` — Node's verdict, code for code, by construction —
+and the peer's certificate; a TLS failure is TLSWrap's error: the message
+`ERR_print_errors` gives (OpenSSL's last error line, which opens with the
+thread's id — the process's own value, as Node's is its own) and the code
+`ERR_SSL_` + its reason. A server acknowledges no SNI (no SNICallback is
+offered). What is not Node's: the module still drives events and
+`checkServerIdentity` (S090), and no session is resumed (S090 (f)).
 
 (h) **fetch is the runner's own HTTP/1.1 client** (`wn_fetch.c`), made to
 answer as Node's undici does (measured against Node v24.18.1; S098 (a)
@@ -8431,7 +8436,11 @@ request (undici tunnels it with CONNECT; `https:` is tunnelled here too);
 undici's process warnings (a lowercase `patch`) are not printed; there are
 no connect, headers or body timeouts (undici's are 10 s, 300 s and 300 s:
 a server that stalls holds the request until the program aborts it); TLS
-verification is (g)'s verdict, over (g)'s root store (Node's), with
+verification is (g)'s, as undici's tls.connect reaches it (a default
+secure context over (g)'s root store, SNI for a host name, ALPN
+`http/1.1`; a TLS failure is the socket's error, Node's message and code;
+no TLS session is kept for resumption — undici's session cache shows only
+to the server), with
 Node's code and reason (its `--use-system-ca` suggestion included), and
 the host name is checked as Node's `tls.checkServerIdentity` checks it,
 over the certificate as Node hands it to that function: its
@@ -8480,7 +8489,12 @@ security re-review rows hold (g)'s verdicts and (h)'s name check over the
 certificates `tests/fixtures/tls-review/gen.py` makes, through a CONNECT
 proxy, and (h)'s parser over `tests/fixtures/tls-review/responses.mjs`'s
 malformed responses and its fuzz of them; the proxy's refusal row holds
-the lane alone, Node retrying);
+the lane alone, Node retrying; its board #332 rows hold (g) over the
+malformed certificates `tests/fixtures/tls-review/gen-malformed.py` makes,
+served by `esrv.c` on mbedTLS, through fetch and tls.connect, every
+verdict and handshake failure — message and code — Node's);
+`packages/compiler/test/openssl-vendor.test.ts` (the vendored OpenSSL is
+Node's, and joining a multi-line macro call keeps every line's number);
 `tests/harness/event-loop.test.ts`, `console-io.test.ts` and
 `dgram.test.ts` (each case on the c and wasm-native lanes); and
 `packages/compiler/test/wasm2c-whole.test.ts` (the translation against

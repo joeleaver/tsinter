@@ -44,7 +44,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { availableParallelism, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { type CcDriver, runtimeSrcDir, targetPlatform } from "./cc.js";
 import {
@@ -170,6 +170,15 @@ export function opensslSources(target: OpensslTarget): string[] {
 }
 
 const memo = new Map<string, Promise<string>>();
+const memoSet = new Map<string, Promise<Set<string>>>();
+function onceSet(key: string, f: () => Promise<Set<string>>): Promise<Set<string>> {
+  let p = memoSet.get(key);
+  if (p === undefined) {
+    p = f();
+    memoSet.set(key, p);
+  }
+  return p;
+}
 function once(key: string, f: () => Promise<string>): Promise<string> {
   let p = memo.get(key);
   if (p === undefined) {
@@ -214,6 +223,11 @@ function archiver(driver: CcDriver): Promise<string[]> {
 
 const ARCHIVE = "libnodessl.a";
 
+/** Node builds this target's release with gcc (its Linux builds) */
+function gccLines(target: OpensslTarget): boolean {
+  return target.startsWith("linux");
+}
+
 /** Where Node's build sees the vendored tree: gyp compiles from out/Release
  * with deps/openssl/... named relatively, so __FILE__ — which OpenSSL's
  * error records carry (ERR_print_errors' "file:line" field, the tail of a
@@ -221,6 +235,165 @@ const ARCHIVE = "libnodessl.a";
  * is compiled with the vendored directory mapped onto that prefix, so an
  * error record names the file exactly as Node's does. */
 const FILE_MAP = "../deps/openssl/";
+
+/* ── __LINE__ as Node's compiler reads it ──────────────────────────────────
+ * OpenSSL's error records carry __LINE__ (OPENSSL_LINE, reached through
+ * ERR_raise, SSLfatal, RLAYERfatal, the XXXerr macros, ...). Where such a
+ * function-like macro's invocation spans several lines, gcc — which builds
+ * Node's Linux release — expands __LINE__ to the line of the macro's name,
+ * clang to the line of its closing parenthesis: "tlsany_meth.c:77" in
+ * Node's "wrong version number" is "tlsany_meth.c:78" from clang. For a
+ * Linux target every such invocation is joined onto its first line (the
+ * line breaks it held follow its closing parenthesis, so every later line
+ * keeps its number), in a copy that names the original file with #line.
+ * Node's macOS build is clang's own reading and is left as it is. */
+
+/** The function-like macros of the vendored tree whose expansion reaches
+ * __LINE__ (directly or through another such macro). */
+export function opensslLineMacros(): Promise<Set<string>> {
+  return onceSet("line-macros", async () => {
+    const defs = new Map<string, Set<string>>();
+    const fnlike = new Set<string>();
+    // the generated headers (config/archs) hold ERR_raise and its kin
+    for (const f of await walk(vendorOpensslDir())) {
+      if (!/\.(c|h|inc)$/.test(f)) continue;
+      const text = (await readFile(f, "latin1")).replace(/\\\r?\n/g, " ");
+      for (const m of text.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\([^)]*\))?(.*)$/gm)) {
+        const body = defs.get(m[1]!) ?? new Set<string>();
+        for (const id of (m[3] ?? "").matchAll(/[A-Za-z_]\w*/g)) body.add(id[0]);
+        defs.set(m[1]!, body);
+        if (m[2] !== undefined) fnlike.add(m[1]!);
+      }
+    }
+    const reach = new Set(["__LINE__"]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const [k, body] of defs) {
+        if (reach.has(k)) continue;
+        for (const id of body)
+          if (reach.has(id)) {
+            reach.add(k);
+            grew = true;
+            break;
+          }
+      }
+    }
+    return new Set([...reach].filter((k) => fnlike.has(k)));
+  });
+}
+
+/** `src` with every multi-line invocation of `names` joined onto its first
+ * line (gcc's __LINE__), the line breaks moved after its closing
+ * parenthesis; comments inside it become a space. Preprocessor lines are
+ * not touched, nor an invocation that holds one. `count` is how many were
+ * joined. */
+export function joinLineMacroInvocations(src: string, names: ReadonlySet<string>): { text: string; count: number } {
+  const n = src.length;
+  let out = "";
+  let last = 0;
+  let count = 0;
+  let i = 0;
+  let bol = true;
+  const isId0 = (c: string): boolean => /[A-Za-z_]/.test(c);
+  const isId = (c: string): boolean => /\w/.test(c);
+  const skipQuoted = (q: number): number => {
+    const quote = src[q];
+    let r = q + 1;
+    while (r < n && src[r] !== quote && src[r] !== "\n") r += src[r] === "\\" ? 2 : 1;
+    return r + 1;
+  };
+  while (i < n) {
+    const c = src[i]!;
+    if (bol) {
+      let j = i;
+      while (j < n && (src[j] === " " || src[j] === "\t")) j++;
+      if (src[j] === "#") {
+        // a directive, with its continuation lines
+        while (j < n && !(src[j] === "\n" && src[j - 1] !== "\\")) j++;
+        i = j + 1;
+        continue;
+      }
+      bol = false;
+    }
+    if (c === "\n") {
+      bol = true;
+      i++;
+      continue;
+    }
+    if (src.startsWith("/*", i)) {
+      const e = src.indexOf("*/", i + 2);
+      i = e < 0 ? n : e + 2;
+      continue;
+    }
+    if (src.startsWith("//", i)) {
+      const e = src.indexOf("\n", i);
+      i = e < 0 ? n : e;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      i = skipQuoted(i);
+      continue;
+    }
+    if (!isId0(c) || (i > 0 && isId(src[i - 1]!))) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && isId(src[j]!)) j++;
+    const name = src.slice(i, j);
+    if (!names.has(name)) {
+      i = j;
+      continue;
+    }
+    let k = j;
+    while (k < n && (src[k] === " " || src[k] === "\t")) k++;
+    if (src[k] !== "(") {
+      i = j;
+      continue;
+    }
+    // the balanced argument list
+    let depth = 0;
+    let q = k;
+    let pieces = "";
+    let lines = 0;
+    let directive = false;
+    let from = k;
+    for (; q < n; q++) {
+      const ch = src[q]!;
+      if (ch === '"' || ch === "'") {
+        const e = skipQuoted(q);
+        q = e - 1;
+        continue;
+      }
+      if (src.startsWith("/*", q) || src.startsWith("//", q)) {
+        const block = src.startsWith("/*", q);
+        const e = block ? src.indexOf("*/", q + 2) + 2 : src.indexOf("\n", q);
+        pieces += src.slice(from, q) + " ";
+        lines += (src.slice(q, e).match(/\n/g) ?? []).length;
+        q = e - 1;
+        from = e;
+        continue;
+      }
+      if (ch === "\n") {
+        if (/^[ \t]*#/.test(src.slice(q + 1, q + 200))) directive = true;
+        pieces += src.slice(from, q) + " ";
+        lines++;
+        from = q + 1;
+        continue;
+      }
+      if (ch === "(") depth++;
+      else if (ch === ")" && --depth === 0) break;
+    }
+    if (q >= n) break;
+    if (lines > 0 && !directive) {
+      out += src.slice(last, k) + pieces + src.slice(from, q + 1) + "\n".repeat(lines);
+      last = q + 1;
+      count++;
+    }
+    i = q + 1;
+  }
+  return { text: out + src.slice(last), count };
+}
 
 async function digestOf(p: string): Promise<string> {
   const b = await readFile(p);
@@ -291,7 +464,7 @@ export interface OpensslBuildOptions {
 /** The cache directory's key for this recipe. */
 export async function opensslRecipeKey(driver: CcDriver, target: OpensslTarget, prefix: boolean): Promise<string> {
   const h = createHash("sha256");
-  h.update(`recipe 4\0${target}\0${FILE_MAP}\0`);
+  h.update(`recipe 5\0${target}\0${FILE_MAP}\0${gccLines(target) ? "gcc-lines 1" : ""}\0`);
   h.update([...opensslCflags(driver, target), ...opensslDefines(target), ...opensslIncludeDirs(target).map((d) => d.slice(vendorOpensslDir().length))].join("\x1f")).update("\0");
   h.update(prefix ? await readFile(opensslPrefixHeader()) : "raw").update("\0");
   h.update(driver.argv.join(" ")).update("\0").update(await compilerVersion(driver)).update("\0");
@@ -323,6 +496,36 @@ export async function ensureOpensslArchive(driver: CcDriver, opts: OpensslBuildO
     // the language)
     const codegen = cflags.filter((f) => !f.startsWith("-std=") && f !== "-pthread" && !f.startsWith("-fvisibility"));
     const sources = opensslSources(target);
+    // gcc's __LINE__ (see joinLineMacroInvocations): the vendored .c files
+    // it changes are copied, rewritten, under build/lines/ (each naming its
+    // original with #line); a TU compiles from there when it is one of
+    // them or quotes one, its own directory searched after the copy's
+    const lined = new Set<string>();
+    if (gccLines(target)) {
+      const names = await opensslLineMacros();
+      for (const f of await walk(join(v, "openssl"))) {
+        if (!f.endsWith(".c")) continue;
+        const { text, count } = joinLineMacroInvocations(await readFile(f, "latin1"), names);
+        if (count === 0) continue;
+        const rel = f.slice(v.length + 1);
+        await mkdir(dirname(join(build, "lines", rel)), { recursive: true });
+        await writeFile(join(build, "lines", rel), `#line 1 "${f}"\n${text}`, "latin1");
+        lined.add(rel);
+      }
+      for (const s of sources) {
+        if (lined.has(s)) continue;
+        const text = await readFile(join(v, s), "latin1");
+        for (const m of text.matchAll(/^[ \t]*#[ \t]*include[ \t]*"([^"]+\.c)"/gm)) {
+          if (lined.has(join(dirname(s), m[1]!))) {
+            await mkdir(dirname(join(build, "lines", s)), { recursive: true });
+            await writeFile(join(build, "lines", s), `#line 1 "${join(v, s)}"\n${text}`, "latin1");
+            lined.add(s);
+            break;
+          }
+        }
+      }
+    }
+    const srcOf = (s: string): string[] => (lined.has(s) ? ["-iquote", dirname(join(v, s)), join(build, "lines", s)] : [join(v, s)]);
     const objName = (s: string): string => `${s.replace(/\.c$/, "").replace(/[/\\]/g, "__")}.o`;
     const envJobs = Number(process.env["SCRIPTC_OSSL_JOBS"] ?? "");
     const jobs = Math.max(1, opts.jobs ?? (Number.isInteger(envJobs) && envJobs > 0 ? envJobs : Math.min(8, availableParallelism())));
@@ -337,13 +540,13 @@ export async function ensureOpensslArchive(driver: CcDriver, opts: OpensslBuildO
           const obj = join(build, objName(s));
           if (names === null) {
             // one -c per invocation (zig's COFF driver rejects several)
-            await cc([...flags, "-c", join(v, s), "-o", obj]);
+            await cc([...flags, "-c", ...srcOf(s), "-o", obj]);
           } else {
             // the frontend's unoptimised IR, renamed, then the optimiser
             // and codegen on it: the object -O2 compiles, its globals
             // spelled scr_ossl_*
             const ll = obj.replace(/\.o$/, ".ll");
-            await cc([...flags, "-S", "-emit-llvm", "-Xclang", "-disable-llvm-passes", join(v, s), "-o", ll]);
+            await cc([...flags, "-S", "-emit-llvm", "-Xclang", "-disable-llvm-passes", ...srcOf(s), "-o", ll]);
             await writeFile(ll, renameIrGlobals(await readFile(ll, "utf8"), names));
             await cc([...codegen, "-c", ll, "-o", obj]);
             await rm(ll, { force: true });

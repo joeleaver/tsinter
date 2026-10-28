@@ -30,7 +30,8 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import { createServer as createHttpsServer } from "node:https";
 import { createConnection, createServer as createNetServer, type AddressInfo, type Server } from "node:net";
 import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -929,4 +930,223 @@ main();
     expect(out).toContain("v6-mapped OK 200 http://[::ffff:7f00:1]:");
     expect(native.stdout.toString("utf8")).toBe(out);
   }, 120_000);
+});
+
+/* ── board #332: certificates OpenSSL refuses that a looser parser took ──
+ * The N1 security review's third kit (rev-n1c): 55 hand-built chains
+ * (tests/fixtures/tls-review/gen-malformed.py), served by esrv
+ * (tests/fixtures/tls-review/esrv.c on vendored mbedTLS, which loads what
+ * OpenSSL will not; the three chains mbedTLS itself refuses by Node's https
+ * server), reached through a CONNECT proxy by fetch and directly by
+ * tls.connect. Before the OpenSSL units the lane's mbedTLS host accepted
+ * fourteen kinds of them where Node refuses; now every line is Node's —
+ * the verdicts, and the handshake failures OpenSSL's decoder raises, their
+ * messages included (OpenSSL's error line opens with the thread's id, a
+ * per-process value, compared as "TID"). */
+async function buildEsrv(): Promise<string> {
+  const vendor = join(repoRoot, "packages/runtime/vendor/mbedtls");
+  const src = join(repoRoot, "tests/fixtures/tls-review/esrv.c");
+  const lib = readdirSync(join(vendor, "library")).filter((n) => n.endsWith(".c")).sort();
+  const h = createHash("sha256").update(readFileSync(src));
+  for (const f of lib) h.update(f).update(readFileSync(join(vendor, "library", f)));
+  const dir = join(repoRoot, "packages/runtime/vendor/.cache", `esrv-${h.digest("hex").slice(0, 16)}`);
+  const bin = join(dir, "esrv");
+  if (existsSync(bin)) return bin;
+  const build = mkdtempSync(join(tmpdir(), "esrv-"));
+  try {
+    const flags = ["-std=c11", "-Os", "-w", "-DTSINTER_X509_KEEP_CRITICAL", "-I", join(vendor, "include"), "-I", join(vendor, "library")];
+    const units = [...lib.map((f) => join(vendor, "library", f)), src];
+    for (let i = 0; i < units.length; i += width * 2) {
+      await Promise.all(
+        units.slice(i, i + width * 2).map(
+          (u, k) =>
+            new Promise<void>((resolve, reject) => {
+              const p = spawn("clang", [...flags, "-c", u, "-o", join(build, `${i + k}.o`)], { stdio: "inherit" });
+              p.on("error", reject);
+              p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`esrv: clang failed on ${u}`))));
+            }),
+        ),
+      );
+    }
+    execFileSync("clang", [...units.map((_, k) => join(build, `${k}.o`)), "-o", join(build, "esrv")]);
+    mkdirSync(join(dir, ".."), { recursive: true });
+    try {
+      renameSync(build, dir);
+    } catch {
+      // another run published it first
+    }
+  } finally {
+    rmSync(build, { recursive: true, force: true });
+  }
+  return bin;
+}
+
+describe("board #332 rows: certificates Node's OpenSSL refuses (the security review's rev-n1c kit)", () => {
+  let pki = "";
+  let esrv: ReturnType<typeof spawn> | null = null;
+  const servers: { close: () => void }[] = [];
+  const cases: { name: string; host: string; port: number }[] = [];
+  let pxPort = 0;
+  beforeAll(async () => {
+    pki = mkdtempSync(join(tmpdir(), "wn-332-"));
+    execFileSync("python3", ["-I", join(repoRoot, "tests/fixtures/tls-review/gen-malformed.py"), pki], { stdio: "pipe", cwd: pki });
+    const list = JSON.parse(readFileSync(join(pki, "cases.json"), "utf8")) as { name: string; host: string }[];
+    const bin = await buildEsrv();
+    const p = spawn(bin, list.flatMap((c) => [c.name, join(pki, `${c.name}.pem`), join(pki, `${c.name}.key`)]), { stdio: ["pipe", "pipe", "inherit"] });
+    esrv = p;
+    const lines = await new Promise<string[]>((resolve, reject) => {
+      let buf = "";
+      p.stdout!.on("data", (d: Buffer) => {
+        buf += d.toString("utf8");
+        if (buf.includes("ready\n")) resolve(buf.split("\n"));
+      });
+      p.on("error", reject);
+      p.on("close", () => reject(new Error(`esrv ended: ${buf}`)));
+    });
+    const listen = (srv: Server | HttpServer): Promise<number> =>
+      new Promise((resolve) => {
+        srv.listen(0, "127.0.0.1", () => resolve((srv.address() as AddressInfo).port));
+        servers.push(srv);
+      });
+    for (const c of list) {
+      const line = lines.find((l) => l.startsWith(`${c.name} `)) ?? "";
+      const port = Number(line.split(" ")[1]);
+      if (Number.isInteger(port) && port > 0) {
+        cases.push({ ...c, port });
+        continue;
+      }
+      // mbedTLS refuses it: Node's own https server sends it
+      const srv = createHttpsServer({ key: readFileSync(join(pki, `${c.name}.key`)), cert: readFileSync(join(pki, `${c.name}.pem`)), ciphers: "DEFAULT:@SECLEVEL=0" }, (_q, r) => r.end(`hi ${c.name}`));
+      srv.on("tlsClientError", () => {});
+      cases.push({ ...c, port: await listen(srv) });
+    }
+    pxPort = await listen(
+      createNetServer((s) => {
+        let buf = Buffer.alloc(0);
+        const on = (d: Buffer): void => {
+          buf = Buffer.concat([buf, d]);
+          const i = buf.indexOf("\r\n\r\n");
+          if (i < 0) return;
+          s.off("data", on);
+          const m = /^CONNECT .*:(\d+) HTTP/.exec(buf.subarray(0, i).toString("latin1"));
+          if (!m) {
+            s.end("HTTP/1.1 400 Bad\r\n\r\n");
+            return;
+          }
+          const u = createConnection(Number(m[1]), "127.0.0.1", () => {
+            s.write("HTTP/1.1 200 OK\r\n\r\n");
+            u.write(buf.subarray(i + 4));
+            s.pipe(u);
+            u.pipe(s);
+          });
+          u.on("error", () => s.destroy());
+          s.on("error", () => u.destroy());
+        };
+        s.on("data", on);
+        s.on("error", () => {});
+      }),
+    );
+  }, 600_000);
+  afterAll(() => {
+    esrv?.stdin?.end();
+    esrv?.kill();
+    for (const s of servers) s.close();
+    if (pki) rmSync(pki, { recursive: true, force: true });
+  });
+
+  const tid = (b: Buffer): string => b.toString("latin1").replace(/[0-9A-F]{8,16}:error:/g, "TID:error:");
+  async function both(src: string, env: Record<string, string>): Promise<{ node: Out; native: Out }> {
+    const dir = mkdtempSync(join(tmpdir(), "wn-332-p-"));
+    try {
+      const entry = join(dir, "main.ts");
+      writeFileSync(entry, src);
+      const res = await compile(entry, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), dynamic: false, backend: "wasm-native" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, entry], repoRoot, undefined, env);
+      const native = await run(res.binaryPath, [], repoRoot, undefined, env);
+      return { node, native };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  /* the fourteen kinds #332 names, as Node answers them */
+  const FLIPS: [string, string][] = [
+    ["c_proxy_nosan", "proxy subject name violation"],
+    ["c_proxy_san", "proxy subject name violation"],
+    ["c_ku_leaf_masked", "unable to verify the first certificate"],
+    ["c_ku_ca_masked", "key usage does not include certificate signing"],
+    ["c_ns_leaf_masked", "unsuitable certificate purpose"],
+    ["c_cn_bad_utf8", "invalid utf8string"],
+    ["c_cn_bmp_odd", "bmpstring is wrong length"],
+    ["c_cn_univ_bad", "illegal characters"],
+    ["c_time_noz", "utctime is too short"],
+    ["c_leaf_bad_nc", "unable to verify the first certificate"],
+    ["c_leaf_bad_crldp", "unable to verify the first certificate"],
+    ["c_leaf_bad_ipaddr", "unable to verify the first certificate"],
+    ["c_leaf_dup_crldp", "unable to verify the first certificate"],
+    ["c_ca_dup_nc", "unable to verify the first certificate"],
+    ["c_ca_nc_unknown_tag", "unable to verify the first certificate"],
+    ["c_ca_nc_trailing", "unable to verify the first certificate"],
+    ["c_smtputf8_nc", "permitted subtree violation"],
+    ["c_rfc3779_unnested", "RFC 3779 resource not subset of parent's resources"],
+  ];
+
+  test("fetch refuses every #332 certificate as Node does — the verdict, or the handshake failure OpenSSL's decoder raises, code and message", async () => {
+    const src = `const U: string[][] = ${JSON.stringify(cases.map((c) => [c.name, c.host, String(c.port)]))};
+async function go(n: string, h: string, p: string): Promise<void> {
+  try {
+    const r = await fetch("https://" + h + ":" + p + "/");
+    console.log(n, "OK", r.status, await r.text());
+  } catch (e) {
+    const x: unknown = e;
+    const c = (x as { cause: { code: string; message: string } }).cause;
+    console.log(n, "ERR", c ? c.code : "", c ? JSON.stringify(c.message) : String(e));
+  }
+}
+async function main(): Promise<void> {
+  for (const p of U) await go(p[0], p[1], p[2]);
+}
+main();
+`;
+    const env = { NODE_USE_ENV_PROXY: "1", https_proxy: `http://127.0.0.1:${pxPort}`, http_proxy: `http://127.0.0.1:${pxPort}`, HTTPS_PROXY: "", HTTP_PROXY: "", no_proxy: "", NO_PROXY: "", NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") };
+    const { node, native } = await both(src, env);
+    const out = tid(node.stdout);
+    const line = (n: string): string => out.split("\n").find((l) => l.startsWith(`${n} `)) ?? "";
+    for (const [n, why] of FLIPS) expect(line(n), n).toContain(why);
+    expect(line("c_cn_bad_utf8")).toContain('ERR_SSL_INVALID_UTF8STRING "TID:error:06800086:asn1 encoding routines:ASN1_mbstring_ncopy:invalid utf8string:../deps/openssl/openssl/crypto/asn1/a_mbstr.c:85:\\n"');
+    expect(line("c_base")).toContain(" OK 200 hi c_base");
+    expect(tid(native.stdout)).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 600_000);
+
+  test("tls.connect reports what Node's OpenSSL reaches on every #332 certificate — the verdict the module reads, or the handshake's TLS error", async () => {
+    const src = `import * as tls from "node:tls";
+const C: string[][] = ${JSON.stringify(cases.map((c) => [c.name, c.host, String(c.port)]))};
+function one(i: number): void {
+  if (i >= C.length) return;
+  const n = C[i][0];
+  let done = false;
+  const s = tls.connect({ host: "127.0.0.1", port: Number(C[i][2]), servername: C[i][1] }, () => {
+    console.log(n, "SECURE authorized=" + String(s.authorized));
+    done = true;
+    s.destroy();
+    one(i + 1);
+  });
+  s.on("error", (e: Error) => {
+    console.log(n, "ERR", JSON.stringify(e.message));
+    if (!done) {
+      done = true;
+      one(i + 1);
+    }
+  });
+}
+one(0);
+`;
+    const { node, native } = await both(src, { NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
+    const out = tid(node.stdout);
+    const line = (n: string): string => out.split("\n").find((l) => l.startsWith(`${n} `)) ?? "";
+    for (const [n, why] of FLIPS) expect(line(n), n).toContain(why);
+    expect(tid(native.stdout)).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 600_000);
 });

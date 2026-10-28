@@ -13,7 +13,7 @@
  * collides with it. The first run builds the archive (about 1100 TUs; the
  * recipe's own parallelism, cached afterwards under vendor/.cache). */
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:https";
@@ -25,7 +25,9 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { resolveCc, runtimeSrcDir } from "../src/backend/cc.js";
 import {
   definedGlobals,
+  joinLineMacroInvocations,
   opensslIncludeArgs,
+  opensslLineMacros,
   opensslPrefixHeader,
   opensslPrefixNames,
   opensslTargetFor,
@@ -198,5 +200,32 @@ describe("the vendored OpenSSL works as Node's does", () => {
   test("OS-09 the archive is published whole, with its digest recorded beside it (#323)", async () => {
     const recorded = await readFile(`${archive}.ok`, "utf8");
     expect(recorded).toBe(`${(await stat(archive)).size} ${(await import("node:crypto")).createHash("sha256").update(await readFile(archive)).digest("hex")}`);
+  });
+});
+
+describe("OpenSSL's error records name the line gcc names (Node's Linux build)", () => {
+  test("OS-10 a multi-line call of a macro reaching __LINE__ is joined onto its first line, and every vendored .c file keeps every line's number", async () => {
+    const names = await opensslLineMacros();
+    for (const n of ["ERR_raise", "SSLfatal", "RLAYERfatal", "ASN1err"]) expect(names.has(n), n).toBe(true);
+    // ERR_raise_data is an object-like macro: its __LINE__ is its own token's, the same for both compilers
+    expect(names.has("ERR_raise_data")).toBe(false);
+    const root = join(runtimeSrcDir(), "..", "vendor", "openssl", "openssl");
+    const walk = (d: string): string[] => readdirSync(d).flatMap((e) => (statSync(join(d, e)).isDirectory() ? walk(join(d, e)) : [join(d, e)]));
+    let joined = 0;
+    for (const f of walk(root).filter((x) => x.endsWith(".c"))) {
+      const src = readFileSync(f, "latin1");
+      const { text, count } = joinLineMacroInvocations(src, names);
+      joined += count;
+      expect(text.split("\n").length, f).toBe(src.split("\n").length);
+    }
+    expect(joined).toBeGreaterThan(400);
+    // Node's "wrong version number" names tlsany_meth.c:77, where the call starts
+    const meth = readFileSync(join(root, "ssl", "record", "methods", "tlsany_meth.c"), "latin1");
+    const line77 = joinLineMacroInvocations(meth, names).text.split("\n")[76]!;
+    expect(line77).toMatch(/RLAYERfatal\(rl, SSL_AD_NO_ALERT,\s+SSL_R_WRONG_VERSION_NUMBER\)$/);
+    // a comment inside the call becomes a space; a call holding a directive is left alone
+    const t = joinLineMacroInvocations("ERR_raise(a, /* x\n y */ b,\n c);\nERR_raise(a,\n#if X\n b\n#endif\n );\n", new Set(["ERR_raise"]));
+    expect(t.count).toBe(1);
+    expect(t.text).toBe("ERR_raise(a,   b,  c)\n\n;\nERR_raise(a,\n#if X\n b\n#endif\n );\n");
   });
 });

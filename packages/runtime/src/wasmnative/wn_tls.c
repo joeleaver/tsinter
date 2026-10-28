@@ -1,27 +1,31 @@
-/* The native runner's TLS engine (native-runner phase N1): abi.ts's
- * `tlsCall` over vendored mbedTLS 3.6 — the same engine the native lane's
- * scr_tls.c uses, recut to the contract's facts-only shape — with the
- * trust and the verdict on Node's own OpenSSL (OpenSSL unit O2: each
- * context is a Node SecureContext, an SSL_CTX built as Node builds one,
- * whose store is Node's — wn_trust.c — and the peer's chain is judged by
- * OpenSSL's X509_verify_cert exactly as OpenSSL's handshake judges it).
- * Every Node behaviour (options, events, socket.authorized, the
- * verification codes' texts, the host-name check, the CA store's strings)
- * is the module's (tls.ts, tls-x509.ts); the host keeps contexts (trust,
- * certificate, key), secures an open netCall socket, VERIFIES the peer's
- * chain and REPORTS the result in OpenSSL's X509_V_ERR numbering — it
- * never fails a handshake over it, never checks a name, never asks a
- * client for a certificate.
+/* The native runner's TLS engine (native-runner phase N1; OpenSSL unit
+ * O3): abi.ts's `tlsCall` on Node's own OpenSSL (3.5.7, the vendored
+ * library backend/openssl-build.ts builds), driven as Node's C++ drives it
+ * — transcribed from Node v24.18.1's src/crypto/crypto_context.cc
+ * (SecureContext: Init, SetCACert, AddCert and its
+ * SSL_CTX_use_certificate_chain, SetKey, SetRootCerts) and
+ * src/crypto/crypto_tls.cc (TLSWrap: InitSSL, the always-accepting
+ * VerifyCallback, ClearOut / ClearIn / EncOut over two memory BIOs,
+ * OnStreamRead, DoWrite, DoShutdown, the SSL error's message and code).
+ * Every Node behaviour above that C++ (options, events, socket.authorized,
+ * the verification codes' texts, the host-name check, the CA store's
+ * strings) is the module's (tls.ts, tls-x509.ts); the host keeps contexts
+ * (Node's SecureContexts: wn_trust.c), secures an open netCall socket and
+ * REPORTS the verdict OpenSSL reached (SSL_get_verify_result) — it never
+ * fails a handshake over it, never checks a name, never asks a client for
+ * a certificate.
  *
  * A secured socket keeps wn_net.c's descriptor, outbound buffer and read
- * gating (WnTlsOps): the engine reads the descriptor from SECURE on
- * (its handshake, then records), its plaintext is queued as DATA — held
- * while the module does not read — and its writes go out as records
- * through the socket's outbound buffer.
+ * gating (WnTlsOps): what the descriptor reads (libuv's 64 KiB reads, at
+ * most 32 per readiness, none after a short one) goes into the SSL's
+ * input BIO and through TLSWrap's cycle; its plaintext is queued as DATA —
+ * held while the module does not read — and the output BIO's records go
+ * out through the socket's outbound buffer. After the handshake the
+ * descriptor is read only while the module reads (Node's TLSWrap passes
+ * readStop down to the socket): what the peer sends meanwhile waits in the
+ * kernel, back-pressuring it.
  *
- * What an mbedTLS engine cannot say as OpenSSL does (a material error's
- * text, a protocol failure's, a verdict OpenSSL would split further) is
- * SEMANTICS.md S090 (b) and S117 (g). */
+ * SEMANTICS.md S117 (g). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
@@ -31,16 +35,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/error.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/x509_crt.h"
-#include "psa/crypto.h"
-
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -49,42 +45,35 @@
 #include "wn_net.h"
 #include "wn_trust.h"
 
-enum { EV_DATA = 3, EV_EOF = 4, EV_READ_ERROR = 5, EV_SECURE = 10, EV_TLS_ERROR = 11 };
+enum { EV_DATA = 3, EV_EOF = 4, EV_READ_ERROR = 5, EV_WRITE_DONE = 6, EV_SECURE = 10, EV_TLS_ERROR = 11 };
 
-static mbedtls_entropy_context entropy;
-static mbedtls_ctr_drbg_context drbg;
-static int rng_ready;
-static void rng_init(void) {
-  if (rng_ready) return;
-  psa_crypto_init();
-  mbedtls_entropy_init(&entropy);
-  mbedtls_ctr_drbg_init(&drbg);
-  if (mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)"tsinter-wn-tls", 14) != 0)
-    wn_host_fail("tlsCall: the engine's random generator could not be seeded");
-  rng_ready = 1;
-}
-
-/* the stores are Node's (wn_trust.c, SEMANTICS.md S117 (g)) */
-
-/* ── contexts ─────────────────────────────────────────────────────────── */
+/* ── contexts (SecureContext) ─────────────────────────────────────────── */
 typedef struct {
-  SSL_CTX *sc; /* Node's SecureContext: the trust (its store) */
-  mbedtls_x509_crt cert;
-  int has_cert;
-  mbedtls_pk_context key;
-  int has_key;
+  SSL_CTX *sc;
 } Ctx;
 static Ctx **ctxs;
 static int n_ctxs;
 
-/* NoPasswordCallback: never a prompt */
+/* NoPasswordCallback */
 static int no_password(char *buf, int size, int rwflag, void *u) {
   (void)buf, (void)size, (void)rwflag, (void)u;
   return 0;
 }
+/* crypto_util.cc PasswordCallback with an empty passphrase (SetKey's
+ * ByteSource when the module passes none): an empty password */
+static int empty_password(char *buf, int size, int rwflag, void *u) {
+  (void)buf, (void)size, (void)rwflag, (void)u;
+  return 0;
+}
 
-/* a material failure: -1, the message's run then the code's run at ptr */
-static int32_t fail(uint32_t ptr, const char *msg, const char *code) {
+/* ThrowCryptoError(err): -1, then over ptr the message (ERR_error_string_n
+ * of the error) and the code error::Decorate gives it */
+static int32_t crypto_fail(uint32_t ptr, unsigned long err) {
+  char msg[128] = {0};
+  ERR_error_string_n(err, msg, sizeof msg);
+  char code[160];
+  wn_ossl_err_code(err, code, sizeof code);
+  ERR_clear_error();
   WnBuf b = {0};
   wn_buf_run8(&b, msg, strlen(msg));
   wn_buf_run8(&b, code, strlen(code));
@@ -92,307 +81,332 @@ static int32_t fail(uint32_t ptr, const char *msg, const char *code) {
   wn_buf_free(&b);
   return -1;
 }
-/* a PEM blob, NUL-terminated (mbedTLS's PEM mode counts the NUL) */
-static unsigned char *blob_pem(uint32_t ptr, size_t *n) {
+
+/* the PEM blob at ptr in a memory BIO (Node's LoadBIO) */
+static BIO *blob_bio(uint32_t ptr) {
   uint32_t len = wn_rd32(ptr);
-  unsigned char *b = malloc((size_t)len + 1);
-  if (!b) abort();
-  memcpy(b, w_hostmem + ptr + 4, len);
-  b[len] = 0;
-  *n = (size_t)len + 1;
-  return b;
-}
-static int pair_ok(Ctx *c) {
-  if (!c->has_cert || !c->has_key) return 1;
-  return mbedtls_pk_check_pair(&c->cert.pk, &c->key, mbedtls_ctr_drbg_random, &drbg) == 0;
+  BIO *bio = BIO_new(BIO_s_mem());
+  if (!bio) abort();
+  if (len && BIO_write(bio, w_hostmem + ptr + 4, (int)len) != (int)len) abort();
+  return bio;
 }
 
-/* ── secured sockets ──────────────────────────────────────────────────── */
+/* crypto_context.cc SSL_CTX_use_certificate_chain (Node's own, "taken from
+ * OpenSSL"): the first certificate, then the rest as the chain; the
+ * issuer it looks up only feeds OCSP stapling */
+static int use_certificate_chain(SSL_CTX *sc, BIO *in) {
+  ERR_clear_error();
+  X509 *x = PEM_read_bio_X509_AUX(in, NULL, no_password, NULL);
+  if (!x) return 0;
+  STACK_OF(X509) *extra = sk_X509_new_null();
+  if (!extra) abort();
+  X509 *e;
+  while ((e = PEM_read_bio_X509(in, NULL, no_password, NULL)) != NULL) sk_X509_push(extra, e);
+  unsigned long err = ERR_peek_last_error();
+  int ret = 0;
+  if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
+    ERR_clear_error();
+    ret = SSL_CTX_use_certificate(sc, x);
+    if (ret) {
+      SSL_CTX_clear_extra_chain_certs(sc);
+      for (int i = 0; i < sk_X509_num(extra); i++)
+        if (!SSL_CTX_add1_chain_cert(sc, sk_X509_value(extra, i))) {
+          ret = 0;
+          break;
+        }
+    }
+  }
+  sk_X509_pop_free(extra, X509_free);
+  X509_free(x);
+  return ret;
+}
+
+/* ── secured sockets (TLSWrap) ────────────────────────────────────────── */
 typedef struct {
-  mbedtls_ssl_config conf;
-  mbedtls_ssl_context ssl;
-  SSL_CTX *sc; /* the context's trust */
+  SSL *ssl;
+  BIO *enc_in, *enc_out;
   int server;
-  int handshaken, dead, notify;
-  /* the raw side read as libuv's uv__read reads it: 64 KiB at a time, at
-   * most 32 reads per readiness, and none after a short one (the next
-   * iteration's) — the engine consumes these bytes */
-  uint8_t *rbuf;
-  size_t rlen, roff;
-  int reads_left, raw_eof, raw_err;
-  /* plaintext a WRITE handed over that the engine has not taken yet (it
-   * answered WANT_READ / WANT_WRITE): taken as the engine can */
+  int established, dead, eof, shutdown;
+  /* plaintext a WRITE handed over that SSL_write has not taken yet
+   * (pending_cleartext_input_): taken by ClearIn */
   WnBuf wp;
-  size_t wp_off;
+  WnSock *sock;
 } Tls;
 
-enum { EV_WRITE_DONE = 6 };
-static void flush_plain(WnSock *s);
+static int tls_index = -1;
 
-static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
-  WnSock *s = ctx;
-  if (s->closed) return MBEDTLS_ERR_NET_CONN_RESET;
-  int r = wn_sock_raw_out(s, buf, len);
-  if (r < 0) return r == -EPIPE || r == -ECONNRESET ? MBEDTLS_ERR_NET_CONN_RESET : MBEDTLS_ERR_NET_SEND_FAILED;
-  return (int)len;
+/* crypto_tls.cc VerifyCallback: verification continues whatever it meets;
+ * the verdict is SSL_get_verify_result's, judged by the module */
+static int verify_continue(int preverify_ok, X509_STORE_CTX *ctx) {
+  (void)preverify_ok, (void)ctx;
+  return 1;
 }
-static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
-  WnSock *s = ctx;
+
+/* TLSWrap::SelectSNIContextCallback with no SNI context (the module offers
+ * no SNICallback): the name is not acknowledged */
+static int sni_noack(SSL *s, int *ad, void *arg) {
+  (void)s, (void)ad, (void)arg;
+  return SSL_TLSEXT_ERR_NOACK;
+}
+
+/* EncOut: the records OpenSSL produced, out through the socket's buffer;
+ * a transport failure is the read side's to report (0, or -errno) */
+static int enc_out(WnSock *s) {
   Tls *t = s->tctx;
-  if (t->roff == t->rlen) {
-    t->roff = t->rlen = 0;
-    if (t->raw_err) return MBEDTLS_ERR_NET_RECV_FAILED;
-    if (t->raw_eof) return 0;
-    if (t->reads_left <= 0) return MBEDTLS_ERR_SSL_WANT_READ;
-    if (!t->rbuf) {
-      t->rbuf = malloc(65536);
-      if (!t->rbuf) abort();
-    }
-    ssize_t n;
-    do n = recv(s->io.fd, t->rbuf, 65536, 0);
-    while (n < 0 && errno == EINTR);
-    if (n < 0) {
-      t->reads_left = 0;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_READ;
-      t->raw_err = errno;
-      return MBEDTLS_ERR_NET_RECV_FAILED;
-    }
-    if (n == 0) {
-      t->raw_eof = 1;
-      return 0; /* mbedTLS maps it to CONN_EOF */
-    }
-    t->rlen = (size_t)n;
-    t->reads_left = n < 65536 ? 0 : t->reads_left - 1;
+  char buf[16384];
+  int r = 0, n;
+  while ((n = BIO_read(t->enc_out, buf, sizeof buf)) > 0) {
+    if (s->closed) continue;
+    int k = wn_sock_raw_out(s, buf, (size_t)n);
+    if (k < 0 && r == 0) r = k;
   }
-  size_t k = t->rlen - t->roff < len ? t->rlen - t->roff : len;
-  memcpy(buf, t->rbuf + t->roff, k);
-  t->roff += k;
-  return (int)k;
+  return r;
 }
 
-/* the verdict on the peer's chain in OpenSSL's X509_V_ERR numbers (abi.ts
- * tlsCall): OpenSSL's, over the chain as the peer sent it, against the
- * context's store (wn_trust.c) — the engine carries the handshake only. A
- * certificate OpenSSL cannot decode is no verdict it could reach:
- * UNSPECIFIED (OpenSSL's handshake fails on it; unit O3) */
-static uint32_t verify_code(Tls *t) {
-  STACK_OF(X509) *sk = sk_X509_new_null();
-  if (!sk) abort();
-  long code = 0;
-  for (const mbedtls_x509_crt *c = mbedtls_ssl_get_peer_cert(&t->ssl); c && c->raw.p; c = c->next) {
-    const unsigned char *p = c->raw.p;
-    X509 *x = d2i_X509(NULL, &p, (long)c->raw.len);
-    if (!x || p != c->raw.p + c->raw.len) {
-      X509_free(x);
-      code = X509_V_ERR_UNSPECIFIED;
-      break;
-    }
-    sk_X509_push(sk, x);
-  }
-  if (code == 0) code = sk_X509_num(sk) ? wn_ossl_verify_chain(t->sc, sk) : X509_V_ERR_UNSPECIFIED;
-  sk_X509_pop_free(sk, X509_free);
-  return (uint32_t)code;
-}
-
-/* an engine failure as OpenSSL would name it (the nearest text) */
-static void tls_error(WnSock *s, int r) {
+/* SSLInfoCallback's SSL_CB_HANDSHAKE_DONE: the module's onhandshakedone —
+ * the SECURE event, the verdict and the peer's certificate */
+static void info_cb(const SSL *ssl, int where, int ret) {
+  (void)ret;
+  if (!(where & SSL_CB_HANDSHAKE_DONE)) return;
+  WnSock *s = SSL_get_ex_data(ssl, tls_index);
   Tls *t = s->tctx;
+  if (t->established) return;
+  t->established = 1;
+  WnBuf b = {0};
+  if (t->server) {
+    wn_buf_u32(&b, 0);
+    wn_buf_blob(&b, NULL, 0);
+  } else {
+    wn_buf_u32(&b, (uint32_t)SSL_get_verify_result(ssl));
+    X509 *peer = SSL_get0_peer_certificate(ssl);
+    unsigned char *der = NULL;
+    int len = peer ? i2d_X509(peer, &der) : 0;
+    wn_buf_blob(&b, der, len > 0 ? (size_t)len : 0);
+    OPENSSL_free(der);
+  }
+  wn_sock_push(s, EV_SECURE, 0, b.p, (uint32_t)b.n);
+  wn_buf_free(&b);
+}
+
+/* a TLS failure (ClearOut's SSL_ERROR_SSL): the message is GetBIOError's,
+ * the code "ERR_SSL_" + the reason of the first error, upper-cased */
+static void tls_error(WnSock *s, unsigned long first) {
+  Tls *t = s->tctx;
+  const char *rs = ERR_reason_error_string(first);
+  char *msg = wn_ossl_bio_error();
   t->dead = 1;
   s->tls_reads = 0;
-  const char *msg, *code;
-  switch (r) {
-    case MBEDTLS_ERR_SSL_INVALID_RECORD:
-    case MBEDTLS_ERR_SSL_UNSUPPORTED_EXTENSION:
-    case MBEDTLS_ERR_SSL_DECODE_ERROR:
-      msg = "error:0A00010B:SSL routines::wrong version number";
-      code = "ERR_SSL_WRONG_VERSION_NUMBER";
-      break;
-    case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
-      msg = "error:0A000410:SSL routines::sslv3 alert handshake failure";
-      code = "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE";
-      break;
-    case MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION:
-      msg = "error:0A000102:SSL routines::unsupported protocol";
-      code = "ERR_SSL_UNSUPPORTED_PROTOCOL";
-      break;
-    default: {
-      static char buf[160];
-      char detail[100];
-      mbedtls_strerror(r, detail, sizeof detail);
-      snprintf(buf, sizeof buf, "error:0A000000:SSL routines::%s", detail);
-      msg = buf;
-      code = "ERR_SSL_SSL_HANDSHAKE_FAILURE";
-    }
+  /* a reason Node cannot name sets no code (Node returns before onerror) */
+  if (!rs) {
+    free(msg);
+    return;
   }
+  char code[160];
+  size_t k = (size_t)snprintf(code, sizeof code, "ERR_SSL_");
+  for (size_t i = 0; rs[i] && k + 1 < sizeof code; i++) code[k++] = rs[i] == ' ' ? '_' : (rs[i] >= 'a' && rs[i] <= 'z' ? (char)(rs[i] - 32) : rs[i]);
+  code[k] = 0;
+  /* a TLS alert stored in the output is flushed before the error */
+  enc_out(s);
   WnBuf b = {0};
   wn_buf_run8(&b, msg, strlen(msg));
   wn_buf_run8(&b, code, strlen(code));
   wn_sock_push(s, EV_TLS_ERROR, 0, b.p, (uint32_t)b.n);
   wn_buf_free(&b);
+  free(msg);
 }
 
-/* a transport failure / end of file: the net events, as a plain socket's */
-static void tls_eof(WnSock *s, int r) {
+/* ClearOut: SSL_read until it has nothing, the plaintext queued as DATA */
+static void clear_out(WnSock *s) {
   Tls *t = s->tctx;
-  t->dead = 1;
-  s->tls_reads = 0;
-  if (r == MBEDTLS_ERR_NET_RECV_FAILED) wn_sock_queue_read(s, EV_READ_ERROR, -(t->raw_err ? t->raw_err : EIO), NULL, 0);
-  else wn_sock_queue_read(s, EV_EOF, 0, NULL, 0);
-}
-
-static void pump(WnSock *s) {
-  Tls *t = s->tctx;
-  if (t->dead || s->connecting) return;
-  if (!t->handshaken) {
-    int r = mbedtls_ssl_handshake(&t->ssl);
-    if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) return;
-    if (r == MBEDTLS_ERR_SSL_CONN_EOF || r == MBEDTLS_ERR_NET_CONN_RESET || r == MBEDTLS_ERR_NET_RECV_FAILED) {
-      tls_eof(s, r);
-      return;
-    }
-    if (r != 0) {
-      tls_error(s, r);
-      return;
-    }
-    t->handshaken = 1;
-    WnBuf b = {0};
-    if (t->server) {
-      wn_buf_u32(&b, 0);
-      wn_buf_blob(&b, NULL, 0);
-    } else {
-      wn_buf_u32(&b, verify_code(t));
-      const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&t->ssl);
-      wn_buf_blob(&b, peer ? peer->raw.p : NULL, peer ? peer->raw.len : 0);
-    }
-    wn_sock_push(s, EV_SECURE, 0, b.p, (uint32_t)b.n);
-    wn_buf_free(&b);
-  }
-  flush_plain(s);
-  if (t->dead) return;
-  static unsigned char buf[16384];
+  if (t->eof || t->dead || s->closed) return;
+  static char out[16384];
+  int n;
+  ERR_set_mark();
   for (;;) {
-    /* after the handshake the engine reads only while the module does
-     * (Node's TLSWrap passes readStop down to the socket): what the peer
-     * sends meanwhile waits in the kernel, back-pressuring it */
-    if (!s->reading) {
-      s->tls_reads = 0;
-      wn_sock_update(s);
+    n = SSL_read(t->ssl, out, sizeof out);
+    if (n <= 0) break;
+    wn_sock_queue_read(s, EV_DATA, 0, out, (uint32_t)n);
+    if (s->closed) {
+      ERR_pop_to_mark();
       return;
     }
-    int r = mbedtls_ssl_read(&t->ssl, buf, sizeof buf);
-    if (r > 0) {
-      wn_sock_queue_read(s, EV_DATA, 0, buf, (uint32_t)r);
-      continue;
-    }
-    if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) return;
-#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
-    if (r == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
-#endif
-    if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || r == MBEDTLS_ERR_SSL_CONN_EOF || r == MBEDTLS_ERR_NET_CONN_RESET ||
-        r == MBEDTLS_ERR_NET_RECV_FAILED) {
-      tls_eof(s, r);
-      return;
-    }
-    tls_error(s, r);
+  }
+  int err = SSL_get_error(t->ssl, n);
+  if (err == SSL_ERROR_ZERO_RETURN) {
+    ERR_pop_to_mark();
+    t->eof = 1;
+    s->tls_reads = 0;
+    wn_sock_queue_read(s, EV_EOF, 0, NULL, 0);
     return;
   }
+  if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    unsigned long first = ERR_peek_error();
+    if (first == 0) {
+      ERR_pop_to_mark();
+      return;
+    }
+    tls_error(s, first);
+    ERR_pop_to_mark();
+    return;
+  }
+  ERR_pop_to_mark();
 }
 
-static void t_readable(WnSock *s) {
+/* ClearIn: the plaintext that waited for the handshake; a WRITE whose
+ * plaintext is all taken and whose records are all sent completes */
+static void clear_in(WnSock *s) {
   Tls *t = s->tctx;
-  t->reads_left = 32;
-  pump(s);
-}
-static void t_writable(WnSock *s) {
-  Tls *t = s->tctx;
-  if (!t->handshaken) pump(s);
-  else flush_plain(s);
-}
-/* hands the engine what it has not taken yet; a WRITE whose plaintext is
- * all taken and whose records are all sent completes */
-static void flush_plain(WnSock *s) {
-  Tls *t = s->tctx;
-  while (!t->dead && t->wp_off < t->wp.n) {
-    int r = mbedtls_ssl_write(&t->ssl, t->wp.p + t->wp_off, t->wp.n - t->wp_off);
-    if (r >= 0) {
-      t->wp_off += (size_t)r;
-      continue;
-    }
-    if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) return;
-    t->wp.n = t->wp_off = 0;
+  if (t->dead || t->wp.n == 0) return;
+  ERR_set_mark();
+  int w = SSL_write(t->ssl, t->wp.p, (int)t->wp.n);
+  if (w > 0) {
+    t->wp.n = 0;
+    ERR_pop_to_mark();
+    return;
+  }
+  int err = SSL_get_error(t->ssl, w);
+  ERR_pop_to_mark();
+  if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    t->wp.n = 0;
     if (s->pending_write) {
       s->pending_write = 0;
-      wn_sock_push(s, EV_WRITE_DONE, r == MBEDTLS_ERR_NET_CONN_RESET ? -ECONNRESET : -EPIPE, NULL, 0);
+      wn_sock_push(s, EV_WRITE_DONE, -EPROTO, NULL, 0);
     }
-    return;
   }
-  if (t->wp.n) t->wp.n = t->wp_off = 0;
-  if (s->pending_write && !wn_sock_out_pending(s)) {
+}
+
+/* a WRITE whose plaintext was taken and whose records are out: done */
+static void write_progress(WnSock *s) {
+  Tls *t = s->tctx;
+  if (s->pending_write && t->wp.n == 0 && !wn_sock_out_pending(s)) {
     s->pending_write = 0;
     wn_sock_push(s, EV_WRITE_DONE, 0, NULL, 0);
   }
 }
+
+/* TLSWrap::Cycle */
+static void cycle(WnSock *s) {
+  clear_in(s);
+  clear_out(s);
+  if (!s->closed) enc_out(s);
+}
+
+/* a transport end of file / failure: ClearOut first (an error is emitted
+ * only after all data was read), then the net event, as a plain socket's */
+static void raw_end(WnSock *s, int e) {
+  Tls *t = s->tctx;
+  clear_out(s);
+  if (s->closed) return;
+  enc_out(s);
+  s->tls_reads = 0;
+  if (t->eof) return; /* after close_notify everything is ignored */
+  t->eof = 1;
+  t->dead = 1;
+  if (e) wn_sock_queue_read(s, EV_READ_ERROR, -e, NULL, 0);
+  else wn_sock_queue_read(s, EV_EOF, 0, NULL, 0);
+}
+
+/* the descriptor is readable: uv__read's reads into the input BIO, each
+ * cycled (OnStreamRead) */
+static void t_readable(WnSock *s) {
+  Tls *t = s->tctx;
+  static uint8_t buf[65536];
+  for (int count = 0; count < 32 && !t->dead && !t->eof && !s->closed; count++) {
+    if (t->established && !s->reading) {
+      s->tls_reads = 0;
+      break;
+    }
+    ssize_t n = recv(s->io.fd, buf, sizeof buf, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      raw_end(s, errno);
+      break;
+    }
+    if (n == 0) {
+      raw_end(s, 0);
+      break;
+    }
+    if (BIO_write(t->enc_in, buf, (int)n) != (int)n) abort();
+    cycle(s);
+    if ((size_t)n < sizeof buf) break;
+  }
+  if (!s->closed) {
+    write_progress(s);
+    wn_sock_update(s);
+  }
+}
+/* the outbound buffer drained some (OnStreamAfterWrite): ClearIn, EncOut */
+static void t_writable(WnSock *s) {
+  cycle(s);
+  if (!s->closed) write_progress(s);
+}
 static int t_busy(WnSock *s) {
   Tls *t = s->tctx;
-  return t->wp_off < t->wp.n;
+  return t->wp.n != 0;
 }
-static void t_connected(WnSock *s) { pump(s); }
+/* a client secured mid-connect: TLSWrap::Start — ClearOut (the
+ * ClientHello), EncOut */
+static void t_connected(WnSock *s) { cycle(s); }
+/* DoWrite: 0 written, 1 pending (WRITE_DONE), -errno */
 static int32_t t_write(WnSock *s, const uint8_t *p, size_t n) {
   Tls *t = s->tctx;
   if (t->dead) return -EPIPE;
-  size_t off = 0;
-  while (off < n) {
-    int r = mbedtls_ssl_write(&t->ssl, p + off, n - off);
-    if (r >= 0) {
-      off += (size_t)r;
-      continue;
-    }
-    if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) {
-      /* the engine cannot take more now (never a spin): the rest waits,
-       * and the WRITE completes when it is taken and sent */
-      wn_buf_put(&t->wp, p + off, n - off);
-      return 1;
-    }
-    return r == MBEDTLS_ERR_NET_CONN_RESET ? -ECONNRESET : -EPIPE;
+  if (n == 0) {
+    /* an empty write drives the stream: ClearOut, then EncOut */
+    clear_out(s);
+    int r = enc_out(s);
+    if (r < 0) return r;
+    return wn_sock_out_pending(s) ? 1 : 0;
   }
+  ERR_set_mark();
+  int w = SSL_write(t->ssl, p, (int)n);
+  if (w <= 0) {
+    int err = SSL_get_error(t->ssl, w);
+    ERR_pop_to_mark();
+    if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) return -EPROTO;
+    /* saved for ClearIn (the handshake has not finished) */
+    wn_buf_put(&t->wp, p, n);
+    int r = enc_out(s);
+    return r < 0 ? r : 1;
+  }
+  ERR_pop_to_mark();
+  int r = enc_out(s);
+  if (r < 0) return r;
   return wn_sock_out_pending(s) ? 1 : 0;
 }
+/* DoShutdown: close_notify (SSL_shutdown, twice when the first answers
+ * 0), EncOut, then the write side */
 static void t_shutdown(WnSock *s) {
   Tls *t = s->tctx;
-  if (!t->dead && t->handshaken && !t->notify) {
-    t->notify = 1;
-    mbedtls_ssl_close_notify(&t->ssl);
+  if (!t->dead) {
+    ERR_set_mark();
+    if (SSL_shutdown(t->ssl) == 0) SSL_shutdown(t->ssl);
+    ERR_pop_to_mark();
   }
+  t->shutdown = 1;
+  enc_out(s);
   wn_sock_shutdown_after_drain(s);
 }
 static void t_read_start(WnSock *s) {
   Tls *t = s->tctx;
-  if (t->dead) return;
+  if (t->dead || t->eof) return;
   s->tls_reads = 1;
-  /* what the engine already holds flows now; the descriptor is read again */
-  if (t->handshaken) pump(s);
   wn_sock_update(s);
 }
 static void t_read_stop(WnSock *s) {
   Tls *t = s->tctx;
-  if (t->handshaken && !t->dead) s->tls_reads = 0;
+  if (t->established && !t->dead) s->tls_reads = 0;
 }
 static void t_free(WnSock *s) {
   Tls *t = s->tctx;
   if (!t) return;
-  mbedtls_ssl_free(&t->ssl);
-  mbedtls_ssl_config_free(&t->conf);
-  free(t->rbuf);
+  SSL_free(t->ssl); /* and its BIOs */
   wn_buf_free(&t->wp);
   free(t);
   s->tctx = NULL;
 }
 static const WnTlsOps OPS = {t_readable, t_writable, t_connected, t_write, t_shutdown, t_read_start, t_read_stop, t_busy, t_free};
-
-/* appends every certificate of `from` to `to` */
-static void chain_add(mbedtls_x509_crt *to, const mbedtls_x509_crt *from) {
-  for (const mbedtls_x509_crt *c = from; c && c->raw.p; c = c->next) mbedtls_x509_crt_parse_der(to, c->raw.p, c->raw.len);
-}
 
 static int32_t secure(uint32_t ptr, int32_t h) {
   WnSock *s = wn_sock_get(h);
@@ -402,35 +416,46 @@ static int32_t secure(uint32_t ptr, int32_t h) {
   size_t snl;
   char *sni = wn_read_run(&off, &snl);
   if (cid < 1 || (int)cid > n_ctxs) wn_host_fail("tlsCall: SECURE with an unknown context");
-  Ctx *c = ctxs[cid - 1];
+  SSL_CTX *sc = ctxs[cid - 1]->sc;
+  if (tls_index < 0) tls_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
   Tls *t = calloc(1, sizeof *t);
   if (!t) abort();
   t->server = mode == 1;
-  mbedtls_ssl_config_init(&t->conf);
-  mbedtls_ssl_init(&t->ssl);
-  if (mbedtls_ssl_config_defaults(&t->conf, t->server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
-                                  MBEDTLS_SSL_PRESET_DEFAULT) != 0)
-    wn_host_fail("tlsCall: the engine refused its default configuration");
-  mbedtls_ssl_conf_rng(&t->conf, mbedtls_ctr_drbg_random, &drbg);
+  t->sock = s;
+  /* TLSWrap: SecureContext::CreateSSL, then InitSSL */
+  t->ssl = SSL_new(sc);
+  if (!t->ssl) wn_host_fail("tlsCall: SSL_new failed");
+  t->enc_in = BIO_new(BIO_s_mem());
+  t->enc_out = BIO_new(BIO_s_mem());
+  if (!t->enc_in || !t->enc_out) abort();
+  /* NodeBIO: an empty read is "retry", never an end */
+  BIO_set_mem_eof_return(t->enc_in, -1);
+  BIO_set_mem_eof_return(t->enc_out, -1);
+  SSL_set_bio(t->ssl, t->enc_in, t->enc_out);
+  SSL_set_verify(t->ssl, SSL_VERIFY_NONE, verify_continue);
+  SSL_set_mode(t->ssl, SSL_MODE_RELEASE_BUFFERS);
+  SSL_set_mode(t->ssl, SSL_MODE_AUTO_RETRY);
+  SSL_set_ex_data(t->ssl, tls_index, s);
+  SSL_set_info_callback(t->ssl, info_cb);
   if (t->server) {
-    mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
-    if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
+    SSL_CTX_set_tlsext_servername_callback(sc, sni_noack);
+    SSL_set_accept_state(t->ssl);
   } else {
-    /* the verdict is recorded, never enforced (Node's verify callback
-     * accepts; the module decides): judged after the handshake against
-     * the context's store */
-    mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
-    t->sc = c->sc;
-    if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
+    if (snl) {
+      /* TLSWrap::SetServername ignores a refusal (a name past 255 bytes
+       * goes without SNI) */
+      ERR_set_mark();
+      SSL_set_tlsext_host_name(t->ssl, sni);
+      ERR_pop_to_mark();
+    }
+    SSL_set_connect_state(t->ssl);
   }
-  if (mbedtls_ssl_setup(&t->ssl, &t->conf) != 0) wn_host_fail("tlsCall: the engine could not set up a session");
-  if (!t->server) mbedtls_ssl_set_hostname(&t->ssl, snl ? sni : NULL);
   free(sni);
-  mbedtls_ssl_set_bio(&t->ssl, s, bio_send, bio_recv, NULL);
   s->tls = &OPS;
   s->tctx = t;
   s->tls_reads = 1;
-  pump(s);
+  /* a client starts its handshake (TLSWrap::Start) once connected */
+  if (!t->server && !s->connecting) cycle(s);
   wn_sock_update(s);
   return 0;
 }
@@ -459,100 +484,64 @@ static int32_t ca_store(uint32_t ptr, uint32_t cap, int32_t which) {
   return n;
 }
 
-static int has_begin(const unsigned char *p, size_t n) {
-  static const char m[] = "-----BEGIN ";
-  for (size_t i = 0; i + sizeof m - 1 <= n; i++)
-    if (memcmp(p + i, m, sizeof m - 1) == 0) return 1;
-  return 0;
+static Ctx *ctx_of(int32_t h, const char *what) {
+  if (h < 1 || h > n_ctxs) wn_host_fail(what);
+  return ctxs[h - 1];
 }
 
 int32_t host_tlsCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x) {
   uint32_t P = (uint32_t)ptr;
-  rng_init();
   switch (op) {
-    case 1: { /* CTX_NEW */
+    case 1: { /* CTX_NEW: new SecureContext, init, configSecureContext's defaults */
       Ctx *c = calloc(1, sizeof *c);
       if (!c) abort();
       c->sc = wn_ossl_ctx_new();
-      mbedtls_x509_crt_init(&c->cert);
-      mbedtls_pk_init(&c->key);
       ctxs = realloc(ctxs, sizeof *ctxs * (size_t)(n_ctxs + 1));
       if (!ctxs) abort();
       ctxs[n_ctxs++] = c;
       return n_ctxs;
     }
-    case 2: { /* CTX_ROOTS */
-      if (h < 1 || h > n_ctxs) wn_host_fail("tlsCall: CTX_ROOTS of a handle that is not a context");
-      wn_ossl_ctx_roots(ctxs[h - 1]->sc);
+    case 2: /* CTX_ROOTS: addRootCerts */
+      wn_ossl_ctx_roots(ctx_of(h, "tlsCall: CTX_ROOTS of a handle that is not a context")->sc);
+      return 0;
+    case 3: { /* CTX_ADD_CA: SecureContext::SetCACert */
+      SSL_CTX *sc = ctx_of(h, "tlsCall: material for a handle that is not a context")->sc;
+      BIO *bio = blob_bio(P);
+      X509 *xc;
+      while ((xc = PEM_read_bio_X509_AUX(bio, NULL, no_password, NULL)) != NULL) {
+        if (X509_STORE_add_cert(wn_ossl_ctx_own_store(sc), xc) != 1 || SSL_CTX_add_client_CA(sc, xc) != 1)
+          wn_host_fail("tlsCall: CTX_ADD_CA could not add a certificate");
+        X509_free(xc);
+      }
+      BIO_free(bio);
+      ERR_clear_error();
       return 0;
     }
-    case 3:
-    case 4:
-    case 5: {
-      if (h < 1 || h > n_ctxs) wn_host_fail("tlsCall: material for a handle that is not a context");
-      Ctx *c = ctxs[h - 1];
-      size_t n;
-      unsigned char *pem = blob_pem(P, &n);
-      int32_t ans = 0;
-      if (op == 3) {
-        /* SecureContext::SetCACert: every certificate PEM_read_bio_X509_AUX
-         * reads, into the context's own store and its client CA list;
-         * what does not parse ends the read, silently */
-        BIO *bio = BIO_new_mem_buf(pem, (int)(n - 1));
-        if (!bio) abort();
-        X509 *x;
-        while ((x = PEM_read_bio_X509_AUX(bio, NULL, no_password, NULL)) != NULL) {
-          if (X509_STORE_add_cert(wn_ossl_ctx_own_store(c->sc), x) != 1 || SSL_CTX_add_client_CA(c->sc, x) != 1)
-            wn_host_fail("tlsCall: CTX_ADD_CA could not add a certificate");
-          X509_free(x);
-        }
-        BIO_free(bio);
-        ERR_clear_error();
-      } else if (op == 4) {
-        mbedtls_x509_crt add;
-        mbedtls_x509_crt_init(&add);
-        int r = mbedtls_x509_crt_parse(&add, pem, n);
-        if (r != 0 || add.raw.p == NULL) {
-          ans = has_begin(pem, n - 1) ? fail(P, "error:068000A8:asn1 encoding routines::wrong tag", "ERR_OSSL_ASN1_WRONG_TAG")
-                                      : fail(P, "error:0480006C:PEM routines::no start line", "ERR_OSSL_PEM_NO_START_LINE");
-        } else {
-          mbedtls_x509_crt_free(&c->cert);
-          mbedtls_x509_crt_init(&c->cert);
-          chain_add(&c->cert, &add);
-          int had = c->has_cert;
-          c->has_cert = 1;
-          if (!pair_ok(c)) {
-            c->has_cert = had;
-            ans = fail(P, "error:05800074:x509 certificate routines::key values mismatch", "ERR_OSSL_X509_KEY_VALUES_MISMATCH");
-          }
-        }
-        mbedtls_x509_crt_free(&add);
-      } else {
-        mbedtls_pk_context k;
-        mbedtls_pk_init(&k);
-        if (mbedtls_pk_parse_key(&k, pem, n, NULL, 0, mbedtls_ctr_drbg_random, &drbg) != 0) {
-          ans = fail(P, "error:1E08010C:DECODER routines::unsupported", "ERR_OSSL_UNSUPPORTED");
-          mbedtls_pk_free(&k);
-        } else {
-          mbedtls_pk_context old = c->key;
-          int had = c->has_key;
-          c->key = k;
-          c->has_key = 1;
-          if (!pair_ok(c)) {
-            c->key = old;
-            c->has_key = had;
-            mbedtls_pk_free(&k);
-            ans = fail(P, "error:05800074:x509 certificate routines::key values mismatch", "ERR_OSSL_X509_KEY_VALUES_MISMATCH");
-          } else if (had)
-            mbedtls_pk_free(&old);
-        }
-      }
-      free(pem);
-      return ans;
+    case 4: { /* CTX_SET_CERT: SecureContext::AddCert */
+      SSL_CTX *sc = ctx_of(h, "tlsCall: material for a handle that is not a context")->sc;
+      BIO *bio = blob_bio(P);
+      int ok = use_certificate_chain(sc, bio);
+      BIO_free(bio);
+      if (!ok) return crypto_fail(P, ERR_get_error());
+      ERR_clear_error();
+      return 0;
+    }
+    case 5: { /* CTX_SET_KEY: SecureContext::SetKey (no passphrase) */
+      SSL_CTX *sc = ctx_of(h, "tlsCall: material for a handle that is not a context")->sc;
+      BIO *bio = blob_bio(P);
+      EVP_PKEY *key = PEM_read_bio_PrivateKey(bio, NULL, empty_password, NULL);
+      BIO_free(bio);
+      if (!key) return crypto_fail(P, ERR_get_error());
+      int ok = SSL_CTX_use_PrivateKey(sc, key);
+      EVP_PKEY_free(key);
+      if (!ok) return crypto_fail(P, ERR_get_error());
+      ERR_clear_error();
+      return 0;
     }
     case 6:
       return secure(P, h);
     case 7:
+      wn_ossl_init();
       return ca_store(P, (uint32_t)len, x);
     default:
       wn_host_fail("tlsCall: an op outside the contract");

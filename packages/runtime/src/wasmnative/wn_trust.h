@@ -45,13 +45,6 @@ void wn_ossl_ctx_roots(SSL_CTX *sc);
  * store (a copy of the root store when it shares that one) */
 X509_STORE *wn_ossl_ctx_own_store(SSL_CTX *sc);
 
-/* the verdict on a chain as the peer sent it (leaf first), reached as
- * OpenSSL's handshake reaches it (ssl_cert.c ssl_verify_internal: the
- * context's store, auth level = its security level, the "ssl_server"
- * defaults, its parameters, and Node's verify callback, which lets every
- * check run): X509_STORE_CTX_get_error, in X509_V_ERR numbers */
-long wn_ossl_verify_chain(SSL_CTX *sc, STACK_OF(X509) *chain);
-
 /* TLSWrap's GetBIOError: ERR_print_errors_cb's LAST line (with its
  * newline), the queue emptied; malloc'd, "" when the queue was empty */
 char *wn_ossl_bio_error(void);

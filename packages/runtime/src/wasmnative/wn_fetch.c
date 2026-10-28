@@ -20,8 +20,11 @@
  * The transfer runs on the runner's event loop (wn_ev.c), never on a
  * thread of its own: a name is looked up on a thread (as libuv does), the
  * socket is non-blocking and polled with the program's other descriptors,
- * and https goes through vendored mbedTLS (the TLS unit's engine) on the
- * program thread. A request holds the loop from START until its BODY or
+ * and https goes through Node's own OpenSSL (the TLS unit's engine,
+ * wn_trust.c) on the program thread, driven as Node's TLSWrap drives it
+ * for undici's tls.connect: a default secure context, the always-accepting
+ * verify callback, SNI for a host name, ALPN "http/1.1", the verdict
+ * (SSL_get_verify_result) and then tls.checkServerIdentity. A request holds the loop from START until its BODY or
  * FAIL is queued, or the module ABORTs it. Connections are not kept for
  * reuse (undici's pool is not observable by a program; the request still
  * says `connection: keep-alive`, as undici's does).
@@ -46,13 +49,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "mbedtls/error.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/oid.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/x509_crt.h"
-#include "psa/crypto.h"
-
+#include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
@@ -752,8 +750,8 @@ typedef struct Req {
   size_t out_off;
   WnBuf tunnel_in; /* the bytes behind the proxy's CONNECT answer */
   size_t tunnel_off;
-  mbedtls_ssl_config conf;
-  mbedtls_ssl_context ssl;
+  SSL *ssl;        /* the connection (its two memory BIOs: rbio, wbio) */
+  BIO *rbio, *wbio;
   int tls_on;
   /* the response, as fetch holds it */
   int status;
@@ -788,8 +786,7 @@ static void req_free_hop(Req *r) {
   if (r->fd >= 0) wn_io_close(&r->io);
   r->fd = -1;
   if (r->tls_on) {
-    mbedtls_ssl_free(&r->ssl);
-    mbedtls_ssl_config_free(&r->conf);
+    SSL_free(r->ssl);
     r->tls_on = 0;
   }
   if (r->ai) freeaddrinfo(r->ai);
@@ -896,37 +893,35 @@ static void req_fail_errno(Req *r, const char *syscall, int e, const char *where
 static void hop_start(Req *r);
 static void fx_ready(WnIo *io, uint32_t evs);
 
-static int rng(void *ctx, unsigned char *out, size_t n) {
-  (void)ctx;
-  size_t got = 0;
-  while (got < n) {
-    ssize_t k = getrandom(out + got, n - got, 0);
-    if (k > 0) got += (size_t)k;
-    else if (errno != EINTR) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-  }
-  return 0;
-}
-
-static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
-  Req *r = ctx;
-  wn_buf_put(&r->out, buf, len);
-  return (int)len;
-}
-static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
-  Req *r = ctx;
+/* the socket's bytes into the engine's input (TLSWrap::OnStreamRead): the
+ * tunnel's first bytes, then one read; 1 bytes went in, 0 none now, -1
+ * the end of file, -2 a read error (*e) */
+static int flush_out(Req *r);
+static int tls_fill(Req *r, int *e) {
   if (r->tunnel_off < r->tunnel_in.n) {
     size_t k = r->tunnel_in.n - r->tunnel_off;
-    if (k > len) k = len;
-    memcpy(buf, r->tunnel_in.p + r->tunnel_off, k);
-    r->tunnel_off += k;
-    return (int)k;
+    if (BIO_write(r->rbio, r->tunnel_in.p + r->tunnel_off, (int)k) != (int)k) abort();
+    r->tunnel_off = r->tunnel_in.n;
+    return 1;
   }
+  static uint8_t buf[65536];
   ssize_t n;
-  do n = recv(r->fd, buf, len, 0);
+  do n = recv(r->fd, buf, sizeof buf, 0);
   while (n < 0 && errno == EINTR);
-  if (n >= 0) return (int)n;
-  if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_READ;
-  return errno == ECONNRESET ? MBEDTLS_ERR_NET_CONN_RESET : MBEDTLS_ERR_NET_RECV_FAILED;
+  if (n > 0) {
+    if (BIO_write(r->rbio, buf, (int)n) != (int)n) abort();
+    return 1;
+  }
+  if (n == 0) return -1;
+  if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+  *e = errno;
+  return -2;
+}
+/* EncOut: the engine's records, behind what waits for the socket */
+static void tls_flush(Req *r) {
+  char b[16384];
+  int n;
+  while ((n = BIO_read(r->wbio, b, sizeof b)) > 0) wn_buf_put(&r->out, b, (size_t)n);
 }
 static int32_t ll_new(void);
 /* a verdict as Node's TLS error: OpenSSL's text (with Node's hint where it
@@ -937,6 +932,11 @@ static void tls_verdict_fail(Req *r, long code) {
   free(msg);
 }
 
+/* crypto_tls.cc VerifyCallback: verification continues whatever it meets */
+static int fetch_verify_continue(int preverify_ok, X509_STORE_CTX *ctx) {
+  (void)preverify_ok, (void)ctx;
+  return 1;
+}
 /* undici's connections: tls.connect with a default secure context (its
  * store the root store: addRootCerts) */
 static SSL_CTX *fetch_ctx(void) {
@@ -947,22 +947,23 @@ static SSL_CTX *fetch_ctx(void) {
   }
   return sc;
 }
-/* the peer's chain as it sent it, as OpenSSL decodes it; NULL when a
- * certificate does not decode */
-static STACK_OF(X509) *peer_chain(Req *r) {
-  STACK_OF(X509) *sk = sk_X509_new_null();
-  if (!sk) abort();
-  for (const mbedtls_x509_crt *c = mbedtls_ssl_get_peer_cert(&r->ssl); c && c->raw.p; c = c->next) {
-    const unsigned char *p = c->raw.p;
-    X509 *x = d2i_X509(NULL, &p, (long)c->raw.len);
-    if (!x || p != c->raw.p + c->raw.len) {
-      X509_free(x);
-      sk_X509_pop_free(sk, X509_free);
-      return NULL;
-    }
-    sk_X509_push(sk, x);
+/* a TLS failure as the socket's error (TLSWrap::ClearOut): the message is
+ * GetBIOError's, the code "ERR_SSL_" + the first error's reason,
+ * upper-cased; a TLS alert waiting in the output goes out first */
+static void tls_ssl_fail(Req *r) {
+  unsigned long first = ERR_peek_error();
+  const char *rs = first ? ERR_reason_error_string(first) : NULL;
+  char *msg = wn_ossl_bio_error();
+  char code[160] = "";
+  if (rs) {
+    size_t k = (size_t)snprintf(code, sizeof code, "ERR_SSL_");
+    for (size_t i = 0; rs[i] && k + 1 < sizeof code; i++) code[k++] = rs[i] == ' ' ? '_' : (rs[i] >= 'a' && rs[i] <= 'z' ? (char)(rs[i] - 32) : rs[i]);
+    code[k] = 0;
   }
-  return sk;
+  tls_flush(r);
+  flush_out(r);
+  req_fail(r, "Error", msg, code);
+  free(msg);
 }
 
 /* the request head, as undici writes it */
@@ -1014,18 +1015,13 @@ static void write_head(Req *r) {
   s_cat(&h, "\r\n");
   WnBuf *dst = &r->out;
   if (r->tls_on) {
-    size_t off = 0;
-    while (off < h.n) {
-      int k = mbedtls_ssl_write(&r->ssl, (const unsigned char *)h.p + off, h.n - off);
-      if (k < 0) break;
-      off += (size_t)k;
-    }
-    off = 0;
-    while (r->has_body && off < r->blen) {
-      int k = mbedtls_ssl_write(&r->ssl, r->body + off, r->blen - off);
-      if (k < 0) break;
-      off += (size_t)k;
-    }
+    /* undici writes the head, then the body: each SSL_write a whole
+     * record run into the output BIO */
+    ERR_set_mark();
+    if (h.n) SSL_write(r->ssl, h.p, (int)h.n);
+    if (r->has_body && r->blen) SSL_write(r->ssl, r->body, (int)r->blen);
+    ERR_pop_to_mark();
+    tls_flush(r);
   } else {
     wn_buf_put(dst, h.p, h.n);
     if (r->has_body) wn_buf_put(dst, r->body, r->blen);
@@ -1232,29 +1228,37 @@ static void hop_start(Req *r) {
 }
 
 static void tls_begin(Req *r) {
-  static int psa;
-  if (!psa) {
-    psa_crypto_init();
-    psa = 1;
-  }
-  mbedtls_ssl_config_init(&r->conf);
-  mbedtls_ssl_init(&r->ssl);
+  /* TLSWrap::InitSSL on undici's tls.connect */
+  r->ssl = SSL_new(fetch_ctx());
+  if (!r->ssl) wn_host_fail("fetch: SSL_new failed");
+  r->rbio = BIO_new(BIO_s_mem());
+  r->wbio = BIO_new(BIO_s_mem());
+  if (!r->rbio || !r->wbio) abort();
+  BIO_set_mem_eof_return(r->rbio, -1);
+  BIO_set_mem_eof_return(r->wbio, -1);
+  SSL_set_bio(r->ssl, r->rbio, r->wbio);
   r->tls_on = 1;
-  mbedtls_ssl_config_defaults(&r->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-  mbedtls_ssl_conf_rng(&r->conf, rng, NULL);
-  /* the engine only carries the handshake: the chain is judged by
-   * wn_x509.c as OpenSSL judges it, the name as Node checks it */
-  mbedtls_ssl_conf_authmode(&r->conf, MBEDTLS_SSL_VERIFY_NONE);
-  mbedtls_ssl_setup(&r->ssl, &r->conf);
+  /* the verdict is recorded and judged after the handshake (Node's
+   * VerifyCallback accepts) */
+  SSL_set_verify(r->ssl, SSL_VERIFY_NONE, fetch_verify_continue);
+  SSL_set_mode(r->ssl, SSL_MODE_RELEASE_BUFFERS);
+  SSL_set_mode(r->ssl, SSL_MODE_AUTO_RETRY);
+  /* undici: ALPNProtocols ["http/1.1"] */
+  static const unsigned char alpn[] = "\x08http/1.1";
+  if (SSL_set_alpn_protos(r->ssl, alpn, sizeof alpn - 1) != 0) wn_host_fail("fetch: ALPN was refused");
   /* SNI for a DNS name (an IP literal gets none); the name itself is
    * checked by check_identity, as Node checks it, never by the engine */
   struct in6_addr a6;
   struct in_addr a4;
-  if (r->url.host[0] == '[' || inet_pton(AF_INET, r->url.host, &a4) == 1 || inet_pton(AF_INET6, r->url.host, &a6) == 1)
-    mbedtls_ssl_set_hostname(&r->ssl, NULL);
-  else
-    mbedtls_ssl_set_hostname(&r->ssl, r->url.host);
-  mbedtls_ssl_set_bio(&r->ssl, r, bio_send, bio_recv, NULL);
+  if (!(r->url.host[0] == '[' || inet_pton(AF_INET, r->url.host, &a4) == 1 || inet_pton(AF_INET6, r->url.host, &a6) == 1))
+  {
+    /* TLSWrap::SetServername ignores a refusal (a name past 255 bytes
+     * goes without SNI) */
+    ERR_set_mark();
+    SSL_set_tlsext_host_name(r->ssl, r->url.host);
+    ERR_pop_to_mark();
+  }
+  SSL_set_connect_state(r->ssl);
   r->state = ST_TLS;
 }
 
@@ -1895,61 +1899,64 @@ static int check_identity(Req *r, X509 *peer) {
   return 0;
 }
 
+/* TLSWrap's cycle for the request: the handshake, the verdict and the
+ * name, then the response's records into undici's parser */
 static void tls_pump(Req *r) {
-  if (r->state == ST_TLS) {
-    int k = mbedtls_ssl_handshake(&r->ssl);
-    if (k == MBEDTLS_ERR_SSL_WANT_READ || k == MBEDTLS_ERR_SSL_WANT_WRITE) return;
-    if (k != 0) {
-      if (k == MBEDTLS_ERR_SSL_CONN_EOF || k == MBEDTLS_ERR_NET_CONN_RESET) {
-        req_fail(r, "Error", "Client network socket disconnected before secure TLS connection was established", "ECONNRESET");
-        return;
-      }
-      char d[120], msg[200];
-      mbedtls_strerror(k, d, sizeof d);
-      snprintf(msg, sizeof msg, "error:0A000000:SSL routines::%s", d);
-      req_fail(r, "Error", msg, "ERR_SSL_SSL_HANDSHAKE_FAILURE");
-      return;
-    }
-    /* the chain first, then the name (Node's order); a certificate OpenSSL
-     * cannot decode is no verdict it could reach: UNSPECIFIED (OpenSSL's
-     * handshake fails on it; unit O3) */
-    STACK_OF(X509) *sk = peer_chain(r);
-    long code = sk == NULL || sk_X509_num(sk) == 0 ? X509_V_ERR_UNSPECIFIED : wn_ossl_verify_chain(fetch_ctx(), sk);
-    if (code != 0) {
-      if (sk) sk_X509_pop_free(sk, X509_free);
-      tls_verdict_fail(r, code);
-      return;
-    }
-    int named = check_identity(r, sk_X509_value(sk, 0));
-    sk_X509_pop_free(sk, X509_free);
-    if (!named) return;
-    write_head(r);
-    r->state = ST_HEAD;
-  }
-  uint8_t buf[16384];
   unsigned gen = r->hop_gen;
   for (;;) {
-    int k = mbedtls_ssl_read(&r->ssl, buf, sizeof buf);
+    int k, e, rerr = 0, f;
+    ERR_clear_error();
+    if (r->state == ST_TLS) {
+      k = SSL_do_handshake(r->ssl);
+      tls_flush(r);
+      if (k == 1) {
+        /* the chain first, then the name (Node's onConnectSecure) */
+        long code = SSL_get_verify_result(r->ssl);
+        if (code != X509_V_OK) {
+          flush_out(r);
+          tls_verdict_fail(r, code);
+          return;
+        }
+        if (!check_identity(r, SSL_get0_peer_certificate(r->ssl))) return;
+        write_head(r);
+        r->state = ST_HEAD;
+        continue;
+      }
+      e = SSL_get_error(r->ssl, k);
+      if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+        tls_ssl_fail(r);
+        return;
+      }
+      f = tls_fill(r, &rerr);
+      if (f > 0) continue;
+      if (f == 0) return;
+      /* the peer went away before the handshake finished */
+      if (f == -1) req_fail(r, "Error", "Client network socket disconnected before secure TLS connection was established", "ECONNRESET");
+      else req_fail_errno(r, "read", rerr, NULL);
+      return;
+    }
+    uint8_t buf[16384];
+    k = SSL_read(r->ssl, buf, sizeof buf);
     if (k > 0) {
       feed(r, buf, (size_t)k);
       if (r->dead || r->hop_gen != gen) return;
       continue;
     }
-    if (k == MBEDTLS_ERR_SSL_WANT_READ || k == MBEDTLS_ERR_SSL_WANT_WRITE) return;
-#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
-    if (k == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
-#endif
-    if (k == 0 || k == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || k == MBEDTLS_ERR_SSL_CONN_EOF) {
+    e = SSL_get_error(r->ssl, k);
+    tls_flush(r);
+    if (e == SSL_ERROR_ZERO_RETURN) {
       on_eof(r);
       return;
     }
-    if (k == MBEDTLS_ERR_NET_CONN_RESET) {
-      on_read_error(r, ECONNRESET);
+    if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+      tls_ssl_fail(r);
       return;
     }
-    char d[120];
-    mbedtls_strerror(k, d, sizeof d);
-    req_fail(r, "Error", d, "ERR_SSL_SSL_HANDSHAKE_FAILURE");
+    f = tls_fill(r, &rerr);
+    if (f > 0) continue;
+    if (f == 0) return;
+    if (f == -1) on_eof(r);
+    else on_read_error(r, rerr);
     return;
   }
 }

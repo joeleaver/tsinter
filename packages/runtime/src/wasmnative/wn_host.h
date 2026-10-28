@@ -2,7 +2,7 @@
  * wn_host.c (process, clocks, fs, zones), wn_ev.c (the event core: the
  * evPoll queue, the loop's wait, signals, fs.watch, stdin), wn_cp.c
  * (child processes), wn_net.c (TCP, UDP, lookups), wn_tls.c (the TLS
- * engine over vendored mbedTLS) and wn_fetch.c (fetch).
+ * engine over Node's own OpenSSL, wn_trust.c) and wn_fetch.c (fetch).
  *
  * THE HOST HOLDS NO GC REFERENCE: every value crossing abi.ts is a number
  * or bytes in the module's linear memory, and everything the host keeps

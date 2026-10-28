@@ -1,10 +1,9 @@
 /*
- * tsinter: TSINTER_X509_KEEP_CRITICAL (defined only for the wasm-native
- * lane's build of this library, backend/wasm-native.ts) keeps a
- * certificate whose critical extension mbedTLS does not parse instead of
- * refusing it: that lane's verifier (runtime/src/wasmnative/wn_x509.c)
- * decides on such a certificate as OpenSSL does. Undefined (every other
- * build), this file is upstream's.
+ * tsinter: TSINTER_X509_KEEP_CRITICAL (defined only for the test server
+ * tests/fixtures/tls-review/esrv.c, which serves board #332's malformed
+ * chains) keeps a certificate whose critical extension mbedTLS does not
+ * parse instead of refusing it. Undefined (every other build), this file
+ * is upstream's.
  */
 /*
  *  X.509 certificate parsing and verification

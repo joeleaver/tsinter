@@ -399,31 +399,6 @@ X509_STORE *wn_ossl_ctx_own_store(SSL_CTX *sc) {
   return c->own = store;
 }
 
-/* crypto_tls.cc VerifyCallback: verification continues whatever it meets */
-static int verify_continue(int preverify_ok, X509_STORE_CTX *ctx) {
-  (void)preverify_ok, (void)ctx;
-  return 1;
-}
-
-long wn_ossl_verify_chain(SSL_CTX *sc, STACK_OF(X509) *chain) {
-  long code = X509_V_ERR_UNSPECIFIED;
-  X509_STORE_CTX *ctx = X509_STORE_CTX_new();
-  if (!ctx) abort();
-  ERR_set_mark();
-  if (sk_X509_num(chain) > 0 && X509_STORE_CTX_init(ctx, SSL_CTX_get_cert_store(sc), sk_X509_value(chain, 0), chain)) {
-    X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx);
-    X509_VERIFY_PARAM_set_auth_level(param, SSL_CTX_get_security_level(sc));
-    X509_STORE_CTX_set_default(ctx, "ssl_server");
-    X509_VERIFY_PARAM_set1(param, SSL_CTX_get0_param(sc));
-    X509_STORE_CTX_set_verify_cb(ctx, verify_continue);
-    X509_verify_cert(ctx);
-    code = X509_STORE_CTX_get_error(ctx);
-  }
-  ERR_pop_to_mark();
-  X509_STORE_CTX_free(ctx);
-  return code;
-}
-
 /* ── error records ────────────────────────────────────────────────────── */
 static int keep_last(const char *str, size_t len, void *u) {
   WnBuf *b = u;
