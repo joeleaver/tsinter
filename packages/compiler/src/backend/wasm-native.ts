@@ -24,6 +24,7 @@ import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { type CcDriver, ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
+import { ensureOpensslArchive } from "./openssl-build.js";
 import {
   IMPORT_CHDIR,
   IMPORT_CP_CALL,
@@ -409,6 +410,16 @@ async function ensureWnTlsArchive(driver: CcDriver): Promise<string> {
     await rm(build, { recursive: true, force: true });
   }
   return archive;
+}
+
+/** Node's own OpenSSL (vendor/openssl, backend/openssl-build.ts) built for
+ * this lane: the archive the host's TLS and X.509 move onto (design units
+ * O2/O3). Unit O1 builds and smoke-tests it (test/openssl-vendor.test.ts);
+ * nothing links it yet — the host still runs on mbedTLS above. */
+export function wasmNativeOpensslArchive(): Promise<string> {
+  const driver = resolveCc();
+  if (driver.target !== null) throw new Error("the wasm-native lane does not cross-compile yet (SCRIPTC_TARGET is set)");
+  return ensureOpensslArchive(driver);
 }
 
 let ccVersionMemo: Promise<string> | null = null;
