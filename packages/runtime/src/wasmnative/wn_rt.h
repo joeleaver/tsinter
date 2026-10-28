@@ -52,6 +52,15 @@ enum {
 };
 _Noreturn void w_trap(int kind);
 
+/* The stack-depth limit (SEMANTICS.md S117 (b)): every translated function
+ * that calls another counts its frame in the translation's w_depth
+ * (wasm2c.ts translateBody);
+ * past W_DEPTH_MAX frames the program traps with V8's stack-overflow text,
+ * as the wasm lane's module does when V8's stack runs out. The limit is the
+ * deepest the wasm lane reaches on Node's default stack (about 18,000 of
+ * the smallest frames), so a recursion that fits there fits here. */
+#define W_DEPTH_MAX 20000u
+
 /* ── the object model: an 8-byte header (canonical type id, array length),
  * then a struct's fields at their natural alignment or an array's
  * elements. References are plain pointers; null is 0. A function

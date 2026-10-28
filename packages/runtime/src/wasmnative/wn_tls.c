@@ -131,7 +131,36 @@ typedef struct {
    * (pending_cleartext_input_): taken by ClearIn */
   WnBuf wp;
   WnSock *sock;
+  /* TLSWrap's write_size_: records went out in one write, and EncOut
+   * writes nothing more until that write completes — a write the kernel
+   * took at once completes in a SetImmediate (here: when the host's turn
+   * ends, before its next wait), one that waited once the outbound buffer
+   * drained. What OpenSSL produces meanwhile gathers in the output BIO and
+   * leaves as ONE write then, so the segments on the wire are Node's
+   * (board #336: a record per write let Nagle hold the next one for the
+   * peer's delayed ACK). */
+  int gated;
+  /* the handshake completed in this read's cycle: Node runs the module's
+   * 'secure' / 'secureConnect' / 'secureConnection' listeners INSIDE that
+   * cycle, before its EncOut, so what they write leaves with the
+   * handshake's last flight; held until the module writes or its turn
+   * ends */
+  int held;
+  int queued; /* on the release list */
 } Tls;
+
+static Tls **rel;
+static size_t n_rel, cap_rel;
+static void release_later(Tls *t) {
+  if (t->queued) return;
+  if (n_rel == cap_rel) {
+    cap_rel = cap_rel ? cap_rel * 2 : 16;
+    rel = realloc(rel, cap_rel * sizeof *rel);
+    if (!rel) abort();
+  }
+  rel[n_rel++] = t;
+  t->queued = 1;
+}
 
 static int tls_index = -1;
 
@@ -149,19 +178,29 @@ static int sni_noack(SSL *s, int *ad, void *arg) {
   return SSL_TLSEXT_ERR_NOACK;
 }
 
-/* EncOut: the records OpenSSL produced, out through the socket's buffer;
- * a transport failure is the read side's to report (0, or -errno) */
-static int enc_out(WnSock *s) {
+/* EncOut: the records OpenSSL produced, out through the socket's buffer
+ * as one write — unless a write is still in flight (gated) or the
+ * handshake's last flight waits for the module (held); `force`
+ * (close_notify, an alert before an error, the transport's end) writes
+ * regardless. A transport failure is the read side's to report (0, or
+ * -errno). */
+static int enc_out_x(WnSock *s, int force) {
   Tls *t = s->tctx;
-  char buf[16384];
-  int r = 0, n;
-  while ((n = BIO_read(t->enc_out, buf, sizeof buf)) > 0) {
-    if (s->closed) continue;
-    int k = wn_sock_raw_out(s, buf, (size_t)n);
-    if (k < 0 && r == 0) r = k;
+  if (!force && (t->gated || t->held)) return 0;
+  char *p = NULL;
+  long n = BIO_get_mem_data(t->enc_out, &p);
+  if (n <= 0) return 0;
+  int r = 0;
+  if (!s->closed) {
+    r = wn_sock_raw_out(s, p, (size_t)n);
+    t->gated = 1;
+    t->held = 0;
+    release_later(t);
   }
+  (void)BIO_reset(t->enc_out);
   return r;
 }
+static int enc_out(WnSock *s) { return enc_out_x(s, 0); }
 
 /* SSLInfoCallback's SSL_CB_HANDSHAKE_DONE: the module's onhandshakedone —
  * the SECURE event, the verdict and the peer's certificate */
@@ -206,7 +245,7 @@ static void tls_error(WnSock *s, unsigned long first) {
   for (size_t i = 0; rs[i] && k + 1 < sizeof code; i++) code[k++] = rs[i] == ' ' ? '_' : (rs[i] >= 'a' && rs[i] <= 'z' ? (char)(rs[i] - 32) : rs[i]);
   code[k] = 0;
   /* a TLS alert stored in the output is flushed before the error */
-  enc_out(s);
+  enc_out_x(s, 1);
   WnBuf b = {0};
   wn_buf_run8(&b, msg, strlen(msg));
   wn_buf_run8(&b, code, strlen(code));
@@ -278,7 +317,7 @@ static void clear_in(WnSock *s) {
 /* a WRITE whose plaintext was taken and whose records are out: done */
 static void write_progress(WnSock *s) {
   Tls *t = s->tctx;
-  if (s->pending_write && t->wp.n == 0 && !wn_sock_out_pending(s)) {
+  if (s->pending_write && t->wp.n == 0 && BIO_ctrl_pending(t->enc_out) == 0 && !wn_sock_out_pending(s)) {
     s->pending_write = 0;
     wn_sock_push(s, EV_WRITE_DONE, 0, NULL, 0);
   }
@@ -297,7 +336,7 @@ static void raw_end(WnSock *s, int e) {
   Tls *t = s->tctx;
   clear_out(s);
   if (s->closed) return;
-  enc_out(s);
+  enc_out_x(s, 1);
   s->tls_reads = 0;
   if (t->eof) return; /* after close_notify everything is ignored */
   t->eof = 1;
@@ -328,7 +367,16 @@ static void t_readable(WnSock *s) {
       break;
     }
     if (BIO_write(t->enc_in, buf, (int)n) != (int)n) abort();
-    cycle(s);
+    int was = t->established;
+    clear_in(s);
+    clear_out(s);
+    /* the cycle that completed the handshake: its flight waits for the
+     * module's listeners (held) */
+    if (!was && t->established && !s->closed) {
+      t->held = 1;
+      release_later(t);
+    }
+    if (!s->closed) enc_out(s);
     if ((size_t)n < sizeof buf) break;
   }
   if (!s->closed) {
@@ -336,14 +384,18 @@ static void t_readable(WnSock *s) {
     wn_sock_update(s);
   }
 }
-/* the outbound buffer drained some (OnStreamAfterWrite): ClearIn, EncOut */
+/* the outbound buffer drained some; once all of it, the write completed
+ * (OnStreamAfterWrite): ClearIn, EncOut */
 static void t_writable(WnSock *s) {
+  Tls *t = s->tctx;
+  if (wn_sock_out_pending(s)) return;
+  t->gated = 0;
   cycle(s);
   if (!s->closed) write_progress(s);
 }
 static int t_busy(WnSock *s) {
   Tls *t = s->tctx;
-  return t->wp.n != 0;
+  return t->wp.n != 0 || BIO_ctrl_pending(t->enc_out) != 0;
 }
 /* a client secured mid-connect: TLSWrap::Start — ClearOut (the
  * ClientHello), EncOut */
@@ -352,6 +404,9 @@ static void t_connected(WnSock *s) { cycle(s); }
 static int32_t t_write(WnSock *s, const uint8_t *p, size_t n) {
   Tls *t = s->tctx;
   if (t->dead) return -EPIPE;
+  /* the module's write runs where Node's listener would: inside the
+   * cycle, before its EncOut */
+  t->held = 0;
   if (n == 0) {
     /* an empty write drives the stream: ClearOut, then EncOut */
     clear_out(s);
@@ -373,7 +428,7 @@ static int32_t t_write(WnSock *s, const uint8_t *p, size_t n) {
   ERR_pop_to_mark();
   int r = enc_out(s);
   if (r < 0) return r;
-  return wn_sock_out_pending(s) ? 1 : 0;
+  return wn_sock_out_pending(s) || BIO_ctrl_pending(t->enc_out) != 0 ? 1 : 0;
 }
 /* DoShutdown: close_notify (SSL_shutdown, twice when the first answers
  * 0), EncOut, then the write side */
@@ -385,7 +440,7 @@ static void t_shutdown(WnSock *s) {
     ERR_pop_to_mark();
   }
   t->shutdown = 1;
-  enc_out(s);
+  enc_out_x(s, 1);
   wn_sock_shutdown_after_drain(s);
 }
 static void t_read_start(WnSock *s) {
@@ -401,11 +456,45 @@ static void t_read_stop(WnSock *s) {
 static void t_free(WnSock *s) {
   Tls *t = s->tctx;
   if (!t) return;
+  if (t->queued)
+    for (size_t i = 0; i < n_rel; i++)
+      if (rel[i] == t) {
+        rel[i] = rel[--n_rel];
+        break;
+      }
   SSL_free(t->ssl); /* and its BIOs */
   wn_buf_free(&t->wp);
   free(t);
   s->tctx = NULL;
 }
+/* the host's turn ends (before its next wait): the SetImmediate in which
+ * Node completes a write the kernel took at once — the gate opens and what
+ * gathered goes out (OnStreamAfterWrite: EncOut, then the write's
+ * callback); a held flight goes too */
+static void tls_release(void) {
+  Tls **v = rel;
+  size_t n = n_rel;
+  rel = NULL;
+  n_rel = cap_rel = 0;
+  for (size_t i = 0; i < n; i++) v[i]->queued = 0;
+  for (size_t i = 0; i < n; i++) {
+    Tls *t = v[i];
+    if (t == NULL) continue;
+    WnSock *s = t->sock;
+    if (s->closed || s->tctx != t) continue;
+    t->held = 0;
+    if (wn_sock_out_pending(s)) continue; /* it completes as it drains */
+    t->gated = 0;
+    enc_out(s);
+    if (!s->closed) {
+      write_progress(s);
+      wn_sock_update(s);
+    }
+  }
+  free(v);
+}
+extern void (*wn_tls_release)(void); /* wn_ev.c */
+
 static const WnTlsOps OPS = {t_readable, t_writable, t_connected, t_write, t_shutdown, t_read_start, t_read_stop, t_busy, t_free};
 
 static int32_t secure(uint32_t ptr, int32_t h) {
@@ -452,6 +541,7 @@ static int32_t secure(uint32_t ptr, int32_t h) {
     SSL_set_connect_state(t->ssl);
   }
   free(sni);
+  wn_tls_release = tls_release;
   s->tls = &OPS;
   s->tctx = t;
   s->tls_reads = 1;

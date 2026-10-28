@@ -131,7 +131,6 @@ const KNOWN: Record<string, string> = {
   "N1-REG-03": "S037: a Buffer crossing an untyped call slices as a copy",
   "N2-REG-01": "S088 (f): the checked-dynamic http handle's unmodelled members are fenced",
   "N2-REG-03": "S088 (g): a null the static type does not admit is fenced",
-  "U4-REG-01": "S090 (h): the rejecting client's Finished has left, so the server's handshake completes",
   "U4-R-13": "S090 (c): a certificate OpenSSL would re-encode is a named Error",
   // Not a function of the program: each prints its child's pid (the wasm
   // lane's host kills the leftover child, S086 (i); this host and Node
@@ -612,6 +611,169 @@ const s = tls.connect(${floodPort}, "localhost", { ca }, () => {
     // bounded by the collector, not by what the peer sent: buffering the
     // flood would take more than its 256 MiB
     expect(nativeMaxRssKb).toBeLessThan(160 * 1024);
+  }, 120_000);
+});
+
+/* ── native-runner N2a: the TLS write pattern (board #336) and the stack
+ * depth (SEMANTICS.md S117 (b)) ─────────────────────────────────────────
+ * Board #336: the host wrote every TLS record as its own write, so the
+ * handshake's Finished left alone and a following small record waited
+ * under Nagle for the peer's delayed ACK (~40 ms a connection). Node does
+ * not set TCP_NODELAY on a tls.connect socket; its TLSWrap writes a
+ * cycle's records as one write and nothing more until that write
+ * completes, and the 'secureConnect' listener runs inside the cycle that
+ * finished the handshake — so its first write leaves WITH the Finished.
+ * The row reads the client's bytes through a TCP relay in this process:
+ * the chunk carrying the client's ChangeCipherSpec must also carry the
+ * Finished and the first application record (one write, one segment),
+ * on Node and natively. */
+describe("N2a rows: the TLS write pattern and the stack depth", () => {
+  const certs = join(repoRoot, "tests/fixtures/server/certs");
+  const pem = (n: string): Buffer => readFileSync(join(certs, n));
+  const servers: { close: () => void }[] = [];
+  let relayPort = 0;
+  /* per relayed connection: the number of TLS records in the client chunk
+   * that carries its ChangeCipherSpec (record type 20) */
+  const ccsRecords: number[] = [];
+  beforeAll(async () => {
+    const listen = (srv: Server | TlsServer): Promise<number> =>
+      new Promise((resolve) => {
+        srv.listen(0, "127.0.0.1", () => resolve((srv.address() as AddressInfo).port));
+        servers.push(srv);
+      });
+    const tlsPort = await listen(
+      createTlsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem") }, (s) => {
+        let got = "";
+        s.on("data", (d: Buffer) => {
+          got += d.toString();
+          if (got.length >= 2) s.write("ok");
+        });
+        s.on("end", () => s.end());
+        s.on("error", () => {});
+      }),
+    );
+    relayPort = await listen(
+      createNetServer((c) => {
+        c.setNoDelay(true);
+        const up = createConnection(tlsPort, "127.0.0.1");
+        up.setNoDelay(true);
+        let pending = Buffer.alloc(0);
+        let seen = false;
+        c.on("data", (d: Buffer) => {
+          up.write(d);
+          if (seen) return;
+          // records wholly inside this chunk, after what a previous chunk left
+          const b = Buffer.concat([pending, d]);
+          let off = 0;
+          let n = 0;
+          let ccs = false;
+          while (off + 5 <= b.length) {
+            const len = b.readUInt16BE(off + 3);
+            if (off + 5 + len > b.length) break;
+            if (b[off] === 20 && off >= pending.length) ccs = true;
+            if (off >= pending.length) n++;
+            off += 5 + len;
+          }
+          pending = b.subarray(off);
+          if (ccs) {
+            seen = true;
+            ccsRecords.push(n);
+          }
+        });
+        up.on("data", (d: Buffer) => c.write(d));
+        c.on("end", () => up.end());
+        up.on("end", () => c.end());
+        c.on("error", () => up.destroy());
+        up.on("error", () => c.destroy());
+      }),
+    );
+  });
+  afterAll(() => {
+    for (const s of servers) s.close();
+  });
+
+  async function both(src: string): Promise<{ node: Out; native: Out }> {
+    const dir = mkdtempSync(join(tmpdir(), "wn-n2a-"));
+    try {
+      const entry = join(dir, "main.ts");
+      writeFileSync(entry, src);
+      const res = await compile(entry, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), dynamic: false, backend: "wasm-native" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, entry], repoRoot, undefined);
+      const native = await run(res.binaryPath, [], repoRoot, undefined);
+      return { node, native };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("N2A-TLS-01 board #336: the 'secureConnect' listener's first write leaves with the handshake's Finished, as one write (Node's TLSWrap); a second write in the same turn follows once that write completed", async () => {
+    const src = `import * as tls from "node:tls";
+import * as fs from "node:fs";
+const ca = fs.readFileSync("tests/fixtures/server/certs/ca.pem", "utf8");
+let left = 3;
+const one = (): void => {
+  const s = tls.connect(${relayPort}, "localhost", { ca }, () => {
+    s.write("a");
+    s.write("b");
+  });
+  s.on("data", (d: Buffer) => {
+    console.log("got", d.toString());
+    s.end();
+  });
+  s.on("close", () => {
+    if (--left > 0) one();
+  });
+};
+one();
+`;
+    ccsRecords.length = 0;
+    const { node, native } = await both(src);
+    expect(node.stdout.toString("utf8")).toBe("got ok\ngot ok\ngot ok\n");
+    expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+    expect(native.code).toBe(0);
+    // ChangeCipherSpec, the Finished (an encrypted record) and "a"
+    expect(ccsRecords).toEqual([3, 3, 3, 3, 3, 3]);
+  }, 120_000);
+
+  /* S117 (b): the depth is counted in wasm frames, W_DEPTH_MAX = 20000 —
+   * a recursion Node survives survives here; an unbounded one ends with
+   * V8's text, exit 1, uncatchable (the wasm lane's outcome) — including
+   * one in tail position, which the C compiler would otherwise have
+   * turned into a loop that never ends. */
+  test("N2A-STACK-01 recursion Node survives (9,000 frames, and a mutual recursion) answers as Node", async () => {
+    const src = `function f(n: number): number { return n === 0 ? 0 : 1 + f(n - 1); }
+function even(k: number): boolean { return k === 0 ? true : odd(k - 1); }
+function odd(k: number): boolean { return k === 0 ? false : even(k - 1); }
+class W { walk(k: number): number { return k === 0 ? 0 : this.walk(k - 1) + 1; } }
+console.log(f(9000), even(9000), new W().walk(9000));
+`;
+    const { node, native } = await both(src);
+    expect(node.stdout.toString("utf8")).toBe("9000 true 9000\n");
+    expect(same(node, native)).toBe(true);
+  }, 120_000);
+
+  test("N2A-STACK-02 unbounded recursion (a tail call included) traps with V8's RangeError text and exit 1, never hangs or faults; Node's try/catch would catch it (S117 (b))", async () => {
+    const src = `let depth = 0;
+function g(): void { depth++; g(); }
+try {
+  g();
+} catch (e) {
+  console.log("caught", (e as Error).name, depth > 1000);
+}
+`;
+    const { node, native } = await both(src);
+    expect(node.stdout.toString("utf8")).toBe("caught RangeError true\n");
+    expect(native.stdout.toString("utf8")).toBe("");
+    expect(native.stderr.toString("utf8")).toBe("RangeError: Maximum call stack size exceeded\n");
+    expect(native.code).toBe(1);
+    const src2 = `function h(n: number): number { return h(n + 1) + 1; }
+console.log(h(0));
+`;
+    const r2 = await both(src2);
+    expect(r2.node.code).toBe(1);
+    expect(r2.native.stderr.toString("utf8")).toBe("RangeError: Maximum call stack size exceeded\n");
+    expect(r2.native.code).toBe(1);
   }, 120_000);
 });
 

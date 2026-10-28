@@ -1017,6 +1017,8 @@ export function wasmModuleToC(bytes: Uint8Array, opts: WholeOptions): string {
   const refGlobals = m.globals.map((g, k) => (g.t === "ref" && tracedHeap(m, g.ht) ? k : -1)).filter((k) => k >= 0);
   out.push(`WObj **const w_gc_roots[${Math.max(1, refGlobals.length)}] = {${refGlobals.length > 0 ? refGlobals.map((k) => `&w_g${k}`).join(", ") : "0"}};`);
   out.push(`const uint32_t w_gc_nroots = ${refGlobals.length};`);
+  // the stack-depth count (translateBody; SEMANTICS.md S117 (b))
+  out.push(`static uint32_t w_depth;`);
   out.push("");
 
   // ── prototypes
@@ -1153,6 +1155,9 @@ const TEMP_LETTER: Record<VT, string> = { i32: "t", ref: "r", i64: "j", f32: "f"
 
 /** Translates one function body. `fi` is its function index (-1: a
  * constant expression, translated as a nullary function with `ftOverride`). */
+/** A return's placeholder for the depth count's decrement (translateBody). */
+const DEPTH_LEAVE = "\u0001";
+
 function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: Ctx, ftOverride?: FuncType): string {
   const { P } = cx;
   const W = cx.w;
@@ -1240,9 +1245,11 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
   };
   const returnStmt = (): void => {
     const vals = ft.results.map(() => pop()).reverse();
-    if (vals.length === 0) emit("return;");
-    else if (vals.length === 1) emit(`return ${vals[0]!.c};`);
-    else emit(`return (${cx.retType(ft)}){${vals.map((v) => v.c).join(", ")}};`);
+    // DEPTH_LEAVE marks every return: a counted frame leaves the depth
+    // count there (resolved once the body is known to call)
+    if (vals.length === 0) emit(`${DEPTH_LEAVE}return;`);
+    else if (vals.length === 1) emit(`${DEPTH_LEAVE}return ${vals[0]!.c};`);
+    else emit(`${DEPTH_LEAVE}return (${cx.retType(ft)}){${vals.map((v) => v.c).join(", ")}};`);
   };
   /** The label a branch to frame f jumps to. */
   const target = (f: Frame): string => (f.kind === "loop" ? `L${f.id}` : `E${f.id}x`);
@@ -1388,6 +1395,8 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
   };
   let deadDepth = 0;
   let lastDead = false;
+  /** the body calls a translated function (it is a counted frame) */
+  let calls = false;
   while (r.pos < r.b.length) {
     const op = r.u8();
     const f = top();
@@ -1543,6 +1552,7 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
         break;
       case 0x10: {
         const callee = r.uleb();
+        if (whole && callee >= W!.nImp) calls = true;
         const cft = cx.ftOf(m.funcTypes[callee]!);
         const args = cft.params.map(() => pop()).reverse();
         flushIf((e) => e.glob || e.mem);
@@ -1551,6 +1561,7 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
       }
       case 0x11: {
         // call_indirect
+        calls = true;
         const ti = r.uleb();
         const tb = r.uleb();
         const cft = cx.ftOf(ti);
@@ -1567,6 +1578,7 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
       }
       case 0x14: {
         // call_ref
+        calls = true;
         const ti = r.uleb();
         const cft = cx.ftOf(ti);
         const fpe = pop();
@@ -2251,7 +2263,16 @@ function translateBody(m: Module, fi: number, body: Body, sigText: string, cx: C
   // A value function whose end is unreachable still needs a C ending (the
   // trap never returns).
   if (ft.results.length > 0 && lastDead) kept.push(whole ? `  w_trap(W_TRAP_UNREACHABLE);` : `  ${P}trap();`);
-  return `${sigText} {\n${decls.join("\n")}${decls.length > 0 ? "\n" : ""}${kept.join("\n")}\n}`;
+  // The stack-depth limit (whole-program, SEMANTICS.md S117 (b)): a
+  // function that calls a translated function counts its frame on entry
+  // and leaves the count at every return, so the limit is a number of wasm
+  // frames, the same on every machine and C compiler (and no sibling call
+  // turns an unbounded recursion into a loop). A leaf adds at most one
+  // frame and is not counted.
+  const counted = whole && fi >= 0 && calls;
+  const lines2 = kept.map((l) => l.replace(DEPTH_LEAVE, counted ? "w_depth--; " : ""));
+  if (counted) lines2.unshift(`  if (W_UNLIKELY(++w_depth > W_DEPTH_MAX)) w_trap(W_TRAP_STACK);`);
+  return `${sigText} {\n${decls.join("\n")}${decls.length > 0 ? "\n" : ""}${lines2.join("\n")}\n}`;
 
   /** The regex profile's GC instructions (its object model, RxObj). */
   function translateRegexGc(sub: number): void {

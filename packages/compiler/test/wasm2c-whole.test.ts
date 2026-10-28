@@ -679,6 +679,24 @@ ${bodies.map((_, j) => `    case ${j + 1}: f${j + 1}(); break;`).join("\n")}
     expect(runC(bytes, drive).trimEnd().split("\n")).toEqual(want);
   });
 
+  test("the stack-depth limit (SEMANTICS.md S117 (b)): a calling function counts its frame, 20,000 frames run, the next one traps W_TRAP_STACK; a leaf is not counted", () => {
+    const types = [[0x60, ...vec([[0x7f]]), ...vec([[0x7f]])]];
+    const funcs: Fn[] = [
+      // f0(n) = n == 0 ? 0 : f0(n - 1) + 1
+      { type: 0, body: [0x20, 0x00, 0x45, 0x04, 0x7f, 0x41, 0x00, 0x05, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x10, 0x00, 0x41, 0x01, 0x6a, 0x0b] },
+      // f1(n) = n + 1: a leaf
+      { type: 0, body: [0x20, 0x00, 0x41, 0x01, 0x6a] },
+    ];
+    const bytes = assemble({ types, funcs, exportAll: true });
+    const c = wasmModuleToC(bytes, { hostImports: new Map() });
+    const f1 = c.slice(c.indexOf("static int32_t f1(int32_t p0) {"));
+    expect(f1.slice(0, f1.indexOf("\n}"))).not.toContain("w_depth");
+    const drive = [19999, 20000, 19999]
+      .map((n) => `  w_depth = 0;\n  if (setjmp(jb)) printf("${n} TRAP %d\\n", trapped_kind == W_TRAP_STACK); else printf("${n} %d %u\\n", f0(${n}), w_depth);`)
+      .join("\n");
+    expect(runC(bytes, drive).trimEnd().split("\n")).toEqual(["19999 19999 0", "20000 TRAP 1", "19999 19999 0"]);
+  });
+
   test("an instruction outside the whole-program subset throws, naming it", () => {
     const types = [[0x60, ...vec([[0x7f]]), ...vec([[0x7f]])]];
     // i32.atomic.load (0xfe 0x10) is outside

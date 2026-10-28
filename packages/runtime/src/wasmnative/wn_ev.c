@@ -452,8 +452,12 @@ void wn_ev_audit(void) {
 }
 
 /* ── the wait ─────────────────────────────────────────────────────────── */
+/* the TLS unit's end of a turn (wn_tls.c tls_release), when one links */
+void (*wn_tls_release)(void);
+
 void wn_ev_wait(double due) {
   ep_init();
+  if (wn_tls_release) wn_tls_release();
   unstage();
   net_this_round = 0;
   for (;;) {
