@@ -53,6 +53,9 @@
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
 
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
 #include "scr_zlib_prefix.h"
 #include "zlib.h"
 
@@ -928,11 +931,38 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
 static int32_t ll_new(void);
 /* a verdict as Node's TLS error: OpenSSL's text (with Node's hint where it
  * gives one) and Node's code */
-static void tls_verdict_fail(Req *r, int code) {
-  char msg[300];
-  const char *hint = code == 18 || code == 21 ? "; if the root CA is installed locally, try running Node.js with --use-system-ca" : "";
-  snprintf(msg, sizeof msg, "%s%s", wn_x509_err_text(code), hint);
+static void tls_verdict_fail(Req *r, long code) {
+  char *msg = wn_x509_err_reason(code);
   req_fail(r, "Error", msg, wn_x509_err_name(code));
+  free(msg);
+}
+
+/* undici's connections: tls.connect with a default secure context (its
+ * store the root store: addRootCerts) */
+static SSL_CTX *fetch_ctx(void) {
+  static SSL_CTX *sc;
+  if (!sc) {
+    sc = wn_ossl_ctx_new();
+    wn_ossl_ctx_roots(sc);
+  }
+  return sc;
+}
+/* the peer's chain as it sent it, as OpenSSL decodes it; NULL when a
+ * certificate does not decode */
+static STACK_OF(X509) *peer_chain(Req *r) {
+  STACK_OF(X509) *sk = sk_X509_new_null();
+  if (!sk) abort();
+  for (const mbedtls_x509_crt *c = mbedtls_ssl_get_peer_cert(&r->ssl); c && c->raw.p; c = c->next) {
+    const unsigned char *p = c->raw.p;
+    X509 *x = d2i_X509(NULL, &p, (long)c->raw.len);
+    if (!x || p != c->raw.p + c->raw.len) {
+      X509_free(x);
+      sk_X509_pop_free(sk, X509_free);
+      return NULL;
+    }
+    sk_X509_push(sk, x);
+  }
+  return sk;
 }
 
 /* the request head, as undici writes it */
@@ -1847,8 +1877,7 @@ static void on_read_error(Req *r, int e) {
  * hands it over: 1 when it matches; otherwise the request fails with
  * ERR_TLS_CERT_ALTNAME_INVALID and Node's reason (wn_x509.c). No
  * certificate at all fails too. */
-static int check_identity(Req *r) {
-  const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&r->ssl);
+static int check_identity(Req *r, X509 *peer) {
   const char *h = r->url.host;
   size_t hl = strlen(h);
   if (hl >= 2 && h[0] == '[') h++, hl -= 2;
@@ -1881,13 +1910,19 @@ static void tls_pump(Req *r) {
       req_fail(r, "Error", msg, "ERR_SSL_SSL_HANDSHAKE_FAILURE");
       return;
     }
-    /* the chain first, then the name (Node's order) */
-    int code = wn_x509_verify(mbedtls_ssl_get_peer_cert(&r->ssl), wn_trust_default());
+    /* the chain first, then the name (Node's order); a certificate OpenSSL
+     * cannot decode is no verdict it could reach: UNSPECIFIED (OpenSSL's
+     * handshake fails on it; unit O3) */
+    STACK_OF(X509) *sk = peer_chain(r);
+    long code = sk == NULL || sk_X509_num(sk) == 0 ? X509_V_ERR_UNSPECIFIED : wn_ossl_verify_chain(fetch_ctx(), sk);
     if (code != 0) {
+      if (sk) sk_X509_pop_free(sk, X509_free);
       tls_verdict_fail(r, code);
       return;
     }
-    if (!check_identity(r)) return;
+    int named = check_identity(r, sk_X509_value(sk, 0));
+    sk_X509_pop_free(sk, X509_free);
+    if (!named) return;
     write_head(r);
     r->state = ST_HEAD;
   }

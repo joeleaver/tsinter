@@ -15,8 +15,9 @@
  * wn_fetch.c). A module importing anything else refuses to build on this
  * lane, naming the import: a LinkError's moment, moved to build time, never
  * a stub that fails late. The TLS and fetch units link only into a module
- * that imports tlsCall / fetch, with the vendored mbedTLS archive (and, for
- * fetch, the vendored zlib) behind them. */
+ * that imports tlsCall / fetch, with Node's OpenSSL (the trust stores and
+ * the verdict; backend/openssl-build.ts) and the vendored mbedTLS archive
+ * (the handshake) behind them (and, for fetch, the vendored zlib). */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
@@ -24,7 +25,7 @@ import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { type CcDriver, ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
-import { ensureOpensslArchive } from "./openssl-build.js";
+import { ensureOpensslArchive, opensslIncludeArgs, opensslTargetFor, opensslTreeDigest } from "./openssl-build.js";
 import {
   IMPORT_CHDIR,
   IMPORT_CP_CALL,
@@ -110,11 +111,15 @@ const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c", "wn_ev.c", "wn_cp.c
 const OPTIONAL_UNITS: readonly { obj: string; needs: RegExp }[] = [
   { obj: "wn_tls.o", needs: /\bhost_tlsCall\(/ },
   { obj: "wn_fetch.o", needs: /\bhost_fetch\(/ },
-  // the trust stores both use (Node's bundled roots: ensureRootsObject)
+  // Node's OpenSSL start-up and trust stores (its bundled roots:
+  // ensureRootsObject), shared by both
   { obj: "wn_trust.o", needs: /\bhost_(tlsCall|fetch)\(/ },
-  // OpenSSL's verification of a peer's chain and Node's name check
-  { obj: "wn_x509.o", needs: /\bhost_(tlsCall|fetch)\(/ },
+  // Node's words for a verdict and its name check (fetch)
+  { obj: "wn_x509.o", needs: /\bhost_fetch\(/ },
 ];
+/** The units that call Node's OpenSSL: compiled with its headers and the
+ * scr_ossl_ prefix header force-included (opensslIncludeArgs). */
+const OPENSSL_UNITS = new Set(["wn_tls.c", "wn_fetch.c", "wn_trust.c", "wn_x509.c"]);
 /** Everything the runner's objects and the translation include. */
 const RUNNER_INPUTS = [
   "wasmnative/wn_rt.h",
@@ -126,6 +131,7 @@ const RUNNER_INPUTS = [
   ...RUNNER_SOURCES.map((s) => `wasmnative/${s}`),
   "scr_zone_names.h",
   "scr_zlib_prefix.h",
+  "scr_ossl_prefix.h",
 ];
 
 let inputsHashMemo: Promise<string> | null = null;
@@ -227,9 +233,13 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
     .update([...cflags(sanitize), ...driver.targetArgs].join("\x1f"))
     .update("\0")
     .update(await ccVersion())
+    .update("\0")
+    // the OpenSSL headers the TLS units compile against
+    .update(await opensslTreeDigest())
     .digest("hex")
     .slice(0, 16);
   const dir = join(cacheRoot, `wasmnative-${key}-${flavor}`);
+  const ossl = opensslIncludeArgs(opensslTargetFor(driver));
   const objs = RUNNER_SOURCES.map((s) => join(dir, s.replace(/\.c$/, ".o")));
   if ((await Promise.all(objs.map((o) => isWholeElf(o, false)))).every(Boolean)) return objs;
   await mkdir(cacheRoot, { recursive: true });
@@ -244,6 +254,7 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
           `-I${join(runtimeSrcDir(), "..", "vendor", "mbedtls", "include")}`,
           `-I${join(runtimeSrcDir(), "..", "vendor", "zlib-chromium")}`,
           `-I${runtimeSrcDir()}`,
+          ...(OPENSSL_UNITS.has(s) ? ossl : []),
           "-c",
           join(wasmNativeRuntimeDir(), s),
           "-o",
@@ -413,9 +424,8 @@ async function ensureWnTlsArchive(driver: CcDriver): Promise<string> {
 }
 
 /** Node's own OpenSSL (vendor/openssl, backend/openssl-build.ts) built for
- * this lane: the archive the host's TLS and X.509 move onto (design units
- * O2/O3). Unit O1 builds and smoke-tests it (test/openssl-vendor.test.ts);
- * nothing links it yet — the host still runs on mbedTLS above. */
+ * this lane: the host's trust stores and verdict (unit O2; the handshake
+ * moves onto it in O3). test/openssl-vendor.test.ts smoke-tests it. */
 export function wasmNativeOpensslArchive(): Promise<string> {
   const driver = resolveCc();
   if (driver.target !== null) throw new Error("the wasm-native lane does not cross-compile yet (SCRIPTC_TARGET is set)");
@@ -449,11 +459,12 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
     const opt = OPTIONAL_UNITS.find((u) => o.endsWith(`/${u.obj}`));
     return opt === undefined || wanted.has(opt.obj);
   });
-  // the TLS engine: the vendored mbedTLS archive (built once, cached; the
-  // plain flavor — its objects carry no sanitizer runtime)
+  // the TLS engine: the vendored mbedTLS archive and Node's OpenSSL (built
+  // once, cached; the plain flavor — their objects carry no sanitizer
+  // runtime)
   const libs = [
     ...(wanted.has("wn_trust.o") ? [await ensureRootsObject()] : []),
-    ...(wanted.has("wn_tls.o") || wanted.has("wn_fetch.o") ? [await ensureWnTlsArchive(driver)] : []),
+    ...(wanted.has("wn_tls.o") || wanted.has("wn_fetch.o") ? [await ensureWnTlsArchive(driver), await wasmNativeOpensslArchive()] : []),
     // fetch's content decoding: the vendored zlib Node bundles
     ...(wanted.has("wn_fetch.o") ? await ensureZlibObjects(false, driver) : []),
     // the response parser: undici's own llhttp (ensureLlhttpObject)
@@ -482,8 +493,12 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
       .update("\0")
       .update(cflags(opts.sanitize).join("\x1f"))
       .update("\0")
-      // the generated units it links (by what they are made from)
+      // the generated units it links (by what they are made from) and the
+      // vendored archives (their cache directories are named by their
+      // recipes)
       .update(`${TLS_ROOTS_SHA256} ${UNDICI_LLHTTP_SHA256}`)
+      .update("\0")
+      .update(libs.map((l) => l.split("/").slice(-2).join("/")).join("\x1f"))
       .update("\0")
       .update(await readFile(opts.cPath))
       .digest("hex");

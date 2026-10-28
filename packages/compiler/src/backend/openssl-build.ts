@@ -214,6 +214,14 @@ function archiver(driver: CcDriver): Promise<string[]> {
 
 const ARCHIVE = "libnodessl.a";
 
+/** Where Node's build sees the vendored tree: gyp compiles from out/Release
+ * with deps/openssl/... named relatively, so __FILE__ — which OpenSSL's
+ * error records carry (ERR_print_errors' "file:line" field, the tail of a
+ * TLS error's message) — reads "../deps/openssl/openssl/ssl/...". Every TU
+ * is compiled with the vendored directory mapped onto that prefix, so an
+ * error record names the file exactly as Node's does. */
+const FILE_MAP = "../deps/openssl/";
+
 async function digestOf(p: string): Promise<string> {
   const b = await readFile(p);
   return `${b.length} ${createHash("sha256").update(b).digest("hex")}`;
@@ -283,7 +291,7 @@ export interface OpensslBuildOptions {
 /** The cache directory's key for this recipe. */
 export async function opensslRecipeKey(driver: CcDriver, target: OpensslTarget, prefix: boolean): Promise<string> {
   const h = createHash("sha256");
-  h.update(`recipe 3\0${target}\0`);
+  h.update(`recipe 4\0${target}\0${FILE_MAP}\0`);
   h.update([...opensslCflags(driver, target), ...opensslDefines(target), ...opensslIncludeDirs(target).map((d) => d.slice(vendorOpensslDir().length))].join("\x1f")).update("\0");
   h.update(prefix ? await readFile(opensslPrefixHeader()) : "raw").update("\0");
   h.update(driver.argv.join(" ")).update("\0").update(await compilerVersion(driver)).update("\0");
@@ -309,7 +317,7 @@ export async function ensureOpensslArchive(driver: CcDriver, opts: OpensslBuildO
   try {
     const v = vendorOpensslDir();
     const cflags = opensslCflags(driver, target);
-    const flags = [...cflags, ...opensslDefines(target), ...opensslIncludeDirs(target).flatMap((d) => ["-I", d])];
+    const flags = [...cflags, `-fmacro-prefix-map=${v}/=${FILE_MAP}`, ...opensslDefines(target), ...opensslIncludeDirs(target).flatMap((d) => ["-I", d])];
     // the IR's codegen half: the same optimisation level and codegen
     // options (the frontend half already fixed visibility, PIC level and
     // the language)

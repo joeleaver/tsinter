@@ -63,6 +63,9 @@ void host_setup(int argc, char **argv) {
   g_argv = argv;
   clock_gettime(CLOCK_MONOTONIC, &t_start);
 }
+/* the invocation's argv[0], as a native process names itself in a
+ * start-up error (wn_trust.c) */
+const char *wn_host_argv0(void) { return g_argc > 0 && g_argv[0] ? g_argv[0] : "scriptc"; }
 
 /* ── growable byte buffer ─────────────────────────────────────────────── */
 typedef struct {

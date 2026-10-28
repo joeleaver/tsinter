@@ -1,13 +1,17 @@
 /* The native runner's TLS engine (native-runner phase N1): abi.ts's
  * `tlsCall` over vendored mbedTLS 3.6 — the same engine the native lane's
- * scr_tls.c uses, recut to the contract's facts-only shape. Every Node
- * behaviour (options, events, socket.authorized, the verification codes'
- * texts, the host-name check, the CA store's strings) is the module's
- * (tls.ts, tls-x509.ts); the host keeps contexts (trust, certificate,
- * key), secures an open netCall socket, VERIFIES the peer's chain and
- * REPORTS the result in OpenSSL's X509_V_ERR numbering — it never fails a
- * handshake over it, never checks a name, never asks a client for a
- * certificate.
+ * scr_tls.c uses, recut to the contract's facts-only shape — with the
+ * trust and the verdict on Node's own OpenSSL (OpenSSL unit O2: each
+ * context is a Node SecureContext, an SSL_CTX built as Node builds one,
+ * whose store is Node's — wn_trust.c — and the peer's chain is judged by
+ * OpenSSL's X509_verify_cert exactly as OpenSSL's handshake judges it).
+ * Every Node behaviour (options, events, socket.authorized, the
+ * verification codes' texts, the host-name check, the CA store's strings)
+ * is the module's (tls.ts, tls-x509.ts); the host keeps contexts (trust,
+ * certificate, key), secures an open netCall socket, VERIFIES the peer's
+ * chain and REPORTS the result in OpenSSL's X509_V_ERR numbering — it
+ * never fails a handshake over it, never checks a name, never asks a
+ * client for a certificate.
  *
  * A secured socket keeps wn_net.c's descriptor, outbound buffer and read
  * gating (WnTlsOps): the engine reads the descriptor from SECURE on
@@ -36,10 +40,14 @@
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
 
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
 #include "wn_host.h"
 #include "wn_net.h"
 #include "wn_trust.h"
-#include "wn_x509.h"
 
 enum { EV_DATA = 3, EV_EOF = 4, EV_READ_ERROR = 5, EV_SECURE = 10, EV_TLS_ERROR = 11 };
 
@@ -60,9 +68,7 @@ static void rng_init(void) {
 
 /* ── contexts ─────────────────────────────────────────────────────────── */
 typedef struct {
-  int roots;
-  mbedtls_x509_crt ca;
-  int has_ca;
+  SSL_CTX *sc; /* Node's SecureContext: the trust (its store) */
   mbedtls_x509_crt cert;
   int has_cert;
   mbedtls_pk_context key;
@@ -70,6 +76,12 @@ typedef struct {
 } Ctx;
 static Ctx **ctxs;
 static int n_ctxs;
+
+/* NoPasswordCallback: never a prompt */
+static int no_password(char *buf, int size, int rwflag, void *u) {
+  (void)buf, (void)size, (void)rwflag, (void)u;
+  return 0;
+}
 
 /* a material failure: -1, the message's run then the code's run at ptr */
 static int32_t fail(uint32_t ptr, const char *msg, const char *code) {
@@ -99,7 +111,7 @@ static int pair_ok(Ctx *c) {
 typedef struct {
   mbedtls_ssl_config conf;
   mbedtls_ssl_context ssl;
-  mbedtls_x509_crt chain; /* the client's trust: roots and added CAs */
+  SSL_CTX *sc; /* the context's trust */
   int server;
   int handshaken, dead, notify;
   /* the raw side read as libuv's uv__read reads it: 64 KiB at a time, at
@@ -159,9 +171,28 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
 }
 
 /* the verdict on the peer's chain in OpenSSL's X509_V_ERR numbers (abi.ts
- * tlsCall): OpenSSL's own checks, transcribed (wn_x509.c) — the engine
- * carries the handshake only */
-static uint32_t verify_code(Tls *t) { return (uint32_t)wn_x509_verify(mbedtls_ssl_get_peer_cert(&t->ssl), &t->chain); }
+ * tlsCall): OpenSSL's, over the chain as the peer sent it, against the
+ * context's store (wn_trust.c) — the engine carries the handshake only. A
+ * certificate OpenSSL cannot decode is no verdict it could reach:
+ * UNSPECIFIED (OpenSSL's handshake fails on it; unit O3) */
+static uint32_t verify_code(Tls *t) {
+  STACK_OF(X509) *sk = sk_X509_new_null();
+  if (!sk) abort();
+  long code = 0;
+  for (const mbedtls_x509_crt *c = mbedtls_ssl_get_peer_cert(&t->ssl); c && c->raw.p; c = c->next) {
+    const unsigned char *p = c->raw.p;
+    X509 *x = d2i_X509(NULL, &p, (long)c->raw.len);
+    if (!x || p != c->raw.p + c->raw.len) {
+      X509_free(x);
+      code = X509_V_ERR_UNSPECIFIED;
+      break;
+    }
+    sk_X509_push(sk, x);
+  }
+  if (code == 0) code = sk_X509_num(sk) ? wn_ossl_verify_chain(t->sc, sk) : X509_V_ERR_UNSPECIFIED;
+  sk_X509_pop_free(sk, X509_free);
+  return (uint32_t)code;
+}
 
 /* an engine failure as OpenSSL would name it (the nearest text) */
 static void tls_error(WnSock *s, int r) {
@@ -351,7 +382,6 @@ static void t_free(WnSock *s) {
   if (!t) return;
   mbedtls_ssl_free(&t->ssl);
   mbedtls_ssl_config_free(&t->conf);
-  mbedtls_x509_crt_free(&t->chain);
   free(t->rbuf);
   wn_buf_free(&t->wp);
   free(t);
@@ -378,7 +408,6 @@ static int32_t secure(uint32_t ptr, int32_t h) {
   t->server = mode == 1;
   mbedtls_ssl_config_init(&t->conf);
   mbedtls_ssl_init(&t->ssl);
-  mbedtls_x509_crt_init(&t->chain);
   if (mbedtls_ssl_config_defaults(&t->conf, t->server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
                                   MBEDTLS_SSL_PRESET_DEFAULT) != 0)
     wn_host_fail("tlsCall: the engine refused its default configuration");
@@ -388,11 +417,10 @@ static int32_t secure(uint32_t ptr, int32_t h) {
     if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
   } else {
     /* the verdict is recorded, never enforced (Node's verify callback
-     * accepts; the module decides): judged after the handshake, by
-     * wn_x509.c against this trust */
+     * accepts; the module decides): judged after the handshake against
+     * the context's store */
     mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
-    if (c->roots) chain_add(&t->chain, wn_trust_default());
-    if (c->has_ca) chain_add(&t->chain, &c->ca);
+    t->sc = c->sc;
     if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
   }
   if (mbedtls_ssl_setup(&t->ssl, &t->conf) != 0) wn_host_fail("tlsCall: the engine could not set up a session");
@@ -407,20 +435,20 @@ static int32_t secure(uint32_t ptr, int32_t h) {
   return 0;
 }
 
-/* CA_STORE: 'system' (1) or 'extra' (2, NODE_EXTRA_CA_CERTS) as DER blobs */
+/* CA_STORE: 'system' (1) or 'extra' (2, NODE_EXTRA_CA_CERTS) as DER blobs,
+ * Node's loaded certificates in its order */
 static int32_t ca_store(uint32_t ptr, uint32_t cap, int32_t which) {
-  mbedtls_x509_crt chain;
-  mbedtls_x509_crt_init(&chain);
-  chain_add(&chain, which == 1 ? wn_trust_system() : wn_trust_extra());
+  size_t count = 0;
+  X509 *const *v = which == 1 ? wn_trust_system(&count) : wn_trust_extra(&count);
   WnBuf b = {0};
-  uint32_t count = 0;
-  wn_buf_u32(&b, 0);
-  for (const mbedtls_x509_crt *c = &chain; c && c->raw.p; c = c->next) {
-    wn_buf_blob(&b, c->raw.p, c->raw.len);
-    count++;
+  wn_buf_u32(&b, (uint32_t)count);
+  for (size_t i = 0; i < count; i++) {
+    unsigned char *der = NULL;
+    int len = i2d_X509(v[i], &der);
+    if (len < 0) wn_host_fail("tlsCall: a store certificate could not be encoded");
+    wn_buf_blob(&b, der, (size_t)len);
+    OPENSSL_free(der);
   }
-  memcpy(b.p, &count, 4);
-  mbedtls_x509_crt_free(&chain);
   int32_t n = (int32_t)b.n;
   if (b.n > cap) {
     wn_buf_free(&b);
@@ -445,7 +473,7 @@ int32_t host_tlsCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
     case 1: { /* CTX_NEW */
       Ctx *c = calloc(1, sizeof *c);
       if (!c) abort();
-      mbedtls_x509_crt_init(&c->ca);
+      c->sc = wn_ossl_ctx_new();
       mbedtls_x509_crt_init(&c->cert);
       mbedtls_pk_init(&c->key);
       ctxs = realloc(ctxs, sizeof *ctxs * (size_t)(n_ctxs + 1));
@@ -455,7 +483,7 @@ int32_t host_tlsCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
     }
     case 2: { /* CTX_ROOTS */
       if (h < 1 || h > n_ctxs) wn_host_fail("tlsCall: CTX_ROOTS of a handle that is not a context");
-      ctxs[h - 1]->roots = 1;
+      wn_ossl_ctx_roots(ctxs[h - 1]->sc);
       return 0;
     }
     case 3:
@@ -467,9 +495,19 @@ int32_t host_tlsCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
       unsigned char *pem = blob_pem(P, &n);
       int32_t ans = 0;
       if (op == 3) {
-        /* Node keeps what parses and ignores the rest */
-        mbedtls_x509_crt_parse(&c->ca, pem, n);
-        c->has_ca = c->ca.raw.p != NULL;
+        /* SecureContext::SetCACert: every certificate PEM_read_bio_X509_AUX
+         * reads, into the context's own store and its client CA list;
+         * what does not parse ends the read, silently */
+        BIO *bio = BIO_new_mem_buf(pem, (int)(n - 1));
+        if (!bio) abort();
+        X509 *x;
+        while ((x = PEM_read_bio_X509_AUX(bio, NULL, no_password, NULL)) != NULL) {
+          if (X509_STORE_add_cert(wn_ossl_ctx_own_store(c->sc), x) != 1 || SSL_CTX_add_client_CA(c->sc, x) != 1)
+            wn_host_fail("tlsCall: CTX_ADD_CA could not add a certificate");
+          X509_free(x);
+        }
+        BIO_free(bio);
+        ERR_clear_error();
       } else if (op == 4) {
         mbedtls_x509_crt add;
         mbedtls_x509_crt_init(&add);
