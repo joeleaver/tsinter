@@ -229,6 +229,121 @@ function argumentsCountIsStatic(L: Lowerer, fn: ts.FunctionLikeDeclaration): boo
   return !escapes;
 }
 
+/** The IDENTITY uses a builtin global's token may meet (GH #74). A
+ * JavaScript source's stdlib global (or builtin-module member) taken as a
+ * value has no runtime object here — it lowers to an interned string
+ * naming it, which answers exactly where only identity and truthiness are
+ * observed:
+ *  - an operand of ===, !==, ==, != (one global, one token);
+ *  - the operand of `!`, or the condition of an if / while / do / for /
+ *    `?:` (a token, like the object, is always truthy);
+ *  - the argument of a membership query — `.has(t)`, `.includes(t)`,
+ *    `.indexOf(t)`, `.lastIndexOf(t)`, `.delete(t)` — or of `.add(t)` on
+ *    a token-safe Set binding;
+ *  - an element of the array literal that seeds a token-safe Set binding
+ *    (`const known = new Set([setTimeout, ...])` — the harness's
+ *    knownGlobals idiom);
+ *  - the initializer of a `const` whose every reference is one of these;
+ *  - the source of an object destructuring (stdlibGlobalTokenDestructure
+ *    checks its own bindings);
+ *  - at depth 0 only (the global's own spelling), the receiver of a member
+ *    access: the member lowerings and their fences own that.
+ * A token-safe Set binding is a `const` initialized by `new Set(...)`
+ * whose every reference is the receiver of `.has` / `.add` / `.delete` /
+ * `.clear` or a `.size` read — its tokens never come back out. Anything
+ * else (an argument to a user function, a typeof the fold did not claim,
+ * a stored or returned value, string conversion, iteration) would observe
+ * the string carrier where Node has the object. */
+export function builtinTokenUseOk(L: Lowerer, node: ts.Node, depth = 0): boolean {
+  if (depth > 4) return false;
+  let outer: ts.Node = node;
+  while (outer.parent !== undefined && ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+  const p = outer.parent;
+  if (p === undefined) return false;
+  if (ts.isBinaryExpression(p)) {
+    const op = p.operatorToken.kind;
+    return (
+      op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
+      op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsToken
+    );
+  }
+  if (ts.isPrefixUnaryExpression(p)) return p.operator === ts.SyntaxKind.ExclamationToken;
+  if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && p.expression === outer) return true;
+  if (ts.isForStatement(p) && p.condition === outer) return true;
+  if (ts.isConditionalExpression(p) && p.condition === outer) return true;
+  if (ts.isCallExpression(p) && p.arguments.length === 1 && p.arguments[0] === outer && ts.isPropertyAccessExpression(p.expression)) {
+    const m = p.expression.name.text;
+    if (m === "has" || m === "includes" || m === "indexOf" || m === "lastIndexOf" || m === "delete") return true;
+    if (m === "add") return tokenSafeSetBinding(L, p.expression.expression);
+    return false;
+  }
+  if (ts.isArrayLiteralExpression(p)) {
+    let arr: ts.Node = p;
+    while (arr.parent !== undefined && ts.isParenthesizedExpression(arr.parent)) arr = arr.parent;
+    const ne = arr.parent;
+    if (ne === undefined || !ts.isNewExpression(ne) || ne.arguments?.length !== 1 || ne.arguments[0] !== arr) return false;
+    if (!ts.isIdentifier(ne.expression) || !L.isStdlibGlobal(ne.expression, "Set")) return false;
+    const decl = ne.parent;
+    return decl !== undefined && ts.isVariableDeclaration(decl) && decl.initializer === ne && ts.isIdentifier(decl.name) &&
+      tokenSafeSetBinding(L, decl.name);
+  }
+  if (ts.isVariableDeclaration(p) && p.initializer === outer) {
+    if (ts.isObjectBindingPattern(p.name)) return true;
+    if (!ts.isIdentifier(p.name) || (ts.getCombinedNodeFlags(p) & ts.NodeFlags.Const) === 0) return false;
+    return everyLocalRef(L, p.name, (r) => builtinTokenUseOk(L, r, depth + 1));
+  }
+  if (depth === 0 && (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === outer) return true;
+  return false;
+}
+
+/** Every reference to the binding `name` declares (in its own file) meets
+ * `ok`; false when the binding has no symbol. */
+function everyLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): boolean {
+  const sym = L.checker.getSymbolAtLocation(name);
+  if (!sym) return false;
+  let good = true;
+  ts.walkPreorder(name.getSourceFile(), (n) => {
+    if (!good) return "stop";
+    if (ts.isIdentifier(n) && n !== name && n.text === name.text) {
+      const s = ts.isShorthandPropertyAssignment(n.parent) ? L.checker.getShorthandAssignmentValueSymbol(n.parent) : L.checker.getSymbolAtLocation(n);
+      if (s === sym && !ok(n)) good = false;
+    }
+    return undefined;
+  });
+  return good;
+}
+
+/** `const known = new Set(...)` whose every reference is the receiver of
+ * `.has` / `.add` / `.delete` / `.clear`, or a `.size` read: a Set whose
+ * elements never come back out (builtinTokenUseOk). */
+function tokenSafeSetBinding(L: Lowerer, recv: ts.Expression): boolean {
+  if (!ts.isIdentifier(recv)) return false;
+  const sym = L.checker.getSymbolAtLocation(recv);
+  const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (decl === undefined || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name)) return false;
+  if ((ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const) === 0) return false;
+  let init = decl.initializer;
+  while (init !== undefined && ts.isParenthesizedExpression(init)) init = init.expression;
+  if (init === undefined || !ts.isNewExpression(init) || !ts.isIdentifier(init.expression) || !L.isStdlibGlobal(init.expression, "Set")) return false;
+  return everyLocalRef(L, decl.name, (r) => {
+    const p = r.parent;
+    if (!ts.isPropertyAccessExpression(p) || p.expression !== r) return false;
+    const m = p.name.text;
+    if (m === "size") return true;
+    return (m === "has" || m === "add" || m === "delete" || m === "clear") && ts.isCallExpression(p.parent) && p.parent.expression === p;
+  });
+}
+
+/** builtinTokenUseOk or a named refusal (GH #74). */
+function requireBuiltinTokenUse(L: Lowerer, expr: ts.Expression, name: string): void {
+  if (builtinTokenUseOk(L, expr)) return;
+  L.unsupported(
+    "SC1090",
+    expr,
+    `the builtin '${name}' used as a value (it has no runtime object here — identity comparisons, truthiness and Set membership tests lower; read and call its members directly)`,
+  );
+}
+
 export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     if (lowerExprDepth >= LOWER_EXPR_MAX_DEPTH) {
       L.unsupported("SC1090", expr, `expressions nested deeper than ${LOWER_EXPR_MAX_DEPTH} levels`);
@@ -870,6 +985,36 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           }
         }
       }
+      // `typeof Math` / `typeof process` / `typeof globalThis.console`
+      // (any spelling of a stdlib global, aliases included) whose declared
+      // type is a non-callable OBJECT type: "object", before the operand
+      // lowers — a JavaScript source's operand would otherwise be the
+      // identity token's string carrier and answer "string" (GH #74).
+      {
+        let target: ts.Expression = expr.expression;
+        while (ts.isParenthesizedExpression(target)) target = target.expression;
+        if (stdlibGlobalNameOf(L, target) !== null) {
+          const t = L.typeOf(target);
+          if (L.checker.getCallSignatures(t).length > 0 || L.checker.getConstructSignatures(t).length > 0) {
+            return { kind: "strLit", value: "function", type: STRING, loc };
+          }
+          if ((t.flags & ts.TypeFlags.Object) !== 0) {
+            return { kind: "strLit", value: "object", type: STRING, loc };
+          }
+        }
+        // `typeof process.cwd`: a stdlib global's own non-optional METHOD
+        // member is a function in Node; the member itself has no value
+        // form here (its calls lower at call sites only).
+        if (
+          ts.isPropertyAccessExpression(target) &&
+          !target.questionDotToken &&
+          stdlibGlobalNameOf(L, target.expression) !== null &&
+          L.isStdlibMember(target) &&
+          L.checker.getCallSignatures(L.typeOf(target)).length > 0
+        ) {
+          return { kind: "strLit", value: "function", type: STRING, loc };
+        }
+      }
       // Island values ask the engine; static primitives constant-fold to
       // the JS answer (the operand still evaluates — JS evaluates typeof
       // operands too — but primitives here are side-effect-free varRefs/
@@ -1070,9 +1215,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             if (roots) return roots;
           }
           // JavaScript sources: a builtin member taken as a bare VALUE is
-          // the same identity-token story as stdlib globals above (the
-          // harness adds worker_threads.Worker to its identity Set).
+          // the same identity-token story as stdlib globals below (the
+          // harness adds worker_threads.Worker to its identity Set) —
+          // identity uses only (builtinTokenUseOk), anything else refuses.
           if (isJsSourceFile(expr.getSourceFile())) {
+            requireBuiltinTokenUse(L, expr, `${bi.module}.${bi.member}`);
             return { kind: "strLit", value: `[builtin ${bi.module}.${bi.member}]`, type: STRING, loc };
           }
           if (builtinModuleFnOf(L, bi.module, bi.member)) {
@@ -1169,17 +1316,21 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // setInterval, URL, ...). Reaching one that no lowering above
       // claimed is SC2020, never an ICE — EXCEPT in JavaScript sources,
       // where a stdlib global taken as a VALUE (never called through this
-      // path — call sites lower earlier) becomes an opaque IDENTITY TOKEN:
-      // an interned string naming the global. Identity flows (the
-      // harness's knownGlobals Set, === comparisons) are exact — one
-      // global, one token; what a token cannot do (be called, answer
-      // typeof "function") meets per-site fences/divergences, and
-      // SEMANTICS.md documents the stance.
+      // path — call sites lower earlier) whose every use is an IDENTITY
+      // use becomes an opaque IDENTITY TOKEN: an interned string naming
+      // the global. The identity uses (builtinTokenUseOk: ===/!==, `!`
+      // and conditions, Set/array membership queries, the harness's
+      // knownGlobals Set) are exact — one global, one token, always
+      // truthy. Anything else would observe the string carrier where Node
+      // has the object (typeof "string", a callee's member reads — GH
+      // #74), so it refuses by name: no runtime object exists for the
+      // global here.
       {
         const sym = L.checker.getSymbolAtLocation(expr);
         if (L.isStdlibSymbol(sym) || expr.text === "globalThis") {
           if (isJsSourceFile(expr.getSourceFile())) {
             const canonical = stdlibGlobalNameOf(L, expr) ?? expr.text;
+            requireBuiltinTokenUse(L, expr, canonical);
             return { kind: "strLit", value: `[builtin ${canonical}]`, type: STRING, loc };
           }
           // The families with a WHY: each hint states what makes the
@@ -1897,6 +2048,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       ) {
         const canonical = stdlibGlobalNameOf(L, expr);
         if (canonical !== null) {
+          requireBuiltinTokenUse(L, expr, canonical);
           return { kind: "strLit", value: `[builtin ${canonical}]`, type: STRING, loc };
         }
       }
@@ -4311,7 +4463,11 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         // in an export aggregate): the slot takes a boxed fence closure —
         // the diagnostics defer to the runtime-fence ledger, the object
         // builds, and only USING the member stops the run.
-        const pureMember = ts.isIdentifier(valueExpr);
+        // A builtin global's refused value (GH #74: `{ m: Math }` has no
+        // object to hold) keeps the statement's fence: a fence CLOSURE in
+        // the slot would answer typeof "function" and print as one where
+        // Node has the object.
+        const pureMember = ts.isIdentifier(valueExpr) && stdlibGlobalNameOf(L, valueExpr) === null && L.builtinImportOf(valueExpr) === null;
         if (
           !(err instanceof PoisonError) ||
           !pureMember ||

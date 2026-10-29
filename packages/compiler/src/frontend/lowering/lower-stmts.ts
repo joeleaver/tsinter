@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, aliasTypeofNarrows, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -2005,9 +2005,9 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
    * surface, so a token binding trades the eager pattern fence for the
    * per-site token rules and loses nothing. Globals with REAL member
    * surfaces (Math.max, JSON.stringify, process.env, console.log) stay
-   * OUT: their detached members would ride the token's quiet
-   * own-property-undefined reads where the property spelling works, so
-   * those patterns keep an eager fence naming the global. `console` is
+   * OUT: their detached members are real functions in Node, which a
+   * token is not, so those patterns keep an eager fence naming the
+   * global. `console` is
    * the one split surface: its five CALL members fence by name, while
    * the rest (`Console` — the suite's constructor-identity probe) have
    * no surface to lose and bind tokens. */
@@ -2030,11 +2030,12 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
    * answers, AND registers in stdlibGlobalAliases — the destructured
    * twin of stdlibGlobalAliasDecl — so receiver-position uses resolve
    * through every surface exactly like the bare global (`const { Math }
-   * = globalThis; Math.max(...)` is Math.max). What a token cannot do
-   * meets the per-site rules lazily at each USE — member reads answer
-   * the wrapper's own-property undefined, calls throw Node-shaped
-   * is-not-a-function TypeErrors — at the use's own line, where the
-   * pattern-level fence killed the program at the destructure.
+   * = globalThis; Math.max(...)` is Math.max). A token is a string
+   * carrier, not the object, so every USE of a token binding must be an
+   * identity use (builtinTokenUseOk — comparisons, truthiness, Set
+   * membership; an alias binding's member accesses route through the
+   * global's surfaces instead); any other use refuses by name at the
+   * destructure (GH #74), never reading the carrier.
    *
    * Everything this rule does NOT claim over a stdlib-global source
    * fences HERE, naming the global — never the token's carrier string
@@ -2045,6 +2046,23 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
    * pre-registered bindings whose slots no token can inhabit. Null only
    * when the source is not a stdlib global at all, or in TypeScript
    * files (the identifier chokepoint fences the global there first). */
+  /** The first reference to the binding `name` declares (in its own
+   * file) that fails `ok`, or null. */
+  function findLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): ts.Identifier | null {
+    const sym = L.checker.getSymbolAtLocation(name);
+    if (!sym) return name;
+    let bad: ts.Identifier | null = null;
+    ts.walkPreorder(name.getSourceFile(), (n) => {
+      if (bad !== null) return "stop";
+      if (ts.isIdentifier(n) && n !== name && n.text === name.text) {
+        const s = ts.isShorthandPropertyAssignment(n.parent) ? L.checker.getShorthandAssignmentValueSymbol(n.parent) : L.checker.getSymbolAtLocation(n);
+        if (s === sym && !ok(n)) bad = n;
+      }
+      return undefined;
+    });
+    return bad;
+  }
+
   function stdlibGlobalTokenDestructure(L: Lowerer, decl: ts.VariableDeclaration, isLet: boolean): IrStmt[] | null {
     if (decl.initializer === undefined || !isJsSourceFile(decl.getSourceFile())) return null;
     const globalName = stdlibGlobalNameOf(L, decl.initializer);
@@ -2106,6 +2124,28 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       const symbol = L.checker.getSymbolAtLocation(el.name);
       if (!symbol || L.tdzPredeclared.has(symbol)) {
         L.unsupported("SC1031", el, `bindings with predeclared slots over the builtin global '${globalName}'`);
+      }
+      // The binding holds the TOKEN: every use must be an identity use
+      // (builtinTokenUseOk — GH #74); an alias binding's member accesses
+      // route through the global's own surfaces and never read it.
+      {
+        const bound = el.name;
+        const isAlias = alias !== null;
+        const bad = findLocalRef(L, bound, (r) => {
+          if (builtinTokenUseOk(L, r, 1)) return true;
+          if (!isAlias) return false;
+          let o: ts.Node = r;
+          while (o.parent !== undefined && ts.isParenthesizedExpression(o.parent)) o = o.parent;
+          const rp = o.parent;
+          return rp !== undefined && (ts.isPropertyAccessExpression(rp) || ts.isElementAccessExpression(rp)) && rp.expression === o;
+        });
+        if (bad !== null) {
+          L.unsupported(
+            "SC1090",
+            bad,
+            `the builtin '${alias ?? `${globalName}.${propName}`}' used as a value through the binding '${bound.text}' (it has no runtime object here — identity comparisons, truthiness and Set membership tests lower; read and call its members directly)`,
+          );
+        }
       }
       const g = L.globalsBySymbol.get(symbol);
       if (g !== undefined && g.type.kind !== "string" && g.type.kind !== "dyn") {
