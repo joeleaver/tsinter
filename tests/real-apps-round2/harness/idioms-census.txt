@@ -1,0 +1,105 @@
+ 1. [7 apps, 64 sites] method calls / member reads on any/unknown receivers in JS
+     {'semver': 35, 'papaparse': 14, 'chess.js': 4, 'expr-eval': 4, 'marked(npm)': 4, 'marked(src)': 2, 'jsdiff': 1}
+       e.g. pgn.js:312 var peg$f4 = function(comment, moves) { return lineToTree(rootNode(comment), ...moves.flat
+       e.g. pgn.js:112 var filler = peg$padEnd("", offset_s.line.toString().length, ' ');
+       e.g. pgn.js:158 return ch.charCodeAt(0).toString(16).toUpperCase();
+ 2. [7 apps, 41 sites] stdlib members with no lowering (reverse, splice/3, split limit, substr, toString(radix), JSON.stringify replacer, Set<any>, defineProperty, fromEntries, flat, parseFloat/isFinite on any, globalThis, RegExp(dynamic))
+     {'papaparse': 20, 'expr-eval': 6, 'smol-toml': 4, 'semver': 4, 'chess.js': 3, 'jsdiff': 3, 'marked(src)': 1}
+       e.g. pgn.js:309 var peg$f1 = function(tagPairs) { return Object.fromEntries(tagPairs) };
+       e.g. pgn.js:169 .replace(/[\x00-\x0F]/g,          function(ch) { return "\\x0" + hex(ch); })
+       e.g. pgn.js:183 .replace(/[\x00-\x0F]/g,          function(ch) { return "\\x0" + hex(ch); })
+ 3. [6 apps, 71 sites] writes/updates through untyped or nested receivers (o.a.b = v, o[k] = v, o.n++, this.a.b |= v)
+     {'chess.js': 31, 'marked(npm)': 20, 'semver': 12, 'papaparse': 6, 'marked(src)': 1, 'jsdiff': 1}
+       e.g. pgn.js:77 self.expected = expected;
+       e.g. pgn.js:78 self.found = found;
+       e.g. pgn.js:79 self.location = location;
+ 4. [6 apps, 36 sites] types with no static representation: option bags (fn|record unions, A & B intersections, Partial<>), any-typed members, recursive Record<string, unknown>
+     {'marked(src)': 13, 'semver': 11, 'smol-toml': 5, 'jsdiff': 5, 'papaparse': 1, 'marked(npm)': 1}
+       e.g. index.ts:44 export default { parse, stringify, TomlDate, TomlError }
+       e.g. stringify.ts:57 function isArrayOfTables(obj: any[]) {
+       e.g. main.ts:22 else if (k === "object") for (const x of Object.values(v as Record<string, unknown>)) coun
+ 5. [5 apps, 42 sites] operators on any-typed values (|, >>>, ===, +=, x-- > 0, comparisons) in JS
+     {'expr-eval': 17, 'semver': 16, 'chess.js': 4, 'papaparse': 4, 'polka': 1}
+       e.g. pgn.js:90 padString += padString.repeat(targetLength);
+       e.g. pgn.js:319 var peg$currPos = options.peg$currPos | 0;
+       e.g. pgn.js:324 var peg$silentFails = options.peg$silentFails | 0;
+ 6. [5 apps, 11 sites] Function.prototype.call/bind/apply and `arguments` on compiled functions
+     {'papaparse': 6, 'expr-eval': 2, 'chess.js': 1, 'polka': 1, 'marked(npm)': 1}
+       e.g. pgn.js:72 var self = Error.call(this, message);
+       e.g. papaparse.js:430 replaceConfig.call(this, config);
+       e.g. papaparse.js:546 ChunkStreamer.call(this, config);
+ 7. [5 apps, 11 sites] builtin globals / Math methods / string methods as values (#84)
+     {'marked(src)': 5, 'expr-eval': 3, 'chess.js': 1, 'smol-toml': 1, 'papaparse': 1}
+       e.g. pgn.js:84 peg$subclass(peg$SyntaxError, Error);
+       e.g. stringify.ts:30 let HAS_WELLFORMED = !!(''.isWellFormed)
+       e.g. papaparse.js:370 if (str.constructor === Date)
+ 8. [4 apps, 143 sites] CommonJS shapes: module.exports = <non-literal>, require() below use (cycle idiom), require() off top level, exports aliasing
+     {'semver': 131, 'marked(src)': 7, 'papaparse': 3, 'expr-eval': 2}
+       e.g. main.mjs:9 console.log(Papa.unparse([["a", "b,c", 'q"uote'], [1, 2.5, "line\nbreak"], [null, true, ""
+       e.g. main.mjs:10 console.log(Papa.unparse({ fields: ["x", "y"], data: [[1, 2], [3, 4]] }, { delimiter: ";",
+       e.g. main.mjs:14 const res = Papa.parse(text, { header, dynamicTyping: args.includes("--dynamic-typing"), s
+ 9. [4 apps, 108 sites] ES5 constructor functions / prototype wiring / props on function objects
+     {'expr-eval': 68, 'papaparse': 19, 'marked(src)': 15, 'chess.js': 6}
+       e.g. pgn.js:67 C.prototype = parent.prototype;
+       e.g. pgn.js:68 child.prototype = new C();
+       e.g. pgn.js:74 if (Object.setPrototypeOf) {
+10. [3 apps, 11 sites] overloads / generic functions as values
+     {'marked(src)': 7, 'jsdiff': 2, 'semver': 2}
+       e.g. marked.ts:152 export const parseInline = marked.parseInline;
+       e.g. marked.ts:153 export const parse = marked;
+       e.g. marked.ts:154 export const parser = _Parser.parse;
+11. [2 apps, 147 sites] `var` read in a hoisted function declared above the var (generated parsers)
+     {'chess.js': 144, 'expr-eval': 3}
+       e.g. pgn.js:484 s0 = peg$currPos;
+       e.g. pgn.js:496 s0 = peg$currPos;
+       e.g. pgn.js:514 s0 = peg$currPos;
+12. [2 apps, 9 sites] generic class hierarchies (subclassing a generic base, overriding inherited generic methods)
+     {'jsdiff': 8, 'polka': 1}
+       e.g. index.js:38 add(method, pattern, ...fns) {
+       e.g. character.ts:4 class CharacterDiff extends Diff<string, string> {}
+       e.g. word.ts:55 class WordDiff extends Diff<string, string> {
+13. [2 apps, 8 sites] typeof/feature-sniffing of undeclared globals (UMD: define, module, exports, self, window, FileReader)
+     {'papaparse': 7, 'expr-eval': 1}
+       e.g. papaparse.js:11 if (typeof define === 'function' && define.amd)
+       e.g. papaparse.js:40 if (typeof self !== 'undefined') { return self; }
+       e.g. papaparse.js:41 if (typeof window !== 'undefined') { return window; }
+14. [2 apps, 6 sites] Date values (new Date, extends Date, instanceof Date)
+     {'smol-toml': 3, 'papaparse': 3}
+       e.g. stringify.ts:37 if (typeof obj.getUTCDate === 'function' && obj instanceof Date) return 'date'
+       e.g. date.ts:39 export class TomlDate extends Date {
+       e.g. main.ts:61 if (e instanceof TomlError) console.log(`TomlError line=${e.line} col=${e.column} ${e.mess
+15. [1 apps, 64 sites] RegExp-valued computed-key object literals (minified marked)
+     {'marked(npm)': 64}
+       e.g. marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedantic:!1,rende
+       e.g. marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedantic:!1,rende
+       e.g. marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedantic:!1,rende
+16. [1 apps, 12 sites] bigint
+     {'chess.js': 12}
+       e.g. chess.ts:30 const MASK64 = 0xffffffffffffffffn
+       e.g. chess.ts:58 const rand = xoroshiro128(0xa187eb39cdcaed8f31c4b365b102e01en)
+       e.g. chess.ts:60 const PIECE_KEYS = Array.from({ length: 2 }, () =>
+17. [1 apps, 3 sites] dynamic import()
+     {'marked(src)': 3}
+       e.g. main.js:27 const { spawn } = await import('child_process');
+       e.g. main.js:28 const { fileURLToPath } = await import('url');
+       e.g. main.js:187 markedConfig = await import(pathToFileURL(configFile).href);
+18. [1 apps, 2 sites] `in` / hasOwnProperty with computed keys
+     {'expr-eval': 2}
+       e.g. bundle.js:77 } else if (type === IVAR && values.hasOwnProperty(item.value)) {
+       e.g. bundle.js:1817 return optionNameMap.hasOwnProperty(op) ? optionNameMap[op] : op;
+19. [1 apps, 2 sites] untyped `const xs = []` (TS evolving array) inferred as number[]
+     {'jsdiff': 2}
+       e.g. create.ts:312 hunks.push(hunk);
+       e.g. create.ts:340 hunks: hunks
+20. [1 apps, 2 sites] fields assigned outside the constructor's top level
+     {'semver': 2}
+       e.g. comparator.js:28 this.value = ''
+       e.g. semver.js:80 this.prerelease = []
+21. [1 apps, 1 sites] typeof on statically typed values / loose ==
+     {'jsdiff': 1}
+       e.g. parse.ts:447 oldLines: typeof chunkHeader[2] === 'undefined' ? 1 : +chunkHeader[2],
+
+UNMATCHED:
+    2 values of type _ run in the embedded dynamic engine, which this build does not include
+    1 rest elements over checked-dynamic sources are not supported yet
+    1 spreading _ into a _ literal (only a same-element-type array spreads) is not supported yet

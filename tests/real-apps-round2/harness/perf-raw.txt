@@ -1,0 +1,59 @@
+node startup rep1 user=0.39 sys=0.04 rss=94516KB
+wn   startup rep1 user=0.00 sys=0.00 rss=3496KB
+node startup rep2 user=0.37 sys=0.04 rss=94232KB
+wn   startup rep2 user=0.00 sys=0.00 rss=3468KB
+node startup rep3 user=0.39 sys=0.04 rss=92904KB
+wn   startup rep3 user=0.00 sys=0.00 rss=3484KB
+node play1 rep1 user=0.89 sys=0.05 rss=99396KB
+wn   play1 rep1 user=0.21 sys=0.03 rss=70728KB
+node play1 rep2 user=0.86 sys=0.07 rss=97180KB
+wn   play1 rep2 user=0.16 sys=0.02 rss=70720KB
+node play1 rep3 user=0.63 sys=0.03 rss=97720KB
+wn   play1 rep3 user=0.15 sys=0.02 rss=70528KB
+node perft5 rep1 user=9.91 sys=0.07 rss=109304KB
+wn   perft5 rep1 user=17.18 sys=0.05 rss=70600KB
+node perft5 rep2 user=9.88 sys=0.09 rss=108760KB
+wn   perft5 rep2 user=18.54 sys=0.08 rss=70564KB
+node perft5 rep3 user=10.32 sys=0.08 rss=109212KB
+wn   perft5 rep3 user=17.66 sys=0.08 rss=70200KB
+node kiwi4 rep1 user=7.22 sys=0.08 rss=110768KB
+wn   kiwi4 rep1 user=14.69 sys=0.09 rss=70296KB
+node kiwi4 rep2 user=7.60 sys=0.07 rss=110068KB
+wn   kiwi4 rep2 user=12.14 sys=0.07 rss=70136KB
+node kiwi4 rep3 user=7.30 sys=0.06 rss=109752KB
+wn   kiwi4 rep3 user=14.16 sys=0.05 rss=70148KB
+node fuzz60 rep1 user=10.26 sys=0.17 rss=126124KB
+wn   fuzz60 rep1 user=15.99 sys=0.06 rss=70924KB
+node fuzz60 rep2 user=9.66 sys=0.13 rss=126160KB
+wn   fuzz60 rep2 user=12.73 sys=0.06 rss=70660KB
+node fuzz60 rep3 user=8.16 sys=0.10 rss=125876KB
+wn   fuzz60 rep3 user=12.40 sys=0.04 rss=70672KB
+node text1500 rep1 user=0.58 sys=0.03 rss=94384KB
+wn   text1500 rep1 user=0.20 sys=0.01 rss=70160KB
+node text1500 rep2 user=0.85 sys=0.05 rss=94088KB
+wn   text1500 rep2 user=0.37 sys=0.04 rss=69948KB
+node text1500 rep3 user=0.98 sys=0.05 rss=96108KB
+wn   text1500 rep3 user=0.44 sys=0.03 rss=70436KB
+node-patched perft5 rep1 user=7.62 sys=0.08 rss=107412KB
+wn-round1    perft5 rep1 user=12.78 sys=0.06 rss=70308KB
+node-patched fuzz60 rep1 user=8.09 sys=0.13 rss=124516KB
+node-patched text1500 rep1 user=0.59 sys=0.03 rss=94508KB
+node-patched perft5 rep2 user=5.58 sys=0.06 rss=107324KB
+wn-round1    perft5 rep2 user=16.31 sys=0.03 rss=70128KB
+node-patched fuzz60 rep2 user=5.09 sys=0.10 rss=127236KB
+node-patched text1500 rep2 user=0.58 sys=0.05 rss=94608KB
+node-patched perft5 rep3 user=5.17 sys=0.05 rss=107400KB
+wn-round1    perft5 rep3 user=15.77 sys=0.07 rss=70128KB
+node-patched fuzz60 rep3 user=5.14 sys=0.10 rss=127552KB
+node-patched text1500 rep3 user=0.52 sys=0.04 rss=96008KB
+round-1 binary output identical
+old perft5 rep1 user=15.52 sys=0.06
+new perft5 rep1 user=16.55 sys=0.06
+old perft5 rep2 user=18.35 sys=0.07
+new perft5 rep2 user=15.66 sys=0.04
+old perft5 rep3 user=13.86 sys=0.04
+new perft5 rep3 user=16.30 sys=0.04
+old perft5 rep4 user=19.22 sys=0.05
+new perft5 rep4 user=14.47 sys=0.05
+old perft5 rep5 user=20.56 sys=0.06
+new perft5 rep5 user=16.61 sys=0.07
