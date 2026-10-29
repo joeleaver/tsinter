@@ -619,6 +619,9 @@ ScrStr *scr_str_pad_end(ScrStr *s, double maxLength, ScrStr *fill);
  * isWellFormed is constant true and toWellFormed the identity (per spec
  * both are no-ops on well-formed input). Borrow s; toWellFormed +1. */
 bool scr_str_is_well_formed(ScrStr *s);
+/* a.localeCompare(b): ASCII by the root collation, a named trap for any
+ * other string (SEMANTICS.md S120). */
+double scr_str_locale_compare(ScrStr *a, ScrStr *b);
 ScrStr *scr_str_to_well_formed(ScrStr *s);
 
 /* RegExp.escape(s) — ES2025 EncodeForRegExpEscape per code point: leading

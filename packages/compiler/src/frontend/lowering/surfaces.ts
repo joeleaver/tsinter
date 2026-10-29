@@ -1506,8 +1506,8 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
       member === "toLocaleUpperCase"
     ) {
       hint =
-        "locale- and ICU-backed behavior lives outside the static runtime (the localeCompare " +
-        "stance: code-unit order, no collation/locale data) — what lowers: the composed " +
+        "locale- and ICU-backed behavior lives outside the static runtime (no locale data " +
+        "beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed " +
         'new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default ' +
         "options; format with template literals, toFixed, and toString otherwise";
     } else if (container === "Object" && member === "assign") {

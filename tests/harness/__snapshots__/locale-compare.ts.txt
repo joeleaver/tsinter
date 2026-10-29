@@ -1,0 +1,53 @@
+locale-compare.ts:12:40 - error SC2020: '.localeCompare with locale 'sv'' is part of the standard library types but has no scriptc lowering yet
+
+  11 | const en = "a".localeCompare("b", "en-US");
+  12 | const swedish = "a".localeCompare("b", "sv");
+     |                                        ^~~~
+  13 | const numeric = "a".localeCompare("b", "en-u-kn-true");
+
+  hint: only ICU's root collation is built in — localeCompare(other), or a locale whose collation is root's ('en', 'en-US'); other locales tailor the order (SEMANTICS.md S120)
+
+locale-compare.ts:13:40 - error SC2020: '.localeCompare with locale 'en-u-kn-true'' is part of the standard library types but has no scriptc lowering yet
+
+  12 | const swedish = "a".localeCompare("b", "sv");
+  13 | const numeric = "a".localeCompare("b", "en-u-kn-true");
+     |                                        ^~~~~~~~~~~~~~
+  14 | const loc = process.argv.length > 3 ? "de" : "en";
+
+  hint: only ICU's root collation is built in — localeCompare(other), or a locale whose collation is root's ('en', 'en-US'); other locales tailor the order (SEMANTICS.md S120)
+
+locale-compare.ts:15:40 - error SC2020: '.localeCompare with a locales argument other than a string literal, a const bound to one, or a list of at most one of those' is part of the standard library types but has no scriptc lowering yet
+
+  14 | const loc = process.argv.length > 3 ? "de" : "en";
+  15 | const runtime = "a".localeCompare("b", loc);
+     |                                        ^~~
+  16 | const list = "a".localeCompare("b", ["en", "fr"]);
+
+  hint: only ICU's root collation is built in — localeCompare(other), or a locale whose collation is root's ('en', 'en-US'); other locales tailor the order (SEMANTICS.md S120)
+
+locale-compare.ts:16:37 - error SC2020: '.localeCompare with a locales argument other than a string literal, a const bound to one, or a list of at most one of those' is part of the standard library types but has no scriptc lowering yet
+
+  15 | const runtime = "a".localeCompare("b", loc);
+  16 | const list = "a".localeCompare("b", ["en", "fr"]);
+     |                                     ^~~~~~~~~~~~
+  17 | const opts = "a".localeCompare("b", "en", { numeric: true });
+
+  hint: only ICU's root collation is built in — localeCompare(other), or a locale whose collation is root's ('en', 'en-US'); other locales tailor the order (SEMANTICS.md S120)
+
+locale-compare.ts:17:43 - error SC2020: '.localeCompare with an options argument' is part of the standard library types but has no scriptc lowering yet
+
+  16 | const list = "a".localeCompare("b", ["en", "fr"]);
+  17 | const opts = "a".localeCompare("b", "en", { numeric: true });
+     |                                           ^~~~~~~~~~~~~~~~~
+  18 | const empty = "a".localeCompare("b", undefined, {});
+
+  hint: only the default collation is built in (tertiary strength, punctuation and case significant, no numeric or caseFirst ordering) — SEMANTICS.md S120
+
+locale-compare.ts:18:49 - error SC2020: '.localeCompare with an options argument' is part of the standard library types but has no scriptc lowering yet
+
+  17 | const opts = "a".localeCompare("b", "en", { numeric: true });
+  18 | const empty = "a".localeCompare("b", undefined, {});
+     |                                                 ^~
+  19 | console.log(plain, en, swedish, numeric, runtime, list, opts, empty);
+
+  hint: only the default collation is built in (tertiary strength, punctuation and case significant, no numeric or caseFirst ordering) — SEMANTICS.md S120

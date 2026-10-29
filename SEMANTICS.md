@@ -8728,3 +8728,87 @@ unit's report; a later unit proves presence statically to drop the tests.
 row against Node spawned at test time, on the wasm lane and — the native
 rows — on the wasm-native lane; (b) and (c) pinned by their fence text); the
 wasm and wasm-native censuses (every corpus program unchanged).
+
+## S120 — `localeCompare` collates by ICU's root collation whatever the host's locale; the c and llvm lanes collate ASCII only and stop by name on anything else *(wasm and wasm-native; (b) the c and llvm lanes, retiring with them at N4; (c) wasm and wasm-native)*
+
+GH #87. `a.localeCompare(b)` answers what Node v24.18.1 answers with no
+locale under a default locale whose collation is the root one (the
+harness's `en-US`, `en`, and every locale CLDR does not tailor):
+ICU 78.3's root collation (CLDR 48, UCA 17, Unicode 17) at tertiary
+strength, punctuation and spaces non-ignorable, normalization on (V8 turns
+it on), `-1`, `0` or `1`. Canonically equivalent spellings mostly compare
+equal, and where ICU's own iterator makes them differ this tier does the
+same (or stops by name, (c)): after a contraction starter (и, ྲ, ཱ, …) whose lookahead matches
+nothing, a run of combining marks ending in a BMP mark right after a
+supplementary one is re-read in its raw order (`collation.ts`,
+markQuirks), so `"и\u{10AE5}\u3099"` and `"и\u3099\u{10AE5}"` differ, as
+in Node. On the WasmGC lanes that is the whole of Unicode — case and
+accents ordered by level, contractions and the prefix rule, Hangul, Han in
+radical-stroke order, implicit weights for unassigned code points and lone
+surrogates — one routine over a ~93 KB table generated from ICU's own
+`FractionalUCA.txt` (`backend/wasm/collation.ts`,
+`scripts/gen-wasm-collation-tables.mjs`); the table enters a module only
+when the program compares. On a statically typed string receiver the
+locales argument may be absent, the global `undefined`, `"en"` or
+`"en-US"` (Node's collation for those is root's, checked over every code
+point) — spelled as a literal, a `const` bound to one (still read at its
+turn, so its TDZ holds), a case variant `Intl.getCanonicalLocales` maps to
+one (`"EN-us"`), `[]`, or a one-element list of one; the options argument
+absent or the global `undefined`. Any other locale, a locale known only at
+run time, a longer list, a spread argument, a parameter that shadows
+`undefined`, any options bag, and `Intl.Collator` refuse at build time by
+name (SC2020). A `localeCompare` call on a dynamically typed receiver (`any`
+in TypeScript, untyped JavaScript) is not this lowering: it stops at run
+time by name (SC1090), as it did before; the island keeps S103's fence.
+
+What parts from Node:
+
+(a) **The host's locale.** A compiled program collates by the root
+collation wherever it runs. Node takes its default locale from the
+environment (`LANG` / `LC_ALL`), so under a locale whose collation CLDR
+tailors (`sv`, `da`, `tr`, `es`'s traditional order, …) Node's
+`localeCompare()` with no locale answers otherwise; the rows here hold
+for Node under a root-collating default locale. (The same reason the
+locale-less `Intl.NumberFormat()` refuses: the default locale is the
+host's.)
+
+(b) **The c and llvm lanes** carry only the table's ASCII slice
+(`scr_string.c`'s `scr_str_locale_compare`): two strings of ASCII
+characters compare exactly as Node does (`"a" < "B"`, `"a" < "A"`,
+punctuation and digits in root order, the controls other than TAB..CR
+ignorable); a string holding any other character stops the program with
+`scriptc: localeCompare: collating a string with a non-ASCII character is
+not supported on the c and llvm lanes (SEMANTICS.md S120)` (an abort, like
+every runtime trap there) where Node answers. Those lanes store strings as
+UTF-8 with lone surrogates already replaced (S002), so the full collation
+belongs to the WasmGC lanes only; this part retires with them at N4.
+(c) **One ICU iterator corner stops by name.** The raw re-read above is
+modelled exactly for the shape measured against Node: a starter with
+contractions that matches nothing. Where ICU's answer depends on more of
+its iterator's state — that starter matching a contraction, or a
+contraction starter among the marks themselves (ཱ U+0F71, …) — when a run
+of combining marks out of canonical order ends in a supplementary mark
+followed by a BMP one, the WasmGC lanes stop with `localeCompare:
+collating a contraction starter next to combining marks that end in a
+supplementary mark followed by a BMP one, out of canonical order, is not
+supported yet (SEMANTICS.md S120)` (the uncaught report, uncatchable)
+where Node answers. The 400,000-string fuzz built around contraction
+starters and marks below never meets it; the sweep of every nonspacing
+mark meets it only with ཱ as the leading character.
+
+Before this entry both lanes compared UTF-16 code units — `"a".localeCompare("B")`
+answered `1` — with no entry registering it.
+
+**Rationale:** Joe's call (2026-10-29): Node-exact collation, the tables
+bundled, no Latin-only subset. **Tested by:**
+`packages/compiler/test/wasm-collation.test.ts` — the tables against
+`Intl.Collator` over every code point, two-code-point strings around
+every contraction and mark, and 400,000 mixed strings (through
+`test/collation-model.ts`, the routine in JavaScript); generated programs
+(23,000 comparisons over 3,300 strings and two sorts) against Node on the
+wasm and wasm-native lanes; the refusals; `scr_string.c`'s ASCII table
+against the model; the raw re-read swept over every nonspacing mark after
+five contraction starters and fuzzed over 400,000 starter-and-mark strings.
+`test/wasm-collation-tables-drift.test.ts` re-renders
+the table from the pinned inputs; `tests/diagnostics/locale-compare.ts`
+pins the refusals. Corpus 2826 and 2827 (ASCII, every lane).

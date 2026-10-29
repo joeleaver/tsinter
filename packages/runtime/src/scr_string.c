@@ -1201,6 +1201,66 @@ bool scr_str_is_well_formed(ScrStr *s) {
 
 ScrStr *scr_str_to_well_formed(ScrStr *s) { return scr_str_retain(s); }
 
+/* ── localeCompare (SEMANTICS.md S120) ─────────────────────────────────
+ * The WasmGC lanes collate every string by ICU's root collation, as Node
+ * does (packages/compiler/src/backend/wasm/collation.ts). These lanes
+ * retire at N4 and carry only its ASCII slice: no ASCII character
+ * decomposes, contracts or expands, so two ASCII strings compare by the
+ * per-character weights below, level by level, zero weights skipped. A
+ * string holding anything else stops the program by name rather than
+ * answer differently from Node. The weights are dense per-level ranks of
+ * the root collation's (primary, secondary, tertiary) for U+0000..U+007F
+ * (the controls other than TAB..CR are completely ignorable), checked
+ * against collation-tables.ts by test/wasm-collation.test.ts. */
+static const unsigned char scr_ascii_coll[128][3] = {
+  {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+  {0,0,0},{1,1,1},{2,1,1},{3,1,1},{4,1,1},{5,1,1},{0,0,0},{0,0,0},
+  {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+  {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+  {6,1,1},{12,1,1},{16,1,1},{28,1,1},{38,1,1},{29,1,1},{27,1,1},{15,1,1},
+  {17,1,1},{18,1,1},{24,1,1},{32,1,1},{9,1,1},{8,1,1},{14,1,1},{25,1,1},
+  {39,1,1},{40,1,1},{41,1,1},{42,1,1},{43,1,1},{44,1,1},{45,1,1},{46,1,1},
+  {47,1,1},{48,1,1},{11,1,1},{10,1,1},{33,1,1},{34,1,1},{35,1,1},{13,1,1},
+  {23,1,1},{49,1,2},{50,1,2},{51,1,2},{52,1,2},{53,1,2},{54,1,2},{55,1,2},
+  {56,1,2},{57,1,2},{58,1,2},{59,1,2},{60,1,2},{61,1,2},{62,1,2},{63,1,2},
+  {64,1,2},{65,1,2},{66,1,2},{67,1,2},{68,1,2},{69,1,2},{70,1,2},{71,1,3},
+  {72,1,2},{73,1,2},{74,1,2},{19,1,1},{26,1,1},{20,1,1},{31,1,1},{7,1,1},
+  {30,1,1},{49,1,1},{50,1,1},{51,1,1},{52,1,1},{53,1,1},{54,1,1},{55,1,1},
+  {56,1,1},{57,1,1},{58,1,1},{59,1,1},{60,1,1},{61,1,1},{62,1,1},{63,1,1},
+  {64,1,1},{65,1,1},{66,1,1},{67,1,1},{68,1,1},{69,1,1},{70,1,1},{71,1,1},
+  {72,1,1},{73,1,1},{74,1,1},{21,1,1},{36,1,1},{22,1,1},{37,1,1},{0,0,0},
+};
+
+double scr_str_locale_compare(ScrStr *a, ScrStr *b) {
+  for (size_t i = 0; i < a->len; i++) {
+    if ((unsigned char)a->data[i] >= 0x80) goto non_ascii;
+  }
+  for (size_t i = 0; i < b->len; i++) {
+    if ((unsigned char)b->data[i] >= 0x80) goto non_ascii;
+  }
+  for (int lv = 0; lv < 3; lv++) {
+    size_t i = 0, j = 0;
+    for (;;) {
+      while (i < a->len && scr_ascii_coll[(unsigned char)a->data[i]][lv] == 0) i++;
+      while (j < b->len && scr_ascii_coll[(unsigned char)b->data[j]][lv] == 0) j++;
+      if (i >= a->len || j >= b->len) {
+        if (i < a->len) return 1;
+        if (j < b->len) return -1;
+        break;
+      }
+      unsigned p = scr_ascii_coll[(unsigned char)a->data[i]][lv];
+      unsigned q = scr_ascii_coll[(unsigned char)b->data[j]][lv];
+      if (p != q) return p < q ? -1 : 1;
+      i++;
+      j++;
+    }
+  }
+  return 0;
+non_ascii:
+  scr_trap("scriptc: localeCompare: collating a string with a non-ASCII character is "
+           "not supported on the c and llvm lanes (SEMANTICS.md S120)\n");
+}
+
 /* Immortal interned booleans (same layout trick the emitter uses for
  * string literals). */
 static const struct { size_t rc; size_t len; size_t cap; char data[5]; }

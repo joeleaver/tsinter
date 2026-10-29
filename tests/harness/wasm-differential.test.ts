@@ -3677,6 +3677,10 @@ const TIER_FLOOR: string[] = [
   "2823-arguments-length-static.ts",
   "2824-builtin-global-values.js",
   "2825-variadic-callback-object-args.js",
+  // GH #87: localeCompare collates by ICU's root collation as Node does
+  // (SEMANTICS.md S120) — new programs passing from their first run.
+  "2826-locale-compare-collation.ts",
+  "2827-locale-compare-sort.ts",
 ];
 
 interface RunResult {

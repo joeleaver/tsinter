@@ -243,6 +243,7 @@ import { StrBuilder, emitFlat, emitFlatCast, emitFlatInline, emitIfFlat, setFlat
 import { Ropes } from "./ropes.js";
 import { Slices, type SliceOpKind, type WinForm } from "./slices.js";
 import { CasingBuilder } from "./casing.js";
+import { CollationBuilder } from "./collation.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexStateBuilder } from "./regex-state.js";
 import { RegexInterpreterBuilder } from "./regex-interpreter.js";
@@ -26982,6 +26983,12 @@ class Assembler {
           case "toWellFormed":
             code.call(this.strs.toWellFormed());
             return;
+          case "localeCompare":
+            // ICU's root collation (collation.ts, SEMANTICS.md S120)
+            this.walkExpr(e.args[0]!);
+            code.call(this.collation.compare());
+            code.f64ConvertI32S();
+            return;
           case "toLowerCase":
             code.call(this.casing.toLowerCase());
             return;
@@ -31654,6 +31661,15 @@ class Assembler {
   private get casing(): CasingBuilder {
     this.casingField ??= new CasingBuilder(this.mb, this.strType);
     return this.casingField;
+  }
+
+  private collationField: CollationBuilder | null = null;
+
+  /** localeCompare's root collation (collation.ts): its tables enter the
+   * module only when a program compares. */
+  private get collation(): CollationBuilder {
+    this.collationField ??= new CollationBuilder(this.mb, this.strType, (c, m) => this.emitNamedTrap(c, m));
+    return this.collationField;
   }
 
   private regexField: RegexBuilder | null = null;

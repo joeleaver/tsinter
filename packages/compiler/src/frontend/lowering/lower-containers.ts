@@ -6,7 +6,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
-import { bindOnce, droppableStatic, holeFencedCall, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { bindOnce, droppableStatic, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
@@ -5280,77 +5280,121 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     };
   }
 
-/** `a.localeCompare(b)` — the one-argument form only (locales/options
-   * select ICU collations that do not exist here). Lowers to an interned
-   * synthetic function returning -1/0/1 by CODE-UNIT order — the same
-   * ordering as the string relational operators — NOT Node's ICU default
-   * collation: a documented divergence (SEMANTICS.md; e.g. Node says
-   * "a" < "B" under ICU while code units say "B" < "a"). For same-case
-   * ASCII the orders agree. Null when the receiver isn't a stdlib string
-   * (caller keeps its generic rejection). */
+/** `a.localeCompare(b)` -> strIntrinsic "localeCompare": -1/0/1 by ICU's
+   * root collation, what Node answers with no locale (SEMANTICS.md S120;
+   * the WasmGC lanes collate every string, the c and llvm lanes ASCII).
+   * The locales argument may be absent, `undefined`, or a literal whose
+   * collation Node resolves to root's exactly (LOCALE_COMPARE_ROOT_LOCALES,
+   * checked over every code point by test/wasm-collation.test.ts); the
+   * options argument may be absent or `undefined`. Any other locale, a
+   * locale known only at run time, and every options bag are refused by
+   * name. Null when the receiver isn't a stdlib string (caller keeps its
+   * generic rejection). */
   function lowerLocaleCompareCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     const receiverIr = L.mapTypeOf(L.typeOf(access.expression));
     if (receiverIr?.kind !== "string") return null;
     if (!L.isStdlibMember(access)) return null;
     const loc = locOf(call);
-    if (call.arguments.length !== 1) {
+    const isUndefinedLiteral = (a: ts.Expression): boolean =>
+      isGlobalUndefined(L, a) ||
+      (a.kind === ts.SyntaxKind.VoidExpression && ts.isNumericLiteral((a as ts.VoidExpression).expression));
+    const [, locales, options] = call.arguments;
+    if (call.arguments.length === 0 || call.arguments.length > 3) {
+      L.noLowering(`.localeCompare with ${call.arguments.length} arguments`, call, "pass the comparison string");
+    }
+    const spread = call.arguments.find((a) => ts.isSpreadElement(a));
+    if (spread !== undefined) L.noLowering(".localeCompare with a spread argument", spread, "pass the arguments directly");
+    let constRead: ts.Identifier | null = null;
+    /* A string literal, or a `const` bound to one (folded). */
+    const literalText = (e: ts.Expression): string | null => {
+      if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) return e.text;
+      if (!ts.isIdentifier(e)) return null;
+      const sym = L.checker.getSymbolAtLocation(e);
+      const decls = sym ? L.checker.declarationsOf(sym) : [];
+      const d = decls.length === 1 ? decls[0]! : null;
+      if (d === null || !ts.isVariableDeclaration(d) || d.initializer === undefined || d.type !== undefined) return null;
+      if (!ts.isVariableDeclarationList(d.parent) || (d.parent.flags & ts.NodeFlags.Const) === 0) return null;
+      const init = d.initializer;
+      if (!ts.isStringLiteral(init) && !ts.isNoSubstitutionTemplateLiteral(init)) return null;
+      constRead = e; // still read at its turn: a read in the binding's TDZ throws as in Node
+      return init.text;
+    };
+    /* The locale a tag names as Intl canonicalizes it ("EN-us" is "en-US"),
+     * or null for a malformed tag (Node throws its RangeError there). */
+    const canonical = (tag: string): string | null => {
+      try {
+        return Intl.getCanonicalLocales(tag)[0] ?? null;
+      } catch {
+        return null;
+      }
+    };
+    if (locales !== undefined && !isUndefinedLiteral(locales)) {
+      // [] is the default locale; [tag] is tag (ECMA-402 CanonicalizeLocaleList)
+      let lit: string | null = null;
+      let ok = false;
+      if (ts.isArrayLiteralExpression(locales)) {
+        if (locales.elements.length === 0) ok = true;
+        else if (locales.elements.length === 1) lit = literalText(locales.elements[0]!);
+      } else lit = literalText(locales);
+      if (lit !== null) {
+        const c = canonical(lit);
+        ok = c !== null && LOCALE_COMPARE_ROOT_LOCALES.has(c);
+      }
+      if (!ok) {
+        L.noLowering(
+          lit === null
+            ? ".localeCompare with a locales argument other than a string literal, a const bound to one, or a list of at most one of those"
+            : `.localeCompare with locale '${lit}'`,
+          locales,
+          "only ICU's root collation is built in — localeCompare(other), or a locale whose collation is root's (" +
+            [...LOCALE_COMPARE_ROOT_LOCALES].map((l) => `'${l}'`).join(", ") +
+            "); other locales tailor the order (SEMANTICS.md S120)",
+        );
+      }
+    }
+    if (options !== undefined && !isUndefinedLiteral(options)) {
       L.noLowering(
-        `.localeCompare with ${call.arguments.length} arguments`,
-        call,
-        "the locales/options parameters select ICU collations that have no lowering — " +
-          "pass exactly the comparison string",
+        ".localeCompare with an options argument",
+        options,
+        "only the default collation is built in (tertiary strength, punctuation and case significant, no numeric or caseFirst ordering) — SEMANTICS.md S120",
       );
     }
     const receiver = L.lowerExpr(access.expression);
-    const arg = L.lowerExpr(call.arguments[0]!);
+    let arg = L.lowerExpr(call.arguments[0]!);
     if (arg.type.kind !== "string") L.badType(call.arguments[0]!, L.typeOf(call.arguments[0]!));
-    const key = "localeCompare";
-    let helper = L.arrHofHelpers.get(key);
-    if (!helper) {
-      helper = `%str.localeCompare`;
-      L.arrHofHelpers.set(key, helper);
-      L.liftedFns.push(buildLocaleCompareFn(helper, loc));
-    }
-    return { kind: "call", callee: helper, args: [receiver, arg], type: F64, loc };
-  }
-
-/** `return a < b ? -1 : a > b ? 1 : 0` over the strCmp primitive (the
-   * relational operators' exact machinery — one interned helper, no new IR
-   * or runtime surface). */
-  function buildLocaleCompareFn(name: string, loc: SrcLoc): IrFunction {
-    const ref = (localId: string): IrExpr => ({ kind: "varRef", localId, type: STRING, loc });
-    const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
-    const cmp = (op: "<" | ">"): IrExpr => ({ kind: "strCmp", op, left: ref("a.0"), right: ref("b.0"), type: BOOL, loc });
-    const body: IrStmt[] = [
-      {
-        kind: "return",
-        value: {
-          kind: "ternary",
-          cond: cmp("<"),
-          then: num(-1),
-          else_: { kind: "ternary", cond: cmp(">"), then: num(1), else_: num(0), type: F64, loc },
-          type: F64,
-          loc,
-        },
+    // Unit U (SEMANTICS.md S119): an argument holding its slot's undefined
+    // is ToString'd, as Node does ("undefined").
+    if (L.undefSlots) arg = undefinedAsText(L, arg, loc);
+    if (constRead === null) return { kind: "strIntrinsic", method: "localeCompare", receiver, args: [arg], type: F64, loc };
+    // a folded const locale: receiver, argument, then the const's own read,
+    // in Node's order
+    const r = L.declareHiddenLocal("%lcRecv", receiver.type);
+    const a = L.declareHiddenLocal("%lcArg", arg.type);
+    return {
+      kind: "seqExpr",
+      stmts: [
+        { kind: "varDecl", localId: r.id, init: receiver, loc },
+        { kind: "varDecl", localId: a.id, init: arg, loc },
+        { kind: "exprStmt", expr: L.lowerExpr(constRead), loc },
+      ],
+      result: {
+        kind: "strIntrinsic",
+        method: "localeCompare",
+        receiver: { kind: "varRef", localId: r.id, type: receiver.type, loc },
+        args: [{ kind: "varRef", localId: a.id, type: arg.type, loc }],
+        type: F64,
         loc,
       },
-    ];
-    return {
-      name,
-      params: [
-        { localId: "a.0", name: "a", type: STRING },
-        { localId: "b.0", name: "b", type: STRING },
-      ],
-      returnType: F64,
-      locals: [
-        { id: "a.0", name: "a", type: STRING, mutable: true },
-        { id: "b.0", name: "b", type: STRING, mutable: true },
-      ],
-      body,
+      type: F64,
       loc,
     };
   }
+
+/** Locales whose collation Node v24.18.1's ICU resolves to the root
+ * collation's exactly — verified over every code point and a million
+ * strings against Intl.Collator by test/wasm-collation.test.ts. */
+export const LOCALE_COMPARE_ROOT_LOCALES: ReadonlySet<string> = new Set(["en", "en-US"]);
 
 /* ── typed arrays / Buffer ─────────────────────────────────────────────── */
 

@@ -714,6 +714,10 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return E.newTemp(e.type, `scr_str_is_well_formed(${r.name})`);
           case "toWellFormed":
             return E.newTemp(e.type, `scr_str_to_well_formed(${r.name})`);
+          // ASCII by the root collation, a named Error otherwise
+          // (SEMANTICS.md S120; scr_string.c)
+          case "localeCompare":
+            return E.newTemp(e.type, `scr_str_locale_compare(${r.name}, ${args[0]!.name})`);
           case "cpAt":
             return E.newTemp(e.type, `scr_str_cp_at(${r.name}, ${args[0]!.name})`);
           default: {

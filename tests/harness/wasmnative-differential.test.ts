@@ -997,6 +997,8 @@ const CLAIM_FLOOR: string[] = [
   "2823-arguments-length-static.ts",
   "2824-builtin-global-values.js",
   "2825-variadic-callback-object-args.js",
+  "2826-locale-compare-collation.ts",
+  "2827-locale-compare-sort.ts",
   "300-if-else.ts",
   "301-while.ts",
   "302-for.ts",

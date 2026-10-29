@@ -9063,6 +9063,10 @@ class LlEmitter {
         return call("scr_str_is_well_formed", "zeroext i1 (ptr)", `ptr ${r.name}`, "i1", false);
       case "toWellFormed":
         return call("scr_str_to_well_formed", "ptr (ptr)", `ptr ${r.name}`, "ptr", true);
+      // ASCII by the root collation, a named Error otherwise
+      // (SEMANTICS.md S120; scr_string.c)
+      case "localeCompare":
+        return call("scr_str_locale_compare", "double (ptr, ptr)", `ptr ${r.name}, ptr ${args[0]!.name}`, "double", false);
       case "cpAt":
         // The code point AT an index as a one-code-point string (+1) —
         // the string-for-of desugar's read.

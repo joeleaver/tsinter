@@ -5795,6 +5795,18 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2826-locale-compare-collation.ts": {
+   "order": [
+    "<repo>/tests/corpus/2826-locale-compare-collation.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2827-locale-compare-sort.ts": {
+   "order": [
+    "<repo>/tests/corpus/2827-locale-compare-sort.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -7461,6 +7473,12 @@
   "<repo>/tests/diagnostics/json-shape/main.ts": {
    "order": [
     "<repo>/tests/diagnostics/json-shape/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/locale-compare.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/locale-compare.ts"
    ],
    "diags": []
   },

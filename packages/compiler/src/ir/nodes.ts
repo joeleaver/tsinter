@@ -1473,6 +1473,10 @@ export type IrStrIntrinsicMethod =
   // true and the identity, per spec on well-formed input.
   | "isWellFormed"
   | "toWellFormed"
+  // a.localeCompare(b) with no locale (or one whose collation is root's):
+  // -1/0/1 by ICU's root collation (SEMANTICS.md S120) — args[0] the other
+  // string.
+  | "localeCompare"
   // The string iterator's step: the full code-POINT character at a UTF-16
   // index (astral chars come back whole where charAt truncates) — for-of
   // over strings desugars onto it, advancing by the result's length.

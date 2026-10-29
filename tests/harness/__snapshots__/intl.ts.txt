@@ -48,7 +48,7 @@ intl.ts:14:18 - error SC2020: 'NumberFormat.format' is part of the standard libr
      |                  ^~~~~~~~~~~~~~
   15 | 
 
-  hint: locale- and ICU-backed behavior lives outside the static runtime (the localeCompare stance: code-unit order, no collation/locale data) — what lowers: the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
+  hint: locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
 
 intl.ts:17:20 - error SC2020: 'Number.prototype.toLocaleString without a locale' is part of the standard library types but has no scriptc lowering yet
 
@@ -84,7 +84,7 @@ intl.ts:22:14 - error SC2020: 'DateTimeFormat.format' is part of the standard li
      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   23 | const dur = new Intl.DurationFormat("en-US").format({ hours: 1, minutes: 23 });
 
-  hint: locale- and ICU-backed behavior lives outside the static runtime (the localeCompare stance: code-unit order, no collation/locale data) — what lowers: the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
+  hint: locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
 
 intl.ts:23:13 - error SC2020: 'DurationFormat.format' is part of the standard library types but has no scriptc lowering yet
 
@@ -93,7 +93,7 @@ intl.ts:23:13 - error SC2020: 'DurationFormat.format' is part of the standard li
      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   24 | const rule = new Intl.PluralRules("en-US").select(1);
 
-  hint: locale- and ICU-backed behavior lives outside the static runtime (the localeCompare stance: code-unit order, no collation/locale data) — what lowers: the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
+  hint: locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
 
 intl.ts:24:14 - error SC2020: 'PluralRules.select' is part of the standard library types but has no scriptc lowering yet
 
@@ -102,7 +102,7 @@ intl.ts:24:14 - error SC2020: 'PluralRules.select' is part of the standard libra
      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   25 | const canon = Intl.getCanonicalLocales("en-us");
 
-  hint: locale- and ICU-backed behavior lives outside the static runtime (the localeCompare stance: code-unit order, no collation/locale data) — what lowers: the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
+  hint: locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
 
 intl.ts:25:15 - error SC2020: 'Intl.getCanonicalLocales' is part of the standard library types but has no scriptc lowering yet
 
@@ -111,4 +111,4 @@ intl.ts:25:15 - error SC2020: 'Intl.getCanonicalLocales' is part of the standard
      |               ^~~~~~~~~~~~~~~~~~~~~~~~
   26 | 
 
-  hint: locale- and ICU-backed behavior lives outside the static runtime (the localeCompare stance: code-unit order, no collation/locale data) — what lowers: the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
+  hint: locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: a.localeCompare(b), the composed new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default options; format with template literals, toFixed, and toString otherwise
