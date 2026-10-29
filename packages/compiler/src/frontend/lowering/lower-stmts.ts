@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, holeFencedArray, mayHoldSlotUndef, undefinedAsAbsent, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -2182,6 +2182,14 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
    * alike (the caller's bindPatternTarget recurses through the latter). */
   function applyBindingDefault(L: Lowerer, el: ts.BindingElement, value: IrExpr): IrExpr {
     const name = el.name!; // callers skip nameless elisions
+    // Unit U (SEMANTICS.md S119): on the WasmGC lanes a plain-typed value
+    // (or a union with no undefined arm) can still hold undefined — the
+    // default fires then, lazily, as in JS.
+    const noArm = value.type.kind !== "union" || L.armTag(value.type.unionId, UNDEFINED_T) < 0;
+    if (noArm && mayHoldSlotUndef(L, value)) {
+      const t = value.type;
+      return undefinedAsAbsent(L, value, L.lowerExprExpecting(el.initializer!, t));
+    }
     if (value.type.kind !== "union") return value; // no undefined arm: dead default
     if (L.armTag(value.type.unionId, UNDEFINED_T) < 0) return value;
     const bodyT = patternBindingType(L, name);
@@ -2199,7 +2207,10 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     const undefTag = L.armTag(fieldType.unionId, UNDEFINED_T);
     if (undefTag < 0) return value;
     const loc = value.loc;
-    const isUndef: IrExpr = { kind: "unionIsTag", unionId: fieldType.unionId, tag: undefTag, negated: false, value, type: BOOL, loc };
+    // Unit U: isUndef also sees the reserved-tag undefined (an array hole).
+    const isUndef: IrExpr = L.undefSlots
+      ? { kind: "isUndef", operand: value, type: BOOL, loc }
+      : { kind: "unionIsTag", unionId: fieldType.unionId, tag: undefTag, negated: false, value, type: BOOL, loc };
     if (typeEquals(bodyT, fieldType)) {
       // The default may ITSELF be undefined-armed: the binding keeps the
       // full union, present values pass through unchanged.
@@ -4805,6 +4816,20 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         const target = L.resolveWritable(expr.left);
         if (!target) L.rejectUnresolved(expr.left, `assignment to '${expr.left.text}' (not a writable local or module global)`);
         const loc = locOf(expr);
+        const unitFree = target.type.kind !== "union" || !(L.unions.get(target.type.unionId)?.arms.some(isUnitType) ?? true);
+        if (unitFree && L.undefSlots && target.type.kind !== "dyn" && target.type.kind !== "jsval") {
+          // Unit U (SEMANTICS.md S119): a plain-typed variable can hold
+          // undefined on the WasmGC lanes — `x ??= e` writes e then (lazily).
+          const read: IrExpr = { kind: "varRef", localId: target.id, type: target.type, loc: locOf(expr.left) };
+          const right = L.lowerExprExpecting(expr.right, target.type);
+          return {
+            kind: "if",
+            cond: { kind: "isUndef", operand: read, type: BOOL, loc },
+            then: [{ kind: "assign", localId: target.id, value: right, loc }],
+            else_: null,
+            loc,
+          };
+        }
         if (target.type.kind !== "union") {
           // The checker says never nullish: JS neither evaluates e nor
           // assigns — the statement is a no-op (lowerNullishCoalesce's
@@ -7660,7 +7685,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * dense, so `i < length` IS presence). */
   function lowerForInArray(L: Lowerer, stmt: ts.ForInStatement, labels: string[] | undefined): IrStmt {
     const loc = locOf(stmt);
-    const arrExpr = L.lowerExpr(stmt.expression);
+    // Unit U (SEMANTICS.md S119 (b)): for-in skips holes — fenced once the
+    // program made a hole.
+    const arrExpr = holeFencedArray(L, L.lowerExpr(stmt.expression), "for-in", loc);
     if (arrExpr.type.kind !== "array") L.badType(stmt.expression, L.typeOf(stmt.expression));
     L.scopes.push(new Map());
     try {

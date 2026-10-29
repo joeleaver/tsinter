@@ -1126,6 +1126,18 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         undefinedT: "undefined", nullT: "object",
       };
       const folded = FOLD[operand.type.kind];
+      if (folded && mayHoldSlotUndef(L, operand)) {
+        // Unit U (SEMANTICS.md S119): a plain-typed value may still hold
+        // undefined on the WasmGC lanes — ask it at run time.
+        return bindOnce(L, operand, loc, (read) => ({
+          kind: "ternary",
+          cond: isUndefExpr(read, false, loc),
+          then: { kind: "strLit", value: "undefined", type: STRING, loc },
+          else_: { kind: "strLit", value: folded, type: STRING, loc },
+          type: STRING,
+          loc,
+        }));
+      }
       if (folded && droppableStatic(operand)) {
         return { kind: "strLit", value: folded, type: STRING, loc };
       }
@@ -1149,6 +1161,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
               test = { kind: "logical", op: "||", left: test, right: { kind: "unionIsTag", unionId: operand.type.unionId, tag: t, negated: false, value: operand, type: BOOL, loc }, type: BOOL, loc };
             }
             result = { kind: "ternary", cond: test, then: { kind: "strLit", value: answer, type: STRING, loc }, else_: result, type: STRING, loc };
+          }
+          // Unit U (SEMANTICS.md S119): a union with no undefined arm
+          // still holds undefined on the WasmGC lanes (its reserved tag,
+          // which no arm test above matches).
+          if (L.undefSlots && !def.arms.some((a) => a.kind === "undefinedT")) {
+            result = { kind: "ternary", cond: isUndefExpr(operand, false, loc), then: { kind: "strLit", value: "undefined", type: STRING, loc }, else_: result, type: STRING, loc };
           }
           return result;
         }
@@ -2762,6 +2780,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     }
     if (other.type.kind === "union") {
       const tag = L.armTag(other.type.unionId, unit.type);
+      if (tag < 0 && unit.unit === "undefined" && L.undefSlots) {
+        // Unit U (SEMANTICS.md S119): a union with no undefined arm still
+        // holds undefined on the WasmGC lanes — its reserved tag.
+        return isUndefExpr(other, negated, loc);
+      }
       if (tag < 0) {
         // A union WITHOUT that unit arm: legal TS (`miss === null` on a
         // `number | undefined` — null/undefined guard comparisons are
@@ -2780,6 +2803,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         };
         return { kind: "logical", op: negated ? "||" : "&&", left: evalOnce, right: answer, type: BOOL, loc };
       }
+      // Unit U (SEMANTICS.md S119): an undefined-armed union can also hold
+      // the reserved-tag undefined (an array's hole) — isUndef tests both.
+      if (unit.unit === "undefined" && L.undefSlots) return isUndefExpr(other, negated, loc);
       return {
         kind: "unionIsTag",
         unionId: other.type.unionId,
@@ -2808,6 +2834,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     // no value (nor a sequence form to keep the call's effects). Fall
     // through to the caller's comparison fence instead of folding a lie.
     if (other.type.kind === "void") return null;
+    // Unit U (SEMANTICS.md S119): on the WasmGC lanes a plain-typed value
+    // can hold undefined (never null) — test it at run time.
+    if (unit.unit === "undefined" && mayHoldSlotUndef(L, other)) return isUndefExpr(other, negated, loc);
     // Non-union operand: it can never hold undefined/null at runtime (the
     // checker narrowed it to a concrete arm), so `=== unit` is false and
     // `!== unit` is true — after the operand evaluates (board #204).
@@ -2893,6 +2922,17 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       const def = L.unions.get(ut.unionId);
       if (!def) L.badType(otherNode, L.typeOf(otherNode));
       const tags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+      if (L.undefSlots && !def.arms.some((a) => a.kind === "undefinedT")) {
+        // Unit U (SEMANTICS.md S119): no undefined arm, so undefined is
+        // the reserved tag on the WasmGC lanes; a null arm joins it.
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+        return bindOnce(L, other, loc, (read) => {
+          const u = isUndefExpr(read, negated, loc);
+          if (nullTag < 0) return u;
+          const n: IrExpr = { kind: "unionIsTag", unionId: ut.unionId, tag: nullTag, negated, value: read, type: BOOL, loc };
+          return { kind: "logical", op: negated ? "&&" : "||", left: u, right: n, type: BOOL, loc };
+        });
+      }
       if (tags.length === 0) {
         // No unit arms: never null-ish (defensive — the fold below).
         return { kind: "boolLit", value: negated, type: BOOL, loc };
@@ -2936,6 +2976,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         return { kind: "unionIsTag", unionId: envRead.type.unionId, tag, negated, value: envRead, type: BOOL, loc };
       }
     }
+    // Unit U (SEMANTICS.md S119): a plain-typed value can hold undefined
+    // on the WasmGC lanes, and undefined == null.
+    if (mayHoldSlotUndef(L, other)) return isUndefExpr(other, negated, loc);
     // A non-nullable operand (tsc allows the comparison as a guard):
     // `== null` is statically false, `!= null` statically true — after the
     // operand evaluates (board #204).
@@ -2991,6 +3034,240 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         return pureReemittable(e);
     }
   }
+
+/** Unit U (SEMANTICS.md S119): on the WasmGC lanes (undefSlots) a value
+ * TypeScript types as a plain `T` can still hold its slot kind's
+ * undefined — an array read past the end, a missing record key, a
+ * destructured element past the end. True when `e` might: the build has
+ * undefSlots, the kind has a plain-slot undefined, and `e` is not a
+ * fresh value that never is one (literals, arithmetic, comparisons,
+ * conversions, fresh allocations). */
+export function mayHoldSlotUndef(L: Lowerer, e: IrExpr): boolean {
+  if (!L.undefSlots) return false;
+  const k = e.type.kind;
+  if (isUnitType(e.type) || k === "void" || k === "dyn" || k === "jsval" || k === "caught") return false;
+  switch (e.kind) {
+    case "numLit":
+    case "strLit":
+    case "boolLit":
+    case "bin":
+    case "unary":
+    case "strConcat":
+    case "toString":
+    case "toBool":
+    case "strEq":
+    case "strCmp":
+    case "unionIsTag":
+    case "isUndef":
+    case "arrayLit":
+    case "recordLit":
+    case "closure":
+    case "new":
+    case "regexLit":
+    case "classRef":
+      return false;
+    default:
+      return true;
+  }
+}
+
+/** Unit U: `f` applied to `e` where `f` reads its operand more than once —
+ * a pure read is re-emitted, anything else is evaluated once into a hidden
+ * local first. */
+export function bindOnce(L: Lowerer, e: IrExpr, loc: SrcLoc, f: (read: IrExpr) => IrExpr): IrExpr {
+  if (pureReemittable(e)) return f(e);
+  const t = L.declareHiddenLocal("%undef", e.type);
+  const read: IrExpr = { kind: "varRef", localId: t.id, type: e.type, loc };
+  const result = f(read);
+  return { kind: "seqExpr", stmts: [{ kind: "varDecl", localId: t.id, init: e, loc }], result, type: result.type, loc };
+}
+
+/** Unit U: a string value whose undefined reads as the text "undefined"
+ * (ToString of undefined). */
+export function undefinedAsText(L: Lowerer, e: IrExpr, loc: SrcLoc): IrExpr {
+  if (!mayHoldSlotUndef(L, e)) return e;
+  // ToString of a string slot: the emitter replaces its undefined (null)
+  // with the text, evaluating the operand once.
+  return { kind: "toString", operand: e, type: STRING, loc };
+}
+
+/** Unit U (SEMANTICS.md S119): the loud fence of an operation where Node
+ * tells a HOLE from undefined (it skips or prints holes) — this tier
+ * stores a hole as the element's undefined, so once the program has made
+ * a hole (a write past an array's end) and `arr` holds an undefined
+ * element, the operation throws a named Error instead of guessing. */
+function holeFenceMessage(what: string, undefOnly?: string): string {
+  return undefOnly !== undefined
+    ? `${what} over an array holding undefined (${undefOnly} — SEMANTICS.md S119)`
+    : `${what} over an array that may hold holes (a write past an array's end leaves undefined where Node keeps a hole, and ${what} tells them apart — SEMANTICS.md S119)`;
+}
+
+function holeFenceCond(arr: IrExpr, loc: SrcLoc, undefOnly?: string): IrExpr {
+  return { kind: "arrHasUndef", arr, ...(undefOnly === undefined ? { holes: true as const } : {}), type: BOOL, loc };
+}
+
+export function holeFenceStmt(arr: IrExpr, what: string, loc: SrcLoc, undefOnly?: string): IrStmt {
+  return {
+    kind: "if",
+    cond: holeFenceCond(arr, loc, undefOnly),
+    then: [{ kind: "runtimeFence", code: "SC1090", message: holeFenceMessage(what, undefOnly), loc }],
+    else_: null,
+    loc,
+  };
+}
+
+/** Unit U: `call` (a call whose first argument is the array receiver)
+ * behind the hole fence — the receiver passes through an interned
+ * `%undef.fence.<n>(a)` helper that runs the check (holeFenceStmt) and
+ * answers `a`, so evaluation order and the call's own shape are kept. */
+export function holeFencedCall(L: Lowerer, call: IrExpr, what: string, loc: SrcLoc, undefOnly?: string): IrExpr {
+  if (!L.undefSlots || call.kind !== "call" || call.args.length === 0) return call;
+  const recv = call.args[0]!;
+  if (recv.type.kind !== "array") return call;
+  return { ...call, args: [holeFencedArray(L, recv, what, loc, undefOnly), ...call.args.slice(1)] };
+}
+
+/** Unit U: the array expression `recv` through the hole fence's
+ * pass-through helper (holeFencedCall's receiver step, for the non-call
+ * observers: `i in a`, for-in). */
+export function holeFencedArray(L: Lowerer, recv: IrExpr, what: string, loc: SrcLoc, undefOnly?: string): IrExpr {
+  const arrT = recv.type;
+  if (!L.undefSlots || arrT.kind !== "array") return recv;
+  const key = `holefence:${typeKey(arrT)}:${what}:${undefOnly ?? ""}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%undef.fence.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const a: IrExpr = { kind: "varRef", localId: "a.0", type: arrT, loc };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "a.0", name: "a", type: arrT }],
+      returnType: arrT,
+      locals: [{ id: "a.0", name: "a", type: arrT, mutable: false }],
+      body: [holeFenceStmt(a, what, loc, undefOnly), { kind: "return", value: a, loc }],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [recv], type: arrT, loc };
+}
+
+/** Unit U (SEMANTICS.md S119): a primitive receiver read for a MEMBER
+ * (`n.toFixed(2)`, `b.toString()`): Node throws a TypeError reading a
+ * member of undefined, so a receiver holding its slot's undefined throws
+ * that TypeError, with Node's text, instead of answering a NaN's or a
+ * stored 2's method. The operand passes through an interned
+ * `%undef.recv.<n>(x)` check helper. */
+export function undefRecvGuard(L: Lowerer, operand: IrExpr, member: string, loc: SrcLoc): IrExpr {
+  if (!mayHoldSlotUndef(L, operand)) return operand;
+  const t = operand.type;
+  const key = `undefrecv:${typeKey(t)}:${member}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%undef.recv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body: [
+        {
+          kind: "if",
+          cond: isUndefExpr(x, false, loc),
+          then: [
+            {
+              kind: "throw",
+              value: {
+                kind: "libCall",
+                fn: "error.new",
+                args: [{ kind: "strLit", value: `Cannot read properties of undefined (reading '${member}')`, type: STRING, loc }],
+                type: { kind: "object", className: "%TypeError" },
+                loc,
+              },
+              loc,
+            },
+          ],
+          else_: null,
+          loc,
+        },
+        { kind: "return", value: x, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [operand], type: t, loc };
+}
+
+/** Unit U (SEMANTICS.md S119): ToNumber of a number that may hold the f64
+ * slot's undefined — exactly that pattern becomes NaN (ToNumber(undefined));
+ * every other value passes through bit for bit (a real signaling NaN
+ * included, S100). A number that cannot hold it passes through. */
+export function toNumberCanon(L: Lowerer, e: IrExpr): IrExpr {
+  if (e.type.kind !== "f64" || !mayHoldSlotUndef(L, e)) return e;
+  const loc = e.loc;
+  return bindOnce(L, e, loc, (read) => ({
+    kind: "ternary",
+    cond: isUndefExpr(read, false, loc),
+    then: { kind: "numLit", value: NaN, type: F64, loc },
+    else_: read,
+    type: F64,
+    loc,
+  }));
+}
+
+/** Unit U: ToNumber of a boolean — `b ? 1 : 0`, and NaN for the bool
+ * slot's undefined. */
+export function boolToNumber(L: Lowerer, e: IrExpr, loc: SrcLoc): IrExpr {
+  const plain = (b: IrExpr): IrExpr => ({
+    kind: "ternary",
+    cond: b,
+    then: { kind: "numLit", value: 1, type: F64, loc },
+    else_: { kind: "numLit", value: 0, type: F64, loc },
+    type: F64,
+    loc,
+  });
+  if (!mayHoldSlotUndef(L, e)) return plain(e);
+  return bindOnce(L, e, loc, (read) => ({
+    kind: "ternary",
+    cond: isUndefExpr(read, false, loc),
+    then: { kind: "numLit", value: NaN, type: F64, loc },
+    else_: plain(read),
+    type: F64,
+    loc,
+  }));
+}
+
+/** Unit U: ToBoolean of a boolean that may hold the bool slot's undefined
+ * (2) — `!!b` reads it through the condition mask, answering false. */
+export function boolCanon(L: Lowerer, e: IrExpr): IrExpr {
+  if (e.type.kind !== "bool" || !mayHoldSlotUndef(L, e)) return e;
+  const loc = e.loc;
+  return { kind: "unary", op: "!", operand: { kind: "unary", op: "!", operand: e, type: BOOL, loc }, type: BOOL, loc };
+}
+
+/** Unit U (SEMANTICS.md S119): an OPTIONAL builtin argument holding its
+ * slot's undefined is an ABSENT argument in JS (`s.slice(0, undefined)`
+ * slices to the end) — `dflt` (the lowering's own completion of the
+ * omitted argument) replaces it at run time. */
+export function undefinedAsAbsent(L: Lowerer, e: IrExpr, dflt: IrExpr): IrExpr {
+  if (!mayHoldSlotUndef(L, e)) return e;
+  const loc = e.loc;
+  return bindOnce(L, e, loc, (read) => ({
+    kind: "ternary",
+    cond: isUndefExpr(read, false, loc),
+    then: dflt,
+    else_: read,
+    type: e.type,
+    loc,
+  }));
+}
+
+/** Unit U: `isUndef(e)` (negated: its `!`). */
+export function isUndefExpr(e: IrExpr, negated: boolean, loc: SrcLoc): IrExpr {
+  const test: IrExpr = { kind: "isUndef", operand: e, type: BOOL, loc };
+  return negated ? { kind: "unary", op: "!", operand: test, type: BOOL, loc } : test;
+}
 
 export function pureReemittable(e: IrExpr): boolean {
     if (e.kind === "varRef") return true;
@@ -3051,7 +3328,23 @@ export function pureReemittable(e: IrExpr): boolean {
       const right = L.jsvalIn(L.lowerExpr(expr.right), expr.right);
       return { kind: "nullish", left, right, type: JSVAL, loc };
     }
-    if (left.type.kind !== "union") return left;
+    const unitFree = left.type.kind === "union" && !(L.unions.get(left.type.unionId)?.arms.some(isUnitType) ?? true);
+    if (left.type.kind !== "union" || unitFree) {
+      // Unit U (SEMANTICS.md S119): a plain-typed left (or a union with no
+      // unit arm, holding its reserved undefined) can hold undefined on
+      // the WasmGC lanes — the default runs then. A default the left's
+      // slot cannot take keeps the historical fold.
+      const whole = mayHoldSlotUndef(L, left) ? L.mapTypeOf(L.typeOf(expr)) : null;
+      if (whole !== null && typeEquals(whole, left.type)) {
+        const right = L.lowerExprExpecting(expr.right, left.type);
+        if (typeEquals(right.type, left.type)) {
+          return bindOnce(L, left, loc, (read) => ({
+            kind: "ternary", cond: isUndefExpr(read, false, loc), then: right, else_: read, type: left.type, loc,
+          }));
+        }
+      }
+      return left;
+    }
     const def = L.unions.get(left.type.unionId);
     if (!def) L.badType(expr.left, L.typeOf(expr.left));
     if (!def.arms.some(isUnitType)) return left;
@@ -3444,6 +3737,35 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           recvNode,
           L.checker.getNonNullableType(L.checker.getTypeAtLocation(recvNode)),
         );
+      }
+      // Unit U (SEMANTICS.md S119): a plain-typed receiver can still hold
+      // undefined on the WasmGC lanes (`xs[i]?.name`) — the chain then
+      // short-circuits to the result slot's own undefined. The receiver
+      // evaluates once, into a hidden local the member lowering reads.
+      if (mayHoldSlotUndef(L, receiver) && !L.chainRecvByNode.has(recvNode)) {
+        const t = L.declareHiddenLocal("%chain", receiver.type);
+        const read: IrExpr = { kind: "varRef", localId: t.id, type: receiver.type, loc: receiver.loc };
+        L.chainRecvByNode.set(recvNode, read);
+        try {
+          const body = L.lowerExpr(expr);
+          if (body.type.kind !== "void" && body.type.kind !== "dyn" && body.type.kind !== "jsval" && !isUnitType(body.type)) {
+            return {
+              kind: "seqExpr",
+              stmts: [{ kind: "varDecl", localId: t.id, init: receiver, loc }],
+              result: { kind: "ternary", cond: isUndefExpr(read, false, loc), then: { kind: "slotUndef", type: body.type, loc }, else_: body, type: body.type, loc },
+              type: body.type,
+              loc,
+            };
+          }
+        } finally {
+          L.chainRecvByNode.delete(recvNode);
+          L.chainHandled.delete(dotNode);
+          if (!hadNarrow) L.chainNarrowedType.delete(recvNode);
+        }
+        L.chainHandled.add(dotNode);
+        if (!hadNarrow) {
+          L.chainNarrowedType.set(recvNode, L.checker.getNonNullableType(L.checker.getTypeAtLocation(recvNode)));
+        }
       }
       try {
         return L.lowerExpr(expr);
@@ -4338,7 +4660,8 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       if (!typeEquals(lowered.type, type.elem)) L.badType(el, L.typeOf(el));
       return lowered;
     });
-    return { kind: "arrayLit", elems, ...(spreads.length > 0 ? { spreads } : {}), type, loc };
+    const holes = L.undefSlots && expr.elements.some((el) => ts.isOmittedExpression(el));
+    return { kind: "arrayLit", elems, ...(spreads.length > 0 ? { spreads } : {}), ...(holes ? { holes: true as const } : {}), type, loc };
   }
 
 /** `{ a: 1, b: "x" }` → recordLit. The record type comes from the
@@ -7477,7 +7800,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
           return { kind: "libCall", fn: "num.fromString", args: [operand], type: F64, loc };
         }
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
-        return operand;
+        return toNumberCanon(L, operand);
       }
       case ts.SyntaxKind.ExclamationToken: {
         // `!x` is ToBoolean-then-negate: f64/string operands go through toBool.
@@ -9399,7 +9722,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       let kNode = expr.left;
       while (ts.isParenthesizedExpression(kNode)) kNode = kNode.expression;
       if (ts.isNumericLiteral(kNode) && L.mapTypeOf(L.typeOf(expr.right))?.kind === "array") {
-        const recvArr = L.lowerExpr(expr.right);
+        // Unit U (SEMANTICS.md S119 (b)): `i in a` tells a hole from
+        // undefined — fenced once the program made a hole.
+        const recvArr = holeFencedArray(L, L.lowerExpr(expr.right), "the 'in' operator", loc);
         if (recvArr.type.kind === "array") {
           const len: IrExpr = { kind: "arrIntrinsic", method: "length", receiver: recvArr, args: [], type: F64, loc };
           const n = Number(kNode.text);

@@ -27,6 +27,7 @@
  * refuses; refusals for arms a helper genuinely must read stay at the
  * emitter where the census lives. */
 import { Code } from "./code.js";
+import { UNDEF_UNION_TAG } from "./undef.js";
 import { emitFlat } from "./strings.js";
 import { isUnitType, type IrType } from "../../ir/nodes.js";
 import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.js";
@@ -148,7 +149,7 @@ export class UnionBuilder {
    * inspects `rep` itself, only threads it through to `arm`, so widening
    * it past `UnionArmRep` is a pure type-level change, no behavior
    * differs for the three existing callers). */
-  private dispatch<T>(c: Code, tagLocal: number, arms: readonly T[], arm: (rep: T, i: number) => void): void {
+  private dispatch<T>(c: Code, tagLocal: number, arms: readonly T[], arm: (rep: T, i: number) => void, onUndef?: () => void): void {
     c.localGet(0);
     c.structGet(this.base(), TAG);
     c.localSet(tagLocal);
@@ -161,6 +162,17 @@ export class UnionBuilder {
       c.return_();
       c.end();
     });
+    if (onUndef !== undefined) {
+      // Unit U (SEMANTICS.md S119): the reserved tag — undefined held by
+      // a union with no undefined arm.
+      c.localGet(tagLocal);
+      c.i32Const(UNDEF_UNION_TAG);
+      c.i32Eq();
+      c.ifVoid();
+      onUndef();
+      c.return_();
+      c.end();
+    }
     c.unreachable();
   }
 
@@ -214,7 +226,7 @@ export class UnionBuilder {
             c.i32Const(1);
             return;
         }
-      });
+      }, () => c.i32Const(0));
       this.mb.setBody(idx, [I32, F64], c.bytes());
       return idx;
     });
@@ -246,6 +258,14 @@ export class UnionBuilder {
       c.i32Ne();
       c.ifVoid();
       c.i32Const(0);
+      c.return_();
+      c.end();
+      // Unit U: both undefined (the reserved tag) — equal.
+      c.localGet(TAGL);
+      c.i32Const(UNDEF_UNION_TAG);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
       c.return_();
       c.end();
       arms.forEach((rep, i) => {
@@ -356,7 +376,7 @@ export class UnionBuilder {
           case "ref":
             throw new Error("ToString over a ref union arm (frontend fence breached)");
         }
-      });
+      }, () => this.deps.lit(c, "undefined"));
       this.mb.setBody(idx, [I32], c.bytes());
       return idx;
     });
@@ -403,7 +423,7 @@ export class UnionBuilder {
           case "ref":
             throw new Error("join over a bytes/ref union arm (front end's own join element fence breached)");
         }
-      });
+      }, () => this.deps.lit(c, ""));
       this.mb.setBody(idx, [I32], c.bytes());
       return idx;
     });

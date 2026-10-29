@@ -363,8 +363,10 @@ describe("board #139: emitCheckpointCore drains a fixed point — a listener-que
     ]);
     const hashA = createHash("sha256").update(readFileSync(pathA)).digest("hex");
     const hashB = createHash("sha256").update(readFileSync(pathB)).digest("hex");
-    expect(hashA).toBe("788640486a92bbd2305c29f1a87e08ca402dc070da81c392a517639797d583fd");
-    expect(hashB).toBe("5358571f89ac34cfd3e9c2214a54d2685dd9fac83ed0021f900c516d84ed8ddc");
+    // Re-pinned by unit U (SEMANTICS.md S119): the modules' shared helpers
+    // (%w.f64ToStr's undefined arm, the string equality's null test) grew.
+    expect(hashA).toBe("53433b3d810d6fa45fac7f24fc836c666ae0ca4c34b4999ba6a9e6712cb7cd5d");
+    expect(hashB).toBe("2e59a78ccd29d856cb58d75eb556fd4903c1e48f9e73884780dbd33bc51913f4");
   });
 
   // R139-g's oracle: rev-27's probe, rev27/probes/b1/139g-two-function-timer.cjs

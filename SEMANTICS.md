@@ -48,7 +48,18 @@ matching, not a divergence in itself (Node's own case conversion is also
 identity on a lone surrogate) — it rides this entry as an editorial
 addition to the tested-by list, not a new semantic claim.
 
-## S003 — Out-of-bounds array reads throw `RangeError` *(inherited)*
+## S003 — Out-of-bounds array reads throw `RangeError` *(inherited; the c and llvm lanes only since unit U)*
+
+**Unit U (2026-10-28, Joe's ruling "typed values hold `undefined` wherever
+JavaScript produces it — match Node"): RETIRED on the wasm and wasm-native
+lanes.** There an index naming no element (past the end, negative,
+fractional, NaN) reads the element kind's `undefined`, and a write past the
+end grows the array, leaving holes (S119 says how they are stored and which
+observers fence). The typed-array/Buffer amendment below is unchanged on
+every lane (a typed array element is still an unboxed number). The c and
+llvm lanes are transitional (they retire with N4) and keep the stance
+below: their IR is unchanged — the frontend emits unit U's shapes only for
+the wasm backends (`LowerOptions.undefSlots`).
 
 Arrays are dense; `a[i]` with `i` outside `[0, length)` throws `RangeError`
 instead of returning `undefined`. This is the static tier's largest deliberate
@@ -151,7 +162,11 @@ range is exotic. **Tested by:** the wasm emitter unit test pins one
 divergent-range comparison against this entry; corpus programs stay outside
 the divergent range (they must, to pass the Node differential).
 
-## S006 — `pop()` on an empty array throws `RangeError` *(inherited)*
+## S006 — `pop()` on an empty array throws `RangeError` *(inherited; the c and llvm lanes only since unit U)*
+
+**Unit U (2026-10-28): RETIRED on the wasm and wasm-native lanes** — an
+empty `pop()` answers the element kind's `undefined` and leaves the array
+as it was, as Node does (S119). The c and llvm lanes keep the stance below.
 
 `Array.prototype.pop` is typed as the ELEMENT (not `elem | undefined`), and
 popping an empty array throws `RangeError` instead of returning `undefined`
@@ -1776,7 +1791,12 @@ of. **Tested by:** the wasm emitter unit test (the record-overflow surface
 pin lives beside the ordering pin above; the dyn-object surface has no
 NEW pin since the gap predates this increment).
 
-## S032 — A dynamic-keyed record read with no representable "missing" answer TRAPS *(wasm tier)*
+## S032 — A dynamic-keyed record read with no representable "missing" answer TRAPS *(the c and llvm lanes only since unit U)*
+
+**Unit U (2026-10-28): RETIRED on the wasm and wasm-native lanes** — every
+typed slot now has a representable `undefined` (S119), so a missing key of
+a `Record<string, T>` / index-signature shape answers it, exactly Node's
+`undefined`. The c and llvm lanes keep the trap described below.
 
 `r[k]` on a record — hybrid (index-signature) or a signature-free shape
 whose declared fields share one common type — checks declared fields
@@ -8617,3 +8637,94 @@ list is `util.getSystemErrorMap()`'s names and texts, and `wn_os_names.h`'s
 tables are generated from the same lists); `packages/compiler/test/wasm-native.test.ts`'s
 cross-target row (an aarch64-linux build carries the host build's module byte
 for byte; macOS and Windows targets refuse by name).
+
+## S119 — Typed slots hold `undefined` on the WasmGC lanes; the observers that tell a hole from `undefined` or need a member of it are loud *(wasm and wasm-native; the c and llvm lanes keep S003, S006 and S032)*
+
+Joe's ruling (2026-10-28): a value TypeScript types as a plain `T` holds
+`undefined` wherever JavaScript produces it — an array read past the end
+(`xs[i]`, destructuring `const [a, b] = argv`), `pop()` of an empty array, a
+missing key of a `Record<string, T>` or index signature, a write past an
+array's end (the gap), a `T | undefined = undefined` default the checker
+narrows to `T` (GH #77), a `T`-typed field read before its first assignment
+(`x!: number`), `Array.from({ length })`'s unassigned slots, and a lying
+`undefined!` / `undefined as any as T`. On the WasmGC lanes each slot kind
+has one `undefined`: an f64 holds one signaling NaN (bits
+`0xFFF4756E64656600` — arithmetic quiets it, so `undefined + 1` is an
+ordinary `NaN`), a bool holds 2, a string and every other reference kind
+hold null, and a union holds its undefined arm or, lacking one, a reserved
+tag no arm has. Every observer answers Node's answer: printing and
+`String`/templates/concatenation (`undefined`, never quoted), `typeof`,
+`=== undefined` / `== null` / `??` / `?.` on a plain-typed value, strict
+equality (`xs[5] === xs[6]`), truthiness, `Number.isNaN` (false) and
+`isNaN` (true), `x++`'s value (`NaN`), relational comparison of strings
+(false), `JSON.stringify` (a field holding `undefined` is dropped, an
+element is `null`), `join` (empty), `includes` / `indexOf`, a crossing into
+`unknown` or `any` (the dynamic `undefined`, views included), and a wrap
+into a union (its `undefined`). ToNumber (`+x`, `Number(x)`, Math's
+arguments) answers `NaN` and ToBoolean (`Boolean(b)`) `false`; SameValue /
+SameValueZero (`Object.is`, Map keys, Set elements) tell `undefined` from
+`NaN`, and a string-keyed Map or Set takes `undefined` as a key of its own;
+an optional builtin argument holding `undefined` is absent (`s.slice(0, u)`
+runs to the end, `a.slice(0, u)` likewise, `join(u)` joins with ",",
+`split(u)` answers `[s]`, `padEnd(n, u)` pads with spaces) and a search
+string holding it is ToString'd (`"undefined"`); a destructuring default
+(`const {p = 9} = o`, `[z = 6]`, parameter patterns) and `x ??= e` fire
+for it; and a `Record` value holding it drops from `JSON.stringify`. A
+member read of a number, boolean or union holding `undefined`
+(`n.toFixed(2)`, `b.toString()`, `u.toString()`) throws Node's `TypeError:
+Cannot read properties of undefined (reading '…')`.
+
+What still parts from Node, each loudly:
+
+(a) **A member of a reference or string slot holding `undefined`.** `r.x`,
+`s.length`, `s.slice(1)`, `f()` on a record/class/array/string/function slot
+holding `undefined` trap (the WasmGC null dereference — uncatchable, exit 1)
+where Node throws a catchable `TypeError`. Uncaught, both exit 1 (S007);
+only a program that catches that `TypeError` differs. (`?.` on such a slot
+is exact.)
+
+(b) **Holes.** A write past the end stores the element's `undefined` in the
+gap, and so does an elision in an array literal (`[1, , 3]`, GH #85), so everything that reads a hole as `undefined` in Node is exact: index
+reads, `length`, for-of, spread, `Array.from`, `join`, `JSON.stringify`,
+`includes`, `find`/`findIndex`/`findLast`/`findLastIndex`, and a crossing
+into `any`. The observers that tell a hole from `undefined` — printing
+(`console.log`/`util.inspect`), `forEach`/`map`/`filter`/`some`/`every`/
+`reduce`/`reduceRight`/`flatMap`, `indexOf` of an `undefined` needle, the
+`in` operator over an array index and for-in over an array —
+throw a named, catchable `Error` ("<operation> over an array that may hold
+holes …", code SC1090) once the program has made a hole anywhere (a write
+past an end, or an elision) and the array holds an element's `undefined`. An array whose holes were all filled
+(the out-of-order fill) is exact everywhere; in a program that made a hole,
+an array holding an EXPLICIT `undefined` fences too (the over-approximation
+the missing per-element hole mark costs). `new Array(n)` stays a compile
+refusal.
+
+(c) **`sort`/`toSorted` of a plain-typed array holding `undefined`** throws
+a named `Error` (Node sorts `undefined` last without calling the
+comparator; union-element arrays with an undefined arm already did that and
+are exact).
+
+(d) **The one f64 pattern.** A double read from bytes (`readDoubleLE`,
+`DataView.getFloat64`) whose bits are exactly `0xFFF4756E64656600` reads as
+a `NaN` with its quiet bit set, where Node keeps the signaling bits — the
+same `NaN` to every observer but a write back to bytes (S036's territory).
+The host's own numbers (its imports) are trusted never to be that pattern.
+
+(e) **A union with no undefined arm holding `undefined`**, re-tagged into
+another union (a generator's yield, a re-tag helper), traps.
+
+(g) **`structuredClone` of a value holding a plain-typed `undefined`**
+(`structuredClone({ a: xs[3] })`) throws the checked crossing's catchable
+TypeError ("expected number at $.a, got undefined") where Node clones it.
+
+(f) **`util.format`'s `%j`, `%o`, `%O`** with a string-typed argument
+holding `undefined` render the string `"undefined"` (`%s` and `%d` are
+exact).
+
+**Rationale:** the ruling — the real-app trial's most common blocker. The
+cost of the representation is measured on three microbenchmarks in the
+unit's report; a later unit proves presence statically to drop the tests.
+**Tested by:** `packages/compiler/test/wasm-undefined-slots.test.ts` (each
+row against Node spawned at test time, on the wasm lane and — the native
+rows — on the wasm-native lane; (b) and (c) pinned by their fence text); the
+wasm and wasm-native censuses (every corpus program unchanged).

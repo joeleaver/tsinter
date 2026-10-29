@@ -705,6 +705,10 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
         // SEMANTICS.md S098): the fetch slice lowers without --dynamic
         // there; the native lanes keep the requires-dynamic diagnostic.
         ...(opts.backend === "wasm" || opts.backend === "wasm-native" ? { hostFetch: true } : {}),
+        // Unit U: the WasmGC lanes give every typed slot an undefined
+        // (SEMANTICS.md S003/S006/S032 are retired there); the native
+        // lanes keep trapping and their IR is unchanged.
+        ...(opts.backend === "wasm" || opts.backend === "wasm-native" ? { undefSlots: true } : {}),
         ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
       });
     } catch (e) {

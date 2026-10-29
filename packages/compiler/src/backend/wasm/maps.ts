@@ -93,6 +93,7 @@
  * (stage B) will instantiate val kinds this file's own Map/Set surface
  * never does (dyn refs, func closures, nested map/set refs) — nothing
  * here assumes val is scalar or non-recursive. */
+import { UNDEF_F64_BITS } from "./undef.js";
 import { BUF, LEN } from "./arrays.js";
 import { Code } from "./code.js";
 import { emitFlat } from "./strings.js";
@@ -300,8 +301,16 @@ export class MapBuilder {
       return;
     }
     if (m.keyKind === "str") {
+      // Unit U (SEMANTICS.md S119): an undefined key (null) hashes as 0
+      // (strEq tells it from "", which shares the bucket).
+      c.localGet(KL);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
       c.localGet(KL);
       c.arrayLen();
+      c.end();
       c.localSet(L);
       c.i32Const(0);
       c.localSet(ACC);
@@ -371,6 +380,19 @@ export class MapBuilder {
       c.localGet(B);
       c.localGet(B);
       c.f64Ne();
+      c.i32And();
+      // Unit U (SEMANTICS.md S119): the f64 undefined is a NaN pattern but
+      // a different key from NaN — two "NaNs" are one key only when both
+      // or neither are undefined.
+      c.localGet(A);
+      c.i64ReinterpretF64();
+      c.i64Const(UNDEF_F64_BITS);
+      c.i64Eq();
+      c.localGet(B);
+      c.i64ReinterpretF64();
+      c.i64Const(UNDEF_F64_BITS);
+      c.i64Eq();
+      c.i32Eq();
       c.i32And();
       c.i32Or();
       return;
@@ -1654,7 +1676,8 @@ export class MapBuilder {
       c.structGet(vecStruct, BUF);
       c.localGet(I);
       c.arrayGet(vecBufType);
-      if (this.isRefKeyKind(m.keyKind)) c.refAsNonNull();
+      // (unit U, SEMANTICS.md S119: an undefined string element is a key)
+      if (this.isRefKeyKind(m.keyKind) && m.keyKind !== "str") c.refAsNonNull();
       // A string[] seed holds string VALUES; the key store is flat.
       if (m.keyKind === "str") emitFlat(c, this.deps.strType());
       c.f64Const(0);

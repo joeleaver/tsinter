@@ -18,7 +18,7 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { droppableStatic, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
+import { boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, toNumberCanon, undefRecvGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -2942,6 +2942,12 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           };
           return { node: a, value: boxed, noSpecs: "function values (Node's %s prints the function's source text)" };
         }
+        // Unit U (SEMANTICS.md S119): a string slot holding undefined
+        // prints `undefined` — and, as a first argument, is no format
+        // string (the text has no '%', so the runtime scan splices nothing).
+        if (lowered.type.kind === "string" && mayHoldSlotUndef(L, lowered)) {
+          return { node: a, value: undefinedAsText(L, lowered, loc) };
+        }
         return { node: a, value: lowered };
       });
       // A RUNTIME first string with further arguments (board #237): Node's
@@ -3192,20 +3198,11 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // preserved). This also admits mixed-kind operands with no VALUE
       // representation (`Boolean(rec && list.some(f))` — a record and a
       // bool) that a value lowering of the `&&` would fence on.
-      if (name === "Boolean") return L.lowerCondition(argNode);
+      if (name === "Boolean") return boolCanon(L, L.lowerCondition(argNode));
       const arg = L.lowerExpr(argNode);
       if (name === "String") return L.ensureString(arg, argNode);
-      if (arg.type.kind === "f64") return arg;
-      if (arg.type.kind === "bool") {
-        return {
-          kind: "ternary",
-          cond: arg,
-          then: { kind: "numLit", value: 1, type: F64, loc },
-          else_: { kind: "numLit", value: 0, type: F64, loc },
-          type: F64,
-          loc,
-        };
-      }
+      if (arg.type.kind === "f64") return toNumberCanon(L, arg);
+      if (arg.type.kind === "bool") return boolToNumber(L, arg, loc);
       if (arg.type.kind === "string") {
         return { kind: "libCall", fn: "num.fromString", args: [arg], type: F64, loc };
       }
@@ -4708,7 +4705,7 @@ const inliningPredicates = new Set<ts.Symbol>();
     const recvKind = L.mapTypeOf(L.typeOf(access.expression))?.kind;
     if (recvKind !== "f64" && recvKind !== "bool" && recvKind !== "string") return null;
     if (!L.isStdlibMember(access)) return null;
-    const operand = L.lowerExpr(access.expression);
+    const operand = undefRecvGuard(L, L.lowerExpr(access.expression), "toString", locOf(call));
     if (operand.type.kind === "string") return operand; // identity, receiver evaluated
     if (operand.type.kind !== "f64" && operand.type.kind !== "bool") return null;
     return { kind: "toString", operand, type: STRING, loc: locOf(call) };
@@ -4736,7 +4733,9 @@ const inliningPredicates = new Set<ts.Symbol>();
         (a.kind === "bytes" && a.elem === "u8"),
     );
     if (!stringable) return null;
-    const operand = L.lowerExpr(access.expression);
+    // Unit U (SEMANTICS.md S119): a union holding undefined throws Node's
+    // TypeError reading the member.
+    const operand = undefRecvGuard(L, L.lowerExpr(access.expression), "toString", locOf(call));
     if (operand.type.kind !== "union") return null;
     return { kind: "toString", operand, type: STRING, loc: locOf(call) };
   }
@@ -4887,20 +4886,20 @@ const inliningPredicates = new Set<ts.Symbol>();
     if (recvKind !== "f64" && recvKind !== "bool" && recvKind !== "string") return null;
     const loc = locOf(call);
     if (name === "toString" && call.arguments.length === 0) {
-      const operand = L.lowerExpr(recv);
+      const operand = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
       if (operand.type.kind === "string") return operand; // identity
       if (operand.type.kind !== "f64" && operand.type.kind !== "bool") return null;
       return { kind: "toString", operand, type: STRING, loc };
     }
     if ((name === "toExponential" || name === "toFixed") && recvKind === "f64" &&
         call.arguments.length === 0) {
-      const operand = L.lowerExpr(recv);
+      const operand = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
       if (operand.type.kind !== "f64") return null;
       const fn = name === "toExponential" ? "num.toExponential" : "num.toFixed0";
       return { kind: "libCall", fn, args: [operand], type: STRING, loc };
     }
     if (name === "toFixed" && recvKind === "f64" && call.arguments.length === 1) {
-      const operand = L.lowerExpr(recv);
+      const operand = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
       let digits = L.lowerExpr(call.arguments[0]!);
       // The optional parameter also admits undefined. Exact unit values
       // become the default 0 after preserving any evaluation effects; an
@@ -4967,7 +4966,7 @@ const inliningPredicates = new Set<ts.Symbol>();
             "everything else is ICU data the binary does not carry",
         );
       }
-      const operand = L.lowerExpr(recv);
+      const operand = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
       if (operand.type.kind !== "f64") return null;
       return { kind: "libCall", fn: "intl.numFormatEnUs", args: [operand], type: STRING, loc };
     }

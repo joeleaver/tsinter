@@ -16,6 +16,7 @@
  * Correctness bar: byte-exact against Node — S001's fuzz gate pins the
  * emitted formatter over 10^5 doubles plus the edge corpus in the wasm
  * emitter unit test, and every claimed corpus program re-checks it. */
+import { UNDEF_F64_BITS } from "./undef.js";
 import { Code } from "./code.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 import {
@@ -866,6 +867,17 @@ export function buildF64ToStr(
     c.localGet(X);
     c.f64Ne();
     c.ifVoid();
+    // Unit U (SEMANTICS.md S119): the f64 slot's undefined is one NaN
+    // pattern, and its ToString is "undefined" (a module without undef
+    // slots never holds the pattern — arithmetic cannot make it).
+    c.localGet(X);
+    c.i64ReinterpretF64();
+    c.i64Const(UNDEF_F64_BITS);
+    c.i64Eq();
+    c.ifVoid();
+    lit("undefined");
+    c.return_();
+    c.end();
     lit("NaN");
     c.return_();
     c.end();

@@ -6995,6 +6995,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         E.line(`${retainCallC(e.type, t.name)};`);
         return t;
       }
+      case "slotUndef":
+      case "isUndef":
+      case "arrHasUndef":
+        // Unit U: undefSlots modules exist only on the WasmGC lanes
+        // (compile() sets the option for --backend wasm / wasm-native);
+        // the native lanes keep SEMANTICS.md S003/S006/S032.
+        throw new Error(`${e.kind} reached a native backend (undefSlots is a WasmGC-lane module flag)`);
       default: {
         const _exhaustive: never = e;
         void _exhaustive;

@@ -812,6 +812,11 @@ export interface IrModule {
    * emissions stay conformance-identical by construction. Absent on every
    * executable build (the backends emit main() exactly as always). */
   lib?: IrLibSection;
+  /** Unit U: typed slots carry `undefined` (slotUndef / isUndef may
+   * appear, and the backend answers a read past an array's end, a pop of
+   * an empty array and a missing record key with the slot's undefined
+   * instead of trapping). Set for the WasmGC lanes only. */
+  undefSlots?: true;
 }
 
 /** One outbound native FFI declaration, copied from the validated format-1
@@ -1238,8 +1243,10 @@ export type IrStmt =
     }
   /** Element write `a[i] = v` — statement-only, like `assign`. Valid indices
    * are [0, length]; i == length appends (JS would create a hole past that —
-   * scriptc traps instead, see SEMANTICS.md). Ownership of a refcounted
-   * value MOVES into the array; the replaced element is released. */
+   * scriptc traps instead, see SEMANTICS.md; in an `undefSlots` module the
+   * array grows and the gap holds the element's undefined, S119). Ownership
+   * of a refcounted value MOVES into the array; the replaced element is
+   * released. */
   | { kind: "arraySet"; arr: IrExpr; index: IrExpr; value: IrExpr; loc: SrcLoc }
   /** Typed-array element write `b[i] = v` — arraySet's sibling for bytes
    * receivers: statement-only, receiver and index like bytesIntrinsic
@@ -4241,6 +4248,29 @@ export type IrExpr =
    * standalone runtime value, so a bare unitLit anywhere else is a
    * validator error and an emitter bug. */
   | { kind: "unitLit"; unit: "undefined" | "null"; type: IrType; loc: SrcLoc }
+  /** Unit U (Joe's 2026-10-28 ruling): the `undefined` a PLAIN slot of
+   * `type` holds — f64, bool, string, every ref kind, or a union (whose
+   * undefined is its undefined arm, or the reserved-tag instance when it
+   * has none). Exists only in modules lowered with `undefSlots` (the
+   * WasmGC lanes; the validator rejects it elsewhere): undefined flowing
+   * into a plain slot the checker approved (`c: string | undefined =
+   * undefined` narrowed to string, a lying `undefined!`) carries it,
+   * where the native lanes throw the stranded-unit TypeError. */
+  | { kind: "slotUndef"; type: IrType; loc: SrcLoc }
+  /** Unit U: true iff `operand` (a non-unit, non-dynamic value) holds its
+   * slot kind's undefined (`slotUndef`) — `x === undefined`, `x == null`,
+   * `typeof x`, `x ?? d` on a value TypeScript types as a plain `T` that
+   * JS can still leave undefined (an array read past the end, a missing
+   * record key). `undefSlots` modules only. Evaluates the operand once. */
+  | { kind: "isUndef"; operand: IrExpr; type: IrType; loc: SrcLoc }
+  /** Unit U: does array `arr` hold an element of its kind's undefined?
+   * With `holes`, only once the program has made a HOLE somewhere (a
+   * write past an array's end) — this tier stores a hole as the element's
+   * undefined, so such an element may be one. The guard behind the loud
+   * fences of the operations where Node tells a hole from undefined
+   * (printing, the hole-skipping callbacks, indexOf) and of sort's
+   * undefined-last rule. `undefSlots` modules only; bool. */
+  | { kind: "arrHasUndef"; arr: IrExpr; holes?: true; type: IrType; loc: SrcLoc }
   | { kind: "varRef"; localId: string; type: IrType; loc: SrcLoc }
   /** Numeric operands; comparisons yield bool. `===`/`!==` additionally
    * accept two same-typed arrays: reference identity (pointer compare),
@@ -4412,7 +4442,17 @@ export type IrExpr =
    * untouched). Allocates; the result is owned (+1); ownership of
    * refcounted plain elements MOVES into the array, spread sources are
    * BORROWED (their elements copy in retained). */
-  | { kind: "arrayLit"; elems: IrExpr[]; spreads?: number[]; type: IrType; loc: SrcLoc }
+  | {
+      kind: "arrayLit";
+      elems: IrExpr[];
+      spreads?: number[];
+      /** Unit U (`undefSlots` modules only): the literal has an elision
+       * (`[1, , 3]`) — a HOLE, stored as the element's undefined; building
+       * it raises the module's holes flag (SEMANTICS.md S119 (b)). */
+      holes?: true;
+      type: IrType;
+      loc: SrcLoc;
+    }
   /** Mapper-less `Array.from({ length: n })` — a length-n array of ABSENT
    * slots: unions carrying an undefined arm hold the interned undefined
    * instance (reads are JS-exact), every other refcounted element kind
@@ -4424,7 +4464,8 @@ export type IrExpr =
    * an empty array). Allocates; the result is owned (+1). */
   | { kind: "arrayNewLen"; length: IrExpr; type: IrType; loc: SrcLoc }
   /** Element read `a[i]`. Index is f64; a non-integer or out-of-bounds index
-   * traps at runtime (JS returns undefined — documented divergence). For
+   * traps at runtime (JS returns undefined — documented divergence; in an
+   * `undefSlots` module it reads the element kind's undefined, S119). For
    * refcounted elements the result is a fresh owned (+1) reference. */
   | { kind: "arrayGet"; arr: IrExpr; index: IrExpr; type: IrType; loc: SrcLoc }
   /** Array method/property on an array receiver: `length` (f64), `push`

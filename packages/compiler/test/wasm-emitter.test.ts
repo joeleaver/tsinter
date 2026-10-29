@@ -4676,14 +4676,11 @@ test("S031 amendment: `__proto__` is an ordinary overflow key, not the prototype
   );
 });
 
-test("S032: a dynamic-keyed record read with no representable \"missing\" answer TRAPS", async () => {
-  // S003's array-OOB stance applied to the record surface: a bare `V` with
-  // no undefined arm can't answer `undefined` for a miss, so it traps
-  // instead. No corpus program can pin the trap for the same S003 reason
-  // (the harness skips the stderr compare on nonzero exit; only the exit
-  // code and PRECEDING stdout need to match, and they do — Node itself
-  // prints `undefined` and keeps running, so a corpus program observing
-  // this exact read fails the differential by construction).
+test("S032 retired by unit U (S119): a dynamic-keyed record read with no undefined arm answers the slot's undefined, as Node does", async () => {
+  // S032 trapped here: a bare `V` had no representable undefined. On the
+  // WasmGC lanes every typed slot holds one now (SEMANTICS.md S119), so
+  // the miss reads it — Node prints `undefined` and keeps running, and so
+  // does this tier. (The c and llvm lanes keep S032's trap.)
   const trapRes = await buildWasm(
     "record-miss-trap.ts",
     [
@@ -4693,13 +4690,13 @@ test("S032: a dynamic-keyed record read with no representable \"missing\" answer
       "}",
       "console.log('pre');",
       "const r: Basic = { known: 1 };",
-      "console.log(r.missing);",
+      "console.log(r.missing, r.missing === undefined, typeof r.missing);",
       "",
     ].join("\n"),
   );
   if (!trapRes.ok) throw new Error(`refused: ${trapRes.diagnostics[0]?.message}`);
-  const trapRun = await runWasmToTrap(trapRes.binaryPath);
-  expect(trapRun.stdout.toString("utf8")).toBe("pre\n");
+  const missRun = await runWasm(trapRes.binaryPath);
+  expect(missRun.stdout.toString("utf8")).toBe("pre\nundefined true undefined\n");
 
   // The SAME miss, but the index signature's value type carries its own
   // undefined arm (S032's "explicit annotation" branch of the "V |

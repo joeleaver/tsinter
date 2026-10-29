@@ -297,6 +297,7 @@ import {
 } from "./stream.js";
 import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
+import { UNDEF_BOOL, UNDEF_F64_BITS, UNDEF_UNION_TAG } from "./undef.js";
 import { Code, ENGINE_MEMORY, setCharsType } from "./code.js";
 import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -323,6 +324,59 @@ export { WasmUnsupportedError } from "./unsupported.js";
  * blunt-on-purpose precedent below): the closure may sit under a wrapper,
  * and any closure naming the id would otherwise capture the slot before
  * its box exists. */
+/** Unit U: can this expression's value be its slot kind's undefined? False
+ * for fresh values — literals, arithmetic, comparisons, conversions. */
+function mayBeSlotUndef(e: WExpr): boolean {
+  switch (e.kind) {
+    case "numLit":
+    case "strLit":
+    case "boolLit":
+    case "bin":
+    case "unary":
+    case "strConcat":
+    case "toString":
+    case "toBool":
+    case "strEq":
+    case "strCmp":
+    case "isUndef":
+    case "arrayLit":
+    case "recordLit":
+    case "closure":
+    case "classRef":
+    case "new":
+      return false;
+    default:
+      return true;
+  }
+}
+
+/** Unit U: a bool expression that only ever answers 0 or 1 (never the
+ * stored bool undefined, 2) — comparisons, tests and conversions. */
+function canonicalBool(e: WExpr): boolean {
+  switch (e.kind) {
+    case "boolLit":
+    case "bin":
+    case "unary":
+    case "toBool":
+    case "strEq":
+    case "strCmp":
+    case "unionIsTag":
+    case "unionEq":
+    case "isUndef":
+    case "instanceOf":
+    case "dynTest":
+    case "dynHasKey":
+    case "dynScalarEq":
+      return true;
+    case "logical":
+      return canonicalBool(e.left as WExpr) && canonicalBool(e.right as WExpr);
+    case "ternary":
+      return canonicalBool(e.then as WExpr) && canonicalBool(e.else_ as WExpr);
+    default:
+      return false;
+  }
+}
+
 function capturesOwnBinding(init: unknown, localId: string): boolean {
   const seen = new Set<object>();
   const visit = (v: unknown): boolean => {
@@ -2759,6 +2813,9 @@ class Assembler {
    * node (hasStrConcat, strings unit S2) or a slice view (strViewsLive): the
    * flatten crossing, value positions and lazy shadows follow it. */
   private readonly nodesLive: boolean;
+  /** Unit U (SEMANTICS.md S119): the module was lowered with undefSlots —
+   * every typed slot can hold its kind's undefined. */
+  private readonly undefSlots: boolean;
   /** Strings unit S3: whether this module can build a slice view
    * (hasStrView — slices.ts). */
   private readonly strViewsLive: boolean;
@@ -3031,6 +3088,7 @@ class Assembler {
     this.strViewsLive = hasStrView(mod);
     this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper(), this.strViewsLive);
     this.nodesLive = this.strViewsLive || hasStrConcat(mod);
+    this.undefSlots = (mod as { undefSlots?: true }).undefSlots === true;
     setFlatCrossing(this.nodesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
     // Phase 2 E0/E1: a module that reaches the island engine carries it
     // (engine.ts), and the engine's code owns memory 0 — so the decision
@@ -6385,6 +6443,10 @@ class Assembler {
       c.globalGet(this.dyn.undefinedGlobal());
     } else if (t.kind === "union" && this.undefinedArmTag(t.unionId) >= 0) {
       c.globalGet(this.unions.unitGlobal(this.undefinedArmTag(t.unionId)));
+    } else if (this.undefSlots) {
+      // Unit U (SEMANTICS.md S119): the plain slot's own undefined —
+      // Node's answer for a key the record does not have.
+      this.emitSlotUndef(t, loc, c);
     } else {
       c.unreachable();
     }
@@ -15707,6 +15769,16 @@ class Assembler {
   private emitDynFromBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined): boolean {
     const c = w.c;
     const dyn = this.dyn;
+    if (this.undefSlots && t.kind !== "dyn" && t.kind !== "jsval" && !isUnitType(t) && t.kind !== "void" && t.kind !== "caught") {
+      // Unit U (SEMANTICS.md S119): a typed slot's undefined crosses as
+      // the dynamic undefined.
+      c.localGet(0);
+      this.emitIsUndefOnStack(t, c, this.wlocal(w, I32));
+      c.ifVoid();
+      c.globalGet(dyn.undefinedGlobal());
+      c.return_();
+      c.end();
+    }
     switch (t.kind) {
       case "f64":
         dyn.boxNum(c, (x) => x.localGet(0));
@@ -16218,12 +16290,35 @@ class Assembler {
   private emitJsonWriteBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined): boolean {
     const c = w.c;
     const json = this.json;
+    if (this.undefSlots && t.kind !== "f64" && t.kind !== "bool" && t.kind !== "string" && t.kind !== "dyn" && t.kind !== "jsval" && !isUnitType(t)) {
+      // Unit U (SEMANTICS.md S119): a composite holding its slot's
+      // undefined serializes as null here (an array element; a record
+      // field holding it was dropped by its caller).
+      c.localGet(0);
+      this.emitIsUndefOnStack(t, c, this.wlocal(w, I32));
+      c.ifVoid();
+      this.pushStrLitInto(c, "null");
+      c.call(json.jbPuts());
+      c.return_();
+      c.end();
+    }
     switch (t.kind) {
       case "f64":
         c.localGet(0);
         c.call(json.jbPutF64());
         return true;
       case "bool":
+        if (this.undefSlots) {
+          // Unit U: the bool undefined (2) serializes as null.
+          c.localGet(0);
+          c.i32Const(UNDEF_BOOL);
+          c.i32Eq();
+          c.ifVoid();
+          this.pushStrLitInto(c, "null");
+          c.call(json.jbPuts());
+          c.return_();
+          c.end();
+        }
         c.localGet(0);
         c.ifResult(this.strRef);
         this.pushStrLitInto(c, "true");
@@ -16233,6 +16328,17 @@ class Assembler {
         c.call(json.jbPuts());
         return true;
       case "string":
+        if (this.undefSlots) {
+          // Unit U: an undefined string element serializes as null (a
+          // record field holding it was dropped by its caller).
+          c.localGet(0);
+          c.refIsNull();
+          c.ifVoid();
+          this.pushStrLitInto(c, "null");
+          c.call(json.jbPuts());
+          c.return_();
+          c.end();
+        }
         c.localGet(0);
         this.emitFlat(c);
         c.call(json.jbPutStr());
@@ -16316,7 +16422,11 @@ class Assembler {
         // index-signature shape ALSO forces the runtime flag (increment
         // 17 stage B) — overflow entries have an unpredictable count, so
         // static comma placement can never cover them.
-        const droppable = fields.some((f) => this.undefinedArmTag2(f.type) >= 0) || info.overflow !== null;
+        // Unit U (SEMANTICS.md S119): every plain field can hold its slot's
+        // undefined, which drops like the undefined arm does.
+        const slotDrop = (ft: IrType): boolean =>
+          this.undefSlots && ft.kind !== "dyn" && ft.kind !== "jsval" && !isUnitType(ft) && ft.kind !== "void";
+        const droppable = fields.some((f) => this.undefinedArmTag2(f.type) >= 0 || slotDrop(f.type)) || info.overflow !== null;
         if (!droppable) {
           for (let i = 0; i < fields.length; i++) {
             const f = fields[i]!;
@@ -16348,7 +16458,14 @@ class Assembler {
           const slot = info.fieldIndex.get(f.name);
           if (inner === null || slot === undefined) return false;
           const utag = this.undefinedArmTag2(f.type);
-          if (utag >= 0) {
+          const udrop = slotDrop(f.type);
+          if (udrop) {
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            this.emitIsUndefOnStack(f.type, c, this.wlocal(w, I32));
+            c.i32Eqz();
+            c.ifVoid();
+          } else if (utag >= 0) {
             c.localGet(0);
             c.structGet(info.struct, slot);
             c.structGet(this.unions.base(), 0);
@@ -16373,7 +16490,7 @@ class Assembler {
           c.localGet(0);
           c.structGet(info.struct, slot);
           c.call(inner);
-          if (utag >= 0) c.end();
+          if (udrop || utag >= 0) c.end();
         }
         if (info.overflow !== null) {
           // OVERFLOW entries in JS own-key order, after every declared
@@ -16448,6 +16565,7 @@ class Assembler {
           c.localSet(oval);
           c.drop();
           const ovfUtag = this.undefinedArmTag2(ovfType);
+          const ovfSlotDrop = !ovfIsDyn && slotDrop(ovfType);
           if (ovfIsDyn) {
             // putDyn's own absence rule (undefined OR function), read
             // straight off the entry's kind tag — no side effects, so
@@ -16464,6 +16582,13 @@ class Assembler {
             c.i32Const(DK.FUNC);
             c.i32Eq();
             c.i32Or();
+            c.i32Eqz();
+            c.ifVoid();
+          } else if (ovfSlotDrop) {
+            // Unit U (SEMANTICS.md S119): an overflow value holding its
+            // slot's undefined drops, as `{a: undefined}` does in Node.
+            c.localGet(oval);
+            this.emitIsUndefOnStack(ovfType, c, this.wlocal(w, I32));
             c.i32Eqz();
             c.ifVoid();
           } else if (ovfUtag >= 0) {
@@ -16504,7 +16629,7 @@ class Assembler {
             if (ovfWriter === null) throw new Error("wasm emitter bug: overflow JSON writer missing for a concrete index value");
             c.call(ovfWriter);
           }
-          if (ovfIsDyn || ovfUtag >= 0) c.end();
+          if (ovfIsDyn || ovfSlotDrop || ovfUtag >= 0) c.end();
           c.localGet(oi);
           c.i32Const(1);
           c.i32Add();
@@ -19140,7 +19265,7 @@ class Assembler {
         return;
       }
       case "if":
-        this.walkExpr(s.cond);
+        this.walkCond(s.cond);
         this.openIf();
         this.walkBody(s.then);
         if (s.else_ !== null) {
@@ -19156,7 +19281,7 @@ class Assembler {
         const breakPos = this.openBlock();
         const continuePos = this.openLoop();
         this.fn.control.push({ kind: "loop", labels: s.labels ?? [], breakPos, continuePos });
-        this.walkExpr(s.cond);
+        this.walkCond(s.cond);
         code.i32Eqz();
         this.brTo(breakPos, true);
         this.walkBody(s.body);
@@ -19177,7 +19302,7 @@ class Assembler {
         this.walkBody(s.body);
         this.fn.control.pop();
         this.close();
-        this.walkExpr(s.cond);
+        this.walkCond(s.cond);
         this.brTo(loopPos, true);
         this.close();
         this.close();
@@ -19191,7 +19316,7 @@ class Assembler {
         const breakPos = this.openBlock();
         const loopPos = this.openLoop();
         if (s.cond !== null) {
-          this.walkExpr(s.cond);
+          this.walkCond(s.cond);
           code.i32Eqz();
           this.brTo(breakPos, true);
         }
@@ -20173,6 +20298,18 @@ class Assembler {
 
   /* ── expressions ────────────────────────────────────────────────────── */
 
+  /** A bool consumed as a CONDITION (if/while/for/ternary tests, `!`).
+   * Unit U (SEMANTICS.md S119): a bool read from storage may be the bool
+   * undefined (2), which is falsy — the condition reads it through `& 1`.
+   * Producers that only ever answer 0/1 skip the mask. */
+  private walkCond(e: WExpr): void {
+    this.walkExpr(e);
+    if (this.undefSlots && e.type.kind === "bool" && !canonicalBool(e)) {
+      this.fn.code.i32Const(1);
+      this.fn.code.i32And();
+    }
+  }
+
   /** Emits the expression's value onto the wasm stack. On refusal (survey
    * path) the value is one `unreachable` and the operands stay unwalked.
    * A string-typed expression always leaves a FLAT `(ref null $chars)`
@@ -20184,7 +20321,7 @@ class Assembler {
     if (e.kind === "varRef" && e.type.kind === "string" && this.readFlatShadow(e.localId, e.loc)) return;
     if (this.nodesLive && e.type.kind === "string" && e.kind === "ternary") {
       // Read flat: each arm flat (walkExprValue's value twin keeps nodes).
-      this.walkExpr(e.cond);
+      this.walkCond(e.cond);
       this.openIfResult(this.strRef);
       this.walkExpr(e.then);
       this.fn.code.else_();
@@ -20200,7 +20337,9 @@ class Assembler {
     if (e.kind === "strConcat") {
       // Read flat on the spot: one flat copy, never a node to flatten.
       this.walkExpr(e.left);
+      if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
       this.walkExpr(e.right);
+      if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
       this.fn.code.call(this.ropes.flatCat());
       this.emitPendingCheck(); // past the length limit: RangeError
       return;
@@ -20629,11 +20768,17 @@ class Assembler {
               return;
             }
             this.walkExpr(e.operand);
+            if (this.undefSlots && mayBeSlotUndef(e.operand as WExpr)) {
+              // Unit U (SEMANTICS.md S119): negation only flips the sign
+              // bit, so the undefined pattern would survive `-(-x)` —
+              // ToNumber the operand first (the pattern becomes NaN).
+              this.emitUndefPatternToNaN();
+            }
             code.f64Neg();
             return;
           }
           case "!":
-            this.walkExpr(e.operand);
+            this.walkCond(e.operand);
             code.i32Eqz();
             return;
           case "~":
@@ -20655,6 +20800,13 @@ class Assembler {
           if (e.op === "+") code.f64Add();
           else code.f64Sub();
         };
+        // Unit U (SEMANTICS.md S119): postfix yields ToNumeric(old) — the
+        // f64 undefined becomes an ordinary NaN (× 1 is exact for every
+        // other value, -0 included).
+        const toNumeric = (): void => {
+          if (!this.undefSlots) return;
+          this.emitUndefPatternToNaN();
+        };
         const global = this.globalById.get(e.localId);
         if (global !== undefined) {
           const idx = this.globalIndex(global, e.loc);
@@ -20665,6 +20817,7 @@ class Assembler {
             code.globalGet(idx);
           } else {
             code.globalGet(idx); // the result: the old value
+            toNumeric();
             code.globalGet(idx);
             add();
             code.globalSet(idx);
@@ -20694,6 +20847,7 @@ class Assembler {
             add();
             code.structSet(box, 0);
             code.localGet(n); // the result: the old value
+            toNumeric();
           }
           this.releaseScratch(F64, n);
           return;
@@ -20704,6 +20858,7 @@ class Assembler {
           code.localTee(idx);
         } else {
           code.localGet(idx); // the result: the old value
+          toNumeric();
           code.localGet(idx);
           add();
           code.localSet(idx);
@@ -20750,6 +20905,13 @@ class Assembler {
           // real branch. Every other ref kind (a generator, map, promise,
           // ...) is an object too — board #204's kept operands reach them.
           this.walkExpr(e.operand);
+          if (this.undefSlots && k !== "procStream") {
+            // Unit U (SEMANTICS.md S119): the slot's undefined is null —
+            // falsy; every object is still truthy.
+            code.refIsNull();
+            code.i32Eqz();
+            return;
+          }
           code.drop();
           code.i32Const(1);
           return;
@@ -20860,7 +21022,7 @@ class Assembler {
         if (e.type.kind === "void") {
           // Both arms are void calls (`c ? f() : g()` in statement
           // position) — a plain if.
-          this.walkExpr(e.cond);
+          this.walkCond(e.cond);
           this.openIf();
           this.walkExpr(e.then);
           code.else_();
@@ -20877,7 +21039,7 @@ class Assembler {
         // (strings unit S2: `s = c ? s + x : y + s` stays a node; walkExpr
         // has the flat twin).
         const arm = (x: WExpr): void => (this.nodesLive ? this.walkValue(x) : this.walkExpr(x));
-        this.walkExpr(e.cond);
+        this.walkCond(e.cond);
         this.openIfResult(t);
         arm(e.then);
         code.else_();
@@ -20900,6 +21062,36 @@ class Assembler {
         return;
 
       case "strCmp": {
+        if (this.undefSlots && (mayBeSlotUndef(e.left as WExpr) || mayBeSlotUndef(e.right as WExpr))) {
+          // Unit U (SEMANTICS.md S119): a relational comparison with an
+          // undefined side compares NaN — false for every operator.
+          const l = this.acquireScratch(this.strRef);
+          const r = this.acquireScratch(this.strRef);
+          this.walkExpr(e.left);
+          code.localSet(l);
+          this.walkExpr(e.right);
+          code.localSet(r);
+          code.localGet(l);
+          code.refIsNull();
+          code.localGet(r);
+          code.refIsNull();
+          code.i32Or();
+          this.openIfResult(I32);
+          code.i32Const(0);
+          code.else_();
+          code.localGet(l);
+          code.localGet(r);
+          code.call(this.strCmpHelper(e.utf16 === true));
+          code.i32Const(0);
+          if (e.op === "<") code.i32LtS();
+          else if (e.op === "<=") code.i32LeS();
+          else if (e.op === ">") code.i32GtS();
+          else code.i32GeS();
+          this.close();
+          this.releaseScratch(this.strRef, r);
+          this.releaseScratch(this.strRef, l);
+          return;
+        }
         this.walkExpr(e.left);
         this.walkExpr(e.right);
         code.call(this.strCmpHelper(e.utf16 === true));
@@ -20915,7 +21107,9 @@ class Assembler {
         // A VALUE: a concatenation node at 13 code units or more
         // (strings unit S2, ropes.ts) — `s += x` in a loop is linear.
         this.walkValue(e.left);
+        if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText();
         this.walkValue(e.right);
+        if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText();
         code.call(this.ropes.cat());
         this.emitPendingCheck(); // past the length limit: RangeError
         return;
@@ -20926,6 +21120,12 @@ class Assembler {
         if (info === null) {
           code.unreachable();
           return;
+        }
+        if (e.holes === true) {
+          // Unit U (SEMANTICS.md S119 (b)): an elision is a hole — raise
+          // the module's holes flag before building.
+          code.i32Const(1);
+          code.globalSet(this.holesMadeGlobal());
         }
         const spreads = new Set(e.spreads ?? []);
         // Fast path — plain literals build the exact-size buffer straight
@@ -21017,6 +21217,28 @@ class Assembler {
         }
         this.walkExpr(e.arr);
         this.walkExpr(e.index);
+        if (this.undefSlots) {
+          // Unit U (SEMANTICS.md S119): an index naming no element reads
+          // undefined. A union vector's absent slot (null) is mapped to
+          // the union's own undefined instance here.
+          code.call(this.vecs.getOrUndef(info));
+          if (at.elem.kind === "union" && this.undefinedArmTag(at.elem.unionId) >= 0) {
+            // the union's own undefined arm for a read past the end or a
+            // hole (the vector's reserved-tag instance)
+            const u = this.acquireScratch(this.unions.baseRef());
+            code.localTee(u);
+            code.structGet(this.unions.base(), 0);
+            code.i32Const(UNDEF_UNION_TAG);
+            code.i32Eq();
+            this.openIfResult(this.unions.baseRef());
+            this.emitSlotUndef(at.elem, e.loc);
+            code.else_();
+            code.localGet(u);
+            this.close();
+            this.releaseScratch(this.unions.baseRef(), u);
+          }
+          return;
+        }
         code.call(this.vecs.get(info));
         return;
       }
@@ -21210,11 +21432,37 @@ class Assembler {
         }
         if (k === "bool") {
           this.walkExpr(e.operand);
+          if (this.undefSlots && mayBeSlotUndef(e.operand as WExpr)) {
+            // Unit U (SEMANTICS.md S119): the bool undefined is 2.
+            const b = this.acquireScratch(I32);
+            code.localTee(b);
+            code.i32Const(UNDEF_BOOL);
+            code.i32Eq();
+            this.openIfResult(this.strRef);
+            this.pushStrLit("undefined");
+            code.else_();
+            code.localGet(b);
+            this.openIfResult(this.strRef);
+            this.pushStrLit("true");
+            code.else_();
+            this.pushStrLit("false");
+            this.close();
+            this.close();
+            this.releaseScratch(I32, b);
+            return;
+          }
           this.openIfResult(this.strRef);
           this.pushStrLit("true");
           code.else_();
           this.pushStrLit("false");
           this.close();
+          return;
+        }
+        if (k === "string" && this.undefSlots) {
+          // Unit U: String(s) of a string slot holding undefined.
+          this.walkValue(e.operand);
+          this.emitStrUndefAsText();
+          this.emitFlat();
           return;
         }
         if (k === "union") {
@@ -21396,6 +21644,24 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (this.undefSlots && mayBeSlotUndef(e.value as WExpr) && vt.kind !== "dyn" && vt.kind !== "jsval" && vt.kind !== "caught") {
+          // Unit U (SEMANTICS.md S119): a plain value holding its slot's
+          // undefined wraps as the union's undefined, not as an arm.
+          const pv = this.mapTypeSoft(vt);
+          const v = this.acquireScratch(pv);
+          this.walkValue(e.value);
+          code.localTee(v);
+          this.emitIsUndefOnStack(vt);
+          this.openIfResult(this.unions.baseRef());
+          this.emitSlotUndef({ kind: "union", unionId: e.unionId }, e.loc);
+          code.else_();
+          code.i32Const(e.tag);
+          code.localGet(v);
+          code.structNew(st);
+          this.close();
+          this.releaseScratch(pv, v);
+          return;
+        }
         code.i32Const(e.tag);
         this.walkValue(e.value);
         code.structNew(st);
@@ -21409,6 +21675,32 @@ class Assembler {
         const st = this.unionArmStruct(e.unionId, e.tag, e.loc);
         if (st === null) {
           code.unreachable();
+          return;
+        }
+        if (this.undefSlots && !isUnitType(e.type)) {
+          // Unit U (SEMANTICS.md S119): the checker narrows by ASSIGNMENT
+          // too (`const v: T | undefined = xs[i]` reads as T), so the box
+          // may hold the union's undefined — it narrows to the arm's own
+          // undefined. Any other arm is still the loud trap.
+          const vt = this.mapTypeSoft(e.type);
+          const u = this.acquireScratch(this.unions.baseRef());
+          this.walkExpr(e.value);
+          code.localTee(u);
+          code.refTest(st);
+          this.openIfResult(vt);
+          code.localGet(u);
+          code.refCast(st);
+          code.structGet(st, 1);
+          code.else_();
+          code.localGet(u);
+          this.emitIsUndefOnStack({ kind: "union", unionId: e.unionId });
+          code.i32Eqz();
+          this.openIf();
+          code.unreachable();
+          this.close();
+          this.emitSlotUndef(e.type, e.loc);
+          this.close();
+          this.releaseScratch(this.unions.baseRef(), u);
           return;
         }
         this.walkExpr(e.value);
@@ -21697,6 +21989,14 @@ class Assembler {
           code.i32Eq();
           if (i > 0) code.i32Or();
         });
+        if (this.undefSlots) {
+          // Unit U (SEMANTICS.md S119): the union's undefined is its
+          // reserved tag (no undefined arm) — nullish too.
+          code.localGet(t);
+          code.i32Const(UNDEF_UNION_TAG);
+          code.i32Eq();
+          code.i32Or();
+        }
         this.openIfResult(rt);
         this.walkExpr(e.right);
         code.else_();
@@ -21960,6 +22260,14 @@ class Assembler {
           code.i32Eq();
           if (i > 0) code.i32Or();
         });
+        if (this.undefSlots) {
+          // Unit U (SEMANTICS.md S119): the reserved-tag undefined
+          // short-circuits too.
+          code.localGet(t);
+          code.i32Const(UNDEF_UNION_TAG);
+          code.i32Eq();
+          code.i32Or();
+        }
         const bind = this.acquireScratch(armVal);
         const emitBind = (): void => {
           code.localGet(u);
@@ -22159,6 +22467,21 @@ class Assembler {
           // the 10000-unit cap and the per-line ` +` continuation, which
           // reads the layout engine's indentation global. Never throws.
           this.walkExpr(e.args[0]!);
+          if (this.undefSlots && mayBeSlotUndef(e.args[0] as WExpr)) {
+            // Unit U (SEMANTICS.md S119): a string slot's undefined
+            // renders unquoted `undefined`.
+            const t = this.acquireScratch(this.strRef);
+            code.localTee(t);
+            code.refIsNull();
+            this.openIfResult(this.strRef);
+            this.pushStrLit("undefined");
+            code.else_();
+            code.localGet(t);
+            code.call(this.insp.str());
+            this.close();
+            this.releaseScratch(this.strRef, t);
+            return;
+          }
           code.call(this.insp.str());
           return;
         }
@@ -23327,6 +23650,15 @@ class Assembler {
           code.localGet(x);
           code.localGet(x);
           code.f64Ne();
+          if (e.fn === "number.isNaN" && this.undefSlots && mayBeSlotUndef(e.args[0] as WExpr)) {
+            // Unit U (SEMANTICS.md S119): Number.isNaN(undefined) is false
+            // (no ToNumber); the global isNaN's ToNumber makes it NaN.
+            code.localGet(x);
+            code.i64ReinterpretF64();
+            code.i64Const(UNDEF_F64_BITS);
+            code.i64Ne();
+            code.i32And();
+          }
           this.releaseScratch(F64, x);
           return;
         }
@@ -23399,6 +23731,22 @@ class Assembler {
           code.localGet(y);
           code.f64Ne();
           code.i32And();
+          if (this.undefSlots) {
+            // Unit U (SEMANTICS.md S119): the f64 undefined is a NaN
+            // pattern but not NaN — "both NaN" only when neither or both
+            // are undefined (both undefined: equal bits, below).
+            code.localGet(x);
+            code.i64ReinterpretF64();
+            code.i64Const(UNDEF_F64_BITS);
+            code.i64Eq();
+            code.localGet(y);
+            code.i64ReinterpretF64();
+            code.i64Const(UNDEF_F64_BITS);
+            code.i64Eq();
+            code.i32Or();
+            code.i32Eqz();
+            code.i32And();
+          }
           code.localGet(x);
           code.i64ReinterpretF64();
           code.localGet(y);
@@ -23428,6 +23776,20 @@ class Assembler {
         }
         if (e.fn === "num.fromString") {
           this.walkExpr(e.args[0]!);
+          if (this.undefSlots && mayBeSlotUndef(e.args[0] as WExpr)) {
+            // Unit U (SEMANTICS.md S119): ToNumber(undefined) is NaN.
+            const t = this.acquireScratch(this.strRef);
+            code.localTee(t);
+            code.refIsNull();
+            this.openIfResult(F64);
+            code.f64Const(CANONICAL_NAN);
+            code.else_();
+            code.localGet(t);
+            code.call(this.strToNumHelper());
+            this.close();
+            this.releaseScratch(this.strRef, t);
+            return;
+          }
           code.call(this.strToNumHelper());
           return;
         }
@@ -26767,6 +27129,19 @@ class Assembler {
        * not just "dynFrom". */
       case "dynFrom": {
         const vt = e.value.type;
+        if (this.undefSlots && (vt.kind === "f64" || vt.kind === "bool" || vt.kind === "string") && mayBeSlotUndef(e.value as WExpr)) {
+          // Unit U (SEMANTICS.md S119): the slot's undefined crosses as the
+          // dynamic undefined — through the helper, which tests for it.
+          const h = this.dynFromHelper(vt, e.loc);
+          if (h === null) {
+            code.unreachable();
+            return;
+          }
+          if (vt.kind === "string") this.walkValue(e.value);
+          else this.walkExpr(e.value);
+          code.call(h);
+          return;
+        }
         switch (vt.kind) {
           case "f64":
             this.dyn.boxNum(code, () => this.walkExpr(e.value));
@@ -29263,6 +29638,19 @@ class Assembler {
        * second walker family. */
       case "jsMarshal": {
         const vt = e.value.type;
+        if (this.undefSlots && (vt.kind === "f64" || vt.kind === "bool" || vt.kind === "string") && mayBeSlotUndef(e.value as WExpr)) {
+          // Unit U (SEMANTICS.md S119): the slot's undefined crosses as the
+          // island's undefined (dynFrom's helper tests for it).
+          const h = this.dynFromHelper(vt, e.loc);
+          if (h === null) {
+            code.unreachable();
+            return;
+          }
+          if (vt.kind === "string") this.walkValue(e.value);
+          else this.walkExpr(e.value);
+          code.call(h);
+          return;
+        }
         switch (vt.kind) {
           case "f64":
             this.dyn.boxNum(code, () => this.walkExpr(e.value));
@@ -31046,6 +31434,47 @@ class Assembler {
         return;
       }
 
+      /* Unit U (SEMANTICS.md S119): the undefined of a typed slot. */
+      case "slotUndef":
+        this.emitSlotUndef(e.type, e.loc);
+        return;
+
+      case "isUndef":
+        this.walkExpr(e.operand);
+        this.emitIsUndefOnStack(e.operand.type);
+        return;
+
+      case "arrHasUndef": {
+        const at = e.arr.type;
+        if (at.kind !== "array") throw new Error("arrHasUndef on a non-array");
+        const info = this.vecInfoFor(at, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const undefTag = at.elem.kind === "union" ? this.undefinedArmTag(at.elem.unionId) : -1;
+        if (e.holes === true) {
+          // Only once a hole exists anywhere (the scan is skipped — and the
+          // operand still evaluated — otherwise).
+          const vref = this.vecs.vecRef(info);
+          const v = this.acquireScratch(vref);
+          this.walkExpr(e.arr);
+          code.localSet(v);
+          code.globalGet(this.holesMadeGlobal());
+          this.openIfResult(I32);
+          code.localGet(v);
+          code.call(this.vecs.hasUndef(info, undefTag));
+          code.else_();
+          code.i32Const(0);
+          this.close();
+          this.releaseScratch(vref, v);
+          return;
+        }
+        this.walkExpr(e.arr);
+        code.call(this.vecs.hasUndef(info, undefTag));
+        return;
+      }
+
       default: {
         const rest: never = e;
         this.refuse(`expr:${(rest as WExpr).kind}`, (rest as WExpr).loc);
@@ -31132,6 +31561,9 @@ class Assembler {
   /** The per-element-type array machinery (arrays.ts), deps injected. */
   private get vecs(): VecBuilder {
     this.vecsField ??= new VecBuilder(this.mb, {
+      undefSlots: this.undefSlots,
+      holesFlag: () => this.holesMadeGlobal(),
+      unionUndefGlobal: () => this.unions.unitGlobal(UNDEF_UNION_TAG),
       strEq: () => this.strEqHelper(),
       flat: (c) => this.emitFlat(c),
       ...(this.strViewsLive ? { strViews: { len: () => this.ropes.len(), copyInto: () => this.slices.copyInto() } } : {}),
@@ -33351,6 +33783,35 @@ class Assembler {
       case "===":
       case "!==": {
         const k = e.left.type.kind;
+        if (k === "f64" && this.undefSlots && mayBeSlotUndef(e.left as WExpr) && mayBeSlotUndef(e.right as WExpr)) {
+          // Unit U (SEMANTICS.md S119): the f64 undefined is a NaN, but
+          // undefined === undefined — equal when f64.eq says so, or when
+          // both hold exactly the undefined bits. (A literal side can
+          // never be undefined, so `x === 5` keeps the bare f64.eq.)
+          const a = this.acquireScratch(F64);
+          const b = this.acquireScratch(F64);
+          this.walkExpr(e.left);
+          code.localSet(a);
+          this.walkExpr(e.right);
+          code.localTee(b);
+          code.localGet(a);
+          code.f64Eq();
+          code.localGet(a);
+          code.i64ReinterpretF64();
+          code.localGet(b);
+          code.i64ReinterpretF64();
+          code.i64Eq();
+          code.localGet(a);
+          code.i64ReinterpretF64();
+          code.i64Const(UNDEF_F64_BITS);
+          code.i64Eq();
+          code.i32And();
+          code.i32Or();
+          if (e.op === "!==") code.i32Eqz();
+          this.releaseScratch(F64, b);
+          this.releaseScratch(F64, a);
+          return;
+        }
         if (k === "f64") {
           this.walkExpr(e.left);
           this.walkExpr(e.right);
@@ -33883,6 +34344,35 @@ class Assembler {
         code.localGet(vec);
         code.structGet(info.struct, 0);
         code.localSet(len);
+        if (this.undefSlots) {
+          // Unit U (SEMANTICS.md S119): an empty pop answers undefined and
+          // leaves the array as it was.
+          code.localGet(len);
+          code.i32Eqz();
+          this.openIfResult(info.elemVal);
+          this.emitSlotUndef(rt.elem, e.loc);
+          code.else_();
+          const es = this.acquireScratch(info.elemVal);
+          code.localGet(vec);
+          code.structGet(info.struct, 1);
+          code.localGet(len);
+          code.i32Const(1);
+          code.i32Sub();
+          this.vecs.emitElemRead(code, info);
+          code.localSet(es);
+          code.localGet(vec);
+          code.localGet(len);
+          code.i32Const(1);
+          code.i32Sub();
+          code.structSet(info.struct, 0);
+          this.clearVacatedSlot(info, vec, len);
+          code.localGet(es);
+          this.releaseScratch(info.elemVal, es);
+          this.close();
+          this.releaseScratch(I32, len);
+          this.releaseScratch(this.vecs.vecRef(info), vec);
+          return;
+        }
         code.localGet(len);
         code.i32Eqz();
         this.openIf();
@@ -34014,7 +34504,10 @@ class Assembler {
   }
 
   /** Pushes the JS ToBoolean of the value in scratch local `s`. f64 is
-   * false iff 0, -0, or NaN — (x != 0) & (x == x); string iff empty. */
+   * false iff 0, -0, or NaN — (x != 0) & (x == x); string iff empty.
+   * Unit U: the slot undefineds are falsy — the f64 one is a NaN (already
+   * false), a null string is false, and a bool reads through `& 1` (its
+   * undefined is 2). */
   private emitTruthiness(k: "f64" | "string" | "bool", s: number): void {
     const code = this.fn.code;
     switch (k) {
@@ -34028,6 +34521,19 @@ class Assembler {
         code.i32And();
         return;
       case "string":
+        if (this.undefSlots) {
+          code.localGet(s);
+          code.refIsNull();
+          code.ifResult(I32);
+          code.i32Const(0);
+          code.else_();
+          code.localGet(s);
+          code.arrayLen();
+          code.i32Const(0);
+          code.i32Ne();
+          code.end();
+          return;
+        }
         code.localGet(s);
         code.arrayLen();
         code.i32Const(0);
@@ -34035,8 +34541,126 @@ class Assembler {
         return;
       case "bool":
         code.localGet(s);
+        if (this.undefSlots) {
+          code.i32Const(1);
+          code.i32And();
+        }
         return;
     }
+  }
+
+  /* ── unit U: the undefined of a typed slot (SEMANTICS.md S119) ────────
+   * f64: one signaling NaN (UNDEF_F64_BITS — arithmetic quiets it, so
+   * `undefined + 1` is an ordinary NaN); bool: 2; string and every other
+   * ref kind: null; a union: its undefined arm's interned instance, or
+   * the reserved-tag (-1) instance when it has none. */
+
+  /** Unit U: the f64 on the stack, with exactly the undefined pattern
+   * replaced by NaN (ToNumber(undefined)); every other value, a real
+   * signaling NaN included, keeps its bits (S100). */
+  private emitUndefPatternToNaN(code: Code = this.fn.code): void {
+    const t = this.acquireScratch(F64);
+    code.localTee(t);
+    code.i64ReinterpretF64();
+    code.i64Const(UNDEF_F64_BITS);
+    code.i64Eq();
+    code.ifResult(F64);
+    code.f64Const(CANONICAL_NAN);
+    code.else_();
+    code.localGet(t);
+    code.end();
+    this.releaseScratch(F64, t);
+  }
+
+  private holesMadeField: number | null = null;
+
+  /** Unit U (SEMANTICS.md S119): the module's "a hole was made" flag — an
+   * i32 global the first write past an array's end sets. */
+  private holesMadeGlobal(): number {
+    this.holesMadeField ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    return this.holesMadeField;
+  }
+
+  /** Unit U: the string value on the stack, with its undefined (null)
+   * replaced by the text "undefined" — JS's ToString of undefined, for
+   * concatenation and templates. */
+  private emitStrUndefAsText(code: Code = this.fn.code, flat = false): void {
+    const vt = flat ? this.strRef : STR_VAL;
+    const t = this.acquireScratch(vt);
+    code.localTee(t);
+    code.refIsNull();
+    code.ifResult(vt);
+    this.pushStrLitInto(code, "undefined");
+    code.else_();
+    code.localGet(t);
+    code.end();
+    this.releaseScratch(vt, t);
+  }
+
+  /** Pushes the undefined a plain slot of type `t` holds. */
+  private emitSlotUndef(t: IrType, loc: SrcLoc | undefined, code: Code = this.fn.code): void {
+    if (t.kind === "union") {
+      const tag = this.undefinedArmTag(t.unionId);
+      code.globalGet(this.unions.unitGlobal(tag >= 0 ? tag : UNDEF_UNION_TAG));
+      return;
+    }
+    if (t.kind === "f64" || t.kind === "procStream") {
+      code.i64Const(UNDEF_F64_BITS);
+      code.f64ReinterpretI64();
+      return;
+    }
+    if (t.kind === "bool") {
+      code.i32Const(UNDEF_BOOL);
+      return;
+    }
+    const vt = this.mapType(t, loc);
+    if (vt === null) {
+      code.unreachable();
+      return;
+    }
+    if (vt.kind !== "ref") throw new Error(`slotUndef: '${t.kind}' maps to a non-ref ${vt.kind}`);
+    code.refNull(vt.typeIndex);
+  }
+
+  /** The value of type `t` on the stack → i32: does it hold its slot
+   * kind's undefined? */
+  private emitIsUndefOnStack(t: IrType, code: Code = this.fn.code, tagScratch?: number): void {
+    if (t.kind === "union") {
+      const undefTag = this.undefinedArmTag(t.unionId);
+      code.structGet(this.unions.base(), 0);
+      if (undefTag < 0) {
+        code.i32Const(UNDEF_UNION_TAG);
+        code.i32Eq();
+        return;
+      }
+      // tag ∈ {-1 (reserved), the undefined arm's tag}
+      const own = tagScratch === undefined;
+      const tg = own ? this.acquireScratch(I32) : tagScratch;
+      code.localTee(tg);
+      code.i32Const(UNDEF_UNION_TAG);
+      code.i32Eq();
+      code.localGet(tg);
+      code.i32Const(undefTag);
+      code.i32Eq();
+      code.i32Or();
+      if (own) this.releaseScratch(I32, tg);
+      return;
+    }
+    if (t.kind === "f64" || t.kind === "procStream") {
+      code.i64ReinterpretF64();
+      code.i64Const(UNDEF_F64_BITS);
+      code.i64Eq();
+      return;
+    }
+    if (t.kind === "bool") {
+      code.i32Const(UNDEF_BOOL);
+      code.i32Eq();
+      return;
+    }
+    code.refIsNull();
   }
 
   /** `scr_dyn_is_nullish` inline: the two unit kinds, off the tag. The
@@ -35203,8 +35827,16 @@ class Assembler {
     const code = this.fn.code;
     const staged: ({ kind: "str" | "bool"; local: number } | null)[] = [];
     for (const a of args) {
-      this.walkExpr(a);
       const t = a.type.kind;
+      if (t === "string" && this.undefSlots && mayBeSlotUndef(a as WExpr)) {
+        // Unit U (SEMANTICS.md S119): a string slot's undefined prints as
+        // `undefined`.
+        this.walkValue(a);
+        this.emitStrUndefAsText();
+        this.emitFlat();
+      } else {
+        this.walkExpr(a);
+      }
       if (t === "string" || t === "f64") {
         // Numbers format eagerly and stage as strings — via inspect's one
         // number-ism, exactly scr_console.c: console.log distinguishes -0
@@ -35236,6 +35868,16 @@ class Assembler {
         code.localGet(s.local);
         code.call(helpers.stage);
       } else {
+        if (this.undefSlots) {
+          // Unit U: the bool undefined (2) prints as `undefined`.
+          code.localGet(s.local);
+          code.i32Const(UNDEF_BOOL);
+          code.i32Eq();
+          this.openIf();
+          this.pushStrLit("undefined");
+          code.call(helpers.stage);
+          code.else_();
+        }
         code.localGet(s.local);
         this.openIf();
         this.pushStrLit("true");
@@ -35244,6 +35886,7 @@ class Assembler {
         this.pushStrLit("false");
         code.call(helpers.stage);
         this.close();
+        if (this.undefSlots) this.close();
       }
     });
     code.i32Const(0x0a);
@@ -51908,6 +52551,19 @@ class Assembler {
     c.i32Const(1);
     c.return_();
     c.end();
+    if (this.undefSlots) {
+      // Unit U (SEMANTICS.md S119): a string slot's undefined is null —
+      // equal only to itself (the ref.eq above), never to a string.
+      c.localGet(0);
+      c.refIsNull();
+      c.localGet(1);
+      c.refIsNull();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+    }
     c.localGet(0);
     c.arrayLen();
     c.localTee(LEN);

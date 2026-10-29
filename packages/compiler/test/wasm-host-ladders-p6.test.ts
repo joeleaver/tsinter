@@ -491,8 +491,10 @@ describe("wasm-host-ladders-p6: the prescan additions are purely additive", () =
     expect(res.ok).toBe(true);
     const bytes = readFileSyncSync(res.binaryPath!);
     const hash = createHash("sha256").update(bytes).digest("hex");
-    expect(bytes.length).toBe(14025);
-    expect(hash).toBe("ccabf6ce3e3fafb6fbc683c2236d4c36453a5759970e658c25dba3793703d5df");
+    // Re-pinned by unit U (SEMANTICS.md S119): %w.f64ToStr's NaN branch now
+    // answers "undefined" for the f64 slot's undefined (14025 → 14073 bytes).
+    expect(bytes.length).toBe(14073);
+    expect(hash).toBe("06a8e12ef6079a16821f24352fd7b96ed1ae16b6ac7cf7c19360c3137078f65a");
   });
 });
 

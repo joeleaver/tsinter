@@ -50,6 +50,7 @@
  * every sampled case, including the two-call distinction at start>len
  * (throws with an explicit end, silently no-ops without one) and the
  * wrap-mod-256 numeric-fill arm. */
+import { UNDEF_F64_BITS } from "./undef.js";
 import { BUF, LEN, type VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
@@ -1843,6 +1844,7 @@ export class BytesBuilder {
         c.f64PromoteF32();
       } else {
         this.emitAssembleI64(c, BUFL, ADDR, 8, le, BITS64);
+        emitNotUndefBits(c, BITS64);
         c.localGet(BITS64);
         c.f64ReinterpretI64();
       }
@@ -6286,6 +6288,7 @@ export class BytesBuilder {
         c.else_();
         this.emitAssembleI64(c, BUFL, ADDR, 8, false, BITS64);
         c.end();
+        emitNotUndefBits(c, BITS64);
         c.localGet(BITS64);
         c.f64ReinterpretI64();
       }
@@ -6552,4 +6555,19 @@ export class BytesBuilder {
       return idx;
     });
   }
+}
+
+/** Unit U (SEMANTICS.md S119): a double read from bytes whose bits are the
+ * f64 slot's undefined pattern reads as that NaN QUIETED (the quiet bit
+ * set) — a NaN, never the undefined. Rewrites the i64 bits in `bits`. */
+function emitNotUndefBits(c: Code, bits: number): void {
+  c.localGet(bits);
+  c.i64Const(UNDEF_F64_BITS);
+  c.i64Eq();
+  c.ifVoid();
+  c.localGet(bits);
+  c.i64Const(1n << 51n);
+  c.i64Or();
+  c.localSet(bits);
+  c.end();
 }

@@ -41,7 +41,7 @@ import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
-import { pureReemittable } from "./lower-exprs.js";
+import { holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable } from "./lower-exprs.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -252,6 +252,43 @@ function isNumberFlag(L: Lowerer, t: IrType, v: () => IrExpr, loc: SrcLoc): IrEx
  * with the depth budget `depth` — a direct scalar libCall or a call of
  * the interned per-type helper. */
 function inspectExpr(
+  L: Lowerer,
+  t: IrType,
+  value: IrExpr,
+  recurse: IrExpr,
+  depth: IrExpr,
+  loc: SrcLoc,
+): IrExpr {
+  // Unit U (SEMANTICS.md S119): a value of a plain type can hold its slot
+  // kind's undefined on the WasmGC lanes — it renders `undefined`. Numbers,
+  // booleans and strings answer it in their own renderers, and every
+  // per-type helper tests its parameter first (undefGuard); only the
+  // remaining library renderers need the test here, over a pure read.
+  if (
+    (t.kind === "regex" || t.kind === "symbol" || t.kind === "bytes" || t.kind === "object") &&
+    mayHoldSlotUndef(L, value) && pureReemittable(value)
+  ) {
+    return {
+      kind: "ternary",
+      cond: isUndefExpr(value, false, loc),
+      then: str("undefined", loc),
+      else_: inspectExprRaw(L, t, value, recurse, depth, loc),
+      type: STRING,
+      loc,
+    };
+  }
+  return inspectExprRaw(L, t, value, recurse, depth, loc);
+}
+
+/** Unit U (SEMANTICS.md S119): a render helper's first statement — its
+ * parameter `v` holding its slot kind's undefined renders `undefined`. */
+function undefGuard(L: Lowerer, t: IrType, loc: SrcLoc): IrStmt[] {
+  const v: IrExpr = { kind: "varRef", localId: "v.0", type: t, loc };
+  if (!mayHoldSlotUndef(L, v)) return [];
+  return [{ kind: "if", cond: isUndefExpr(v, false, loc), then: [{ kind: "return", value: str("undefined", loc), loc }], else_: null, loc }];
+}
+
+function inspectExprRaw(
   L: Lowerer,
   t: IrType,
   value: IrExpr,
@@ -771,7 +808,7 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
     ],
     returnType: STRING,
     locals,
-    body,
+    body: [...undefGuard(L, t, loc), ...(L.undefSlots && t.kind === "array" ? [holeFenceStmt(v(), "printing (util.inspect)", loc)] : []), ...body],
     loc,
   });
   return name;
@@ -787,6 +824,16 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
  * RUNTIME through an interned helper, so a string arm stays verbatim
  * while its sibling arms inspect. Callers check inspectSupport first. */
 export function formatValueExpr(L: Lowerer, t: IrType, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
+  // Unit U (SEMANTICS.md S119): a string holding its slot's undefined
+  // prints `undefined` (the emitter's ToString of a string slot); every
+  // other kind answers in its renderer or helper (undefGuard).
+  if (t.kind === "string" && mayHoldSlotUndef(L, value)) {
+    return { kind: "toString", operand: value, type: STRING, loc };
+  }
+  return formatValueExprRaw(L, t, value, depth, loc);
+}
+
+function formatValueExprRaw(L: Lowerer, t: IrType, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
   switch (t.kind) {
     case "string":
       return value;
@@ -822,7 +869,7 @@ function formatUnionHelper(L: Lowerer, t: IrType & { kind: "union" }, depth: num
   const def = L.unions.get(t.unionId);
   if (!def) throw new Error(`format value over unknown union ${t.unionId}`);
   const v = (): IrExpr => ({ kind: "varRef", localId: "v.0", type: t, loc });
-  const body: IrStmt[] = [];
+  const body: IrStmt[] = [...undefGuard(L, t, loc)];
   def.arms.forEach((arm, tag) => {
     const narrowed: IrExpr = { kind: "unionNarrow", unionId: t.unionId, tag, value: v(), type: arm, loc };
     body.push({

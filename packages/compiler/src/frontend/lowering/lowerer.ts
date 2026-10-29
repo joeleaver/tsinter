@@ -348,6 +348,14 @@ export interface LowerOptions {
    * and the module itself serves them. compile() sets it for the wasm
    * backend only; the native lanes keep the requires-dynamic diagnostic. */
   hostFetch?: boolean;
+  /** The build's backend gives every typed slot an `undefined` (the WasmGC
+   * lanes — unit U, Joe's 2026-10-28 ruling): undefined flowing into a
+   * plain slot lowers to `slotUndef` instead of the stranded-unit throw,
+   * and `typeof x` / `x === undefined` / `x == null` / `x ?? d` on a
+   * non-union operand test it at run time (`isUndef`) instead of folding.
+   * compile() sets it for the wasm backends only; the native lanes keep
+   * SEMANTICS.md S003/S006/S032 and their IR is unchanged. */
+  undefSlots?: boolean;
   /** Node's startup refusal (LoadResult.startupCrash — preflight's
    * resolution walk and CJS named-import link check): the program
    * compiles to that startup crash. */
@@ -381,6 +389,8 @@ export interface LowererMode {
   targetPlatform?: string;
   /** LowerOptions.hostFetch — lowerToIr passes it to every pass. */
   hostFetch?: boolean;
+  /** LowerOptions.undefSlots — lowerToIr passes it to every pass. */
+  undefSlots?: boolean;
   /** Node's startup refusal (preflight's resolution walk / CJS named-
    * import link check): %main opens with exactly this throw, before any
    * module init — Node refuses the whole graph before anything evaluates,
@@ -421,6 +431,7 @@ export function lowerToIr(
   const dynamic = options.dynamic ?? false;
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
+  const undefSlots = options.undefSlots ?? false;
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -442,6 +453,7 @@ export function lowerToIr(
   const validation = new Lowerer(program, entry, moduleOrder, dynamic, {
     targetPlatform,
     hostFetch,
+    undefSlots,
     ffiImports,
   });
   const ffiValidation = validateFfiImports(validation);
@@ -456,6 +468,7 @@ export function lowerToIr(
     : new Lowerer(program, entry, moduleOrder, dynamic, {
         targetPlatform,
         hostFetch,
+        undefSlots,
         ffiImports,
         ffiBindingSymbols: ffiValidation.symbolsByName,
       });
@@ -464,6 +477,7 @@ export function lowerToIr(
     reachable,
     targetPlatform,
     hostFetch,
+    undefSlots,
     startupCrash,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
@@ -478,6 +492,7 @@ export function lowerToIr(
     alreadyFlushed: emit.flushedSymbols,
     targetPlatform,
     hostFetch,
+    undefSlots,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
   });
@@ -1249,6 +1264,8 @@ export class Lowerer {
   readonly targetPlatform: string;
   /** LowererMode.hostFetch: the fetch slice lowers without --dynamic. */
   readonly hostFetch: boolean;
+  /** LowererMode.undefSlots: typed slots carry undefined (wasm lanes). */
+  readonly undefSlots: boolean;
   /** LowererMode.startupCrash — buildMain opens %main with the throw. */
   readonly startupCrash: StartupCrash | null;
   /** Outbound native bindings by their source-level ambient name. */
@@ -1308,6 +1325,7 @@ export class Lowerer {
     this.alreadyFlushed = mode.alreadyFlushed ?? new Set();
     this.targetPlatform = mode.targetPlatform ?? process.platform;
     this.hostFetch = mode.hostFetch ?? false;
+    this.undefSlots = mode.undefSlots ?? false;
     this.startupCrash = mode.startupCrash ?? null;
     this.ffiImports = mode.ffiImports ?? [];
     this.ffiImportsByName = new Map(this.ffiImports.map((entry) => [entry.name, entry]));
@@ -2175,6 +2193,7 @@ export class Lowerer {
             ...(this.npmEmbedded ? { embedded: this.npmEmbedded } : {}),
             entry: ENTRY_NAME,
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
+            ...(this.undefSlots ? { undefSlots: true as const } : {}),
           };
     return {
       module,
@@ -5328,6 +5347,12 @@ export class Lowerer {
       return null;
     }
     const what = expr.type.kind === "undefinedT" ? "undefined" : "null";
+    // Unit U (SEMANTICS.md S119): on the WasmGC lanes every plain slot
+    // has an undefined — the slot holds it, exactly as Node's binding
+    // does. A plain slot still has no null, so null keeps the throw.
+    if (this.undefSlots && what === "undefined" && expected.kind !== "caught") {
+      return { kind: "slotUndef", type: expected, loc };
+    }
     const key = `strandunit:${typeKey(expected)}:${expr.type.kind}`;
     let name = this.retagHelpers.get(key);
     if (!name) {
@@ -5381,6 +5406,9 @@ export class Lowerer {
     let what: string;
     if (isUnitType(src)) {
       what = src.kind === "undefinedT" ? "undefined" : "null";
+      // Unit U (SEMANTICS.md S119): a union with no undefined arm still
+      // holds undefined on the WasmGC lanes (its reserved-tag instance).
+      if (this.undefSlots && what === "undefined") return { kind: "slotUndef", type: expected, loc };
     } else if (src.kind === "f64" || src.kind === "bool" || src.kind === "string") {
       // A SCALAR the union has no arm for (`4 as any as X`, a generic
       // dummy for an unmappable instantiation): no widening exists at
@@ -5622,7 +5650,10 @@ export class Lowerer {
    * use of such an undefined, so the catchable TypeError at the read is
    * the same failure, named earlier (SEMANTICS.md). */
   deferredReadHelper(fromId: string, target: IrType, loc: SrcLoc): string | null {
-    if (target.kind !== "bool" && target.kind !== "f64") {
+    // Unit U (SEMANTICS.md S119): on the WasmGC lanes every plain slot
+    // holds undefined, so a not-yet-assigned field reads as the target's
+    // own undefined — Node's value — for every kind.
+    if (target.kind !== "bool" && target.kind !== "f64" && !this.undefSlots) {
       return this.narrowedArmHelper(fromId, target, loc);
     }
     const from = this.unions.get(fromId);
@@ -5637,9 +5668,11 @@ export class Lowerer {
     const fromT: IrType = { kind: "union", unionId: fromId };
     const u: IrExpr = { kind: "varRef", localId: "u.0", type: fromT, loc };
     const dflt: IrExpr =
-      target.kind === "bool"
-        ? { kind: "boolLit", value: false, type: BOOL, loc }
-        : { kind: "numLit", value: NaN, type: F64, loc };
+      this.undefSlots
+        ? { kind: "slotUndef", type: target, loc }
+        : target.kind === "bool"
+          ? { kind: "boolLit", value: false, type: BOOL, loc }
+          : { kind: "numLit", value: NaN, type: F64, loc };
     this.liftedFns.push({
       name,
       params: [{ localId: "u.0", name: "u", type: fromT }],

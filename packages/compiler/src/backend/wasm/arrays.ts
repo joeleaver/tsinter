@@ -12,6 +12,14 @@
  * protocol deliberately does NOT catch these). Ref-element reads trap
  * on an absent (null) slot, SEMANTICS.md 46's arrayNewLen rule.
  *
+ * Unit U (deps.undefSlots — every module compile() builds; SEMANTICS.md
+ * S119): an element can hold its kind's undefined (f64: the signaling-NaN
+ * pattern, bool: 2, ref: null). `getOrUndef` answers it for an index
+ * naming no element, `set` grows the array past its end with the gap
+ * holding it (and raises the module's holes flag), and an absent ref slot
+ * reads as it — except in a union vector, whose undefined is an interned
+ * instance the emitter maps at its arrayGet.
+ *
  * Everything is keyed by the element's VALUE representation: one struct,
  * one buffer type, one helper family per distinct element type, interned.
  * The emitter injects what element formatting needs (strEq for string
@@ -20,6 +28,7 @@ import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type StorageType, type ValType } from "./module.js";
 import { emitFlat } from "./strings.js";
 import { MAX_STRING_LENGTH } from "./ropes.js";
+import { UNDEF_BOOL, UNDEF_F64_BITS } from "./undef.js";
 
 export interface VecDeps {
   /** %w.strEq's index (content equality for string elements). */
@@ -54,6 +63,16 @@ export interface VecDeps {
     pushMessage: (c: Code) => void,
     codeLit: string | null,
   ) => void;
+  /** Unit U (SEMANTICS.md S119): elements can hold their kind's undefined
+   * — a read past the end answers it, a write past the end grows the
+   * array with holes, and an absent ref slot reads as undefined. */
+  undefSlots?: boolean;
+  /** Unit U: the module's "a hole was made" flag (an i32 global set by
+   * the first write past an array's end). */
+  holesFlag?: () => number;
+  /** Unit U: the reserved-tag union instance (unions.ts), a union vector's
+   * hole — every union observer reads it as undefined. */
+  unionUndefGlobal?: () => number;
 }
 
 /** How elements compare (===/SameValueZero) and format (join). */
@@ -126,7 +145,140 @@ export class VecBuilder {
   emitElemRead(c: Code, v: VecInfo): void {
     if (v.storage === "i8" || v.storage === "i16") c.arrayGetU(v.bufType);
     else c.arrayGet(v.bufType);
-    if (v.refElem) c.refAsNonNull();
+    // Unit U: an absent ref slot IS the element's undefined (null) — except
+    // in a union-element vector, whose undefined is an interned instance
+    // (the emitter's arrayGet maps null to it; other readers stay loud).
+    if (v.refElem && !(this.deps.undefSlots === true && v.key !== "vec(union)")) c.refAsNonNull();
+  }
+
+  /** Unit U: pushes the element kind's undefined (f64: the signaling-NaN
+   * pattern; bool: 2; ref: null — a union vector's caller maps it). */
+  emitUndef(c: Code, v: VecInfo): void {
+    if (v.key === "vec(union)" && this.deps.unionUndefGlobal !== undefined) {
+      c.globalGet(this.deps.unionUndefGlobal());
+      return;
+    }
+    if (v.elemKind === "f64") {
+      c.i64Const(UNDEF_F64_BITS);
+      c.f64ReinterpretI64();
+    } else if (v.elemKind === "bool") {
+      c.i32Const(UNDEF_BOOL);
+    } else {
+      if (v.elemVal.kind !== "ref") throw new Error("emitUndef on a non-ref element");
+      c.refNull(v.elemVal.typeIndex);
+    }
+  }
+
+  /** %w.vec.hasUndef — (vec) → i32: unit U's scan for an element holding
+   * its kind's undefined (f64: the signaling-NaN pattern; bool: 2; ref:
+   * null — in a union vector only a hole is null). */
+  hasUndef(v: VecInfo, unionUndefTag = -1): number {
+    return this.cached(`${v.key}:hasUndef:${unionUndefTag}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.vecRef(v)], [I32]), `%w.vec.hasUndef:${v.key}:${unionUndefTag}`);
+      const c = new Code();
+      const V = 0;
+      const I = 1;
+      const N = 2;
+      const E = 3;
+      const T = 4;
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(N);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(I);
+      if (v.storage === "i8" || v.storage === "i16") c.arrayGetU(v.bufType);
+      else c.arrayGet(v.bufType);
+      if (v.elemKind === "f64") {
+        c.i64ReinterpretF64();
+        c.i64Const(UNDEF_F64_BITS);
+        c.i64Eq();
+      } else if (v.elemKind === "bool") {
+        c.i32Const(UNDEF_BOOL);
+        c.i32Eq();
+      } else if (v.key === "vec(union)") {
+        // a union element: null (a grown gap), the reserved tag (-1), or
+        // the union's own undefined arm (an elision's or an explicit one)
+        c.localTee(E);
+        c.refIsNull();
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(E);
+        if (v.elemVal.kind !== "ref") throw new Error("union vector element is not a ref");
+        c.structGet(v.elemVal.typeIndex, 0);
+        c.localTee(T);
+        c.i32Const(-1);
+        c.i32Eq();
+        c.localGet(T);
+        c.i32Const(unionUndefTag);
+        c.i32Eq();
+        c.i32Or();
+        c.end();
+      } else {
+        c.refIsNull();
+      }
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.i32Const(0);
+      this.mb.setBody(idx, [I32, I32, v.elemVal, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.getU — (vec, f64) → elem: unit U's `a[i]`. An integer index in
+   * [0, len) reads the element; any other index — past the end, negative,
+   * fractional, NaN — names no element, and JS answers undefined
+   * (SEMANTICS.md S119; the native lanes keep S003's trap). */
+  getOrUndef(v: VecInfo): number {
+    return this.cached(`${v.key}:getU`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v), F64], [v.elemVal]),
+        `%w.vec.getU:${v.key}`,
+      );
+      const c = new Code();
+      const V = 0;
+      const X = 1;
+      const I = 2;
+      // in range: i = trunc_sat(x) names x exactly (fractions, NaN and
+      // out-of-i32 values fail) and 0 <= i < len (unsigned: negatives fail)
+      c.localGet(X);
+      c.i32TruncSatF64S();
+      c.localTee(I);
+      c.f64ConvertI32S();
+      c.localGet(X);
+      c.f64Eq();
+      c.localGet(I);
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.i32LtU();
+      c.i32And();
+      c.ifResult(v.elemVal);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(I);
+      this.emitElemRead(c, v);
+      c.else_();
+      this.emitUndef(c, v);
+      c.end();
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
   }
 
   /** Validates the f64 index in local X: an integer, ≥ 0, and ≤ the limit
@@ -389,6 +541,31 @@ export class VecBuilder {
       const E = 2;
       const I = 3;
       const NB = 4;
+      if (this.deps.undefSlots === true) {
+        // Unit U (SEMANTICS.md S119): any integer index up to 2^31 - 2 is
+        // writable — a write at or past the end goes out of line
+        // (setGrow: the append, or the growth past the end that leaves
+        // holes), so the in-range write stays the one store. A negative or
+        // fractional index (an ordinary property in JS, not an element)
+        // still traps.
+        this.emitIndexCheck(c, X, I, () => c.f64Const(2147483646));
+        c.localGet(I);
+        c.localGet(V);
+        c.structGet(v.struct, LEN);
+        c.i32GeS();
+        c.ifVoid();
+        c.localGet(V);
+        c.localGet(I);
+        c.call(this.setGrow(v));
+        c.end();
+        c.localGet(V);
+        c.structGet(v.struct, BUF);
+        c.localGet(I);
+        c.localGet(E);
+        c.arraySet(v.bufType);
+        this.mb.setBody(idx, [I32, this.nullableBuf(v)], c.bytes());
+        return idx;
+      }
       this.emitIndexCheck(c, X, I, () => {
         c.localGet(V);
         c.structGet(v.struct, LEN);
@@ -413,6 +590,120 @@ export class VecBuilder {
       c.localGet(E);
       c.arraySet(v.bufType);
       this.mb.setBody(idx, [I32, this.nullableBuf(v)], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.setGrow — (vec, i32 i) → (), i ≥ length: unit U's out-of-line
+   * half of `a[i] = x` — the gap (growGap) when i > length, then the
+   * append's capacity and length (the caller stores slot i). */
+  private setGrow(v: VecInfo): number {
+    return this.cached(`${v.key}:setGrow`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.vecRef(v), I32], []), `%w.vec.setGrow:${v.key}`);
+      const c = new Code();
+      const V = 0;
+      const I = 1;
+      const NB = 2;
+      c.localGet(I);
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(V);
+      c.localGet(I);
+      c.call(this.growGap(v));
+      c.end();
+      this.emitEnsureCapacity(c, v, V, I, NB);
+      c.localGet(V);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.structSet(v.struct, LEN);
+      this.mb.setBody(idx, [this.nullableBuf(v)], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.growGap — (vec, i32 i) → (): unit U's write past the end (i >
+   * length). JS grows the array to i + 1 and leaves HOLES at [length, i),
+   * which read as undefined: the gap holds the element's undefined, the
+   * length becomes i (the caller's append path then takes slot i), and
+   * the module's holes flag is raised (SEMANTICS.md S119 (b)). */
+  private growGap(v: VecInfo): number {
+    return this.cached(`${v.key}:growGap`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.vecRef(v), I32], []), `%w.vec.growGap:${v.key}`);
+      const c = new Code();
+      const V = 0;
+      const I = 1;
+      const NB = 2;
+      const J = 3;
+      // capacity for slot I: grow to max(2 * cap | 4, I + 1)
+      c.localGet(I);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.arrayLen();
+      c.i32GeS();
+      c.ifVoid();
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.arrayLen();
+      c.i32Const(1);
+      c.i32Shl();
+      c.i32Const(4);
+      c.i32Or();
+      c.localTee(J);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(J);
+      c.localGet(I);
+      c.i32GtS();
+      c.select();
+      c.arrayNewDefault(v.bufType);
+      c.localSet(NB);
+      c.localGet(NB);
+      c.i32Const(0);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.i32Const(0);
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.arrayCopy(v.bufType, v.bufType);
+      c.localGet(V);
+      c.localGet(NB);
+      c.refAsNonNull();
+      c.structSet(v.struct, BUF);
+      c.end();
+      // fill [len, I) with the element's undefined
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(J);
+      c.block();
+      c.loop();
+      c.localGet(J);
+      c.localGet(I);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(J);
+      this.emitUndef(c, v);
+      c.arraySet(v.bufType);
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(V);
+      c.localGet(I);
+      c.structSet(v.struct, LEN);
+      if (this.deps.holesFlag !== undefined) {
+        c.i32Const(1);
+        c.globalSet(this.deps.holesFlag());
+      }
+      this.mb.setBody(idx, [this.nullableBuf(v), I32], c.bytes());
       return idx;
     });
   }
@@ -542,6 +833,39 @@ export class VecBuilder {
   private emitElemEq(c: Code, v: VecInfo, A: number, B: number, sameValueZero: boolean): void {
     switch (v.elemKind) {
       case "f64":
+        if (this.deps.undefSlots === true) {
+          // Unit U: undefined (the signaling-NaN pattern) equals only
+          // undefined — and, for SameValueZero, is not "a NaN".
+          const isU = (L: number): void => {
+            c.localGet(L);
+            c.i64ReinterpretF64();
+            c.i64Const(UNDEF_F64_BITS);
+            c.i64Eq();
+          };
+          isU(A);
+          isU(B);
+          c.i32And();
+          isU(A);
+          isU(B);
+          c.i32Or();
+          c.i32Eqz();
+          c.localGet(A);
+          c.localGet(B);
+          c.f64Eq();
+          if (sameValueZero) {
+            c.localGet(A);
+            c.localGet(A);
+            c.f64Ne();
+            c.localGet(B);
+            c.localGet(B);
+            c.f64Ne();
+            c.i32And();
+            c.i32Or();
+          }
+          c.i32And();
+          c.i32Or();
+          return;
+        }
         c.localGet(A);
         c.localGet(B);
         c.f64Eq();
@@ -567,7 +891,13 @@ export class VecBuilder {
         c.localGet(A);
         c.refIsNull();
         c.ifResult(I32);
-        c.i32Const(0);
+        if (this.deps.undefSlots === true) {
+          // Unit U: an undefined element equals an undefined needle.
+          c.localGet(B);
+          c.refIsNull();
+        } else {
+          c.i32Const(0);
+        }
         c.else_();
         c.localGet(A);
         this.deps.flat(c);
@@ -695,14 +1025,30 @@ export class VecBuilder {
       const S = 6; // str
       const DEST = 7; // str
       const PARTS = 8; // parts (non-string elements only)
+      const S0 = 9; // f64 (unit U scratch)
+      const B0 = 10; // i32 (unit U scratch)
+      const EQ = 11; // the element value (unit U scratch)
       const stringElems = v.elemKind === "string";
       const views = stringElems ? this.deps.strViews : undefined;
+      const undef = this.deps.undefSlots === true;
+      /** Unit U: an undefined string element (null) joins as "". */
+      const emptyIfUndef = (): void => {
+        if (!undef || !stringElems) return;
+        c.localTee(EQ);
+        c.refIsNull();
+        c.ifResult(v.elemVal);
+        this.deps.lit(c, "");
+        c.else_();
+        c.localGet(EQ);
+        c.end();
+      };
       /** A string element's VALUE (views: measured and copied in place). */
       const elemValue = (): void => {
         c.localGet(V);
         c.structGet(v.struct, BUF);
         c.localGet(I);
         this.emitElemRead(c, v);
+        emptyIfUndef();
       };
       const pushElem = (): void => {
         if (stringElems) {
@@ -710,6 +1056,7 @@ export class VecBuilder {
           c.structGet(v.struct, BUF);
           c.localGet(I);
           this.emitElemRead(c, v);
+          emptyIfUndef();
           emitFlat(c, strType);
         } else {
           c.localGet(PARTS);
@@ -788,9 +1135,40 @@ export class VecBuilder {
           this.emitElemRead(c, v);
           switch (v.elemKind) {
             case "f64":
+              if (undef) {
+                // Unit U: an undefined element joins as "".
+                c.localTee(S0);
+                c.i64ReinterpretF64();
+                c.i64Const(UNDEF_F64_BITS);
+                c.i64Eq();
+                c.ifResult(strRefT);
+                this.deps.lit(c, "");
+                c.else_();
+                c.localGet(S0);
+                c.call(this.deps.f64ToStr());
+                c.end();
+                break;
+              }
               c.call(this.deps.f64ToStr());
               break;
             case "bool":
+              if (undef) {
+                // Unit U: 2 is undefined, joined as "".
+                c.localTee(B0);
+                c.i32Const(UNDEF_BOOL);
+                c.i32Eq();
+                c.ifResult(strRefT);
+                this.deps.lit(c, "");
+                c.else_();
+                c.localGet(B0);
+                c.ifResult(strRefT);
+                this.deps.lit(c, "true");
+                c.else_();
+                this.deps.lit(c, "false");
+                c.end();
+                c.end();
+                break;
+              }
               c.ifResult(strRefT);
               this.deps.lit(c, "true");
               c.else_();
@@ -863,7 +1241,7 @@ export class VecBuilder {
         c.localSet(POS);
       });
       c.localGet(DEST);
-      this.mb.setBody(idx, [I32, I32, I32, I32, strRefT, strRefT, partsRefT], c.bytes());
+      this.mb.setBody(idx, [I32, I32, I32, I32, strRefT, strRefT, partsRefT, F64, I32, v.elemVal], c.bytes());
       return idx;
     });
   }

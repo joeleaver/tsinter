@@ -2,6 +2,7 @@
  * its boundary fences), island-expression detection, the island method-call
  * surface (Math and number/string methods under --dynamic), and the npm
  * package boundary fences for node_modules-declared symbols. */
+import { boolToNumber, toNumberCanon } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
@@ -745,13 +746,15 @@ import { regexCrossingChecked } from "./lower-regex.js";
           `spreading '${L.fmt(src.type)}' into Math.${name} (only a number[] spreads)`,
         );
       }
-      return {
+      const folded: IrExpr = {
         kind: "libCall",
         fn: name === "max" ? "math.maxArr" : "math.minArr",
         args: [src],
         type: F64,
         loc,
       };
+      // Unit U (SEMANTICS.md S119): an undefined element is NaN to the fold.
+      return L.undefSlots ? toNumberCanon(L, folded) : folded;
     }
     const kind = L.mapTypeOf(L.typeOf(access.expression))?.kind;
     const entry =
@@ -822,14 +825,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
         case "string":
           return { kind: "libCall", fn: "num.fromString", args: [e], type: F64, loc };
         case "bool":
-          return {
-            kind: "ternary",
-            cond: e,
-            then: { kind: "numLit", value: 1, type: F64, loc },
-            else_: { kind: "numLit", value: 0, type: F64, loc },
-            type: F64,
-            loc,
-          };
+          return boolToNumber(L, e, loc);
+        case "f64":
+          // Unit U (SEMANTICS.md S119): ToNumber of an undefined number.
+          return toNumberCanon(L, e);
         case "dyn":
           return { kind: "libCall", fn: "dyn.toNumber", args: [e], type: F64, loc };
         case "jsval":

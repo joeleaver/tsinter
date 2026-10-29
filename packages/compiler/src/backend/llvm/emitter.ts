@@ -6808,6 +6808,13 @@ class LlEmitter {
         B.line(`store ptr ${trueOrigVal}, ptr ${trueOrigP}`);
         return this.own({ name: c, type: e.type });
       }
+      case "slotUndef":
+      case "isUndef":
+      case "arrHasUndef":
+        // Unit U: undefSlots modules exist only on the WasmGC lanes
+        // (compile() sets the option for --backend wasm / wasm-native);
+        // the native lanes keep SEMANTICS.md S003/S006/S032.
+        throw new Error(`${e.kind} reached a native backend (undefSlots is a WasmGC-lane module flag)`);
       default: {
         // Exhaustive: phase 6 claimed the last IR expression kinds.
         const _exhaustive: never = e;

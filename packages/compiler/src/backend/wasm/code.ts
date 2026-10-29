@@ -347,6 +347,11 @@ export class Code {
     this.w.u8(0x37);
     this.memarg(0, off, mem);
   }
+  /** i32.trunc_sat_f64_s — saturating (never traps; NaN gives 0). */
+  i32TruncSatF64S(): void {
+    this.w.u8(0xfc);
+    this.w.uleb(2);
+  }
   /** i64.trunc_sat_f64_u — saturating (never traps). */
   i64TruncSatF64U(): void {
     this.w.u8(0xfc);

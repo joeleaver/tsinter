@@ -1579,6 +1579,7 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       unionsById,
       globalsById,
       errors,
+      mod.undefSlots === true,
     );
   }
   return errors;
@@ -1593,6 +1594,7 @@ function validateFunction(
   unions: Map<string, IrUnionDef>,
   globals: Map<string, IrGlobal>,
   errors: IrValidationError[],
+  undefSlots = false,
 ): void {
   const locals = new Map(fn.locals.map((l) => [l.id, l]));
   const err = (message: string, loc: SrcLoc) =>
@@ -1736,6 +1738,33 @@ function validateFunction(
         // runtime value, so a bare one is frontend breakage.
         err(`bare unitLit '${e.unit}' outside a unionWrap`, e.loc);
         break;
+      case "slotUndef": {
+        // Unit U: only in undefSlots modules (the WasmGC lanes), and only
+        // for a kind with a representable undefined — never a unit,
+        // void, or a dynamic kind (those carry their own undefined).
+        const k = e.type.kind;
+        if (!undefSlots) err("slotUndef outside an undefSlots module", e.loc);
+        if (isUnitType(e.type) || k === "void" || k === "dyn" || k === "jsval" || k === "caught") {
+          err(`slotUndef of '${k}' (no plain-slot undefined)`, e.loc);
+        }
+        break;
+      }
+      case "arrHasUndef":
+        checkExpr(e.arr);
+        if (!undefSlots) err("arrHasUndef outside an undefSlots module", e.loc);
+        if (e.arr.type.kind !== "array") err(`arrHasUndef of a non-array '${e.arr.type.kind}'`, e.loc);
+        if (e.type.kind !== "bool") err("arrHasUndef must be bool", e.loc);
+        break;
+      case "isUndef": {
+        checkExpr(e.operand);
+        const k = e.operand.type.kind;
+        if (!undefSlots) err("isUndef outside an undefSlots module", e.loc);
+        if (isUnitType(e.operand.type) || k === "void" || k === "dyn" || k === "jsval" || k === "caught") {
+          err(`isUndef of '${k}' (no plain-slot undefined)`, e.loc);
+        }
+        if (e.type.kind !== "bool") err("isUndef must be bool", e.loc);
+        break;
+      }
       case "varRef": {
         const binding = locals.get(e.localId) ?? globals.get(e.localId);
         if (!binding) err(`varRef to undeclared local/global "${e.localId}"`, e.loc);
@@ -2128,6 +2157,8 @@ function validateFunction(
         } else if (
           e.operand.type.kind !== "f64" &&
           e.operand.type.kind !== "bool" &&
+          // Unit U: String(s) over a string slot that may hold undefined.
+          !(undefSlots && e.operand.type.kind === "string") &&
           e.operand.type.kind !== "caught" &&
           e.operand.type.kind !== "dyn" &&
           // Plain data records print Object.prototype.toString's constant

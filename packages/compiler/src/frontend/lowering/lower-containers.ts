@@ -6,7 +6,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
-import { droppableStatic, isRequireMainFilename, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { bindOnce, droppableStatic, holeFencedCall, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
@@ -370,14 +370,23 @@ function lowerOptionalDefaultArg(
       if (!typeEquals(needle.type, elem)) {
         L.badType(call.arguments[0]!, L.typeOf(call.arguments[0]!));
       }
-      return {
+      const search = (recv: IrExpr): IrExpr => ({
         kind: "arrIntrinsic",
         method: name,
-        receiver,
+        receiver: recv,
         args: [needle],
         type: name === "indexOf" ? F64 : BOOL,
         loc,
-      };
+      });
+      // Unit U (SEMANTICS.md S119): indexOf skips holes in Node (includes
+      // reads them as undefined) — fenced once the program made one.
+      if (name === "indexOf" && mayHoldSlotUndef(L, needle) && ["f64", "string", "bool", "record", "object", "array"].includes(needle.type.kind)) {
+        // (a helper call shape, so holeFencedCall can guard the receiver;
+        // only an undefined needle can tell a hole from undefined)
+        const helper = indexOfHelper(L, elem, receiverIr, loc);
+        return holeFencedCall(L, { kind: "call", callee: helper, args: [receiver, needle], type: F64, loc }, "Array.prototype.indexOf", loc);
+      }
+      return search(receiver);
     }
     if (name === "concat") {
       // `a.concat(x, ys, ...)` — a fresh array of a's elements followed by
@@ -446,6 +455,8 @@ function lowerOptionalDefaultArg(
       for (let i = 0; i < args.length; i++) {
         if (args[i]!.type.kind !== "f64") L.badType(call.arguments[i]!, L.typeOf(call.arguments[i]!));
       }
+      // Unit U (SEMANTICS.md S119): an undefined end is an absent one.
+      if (args.length === 2) args[1] = undefinedAsAbsent(L, args[1]!, { kind: "numLit", value: Infinity, type: F64, loc });
       return { kind: "arrIntrinsic", method: "slice", receiver, args, type: receiverIr, loc };
     }
     if (name === "splice") {
@@ -502,22 +513,26 @@ function lowerOptionalDefaultArg(
         );
       }
       const receiver = L.lowerExpr(access.expression);
-      const sep = L.lowerExpr(call.arguments[0]!);
+      // Unit U (SEMANTICS.md S119): join(undefined) joins with ",".
+      const sep = undefinedAsAbsent(L, L.lowerExpr(call.arguments[0]!), { kind: "strLit", value: ",", type: STRING, loc });
       return { kind: "arrIntrinsic", method: "join", receiver, args: [sep], type: STRING, loc };
     }
+    // Unit U (SEMANTICS.md S119): the callbacks that SKIP holes in Node
+    // fence an array that may hold one (holeFencedCall).
     if (name === "map" || name === "filter" || name === "forEach") {
-      return lowerArrayHofCall(L, call, access, name, elem);
+      return holeFencedCall(L, lowerArrayHofCall(L, call, access, name, elem), `Array.prototype.${name}`, loc);
     }
     if (
       name === "find" || name === "findIndex" || name === "findLast" ||
       name === "findLastIndex" || name === "some" || name === "every"
     ) {
-      return lowerArrayFindLikeCall(L, call, access, name, elem);
+      const r = lowerArrayFindLikeCall(L, call, access, name, elem);
+      return name === "some" || name === "every" ? holeFencedCall(L, r, `Array.prototype.${name}`, loc) : r;
     }
     if (name === "at") return lowerArrayAtCall(L, call, access, elem);
-    if (name === "flatMap") return lowerArrayFlatMapCall(L, call, access, elem);
+    if (name === "flatMap") return holeFencedCall(L, lowerArrayFlatMapCall(L, call, access, elem), "Array.prototype.flatMap", loc);
     // reduce / reduceRight
-    return lowerArrayReduceCall(L, call, access, name as "reduce" | "reduceRight", elem);
+    return holeFencedCall(L, lowerArrayReduceCall(L, call, access, name as "reduce" | "reduceRight", elem), `Array.prototype.${name}`, loc);
   }
 
 /** A VARIADIC JS callback (`function () { ... arguments ... }`, `(...a)
@@ -1690,7 +1705,7 @@ function lowerOptionalDefaultArg(
         L.liftedFns.push(buildArraySortFn(helper, STRING, 2, copyFirst, null, loc));
       }
       const fnArg: IrExpr = { kind: "closure", fnName: cmp, captures: [], type: fnT, loc };
-      return { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
+      return holeFencedCall(L, { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc }, `Array.prototype.${method}`, loc, SORT_UNDEF);
     }
     if (call.arguments.length !== 1) {
       L.noLowering(
@@ -1733,8 +1748,39 @@ function lowerOptionalDefaultArg(
         ),
       );
     }
-    return { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
+    const sortCall: IrExpr = { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
+    return elem.kind === "union" ? sortCall : holeFencedCall(L, sortCall, `Array.prototype.${method}`, loc, SORT_UNDEF);
   }
+
+/** Unit U: `%arr.indexOf.<n>(a, x)` — the indexOf intrinsic as a helper
+ * call, so the hole fence can guard it as an expression. */
+function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): string {
+  const key = `indexOf:${typeKey(elem)}`;
+  const existing = L.arrHofHelpers.get(key);
+  if (existing) return existing;
+  const name = `%arr.indexOf.${L.arrHofHelpers.size}`;
+  L.arrHofHelpers.set(key, name);
+  const a: IrExpr = { kind: "varRef", localId: "a.0", type: arrT, loc };
+  const x: IrExpr = { kind: "varRef", localId: "x.0", type: elem, loc };
+  L.liftedFns.push({
+    name,
+    params: [
+      { localId: "a.0", name: "a", type: arrT },
+      { localId: "x.0", name: "x", type: elem },
+    ],
+    returnType: F64,
+    locals: [
+      { id: "a.0", name: "a", type: arrT, mutable: false },
+      { id: "x.0", name: "x", type: elem, mutable: false },
+    ],
+    body: [{ kind: "return", value: { kind: "arrIntrinsic", method: "indexOf", receiver: a, args: [x], type: F64, loc }, loc }],
+    loc,
+  });
+  return name;
+}
+
+/** Unit U: why sort fences an undefined element of a plain-typed array. */
+const SORT_UNDEF = "Node sorts undefined last without calling the comparator; this tier's sort does not model that for a plain-typed array";
 
 /** JS's default sort comparator for STRING elements, interned once:
    *
@@ -5193,6 +5239,36 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     // same call with the default made explicit.
     if ((entry.method === "padStart" || entry.method === "padEnd") && args.length === 1) {
       args.push({ kind: "strLit", value: " ", type: STRING, loc: locOf(call) });
+    }
+    if (L.undefSlots) {
+      // Unit U (SEMANTICS.md S119): an argument holding its slot's
+      // undefined — an optional one is ABSENT (slice/substring's end runs
+      // to the end, the pad fill is " "), a search string is ToString'd
+      // ("undefined"), and split(undefined) answers [s].
+      const sloc = locOf(call);
+      const m = entry.method;
+      args.forEach((a, i) => {
+        if (i === 1 && (m === "slice" || m === "substring")) {
+          args[i] = undefinedAsAbsent(L, a, { kind: "numLit", value: Infinity, type: F64, loc: sloc });
+        } else if (i === 1 && (m === "padStart" || m === "padEnd")) {
+          args[i] = undefinedAsAbsent(L, a, { kind: "strLit", value: " ", type: STRING, loc: sloc });
+        } else if (a.type.kind === "string" && m !== "split") {
+          args[i] = undefinedAsText(L, a, sloc);
+        }
+      });
+      if (m === "split" && mayHoldSlotUndef(L, args[0]!)) {
+        const sep = args[0]!;
+        return bindOnce(L, receiver, sloc, (recv) =>
+          bindOnce(L, sep, sloc, (sp) => ({
+            kind: "ternary",
+            cond: isUndefExpr(sp, false, sloc),
+            then: { kind: "arrayLit", elems: [recv], type: arrayOf(STRING), loc: sloc },
+            else_: { kind: "strIntrinsic", method: "split", receiver: recv, args: [sp], type: entry.result, loc: sloc },
+            type: entry.result,
+            loc: sloc,
+          })),
+        );
+      }
     }
     return {
       kind: "strIntrinsic",
