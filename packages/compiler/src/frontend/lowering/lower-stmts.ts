@@ -2144,7 +2144,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           L.unsupported(
             "SC1090",
             bad,
-            `the builtin '${alias ?? `${globalName}.${propName}`}' used as a value through the binding '${bound.text}' (it has no runtime object here — identity comparisons, truthiness and Set membership tests lower; read and call its members directly)`,
+            `the builtin '${alias ?? `${globalName}.${propName}`}' used as a value through the binding '${bound.text}' (it has no runtime object here — comparisons with another builtin, truthiness and builtin-only Set membership tests lower; read and call its members directly)`,
           );
         }
       }

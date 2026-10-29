@@ -823,6 +823,19 @@ export function withEsFnName(L: Lowerer, e: IrExpr & { kind: "dynFrom" }, node: 
   return name === null ? e : { ...e, fnName: name };
 }
 
+/** A value whose crossing into the dyn rest array is exact: a scalar
+ * (number, string, boolean) or a union of scalars and units — copying it
+ * is unobservable — or a value already dyn (it crosses by reference).
+ * Composites (arrays, records, objects, ...) cross as
+ * copies (S014). */
+export function isPrimitiveArgType(L: Lowerer, t: IrType): boolean {
+  if (t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "dyn" || isUnitType(t)) return true;
+  if (t.kind === "union") {
+    return L.unions.get(t.unionId)?.arms.every((a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a)) ?? false;
+  }
+  return false;
+}
+
 export class Lowerer {
   readonly checker: ts.TypeChecker;
   readonly diags: ScrDiagnostic[] = [];
@@ -4873,6 +4886,11 @@ export class Lowerer {
    * ir/nodes.ts's closure-node doc for the field's contract. */
   funcCoerceAdapter(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }, loc: SrcLoc): string | null {
     if (fromT.rest === true && fromT.restAbi !== "jsval" && toT.rest !== true) {
+      // Only all-primitive slots adapt here: a composite argument crosses
+      // into the rest array as a COPY (S014), and with no view of the
+      // callback's body nothing proves the copy is never observed
+      // (adaptVariadicCallback vets the body and calls the adapter itself).
+      if (toT.params.some((t) => !isPrimitiveArgType(this, t))) return null;
       return this.restFuncAdapter(fromT, toT, loc);
     }
     if (fromT.rest === true || toT.rest === true) return null;
@@ -5027,7 +5045,9 @@ export class Lowerer {
    * every argument converted to dyn — so the boxed thunk delivers JS arity:
    * leading parameters bind positionally, the rest/`arguments` array holds
    * the surplus (composite arguments cross by S014's copy, `arguments` is
-   * S081's real array). The dyn result checks back into the slot's return
+   * S081's real array; a composite argument is a copy (S014), so callers
+   * admit one only where the callback provably never observes it —
+   * adaptVariadicCallback's body vetting). The dyn result checks back into the slot's return
    * type (a mismatch is the catchable TypeError every dyn check throws).
    * Null — the caller's fence stands — when the function cannot box or an
    * argument/result has no dyn crossing. */

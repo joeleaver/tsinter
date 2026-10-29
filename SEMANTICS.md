@@ -6535,12 +6535,16 @@ on `arguments`), `typeof arguments` (`"object"`), `arguments == null` (`false`),
 The two answers DIVERGE on the eleven observables below, each measured against Node v24.18.1 (`arguments`
 inside a CLASS or STATIC method is a DIFFERENT construct, not this entry's territory: there the front
 end folds `arguments.length` to the declared parameter count in a TypeScript file only where every
-invocation is a direct call tsc arity-checks — the method never extracted, its class without heritage, its
-instances never typed through another member of that name — refuses it by name in a TypeScript file
+invocation is a direct call tsc arity-checks against the function's own parameter list — no overloads, no
+`this:` or trailing-`void` parameter counted, a method's class without heritage or subclass and its
+instances never flowing anywhere but a member-access receiver — refuses it by name in a TypeScript file
 otherwise, and refuses it by name in a JavaScript file, where a caller may pass any count — board #164,
 GH #22). The same eleven observables hold when such a variadic function is handed to a builtin that calls
-it — the array iteration methods and a sort comparator pass every argument Node passes, a composite one
-(the array) crossing by S014's copy:
+it — the array iteration methods and a sort comparator pass every argument Node passes. An object or array
+argument would reach the rest array as a COPY (S014), never observable by this entry's rule: a variadic
+callback whose body uses an object or array position at all (a read, a write, a method call, an identity
+test, passing or storing it; `arguments.length` and scalar positions stay free) refuses by name (SC1090), as does one whose body is not in view
+(GH #22):
 
 `.callee` — strict mode: Node throws a TypeError reading it (`'caller', 'callee', and 'arguments'
 properties may not be accessed`) where this tier answers `undefined` (S081-8, a strict `.cjs`). Sloppy

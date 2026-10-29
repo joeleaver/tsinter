@@ -1,0 +1,34 @@
+arguments-length-escapes.ts:7:43 - error SC1090: 'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there) are not supported yet
+
+  6 | function over(a: number, b: number): number;
+  7 | function over(a: number): number { return arguments.length + a * 0; }
+    |                                           ^~~~~~~~~~~~~~~~
+  8 | console.log(over(1, 2));
+
+arguments-length-escapes.ts:12:33 - error SC1090: 'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there) are not supported yet
+
+  11 |   m(a: number, b: number): number;
+  12 |   m(a: number): number { return arguments.length + a * 0; }
+     |                                 ^~~~~~~~~~~~~~~~
+  13 | }
+
+arguments-length-escapes.ts:16:46 - error SC1090: 'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there) are not supported yet
+
+  15 | 
+  16 | class Narrow { m(a: number): number { return arguments.length + a * 0; } }
+     |                                              ^~~~~~~~~~~~~~~~
+  17 | function viaConstraint<T extends { m(a: number, b: number): number }>(t: T): number { return t.m(1, 2); }
+
+arguments-length-escapes.ts:20:60 - error SC1090: 'arguments.length' in functions with optional, default, or rest parameters (the count varies per call — a fixed-arity signature folds to a constant) are not supported yet
+
+  19 | 
+  20 | function trailingVoid(a: number, b: void): number { return arguments.length + a * 0; }
+     |                                                            ^~~~~~~~~~~~~~~~
+  21 | console.log(trailingVoid(1));
+
+arguments-length-escapes.ts:21:13 - error SC1090: this call form is not supported yet
+
+  20 | function trailingVoid(a: number, b: void): number { return arguments.length + a * 0; }
+  21 | console.log(trailingVoid(1));
+     |             ^~~~~~~~~~~~~~~
+  22 | 

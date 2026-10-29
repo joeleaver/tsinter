@@ -5789,6 +5789,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2825-variadic-callback-object-args.js": {
+   "order": [
+    "<repo>/tests/corpus/2825-variadic-callback-object-args.js"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -6763,6 +6769,12 @@
   "<repo>/tests/diagnostics/any.ts": {
    "order": [
     "<repo>/tests/diagnostics/any.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/arguments-length-escapes.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/arguments-length-escapes.ts"
    ],
    "diags": []
   },

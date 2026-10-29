@@ -12,7 +12,7 @@ import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { DYN_DISPATCH_METHODS, islandPrimitiveExit } from "./lower-calls.js";
 import { typeKey } from "../types.js";
-import { dynUndefinedExpr, own, WidthLift, withEsFnName } from "./lowerer.js";
+import { dynUndefinedExpr, isPrimitiveArgType, own, WidthLift, withEsFnName } from "./lowerer.js";
 
 /** Lower an expression whose checker type is statically `undefined`/`void`.
  * Optional builtin arguments use this before their ordinary expected-type
@@ -531,7 +531,25 @@ function lowerOptionalDefaultArg(
   export function adaptVariadicCallback(L: Lowerer, argNode: ts.Node, fnArg: IrExpr, params: IrType[]): IrExpr {
     if (fnArg.type.kind !== "func" || fnArg.type.rest !== true) return fnArg;
     const fullT: IrType & { kind: "func" } = { kind: "func", params, ret: fnArg.type.ret };
-    const adapted = L.coerceToExpected(fnArg, fullT);
+    // A composite argument (the element object, the array itself) reaches
+    // the callback as a COPY (S014), where Node hands over the object: a
+    // write, a method call, an identity test or any onward flow would
+    // observe the copy. Admitted only when the callback's body provably
+    // reads the copied positions not at all — `arguments.length`, and
+    // `arguments[k]` / `rest[k]` at scalar positions; anything else
+    // refuses by name (GH #22).
+    const bad = variadicCompositeUse(L, argNode, params);
+    if (bad !== null) {
+      L.unsupported(
+        "SC1090",
+        bad,
+        "a variadic callback (a rest parameter or 'arguments') using an object or array argument (it would be a copy here, where Node passes the object itself — declare the parameter instead)",
+      );
+    }
+    const name = L.restFuncAdapter(fnArg.type as IrType & { kind: "func" }, fullT, locOf(argNode));
+    const adapted: IrExpr = name
+      ? { kind: "call", callee: name, args: [fnArg], type: fullT, loc: locOf(argNode) }
+      : fnArg;
     if (adapted.type.kind !== "func" || adapted.type.rest === true) {
       L.unsupported(
         "SC1090",
@@ -540,6 +558,69 @@ function lowerOptionalDefaultArg(
       );
     }
     return adapted;
+  }
+
+/** The first use in a variadic callback's body that could observe a
+   * COMPOSITE argument's copy, or null when none can (adaptVariadicCallback).
+   * Every position `params` marks composite must stay unread: a declared
+   * leading parameter at such a position, or any use of the rest array /
+   * `arguments` other than `.length` and a literal-index read of a scalar
+   * position, is a use. A callback whose body is not in view (anything but
+   * a function expression, an arrow or a function declaration's name)
+   * counts as using everything. */
+  function variadicCompositeUse(L: Lowerer, argNode: ts.Node, params: IrType[]): ts.Node | null {
+    const composite = params.map((t) => !isPrimitiveArgType(L, t));
+    if (!composite.some((c) => c)) return null;
+    let fn: ts.Node | undefined = argNode;
+    while (fn !== undefined && ts.isParenthesizedExpression(fn)) fn = fn.expression;
+    if (fn !== undefined && ts.isIdentifier(fn)) {
+      const sym = L.checker.getSymbolAtLocation(fn);
+      fn = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+    }
+    if (fn === undefined || !(ts.isFunctionExpression(fn) || ts.isArrowFunction(fn) || ts.isFunctionDeclaration(fn)) || fn.body === undefined) {
+      return argNode;
+    }
+    const f = fn;
+    const params0 = f.parameters;
+    const restParam = params0.length > 0 && params0[params0.length - 1]!.dotDotDotToken ? params0[params0.length - 1]! : undefined;
+    const offset = restParam ? params0.length - 1 : 0;
+    for (let i = 0; i < offset; i++) {
+      if (composite[i]) return params0[i]!;
+    }
+    const restSym = restParam && ts.isIdentifier(restParam.name) ? L.checker.getSymbolAtLocation(restParam.name) : undefined;
+    if (restParam && !restSym) return restParam;
+    let bad: ts.Node | null = null;
+    const okUse = (ref: ts.Node): boolean => {
+      const p = ref.parent;
+      if (p === undefined) return false;
+      const isTarget = (n: ts.Node): boolean => {
+        const q = n.parent;
+        return q !== undefined && (
+          (ts.isBinaryExpression(q) && q.left === n && q.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && q.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+          ts.isPrefixUnaryExpression(q) && (q.operator === ts.SyntaxKind.PlusPlusToken || q.operator === ts.SyntaxKind.MinusMinusToken) ||
+          ts.isPostfixUnaryExpression(q) || ts.isDeleteExpression(q));
+      };
+      if (ts.isPropertyAccessExpression(p) && p.expression === ref) return p.name.text === "length" && !isTarget(p);
+      if (ts.isElementAccessExpression(p) && p.expression === ref && ts.isNumericLiteral(p.argumentExpression)) {
+        const k = offset + Number(p.argumentExpression.text);
+        return !isTarget(p) && (k >= composite.length || !composite[k]!);
+      }
+      return false;
+    };
+    ts.walkPreorder(f.body!, (n) => {
+      if (bad !== null) return "stop";
+      if (restSym === undefined && n !== f && (ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) || ts.isAccessor(n) || ts.isConstructorDeclaration(n))) {
+        return "skip"; // their own `arguments`
+      }
+      if (ts.isIdentifier(n)) {
+        const hit = restSym !== undefined
+          ? n.text === restSym.name && L.checker.getSymbolAtLocation(n) === restSym
+          : n.text === "arguments" && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n);
+        if (hit && !okUse(n)) bad = n;
+      }
+      return undefined;
+    });
+    return bad;
   }
 
 /** The builtins whose desugared loop cannot hand a callback EVERY argument

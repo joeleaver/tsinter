@@ -3676,6 +3676,7 @@ const TIER_FLOOR: string[] = [
   "2822-variadic-builtin-callbacks.js",
   "2823-arguments-length-static.ts",
   "2824-builtin-global-values.js",
+  "2825-variadic-callback-object-args.js",
 ];
 
 interface RunResult {

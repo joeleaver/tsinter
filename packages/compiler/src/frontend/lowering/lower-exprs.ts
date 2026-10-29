@@ -111,16 +111,30 @@ export function abstractPropertyDeclOf(L: Lowerer, expr: ts.PropertyAccessExpres
  *    value — a builtin callback slot passes extra arguments, and TS lets a
  *    shorter function into a wider function-typed slot); a function
  *    expression other than an immediately-invoked one;
+ *  - a function or method with OVERLOADS (callers check the overloads);
  *  - a class method referenced other than as a callee, declared on a class
- *    with heritage (a base or interface may declare the member with more
- *    parameters, and calls through it dispatch here), or whose instances
- *    flow into a contextual type whose same-named member is not this one
- *    (a structural interface, `any`, a union, a type parameter);
+ *    with heritage or a subclass, or whose instances (or `this`) flow
+ *    anywhere but a member-access receiver (a base, interface, structural
+ *    or generic-constraint type may declare more parameters);
  *  - a constructor whose class is used as a value (a construct-signature
  *    slot may declare more parameters).
  * Accessors are always static (a get passes none, a set exactly one). */
 function argumentsCountIsStatic(L: Lowerer, fn: ts.FunctionLikeDeclaration): boolean {
   if (ts.isGetAccessorDeclaration(fn) || ts.isSetAccessorDeclaration(fn)) return true;
+  // OVERLOADS: callers are checked against the overload signatures, not
+  // the implementation's parameter list — `f(1, 2)` through a two-parameter
+  // overload reaches a one-parameter implementation.
+  {
+    if (ts.isConstructorDeclaration(fn)) {
+      const owner = fn.parent;
+      if (owner !== undefined && (ts.isClassDeclaration(owner) || ts.isClassExpression(owner)) &&
+        owner.members.filter((m) => ts.isConstructorDeclaration(m)).length > 1) return false;
+    } else {
+      const nameNode = (fn as { name?: ts.Node }).name;
+      const sym = nameNode !== undefined ? L.checker.getSymbolAtLocation(nameNode) : undefined;
+      if (sym !== undefined && L.checker.declarationsOf(sym).length > 1) return false;
+    }
+  }
   const unwrapParens = (n: ts.Node): ts.Node => {
     let cur = n;
     while (cur.parent !== undefined && ts.isParenthesizedExpression(cur.parent)) cur = cur.parent;
@@ -190,10 +204,20 @@ function argumentsCountIsStatic(L: Lowerer, fn: ts.FunctionLikeDeclaration): boo
     });
   }
   if (!ts.isMethodDeclaration(fn) || fn.name === undefined) return false;
+  // A method is reached through a WIDER signature whenever an instance of
+  // its class is typed as anything else (a base or interface, a
+  // structural parameter type, a type parameter's constraint, a covariant
+  // array, `any`) — so the fold requires instances that never flow: no
+  // heritage on the class, no subclass, every `new C(...)` (and every
+  // `this` in the class) used only as a member-access receiver or as the
+  // initializer of an unannotated const whose every reference is one, and
+  // every reference to the method a direct call.
   if (cls.heritageClauses !== undefined && cls.heritageClauses.length > 0) return false;
+  if (!cls.name) return false;
+  const csym = L.checker.getSymbolAtLocation(cls.name);
   const msym = L.checker.getSymbolAtLocation(fn.name);
   const mname = ts.isIdentifier(fn.name) || ts.isPrivateIdentifier(fn.name) || ts.isStringLiteral(fn.name) ? fn.name.text : null;
-  if (!msym || mname === null) return false;
+  if (!csym || !msym || mname === null) return false;
   const isMember = (n: ts.Node): boolean => {
     const p = n.parent;
     if (p === undefined) return false;
@@ -203,57 +227,70 @@ function argumentsCountIsStatic(L: Lowerer, fn: ts.FunctionLikeDeclaration): boo
     return false;
   };
   if (!everyRef(msym, mname, isMember)) return false;
-  // Structural escape: an expression whose type carries THIS method,
-  // contextually typed by a type whose same-named member is another.
-  let escapes = false;
-  for (const f of files) {
-    ts.walkPreorder(f, (n) => {
-      if (escapes) return "stop";
-      if (ts.isTypeNode(n)) return "skip";
-      const candidate =
-        (ts.isIdentifier(n) && !(n.parent !== undefined && (n.parent as { name?: ts.Node }).name === n && !ts.isShorthandPropertyAssignment(n.parent))) ||
-        n.kind === ts.SyntaxKind.ThisKeyword ||
-        ts.isNewExpression(n) || ts.isCallExpression(n) || ts.isPropertyAccessExpression(n) ||
-        ts.isElementAccessExpression(n) || ts.isParenthesizedExpression(n) || ts.isConditionalExpression(n) ||
-        ts.isBinaryExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n) || ts.isAwaitExpression(n);
-      if (!candidate) return undefined;
-      const t = L.checker.getTypeAtLocation(n);
-      if (L.checker.getPropertyOfType(t, mname) !== msym) return undefined;
-      const ctx = L.checker.getContextualType(n);
-      if (ctx === undefined) return undefined;
-      if (L.checker.getPropertyOfType(L.checker.getNonNullableType(ctx), mname) !== msym) escapes = true;
-      return undefined;
-    });
-    if (escapes) break;
-  }
-  return !escapes;
+  const isReceiver = (n: ts.Node): boolean => {
+    const outer = unwrapParens(n);
+    const p = outer.parent;
+    return p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === outer;
+  };
+  /** An instance-valued expression that never flows anywhere. */
+  const instanceStays = (n: ts.Node): boolean => {
+    if (isReceiver(n)) return true;
+    const outer = unwrapParens(n);
+    const p = outer.parent;
+    if (p !== undefined && ts.isVariableDeclaration(p) && p.initializer === outer && ts.isIdentifier(p.name) &&
+      (ts.getCombinedNodeFlags(p) & ts.NodeFlags.Const) !== 0 && p.type === undefined) {
+      const vsym = L.checker.getSymbolAtLocation(p.name);
+      const vname = p.name;
+      return vsym !== undefined && everyRef(vsym, vname.text, (r) => r === vname || isReceiver(r));
+    }
+    return false;
+  };
+  const classOk = everyRef(csym, cls.name.text, (n) => {
+    const outer = unwrapParens(n);
+    const p = outer.parent;
+    if (p === undefined) return false;
+    if (ts.isNewExpression(p) && p.expression === outer) return instanceStays(p);
+    if (ts.isPropertyAccessExpression(p) && p.expression === outer) return p.name.text !== "prototype";
+    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === outer) return true;
+    return false; // extends C, the class as a value, ...
+  });
+  if (!classOk) return false;
+  let thisEscapes = false;
+  ts.walkPreorder(cls, (n) => {
+    if (thisEscapes) return "stop";
+    if (n !== cls && (ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n))) return "skip";
+    if (n.kind === ts.SyntaxKind.ThisKeyword && !isReceiver(n)) thisEscapes = true;
+    return undefined;
+  });
+  return !thisEscapes;
 }
 
 /** The IDENTITY uses a builtin global's token may meet (GH #74). A
  * JavaScript source's stdlib global (or builtin-module member) taken as a
  * value has no runtime object here — it lowers to an interned string
- * naming it, which answers exactly where only identity and truthiness are
- * observed:
- *  - an operand of ===, !==, ==, != (one global, one token);
+ * naming it, which answers exactly ONLY where nothing but another token
+ * can meet it (a real string equal to the carrier must never compare
+ * equal, and `Math == "[object Math]"` must never compare unequal):
+ *  - an operand of ===, !==, ==, != whose other operand is also a token
+ *    (isBuiltinTokenExpr) or a null/undefined literal;
  *  - the operand of `!`, or the condition of an if / while / do / for /
  *    `?:` (a token, like the object, is always truthy);
- *  - the argument of a membership query — `.has(t)`, `.includes(t)`,
- *    `.indexOf(t)`, `.lastIndexOf(t)`, `.delete(t)` — or of `.add(t)` on
- *    a token-safe Set binding;
- *  - an element of the array literal that seeds a token-safe Set binding
- *    (`const known = new Set([setTimeout, ...])` — the harness's
- *    knownGlobals idiom);
+ *  - the argument of `.has` / `.add` / `.delete` on a token-only Set
+ *    binding, or an element of the array literal seeding one (the
+ *    harness's knownGlobals idiom, `new Set([setTimeout, ...])`);
  *  - the initializer of a `const` whose every reference is one of these;
  *  - the source of an object destructuring (stdlibGlobalTokenDestructure
  *    checks its own bindings);
  *  - at depth 0 only (the global's own spelling), the receiver of a member
  *    access: the member lowerings and their fences own that.
- * A token-safe Set binding is a `const` initialized by `new Set(...)`
- * whose every reference is the receiver of `.has` / `.add` / `.delete` /
- * `.clear` or a `.size` read — its tokens never come back out. Anything
- * else (an argument to a user function, a typeof the fold did not claim,
- * a stored or returned value, string conversion, iteration) would observe
- * the string carrier where Node has the object. */
+ * A token-only Set binding is a `const` initialized by `new Set([...])`
+ * whose seed elements are all tokens and whose every reference is the
+ * receiver of `.has(t)` / `.add(t)` / `.delete(t)` with a token argument,
+ * of `.clear()`, or a `.size` read — no non-token ever enters or is looked
+ * up, and its tokens never come back out. Anything else (an argument to a
+ * user function or a user-defined `.includes`, a string method, a typeof
+ * the fold did not claim, a stored or returned value, string conversion,
+ * iteration) would observe the string carrier where Node has the object. */
 export function builtinTokenUseOk(L: Lowerer, node: ts.Node, depth = 0): boolean {
   if (depth > 4) return false;
   let outer: ts.Node = node;
@@ -262,10 +299,14 @@ export function builtinTokenUseOk(L: Lowerer, node: ts.Node, depth = 0): boolean
   if (p === undefined) return false;
   if (ts.isBinaryExpression(p)) {
     const op = p.operatorToken.kind;
-    return (
-      op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
-      op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsToken
-    );
+    if (
+      op !== ts.SyntaxKind.EqualsEqualsEqualsToken && op !== ts.SyntaxKind.ExclamationEqualsEqualsToken &&
+      op !== ts.SyntaxKind.EqualsEqualsToken && op !== ts.SyntaxKind.ExclamationEqualsToken
+    ) {
+      return false;
+    }
+    const other = p.left === outer ? p.right : p.left;
+    return isBuiltinTokenExpr(L, other) || isNullishLiteral(other);
   }
   if (ts.isPrefixUnaryExpression(p)) return p.operator === ts.SyntaxKind.ExclamationToken;
   if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && p.expression === outer) return true;
@@ -273,19 +314,11 @@ export function builtinTokenUseOk(L: Lowerer, node: ts.Node, depth = 0): boolean
   if (ts.isConditionalExpression(p) && p.condition === outer) return true;
   if (ts.isCallExpression(p) && p.arguments.length === 1 && p.arguments[0] === outer && ts.isPropertyAccessExpression(p.expression)) {
     const m = p.expression.name.text;
-    if (m === "has" || m === "includes" || m === "indexOf" || m === "lastIndexOf" || m === "delete") return true;
-    if (m === "add") return tokenSafeSetBinding(L, p.expression.expression);
-    return false;
+    return (m === "has" || m === "add" || m === "delete") && tokenSafeSetBinding(L, p.expression.expression);
   }
   if (ts.isArrayLiteralExpression(p)) {
-    let arr: ts.Node = p;
-    while (arr.parent !== undefined && ts.isParenthesizedExpression(arr.parent)) arr = arr.parent;
-    const ne = arr.parent;
-    if (ne === undefined || !ts.isNewExpression(ne) || ne.arguments?.length !== 1 || ne.arguments[0] !== arr) return false;
-    if (!ts.isIdentifier(ne.expression) || !L.isStdlibGlobal(ne.expression, "Set")) return false;
-    const decl = ne.parent;
-    return decl !== undefined && ts.isVariableDeclaration(decl) && decl.initializer === ne && ts.isIdentifier(decl.name) &&
-      tokenSafeSetBinding(L, decl.name);
+    const decl = tokenSetSeedDecl(L, p);
+    return decl !== null && tokenSafeSetBinding(L, decl.name as ts.Identifier);
   }
   if (ts.isVariableDeclaration(p) && p.initializer === outer) {
     if (ts.isObjectBindingPattern(p.name)) return true;
@@ -293,6 +326,35 @@ export function builtinTokenUseOk(L: Lowerer, node: ts.Node, depth = 0): boolean
     return everyLocalRef(L, p.name, (r) => builtinTokenUseOk(L, r, depth + 1));
   }
   if (depth === 0 && (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === outer) return true;
+  return false;
+}
+
+function isNullishLiteral(e: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  return e.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(e) && e.text === "undefined") || ts.isVoidExpression(e);
+}
+
+/** An expression that lowers to a builtin identity TOKEN: a stdlib
+ * global's spelling (aliases included), a builtin-module member binding,
+ * a const initialized by one, or a binding destructured from a stdlib
+ * global. */
+export function isBuiltinTokenExpr(L: Lowerer, e: ts.Expression, depth = 0): boolean {
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (depth > 4) return false;
+  if (stdlibGlobalNameOf(L, e) !== null) return true;
+  if (!ts.isIdentifier(e)) return false;
+  if (L.builtinImportOf(e) !== null) return true;
+  const sym = L.checker.getSymbolAtLocation(e);
+  const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (decl === undefined) return false;
+  if (ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) && decl.initializer !== undefined &&
+    (ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const) !== 0) {
+    return isBuiltinTokenExpr(L, decl.initializer, depth + 1);
+  }
+  if (ts.isBindingElement(decl) && ts.isObjectBindingPattern(decl.parent) && ts.isVariableDeclaration(decl.parent.parent)) {
+    const init = decl.parent.parent.initializer;
+    return init !== undefined && stdlibGlobalNameOf(L, init) !== null;
+  }
   return false;
 }
 
@@ -313,9 +375,22 @@ function everyLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier)
   return good;
 }
 
-/** `const known = new Set(...)` whose every reference is the receiver of
- * `.has` / `.add` / `.delete` / `.clear`, or a `.size` read: a Set whose
- * elements never come back out (builtinTokenUseOk). */
+/** The const declaration `const s = new Set([...])` an array literal seeds,
+ * or null. */
+function tokenSetSeedDecl(L: Lowerer, arr: ts.ArrayLiteralExpression): ts.VariableDeclaration | null {
+  let a: ts.Node = arr;
+  while (a.parent !== undefined && ts.isParenthesizedExpression(a.parent)) a = a.parent;
+  const ne = a.parent;
+  if (ne === undefined || !ts.isNewExpression(ne) || ne.arguments?.length !== 1 || ne.arguments[0] !== a) return null;
+  if (!ts.isIdentifier(ne.expression) || !L.isStdlibGlobal(ne.expression, "Set")) return null;
+  const decl = ne.parent;
+  return decl !== undefined && ts.isVariableDeclaration(decl) && decl.initializer === ne && ts.isIdentifier(decl.name) ? decl : null;
+}
+
+/** A token-only Set binding (builtinTokenUseOk): `const known = new
+ * Set([t, ...])` with token seeds, every reference the receiver of
+ * `.has(t)` / `.add(t)` / `.delete(t)` with a token argument, `.clear()`,
+ * or a `.size` read. */
 function tokenSafeSetBinding(L: Lowerer, recv: ts.Expression): boolean {
   if (!ts.isIdentifier(recv)) return false;
   const sym = L.checker.getSymbolAtLocation(recv);
@@ -325,12 +400,22 @@ function tokenSafeSetBinding(L: Lowerer, recv: ts.Expression): boolean {
   let init = decl.initializer;
   while (init !== undefined && ts.isParenthesizedExpression(init)) init = init.expression;
   if (init === undefined || !ts.isNewExpression(init) || !ts.isIdentifier(init.expression) || !L.isStdlibGlobal(init.expression, "Set")) return false;
+  const args = init.arguments ?? [];
+  if (args.length > 1) return false;
+  if (args.length === 1) {
+    let seed = args[0]!;
+    while (ts.isParenthesizedExpression(seed)) seed = seed.expression;
+    if (!ts.isArrayLiteralExpression(seed) || !seed.elements.every((el) => !ts.isSpreadElement(el) && isBuiltinTokenExpr(L, el))) return false;
+  }
   return everyLocalRef(L, decl.name, (r) => {
     const p = r.parent;
     if (!ts.isPropertyAccessExpression(p) || p.expression !== r) return false;
     const m = p.name.text;
     if (m === "size") return true;
-    return (m === "has" || m === "add" || m === "delete" || m === "clear") && ts.isCallExpression(p.parent) && p.parent.expression === p;
+    const call = p.parent;
+    if (!ts.isCallExpression(call) || call.expression !== p) return false;
+    if (m === "clear") return call.arguments.length === 0;
+    return (m === "has" || m === "add" || m === "delete") && call.arguments.length === 1 && isBuiltinTokenExpr(L, call.arguments[0]!);
   });
 }
 
@@ -340,7 +425,7 @@ function requireBuiltinTokenUse(L: Lowerer, expr: ts.Expression, name: string): 
   L.unsupported(
     "SC1090",
     expr,
-    `the builtin '${name}' used as a value (it has no runtime object here — identity comparisons, truthiness and Set membership tests lower; read and call its members directly)`,
+    `the builtin '${name}' used as a value (it has no runtime object here — comparisons with another builtin, truthiness and builtin-only Set membership tests lower; read and call its members directly)`,
   );
 }
 
@@ -1832,9 +1917,19 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           fn = ts.isSourceFile(fn) ? undefined : fn.parent;
         }
         if (fn !== undefined) {
-          const fixedArity = (fn as ts.FunctionLikeDeclaration).parameters.every(
+          // A `this:` parameter is a type annotation, never an argument;
+          // a `void`-typed parameter may be omitted by the caller (tsc's
+          // trailing-void rule), so its count is not fixed.
+          const realParams = (fn as ts.FunctionLikeDeclaration).parameters.filter(
+            (p) => !(ts.isIdentifier(p.name) && p.name.text === "this"),
+          );
+          const voidish = (p: ts.ParameterDeclaration): boolean =>
+            p.type !== undefined &&
+            (p.type.kind === ts.SyntaxKind.VoidKeyword ||
+              (ts.isUnionTypeNode(p.type) && p.type.types.some((t) => t.kind === ts.SyntaxKind.VoidKeyword)));
+          const fixedArity = realParams.every(
             (p) => p.questionToken === undefined && p.initializer === undefined &&
-              p.dotDotDotToken === undefined,
+              p.dotDotDotToken === undefined && !voidish(p),
           );
           // Board #164: only TypeScript enforces the arity — a JavaScript
           // caller may pass any count (`m(1, 2)` on a parameterless method
@@ -1857,7 +1952,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           if (fixedArity && !jsSource) {
             return {
               kind: "numLit",
-              value: (fn as ts.FunctionLikeDeclaration).parameters.length,
+              value: realParams.length,
               type: F64,
               loc,
             };
