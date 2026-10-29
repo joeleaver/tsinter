@@ -23,13 +23,15 @@
  *
  * Environment (diagnostics): WN_GC_STRESS=n collects every n allocations;
  * WN_GC_MIN_MB=n sets the minimum allocation between collections (default
- * 64); WN_GC_STATS=1 prints the collector's totals to stderr at exit. */
+ * 64); WN_GC_STATS=1 prints the collector's totals, and its pauses (timed
+ * only then), to stderr at exit. */
 #define _GNU_SOURCE
 #include "wn_rt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BLK_SHIFT 16
@@ -45,6 +47,12 @@ static const uint32_t SIZES[] = {16,   32,   48,   64,   80,   96,   112,  128, 
                                  640,  768,  896,  1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192};
 #define NSC ((int)(sizeof SIZES / sizeof SIZES[0]))
 static uint8_t sc_of[MAX_SMALL / 16 + 1];
+/* a slot's index without a division: (offset * RECIP[c]) >> 32 is
+ * offset / SIZES[c] exactly for every offset inside a 64 KiB block (the
+ * reciprocal's error stays below 2^-16, and 1/SIZES[c] >= 2^-13; checked
+ * exhaustively for these classes when it was written) */
+static uint64_t RECIP[NSC];
+static inline uint32_t slot_of(uint32_t off, int c) { return (uint32_t)(((uint64_t)off * RECIP[c]) >> 32); }
 
 static uint8_t *arena;
 static size_t top; /* blocks handed out by the bump so far */
@@ -69,6 +77,8 @@ static size_t gc_min = WN_GC_MIN_DEFAULT;
 static size_t since, threshold = WN_GC_MIN_DEFAULT, live_bytes;
 static size_t stress, stress_n;
 static size_t stat_gcs, stat_alloc_bytes, stat_max_live, stat_small, stat_large, stat_large_req;
+static int stat_on;
+static double stat_pause_total, stat_pause_max; /* ms, timed only under WN_GC_STATS */
 
 static uint8_t *stack_top;
 
@@ -87,8 +97,8 @@ static void *reserve(size_t n) {
 }
 
 static void stats(void) {
-  fprintf(stderr, "wn_gc: %zu collections, %zu bytes allocated (%zu small objects, %zu large: %zu bytes asked), max live %zu, heap blocks %zu\n", stat_gcs, stat_alloc_bytes, stat_small,
-          stat_large, stat_large_req, stat_max_live, top);
+  fprintf(stderr, "wn_gc: %zu collections, %zu bytes allocated (%zu small objects, %zu large: %zu bytes asked), max live %zu, heap blocks %zu, pause total %.3f ms, max %.3f ms\n", stat_gcs,
+          stat_alloc_bytes, stat_small, stat_large, stat_large_req, stat_max_live, top, stat_pause_total, stat_pause_max);
 }
 
 static void gc_init(void) {
@@ -101,6 +111,7 @@ static void gc_init(void) {
   bbits = reserve(NBLK * sizeof(uint64_t *));
   bnext = reserve(NBLK * sizeof(uint32_t));
   for (int c = 0; c < NSC; c++) avail[c] = UINT32_MAX;
+  for (int k = 0; k < NSC; k++) RECIP[k] = ((uint64_t)1 << 32) / SIZES[k] + 1;
   int c = 0;
   for (size_t s = 0; s <= MAX_SMALL / 16; s++) {
     while (SIZES[c] < s * 16) c++;
@@ -111,7 +122,10 @@ static void gc_init(void) {
   e = getenv("WN_GC_STRESS");
   if (e && *e) stress = (size_t)strtoull(e, NULL, 10);
   e = getenv("WN_GC_STATS");
-  if (e && *e == '1') atexit(stats);
+  if (e && *e == '1') {
+    stat_on = 1;
+    atexit(stats);
+  }
 }
 
 static inline uint32_t nslots(int c) { return (uint32_t)(BLK / SIZES[c]); }
@@ -194,7 +208,7 @@ static WObj *alloc_small(size_t bytes) {
   uint32_t sz = SIZES[c];
   memset(p, 0, sz);
   size_t b = ((uint8_t *)p - arena) >> BLK_SHIFT;
-  uint32_t i = (uint32_t)(((uint8_t *)p - arena - (b << BLK_SHIFT)) / sz);
+  uint32_t i = slot_of((uint32_t)((uint8_t *)p - arena - (b << BLK_SHIFT)), c);
   bbits[b][i >> 6] |= (uint64_t)1 << (i & 63);
   since += sz;
   stat_alloc_bytes += sz;
@@ -268,7 +282,7 @@ static void mark_addr(uintptr_t a) {
     int c = bsc[b];
     uint32_t sz = SIZES[c];
     uintptr_t base = (uintptr_t)arena + (b << BLK_SHIFT);
-    uint32_t i = (uint32_t)((a - base) / sz);
+    uint32_t i = slot_of((uint32_t)(a - base), c);
     if (i >= nslots(c)) return;
     uint64_t bit = (uint64_t)1 << (i & 63);
     uint64_t *alloc = bbits[b], *mark = alloc + 64;
@@ -397,5 +411,13 @@ __attribute__((noinline)) static void collect(void) {
   /* spill every callee-saved register into this frame, so the stack scan
    * sees references the translated code holds only in registers */
   __builtin_unwind_init();
+  struct timespec a, b;
+  if (stat_on) clock_gettime(CLOCK_MONOTONIC, &a);
   collect_inner();
+  if (stat_on) {
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double ms = (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
+    stat_pause_total += ms;
+    if (ms > stat_pause_max) stat_pause_max = ms;
+  }
 }
