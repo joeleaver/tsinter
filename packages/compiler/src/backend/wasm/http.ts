@@ -137,8 +137,6 @@ const wEnding = 1 << 0;
 const wEnded = 1 << 1;
 const wFinished = 1 << 2;
 
-/** Node's getDefaultHighWaterMark(false). */
-const HWM = 65536;
 
 /* ── $inc: IncomingMessage ─────────────────────────────────────────── */
 const I_RS = 0;
@@ -2453,7 +2451,7 @@ export class HttpBuilder {
 
   /** canPushMore(state) */
   private canPushMore($: A, o: X): X {
-    return $.both($.not(this.rbit($, o, kEnded)), $.or($.lt($.get(this.IT, I_RLEN, o), $.i(HWM)), $.eq($.get(this.IT, I_RLEN, o), $.i(0))));
+    return $.both($.not(this.rbit($, o, kEnded)), $.or($.lt($.get(this.IT, I_RLEN, o), $.call(this.net.defaultHwmFn())), $.eq($.get(this.IT, I_RLEN, o), $.i(0))));
   }
 
   /** Readable.prototype.push(chunk) for a Buffer chunk. */
@@ -2564,7 +2562,7 @@ export class HttpBuilder {
         $.not(
           $.both(
             $.not(this.rbit($, s, kReading | kEnded)),
-            $.or($.lt($.get(IT, I_RLEN, s), $.i(HWM)), $.both(this.rbit($, s, kFlowing), $.eq($.get(IT, I_RLEN, s), $.i(0)))),
+            $.or($.lt($.get(IT, I_RLEN, s), $.call(this.net.defaultHwmFn())), $.both(this.rbit($, s, kFlowing), $.eq($.get(IT, I_RLEN, s), $.i(0)))),
           ),
         ),
       );
@@ -2601,7 +2599,7 @@ export class HttpBuilder {
       $.if($.both($.not(this.rbit($, s, kDestroyed | kErrored)), $.or($.ne($.get(IT, I_RLEN, s), $.i(0)), this.rbit($, s, kEnded))), () =>
         this.rclr($, s, kEmittedReadable),
       );
-      $.if($.both($.not(this.rbit($, s, kFlowing | kEnded)), $.le($.get(IT, I_RLEN, s), $.i(HWM))), () => this.rset($, s, kNeedReadable));
+      $.if($.both($.not(this.rbit($, s, kFlowing | kEnded)), $.le($.get(IT, I_RLEN, s), $.call(this.net.defaultHwmFn()))), () => this.rset($, s, kNeedReadable));
       $.run(this.incFlowFn(), s);
     });
   }
@@ -2739,7 +2737,7 @@ export class HttpBuilder {
       const howMuch = (from: number): void => $.put(N, $.call(this.incHowMuchFn(), s, $.l(from)));
       $.put(NORIG, $.l(N));
       $.if($.dne($.l(N), $.d(0)), () => this.rclr($, s, kEmittedReadable));
-      $.if($.both($.both($.deq($.l(N), $.d(0)), this.rbit($, s, kNeedReadable)), $.or($.ge(len, $.i(HWM)), this.rbit($, s, kEnded))), () => {
+      $.if($.both($.both($.deq($.l(N), $.d(0)), this.rbit($, s, kNeedReadable)), $.or($.ge(len, $.call(this.net.defaultHwmFn())), this.rbit($, s, kEnded))), () => {
         $.if($.both($.eq(len, $.i(0)), this.rbit($, s, kEnded)), () => $.run(this.incEndReadableFn(), s), () => $.run(this.incEmitReadableFn(), s));
         $.ret($.nul(BT));
       });
@@ -2749,7 +2747,7 @@ export class HttpBuilder {
         $.ret($.nul(BT));
       });
       $.put(DOREAD, this.rbit($, s, kNeedReadable));
-      $.if($.or($.eq(len, $.i(0)), $.dlt($.dsub($.i2d(len), $.l(N)), $.d(HWM))), () => $.put(DOREAD, $.i(1)));
+      $.if($.or($.eq(len, $.i(0)), $.dlt($.dsub($.i2d(len), $.l(N)), $.i2d($.call(this.net.defaultHwmFn())))), () => $.put(DOREAD, $.i(1)));
       $.if(this.rbit($, s, kReading | kEnded | kDestroyed | kErrored), () => $.put(DOREAD, $.i(0)), () => {
         $.if($.l(DOREAD), () => {
           this.rset($, s, kReading | kSync);
@@ -2761,7 +2759,7 @@ export class HttpBuilder {
       });
       $.if($.dgt($.l(N), $.d(0)), () => $.put(RET, $.call(this.incFromListFn(), s, $.d2i($.l(N)))));
       $.if($.isNull($.l(RET)), () => {
-        $.if($.le(len, $.i(HWM)), () => this.rset($, s, kNeedReadable));
+        $.if($.le(len, $.call(this.net.defaultHwmFn())), () => this.rset($, s, kNeedReadable));
         $.put(N, $.d(0));
       }, () => {
         $.set(IT, I_RLEN, s, $.sub(len, $.d2i($.l(N))));
@@ -5281,7 +5279,7 @@ export class HttpBuilder {
       const NEEDPAUSE = f.local(I32);
       const M = f.local(this.outRef());
       $.put(S, $.get(KT, K_SOCK, $.l(K)));
-      $.put(NEEDPAUSE, $.gt($.get(KT, K_OUTDATA, $.l(K)), $.i(HWM)));
+      $.put(NEEDPAUSE, $.gt($.get(KT, K_OUTDATA, $.l(K)), $.call(this.net.defaultHwmFn())));
       $.if($.both($.get(this.sockT, NET_SOCK_HTTP.S_HPAUSED, $.l(S)), $.not($.l(NEEDPAUSE))), () => {
         $.set(this.sockT, NET_SOCK_HTTP.S_HPAUSED, $.l(S), $.i(0));
         $.if($.notNull($.get(this.sockT, NET_SOCK_HTTP.S_PARSER, $.l(S))), () => this.parserPause($, $.cast(this.PT, $.get(this.sockT, NET_SOCK_HTTP.S_PARSER, $.l(S))), false));
@@ -5388,12 +5386,12 @@ export class HttpBuilder {
       });
       $.run(this.connPushFn(K_IN, K_IN_N), $.l(K), $.l(REQ));
       $.if($.not($.get(this.sockT, NET_SOCK_HTTP.S_HPAUSED, $.l(S))), () => {
-        $.if($.or($.call(this.net.needDrainHelper(), $.l(S)), $.ge($.get(KT, K_OUTDATA, $.l(K)), $.i(HWM))), () => {
+        $.if($.or($.call(this.net.needDrainHelper(), $.l(S)), $.ge($.get(KT, K_OUTDATA, $.l(K)), $.call(this.net.defaultHwmFn()))), () => {
           $.set(this.sockT, NET_SOCK_HTTP.S_HPAUSED, $.l(S), $.i(1));
           $.run(this.net.pauseHelper(), $.l(S));
         });
       });
-      $.put(RES, $.call(this.resNewFn(), $.l(REQ), $.i(HWM)));
+      $.put(RES, $.call(this.resNewFn(), $.l(REQ), $.call(this.net.defaultHwmFn())));
       $.set(this.RT, R_CONN, $.l(RES), $.l(K));
       $.set(this.OT, O_KATIMEOUT, $.l(RES), $.get(this.HT, H_KATIMEOUT, $.l(H)));
       $.set(this.OT, O_MAXREQPERSOCK, $.l(RES), $.get(this.HT, H_MAXREQPERSOCK, $.l(H)));
@@ -5665,7 +5663,7 @@ export class HttpBuilder {
           $.put(METHOD, $.call(this.asciiUpperFn(), $.l(METHOD0)));
         }, () => $.put(METHOD, this.lit($, "GET")));
         // OutgoingMessage.call(this), then the request's own fields.
-        this.pushOutInit(c, 2, $.i(HWM));
+        this.pushOutInit(c, 2, $.call(this.net.defaultHwmFn()));
         c.localGet(AG); // C_AGENT
         c.localGet(METHOD); // C_METHOD
         $.do($.sel(this.strRef, $.gt($.alen($.l(PATH)), $.i(0)), $.l(PATH), this.lit($, "/"))); // C_PATH (this[kPath])

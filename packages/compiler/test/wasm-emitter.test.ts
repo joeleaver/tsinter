@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { osTableHostNum } from "./wasm-os-tables-host.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
 import { emitWasmModule, parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
 import { arrayOf, REGEX, RUNTIME_ERROR_CLASSES, STRING, VOID, type IrClassDef, type IrExpr, type IrGlobal, type IrModule, type IrStmt, type SrcLoc } from "../src/ir/nodes.js";
@@ -56,6 +57,12 @@ async function runWasm(modulePath: string): Promise<{ stdout: Buffer; stderr: Bu
         if (memory === null) throw new Error("write before instantiation completed");
         chunks[fd === 2 ? 2 : 1].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
       },
+      // SEMANTICS.md S118: a stream's default highWaterMark is the host OS's
+      hostNum(kind: number, arg: number): number {
+        const v = osTableHostNum(kind, arg);
+        if (v === undefined) throw new Error(`hostNum: unscripted kind ${kind}`);
+        return v;
+      },
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
@@ -74,6 +81,12 @@ async function runWasmToTrap(modulePath: string): Promise<{ stdout: Buffer; stde
       write(fd: number, ptr: number, len: number): void {
         if (memory === null) throw new Error("write before instantiation completed");
         chunks[fd === 2 ? 2 : 1].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+      },
+      // SEMANTICS.md S118: a stream's default highWaterMark is the host OS's
+      hostNum(kind: number, arg: number): number {
+        const v = osTableHostNum(kind, arg);
+        if (v === undefined) throw new Error(`hostNum: unscripted kind ${kind}`);
+        return v;
       },
     },
   });

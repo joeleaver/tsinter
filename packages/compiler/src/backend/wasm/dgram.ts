@@ -948,7 +948,7 @@ export class DgramBuilder {
       $.if($.not($.call(this.healthFn(), $.l(0))), () => $.ret($.i(0)));
       $.if($.eq($.get(this.udpT(), U_H, $.l(0)), $.i(0)), () => {
         // getsockname on a socket with no fd: EBADF
-        $.do($.call(this.net.errnoExHelper(), $.i(-9), this.lit($, "getsockname")));
+        $.do($.call(this.net.errnoExHelper(), $.raw((c) => this.net.emitErrnoNum(c, "EBADF")), this.lit($, "getsockname")));
         this.deps.throwStack(f.c);
         $.ret($.i(0));
       });

@@ -305,13 +305,31 @@ export function resolveCc(
     throw new Error(`unknown SCRIPTC_CC '${cc}' (supported: clang, zigcc)`);
   }
   if (target === "") return { argv: ["zig", "cc"], target: null, ...hostArgs };
-  const linux = target.includes("linux");
+  const pinned = pinTargetTriple(target);
+  const linux = pinned.includes("linux");
   return {
     argv: ["zig", "cc"],
-    target,
-    targetArgs: ["-target", target, ...(linux ? ["-D_GNU_SOURCE"] : [])],
+    target: pinned,
+    targetArgs: ["-target", pinned, ...(linux ? ["-D_GNU_SOURCE"] : [])],
     linkArgs: linux ? ["-lm"] : [],
   };
+}
+
+/** The oldest macOS a produced binary supports: Node v24's own floor
+ * (BUILDING.md: macOS >= 13.5). zig's default deployment target is its
+ * newest SDK's, where an API such as pipe2 (macOS 27) links weakly and is
+ * missing at run time on every older macOS; pinned, a newer API is an
+ * availability diagnostic (an error for the runner's own units:
+ * wasm-native.ts's cflags). */
+export const MACOS_MIN_VERSION = "13.5";
+
+/** A macOS triple without a version gets MACOS_MIN_VERSION pinned
+ * (`aarch64-macos` → `aarch64-macos.13.5`); every other triple, and a macOS
+ * one that names its own version, is unchanged. */
+export function pinTargetTriple(triple: string): string {
+  const parts = triple.split("-");
+  if (parts.length >= 2 && parts[1] === "macos") parts[1] = `macos.${MACOS_MIN_VERSION}`;
+  return parts.join("-");
 }
 
 /** The OS the produced binary runs on: the triple's OS under SCRIPTC_TARGET,

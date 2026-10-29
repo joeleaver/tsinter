@@ -43,6 +43,10 @@ export interface ChildProcDeps {
   stageCursor: () => number;
   /** Push a compile-time string literal. */
   pushStrLit: (c: Code, value: string) => void;
+  /** SEMANTICS.md S118 (ostables.ts): `(i32 host errno) -> string` Node's
+   * code ("" for none), `(i32 host signal) -> string` its name. */
+  osErrnoName: () => number;
+  osSignalName: () => number;
   /** Print `message` as the uncaught report and trap. */
   namedTrap: (c: Code, message: string) => void;
   stringVecRef: () => ValType;
@@ -110,137 +114,6 @@ export const CP_CODES: readonly string[] = [
   "ENOBUFS",
 ];
 
-/** Node's name for each Linux signal number, index = number: the FIRST
- * key carrying that number in os.constants.signals' own order (so 6 is
- * SIGABRT, never SIGIOT, and 29 is SIGIO, never SIGPOLL), 1..31 with no
- * gaps, measured on Node v24.18.1. Index 0 is unused (no signal). */
-export const CP_SIGNAL_NAMES: readonly string[] = [
-  "",
-  "SIGHUP",
-  "SIGINT",
-  "SIGQUIT",
-  "SIGILL",
-  "SIGTRAP",
-  "SIGABRT",
-  "SIGBUS",
-  "SIGFPE",
-  "SIGKILL",
-  "SIGUSR1",
-  "SIGSEGV",
-  "SIGUSR2",
-  "SIGPIPE",
-  "SIGALRM",
-  "SIGTERM",
-  "SIGSTKFLT",
-  "SIGCHLD",
-  "SIGCONT",
-  "SIGSTOP",
-  "SIGTSTP",
-  "SIGTTIN",
-  "SIGTTOU",
-  "SIGURG",
-  "SIGXCPU",
-  "SIGXFSZ",
-  "SIGVTALRM",
-  "SIGPROF",
-  "SIGWINCH",
-  "SIGIO",
-  "SIGPWR",
-  "SIGSYS",
-];
-
-/** Node's own errno -> name map (util.getSystemErrorMap(): libuv's names,
- * keyed by the NEGATIVE errno), for an errno outside CP_CODES: Node's
- * spawnSync error code is that name, or "Unknown system error -<n>" when
- * libuv has none. */
-// generated from Node v24.18.1 util.getSystemErrorMap(): 85 entries
-export const CP_ERRNO_NAMES: readonly (readonly [number, string])[] = [
-  [-1, "EPERM"],
-  [-2, "ENOENT"],
-  [-3, "ESRCH"],
-  [-4, "EINTR"],
-  [-5, "EIO"],
-  [-6, "ENXIO"],
-  [-7, "E2BIG"],
-  [-8, "ENOEXEC"],
-  [-9, "EBADF"],
-  [-11, "EAGAIN"],
-  [-12, "ENOMEM"],
-  [-13, "EACCES"],
-  [-14, "EFAULT"],
-  [-16, "EBUSY"],
-  [-17, "EEXIST"],
-  [-18, "EXDEV"],
-  [-19, "ENODEV"],
-  [-20, "ENOTDIR"],
-  [-21, "EISDIR"],
-  [-22, "EINVAL"],
-  [-23, "ENFILE"],
-  [-24, "EMFILE"],
-  [-25, "ENOTTY"],
-  [-26, "ETXTBSY"],
-  [-27, "EFBIG"],
-  [-28, "ENOSPC"],
-  [-29, "ESPIPE"],
-  [-30, "EROFS"],
-  [-31, "EMLINK"],
-  [-32, "EPIPE"],
-  [-34, "ERANGE"],
-  [-36, "ENAMETOOLONG"],
-  [-38, "ENOSYS"],
-  [-39, "ENOTEMPTY"],
-  [-40, "ELOOP"],
-  [-49, "EUNATCH"],
-  [-61, "ENODATA"],
-  [-64, "ENONET"],
-  [-71, "EPROTO"],
-  [-75, "EOVERFLOW"],
-  [-84, "EILSEQ"],
-  [-88, "ENOTSOCK"],
-  [-89, "EDESTADDRREQ"],
-  [-90, "EMSGSIZE"],
-  [-91, "EPROTOTYPE"],
-  [-92, "ENOPROTOOPT"],
-  [-93, "EPROTONOSUPPORT"],
-  [-94, "ESOCKTNOSUPPORT"],
-  [-95, "ENOTSUP"],
-  [-97, "EAFNOSUPPORT"],
-  [-98, "EADDRINUSE"],
-  [-99, "EADDRNOTAVAIL"],
-  [-100, "ENETDOWN"],
-  [-101, "ENETUNREACH"],
-  [-103, "ECONNABORTED"],
-  [-104, "ECONNRESET"],
-  [-105, "ENOBUFS"],
-  [-106, "EISCONN"],
-  [-107, "ENOTCONN"],
-  [-108, "ESHUTDOWN"],
-  [-110, "ETIMEDOUT"],
-  [-111, "ECONNREFUSED"],
-  [-112, "EHOSTDOWN"],
-  [-113, "EHOSTUNREACH"],
-  [-114, "EALREADY"],
-  [-121, "EREMOTEIO"],
-  [-125, "ECANCELED"],
-  [-3000, "EAI_ADDRFAMILY"],
-  [-3001, "EAI_AGAIN"],
-  [-3002, "EAI_BADFLAGS"],
-  [-3003, "EAI_CANCELED"],
-  [-3004, "EAI_FAIL"],
-  [-3005, "EAI_FAMILY"],
-  [-3006, "EAI_MEMORY"],
-  [-3007, "EAI_NODATA"],
-  [-3008, "EAI_NONAME"],
-  [-3009, "EAI_OVERFLOW"],
-  [-3010, "EAI_SERVICE"],
-  [-3011, "EAI_SOCKTYPE"],
-  [-3013, "EAI_BADHINTS"],
-  [-3014, "EAI_PROTOCOL"],
-  [-4028, "EFTYPE"],
-  [-4080, "ECHARSET"],
-  [-4094, "UNKNOWN"],
-  [-4095, "EOF"],
-];
 
 /** `cpCall`'s op numbers (abi.ts). */
 const OP_RUN = 1;
@@ -1052,13 +925,15 @@ export class ChildProcBuilder {
   }
 
   /** `%w.cp.codeName(errCode) -> string` — the record's errCode as Node's
-   * error code: CP_CODES for 1..15, else Node's name for the carried errno
-   * (CP_ERRNO_NAMES), else "Unknown system error -<n>". */
+   * error code: CP_CODES for 1..15, else Node's name for the carried host-OS
+   * errno (SEMANTICS.md S118: the host's own number, named through
+   * ostables.ts), else "Unknown system error -<n>". */
   codeNameHelper(): number {
     return this.cached("codeName", [I32], [this.strRef()], (idx) => {
       const c = new Code();
       const CODE = 0;
       const NEG = 1;
+      const NAME = 2;
       CP_CODES.forEach((name, i) => {
         c.localGet(CODE);
         c.i32Const(i + 1);
@@ -1072,42 +947,27 @@ export class ChildProcBuilder {
       c.localGet(CODE);
       c.i32Const(256);
       c.i32Add();
-      c.localSet(NEG);
-      for (const [n, name] of CP_ERRNO_NAMES) {
-        c.localGet(NEG);
-        c.i32Const(n);
-        c.i32Eq();
-        c.ifVoid();
-        this.deps.pushStrLit(c, name);
-        c.return_();
-        c.end();
-      }
+      c.localTee(NEG);
+      c.call(this.deps.osErrnoName());
+      c.localTee(NAME);
+      c.arrayLen();
+      c.ifVoid();
+      c.localGet(NAME);
+      c.return_();
+      c.end();
       this.deps.pushStrLit(c, "Unknown system error ");
       c.localGet(NEG);
       c.f64ConvertI32S();
       c.call(this.deps.f64ToStr());
       c.call(this.deps.concat());
-      this.mb.setBody(idx, [I32], c.bytes());
+      this.mb.setBody(idx, [I32, this.strRef()], c.bytes());
     });
   }
 
-  /** `%w.cp.signalName(n) -> string` (n in 1..31; anything else ""). */
+  /** `%w.cp.signalName(n) -> string`: Node's name for the host OS's
+   * signal number `n` (ostables.ts — SEMANTICS.md S118), "" for none. */
   signalNameHelper(): number {
-    return this.cached("signalName", [I32], [this.strRef()], (idx) => {
-      const c = new Code();
-      CP_SIGNAL_NAMES.forEach((name, n) => {
-        if (n === 0) return;
-        c.localGet(0);
-        c.i32Const(n);
-        c.i32Eq();
-        c.ifVoid();
-        this.deps.pushStrLit(c, name);
-        c.return_();
-        c.end();
-      });
-      this.deps.pushStrLit(c, "");
-      this.mb.setBody(idx, [], c.bytes());
-    });
+    return this.deps.osSignalName();
   }
 
   /** `%w.cp.error(res) -> Error` — spawnSync's `error` property: a FRESH

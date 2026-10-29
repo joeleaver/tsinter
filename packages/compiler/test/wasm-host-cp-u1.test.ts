@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { osTableHostNum } from "./wasm-os-tables-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -153,7 +154,9 @@ async function runForced(binaryPath: string, host: ForcedHost = {}): Promise<For
       if (kind === 4) return writeUtf16("linux", ptr, cap);
       throw new Error(`hostStr: unscripted kind ${kind}`);
     },
-    hostNum(kind: number): number {
+    hostNum(kind: number, arg = 0): number {
+      const os = osTableHostNum(kind, arg);
+      if (os !== undefined) return os;
       if (kind === 0) return 2;
       if (kind === 1) return env.length;
       throw new Error(`hostNum: unscripted kind ${kind}`);

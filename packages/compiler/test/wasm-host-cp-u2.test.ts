@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm, runWasmToTrap, type HostOverrides, type HostRun } from "./wasm-host.js";
+import { osTableHostNum } from "./wasm-os-tables-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -159,6 +160,8 @@ function forced(script: Script): { overrides: HostOverrides; trace: Trace } {
       return 0;
     },
     hostNum(kind: number, _arg: number): number {
+      const os = osTableHostNum(kind, _arg);
+      if (os !== undefined) return os;
       if (kind === 0) return 2;
       if (kind === 1) return env.length;
       throw new Error(`forced host: hostNum kind ${kind}`);

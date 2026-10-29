@@ -590,6 +590,22 @@ const PATH_WIN32_MODULE_FNS: Record<string, BuiltinModuleFn | undefined> = {
   toNamespacedPath: { fn: "path.win32ToNamespacedPath", params: [STRING], result: STRING },
 };
 
+/** SEMANTICS.md S118 — the bare module under a "host" build (the WasmGC
+ * tier: one module for every OS): each member picks the posix or the win32
+ * twin by the host's platform at run time, as Node's bare `path` IS its
+ * OS's implementation. */
+const PATH_HOST_MODULE_FNS: Record<string, BuiltinModuleFn | undefined> = {
+  join: { fn: "path.hostJoin", params: [STRING], result: STRING, variadicPack: true },
+  resolve: { fn: "path.hostResolve", params: [STRING], result: STRING, variadicPack: true },
+  normalize: { fn: "path.hostNormalize", params: [STRING], result: STRING },
+  dirname: { fn: "path.hostDirname", params: [STRING], result: STRING },
+  basename: { fn: "path.hostBasename", params: [STRING, STRING], result: STRING, defaults: [""] },
+  extname: { fn: "path.hostExtname", params: [STRING], result: STRING },
+  isAbsolute: { fn: "path.hostIsAbsolute", params: [STRING], result: BOOL },
+  relative: { fn: "path.hostRelative", params: [STRING, STRING], result: STRING },
+  toNamespacedPath: { fn: "path.hostToNamespacedPath", params: [STRING], result: STRING },
+};
+
 export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn | undefined> | undefined> = {
   fs: {
     readFileSync: { fn: "fs.readFileSync", params: [STRING, STRING], result: STRING },
@@ -1080,16 +1096,46 @@ const URL_WIN32_MODULE_FNS: Record<string, BuiltinModuleFn | undefined> = {
   pathToFileURL: { fn: "url.pathToFileURLWin32", params: [STRING], result: URL_T },
 };
 
+/** url's "host" table (S118): pathToFileURL picks its flavor at run time. */
+const URL_HOST_MODULE_FNS: Record<string, BuiltinModuleFn | undefined> = {
+  fileURLToPath: { fn: "url.fileURLToPathStr", params: [STRING], result: STRING },
+  pathToFileURL: { fn: "url.pathToFileURLHost", params: [STRING], result: URL_T },
+};
+
 /** BUILTIN_MODULE_FNS with the platform-conditional modules bound per
  * TARGET: a win32 triple compiles Node-on-Windows semantics — `path` is
- * path.win32 and url's bridge takes the win32 flavors. Fence wording is
- * unaffected — callers keep naming the module the source spelled. */
+ * path.win32 and url's bridge takes the win32 flavors. A "host" build (the
+ * WasmGC tier — SEMANTICS.md S118) binds the run-time-dispatching tables:
+ * the module learns its OS from the host. Fence wording is unaffected —
+ * callers keep naming the module the source spelled. */
 export function builtinModuleFnsOf(L: Lowerer, module: string): Record<string, BuiltinModuleFn | undefined> | undefined {
   if (L.targetPlatform === "win32") {
     if (module === "path") return BUILTIN_MODULE_FNS["path/win32"];
     if (module === "url") return URL_WIN32_MODULE_FNS;
   }
+  if (L.targetPlatform === "host") {
+    if (module === "path") return PATH_HOST_MODULE_FNS;
+    if (module === "url") return URL_HOST_MODULE_FNS;
+  }
   return ownEntry(BUILTIN_MODULE_FNS, module);
+}
+
+/** A builtin-module constant as an IR expression: the baked literal, or —
+ * under a "host" build (S118) — for a constant whose value is the OS's
+ * (path.sep, path.delimiter, os.EOL), the posix or win32 value chosen at
+ * run time. undefined when the member is no constant. */
+export function builtinModuleConstExprOf(L: Lowerer, module: string, member: string, loc: { file: string; start: number; end: number }): IrExpr | undefined {
+  if (L.targetPlatform === "host") {
+    const w = ownEntry(WIN32_TARGET_CONSTS, module);
+    const win = w ? ownEntry(w, member) : undefined;
+    const posix = ownEntry(BUILTIN_MODULE_CONSTS, module);
+    const pv = posix ? ownEntry(posix, member) : undefined;
+    if (typeof win === "string" && typeof pv === "string" && win !== pv) {
+      return { kind: "libCall", fn: "os.hostChoice", args: [builtinConstLit(pv, loc), builtinConstLit(win, loc)], type: STRING, loc };
+    }
+  }
+  const c = builtinModuleConstOf(L, module, member);
+  return c !== undefined ? builtinConstLit(c, loc) : undefined;
 }
 
 /** Own-property lookup — lowerer.ts's own(), duplicated locally because

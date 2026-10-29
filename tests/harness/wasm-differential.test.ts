@@ -37,6 +37,7 @@ import { TLSSocket, connect as tlsConnect, createSecureContext, getCACertificate
 import { createSocket as dgramCreateSocket, type Socket as UdpSocket } from "node:dgram";
 import * as netModuleNs from "node:net";
 import { lookup as dnsLookup } from "node:dns";
+import * as dnsConstants from "node:dns";
 import { hasSubscribers as dcHasSubscribers, subscribe as dcSubscribe, unsubscribe as dcUnsubscribe } from "node:diagnostics_channel";
 import { createHash, randomBytes, randomFillSync } from "node:crypto";
 import {
@@ -80,6 +81,7 @@ import { makeHostFacts, type HostFactSnapshot } from "./host-facts.js";
 // packages/compiler/test/wasm-host.ts.
 import { makeFetchHost } from "../../packages/compiler/test/wasm-fetch-host.js";
 import { makeTzHost } from "../../packages/compiler/test/wasm-tz-host.js";
+import { osTableHostNum, uvErrno } from "../../packages/compiler/test/wasm-os-tables-host.js";
 // eslint-disable-next-line import/no-relative-packages
 import { startFetchServers } from "../fixtures/fetch/servers.mjs";
 
@@ -4276,7 +4278,7 @@ function killErrnoFor(outcome: { returned: boolean | undefined; thrownErrno: num
   if (outcome.thrownErrno !== undefined) return outcome.thrownErrno;
   if (outcome.returned === true) return 0;
   if (outcome.errorErrno !== undefined) return outcome.errorErrno;
-  return -3;
+  return uvErrno("ESRCH");
 }
 
 /** The SPAWN disposition from what public spawn() did: it threw with a
@@ -4773,7 +4775,7 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
         // this write too — with the error the socket died of (ECONNRESET
         // after an RST, ...), else EPIPE, as write(2) answers on a socket
         // whose peer is gone.
-        if (sock.destroyed) return sock.errored ? netErrno(sock.errored) : -32;
+        if (sock.destroyed) return sock.errored ? netErrno(sock.errored) : uvErrno("EPIPE");
         const data = Buffer.from(new Uint8Array(buffer, ptr, len));
         const before = sock.errored;
         sock.write(data, (err) => {
@@ -4796,7 +4798,7 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
         // down and the module completes the request in its own pending
         // pass (abi.ts SHUTDOWN), as libuv does.
         const sock = rec.sock!;
-        if (sock.destroyed || !sock.writable) return -107;
+        if (sock.destroyed || !sock.writable) return uvErrno("ENOTCONN");
         sock.end();
         return 0;
       }
@@ -4832,7 +4834,10 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
       }
       case NET_OP_RESOLVE: {
         const family = dv.getUint32(ptr, true);
-        const hints = dv.getUint32(ptr + 4, true);
+        // abi.ts: the contract's flag bits (32 ADDRCONFIG, 8 V4MAPPED,
+        // 16 ALL), mapped to this Node OS's dns constants (S118)
+        const bits = dv.getUint32(ptr + 4, true);
+        const hints = (bits & 32 ? dnsConstants.ADDRCONFIG : 0) | (bits & 8 ? dnsConstants.V4MAPPED : 0) | (bits & 16 ? dnsConstants.ALL : 0);
         const { text: name } = netReadRun(buffer, ptr + 8);
         const rh = newRec({ kind: "resolve" });
         dnsLookup(name, { all: true, family: family as 0 | 4 | 6, hints, order: "verbatim" }, (err, addresses) => {
@@ -5308,7 +5313,7 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
   const sigCall = (op: number, x: number): number => {
     if (op === 1) {
       const name = sigNameOf(x);
-      if (name === undefined) return -22;
+      if (name === undefined) return uvErrno("EINVAL");
       const handle = sigNextHandle++;
       const listener = (): void => {
         evPush({ source: 3, handle, kind: 1, a: x, b: 0, payload: new Uint8Array(0) });
@@ -5845,6 +5850,11 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
           // (P5) above.
           case 15:
             return totalmem();
+          // SEMANTICS.md S118: this Node OS's signal / errno numbers
+          case 16:
+          case 17:
+          case 18:
+            return osTableHostNum(kind, arg)!;
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }
@@ -5898,7 +5908,7 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
         if (pid <= 0) loud("pid <= 0 broadcasts to a process group");
         if (sig === 0) return doKill();
         if (pid === process.pid) {
-          if (sig === 28) return doKill();
+          if (sig === osConstants.signals.SIGWINCH) return doKill();
           // Unit G1: a signal this run has subscribed to is caught by the
           // subscription's own listener (abi.ts sigCall), never its default
           // action — delivering it is safe and is the program's behaviour.

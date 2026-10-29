@@ -6,7 +6,7 @@ import { nativeRegexLiteralRefusal } from "./backend/regex-native.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
 import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backend/wasm/emitter.js";
 import { EngineFormatError } from "./backend/wasm/engine.js";
-import { compileWasmNative, translateForNativeRunner } from "./backend/wasm-native.js";
+import { compileWasmNative, nativeTargetOs, translateForNativeRunner } from "./backend/wasm-native.js";
 import { Wasm2cHostImportError } from "./backend/wasm2c.js";
 import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
@@ -697,7 +697,10 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     try {
       lowered = fe.lower({
         dynamic: opts.dynamic ?? false,
-        targetPlatform: buildTargetPlatform(),
+        // The WasmGC tier compiles ONE module for every OS: it learns its
+        // OS from the host at run time ("host" — SEMANTICS.md S118); the
+        // C and LLVM lanes still compile for one target platform.
+        targetPlatform: opts.backend === "wasm" || opts.backend === "wasm-native" ? "host" : buildTargetPlatform(),
         // The WasmGC tier's host supplies fetch (one `fetch` import,
         // SEMANTICS.md S098): the fetch slice lowers without --dynamic
         // there; the native lanes keep the requires-dynamic diagnostic.
@@ -777,16 +780,16 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
       // with the runner. What the translator or the runner's host cannot
       // take refuses loudly, by name (a LinkError's moment moved to build
       // time), never a stub.
-      if (resolveCc().target !== null) {
+      // A cross target (SCRIPTC_TARGET) links the SAME module with that
+      // target's runner; the runner's C host is Linux's so far, so a macOS
+      // or Windows target refuses by name (wasm-native:target).
+      try {
+        nativeTargetOs();
+      } catch (err) {
+        if (!(err instanceof Error)) throw err;
         return {
           ok: false,
-          diagnostics: [
-            {
-              code: "SC3001",
-              message: "the wasm-native lane does not cross-compile yet: SCRIPTC_TARGET is set (wasm-native:cross)",
-              loc: { file: entryPath, start: 0, end: 0 },
-            },
-          ],
+          diagnostics: [{ code: "SC3001", message: `${err.message} (wasm-native:target)`, loc: { file: entryPath, start: 0, end: 0 } }],
           sourceTexts,
         };
       }
@@ -795,7 +798,10 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
         c = translateForNativeRunner(bytes);
       } catch (err) {
         if (!(err instanceof Error)) throw err;
-        const kind = err instanceof Wasm2cHostImportError ? `host:${err.importName}` : `wasm2c:${err.message.replace(/^wasm2c: /, "").replace(/ \((function|a constant expression)[^)]*\)$/, "")}`;
+        const kind =
+          err instanceof Wasm2cHostImportError
+            ? `host:${err.importName}`
+            : `wasm2c:${err.message.replace(/^wasm2c: /, "").replace(/ \((function|a constant expression)[^)]*\)$/, "")}`;
         return {
           ok: false,
           diagnostics: [

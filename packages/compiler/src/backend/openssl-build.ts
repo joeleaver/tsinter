@@ -66,6 +66,18 @@ export function opensslPrefixHeader(): string {
   return join(runtimeSrcDir(), "scr_ossl_prefix.h");
 }
 
+/** The cross triples the prefix header is measured over besides the host
+ * (scripts/gen-openssl-prefix.mjs --all): every OS the wasm-native runner is
+ * built for, so one header serves them all. */
+export const OPENSSL_PREFIX_TARGETS: readonly string[] = ["aarch64-macos", "x86_64-macos", "x86_64-windows-gnu"];
+
+/** The configurations that define `name`, per the header's trailing
+ * `only:` comment; null when every measured configuration does. */
+export async function opensslPrefixOnly(): Promise<Map<string, string[]>> {
+  const text = await readFile(opensslPrefixHeader(), "utf8");
+  return new Map([...text.matchAll(/^#define (\w+) scr_ossl_\1 \/\* only: ([^*]*) \*\/$/gm)].map((m) => [m[1]!, m[2]!.split(" ")]));
+}
+
 /** Node's configuration for the produced binary's OS and CPU: the
  * SCRIPTC_TARGET triple's, else the host's. Android is Node's own mapping
  * (openssl_no_asm.gypi: arm64/x64 "linux", "android" → linux-*). A target
@@ -421,7 +433,7 @@ async function isWholeArchive(p: string): Promise<boolean> {
  * EVP_aes_128_cfb → EVP_aes_128_cfb128 — but which OpenSSL still defines). */
 export async function opensslPrefixNames(callersOnly = false): Promise<Set<string>> {
   const text = await readFile(opensslPrefixHeader(), "utf8");
-  const re = callersOnly ? /^#define (\w+) scr_ossl_\1$/gm : /#define (\w+) scr_ossl_\1\b/gm;
+  const re = callersOnly ? /^#define (\w+) scr_ossl_\1(?: \/\* only: [^*]*\*\/)?$/gm : /#define (\w+) scr_ossl_\1\b/gm;
   return new Set([...text.matchAll(re)].map((m) => m[1]!));
 }
 
@@ -432,20 +444,43 @@ export function renameIrGlobals(ir: string, names: ReadonlySet<string>): string 
   return ir.replace(/@([A-Za-z_][A-Za-z0-9_]*)/g, (m, n: string) => (names.has(n) ? `@scr_ossl_${n}` : m));
 }
 
-/** The defined global names of an object or archive per `nm` (llvm-nm
- * when on PATH, which reads every object format; else the system nm), the
- * Mach-O leading underscore removed; null when no nm can read it. */
+/** The nm tools to try, in order: llvm-nm (on PATH, else the one beside
+ * clang — `clang -print-prog-name=llvm-nm`; it reads every object format),
+ * then the system nm (GNU nm on Linux reads no Mach-O). */
+let nmToolsMemo: Promise<string[]> | null = null;
+function nmTools(): Promise<string[]> {
+  nmToolsMemo ??= execFileAsync("clang", ["-print-prog-name=llvm-nm"]).then(
+    (r) => {
+      const p = r.stdout.trim();
+      return p !== "" && p !== "llvm-nm" ? ["llvm-nm", p, "nm"] : ["llvm-nm", "nm"];
+    },
+    () => ["llvm-nm", "nm"],
+  );
+  return nmToolsMemo;
+}
+
+/** The defined global names of an object or archive per `nm`, the Mach-O
+ * leading underscore removed; null when no nm can read it. A tool that
+ * reads the file but finds NO global (GNU nm over a Mach-O archive prints
+ * nothing and succeeds) has not read it: the next tool is tried — an empty
+ * answer must never pass a gate vacuously. */
 export async function definedGlobals(path: string, darwin: boolean): Promise<Set<string> | null> {
-  for (const tool of ["llvm-nm", "nm"]) {
+  for (const tool of await nmTools()) {
     try {
       const { stdout } = await execFileAsync(tool, ["-g", "--defined-only", "--format=just-symbols", path], { maxBuffer: 1 << 28 });
       const names = new Set<string>();
       for (const line of stdout.split("\n")) {
         const n = line.trim();
         if (n === "" || n.endsWith(":")) continue;
+        // a mingw COFF object's `.refptr.<name>` is the compiler's COMDAT
+        // indirection cell for a reference to the external DATA symbol
+        // <name> (pseudo-relocation support), not a definition of <name>:
+        // identical cells merge across objects, and <name> may be the C
+        // runtime's (`.refptr._iob`) — never a name to prefix
+        if (n.startsWith(".refptr.")) continue;
         names.add(darwin && n.startsWith("_") ? n.slice(1) : n);
       }
-      return names;
+      if (names.size > 0) return names;
     } catch {
       // the next tool
     }

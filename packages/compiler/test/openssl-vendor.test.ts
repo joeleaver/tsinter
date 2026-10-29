@@ -30,6 +30,7 @@ import {
   opensslLineMacros,
   opensslPrefixHeader,
   opensslPrefixNames,
+  opensslPrefixOnly,
   opensslTargetFor,
 } from "../src/backend/openssl-build.js";
 import { OPENSSL_VERSION } from "../src/backend/openssl-sources.js";
@@ -99,7 +100,15 @@ describe("the vendored OpenSSL's symbol prefix", () => {
     expect(defined).not.toBeNull();
     expect([...defined!].filter((n) => !n.startsWith("scr_ossl_"))).toEqual([]);
     const names = await opensslPrefixNames();
-    for (const n of names) expect(defined!.has(`scr_ossl_${n}`), `scr_ossl_${n} defined`).toBe(true);
+    // the header is measured over every runner target (gen-openssl-prefix
+    // --all): a name another configuration alone defines carries an
+    // "only:" comment, and the host archive defines exactly the others
+    const only = await opensslPrefixOnly();
+    for (const n of names) {
+      const here = only.get(n)?.includes(target) ?? true;
+      expect(defined!.has(`scr_ossl_${n}`), `scr_ossl_${n} defined on ${target}`).toBe(here);
+    }
+    expect([...only.values()].some((ts) => !ts.includes(target))).toBe(true);
     const { stdout } = await execFileAsync("nm", ["-u", archive], { maxBuffer: 1 << 28 });
     const undef = new Set(stdout.split("\n").map((l) => l.trim().split(/\s+/).pop()!).map((n) => (darwin && n.startsWith("_") ? n.slice(1) : n)));
     expect([...names].filter((n) => undef.has(n))).toEqual([]);

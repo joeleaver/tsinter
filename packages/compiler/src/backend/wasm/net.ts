@@ -73,6 +73,13 @@ export interface NetDeps {
   f64ToStr: () => number;
   /** childproc.ts: `(i32) -> string`, an errno carried as -(256 + n). */
   codeName: () => number;
+  /** SEMANTICS.md S118 (ostables.ts): push the host OS's libuv number for an
+   * errno name; `(i32 errno) -> string` libuv's message for it ("" for none). */
+  osErrnoNum: (c: Code, name: string) => void;
+  osErrnoMessage: () => number;
+  /** S118: `() -> i32` Node's default byte highWaterMark on the host's OS
+   * (getDefaultHighWaterMark(false): 16 KiB on win32, 64 KiB elsewhere). */
+  defaultHwm: () => number;
   /** childproc.ts: `(s, ptr, cut) -> next`, one UTF-16 run. */
   stageRun: () => number;
   voidClos: () => { clos: number; fn: number };
@@ -186,11 +193,9 @@ const EV_HEADER_BYTES = 24;
 const EV_FIRST_CAPACITY = 1024;
 const HOST_FAILURE = "netCall: host failure";
 
-const UV_ECANCELED = -125;
-const UV_ENOTCONN = -107;
+/* UV_ECANCELED and UV_ENOTCONN are the host OS's numbers (SEMANTICS.md
+ * S118): pushed by name through deps.osErrnoNum. */
 
-/* Node's getDefaultHighWaterMark(false) on v24.18.1. */
-const HWM = 65536;
 
 /* ── the Readable state bits (lib/internal/streams/readable.js's own
  * names; only the ones a Socket can reach — objectMode, a decoder, and
@@ -393,40 +398,6 @@ export const NET_LISTS = {
 };
 export type NetList = ListSpec;
 
-/** Node's uv error messages (util.getSystemErrorMap(), v24.18.1) for the
- * errnos a listen can fail with — UVExceptionWithHostPort's middle part.
- * An errno outside the table renders libuv's "unknown error". */
-// generated from Node v24.18.1 util.getSystemErrorMap()
-const UV_MESSAGES: readonly (readonly [number, string])[] = [
-  [-7, "argument list too long"], [-13, "permission denied"], [-98, "address already in use"],
-  [-99, "address not available"], [-97, "address family not supported"], [-11, "resource temporarily unavailable"],
-  [-3000, "address family not supported"], [-3001, "temporary failure"], [-3002, "bad ai_flags value"],
-  [-3013, "invalid value for hints"], [-3003, "request canceled"], [-3004, "permanent failure"],
-  [-3005, "ai_family not supported"], [-3006, "out of memory"], [-3007, "no address"],
-  [-3008, "unknown node or service"], [-3009, "argument buffer overflow"], [-3014, "resolved protocol is unknown"],
-  [-3010, "service not available for socket type"], [-3011, "socket type not supported"],
-  [-114, "connection already in progress"], [-9, "bad file descriptor"], [-16, "resource busy or locked"],
-  [-125, "operation canceled"], [-4080, "invalid Unicode character"], [-103, "software caused connection abort"],
-  [-111, "connection refused"], [-104, "connection reset by peer"], [-89, "destination address required"],
-  [-17, "file already exists"], [-14, "bad address in system call argument"], [-27, "file too large"],
-  [-113, "host is unreachable"], [-4, "interrupted system call"], [-22, "invalid argument"], [-5, "i/o error"],
-  [-106, "socket is already connected"], [-21, "illegal operation on a directory"],
-  [-40, "too many symbolic links encountered"], [-24, "too many open files"], [-90, "message too long"],
-  [-36, "name too long"], [-100, "network is down"], [-101, "network is unreachable"], [-23, "file table overflow"],
-  [-105, "no buffer space available"], [-19, "no such device"], [-2, "no such file or directory"],
-  [-12, "not enough memory"], [-64, "machine is not on the network"], [-92, "protocol not available"],
-  [-28, "no space left on device"], [-38, "function not implemented"], [-107, "socket is not connected"],
-  [-20, "not a directory"], [-39, "directory not empty"], [-88, "socket operation on non-socket"],
-  [-95, "operation not supported on socket"], [-75, "value too large for defined data type"],
-  [-1, "operation not permitted"], [-32, "broken pipe"], [-71, "protocol error"], [-93, "protocol not supported"],
-  [-91, "protocol wrong type for socket"], [-34, "result too large"], [-30, "read-only file system"],
-  [-108, "cannot send after transport endpoint shutdown"], [-29, "invalid seek"], [-3, "no such process"],
-  [-110, "connection timed out"], [-26, "text file is busy"], [-18, "cross-device link not permitted"],
-  [-4094, "unknown error"], [-4095, "end of file"], [-6, "no such device or address"], [-31, "too many links"],
-  [-112, "host is down"], [-121, "remote I/O error"], [-25, "inappropriate ioctl for device"],
-  [-4028, "inappropriate file type or format"], [-84, "illegal byte sequence"], [-94, "socket type not supported"],
-  [-61, "no data available"], [-49, "protocol driver not attached"], [-8, "exec format error"],
-];
 
 /** One function under construction: its Code and its extra locals. */
 class Fn {
@@ -1576,18 +1547,17 @@ export class NetBuilder {
       const MSG = f.local(this.strRef);
       this.codeOf(c, () => c.localGet(0));
       c.localSet(CODE);
+      // libuv's message for the host OS's errno (SEMANTICS.md S118),
+      // "unknown error" for one its map lacks
+      c.localGet(0);
+      c.call(this.deps.osErrnoMessage());
+      c.localTee(MSG);
+      c.arrayLen();
+      c.i32Eqz();
+      c.ifVoid();
       this.lit(c, "unknown error");
       c.localSet(MSG);
-      for (const [n, text] of UV_MESSAGES) {
-        this.if_(c, () => {
-          c.localGet(0);
-          c.i32Const(n);
-          c.i32Eq();
-        }, () => {
-          this.lit(c, text);
-          c.localSet(MSG);
-        });
-      }
+      c.end();
       this.deps.newError(c, "%Error", "Error", (c2) => {
         c2.localGet(1);
         this.lit(c2, " ");
@@ -1611,10 +1581,10 @@ export class NetBuilder {
       const c = f.c;
       const CODE = f.local(this.strRef);
       c.localGet(0);
-      c.i32Const(-3007);
+      this.deps.osErrnoNum(c, "EAI_NODATA");
       c.i32Eq();
       c.localGet(0);
-      c.i32Const(-3008);
+      this.deps.osErrnoNum(c, "EAI_NONAME");
       c.i32Eq();
       c.i32Or();
       c.ifResult(this.strRef);
@@ -1633,6 +1603,16 @@ export class NetBuilder {
         this.concat(c2);
       }, (c2) => c2.localGet(CODE));
     });
+  }
+
+  /** `() -> i32` Node's default byte highWaterMark on the host's OS (S118). */
+  defaultHwmFn(): number {
+    return this.deps.defaultHwm();
+  }
+
+  /** Push the host OS's libuv number for errno `name` (SEMANTICS.md S118). */
+  emitErrnoNum(c: Code, name: string): void {
+    this.deps.osErrnoNum(c, name);
   }
 
   /** Push a fresh Node error (class Error) with a literal message and code. */
@@ -2214,7 +2194,7 @@ export class NetBuilder {
     this.sbits(c, s, S_RS, kEnded);
     c.i32Eqz();
     this.sget(c, s, S_RLEN);
-    c.i32Const(HWM);
+    c.call(this.deps.defaultHwm());
     c.i32LtS();
     this.sget(c, s, S_RLEN);
     c.i32Eqz();
@@ -2395,7 +2375,7 @@ export class NetBuilder {
       this.sbits(c, S, S_RS, kReading | kEnded);
       c.i32Eqz();
       this.sget(c, S, S_RLEN);
-      c.i32Const(HWM);
+      c.call(this.deps.defaultHwm());
       c.i32LtS();
       this.sbits(c, S, S_RS, kFlowing);
       this.sget(c, S, S_RLEN);
@@ -2466,7 +2446,7 @@ export class NetBuilder {
         this.sbits(c, S, S_RS, kFlowing | kEnded);
         c.i32Eqz();
         this.sget(c, S, S_RLEN);
-        c.i32Const(HWM);
+        c.call(this.deps.defaultHwm());
         c.i32LeS();
         c.i32And();
       }, () => this.sbitSet(c, S, S_RS, kNeedReadable));
@@ -2804,7 +2784,7 @@ export class NetBuilder {
         this.sbits(c, S, S_RS, kNeedReadable);
         c.i32And();
         this.sget(c, S, S_RLEN);
-        c.i32Const(HWM);
+        c.call(this.deps.defaultHwm());
         c.i32GeS();
         this.sbits(c, S, S_RS, kEnded);
         c.i32Or();
@@ -2852,7 +2832,8 @@ export class NetBuilder {
         c.f64ConvertI32S();
         c.localGet(N);
         c.f64Sub();
-        c.f64Const(HWM);
+        c.call(this.deps.defaultHwm());
+        c.f64ConvertI32S();
         c.f64Lt();
         c.i32Or();
       }, () => {
@@ -2895,7 +2876,7 @@ export class NetBuilder {
       }, () => {
         this.if_(c, () => {
           this.sget(c, S, S_RLEN);
-          c.i32Const(HWM);
+          c.call(this.deps.defaultHwm());
           c.i32LeS();
         }, () => this.sbitSet(c, S, S_RS, kNeedReadable));
         c.f64Const(0);
@@ -3361,7 +3342,7 @@ export class NetBuilder {
         this.sbitClr(c, S, S_WS, wSync);
       });
       this.sget(c, S, S_WLEN);
-      c.i32Const(HWM);
+      c.call(this.deps.defaultHwm());
       c.i32LtS();
       this.sget(c, S, S_WLEN);
       c.i32Eqz();
@@ -4612,7 +4593,7 @@ export class NetBuilder {
       }, () => this.trap(c));
       this.if_(c, () => {
         c.localGet(R);
-        c.i32Const(UV_ENOTCONN);
+        this.deps.osErrnoNum(c, "ENOTCONN");
         c.i32Eq();
       }, () => {
         c.localGet(S);
@@ -5092,7 +5073,7 @@ export class NetBuilder {
       this.if_(c, () => this.sget(c, S, S_WPEND), () => {
         this.sset(c, S, S_WPEND, () => c.i32Const(0));
         c.localGet(S);
-        c.i32Const(UV_ECANCELED);
+        this.deps.osErrnoNum(c, "ECANCELED");
         this.lit(c, "write");
         c.call(this.errnoExHelper());
         c.call(this.onwriteHelper());

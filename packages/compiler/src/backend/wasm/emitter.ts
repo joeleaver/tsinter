@@ -120,6 +120,8 @@ import {
   HOST_STR_KIND_ENV_VALUE,
   HOST_STR_KIND_EXEC_PATH,
   HOST_NUM_KIND_OS_TOTALMEM,
+  PLATFORM_ID_DARWIN,
+  PLATFORM_ID_WIN32,
   HOST_STR_KIND_OS_HOMEDIR,
   HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON,
   HOST_STR_KIND_OS_RELEASE,
@@ -187,8 +189,9 @@ import { QsBuilder, type QsDict } from "./querystring.js";
 import { IdnaBuilder } from "./url-idna.js";
 import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
+import { OsTablesBuilder } from "./ostables.js";
 import { ProcessBuilder } from "./process.js";
-import { PathBuilder } from "./path.js";
+import { PathBuilder, type PathHostMember } from "./path.js";
 import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
@@ -834,6 +837,11 @@ function hostStrReachable(mod: WModule): boolean {
         node === "process.chdir" ||
         // INC-29 U3: pathToFileURL resolves against the cwd snapshot.
         node === "url.pathToFileURL" ||
+        // S118: the host-dispatched pathToFileURL and bare path members
+        // (resolve/relative read the cwd on either arm)
+        node === "url.pathToFileURLHost" ||
+        node === "path.hostResolve" ||
+        node === "path.hostRelative" ||
         // INC-26 P4 (design-host-v7.txt §3.5, abi.ts kinds 8/9): os.tmpdir
         // and os.homedir are the pass's ONLY hostStr consumers — none of
         // the 13 fs.* keys touches hostStr at all (fsCall stages paths
@@ -953,7 +961,20 @@ function hostNumReachable(mod: WModule): boolean {
         node === "cp.execCapture" ||
         // INC-28 U2: and the two asynchronous keys, as hostStrReachable.
         node === "cp.spawn" ||
-        node === "cp.spawnOpts"
+        node === "cp.spawnOpts" ||
+        // SEMANTICS.md S118: the run-time OS choices (hostNum kind 18) —
+        // the bare path module, path.sep/delimiter/os.EOL, the url win32
+        // arms, and every stream's default highWaterMark
+        node.startsWith("path.host") ||
+        node === "os.hostChoice" ||
+        node === "stream.hostDefaultHwm" ||
+        node.startsWith("url.fileURLToPath") ||
+        node === "url.pathToFileURLHost" ||
+        node.startsWith("readable.") ||
+        node.startsWith("writable.") ||
+        node.startsWith("duplex.") ||
+        node.startsWith("transform.") ||
+        node.startsWith("passthrough.")
       ) {
         found = true;
       }
@@ -3077,9 +3098,13 @@ class Assembler {
     this.hostStrFunc = hostStrReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_HOST_STR, this.mb.funcType([I32, I32, I32, I32], [I32]))
       : null;
-    this.hostNumFunc = hostNumReachable(mod)
-      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_HOST_NUM, this.mb.funcType([I32, I32], [F64]))
-      : null;
+    // SEMANTICS.md S118: a module that receives a host-OS signal or errno
+    // number (kill, child processes, net, signals, stdin) names it through
+    // hostNum kinds 16/17 (ostables.ts), so it imports hostNum as well.
+    this.hostNumFunc =
+      hostNumReachable(mod) || killReachable(mod) || cpCallReachable(mod) || eventModuleReachable(mod) || netMod || httpModuleReachable(mod) || hevSignals || hevStdin
+        ? this.mb.importFunc(IMPORT_MODULE, IMPORT_HOST_NUM, this.mb.funcType([I32, I32], [F64]))
+        : null;
     // `exit`'s decision (INC-26 P1, D3): present only in modules that call
     // `process.exit`, minted right after `hostNumFunc`.
     this.exitFunc = exitReachable(mod)
@@ -9209,7 +9234,7 @@ class Assembler {
     code.localGet(st);
     this.emitDynIsAbsentish(code, (cc) => cc.localGet(HWM));
     code.ifResult(F64);
-    code.f64Const(65536);
+    this.os.emitDefaultHwmF64(code);
     code.else_();
     code.localGet(HWM);
     code.structGet(dynT, DYN_KIND);
@@ -10281,6 +10306,19 @@ class Assembler {
    * `cached()` memo, its own `%w.proc.*` prefix), sharing the module's
    * existing string-vec machinery (arrayOf(STRING)'s VecInfo) rather than
    * inventing a second array representation. */
+  /** SEMANTICS.md S118: the host OS's signal and errno numbers, by name
+   * (ostables.ts). */
+  private osField: OsTablesBuilder | null = null;
+  private get os(): OsTablesBuilder {
+    this.osField ??= new OsTablesBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strEq: () => this.strEqHelper(),
+      hostNumFunc: () => this.hostNumFuncOrThrow(),
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+    });
+    return this.osField;
+  }
+
   private get proc(): ProcessBuilder {
     this.procField ??= new ProcessBuilder(this.mb, {
       strRef: () => this.strRef,
@@ -10293,6 +10331,8 @@ class Assembler {
       chdirFunc: () => this.chdirFuncOrThrow(),
       umaskFunc: () => this.umaskFuncOrThrow(),
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      osSignalByName: () => this.os.signalByNameHelper(),
+      osSignalNum: (c, name) => this.os.emitSignalNum(c, name),
       enqueueRaw: () => this.nextTick.enqueueRaw(),
       rawFnType: () => this.nextTick.rawFnType(),
       defaultReportHelper: () => this.defaultWarningReportHelper(),
@@ -10349,6 +10389,7 @@ class Assembler {
       strType: () => this.strType,
       readHostStr: () => this.proc.readHostStr(),
       strEq: () => this.strEqHelper(),
+      emitIsWin32: (c) => this.os.emitPlatformIs(c, PLATFORM_ID_WIN32),
       stringVecInfo: () => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!,
       stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecGet: () => this.vecs.getFlat(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
@@ -10480,6 +10521,23 @@ class Assembler {
     return this.hostStrFunc;
   }
 
+  /** Print `message` as the uncaught report and stop (the builders'
+   * `namedTrap`). */
+  private emitNamedTrap(c: Code, message: string): void {
+    const exc = this.exc();
+    this.pushStrLitInto(c, message);
+    c.globalSet(exc.refG);
+    c.i32Const(EXC_STR);
+    c.globalSet(exc.kindG);
+    c.call(this.reportUncaughtHelper());
+  }
+
+  /** SEMANTICS.md S118: a surface whose Node behaviour on OS `id` the tier
+   * does not model yet stops there by name, never silently differs. */
+  private emitUnsupportedOn(c: Code, id: number, what: string): void {
+    this.os.emitUnsupportedOn(c, id, what, (cc, m) => this.emitNamedTrap(cc, m));
+  }
+
   /** `this.hostNumFunc`, or a descriptive throw. */
   private hostNumFuncOrThrow(): number {
     if (this.hostNumFunc === null) {
@@ -10606,6 +10664,8 @@ class Assembler {
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      osErrnoName: () => this.os.errnoNameHelper(),
+      osSignalName: () => this.os.signalNameHelper(),
       namedTrap: (c, message) => {
         const exc = this.exc();
         this.pushStrLitInto(c, message);
@@ -10703,6 +10763,9 @@ class Assembler {
       concat: () => this.concatHelper(),
       f64ToStr: () => this.f64ToStrHelper(),
       codeName: () => this.cp.codeNameHelper(),
+      osErrnoNum: (c, name) => this.os.emitErrnoNum(c, name),
+      osErrnoMessage: () => this.os.errnoMessageHelper(),
+      defaultHwm: () => this.os.defaultHwmHelper(),
       stageRun: () => this.cp.stageRunHelper(),
       voidClos: () => this.closPairFor([], []),
       errClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
@@ -15238,6 +15301,7 @@ class Assembler {
       checkCwdEnv: () => this.cp.checkCwdEnvHelper(),
       codeName: () => this.cp.codeNameHelper(),
       signalName: () => this.cp.signalNameHelper(),
+      osErrnoNum: (c, name) => this.os.emitErrnoNum(c, name),
       concat: () => this.concatHelper(),
       throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
       newErrorCoded: (c, pushMessage, pushCode) => {
@@ -23805,6 +23869,30 @@ class Assembler {
         if (e.fn === "path.win32Join") {
           this.walkExpr(e.args[0]!);
           code.call(this.path.win32JoinHelper());
+          return;
+        }
+        // SEMANTICS.md S118: the bare module on a "host" build — the posix
+        // or the win32 member by the host's OS at run time
+        if (e.fn.startsWith("path.host")) {
+          const m = e.fn.slice("path.host".length);
+          const member = (m[0]!.toLowerCase() + m.slice(1)) as PathHostMember;
+          for (const a of e.args) this.walkExpr(a);
+          code.call(this.path.hostHelper(member));
+          return;
+        }
+        // S118: path.sep / path.delimiter / os.EOL — [posix, win32]
+        if (e.fn === "os.hostChoice") {
+          this.os.emitPlatformIs(code, PLATFORM_ID_WIN32);
+          code.ifResult(this.strRef);
+          this.walkExpr(e.args[1]!);
+          code.else_();
+          this.walkExpr(e.args[0]!);
+          code.end();
+          return;
+        }
+        // S118: stream.getDefaultHighWaterMark(false), the host OS's
+        if (e.fn === "stream.hostDefaultHwm") {
+          this.os.emitDefaultHwmF64(code);
           return;
         }
         if (e.fn === "path.win32Resolve") {
@@ -35792,10 +35880,18 @@ class Assembler {
       case "url.searchParams":
         return simple(() => W().searchParamsFn(), false);
       case "url.fileURLToPathUrl":
+        // S118: Node's win32 arm (drive letters, backslashes, UNC) is not
+        // in the tier yet
+        this.emitUnsupportedOn(code, PLATFORM_ID_WIN32, "url.fileURLToPath (Node's win32 arm)");
         return simple(() => W().fileToPathFn(), true);
       case "url.fileURLToPathStr":
+        this.emitUnsupportedOn(code, PLATFORM_ID_WIN32, "url.fileURLToPath (Node's win32 arm)");
         return simple(() => W().fileStrToPathFn(), true);
       case "url.pathToFileURL":
+        return simple(() => W().pathToFileFn(), true);
+      case "url.pathToFileURLHost":
+        // S118: the bare module's pathToFileURL is the host OS's flavor
+        this.emitUnsupportedOn(code, PLATFORM_ID_WIN32, "url.pathToFileURL (Node's win32 arm)");
         return simple(() => W().pathToFileFn(), true);
       case "sp.new":
         return simple(() => W().spNewFn(), false);
@@ -36796,7 +36892,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmLocal);
         this.close();
@@ -37085,7 +37181,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmLocal);
         this.close();
@@ -37438,7 +37534,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmRLocal);
         this.close();
@@ -37453,7 +37549,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmWLocal);
         this.close();
@@ -37685,7 +37781,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmRLocal);
         this.close();
@@ -37700,7 +37796,7 @@ class Assembler {
         code.f64Const(0);
         code.f64Lt();
         this.openIfResult(F64);
-        code.f64Const(65536);
+        this.os.emitDefaultHwmF64(code);
         code.else_();
         code.localGet(hwmWLocal);
         this.close();

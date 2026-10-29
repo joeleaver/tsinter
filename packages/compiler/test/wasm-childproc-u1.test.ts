@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { constants as osConstants } from "node:os";
 import { getSystemErrorMap } from "node:util";
 import { compile } from "../src/index.js";
-import { CP_ERRNO_NAMES, CP_SIGNAL_NAMES } from "../src/backend/wasm/childproc.js";
+import { ERRNO_NAMES, SIGNAL_NAMES } from "../src/backend/wasm/os-names.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -149,16 +149,21 @@ describe("INC-28 U1 child_process — host-free rows", () => {
     }, 300_000);
   }
 
-  test("N-MAP-01 the errno-name table equals Node's own util.getSystemErrorMap() entry for entry — SINGLE-EDIT: one table entry altered", () => {
-    const node = [...getSystemErrorMap().entries()].map(([n, [name]]) => [n, name] as const).sort((a, b) => b[0] - a[0]);
-    expect(CP_ERRNO_NAMES.map(([n, name]) => [n, name])).toEqual(node.map(([n, name]) => [n, name]));
+  // SEMANTICS.md S118: the module keeps names only (os-names.ts); the
+  // numbers are the host's (hostNum kinds 16/17)
+  test("N-MAP-01 the errno-name table equals Node's own util.getSystemErrorMap() names, entry for entry — SINGLE-EDIT: one table entry altered", () => {
+    expect(ERRNO_NAMES.map(([name]) => name)).toEqual([...getSystemErrorMap().values()].map(([name]) => name));
   });
 
-  test("N-MAP-02 the signal-name table gives the FIRST os.constants.signals name per number, 1..31 — SINGLE-EDIT: a name shifted by one", () => {
+  test("N-MAP-02 the signal-name table reads each number back as its FIRST os.constants.signals name — SINGLE-EDIT: a name shifted by one", () => {
     const first = new Map<number, string>();
     for (const [name, n] of Object.entries(osConstants.signals as Record<string, number>)) if (!first.has(n)) first.set(n, name);
-    const expected = [""];
-    for (let n = 1; n <= 31; n++) expected.push(first.get(n) ?? "");
-    expect([...CP_SIGNAL_NAMES]).toEqual(expected);
+    const sigs = osConstants.signals as Record<string, number | undefined>;
+    const firstByList = new Map<number, string>();
+    for (const name of SIGNAL_NAMES) {
+      const n = sigs[name];
+      if (n !== undefined && !firstByList.has(n)) firstByList.set(n, name);
+    }
+    expect([...firstByList].sort((a, b) => a[0] - b[0])).toEqual([...first].sort((a, b) => a[0] - b[0]));
   });
 });

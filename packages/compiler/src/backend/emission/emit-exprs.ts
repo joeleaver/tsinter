@@ -6272,6 +6272,21 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             // `X.name` through a class value: the class object's stored
             // .name string (+1 — a no-op retain on the interned immortal).
             return finish(`scr_classobj_name(${arg(0)})`);
+          // SEMANTICS.md S118: only a "host" build (the WasmGC tier)
+          // lowers these; the C lane compiles for one target platform
+          case "path.hostJoin":
+          case "path.hostResolve":
+          case "path.hostNormalize":
+          case "path.hostDirname":
+          case "path.hostBasename":
+          case "path.hostExtname":
+          case "path.hostIsAbsolute":
+          case "path.hostRelative":
+          case "path.hostToNamespacedPath":
+          case "os.hostChoice":
+          case "stream.hostDefaultHwm":
+          case "url.pathToFileURLHost":
+            throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
           default: {
             const _exhaustive: never = fn;
             void _exhaustive;

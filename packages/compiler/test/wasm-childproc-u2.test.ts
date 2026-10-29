@@ -114,7 +114,7 @@ describe("INC-28 U2 child_process async — host-free rows", () => {
     const r = await build('process.on("SIGINT", () => console.log("int"));\nconsole.log("armed");\n');
     expect(r.ok, JSON.stringify(r)).toBe(true);
     if (!r.ok) return;
-    expect(r.imports).toEqual(["tsinter.write", "tsinter.now", "tsinter.evPoll", "tsinter.sigCall"]);
+    expect(r.imports).toEqual(["tsinter.write", "tsinter.now", "tsinter.hostNum", "tsinter.evPoll", "tsinter.sigCall"]);
     expect(r.exports).toContain("_loop");
   });
   const liftedU3: [string, string, string][] = [

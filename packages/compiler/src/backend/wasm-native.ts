@@ -23,7 +23,7 @@ import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
+import { type CcDriver, ensureZlibObjects, resolveCc, runtimeSrcDir, targetPlatform } from "./cc.js";
 import { ensureOpensslArchive, opensslIncludeArgs, opensslTargetFor, opensslTreeDigest } from "./openssl-build.js";
 import {
   IMPORT_CHDIR,
@@ -86,6 +86,19 @@ export const NATIVE_HOST_IMPORTS: ReadonlyMap<string, HostImportSig> = new Map([
   [IMPORT_FETCH, sig(["i32", "i32", "i32", "i32", "i32"], ["i32"])],
 ]);
 
+/** The OS a wasm-native executable is built for: the produced binary's
+ * (cc.ts targetPlatform — the SCRIPTC_TARGET triple's, else the
+ * host's). The MODULE is the same for every OS (its OS is a run-time answer
+ * of the host — SEMANTICS.md S118); only the runner differs, and the
+ * runner's C host is Linux's so far: a macOS or Windows target refuses by
+ * name (wasm-native:target) — the host's port is not built yet. */
+export type NativeOs = "linux";
+export function nativeTargetOs(driver: CcDriver = resolveCc()): NativeOs {
+  const os = targetPlatform(driver);
+  if (os === "linux") return os;
+  throw new Error(`the wasm-native runner's host is not yet ported to ${os} (${driver.target ?? "host"})`);
+}
+
 const WA = (globalThis as unknown as { WebAssembly: { validate: (b: Uint8Array) => boolean } }).WebAssembly;
 
 /** The module translated for the runner (throws Wasm2cHostImportError for
@@ -104,6 +117,10 @@ export function wasmNativeRuntimeDir(): string {
 
 /** The runner's C units, compiled once per flavor into objects. */
 const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c", "wn_ev.c", "wn_cp.c", "wn_net.c", "wn_tls.c", "wn_fetch.c", "wn_trust.c", "wn_x509.c"];
+/** The OS libraries the runner links after every object. */
+function osLinkArgs(_os: NativeOs): string[] {
+  return ["-lpthread", "-lm"];
+}
 /** The units a module links only when it imports what they serve (the
  * translation declares `host_<import>` for each import it has): the TLS
  * engine (and Node's OpenSSL behind it). */
@@ -128,6 +145,8 @@ const RUNNER_INPUTS = [
   "wasmnative/wn_llw.h",
   "wasmnative/wn_x509.h",
   ...RUNNER_SOURCES.map((s) => `wasmnative/${s}`),
+  "wasmnative/wn_os_names.h",
+  "wasmnative/uv_errno.h",
   "scr_zone_names.h",
   "scr_zlib_prefix.h",
   "scr_ossl_prefix.h",
@@ -177,7 +196,7 @@ async function exists(p: string): Promise<boolean> {
  * when it was published — an empty or truncated file left by a crashed
  * compiler (or a crashed copy) is removed and rebuilt, never run. */
 const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
-async function isWholeElf(p: string, executable: boolean): Promise<boolean> {
+async function isWholeElf(p: string, executable: boolean, _os: NativeOs = "linux"): Promise<boolean> {
   try {
     const st = await stat(p);
     if (!st.isFile() || st.size < 64) return false;
@@ -187,6 +206,11 @@ async function isWholeElf(p: string, executable: boolean): Promise<boolean> {
   } catch {
     return false;
   }
+}
+/** A cross target's cache directories carry its triple (a host build's
+ * names are unchanged). */
+function targetSuffix(driver: CcDriver): string {
+  return driver.target !== null ? `-${driver.target}` : "";
 }
 /** Publishes a freshly built cache directory: renamed into place when
  * there is none; when another process published one first and it is whole,
@@ -212,8 +236,9 @@ async function digestOf(p: string): Promise<string> {
  * vendor/.cache (atomic-rename publish, like the regex engine object). */
 async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
   const driver = resolveCc();
-  if (driver.target !== null) throw new Error("the wasm-native lane does not cross-compile yet (SCRIPTC_TARGET is set)");
-  const flavor = `${sanitize ? "ubsan" : "plain"}${driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc"}`;
+  const os = nativeTargetOs(driver);
+  const sources = RUNNER_SOURCES;
+  const flavor = `${sanitize ? "ubsan" : "plain"}${driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc"}${targetSuffix(driver)}`;
   const cacheRoot = join(runtimeSrcDir(), "..", "vendor", ".cache");
   // keyed by the inputs, the flags and the compiler that built them
   const key = createHash("sha256")
@@ -229,13 +254,13 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
     .slice(0, 16);
   const dir = join(cacheRoot, `wasmnative-${key}-${flavor}`);
   const ossl = opensslIncludeArgs(opensslTargetFor(driver));
-  const objs = RUNNER_SOURCES.map((s) => join(dir, s.replace(/\.c$/, ".o")));
-  if ((await Promise.all(objs.map((o) => isWholeElf(o, false)))).every(Boolean)) return objs;
+  const objs = sources.map((s) => join(dir, s.replace(/\.c$/, ".o")));
+  if ((await Promise.all(objs.map((o) => isWholeElf(o, false, os)))).every(Boolean)) return objs;
   await mkdir(cacheRoot, { recursive: true });
   const build = await mkdtemp(join(cacheRoot, `build-wasmnative-${flavor}-`));
   try {
     await Promise.all(
-      RUNNER_SOURCES.map((s) =>
+      sources.map((s) =>
         execFileAsync(driver.argv[0] ?? "clang", [
           ...driver.argv.slice(1),
           ...cflags(sanitize),
@@ -250,9 +275,9 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
         ]),
       ),
     );
-    const built = RUNNER_SOURCES.map((s) => join(build, s.replace(/\.c$/, ".o")));
-    if (!(await Promise.all(built.map((o) => isWholeElf(o, false)))).every(Boolean)) {
-      throw new Error("wasm-native: the compiler left a runner object that is not a whole ELF file");
+    const built = sources.map((s) => join(build, s.replace(/\.c$/, ".o")));
+    if (!(await Promise.all(built.map((o) => isWholeElf(o, false, os)))).every(Boolean)) {
+      throw new Error(`wasm-native: the compiler left a runner object that is not a whole ELF file`);
     }
     await publishDir(build, dir, objs.map((o) => o.slice(dir.length + 1)));
   } finally {
@@ -270,7 +295,7 @@ async function ensureRootsObject(): Promise<string> {
   const driver = resolveCc();
   const cacheRoot = join(runtimeSrcDir(), "..", "vendor", ".cache");
   const key = createHash("sha256").update(TLS_ROOTS_SHA256).update("\0").update(await ccVersion()).digest("hex").slice(0, 16);
-  const dir = join(cacheRoot, `wasmnative-roots-${key}`);
+  const dir = join(cacheRoot, `wasmnative-roots-${key}${targetSuffix(driver)}`);
   const obj = join(dir, "wn_roots.o");
   if (await isWholeElf(obj, false)) return obj;
   await mkdir(cacheRoot, { recursive: true });
@@ -346,7 +371,7 @@ async function ensureLlhttpObject(sanitize: boolean): Promise<string> {
     .update(await ccVersion())
     .digest("hex")
     .slice(0, 16);
-  const dir = join(cacheRoot, `wasmnative-llhttp-${key}-${sanitize ? "ubsan" : "plain"}`);
+  const dir = join(cacheRoot, `wasmnative-llhttp-${key}-${sanitize ? "ubsan" : "plain"}${targetSuffix(driver)}`);
   const obj = join(dir, "wn_llhttp.o");
   if (await isWholeElf(obj, false)) return obj;
   await mkdir(cacheRoot, { recursive: true });
@@ -366,17 +391,21 @@ async function ensureLlhttpObject(sanitize: boolean): Promise<string> {
 /** Node's own OpenSSL (vendor/openssl, backend/openssl-build.ts) built for
  * this lane: the host's TLS engine, trust stores and verdict (units O2,
  * O3). test/openssl-vendor.test.ts smoke-tests it. */
-export function wasmNativeOpensslArchive(): Promise<string> {
-  const driver = resolveCc();
-  if (driver.target !== null) throw new Error("the wasm-native lane does not cross-compile yet (SCRIPTC_TARGET is set)");
+export function wasmNativeOpensslArchive(driver: CcDriver = resolveCc()): Promise<string> {
   return ensureOpensslArchive(driver);
 }
 
-let ccVersionMemo: Promise<string> | null = null;
+/** per driver (clang and `zig cc` can both build in one process) */
+const ccVersionMemo = new Map<string, Promise<string>>();
 function ccVersion(): Promise<string> {
   const driver = resolveCc();
-  ccVersionMemo ??= execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), "--version"], { cwd: tmpdir() }).then((r) => r.stdout.split("\n", 1)[0] ?? "");
-  return ccVersionMemo;
+  const k = driver.argv.join(" ");
+  let v = ccVersionMemo.get(k);
+  if (v === undefined) {
+    v = execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), "--version"], { cwd: tmpdir() }).then((r) => r.stdout.split("\n", 1)[0] ?? "");
+    ccVersionMemo.set(k, v);
+  }
+  return v;
 }
 
 function cacheRootDir(): string | null {
@@ -392,6 +421,7 @@ function cacheRootDir(): string | null {
  * inputs, the flags and the C bytes). */
 export async function compileWasmNative(opts: { cPath: string; outPath: string; sanitize: boolean }): Promise<void> {
   const driver = resolveCc();
+  const os = nativeTargetOs(driver);
   const allObjs = await ensureRunnerObjects(opts.sanitize);
   const cText = await readFile(opts.cPath, "utf8");
   const wanted = new Set(OPTIONAL_UNITS.filter((u) => u.needs.test(cText)).map((u) => u.obj));
@@ -424,8 +454,7 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
     "-o",
     opts.outPath,
     ...linkFlags,
-    "-lpthread",
-    "-lm",
+    ...osLinkArgs(os),
   ];
   const root = cacheRootDir();
   let cached: string | null = null;
@@ -436,6 +465,9 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
       .update(await runnerInputsHash())
       .update("\0")
       .update(cflags(opts.sanitize).join("\x1f"))
+      .update("\0")
+      // a cross target's executables are its own
+      .update([...driver.targetArgs, ...osLinkArgs(os)].join("\x1f"))
       .update("\0")
       // the generated units it links (by what they are made from) and the
       // vendored archives (their cache directories are named by their
@@ -453,7 +485,7 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
       // reused only when whole: an ELF executable matching the size and
       // digest recorded when it was published (#323)
       const recorded = await readFile(`${cached}.ok`, "utf8").catch(() => null);
-      if (recorded !== null && (await isWholeElf(cached, true)) && (await digestOf(cached)) === recorded) {
+      if (recorded !== null && (await isWholeElf(cached, true, os)) && (await digestOf(cached)) === recorded) {
         const tmp = `${opts.outPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
         try {
           await copyFile(cached, tmp);
@@ -476,7 +508,7 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
   const linkArgs = args.map((a) => (a === opts.outPath ? out : a));
   try {
     await execFileAsync(driver.argv[0] ?? "clang", linkArgs, { maxBuffer: 64 << 20 });
-    if (!(await isWholeElf(out, true))) throw new Error("wasm-native: the link left an executable that is not a whole ELF file");
+    if (!(await isWholeElf(out, true, os))) throw new Error(`wasm-native: the link left an executable that is not a whole ELF file`);
     await rename(out, opts.outPath);
   } finally {
     await rm(out, { force: true });

@@ -12,7 +12,7 @@
  *    released: the runner's WN_FD_AUDIT line after children, pipes,
  *    sockets, watches and signal subscriptions came and went.
  * Each program runs in its own temporary directory, the oracle first. */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { chmodSync, globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -321,4 +321,55 @@ console.log("after");
     expect(native.signal).toBe(node.signal);
     expect(native.stdout).toBe(node.stdout);
   });
+});
+
+/* The cross plumbing (per-target caches and executables, the pinned
+ * triple): a Linux target builds through zig cc with its own runner
+ * objects; a macOS or Windows target refuses by name — the runner's host
+ * is not ported there yet (SEMANTICS.md S118 (b)). One module for every OS:
+ * the wasm bytes do not depend on the target. */
+describe("the wasm-native lane under a cross target", () => {
+  const zig = (() => {
+    try {
+      execFileSync("zig", ["version"], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  async function withTarget<T>(target: string, body: () => Promise<T>): Promise<T> {
+    const prev = [process.env["SCRIPTC_CC"], process.env["SCRIPTC_TARGET"]];
+    process.env["SCRIPTC_CC"] = "zigcc";
+    process.env["SCRIPTC_TARGET"] = target;
+    try {
+      return await body();
+    } finally {
+      if (prev[0] === undefined) delete process.env["SCRIPTC_CC"];
+      else process.env["SCRIPTC_CC"] = prev[0];
+      if (prev[1] === undefined) delete process.env["SCRIPTC_TARGET"];
+      else process.env["SCRIPTC_TARGET"] = prev[1];
+    }
+  }
+  test.skipIf(!zig)("aarch64-linux-gnu links an aarch64 ELF executable; the module is the host build's, byte for byte; macOS and Windows refuse by name", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tsinter-wn-cross-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, `import * as path from "node:path";\nconsole.log(process.platform, path.join("a", "b"));\n`);
+      const host = await compile(file, { outPath: join(dir, "h", "p"), outDir: join(dir, "h"), backend: "wasm-native" });
+      if (!host.ok) throw new Error(host.diagnostics.map((d) => d.message).join("\n"));
+      const cross = await withTarget("aarch64-linux-gnu.2.36", () => compile(file, { outPath: join(dir, "x", "p"), outDir: join(dir, "x"), backend: "wasm-native" }));
+      if (!cross.ok) throw new Error(cross.diagnostics.map((d) => d.message).join("\n"));
+      const elf = readFileSync(cross.binaryPath);
+      expect(elf.subarray(0, 4)).toEqual(Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+      expect(elf.readUInt16LE(18)).toBe(0xb7); // e_machine EM_AARCH64
+      expect(readFileSync(join(dir, "x", "main.wasm"))).toEqual(readFileSync(join(dir, "h", "main.wasm")));
+      for (const t of ["aarch64-macos", "x86_64-windows-gnu"]) {
+        const r = await withTarget(t, () => compile(file, { outPath: join(dir, t, "p"), outDir: join(dir, t), backend: "wasm-native" }));
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.diagnostics[0]!.message).toMatch(/runner's host is not yet ported to (darwin|win32) .*\(wasm-native:target\)$/);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 600_000);
 });

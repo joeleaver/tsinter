@@ -83,6 +83,8 @@ export interface PathDeps {
    * shared helper process.ts already reuses via its own `strEq` dep —
    * not a second helper under a new name (the CACHED lesson). */
   strEq: () => number;
+  /** SEMANTICS.md S118 (ostables.ts): push 1 when the host's OS is win32. */
+  emitIsWin32: (c: Code) => void;
 }
 
 export class PathBuilder {
@@ -6036,4 +6038,48 @@ export class PathBuilder {
       return idx;
     });
   }
+
+  /* ── SEMANTICS.md S118: the bare module on a "host" build ─────────────── */
+
+  /** `%w.path.host<Member>` — the bare `path` module's member when one
+   * module runs on every OS: the win32 twin when the host's OS is win32
+   * (Node's bare path IS path.win32 there), the posix one otherwise. The
+   * same parameters and result as the pair it chooses between. */
+  hostHelper(member: PathHostMember): number {
+    const s = this.str();
+    const vec = (): ValType => this.deps.stringVecRef();
+    const spec: Record<PathHostMember, { params: ValType[]; result: ValType; posix: () => number; win32: () => number }> = {
+      join: { params: [vec()], result: s, posix: () => this.joinHelper(), win32: () => this.win32JoinHelper() },
+      resolve: { params: [vec()], result: s, posix: () => this.resolveHelper(), win32: () => this.win32ResolveHelper() },
+      normalize: { params: [s], result: s, posix: () => this.normalizeHelper(), win32: () => this.win32NormalizeHelper() },
+      dirname: { params: [s], result: s, posix: () => this.dirnameHelper(), win32: () => this.win32DirnameHelper() },
+      basename: { params: [s, s], result: s, posix: () => this.basenameHelper(), win32: () => this.win32BasenameHelper() },
+      extname: { params: [s], result: s, posix: () => this.extnameHelper(), win32: () => this.win32ExtnameHelper() },
+      isAbsolute: { params: [s], result: I32, posix: () => this.isAbsoluteHelper(), win32: () => this.win32IsAbsoluteHelper() },
+      relative: { params: [s, s], result: s, posix: () => this.relativeHelper(), win32: () => this.win32RelativeHelper() },
+      toNamespacedPath: { params: [s], result: s, posix: () => this.toNamespacedPathHelper(), win32: () => this.win32ToNamespacedPathHelper() },
+    };
+    const sp = spec[member];
+    return this.cached(`host_${member}`, sp.params, [sp.result], (idx) => {
+      const win32 = sp.win32();
+      const posix = sp.posix();
+      const c = new Code();
+      this.deps.emitIsWin32(c);
+      c.ifResult(sp.result);
+      sp.params.forEach((_, i) => c.localGet(i));
+      c.call(win32);
+      c.else_();
+      sp.params.forEach((_, i) => c.localGet(i));
+      c.call(posix);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  private str(): ValType {
+    return this.strRef();
+  }
 }
+
+export type PathHostMember = "join" | "resolve" | "normalize" | "dirname" | "basename" | "extname" | "isAbsolute" | "relative" | "toNamespacedPath";

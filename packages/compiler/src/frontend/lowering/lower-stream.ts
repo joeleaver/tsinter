@@ -1366,6 +1366,8 @@ export function lowerStreamModuleCall(L: Lowerer, call: ts.CallExpression,
     // (lib/internal/streams/state.js: win32 keeps 16 KiB), so the fold
     // follows the TARGET platform like the path-module binding.
     if (args.length === 1 && args[0]!.kind === ts.SyntaxKind.FalseKeyword) {
+      // a "host" build (the WasmGC tier, SEMANTICS.md S118) asks at run time
+      if (L.targetPlatform === "host") return { kind: "libCall", fn: "stream.hostDefaultHwm", args: [], type: F64, loc };
       return f64Lit(L.targetPlatform === "win32" ? 16384 : 65536, loc);
     }
     if (args.length === 1 && args[0]!.kind === ts.SyntaxKind.TrueKeyword) return f64Lit(16, loc);

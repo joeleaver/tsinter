@@ -95,6 +95,7 @@ import { readFileSync } from "node:fs";
 import { expect } from "vitest";
 import { makeFetchHost, writeFetchEvent, type FetchHostEvent } from "./wasm-fetch-host.js";
 import { makeTzHost } from "./wasm-tz-host.js";
+import { osTableHostNum } from "./wasm-os-tables-host.js";
 
 /** `tsinter.exit`'s sentinel (abi.ts §2.5) — thrown by the host, caught
  * inside `drive()` before it can propagate as an unhandled rejection. */
@@ -328,6 +329,11 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
           // measurement as the hostStr additions above.
           case 15: // os.totalmem, bytes
             return 1e9;
+          // SEMANTICS.md S118: this Node OS's signal / errno numbers
+          case 16:
+          case 17:
+          case 18:
+            return osTableHostNum(kind, arg)!;
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }

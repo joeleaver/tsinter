@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { osTableHostNum } from "./wasm-os-tables-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -167,6 +168,10 @@ async function runForced(binaryPath: string, host: ForcedHost = {}): Promise<{ s
             return host.availableMemory ?? 123456;
           case 13:
             return host.constrainedMemory ?? 654321;
+          case 16:
+          case 17:
+          case 18:
+            return osTableHostNum(kind, arg)!;
           case 14: {
             const v = rusage[arg];
             if (v === undefined) throw new Error(`hostNum: rusage index out of range ${arg}`);

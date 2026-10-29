@@ -62,8 +62,11 @@ export interface ChildAsyncDeps {
   checkCwdEnv: () => number;
   /** childproc.ts: `(i32) -> string`, an errno carried as -(256 + n). */
   codeName: () => number;
-  /** childproc.ts: `(i32) -> string`, a Linux signal's name. */
+  /** childproc.ts: `(i32) -> string`, a host-OS signal's name. */
   signalName: () => number;
+  /** SEMANTICS.md S118 (ostables.ts): push the host OS's libuv number for
+   * an errno name. */
+  osErrnoNum: (c: Code, name: string) => void;
   concat: () => number;
   /** Write an Error of `className` into the pending cell. */
   throwCoded: (c: Code, className: string, name: string, pushMessage: (c: Code) => void, pushCode: (c: Code) => void) => void;
@@ -112,9 +115,11 @@ const SPAWN_HEADER_BYTES = 32;
 const EV_HEADER_BYTES = 24;
 const EV_FIRST_CAPACITY = 1024;
 const HOST_FAILURE = "cpCall: host failure";
-/** The errnos Node reports later as an 'error' event (EACCES, EAGAIN,
- * EMFILE, ENFILE, ENOENT on Linux); every other one is thrown at once. */
-const EMIT_LATER_ERRNOS: readonly number[] = [-13, -11, -24, -23, -2];
+/** The errnos Node reports later as an 'error' event (child_process.js:
+ * UV_EACCES, UV_EAGAIN, UV_EMFILE, UV_ENFILE, UV_ENOENT); every other one
+ * is thrown at once. By NAME: the numbers are the host OS's (SEMANTICS.md
+ * S118, ostables.ts). */
+const EMIT_LATER_ERRNOS: readonly string[] = ["EACCES", "EAGAIN", "EMFILE", "ENFILE", "ENOENT"];
 
 /* The child struct's fields. */
 export const CH_HANDLE = 0; // i32, -1 = no host child
@@ -122,7 +127,7 @@ export const CH_PID = 1; // f64
 export const CH_HAS_PID = 2; // i32
 export const CH_STATE = 3; // i32: 0 running, 1 exited with a code, 2 ended by a signal, 3 failed spawn's error fired
 export const CH_CODE = 4; // f64: the exit code, or the negative errno in state 3
-export const CH_SIGNAL = 5; // i32: the Linux signal number in state 2
+export const CH_SIGNAL = 5; // i32: the host OS's signal number in state 2
 export const CH_KILLED = 6; // i32
 export const CH_REFFED = 7; // i32
 export const CH_CONSUMED = 8; // i32: the exit (or the failure) has been delivered
@@ -899,7 +904,7 @@ export class ChildAsyncBuilder {
       c.localSet(DERIVED);
       for (const e of EMIT_LATER_ERRNOS) {
         c.localGet(ERRNO);
-        c.i32Const(e);
+        this.deps.osErrnoNum(c, e);
         c.i32Eq();
         c.ifVoid();
         c.i32Const(1);
@@ -1142,7 +1147,7 @@ export class ChildAsyncBuilder {
       this.trap(c);
       c.end();
       c.localGet(R);
-      c.i32Const(-3);
+      this.deps.osErrnoNum(c, "ESRCH");
       c.i32Eq();
       c.ifVoid();
       c.i32Const(0);
@@ -1154,10 +1159,10 @@ export class ChildAsyncBuilder {
       c.call(this.deps.codeName());
       c.localSet(CODE);
       c.localGet(R);
-      c.i32Const(-22);
+      this.deps.osErrnoNum(c, "EINVAL");
       c.i32Eq();
       c.localGet(R);
-      c.i32Const(-38);
+      this.deps.osErrnoNum(c, "ENOSYS");
       c.i32Eq();
       c.i32Or();
       c.ifVoid();

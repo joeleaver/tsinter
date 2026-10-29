@@ -62,7 +62,7 @@ describe("INC-29 U1 node:net — host-free rows", () => {
       const r = await build(src);
       expect(r.ok, JSON.stringify(r)).toBe(true);
       if (!r.ok) return;
-      expect(r.imports).toEqual(["tsinter.write", "tsinter.now", "tsinter.evPoll", "tsinter.netCall"]);
+      expect(r.imports).toEqual(["tsinter.write", "tsinter.now", "tsinter.hostNum", "tsinter.evPoll", "tsinter.netCall"]);
       expect(r.exports).toContain("_loop");
       expect(r.exports).not.toContain("_tick");
     });

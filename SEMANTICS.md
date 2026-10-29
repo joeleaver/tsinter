@@ -8538,3 +8538,48 @@ through the real runner), and `packages/compiler/test/wasm-native.test.ts`
 self-sent SIGSEGV, the descriptor audits, and that the vendored llhttp is
 the running Node's undici's). (b) was measured by hand (`f(50000)`, then unbounded
 recursion: the native trap in 0.2 s, exit 1).
+
+## S118 — The WasmGC tier compiles one module for every OS: it learns its OS from the host at run time, and where its own Node behaviour for an OS is not built yet it stops there by name *(wasm and wasm-native lanes)*
+
+**Stance.** Node's observable behaviour differs by OS — `process.platform`,
+signal and errno numbers (`os.constants.signals`, `util.getSystemErrorMap()`),
+the bare `path` module (path.win32 on Windows), `path.sep` / `path.delimiter`
+/ `os.EOL`, `stream.getDefaultHighWaterMark(false)` (16 KiB on win32, 64 KiB
+elsewhere). The WasmGC tier bakes none of these into the module: the frontend
+lowers a wasm build as a `"host"` platform build, and the module asks the host
+(abi.ts: `hostStr` kind 4 for the platform's name, `hostNum` kinds 16 and 17
+for the number the host's OS gives a signal / errno NAME — the module keeps
+only names, `backend/wasm/os-names.ts`, generated from Node's libuv headers by
+`scripts/gen-os-names.mjs` — and kind 18 for the platform as a number). Every
+signal or errno number crossing the host contract is the host OS's own; the
+module names it through those kinds. The JS host answers from the Node it runs
+under (`os.constants.signals`, `util.getSystemErrorMap()`), the native hosts
+from `wn_os_names.h` (libuv's own `uv/errno.h`, vendored beside it). On Linux
+every answer is the value the module used to bake in, so Linux output is
+unchanged.
+
+**What still parts from Node off Linux, by name.**
+- (a) `url.fileURLToPath` and the bare module's `url.pathToFileURL` on win32:
+  Node's win32 arms (drive letters, backslashes, UNC) are not in the tier; the
+  program stops with `wasm tier: url.… is not supported on win32 yet`.
+- (b) Not yet guarded, and reached by no lane today (the wasm-native runner
+  refuses a macOS or Windows target by name, `wasm-native:target`, and no
+  harness runs the wasm lane under Node off Linux): `process.env`'s
+  case-insensitive keys on win32, `execSync`'s shell (`/bin/sh -c`; Node on
+  win32 uses `cmd.exe /d /s /c`), `process.getuid`/`getgid` (absent on win32),
+  `fs.lchmod` (a real function on macOS; the tier builds Linux's "is not a
+  function" arm), and the dns `ADDRCONFIG` flag's spelling in the native host
+  (`wn_net.c` passes the contract's bit 32 to getaddrinfo raw — Linux's
+  value; the JS host maps it to its Node's `dns.ADDRCONFIG`). Each must be
+  made loud or exact before a macOS or Windows host ships.
+- (c) `process.on('SIGINT' | 'SIGTERM')` still lowers the numbers 2 and 15:
+  they are those signals' numbers on every OS Node runs on (libuv's Windows
+  emulation included).
+
+**Tested by:** the wasm and wasm-native differentials (Linux: unchanged
+output); `packages/compiler/test/os-names.test.ts` (the names are Node's: the
+signal list covers this Node's `os.constants.signals` in its order, the errno
+list is `util.getSystemErrorMap()`'s names and texts, and `wn_os_names.h`'s
+tables are generated from the same lists); `packages/compiler/test/wasm-native.test.ts`'s
+cross-target row (an aarch64-linux build carries the host build's module byte
+for byte; macOS and Windows targets refuse by name).

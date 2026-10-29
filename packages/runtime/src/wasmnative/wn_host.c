@@ -50,6 +50,7 @@
 
 #include "wn_rt.h"
 #include "../scr_zone_names.h"
+#include "wn_os_names.h"
 
 extern char **environ;
 
@@ -404,8 +405,16 @@ int32_t host_hostStr(int32_t kind, int32_t index, int32_t ptr, int32_t cap) {
       char b[PATH_MAX];
       return put_str(getcwd(b, sizeof b) ? b : "", P, CAP);
     }
-    case 4:
+    case 4: /* process.platform: the OS this host runs on (S118) */
+#if defined(__linux__)
       return put_str("linux", P, CAP);
+#elif defined(__APPLE__)
+      return put_str("darwin", P, CAP);
+#elif defined(_WIN32)
+      return put_str("win32", P, CAP);
+#else
+#error "the native runner's host knows linux, darwin and win32"
+#endif
     case 5:
 #if defined(__x86_64__)
       return put_str("x64", P, CAP);
@@ -553,6 +562,22 @@ double host_hostNum(int32_t kind, int32_t arg) {
       if (sysinfo(&si) != 0) return 0;
       return (double)si.totalram * si.mem_unit;
     }
+    /* SEMANTICS.md S118: the module keeps names, the host answers its OS's
+     * numbers (wn_os_names.h, generated with the module's os-names.ts) */
+    case 16:
+      return arg >= 0 && arg < WN_NSIGNALS ? wn_signal_numbers[arg] : 0;
+    case 17:
+      return arg >= 0 && arg < WN_NERRNOS ? wn_errno_numbers[arg] : 0;
+    case 18: /* the host's OS: 0 linux, 1 darwin, 2 win32, 3 other */
+#if defined(__linux__)
+      return 0;
+#elif defined(__APPLE__)
+      return 1;
+#elif defined(_WIN32)
+      return 2;
+#else
+      return 3;
+#endif
     default:
       fprintf(stderr, "native runner: hostNum kind %d is not part of the host contract\n", kind);
       exit(70);

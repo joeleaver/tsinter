@@ -83,6 +83,21 @@
  *      10  threadCpuUsage.user              11  threadCpuUsage.system
  *      12  availableMemory, bytes           13  constrainedMemory, bytes
  *      14  rusage field `arg`, 0..15        15  os.totalmem, bytes
+ *      16  the number the host's OS gives signal os-names.ts
+ *          SIGNAL_NAMES[arg] (os.constants.signals' value), 0 = none
+ *      17  the libuv number the host's OS gives errno os-names.ts
+ *          ERRNO_NAMES[arg] (negative: -errno on POSIX, libuv's own on
+ *          Windows; util.getSystemErrorMap()'s key), 0 = none
+ *      18  the host's OS: 0 linux, 1 darwin, 2 win32, 3 any other (the
+ *          OS process.platform names — hostStr kind 4)
+ *     KINDS 16-18 ARE HOW ONE MODULE RUNS ON EVERY OS (SEMANTICS.md S118):
+ *     the module keeps the NAMES (generated: scripts/gen-os-names.mjs) and
+ *     never a number; every signal or errno number that crosses this
+ *     contract (kill, cpCall, netCall, sigCall answers) is the HOST OS's
+ *     own, and the module names it through these two kinds. A host answers
+ *     what its OS's Node would put in os.constants.signals and
+ *     util.getSystemErrorMap() — the JS host reads exactly those; the
+ *     native hosts read wn_os_names.h.
  *     Kinds 0 and 1 are read ONCE each, at the argv/env snapshot (below);
  *     everything else is read at its own call site, every time. P1 minted
  *     and consumed kinds 0-1. INC-26 P3 (design §3.2) consumes kinds 2-14
@@ -182,11 +197,10 @@
  *     name, and the UNKNOWN arm as `Error("kill E<n>")` (n = -answer-256)
  *     with NO `.code` — reproducing the native lane's own asymmetry
  *     (scr_lib.c's `scr_kill_send`) rather than tidying it.
- *     THE SIGNAL NUMBER CROSSES IN LINUX NUMBERING — the tier's comparison
- *     platform. A host on another platform translates; two names share a
- *     number in Node's own table (SIGABRT=SIGIOT, SIGPOLL=SIGIO), so a
- *     translating host must know both spellings answer the same wire
- *     value. THE PID/SIGNAL VALIDATION AND THE NAME TABLE ARE PURE
+ *     THE SIGNAL NUMBER CROSSES IN THE HOST OS'S OWN NUMBERING (SEMANTICS.md
+ *     S118): the module turns a name into the host's number through
+ *     hostNum kind 16 (two names may share one: SIGABRT=SIGIOT). THE
+ *     PID/SIGNAL VALIDATION AND THE NAME TABLE ARE PURE
  *     IN-MODULE WORK — this import's ONLY job is the syscall's residue;
  *     Node's exact wording for a bad pid or an unknown signal never
  *     reaches the host at all.
@@ -484,7 +498,7 @@
  *     up to a multiple of 4, little-endian: header u32 stdinMode at +0
  *     (0 pipe at end-of-file, 1 pipe carrying the input below, 2 inherit,
  *     3 ignore), u32 stdoutMode at +4 and u32 stderrMode at +8 (0 capture,
- *     1 discard, 2 inherit), u32 killSignal at +12 (a validated Linux
+ *     1 discard, 2 inherit), u32 killSignal at +12 (a validated host-OS
  *     signal number), f64 timeoutMs at +16 (0 = none; any accepted value,
  *     however large, is passed through), u32 maxBufferMode at +24
  *     (0 = Node's default limit, 1 = unbounded), u32 reserved at +28 = 0 —
@@ -502,7 +516,7 @@
  *     detaches older views).
  *     THE RESULT RECORD (op 2), field by field from the host's own child
  *     result, written through a DataView: u32 hasStatus at +0, f64 status
- *     at +4, u32 signal at +12 (0 = none, else the Linux number), i32
+ *     at +4, u32 signal at +12 (0 = none, else the host OS's number), i32
  *     errCode at +16, u32 stdoutLen at +20, u32 stderrLen at +24, u32
  *     reserved at +28 — 4+8+4+4+4+4+4 = 32 bytes. ORTHOGONAL: a status and
  *     an error can both be present (a child that traps the timeout's
@@ -537,11 +551,12 @@
  *     in modules reaching child.kill, child.killNum or child.unref:
  *       op 5 SPAWN(ptr, len)   -> the host starts a child and answers at
  *                                 once (it does not wait for it)
- *       op 6 KILL(h, which)    -> `which` is the Linux signal number;
+ *       op 6 KILL(h, which)    -> `which` is the host OS's signal number;
  *                                 answers 0 when the signal was sent, else
- *                                 a NEGATIVE Linux errno (ESRCH -3 for a
- *                                 child already reaped, EINVAL -22, ENOSYS
- *                                 -38, EPERM -1, ...)
+ *                                 the host's NEGATIVE libuv errno (ESRCH
+ *                                 for a child already reaped, EINVAL,
+ *                                 ENOSYS, EPERM, ... — hostNum kind 17
+ *                                 names it; S118)
  *       op 7 UNREF(h)          -> 0
  *       op 8 RELEASE(h)        -> 0; the module sends it once the child's
  *                                 exit has been delivered, and the handle
@@ -569,7 +584,7 @@
  *     count and that many (key, value) runs, the child's WHOLE environment
  *     — and no input. `len` is the record's total byte length.
  *     THE SPAWN REPLY, written by the host over the same ptr: i32 errno at
- *     +0 (0, or the NEGATIVE Linux errno the spawn failed with), i32
+ *     +0 (0, or the host's NEGATIVE libuv errno the spawn failed with), i32
  *     disposition at +4 (0 spawned, 1 the failure is reported later as an
  *     'error' event, 2 the failure is thrown now — Node's own split: EACCES,
  *     EAGAIN, EMFILE, ENFILE and ENOENT are reported later, every other
@@ -605,7 +620,7 @@
  *     u32 handle at +4, u32 kind at +8,
  *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
  *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
- *     code, or -1 when a signal ended the child; b = that signal's Linux
+ *     code, or -1 when a signal ended the child; b = that signal's host-OS
  *     number, else 0; no payload), 2 bytes for the PROGRAM'S stdout, 3
  *     bytes for the PROGRAM'S stderr (named by destination: a child's
  *     inherited stream, or its fd 1 or 2 given in either output slot, is
@@ -652,7 +667,7 @@
  *     Readable / Writable state machine of a Socket, every nextTick and
  *     emit position, the closing phase — is built in the module (net.ts),
  *     so a host answers facts only: a HANDLE (>= 1, numbered from 1 in one
- *     space shared by servers, sockets and lookups), a NEGATIVE Linux
+ *     space shared by servers, sockets and lookups), a NEGATIVE host-OS libuv
  *     errno (or a negative getaddrinfo code, Node's -3000 range), a
  *     completion. Strings travel as UTF-16 RUNS: u32 code-unit count, the
  *     units, zero padding to a multiple of 4. All words little-endian.
@@ -719,7 +734,12 @@
  *                               ECANCELED in its own closing phase.
  *       op 8 NODELAY(h, x)      -> 0. TCP_NODELAY on h, on when x != 0.
  *       op 9 RESOLVE(ptr, len)  request: u32 family (0, 4 or 6), u32
- *                               hints (Node's ADDRCONFIG, 32), the name's
+ *                               hints (THIS CONTRACT's flag bits: 32
+ *                               ADDRCONFIG, 8 V4MAPPED, 16 ALL — Linux's
+ *                               getaddrinfo values; a host whose OS
+ *                               spells them otherwise, such as macOS's
+ *                               AI_ADDRCONFIG 0x400, maps each bit to its
+ *                               own flag — SEMANTICS.md S118), the name's
  *                               run. Answers a request handle at once;
  *                               the answer is a RESOLVE_DONE, after which
  *                               the request handle is gone.
@@ -1089,9 +1109,10 @@
  *     after sleep]
  *     sigCall(op, x) -> i32: libuv's uv_signal_start / uv_signal_stop, and
  *     nothing more.
- *       op 1 START(x = a Linux signal number) -> a subscription handle
- *                               (>= 1; numbered from 1), or the NEGATIVE
- *                               Linux errno the subscription failed with.
+ *       op 1 START(x = the host OS's signal number) -> a subscription
+ *                               handle (>= 1; numbered from 1), or the
+ *                               host's NEGATIVE libuv errno the
+ *                               subscription failed with.
  *                               From now on the host catches that signal
  *                               instead of taking its default action, and
  *                               queues one SIGNAL record per delivery its
@@ -1108,7 +1129,7 @@
  *     subscription never holds the loop: Node unrefs the wrap) — is the
  *     module's (hostev.ts).
  *     EVENTS, evPoll source 3, `handle` the subscription: kind 1 SIGNAL,
- *     a = the Linux signal number, b = 0, no payload. Any record out of
+ *     a = the host OS's signal number, b = 0, no payload. Any record out of
  *     these shapes (an unknown kind, a handle the module does not hold, a
  *     signal number that is not the handle's) is the named trap "evPoll:
  *     host failure".
@@ -1545,3 +1566,13 @@ export const HOST_NUM_KIND_AVAILABLE_MEMORY = 12;
 export const HOST_NUM_KIND_CONSTRAINED_MEMORY = 13;
 export const HOST_NUM_KIND_RUSAGE = 14;
 export const HOST_NUM_KIND_OS_TOTALMEM = 15;
+/** SEMANTICS.md S118: the host OS's number for a signal / errno name. */
+export const HOST_NUM_KIND_SIGNAL_NUMBER = 16;
+export const HOST_NUM_KIND_ERRNO_NUMBER = 17;
+/** S118: the host's OS as a number — what process.platform names, for the
+ * module's own run-time choices (bare path, os.EOL, stream defaults). */
+export const HOST_NUM_KIND_PLATFORM_ID = 18;
+export const PLATFORM_ID_LINUX = 0;
+export const PLATFORM_ID_DARWIN = 1;
+export const PLATFORM_ID_WIN32 = 2;
+export const PLATFORM_ID_OTHER = 3;

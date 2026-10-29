@@ -7,9 +7,14 @@
  * header), and force-includes the header into every TU that calls the
  * archive (opensslIncludeArgs). The commented-out lines are names a public
  * header maps to another name, so a caller never spells them; the archive
- * renames them all the same. Measured with nm over the targets:
+ * renames them all the same. A trailing "only:" comment names the
+ * configurations that define a name not all of them do. Measured with nm
+ * over the targets:
  * linux-x86_64: 10769
- * (10769 names). packages/compiler/test/openssl-vendor.test.ts
+ * darwin64-arm64-cc (aarch64-macos.13.5): 10768
+ * darwin64-x86_64-cc (x86_64-macos.13.5): 10769
+ * VC-WIN64A (x86_64-windows-gnu): 10769
+ * (10776 names). packages/compiler/test/openssl-vendor.test.ts
  * holds every built archive and a linked executable to it. */
 #ifndef SCR_OSSL_PREFIX_H
 #define SCR_OSSL_PREFIX_H
@@ -2985,16 +2990,16 @@
 #define OPENSSL_config scr_ossl_OPENSSL_config
 #define OPENSSL_cpuid_setup scr_ossl_OPENSSL_cpuid_setup
 #define OPENSSL_die scr_ossl_OPENSSL_die
-#define OPENSSL_fork_child scr_ossl_OPENSSL_fork_child
-#define OPENSSL_fork_parent scr_ossl_OPENSSL_fork_parent
-#define OPENSSL_fork_prepare scr_ossl_OPENSSL_fork_prepare
+#define OPENSSL_fork_child scr_ossl_OPENSSL_fork_child /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
+#define OPENSSL_fork_parent scr_ossl_OPENSSL_fork_parent /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
+#define OPENSSL_fork_prepare scr_ossl_OPENSSL_fork_prepare /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
 #define OPENSSL_gmtime scr_ossl_OPENSSL_gmtime
 #define OPENSSL_gmtime_adj scr_ossl_OPENSSL_gmtime_adj
 #define OPENSSL_gmtime_diff scr_ossl_OPENSSL_gmtime_diff
 #define OPENSSL_hexchar2int scr_ossl_OPENSSL_hexchar2int
 #define OPENSSL_hexstr2buf scr_ossl_OPENSSL_hexstr2buf
 #define OPENSSL_hexstr2buf_ex scr_ossl_OPENSSL_hexstr2buf_ex
-#define OPENSSL_ia32cap_P scr_ossl_OPENSSL_ia32cap_P
+#define OPENSSL_ia32cap_P scr_ossl_OPENSSL_ia32cap_P /* only: linux-x86_64 darwin64-x86_64-cc VC-WIN64A */
 #define OPENSSL_info scr_ossl_OPENSSL_info
 #define OPENSSL_init scr_ossl_OPENSSL_init
 #define OPENSSL_init_crypto scr_ossl_OPENSSL_init_crypto
@@ -6186,14 +6191,16 @@
 #define asn1_d2i_read_bio scr_ossl_asn1_d2i_read_bio
 #define asn1_item_embed_d2i scr_ossl_asn1_item_embed_d2i
 #define async_deinit scr_ossl_async_deinit
-#define async_fibre_free scr_ossl_async_fibre_free
-#define async_fibre_makecontext scr_ossl_async_fibre_makecontext
+#define async_fibre_free scr_ossl_async_fibre_free /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
+#define async_fibre_init_dispatcher scr_ossl_async_fibre_init_dispatcher /* only: VC-WIN64A */
+#define async_fibre_makecontext scr_ossl_async_fibre_makecontext /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
 #define async_get_ctx scr_ossl_async_get_ctx
 #define async_init scr_ossl_async_init
 #define async_local_cleanup scr_ossl_async_local_cleanup
-#define async_local_deinit scr_ossl_async_local_deinit
-#define async_local_init scr_ossl_async_local_init
+#define async_local_deinit scr_ossl_async_local_deinit /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
+#define async_local_init scr_ossl_async_local_init /* only: linux-x86_64 darwin64-arm64-cc darwin64-x86_64-cc */
 #define async_start_func scr_ossl_async_start_func
+#define async_start_func_win scr_ossl_async_start_func_win /* only: VC-WIN64A */
 #define async_wait_ctx_reset_counts scr_ossl_async_wait_ctx_reset_counts
 #define b2i_DSA_PVK_bio scr_ossl_b2i_DSA_PVK_bio
 #define b2i_DSA_PVK_bio_ex scr_ossl_b2i_DSA_PVK_bio_ex
@@ -6257,6 +6264,9 @@
 #define bn_wexpand scr_ossl_bn_wexpand
 #define bread_conv scr_ossl_bread_conv
 #define bwrite_conv scr_ossl_bwrite_conv
+#define capi_find_key scr_ossl_capi_find_key /* only: VC-WIN64A */
+#define capi_free_key scr_ossl_capi_free_key /* only: VC-WIN64A */
+#define capi_list_certs scr_ossl_capi_list_certs /* only: VC-WIN64A */
 #define check_in_list scr_ossl_check_in_list
 #define conf_ssl_get scr_ossl_conf_ssl_get
 #define conf_ssl_get_cmd scr_ossl_conf_ssl_get_cmd
@@ -7738,6 +7748,7 @@
 #define ossl_crypto_ex_data_get_ossl_lib_ctx scr_ossl_ossl_crypto_ex_data_get_ossl_lib_ctx
 #define ossl_crypto_free_ex_index_ex scr_ossl_ossl_crypto_free_ex_index_ex
 #define ossl_crypto_get_ex_new_index_ex scr_ossl_ossl_crypto_get_ex_new_index_ex
+#define ossl_crypto_mem_barrier scr_ossl_ossl_crypto_mem_barrier /* only: VC-WIN64A */
 #define ossl_crypto_mutex_free scr_ossl_ossl_crypto_mutex_free
 #define ossl_crypto_mutex_lock scr_ossl_ossl_crypto_mutex_lock
 #define ossl_crypto_mutex_new scr_ossl_ossl_crypto_mutex_new
@@ -10247,6 +10258,7 @@
 #define ossl_v3_tls_feature scr_ossl_ossl_v3_tls_feature
 #define ossl_v3_user_notice scr_ossl_ossl_v3_user_notice
 #define ossl_v3_utf8_list scr_ossl_ossl_v3_utf8_list
+#define ossl_winstore_store_functions scr_ossl_ossl_winstore_store_functions /* only: VC-WIN64A */
 #define ossl_wp_functions scr_ossl_ossl_wp_functions
 #define ossl_x25519 scr_ossl_ossl_x25519
 #define ossl_x25519_keyexch_functions scr_ossl_ossl_x25519_keyexch_functions

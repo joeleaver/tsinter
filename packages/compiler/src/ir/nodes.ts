@@ -1882,6 +1882,24 @@ export type IrLibFn =
   | "path.win32IsAbsolute"
   | "path.win32Relative"
   | "path.win32ToNamespacedPath"
+  /** SEMANTICS.md S118 — the WasmGC tier's bare `path` (one module for
+   * every OS): each picks the posix or the win32 twin above by the
+   * host's platform at run time (Node's bare `path` IS its OS's). */
+  | "path.hostJoin"
+  | "path.hostResolve"
+  | "path.hostNormalize"
+  | "path.hostDirname"
+  | "path.hostBasename"
+  | "path.hostExtname"
+  | "path.hostIsAbsolute"
+  | "path.hostRelative"
+  | "path.hostToNamespacedPath"
+  /** S118: args [posix literal, win32 literal] — path.sep, path.delimiter
+   * and os.EOL in the WasmGC tier, the host platform's at run time. */
+  | "os.hostChoice"
+  /** S118: stream.getDefaultHighWaterMark(false) in the WasmGC tier — the
+   * host platform's (Node: 16 KiB on win32, 64 KiB elsewhere). */
+  | "stream.hostDefaultHwm"
   /** node:os: homedir is $HOME else getpwuid(3); tmpdir is Node's env
    * cascade ($TMPDIR/$TMP/$TEMP else /tmp, one trailing slash trimmed).
    * os.platform() lowers to process.platform — one implementation. */
@@ -2114,6 +2132,9 @@ export type IrLibFn =
    * because that arm THROWS for malformed UNC inputs — may-throw seeds on
    * it while posix pathToFileURL emission stays byte-identical. */
   | "url.pathToFileURLWin32"
+  /** S118: the WasmGC tier's pathToFileURL — the posix or the win32
+   * flavor by the host's platform at run time. */
+  | "url.pathToFileURLHost"
   /** URLSearchParams (scr_url.c — always linked with the url unit).
    * Construction: sp.new (empty), sp.parse (one borrowed init string —
    * a single leading '?' strips, Node's constructor), sp.copy (snapshot
@@ -7252,6 +7273,8 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // raises ERR_INVALID_ARG_VALUE TypeErrors for malformed UNC inputs, so
   // only THIS flavor seeds may-throw — posix emission stays untouched.
   "url.pathToFileURLWin32",
+  // S118: the host-dispatched flavor runs the win32 arm on a win32 host
+  "url.pathToFileURLHost",
   // URLSearchParams from a string[][]: Node's ERR_INVALID_TUPLE TypeError
   // on a row that is not a [name, value] pair. The rest of the sp family
   // never throws.

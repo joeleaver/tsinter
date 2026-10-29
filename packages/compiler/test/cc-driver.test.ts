@@ -73,10 +73,15 @@ test("zigcc resolves to `zig cc`; linux triples add -target and -D_GNU_SOURCE", 
   expect(cross.targetArgs).toEqual(["-target", "aarch64-linux-gnu.2.36", "-D_GNU_SOURCE"]);
   expect(cross.linkArgs).toEqual(["-lm"]);
 
-  // Non-linux triples get the -target but not glibc's visibility macro.
+  // Non-linux triples get the -target but not glibc's visibility macro; a
+  // macOS triple without a version gets Node's floor pinned (pipe2 & co.
+  // would otherwise link weakly against zig's newest SDK).
   const mac = resolveCc({ SCRIPTC_CC: "zigcc", SCRIPTC_TARGET: "aarch64-macos" });
-  expect(mac.targetArgs).toEqual(["-target", "aarch64-macos"]);
+  expect(mac.target).toBe("aarch64-macos.13.5");
+  expect(mac.targetArgs).toEqual(["-target", "aarch64-macos.13.5"]);
   expect(mac.linkArgs).toEqual([]);
+  // a version the triple names itself is kept
+  expect(resolveCc({ SCRIPTC_CC: "zigcc", SCRIPTC_TARGET: "x86_64-macos.14.0" }).target).toBe("x86_64-macos.14.0");
 
   // Windows triples too: mingw-w64 headers expose everything by default.
   const win = resolveCc({ SCRIPTC_CC: "zigcc", SCRIPTC_TARGET: "x86_64-windows-gnu" });

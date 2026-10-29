@@ -155,6 +155,10 @@ export interface ProcessDeps {
    * `pushStrLitInto`, threaded through — INC-26 P3, `killSignalByNameHelper`'s
    * ONLY use so far). */
   pushStrLit: (c: Code, value: string) => void;
+  /** SEMANTICS.md S118 (ostables.ts): `%w.os.signalByName` and the
+   * host OS's number for one signal name, pushed. */
+  osSignalByName: () => number;
+  osSignalNum: (c: Code, name: string) => void;
   /** The pending-exception cell's four globals (emitter.ts's `exc()`) —
    * needed ONLY by `exitDrain`, to snapshot-clear-restore around EACH
    * listener call. Without this, a listener that itself throws (M-18(ii))
@@ -1796,87 +1800,39 @@ export class ProcessBuilder {
   // precedent: idiosyncratic-enough validation logic stays at the call
   // site rather than becoming a one-caller process.ts method).
 
-  /** `process.kill`'s IN-MODULE signal-name table (design §2.7, rev-26
-   * B-2/R-7): Node's `os.constants.signals` ON LINUX, measured directly
-   * (never `scr_signal_by_name`'s smaller C table) — 33 names over 31
-   * numbers 1-31 with NO GAPS, two alias pairs (SIGABRT=SIGIOT=6,
-   * SIGIO=SIGPOLL=29). Measured by:
-   *   node --experimental-transform-types signals.mjs
-   * (scratchpad/p3probes/signals.mjs, sha256 fcc3c7c32553f34f65063bf463c
-   * 982590d5ad3bc2695c037d8f3bb22228add5a — independently re-run this
-   * pass, package.json {"type":"module"}, via `os.constants.signals`).
-   * SIGBREAK/SIGINFO/SIGUNUSED/SIGCLD/SIGRTMIN/SIGRTMAX are ABSENT on
-   * Linux (measured) and must NOT be added from a `kill -l` reading. */
-  private static readonly KILL_SIGNAL_TABLE: readonly (readonly [string, number])[] = [
-    ["SIGHUP", 1],
-    ["SIGINT", 2],
-    ["SIGQUIT", 3],
-    ["SIGILL", 4],
-    ["SIGTRAP", 5],
-    ["SIGABRT", 6],
-    ["SIGIOT", 6],
-    ["SIGBUS", 7],
-    ["SIGFPE", 8],
-    ["SIGKILL", 9],
-    ["SIGUSR1", 10],
-    ["SIGSEGV", 11],
-    ["SIGUSR2", 12],
-    ["SIGPIPE", 13],
-    ["SIGALRM", 14],
-    ["SIGTERM", 15],
-    ["SIGSTKFLT", 16],
-    ["SIGCHLD", 17],
-    ["SIGCONT", 18],
-    ["SIGSTOP", 19],
-    ["SIGTSTP", 20],
-    ["SIGTTIN", 21],
-    ["SIGTTOU", 22],
-    ["SIGURG", 23],
-    ["SIGXCPU", 24],
-    ["SIGXFSZ", 25],
-    ["SIGVTALRM", 26],
-    ["SIGPROF", 27],
-    ["SIGWINCH", 28],
-    ["SIGIO", 29],
-    ["SIGPOLL", 29],
-    ["SIGPWR", 30],
-    ["SIGSYS", 31],
-  ];
-
-  /** `%w.proc.killSignalByName(name: str) -> f64`: 15 (SIGTERM) if `name`
-   * is the EMPTY STRING (CP1 delta D-2 — Node applies `sig = sig ||
-   * 'SIGTERM'` BEFORE the table lookup, so an empty string sends SIGTERM
-   * rather than throwing "Unknown signal: "), else the table's number for
-   * an EXACT-CASE match, else -1 (unknown — the caller renders Node's
-   * `Unknown signal: <name>` TypeError). A flat sequence of independent
-   * early-return checks — never a JS-object-keyed lookup, which would
-   * leak `Object.prototype` members ("toString", "constructor", ...) as
-   * false positives (rev-26 R-7's own warning); a string-equality chain
-   * has no such surface BY CONSTRUCTION. */
+  /** `%w.proc.killSignalByName(name: str) -> f64`: the host OS's number
+   * for SIGTERM if `name` is the EMPTY STRING (CP1 delta D-2 — Node
+   * applies `sig = sig || 'SIGTERM'` BEFORE the table lookup, so an empty
+   * string sends SIGTERM rather than throwing "Unknown signal: "), else the
+   * host OS's number for an EXACT-CASE match of one of its
+   * os.constants.signals names, else -1 (unknown on this OS — the caller
+   * renders Node's `Unknown signal: <name>` TypeError). SEMANTICS.md S118:
+   * the names are os-names.ts's, every number the HOST's (ostables.ts) —
+   * the module bakes in no OS's table. */
   killSignalByNameHelper(): number {
     return this.cached("killSignalByName", [this.strRef()], [F64], (idx) => {
       const c = new Code();
       const NAME = 0;
-      const strEq = this.deps.strEq();
+      const NUM = 1;
       c.localGet(NAME);
       c.arrayLen();
       c.i32Eqz();
       c.ifVoid();
-      c.f64Const(15);
+      this.deps.osSignalNum(c, "SIGTERM");
+      c.f64ConvertI32S();
       c.return_();
       c.end();
-      for (const [name, num] of ProcessBuilder.KILL_SIGNAL_TABLE) {
-        c.localGet(NAME);
-        this.deps.pushStrLit(c, name);
-        c.call(strEq);
-        c.ifVoid();
-        c.f64Const(num);
-        c.return_();
-        c.end();
-      }
+      c.localGet(NAME);
+      c.call(this.deps.osSignalByName());
+      c.localTee(NUM);
+      c.i32Eqz();
+      c.ifVoid();
       c.f64Const(-1);
       c.return_();
-      this.mb.setBody(idx, [this.strRef()], c.bytes());
+      c.end();
+      c.localGet(NUM);
+      c.f64ConvertI32S();
+      this.mb.setBody(idx, [I32], c.bytes());
       return idx;
     });
   }
