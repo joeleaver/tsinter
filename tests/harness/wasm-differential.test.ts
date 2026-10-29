@@ -3667,6 +3667,15 @@ const TIER_FLOOR: string[] = [
   // fresh (SEMANTICS.md S115); a new program, passing here from its first
   // run.
   "2788-typed-views.ts",
+  // GH #49 / #22 / #74 (silent divergences turned Node-exact or loud):
+  // the switch-case TDZ and case-function hoisting, variadic callbacks at
+  // Node's full arity and the provable arguments.length fold, builtin
+  // globals as values — new programs passing from their first run.
+  "2820-switch-case-tdz.ts",
+  "2821-switch-case-fn-hoist.ts",
+  "2822-variadic-builtin-callbacks.js",
+  "2823-arguments-length-static.ts",
+  "2824-builtin-global-values.js",
 ];
 
 interface RunResult {

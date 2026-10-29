@@ -5759,6 +5759,36 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2820-switch-case-tdz.ts": {
+   "order": [
+    "<repo>/tests/corpus/2820-switch-case-tdz.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2821-switch-case-fn-hoist.ts": {
+   "order": [
+    "<repo>/tests/corpus/2821-switch-case-fn-hoist.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2822-variadic-builtin-callbacks.js": {
+   "order": [
+    "<repo>/tests/corpus/2822-variadic-builtin-callbacks.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2823-arguments-length-static.ts": {
+   "order": [
+    "<repo>/tests/corpus/2823-arguments-length-static.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2824-builtin-global-values.js": {
+   "order": [
+    "<repo>/tests/corpus/2824-builtin-global-values.js"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -6733,6 +6763,12 @@
   "<repo>/tests/diagnostics/any.ts": {
    "order": [
     "<repo>/tests/diagnostics/any.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/arguments-length-value.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/arguments-length-value.ts"
    ],
    "diags": []
   },
@@ -7799,6 +7835,12 @@
   "<repo>/tests/diagnostics/stdlib.ts": {
    "order": [
     "<repo>/tests/diagnostics/stdlib.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/switch-case-tdz.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/switch-case-tdz.ts"
    ],
    "diags": []
   },

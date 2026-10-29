@@ -2014,6 +2014,24 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
   const TOKEN_OPAQUE_GLOBALS: ReadonlySet<string> = new Set(["crypto"]);
   const CONSOLE_CALL_MEMBERS: ReadonlySet<string> = new Set(["log", "info", "debug", "error", "warn"]);
 
+/** The first reference to the binding `name` declares (in its own
+   * file) that fails `ok`, or null. */
+  function findLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): ts.Identifier | null {
+    const sym = L.checker.getSymbolAtLocation(name);
+    if (!sym) return name;
+    let bad: ts.Identifier | null = null;
+    ts.walkPreorder(name.getSourceFile(), (n) => {
+      if (bad !== null) return "stop";
+      if (ts.isIdentifier(n) && n !== name && n.text === name.text) {
+        const s = ts.isShorthandPropertyAssignment(n.parent) ? L.checker.getShorthandAssignmentValueSymbol(n.parent) : L.checker.getSymbolAtLocation(n);
+        if (s === sym && !ok(n)) bad = n;
+      }
+      return undefined;
+    });
+    return bad;
+  }
+
+
 /** `const { subtle } = globalThis.crypto`, `const { Console } = console`,
    * `const { crypto } = globalThis` — an object pattern over a STDLIB
    * GLOBAL in a JavaScript file (the suite's webcrypto/console
@@ -2046,23 +2064,6 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
    * pre-registered bindings whose slots no token can inhabit. Null only
    * when the source is not a stdlib global at all, or in TypeScript
    * files (the identifier chokepoint fences the global there first). */
-  /** The first reference to the binding `name` declares (in its own
-   * file) that fails `ok`, or null. */
-  function findLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): ts.Identifier | null {
-    const sym = L.checker.getSymbolAtLocation(name);
-    if (!sym) return name;
-    let bad: ts.Identifier | null = null;
-    ts.walkPreorder(name.getSourceFile(), (n) => {
-      if (bad !== null) return "stop";
-      if (ts.isIdentifier(n) && n !== name && n.text === name.text) {
-        const s = ts.isShorthandPropertyAssignment(n.parent) ? L.checker.getShorthandAssignmentValueSymbol(n.parent) : L.checker.getSymbolAtLocation(n);
-        if (s === sym && !ok(n)) bad = n;
-      }
-      return undefined;
-    });
-    return bad;
-  }
-
   function stdlibGlobalTokenDestructure(L: Lowerer, decl: ts.VariableDeclaration, isLet: boolean): IrStmt[] | null {
     if (decl.initializer === undefined || !isJsSourceFile(decl.getSourceFile())) return null;
     const globalName = stdlibGlobalNameOf(L, decl.initializer);
