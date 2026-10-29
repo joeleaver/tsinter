@@ -240,10 +240,19 @@ void (*wn_fetch_delivered)(const WnEv *e);
 /* abi.ts evPoll: the oldest queued event at ptr, its length; 0 when the
  * queue is empty (or its head belongs to a later host iteration); -(the
  * length needed) when cap is short, the event kept */
+/* the TLS unit (wn_tls.c), when one links: the end of the module's poll
+ * phase completes the secured sockets' gated writes (tls_release), and
+ * while one waits for it the host's wait does not block (tls_due) */
+void (*wn_tls_release)(void);
+int (*wn_tls_due)(void);
+
 int32_t host_evPoll(int32_t ptr, int32_t cap) {
   WnEv *e = q_head;
-  if (!e) return 0;
-  if (e->source == WN_SRC_NET && (int64_t)e->gen > poll_gen) return 0;
+  if (!e || (e->source == WN_SRC_NET && (int64_t)e->gen > poll_gen)) {
+    /* no more events this iteration: the poll phase ends here */
+    if (wn_tls_release) wn_tls_release();
+    return 0;
+  }
   uint32_t need = 24 + e->len;
   if ((uint32_t)cap < need) return -(int32_t)need;
   uint32_t p = (uint32_t)ptr;
@@ -452,18 +461,14 @@ void wn_ev_audit(void) {
 }
 
 /* ── the wait ─────────────────────────────────────────────────────────── */
-/* the TLS unit's end of a turn (wn_tls.c tls_release), when one links */
-void (*wn_tls_release)(void);
-
 void wn_ev_wait(double due) {
   ep_init();
-  if (wn_tls_release) wn_tls_release();
   unstage();
   net_this_round = 0;
   for (;;) {
     apply_pending();
     int timeout;
-    if (q_head || n_always > 0) timeout = 0;
+    if (q_head || n_always > 0 || (wn_tls_due && wn_tls_due())) timeout = 0;
     else if (isinf(due)) {
       if (n_live <= 0) wn_host_fail("the module waits for an event no source can deliver");
       timeout = -1;

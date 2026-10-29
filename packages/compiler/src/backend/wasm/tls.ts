@@ -1251,10 +1251,14 @@ export class TlsBuilder {
           $.ret();
         });
       }, () => $.set(this.xT(), X_AUTH, $.l(X_), $.i(1)));
-      $.drop($.call(this.net.emitHelper(this.tf.L_SECURE), $.l(S)));
-      this.excReturn($);
-      // the verdict is in: a write held until now goes to the host
+      // the verdict is in: a write held until now goes to the host, and
+      // the socket is established BEFORE 'secureConnect' runs (Node's
+      // _finishInit sets _secureEstablished, then emits 'secure'), so a
+      // write in the listener goes straight to the host — a destroy() in
+      // the same listener leaves it sent, as under Node
       $.run(this.releaseFn(), $.l(X_));
+      this.excReturn($);
+      $.drop($.call(this.net.emitHelper(this.tf.L_SECURE), $.l(S)));
       this.excReturn($);
       $.run(this.net.removeHelper(NET_LISTS.L_END), $.l(S), $.get(this.xT(), X_ENDCB, $.l(X_)));
     });

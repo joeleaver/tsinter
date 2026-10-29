@@ -6879,7 +6879,7 @@ A secured socket and a dgram socket are net-lane handles for event ordering: S08
 - **(e) The handshake timeout is not armed.** `handshakeTimeout` is validated as Node does and has no timer: a peer that stalls a server's handshake is waited for, where Node emits `ERR_TLS_HANDSHAKE_TIMEOUT` after 120 s.
 - **(f) Sessions are not resumed.** `isSessionReused()` is false, so `checkServerIdentity` runs on every connection (Node skips it for a resumed session); an https Agent keeps no session cache; `ticketKeys`, `sessionTimeout` and `sessionIdContext` are validated and inert; a `'session'` listener does not lower.
 - **(g) A secured socket's plaintext is read ahead, and a TLS failure after the handshake destroys the socket.** The host reads a secured socket for its handshake whatever the module's read state and holds the plaintext until the module reads (Node's TLSSocket stops reading at its high-water mark). The handshake's completion and the first plaintext of the same read arrive as two events with a microtask checkpoint between them. A TLS protocol error after the handshake destroys the socket with that error (Node emits it and leaves the socket).
-- **(h) A rejecting client's handshake Finished reaches the server.** A client that rejects the server's certificate decides after its host engine completed its side of the handshake, so with TLS 1.3 the server's handshake completes too (its `'secureConnection'` runs, then the client closes); under Node the client destroys the socket before its Finished leaves and the server's handshake never completes. No application data reaches such a server: what the client wrote before its verdict is held in the module and dropped, so an https server sees a connection and no request. The wasm-native lane does not share (h): its host holds the flight that completes a client's handshake until the module has run its listeners (as Node's TLSWrap writes it only after them, native-runner N2a, board #336), and a rejecting client destroys the socket before its Finished leaves, as under Node.
+- **(h) A rejecting client's handshake Finished reaches the server.** A client that rejects the server's certificate decides after its host engine completed its side of the handshake, so with TLS 1.3 the server's handshake completes too (its `'secureConnection'` runs, then the client closes); under Node the client destroys the socket before its Finished leaves and the server's handshake never completes. No application data reaches such a server: what the client wrote before its verdict is held in the module and dropped, so an https server sees a connection and no request. The wasm-native lane does not share (h): its host holds the flight that completes a client's handshake until the module has run its listeners (as Node's TLSWrap writes it only after them, native-runner N2a, board #336), and a rejecting client destroys the socket before its Finished leaves, as under Node (a listener that writes first sends the Finished with that write, as Node does; one that only destroys sends neither). On every lane the module releases a write it held for the verdict BEFORE emitting `'secureConnect'`, and a write in that listener goes straight to the host, so a `destroy()` later in the listener leaves it sent, as under Node.
 - **(i) A tls.Server has no separate raw socket.** Node's `'connection'` event carries the raw TCP socket, then a TLSSocket wraps it; here one socket is both, and `server.on('connection')` on a TLS server is a named Error ("a 'connection' listener on a tls.Server is not supported yet").
 - **(j) Options this tier does not carry are fenced by name.** Every option is validated with Node's ladder and text first; then an option whose effect is not modelled is a named Error at the point Node would use it ("tls.createServer option 'ciphers' is not supported yet"): non-default `minVersion` / `maxVersion`, `secureProtocol`, `ciphers`, `sigalgs`, a non-`auto` `ecdhCurve`, `dhparam`, `crl`, `pfx`, a `passphrase`, key objects, more than one cert or key, engines, `allowPartialTrustChain`, a non-zero `secureOptions`, `requestCert: true`, ALPN, SNI and PSK callbacks, and the net-level members (`allowHalfOpen`, `pauseOnConnect`, `noDelay`, `keepAlive`, `highWaterMark`, ...); on `tls.connect` a `checkServerIdentity` function, `secureContext`, `session`, `socket`, `timeout`, a string port, an IP or non-string `servername` (Node warns DEP0123 or throws after the connect has started), and the net connect options. `NODE_TLS_REJECT_UNAUTHORIZED` is not consulted. `tls.checkServerIdentity` reads host names of ASCII letters, digits, `-`, `_` and `.`, and IP literals (an IPv6 literal is not a domain to Node's `domainToASCII`, so it is matched against DNS names and fails, as Node's does); other host names, `xn--` labels and IPv4 shorthands are a named Error; and a certificate whose alt names Node would quote, or that carries an othername, DirName, Registered ID, X400 or EdiParty alt name, or a CN of another string kind, is a named Error. The https server advertises no ALPN (Node's offers `http/1.1`); an https request's explicit `rejectUnauthorized: true` shares an Agent pool with the default (Node keys them apart). dgram: a host NAME as an address (a dns.lookup), a bind port outside 0..65535, send callbacks and buffer lists are named Errors; `udp6` does not lower.
 
@@ -8289,17 +8289,21 @@ translateBody; a leaf adds at most one frame and is not counted), and past
 `W_DEPTH_MAX` = 20,000 frames the program ends with `RangeError: Maximum
 call stack size exceeded` on stderr and exit status 1, uncatchable — the
 wasm lane's own outcome for a stack overflow (V8's RangeError ends the run;
-the module has no way to catch one). 20,000 is the deepest the wasm lane
-reaches on Node's default stack with the smallest frames (measured on Node
-v24.18.1: about 17,900 for a no-argument recursion, 11,400–13,900 for a
-closure, a method, a mutual and a one-argument recursion, where Node itself
-reaches 9,600–12,500), so a recursion Node or the wasm lane survives
-survives here. Where Node diverges: (1) Node's `RangeError` is CATCHABLE —
-`try { recurse() } catch (e) {}` recovers under Node and ends the run here,
-as on the wasm lane; (2) the depth differs — a recursion between Node's
+the module has no way to catch one). The limit sits above both measured
+depths (Node v24.18.1, default stack): the wasm lane reaches about 17,900
+frames of a no-argument recursion and 11,400–13,900 of a closure, a
+method, a mutual and a one-argument recursion; Node reaches 9,600–12,500
+on the same shapes, each of which is one wasm frame per call here, so on
+those shapes a recursion Node survives survives here (N2A-STACK-01 holds
+9,000). It is not a guarantee for every program: where one JS call is
+several counted wasm frames (a call through module helpers that
+themselves call), the count grows faster than Node's stack and such a
+recursion can overflow here at a depth Node survives. Where Node
+diverges: (1) Node's `RangeError` is CATCHABLE — `try { recurse() } catch
+(e) {}` recovers under Node and ends the run here, as on the wasm lane;
+(2) the depth differs — a one-frame-per-call recursion between Node's
 limit and 20,000 frames completes here where Node throws, and a recursion
-whose JS frames each take several wasm frames overflows here sooner than
-the frame count suggests. A tail-position recursion counts too (the count
+of several wasm frames per call overflows sooner, as just said. A tail-position recursion counts too (the count
 keeps the C compiler from turning it into a loop that never ends). The
 program runs on a 512 MiB stack, so the count, not the stack, is what
 overflows; a frame larger than the 64 KiB guard cannot step over it (the
@@ -8530,6 +8534,9 @@ collector forced every n allocations);
 tail call included — ends with the RangeError text and exit 1, and
 `packages/compiler/test/wasm2c-whole.test.ts`'s stack-depth test holds the
 count itself: 20,000 frames run, the next traps, a leaf is not counted;
+N2A-TLS-01 and -02 hold the TLS host's write pattern against Node — one
+write per TLSWrap cycle, a gated write completed before the program's
+setImmediate and timers, S090 (h)'s wasm-native note;
 every program of the wasm
 lane's host rows — child_process, node:net / http / tls / https / dgram,
 signals, fs.watch, stdin and readline — and the fetch fixtures, natively,

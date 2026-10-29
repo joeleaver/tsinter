@@ -133,9 +133,11 @@ typedef struct {
   WnSock *sock;
   /* TLSWrap's write_size_: records went out in one write, and EncOut
    * writes nothing more until that write completes — a write the kernel
-   * took at once completes in a SetImmediate (here: when the host's turn
-   * ends, before its next wait), one that waited once the outbound buffer
-   * drained. What OpenSSL produces meanwhile gathers in the output BIO and
+   * took at once completes in a native SetImmediate, which Node runs at
+   * the start of the check phase, ahead of the program's setImmediate
+   * callbacks (here: when the module's poll phase ends — its evPoll
+   * answering no more events, wn_ev.c), one that waited once the outbound
+   * buffer drained. What OpenSSL produces meanwhile gathers in the output BIO and
    * leaves as ONE write then, so the segments on the wire are Node's
    * (board #336: a record per write let Nagle hold the next one for the
    * peer's delayed ACK). */
@@ -143,8 +145,9 @@ typedef struct {
   /* the handshake completed in this read's cycle: Node runs the module's
    * 'secure' / 'secureConnect' / 'secureConnection' listeners INSIDE that
    * cycle, before its EncOut, so what they write leaves with the
-   * handshake's last flight; held until the module writes or its turn
-   * ends */
+   * handshake's last flight; held until the module writes or its poll
+   * phase ends (a socket destroyed meanwhile sends none of it, as Node's
+   * listener destroying it does) */
   int held;
   int queued; /* on the release list */
 } Tls;
@@ -467,10 +470,12 @@ static void t_free(WnSock *s) {
   free(t);
   s->tctx = NULL;
 }
-/* the host's turn ends (before its next wait): the SetImmediate in which
- * Node completes a write the kernel took at once — the gate opens and what
- * gathered goes out (OnStreamAfterWrite: EncOut, then the write's
- * callback); a held flight goes too */
+/* the module's poll phase ended (wn_ev.c host_evPoll): Node's check phase
+ * begins with its native immediates, among them the one completing a write
+ * the kernel took at once — the gate opens and what gathered goes out
+ * (OnStreamAfterWrite: EncOut, then the write's callback); a held flight
+ * goes too. All of it before the program's own setImmediate callbacks and
+ * timers run. */
 static void tls_release(void) {
   Tls **v = rel;
   size_t n = n_rel;
@@ -493,7 +498,17 @@ static void tls_release(void) {
   }
   free(v);
 }
+/* something waits for the next poll phase's end: the host's wait must
+ * not block (Node's pending native immediate keeps its poll from blocking) */
+static int tls_due(void) {
+  for (size_t i = 0; i < n_rel; i++) {
+    Tls *t = rel[i];
+    if (t->held || BIO_ctrl_pending(t->enc_out) != 0) return 1;
+  }
+  return 0;
+}
 extern void (*wn_tls_release)(void); /* wn_ev.c */
+extern int (*wn_tls_due)(void);
 
 static const WnTlsOps OPS = {t_readable, t_writable, t_connected, t_write, t_shutdown, t_read_start, t_read_stop, t_busy, t_free};
 
@@ -542,6 +557,7 @@ static int32_t secure(uint32_t ptr, int32_t h) {
   }
   free(sni);
   wn_tls_release = tls_release;
+  wn_tls_due = tls_due;
   s->tls = &OPS;
   s->tctx = t;
   s->tls_reads = 1;

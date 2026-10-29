@@ -29,7 +29,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { createConnection, createServer as createNetServer, type AddressInfo, type Server } from "node:net";
-import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
+import { createServer as createTlsServer, type Server as TlsServer, type TLSSocket } from "node:tls";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -635,6 +635,11 @@ describe("N2a rows: the TLS write pattern and the stack depth", () => {
   /* per relayed connection: the number of TLS records in the client chunk
    * that carries its ChangeCipherSpec (record type 20) */
   const ccsRecords: number[] = [];
+  /* N2A-TLS-02's receivers (TLS 1.3, and 1.2 by maxVersion): what each
+   * connection delivered, by the time it closed */
+  let recv13Port = 0;
+  let recv12Port = 0;
+  const received: string[] = [];
   beforeAll(async () => {
     const listen = (srv: Server | TlsServer): Promise<number> =>
       new Promise((resolve) => {
@@ -652,6 +657,16 @@ describe("N2a rows: the TLS write pattern and the stack depth", () => {
         s.on("error", () => {});
       }),
     );
+    const receiver = (s: TLSSocket): void => {
+      let g = "";
+      s.on("data", (d: Buffer) => {
+        g += d.toString();
+      });
+      s.on("close", () => received.push(g));
+      s.on("error", () => {});
+    };
+    recv13Port = await listen(createTlsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem") }, receiver));
+    recv12Port = await listen(createTlsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem"), maxVersion: "TLSv1.2" }, receiver));
     relayPort = await listen(
       createNetServer((c) => {
         c.setNoDelay(true);
@@ -734,6 +749,67 @@ one();
     expect(native.code).toBe(0);
     // ChangeCipherSpec, the Finished (an encrypted record) and "a"
     expect(ccsRecords).toEqual([3, 3, 3, 3, 3, 3]);
+  }, 120_000);
+
+  /* The gated second write completes where Node completes it: in a native
+   * immediate at the start of the check phase — after the poll phase's
+   * callbacks and their nextTicks, before the program's setImmediate
+   * callbacks and timers. So a destroy() from setImmediate or a 0 ms timer
+   * finds "y" sent; one from nextTick, or in the listener itself, finds it
+   * not sent (Node drops it with the socket); end() flushes everything.
+   * And the 'secureConnect' listener's own first write reaches the peer
+   * even when the listener then destroys the socket. TLS 1.3 and 1.2. */
+  test("N2A-TLS-02 a second write in 'secureConnect', then destroy() from setImmediate / setTimeout 0 / nextTick / the listener, or end(): what the server receives is Node's (TLS 1.3 and 1.2)", async () => {
+    const src = `import * as tls from "node:tls";
+import * as fs from "node:fs";
+const ca = fs.readFileSync("tests/fixtures/server/certs/ca.pem", "utf8");
+const modes = ["imm", "t0", "tick", "sync", "end"];
+let k = 0;
+const next = (): void => {
+  if (k >= modes.length * 2) return;
+  const mode = modes[k % modes.length]!;
+  const v = k < modes.length ? "13" : "12";
+  const port = k < modes.length ? ${recv13Port} : ${recv12Port};
+  k++;
+  const s = tls.connect(port, "localhost", { ca }, () => {
+    s.write(v + mode + ":x");
+    s.write("y");
+    if (mode === "imm") setImmediate(() => s.destroy());
+    if (mode === "t0") setTimeout(() => s.destroy(), 0);
+    if (mode === "tick") process.nextTick(() => s.destroy());
+    if (mode === "sync") s.destroy();
+    if (mode === "end") s.end("z");
+  });
+  s.on("close", () => {
+    console.log(v, mode, "close");
+    setTimeout(next, 50);
+  });
+  s.on("error", (e: Error) => console.log("error", e.message));
+};
+next();
+`;
+    const want = "12end:xyz,12imm:xy,12sync:x,12t0:xy,12tick:x,13end:xyz,13imm:xy,13sync:x,13t0:xy,13tick:x";
+    const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 500));
+    received.length = 0;
+    const dir = mkdtempSync(join(tmpdir(), "wn-n2a-"));
+    try {
+      const entry = join(dir, "main.ts");
+      writeFileSync(entry, src);
+      const res = await compile(entry, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), dynamic: false, backend: "wasm-native" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, entry], repoRoot, undefined);
+      await settle();
+      const atNode = [...received].sort().join(",");
+      received.length = 0;
+      const native = await run(res.binaryPath, [], repoRoot, undefined);
+      await settle();
+      const atNative = [...received].sort().join(",");
+      expect(atNode).toBe(want);
+      expect(atNative).toBe(atNode);
+      expect(same(node, native)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 120_000);
 
   /* S117 (b): the depth is counted in wasm frames, W_DEPTH_MAX = 20000 —

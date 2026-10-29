@@ -47,10 +47,12 @@ static const uint32_t SIZES[] = {16,   32,   48,   64,   80,   96,   112,  128, 
                                  640,  768,  896,  1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192};
 #define NSC ((int)(sizeof SIZES / sizeof SIZES[0]))
 static uint8_t sc_of[MAX_SMALL / 16 + 1];
-/* a slot's index without a division: (offset * RECIP[c]) >> 32 is
- * offset / SIZES[c] exactly for every offset inside a 64 KiB block (the
- * reciprocal's error stays below 2^-16, and 1/SIZES[c] >= 2^-13; checked
- * exhaustively for these classes when it was written) */
+/* a slot's index without a division: with R = floor(2^32 / s) + 1 for a
+ * size class s, (off * R) >> 32 == floor(off / s) for every offset in a
+ * 64 KiB block. R = 2^32/s + d with 0 < d <= 1, so off*R/2^32 = off/s + e
+ * with 0 <= e = off*d/2^32 < 2^-16; off/s is an integer or at least 1/s >=
+ * 2^-13 below the next one, so adding e never reaches it. (Also checked
+ * exhaustively: all 32 classes, every offset below 65,536.) */
 static uint64_t RECIP[NSC];
 static inline uint32_t slot_of(uint32_t off, int c) { return (uint32_t)(((uint64_t)off * RECIP[c]) >> 32); }
 
