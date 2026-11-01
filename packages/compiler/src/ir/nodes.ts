@@ -1386,12 +1386,24 @@ export type IrArrIntrinsicMethod =
    * when the relative index is out of range. */
   | "toReversed"
   | "toSpliced"
-  | "with";
+  | "with"
+  /** The WasmGC lanes' V8 sorts (backend/wasm/sort.ts; the c and llvm lanes keep the
+   * lowering's insertion sort and never see these). `sort` and `toSorted` take the
+   * comparator, or nothing for the default order (string and number elements only:
+   * the lowering passes a comparator for the others). `typedSort` sorts an f64
+   * element list as a typed array sorts: the merge sort with a comparator, numeric
+   * ascending without. */
+  | "sort"
+  | "toSorted"
+  | "typedSort";
 
 /** Array intrinsics whose runtime implementation can raise a catchable
  * exception (rather than the static tier's deliberate index traps). */
 export const MAY_THROW_ARR_METHODS: ReadonlySet<IrArrIntrinsicMethod> = new Set([
   "with",
+  "sort",
+  "toSorted",
+  "typedSort",
 ]);
 
 /** The Map method/property surface (mirrors ambient/scriptc.d.ts) plus the

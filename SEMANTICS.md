@@ -1251,8 +1251,8 @@ and throws it at the MEMBER GET, before an argument is evaluated, so
 `nul.push(sideEffect())` runs nothing before it. The implemented Array,
 String-slice and Function apply/call semantics are Node's own up to the
 divergences registered elsewhere: `map`'s padded output slots (S016),
-`sort`'s comparison sequence, its mutating-comparator case and its
-comparator-result coercion (S024).
+and, on the c and llvm lanes, `sort`'s comparison sequence, its
+mutating-comparator case and its comparator-result coercion (S024).
 
 **Rationale:** mostly inherited — the C runtime fences the first three
 with exactly these texts, and the fences are TODO markers rather than
@@ -1289,62 +1289,68 @@ member get, before the arguments run, where the C runtime evaluates them
 first. All five are gaps in the C lane rather than stances, and are
 tracked as such.
 
-## S024 — `sort`'s ORDER is Node-exact; its comparison SEQUENCE is not *(inherited)*
+## S024 — On the c and llvm lanes `sort`'s ORDER is Node-exact and its comparison SEQUENCE is not; the WasmGC lanes and the embedded engine sort as V8 does, except for the length a shrinking comparator leaves over an array with holes *(the c and llvm lanes, retiring with them at N4; the hole case on wasm and wasm-native)*
 
-`Array.prototype.sort` over a dyn receiver is a stable merge sort, where
-V8 runs TimSort. For every consistent comparator that ANSWERS IN NUMBERS
-OR BOOLEANS the two agree on the answer — same order, same stability,
-same identity (`a.sort() === a`), verified across 74 outputs spanning
-lengths 0 to 33 plus duplicate-heavy, reverse-sorted and pre-sorted
-shapes with both the default and a numeric
-comparator. What differs is HOW MANY TIMES the comparator runs and in
-what pairing, which a comparator with side effects can see:
-`[3,1,2].sort(counting)` calls it 4 times in Node, 3 on the C lane and 3
-here; `[5,4,3,2,1]` is 4 / 7 / 5; `[5,2,8,1,9,3,7,4,6,0,11,10]` is
-29 / 29 / 31. The wasm lane's count differs from the C lane's as well,
-because its merge runs bottom-up where C's recurses — neither is
-"the" answer, and there is no answer to match short of reimplementing
-TimSort.
+The WasmGC lanes (wasm and wasm-native, static arrays, typed arrays and dyn
+values alike) and the embedded engine on every lane run V8's own sort:
+`packages/runtime/vendor/quickjs-ng/tsinter_timsort.h` transcribes
+`array-sort.tq` (TimSort) and `typed-array-sort.tq` (the comparator merge
+sort) from the V8 Node v24.18.1 ships, and the same text compiles into both
+engines. A comparator sees exactly Node's calls, in Node's order, with the
+operands in Node's order; undefined and holes never reach it; it may throw
+(the receiver stays as it was: V8 sorts a work array and writes back when it
+finished), mutate the receiver (the write-back restores what it removed and
+keeps what it added past the original length) or sort reentrantly; its answer
+goes through ToNumber. One exception: a statically typed array stores a hole as
+the element's undefined (S119), a dyn array pads a write past its end with
+undefined (S016), and V8's write-back treats the two differently. It STORES
+undefineds and DELETES holes' indices, which never extends the array, so when a
+comparator shrinks such an array, it ends one element longer per hole than in
+Node: `const a: (number | undefined)[] = [3, , 1]`, sorted by a comparator that
+pops `a` empty, has length 3 here and 2 in Node, and `JSON.parse("[3,1]")` with
+`c[3] = 0` has 4 and 3. The engine tells a hole from undefined and is exact.
 
-The qualifier in that first sentence is the second divergence.
-A comparator's RESULT is read from the shared numeric slot, which
-numbers and booleans fill and no other kind does — C's rule, inherited —
-so a comparator answering anything else reads as 0 at every pair and
-sorts NOTHING. The reachable case is a string-returning comparator,
-which is perfectly consistent and which Node handles by applying
-ToNumber to the result: `[3,1,2].sort((x, y) => x < y ? "-1" : "1")`
-answers `1,2,3` in Node and `3,1,2` here, silently. (Full ToNumber over
-an arbitrary dyn value is the same rock S023's index-argument fence
-names — one coercion away, and its own increment.) An INCONSISTENT
-comparator is outside the claim entirely, as ECMA-262 leaves it
-implementation-defined: a boolean `(x, y) => x > y` never answers
-negative, and `[3,1,2]` sorted with it is `1,2,3` here and `3,1,2` in
-Node.
+The c and llvm lanes' STATIC sort and DYN sort keep their own algorithms
+until N4 deletes them. `Array.prototype.sort` over a statically typed array
+is an insertion sort there, and over a dyn receiver a stable merge sort. For every
+consistent comparator that ANSWERS IN NUMBERS OR BOOLEANS these agree with
+Node on the answer — same order, same stability, same identity
+(`a.sort() === a`). What differs:
 
-A comparator that MUTATES the receiver is the same fact at its loudest.
-Both tiers sort a SNAPSHOT (the spec's shape, and what keeps a mutating
-comparator from reordering the elements being compared), then write the
-result back index by index for as many indices as the receiver still
-has — so a comparator that shrinks the array keeps the shrink, where V8
-writes its whole snapshot back and RESTORES the removed elements:
-`[5,3,9,1,7,2]` with a comparator that pops twice answers
-`1,2,3,5,7,9` (length 6) in Node and `1,2,3,5` (length 4) on both tiers.
+- **The sequence.** HOW MANY TIMES the comparator runs and in what pairing:
+  `[3,1,2].sort(counting)` calls it 4 times in Node and 3 on the C lane;
+  `[5,4,3,2,1]` is 4 and 7.
+- **The result coercion.** A comparator's RESULT is read from the shared
+  numeric slot, which numbers and booleans fill and no other kind does, so a
+  comparator answering anything else reads as 0 at every pair and sorts
+  NOTHING: `[3,1,2].sort((x, y) => x < y ? "-1" : "1")` answers `1,2,3` in
+  Node and `3,1,2` there, silently.
+- **A mutating comparator.** Both sort a snapshot, then write back index by
+  index for as many indices as the receiver still has, so a comparator that
+  shrinks the array keeps the shrink where V8 restores the removed elements:
+  `[5,3,9,1,7,2]` with a comparator that pops twice answers `1,2,3,5,7,9`
+  (length 6) in Node and `1,2,3,5` (length 4) there.
+- **A throwing comparator** leaves the static insertion sort's partial work in
+  the receiver, where Node leaves it untouched.
+- **The default order** lowers for string elements only (a named refusal for
+  the others), and orders dyn strings by code point (S005).
 
-**Rationale:** ECMA-262 leaves both the algorithm and the mutating-
-comparator case implementation-defined, so neither is a conformance
-question; matching V8's observable comparison sequence would mean
-shipping TimSort, which is a performance-and-fidelity feature nobody has
-asked for and a much larger surface to get wrong than a merge whose
-ORDER is provably right. The result coercion is the one arm here that IS
-a conformance gap rather than a licensed choice — the spec's step is
-plainly ToNumber — and it is inherited exactly: the C runtime reads the
-same two kinds from the same union slot, so narrowing the claim keeps
-the lanes describable together while the coercion increment is
-outstanding. **Tested by:** the wasm emitter unit test pins the
-ordering, the stability, the receiver identity — the properties that ARE
-specified — and the string-comparator result, with Node's answer beside
-ours. No corpus program can pin the sequence: one that counted
-comparisons would fail the differential against Node on every lane.
+**On the WasmGC lanes**, two named refusals remain, both where a sort needs a
+surface those paths do not have: the default order of an array of non-primitive
+static elements refuses at compile time (`.sort without a comparator`) and stops
+by name at run time when a cast lied that `undefined` was a comparator over such
+elements, and `sort` / `toSorted` of a typed array held in a dynamic value throws a named
+`calling 'sort' on a typed array held in a dynamic value is not supported yet`
+Error.
+
+**Rationale:** Node's comparator sequence is observable, so the WasmGC lanes
+match it (GH #80); the c and llvm lanes are transitional and porting a sort to
+them buys nothing that survives N4. **Tested by:**
+`packages/compiler/test/wasm-sort.test.ts` — every (x, y) pair over TimSort's
+shapes and size thresholds, every element representation and entry point, what
+a comparator can do mid-sort and the engine's own sort, against Node on the
+wasm and wasm-native lanes; `tests/corpus/518-array-sort.ts` and
+`2322-dyn-array-sort.cjs` pin the order on every lane.
 
 ## S025 — A dyn object carrying the reserved `%error` key IS an error *(inherited)*
 
@@ -8092,8 +8098,9 @@ the rest — are retired with that model (follow-up unit H).
   receiver` TypeError. `keys`, `values`, `entries`, `toSpliced`,
   `copyWithin` and `toLocaleString` on an island array are named
   `'Array.prototype.<m>' on a dynamic value is not supported yet` Errors.
-  A comparator's CALL SEQUENCE (how many calls, which pairs) is the merge
-  sort's, not V8's (S024).
+  On the c and llvm lanes a comparator's CALL SEQUENCE (how many calls, which
+  pairs) over a typed array shared as `any` is their merge sort's, not V8's
+  (S024).
 
 **Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts` —
 H-B2, H-S2 and H-S2b ((f), wasm and c), H-S3, H-S110c (wasm and c),
@@ -8699,10 +8706,12 @@ an array holding an EXPLICIT `undefined` fences too (the over-approximation
 the missing per-element hole mark costs). `new Array(n)` stays a compile
 refusal.
 
-(c) **`sort`/`toSorted` of a plain-typed array holding `undefined`** throws
-a named `Error` (Node sorts `undefined` last without calling the
-comparator; union-element arrays with an undefined arm already did that and
-are exact).
+(c) **`sort` moves a hole as `undefined`.** Node's sort leaves holes after
+the undefineds it moves to the end; here both are the element's undefined at
+the same place, which every observer that cannot tell them apart reads
+exactly and the fenced observers above stop on. `sort` and `toSorted`
+themselves are exact, comparator calls included, except that a comparator which
+shrinks the array leaves it one element longer per hole than Node does (S024).
 
 (d) **The one f64 pattern.** A double read from bytes (`readDoubleLE`,
 `DataView.getFloat64`) whose bits are exactly `0xFFF4756E64656600` reads as

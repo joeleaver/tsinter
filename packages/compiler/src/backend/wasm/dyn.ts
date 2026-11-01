@@ -133,6 +133,7 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
+import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
@@ -325,6 +326,8 @@ export interface DynDeps {
   /** %w.vec.newLen:dyn — a fresh vector of n ABSENT slots; every caller
    * here passes 0 and fills by push, which is `scr_dyn_new_arr`. */
   arrNewLen: () => number;
+  /** V8's sorts (sort.ts). */
+  arraySort: () => ArraySort;
   /** %w.str.cpAt — the string iterator's step (a paired high surrogate
    * brings its low half along). The ITERATION surfaces walk code POINTS,
    * unlike the keyed read's code units. */
@@ -9343,385 +9346,123 @@ export class DynBuilder {
     );
   }
 
-  /** %w.dyn.sortCmp(x, y, cmp) → i32 in {-1, 0, 1} — one comparison of
-   * `Array.prototype.sort`. `undefined` sinks BEFORE any comparator runs
-   * (JS's rule, and null does not sink — it sorts by its text). A
-   * comparator's answer converts loosely: numbers and booleans read the
-   * shared `num` slot, everything else counts as 0, and NaN lands there
-   * too since it is neither `< 0` nor `> 0`. A null `cmp` takes the
-   * DEFAULT comparator: the ToString images ordered by UTF-16 CODE UNIT,
-   * which is ECMAScript's own order and Node-exact. (C compares the same
-   * images with `scr_str_cmp`, whose UTF-8 storage makes it code-POINT
-   * order — S005's inherited divergence, which the flagged comparator
-   * exists to avoid and this lane therefore does not reproduce.)
-   * A throwing comparator leaves the exception pending and answers 0;
-   * the caller tests the flag. */
+  /** %w.dyn.sortCmp(cmp, x, y) → f64: one comparison of `Array.prototype.sort`
+   * over elements the sort's pre-processing already rid of undefined. With a
+   * comparator its answer is ToNumber's (NaN reads as 0 in the sort; a throw leaves
+   * the exception pending, which the sort tests). A null `cmp` takes
+   * SortCompareDefault: two numbers through their spellings, anything else as the
+   * ToString images ordered by UTF-16 code unit. */
   sortCmp(): number {
-    return this.cached(
-      "sortCmp",
-      [this.dynRef(), this.dynRef(), this.dynRef()],
-      [I32],
-      (idx) => {
-        const dynT = this.dynT();
-        const c = new Code();
-        const XU = 3;
-        const YU = 4;
-        const V = 5;
-        const R = 6;
-        const F = 7;
-        c.localGet(0);
-        c.structGet(dynT, DYN_KIND);
-        c.i32Const(DK.UNDEF);
-        c.i32Eq();
-        c.localSet(XU);
-        c.localGet(1);
-        c.structGet(dynT, DYN_KIND);
-        c.i32Const(DK.UNDEF);
-        c.i32Eq();
-        c.localSet(YU);
-        c.localGet(XU);
-        c.localGet(YU);
-        c.i32Or();
-        c.ifVoid();
-        c.localGet(XU);
-        c.localGet(YU);
-        c.i32And();
-        c.ifResult(I32);
-        c.i32Const(0);
-        c.else_();
-        c.localGet(XU);
-        c.ifResult(I32);
-        c.i32Const(1);
-        c.else_();
-        c.i32Const(-1);
-        c.end();
-        c.end();
-        c.return_();
-        c.end();
-        c.localGet(2);
-        c.refIsNull();
-        c.i32Eqz();
-        c.ifVoid();
-        this.pushNewArr(c);
-        c.localSet(V);
-        c.localGet(V);
-        c.localGet(0);
-        c.call(this.arrPush());
-        c.localGet(V);
-        c.localGet(1);
-        c.call(this.arrPush());
-        c.localGet(2);
-        c.localGet(V);
-        this.deps.lit(c, "comparefn");
-        c.call(this.callFn());
-        c.localTee(R);
-        c.refIsNull();
-        c.ifVoid();
-        c.i32Const(0);
-        c.return_();
-        c.end();
-        c.f64Const(0);
-        c.localSet(F);
-        c.localGet(R);
+    return this.cached("sortCmp", [this.dynRef(), this.dynRef(), this.dynRef()], [F64], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const V = 3;
+      const R = 4;
+      const FX = 5;
+      const FY = 6;
+      const XI = 7;
+      const YI = 8;
+      c.localGet(0);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      this.pushNewArr(c);
+      c.localSet(V);
+      c.localGet(V);
+      c.localGet(1);
+      c.call(this.arrPush());
+      c.localGet(V);
+      c.localGet(2);
+      c.call(this.arrPush());
+      c.localGet(0);
+      c.localGet(V);
+      this.deps.lit(c, "comparefn");
+      c.call(this.callFn());
+      c.localTee(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.f64Const(0);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      c.call(this.deps.jsToNumber());
+      c.return_();
+      c.end();
+      const isNum = (l: number): void => {
+        c.localGet(l);
         c.structGet(dynT, DYN_KIND);
         c.i32Const(DK.NUM);
         c.i32Eq();
-        c.localGet(R);
-        c.structGet(dynT, DYN_KIND);
-        c.i32Const(DK.BOOL);
-        c.i32Eq();
-        c.i32Or();
-        c.ifVoid();
-        c.localGet(R);
-        c.structGet(dynT, DYN_NUM);
-        c.localSet(F);
-        c.end();
-        c.localGet(F);
-        c.f64Const(0);
-        c.f64Lt();
-        c.ifResult(I32);
-        c.i32Const(-1);
-        c.else_();
-        c.localGet(F);
-        c.f64Const(0);
-        c.f64Gt();
-        c.ifResult(I32);
-        c.i32Const(1);
-        c.else_();
-        c.i32Const(0);
-        c.end();
-        c.end();
-        c.return_();
-        c.end();
-        c.localGet(0);
-        c.call(this.toStr());
-        c.localGet(1);
-        c.call(this.toStr());
-        c.call(this.deps.strCmpU16());
-        this.mb.setBody(idx, [I32, I32, this.arrRef(), this.dynRef(), F64], c.bytes());
-      },
+      };
+      isNum(1);
+      isNum(2);
+      c.i32And();
+      c.ifVoid();
+      c.localGet(1);
+      c.structGet(dynT, DYN_NUM);
+      c.localSet(FX);
+      c.localGet(2);
+      c.structGet(dynT, DYN_NUM);
+      c.localSet(FY);
+      emitNumberCompareDefault(c, FX, FY, XI, YI, this.deps.arraySort().smiCompare(), () => this.deps.f64ToStr(), () => this.deps.strCmpU16());
+      c.return_();
+      c.end();
+      c.localGet(1);
+      c.call(this.toStr());
+      c.localGet(2);
+      c.call(this.toStr());
+      c.call(this.deps.strCmpU16());
+      c.f64ConvertI32S();
+      this.mb.setBody(idx, [this.arrRef(), this.dynRef(), F64, F64, I32, I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.sortClass(d) → 0 an element, 1 undefined, 2 a hole (a null slot). */
+  private sortClass(): number {
+    return this.cached("sortClass", [this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(2);
+      c.else_();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  private sortInstance(): SortInstance {
+    const v = this.deps.arrVec();
+    return {
+      key: "dyn",
+      elem: this.dynRef(),
+      arrayType: v.bufType,
+      packed: false,
+      ctx: this.dynRef(),
+      compare: this.sortCmp(),
+      classify: this.sortClass(),
+    };
+  }
+
+  /** %w.sort.dyn.vecSort(vec, cmp) → i32 ok: V8's TimSort over the dyn vector
+   * (sort.ts). Answers 0 with the exception pending when a comparator threw. */
+  sortArr(): number {
+    return this.deps.arraySort().vecSort(
+      this.sortInstance(),
+      this.deps.arrVec(),
+      (c) => c.globalGet(this.undefinedGlobal()),
+      (c) => c.refNull(this.dynT()),
     );
   }
 
-  /** %w.dyn.sortArr(vec, cmp) → i32 ok — the spec's SNAPSHOT sort:
-   * elements copy into a work list, a stable merge orders it, and the
-   * ordered list writes back index by index, so a comparator that mutates
-   * the receiver mid-sort never reorders the elements being compared.
-   * `dyn_arr_sort` with its recursion turned bottom-up (one loop pair
-   * instead of a self-call, since every merge width is known). Stability
-   * is the `<= 0` that takes the LEFT run's element on a tie. Answers 0
-   * with the exception pending when a comparator threw.
-   *
-   * The ORDER this produces is Node's for every consistent comparator;
-   * the comparison SEQUENCE is not V8's TimSort's and cannot be, which
-   * a counting or mutating comparator can see — SEMANTICS.md S024. */
-  sortArr(): number {
-    return this.cached("sortArr", [this.arrRef(), this.dynRef()], [I32], (idx) => {
-      const vec = this.deps.arrVec();
-      const c = new Code();
-      const N = 2;
-      const WORK = 3;
-      const TMP = 4;
-      const W = 5;
-      const LO = 6;
-      const MID = 7;
-      const HI = 8;
-      const I = 9;
-      const J = 10;
-      const K = 11;
-      c.localGet(0);
-      c.structGet(vec.struct, VEC_LEN);
-      c.localSet(N);
-      c.localGet(N);
-      c.f64ConvertI32U();
-      c.call(this.deps.arrNewLen());
-      c.localSet(WORK);
-      c.localGet(N);
-      c.f64ConvertI32U();
-      c.call(this.deps.arrNewLen());
-      c.localSet(TMP);
-      // The snapshot.
-      c.i32Const(0);
-      c.localSet(I);
-      c.block();
-      c.loop();
-      c.localGet(I);
-      c.localGet(N);
-      c.i32GeU();
-      c.brIf(1);
-      this.arrSet(
-        c,
-        (x) => x.localGet(WORK),
-        (x) => x.localGet(I),
-        (x) => this.arrAt(x, (y) => y.localGet(0), (y) => y.localGet(I)),
-      );
-      c.localGet(I);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.br(0);
-      c.end();
-      c.end();
-      // Bottom-up merge: runs of width W pair off into TMP, then TMP
-      // copies back over WORK and the width doubles.
-      c.i32Const(1);
-      c.localSet(W);
-      c.block();
-      c.loop();
-      c.localGet(W);
-      c.localGet(N);
-      c.i32GeU();
-      c.brIf(1);
-      c.i32Const(0);
-      c.localSet(LO);
-      c.block();
-      c.loop();
-      c.localGet(LO);
-      c.localGet(N);
-      c.i32GeU();
-      c.brIf(1);
-      // mid = min(lo + w, n), hi = min(lo + 2w, n)
-      const clampTo = (base: number, add: number, out: number): void => {
-        c.localGet(base);
-        c.localGet(add);
-        c.i32Add();
-        c.localTee(out);
-        c.localGet(N);
-        c.i32GtU();
-        c.ifVoid();
-        c.localGet(N);
-        c.localSet(out);
-        c.end();
-      };
-      clampTo(LO, W, MID);
-      c.localGet(W);
-      c.i32Const(1);
-      c.i32Shl();
-      c.localSet(K); // 2w, borrowed before K becomes the write cursor
-      clampTo(LO, K, HI);
-      c.localGet(LO);
-      c.localSet(I);
-      c.localGet(MID);
-      c.localSet(J);
-      c.localGet(LO);
-      c.localSet(K);
-      // The merge proper.
-      c.block();
-      c.loop();
-      c.localGet(I);
-      c.localGet(MID);
-      c.i32LtU();
-      c.localGet(J);
-      c.localGet(HI);
-      c.i32LtU();
-      c.i32And();
-      c.i32Eqz();
-      c.brIf(1);
-      this.arrAt(c, (x) => x.localGet(WORK), (x) => x.localGet(I));
-      this.arrAt(c, (x) => x.localGet(WORK), (x) => x.localGet(J));
-      c.localGet(1);
-      c.call(this.sortCmp());
-      c.i32Const(0);
-      c.i32LeS();
-      c.ifVoid();
-      this.arrSet(
-        c,
-        (x) => x.localGet(TMP),
-        (x) => x.localGet(K),
-        (x) => this.arrAt(x, (y) => y.localGet(WORK), (y) => y.localGet(I)),
-      );
-      c.localGet(I);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.else_();
-      this.arrSet(
-        c,
-        (x) => x.localGet(TMP),
-        (x) => x.localGet(K),
-        (x) => this.arrAt(x, (y) => y.localGet(WORK), (y) => y.localGet(J)),
-      );
-      c.localGet(J);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(J);
-      c.end();
-      c.localGet(K);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(K);
-      // A comparator that threw stops everything — checked AFTER the
-      // write so the loop shape stays one branch.
-      c.globalGet(this.deps.excKind());
-      c.ifVoid();
-      c.i32Const(0);
-      c.return_();
-      c.end();
-      c.br(0);
-      c.end();
-      c.end();
-      // The tails.
-      const drain = (cursor: number, limit: number): void => {
-        c.block();
-        c.loop();
-        c.localGet(cursor);
-        c.localGet(limit);
-        c.i32GeU();
-        c.brIf(1);
-        this.arrSet(
-          c,
-          (x) => x.localGet(TMP),
-          (x) => x.localGet(K),
-          (x) => this.arrAt(x, (y) => y.localGet(WORK), (y) => y.localGet(cursor)),
-        );
-        c.localGet(cursor);
-        c.i32Const(1);
-        c.i32Add();
-        c.localSet(cursor);
-        c.localGet(K);
-        c.i32Const(1);
-        c.i32Add();
-        c.localSet(K);
-        c.br(0);
-        c.end();
-        c.end();
-      };
-      drain(I, MID);
-      drain(J, HI);
-      c.localGet(LO);
-      c.localGet(W);
-      c.i32Const(1);
-      c.i32Shl();
-      c.i32Add();
-      c.localSet(LO);
-      c.br(0);
-      c.end();
-      c.end();
-      // TMP → WORK for the next width.
-      c.i32Const(0);
-      c.localSet(I);
-      c.block();
-      c.loop();
-      c.localGet(I);
-      c.localGet(N);
-      c.i32GeU();
-      c.brIf(1);
-      this.arrSet(
-        c,
-        (x) => x.localGet(WORK),
-        (x) => x.localGet(I),
-        (x) => this.arrAt(x, (y) => y.localGet(TMP), (y) => y.localGet(I)),
-      );
-      c.localGet(I);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.br(0);
-      c.end();
-      c.end();
-      c.localGet(W);
-      c.i32Const(1);
-      c.i32Shl();
-      c.localSet(W);
-      c.br(0);
-      c.end();
-      c.end();
-      // Write back into whatever the receiver holds NOW: a comparator
-      // that SHRANK the array leaves the surplus behind, C's own stance.
-      c.i32Const(0);
-      c.localSet(I);
-      c.block();
-      c.loop();
-      c.localGet(I);
-      c.localGet(N);
-      c.i32GeU();
-      c.brIf(1);
-      c.localGet(I);
-      c.localGet(0);
-      c.structGet(vec.struct, VEC_LEN);
-      c.i32LtU();
-      c.ifVoid();
-      this.arrSet(
-        c,
-        (x) => x.localGet(0),
-        (x) => x.localGet(I),
-        (x) => this.arrAt(x, (y) => y.localGet(WORK), (y) => y.localGet(I)),
-      );
-      c.end();
-      c.localGet(I);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.br(0);
-      c.end();
-      c.end();
-      c.i32Const(1);
-      this.mb.setBody(
-        idx,
-        [I32, this.arrRef(), this.arrRef(), I32, I32, I32, I32, I32, I32, I32],
-        c.bytes(),
-      );
-    });
+  /** %w.sort.dyn.vecToSorted(vec, cmp) → the sorted copy, null when a comparator
+   * threw. */
+  toSortedArr(): number {
+    return this.deps.arraySort().vecToSorted(this.sortInstance(), this.deps.arrVec(), (c) => c.globalGet(this.undefinedGlobal()));
   }
 
   /** %w.dyn.nullishRecv:&lt;method&gt;(recv) — the TypeError a NULLISH
@@ -11234,25 +10975,7 @@ export class DynBuilder {
                 c.refNull(dynT);
                 c.return_();
                 c.end();
-                // The copy first (ArrayCreate(len) + SortIndexedProperties
-                // over the receiver), then the receiver's own sort over it.
-                this.pushNewArr(c);
-                c.localSet(OUT);
-                c.i32Const(0);
-                c.localSet(I);
-                forLoop(
-                  () => c.localGet(N),
-                  () => {
-                    c.localGet(OUT);
-                    elemAt(I);
-                    c.call(this.arrPush());
-                  },
-                );
-                c.localGet(N);
-                c.i32Const(1);
-                c.i32GtU();
-                c.ifVoid();
-                c.localGet(OUT);
+                c.localGet(A);
                 c.localGet(B);
                 c.i32Const(DK.FUNC);
                 c.i32Eq();
@@ -11261,12 +10984,12 @@ export class DynBuilder {
                 c.else_();
                 c.refNull(dynT);
                 c.end();
-                c.call(this.sortArr());
-                c.i32Eqz();
+                c.call(this.toSortedArr());
+                c.localTee(OUT);
+                c.refIsNull();
                 c.ifVoid();
                 c.refNull(dynT);
                 c.return_();
-                c.end();
                 c.end();
                 this.boxArr(c, (x) => x.localGet(OUT));
                 return;
@@ -12068,6 +11791,16 @@ export class DynBuilder {
             c.localGet(B);
             c.arrayCopy(bufT, bufT);
             c.end();
+          });
+        }
+        if (method === "sort" || method === "toSorted") {
+          // Sorting a typed array through a dynamic value, where the static
+          // lowering's element type is out of reach.
+          this.arm(c, K, [DK.BYTES], () => {
+            this.deps.throwError(c, "%Error", "Error", (x) =>
+              this.deps.lit(x, `calling '${method}' on a typed array held in a dynamic value is not supported yet`),
+            );
+            c.refNull(dynT);
           });
         }
         if (method === "constructor" && this.deps.bytesCtor !== undefined) {

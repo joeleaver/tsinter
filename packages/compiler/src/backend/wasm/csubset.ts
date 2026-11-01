@@ -384,7 +384,7 @@ function expandAll(items: PpItem[]): Tok[] {
 
 /** C scalar and reference types: int/int32_t = "int", uint32_t = "uint",
  * long = "i64", uint64_t = "u64"; "fa"/"ia" are double / int32 arrays. */
-export type CT = "double" | "int" | "uint" | "i64" | "u64" | "fa" | "ia";
+export type CT = "double" | "int" | "uint" | "i64" | "u64" | "fa" | "ia" | "el" | "ea" | "ctx";
 
 type Expr =
   | { k: "num"; t: CT; v: number | bigint; line: number }
@@ -453,6 +453,9 @@ const TYPE_NAMES: Record<string, CT> = {
   int32_t: "int",
   uint32_t: "uint",
   uint64_t: "u64",
+  // only with a CExt: see CExt below
+  elem_t: "el",
+  ctx_t: "ctx",
 };
 const SPECIFIERS = new Set(["static", "const", "volatile", "inline"]);
 
@@ -580,6 +583,10 @@ class Parser {
     return [t, isStatic, qualified];
   }
 
+  private pointerTo(t: CT): CT {
+    return t === "double" ? "fa" : t === "int" ? "ia" : t === "el" ? "ea" : this.err("pointer type outside the subset");
+  }
+
   private staticVar(isStatic: boolean, qualified: boolean): void {
     if (isStatic && !qualified) {
       this.err("a static variable that is neither const nor volatile (mutable static state) is outside the subset");
@@ -592,7 +599,7 @@ class Parser {
     const name = this.ident();
     let t = TYPE_NAMES[name];
     if (t === undefined) this.err(`type ${name} is outside the subset`);
-    if (this.eat("*")) t = t === "double" ? "fa" : t === "int" ? "ia" : this.err("pointer type outside the subset");
+    if (this.eat("*")) t = this.pointerTo(t);
     return t;
   }
 
@@ -645,7 +652,7 @@ class Parser {
     if (this.eat(")")) return ps;
     for (;;) {
       let [t] = this.declSpec();
-      if (this.eat("*")) t = t === "double" ? "fa" : t === "int" ? "ia" : this.err("pointer parameter type");
+      if (this.eat("*")) t = this.pointerTo(t);
       const name = this.ident();
       ps.push({ name, t });
       if (this.eat(")")) return ps;
@@ -700,8 +707,9 @@ class Parser {
     const line = this.line();
     if (this.is("{")) return { k: "block", body: this.block() };
     if (this.atDecl()) {
-      const [t, isStatic, qualified] = this.declSpec();
+      const [spec, isStatic, qualified] = this.declSpec();
       this.staticVar(isStatic, qualified);
+      const t = this.eat("*") ? this.pointerTo(spec) : spec;
       const name = this.ident();
       return { k: "decl", isStatic, decls: this.declRest(t, name), line };
     }
@@ -1052,6 +1060,23 @@ interface Frame {
   label?: string;
 }
 
+/** What a unit written over `elem_t` (one element type, instantiated per use) needs
+ * from the module it is compiled into (timsort-src.ts). `elem_t` is the element's
+ * value type, `elem_t*` a GC array of them with `arrayType`, and `ctx_t` an opaque
+ * reference passed through. Calls: the `externs`, by name, are module functions;
+ * `ea_new(n)` / `ia_new(n)` are array.new_default; `ea_copy(dst, dstPos, src, srcPos,
+ * n)` is array.copy (answering 0); `sort_threw()` is the module's pending-exception
+ * test. */
+export interface CExt {
+  elem: ValType;
+  arrayType: number;
+  /** i8 / i16 storage: elements read with array.get_u */
+  packed: boolean;
+  ctx: ValType;
+  externs: Record<string, { params: CT[]; ret: CT; index: number }>;
+  excKindGlobal: number;
+}
+
 /** Compiles a CUnit's functions into a ModuleBuilder on demand. */
 export class CCompiler {
   private readonly idx = new Map<string, number>();
@@ -1064,6 +1089,7 @@ export class CCompiler {
     private readonly mb: ModuleBuilder,
     private readonly unit: CUnit,
     private readonly prefix: string,
+    readonly ext?: CExt,
   ) {
     this.fa = mb.arrayType(F64, true);
     this.ia = mb.arrayType(I32, true);
@@ -1083,7 +1109,18 @@ export class CCompiler {
         return { kind: "ref", nullable: true, typeIndex: this.fa };
       case "ia":
         return { kind: "ref", nullable: true, typeIndex: this.ia };
+      case "el":
+        return this.need().elem;
+      case "ea":
+        return { kind: "ref", nullable: true, typeIndex: this.need().arrayType };
+      case "ctx":
+        return this.need().ctx;
     }
+  }
+
+  need(): CExt {
+    if (this.ext === undefined) throw new CSubsetError("elem_t / ctx_t outside an instantiated unit");
+    return this.ext;
   }
 
   /** The wasm function index of C function `name`, declared on first use; its
@@ -1140,6 +1177,28 @@ export class CCompiler {
   }
 }
 
+/** Whether `s` contains a `goto label`. */
+function hasGoto(s: Stmt, label: string): boolean {
+  switch (s.k) {
+    case "goto":
+      return s.label === label;
+    case "block":
+      return s.body.some((b) => hasGoto(b, label));
+    case "if":
+      return hasGoto(s.t, label) || (s.e !== undefined && hasGoto(s.e, label));
+    case "while":
+    case "do":
+    case "for":
+      return hasGoto(s.body, label);
+    case "switch":
+      return s.clauses.some((cl) => cl.body.some((b) => hasGoto(b, label)));
+    case "label":
+      return hasGoto(s.s, label);
+    default:
+      return false;
+  }
+}
+
 class FnGen {
   readonly code = new Code();
   readonly locals: ValType[] = [];
@@ -1186,10 +1245,28 @@ class FnGen {
 
   private block(body: Stmt[], scoped = true): void {
     if (scoped) this.scopes.push(new Map());
-    // labels in this block that a goto targets: the statements from the label on
-    // become one wasm loop the goto branches back to
+    // A label an EARLIER statement of this block jumps to is a forward goto: a wasm
+    // block closing at the label, the first label innermost.
+    const forward = new Set<string>();
+    body.forEach((s, i) => {
+      if (s.k === "label" && body.slice(0, i).some((p) => hasGoto(p, s.label))) forward.add(s.label);
+    });
+    const labels = body.filter((s) => s.k === "label");
+    if (forward.size > 0 && forward.size !== labels.length) throw new CSubsetError(`${this.f.name}: forward and backward labels in one block`);
+    for (const l of [...forward].reverse()) {
+      this.code.block();
+      this.frames.push({ kind: "label", label: l });
+    }
+    // otherwise, a label a goto targets: the statements from the label on become one
+    // wasm loop the goto branches back to
     for (let i = 0; i < body.length; i++) {
       const s = body[i]!;
+      if (s.k === "label" && forward.has(s.label)) {
+        this.frames.pop();
+        this.code.end();
+        this.stmt(s.s);
+        continue;
+      }
       if (s.k === "label") {
         const c = this.code;
         c.loop();
@@ -1411,6 +1488,11 @@ class FnGen {
       }
       case "call": {
         if (e.name === "fabs" || e.name === "sqrt" || e.name === "floor") return "double";
+        if (e.name === "ea_new") return "ea";
+        if (e.name === "ia_new") return "ia";
+        if (e.name === "ea_copy" || e.name === "sort_threw") return "int";
+        const ext = this.cc.ext?.externs[e.name];
+        if (ext !== undefined) return ext.ret;
         const f = this.unit.funcs.get(e.name);
         if (f === undefined) return this.err(e.line, `unknown function ${e.name}`);
         return f.ret;
@@ -1419,6 +1501,7 @@ class FnGen {
         const a = this.typeOf(e.a);
         if (a === "fa") return "double";
         if (a === "ia") return "int";
+        if (a === "ea") return "el";
         return this.err(e.line, "subscript of a non-array");
       }
       case "cast":
@@ -1580,6 +1663,13 @@ class FnGen {
       }
       case "idx": {
         const at = this.emit(e.a);
+        if (at === "ea") {
+          const x = this.cc.need();
+          this.emitIndex(e.i);
+          if (x.packed) c.arrayGetU(x.arrayType);
+          else c.arrayGet(x.arrayType);
+          return "el";
+        }
         if (at !== "fa" && at !== "ia") this.err(e.line, "subscript of a non-array");
         this.emitIndex(e.i);
         c.arrayGet(at === "fa" ? this.cc.fa : this.cc.ia);
@@ -1847,12 +1937,12 @@ class FnGen {
     }
     if (e.a.k !== "idx") this.err(e.line, "assignment to a non-lvalue");
     const at = this.emit(e.a.a);
-    if (at !== "fa" && at !== "ia") this.err(e.line, "subscript of a non-array");
+    if (at !== "fa" && at !== "ia" && at !== "ea") this.err(e.line, "subscript of a non-array");
     if (e.a.a.k === "id") {
       const s = this.lookup(e.a.a.name, e.line);
       if (s.kind === "const") this.err(e.line, `assignment into the constant table ${e.a.a.name}`);
     }
-    const T = at === "fa" ? this.cc.fa : this.cc.ia;
+    const T = at === "fa" ? this.cc.fa : at === "ia" ? this.cc.ia : this.cc.need().arrayType;
     if (bop === null) {
       this.emitIndex(e.a.i);
       rhs();
@@ -1901,13 +1991,38 @@ class FnGen {
       else c.f64Floor();
       return "double";
     }
+    const x = this.cc.ext;
+    if (x !== undefined) {
+      if (e.name === "ea_new" || e.name === "ia_new") {
+        this.emitAs(e.args[0]!, "int");
+        c.arrayNewDefault(e.name === "ea_new" ? x.arrayType : this.cc.ia);
+        return e.name === "ea_new" ? "ea" : "ia";
+      }
+      if (e.name === "ea_copy") {
+        e.args.forEach((a, i) => this.emitAs(a, i === 0 || i === 2 ? "ea" : "int"));
+        c.arrayCopy(x.arrayType, x.arrayType);
+        c.i32Const(0);
+        return "int";
+      }
+      if (e.name === "sort_threw") {
+        c.globalGet(x.excKindGlobal);
+        return "int";
+      }
+      const ext = x.externs[e.name];
+      if (ext !== undefined) {
+        if (ext.params.length !== e.args.length) this.err(e.line, `${e.name} takes ${ext.params.length} arguments`);
+        e.args.forEach((a, i) => this.emitAs(a, ext.params[i]!));
+        c.call(ext.index);
+        return ext.ret;
+      }
+    }
     const f = this.unit.funcs.get(e.name);
     if (f === undefined) this.err(e.line, `unknown function ${e.name}`);
     if (f.params.length !== e.args.length) this.err(e.line, `${e.name} takes ${f.params.length} arguments`);
     e.args.forEach((a, i) => {
       const pt = f.params[i]!.t;
       const at = this.typeOf(a);
-      if ((pt === "fa" || pt === "ia") && at !== pt) this.err(e.line, `argument ${i + 1} of ${e.name}: ${at} for ${pt}`);
+      if ((pt === "fa" || pt === "ia" || pt === "ea") && at !== pt) this.err(e.line, `argument ${i + 1} of ${e.name}: ${at} for ${pt}`);
       this.emitAs(a, pt);
     });
     c.call(this.callee(e.name));

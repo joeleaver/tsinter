@@ -494,18 +494,19 @@ ys.forEach((y) => console.log(y));`,
     );
     expect(out).toBe("[ undefined, 2 ]\nundefined\n2\n");
   });
-  test("sort over a plain-typed array holding undefined", async () => {
-    // Node: [ 1, 2, undefined ] — undefined last, the comparator never sees it.
+  test("sort over a plain-typed array holding undefined is exact", async () => {
+    // Node: undefined last, the comparator never sees it (SEMANTICS.md S024).
     const out = await fenced(
       "f3",
       `const xs: number[] = [2, 1];
 xs.push(xs[9]);
-try {
-  xs.sort((a, b) => a - b);
-} catch (e) {
-  console.log((e as Error).message.split(" (")[0]);
-}`,
+let calls = 0;
+xs.sort((a, b) => {
+  calls++;
+  return a - b;
+});
+console.log(xs.length, xs[0], xs[1], xs[2], calls);`,
     );
-    expect(out).toBe("Array.prototype.sort over an array holding undefined\n");
+    expect(out).toBe("3 1 2 undefined 1\n");
   });
 });

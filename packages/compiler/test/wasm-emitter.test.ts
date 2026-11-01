@@ -2946,12 +2946,9 @@ test("S023: apply's argsArray — the array-like fence and the primitive's own T
   );
 });
 
-test("S024: a comparator's answer is read from numbers and booleans only", async () => {
-  // The result reads the shared numeric slot, which no other kind fills,
-  // so a STRING-returning comparator — consistent, and one Node sorts
-  // correctly by applying ToNumber — reads as 0 at every pair and sorts
-  // nothing. An INCONSISTENT boolean comparator is outside any claim:
-  // ECMA-262 leaves it implementation-defined and the two simply differ.
+test("a dyn comparator's answer goes through ToNumber", async () => {
+  // Node's answers: ToNumber of the strings sorts, and a boolean comparator
+  // never answers negative, which V8's sort takes as "in order".
   const res = await buildWasm(
     "dyn-invoke-cmpret.ts",
     [
@@ -2973,10 +2970,8 @@ test("S024: a comparator's answer is read from numbers and booleans only", async
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
     [
-      // S024 — Node answers 1,2,3: it ToNumbers the strings.
-      "string 3,1,2",
-      // S024 — Node answers 3,1,2 for the inconsistent one.
-      "boolean 1,2,3",
+      "string 1,2,3",
+      "boolean 3,1,2",
       "number 1,2,3",
       "",
     ].join("\n"),

@@ -1668,8 +1668,9 @@ function lowerOptionalDefaultArg(
     return name;
   }
 
-/** `a.sort(cmp)` / `a.toSorted(cmp)`, desugared to an interned synthetic
-   * function like the other array HOFs. sort mutates and returns the receiver;
+/** `a.sort(cmp)` / `a.toSorted(cmp)`. The WasmGC lanes take V8's sort
+   * (lowerWasmArraySortCall). On the c and llvm lanes (SEMANTICS.md S024), desugared
+   * to an interned synthetic function like the other array HOFs. sort mutates and returns the receiver;
    * toSorted takes its shallow snapshot INSIDE the helper, after the receiver
    * and comparator expressions have both been evaluated, then sorts and
    * returns that copy without touching the receiver. The loop is a
@@ -1693,6 +1694,7 @@ function lowerOptionalDefaultArg(
     const loc = locOf(call);
     const method = access.name.text === "toSorted" ? "toSorted" : "sort";
     const copyFirst = method === "toSorted";
+    if (L.undefSlots) return lowerWasmArraySortCall(L, call, access, elem, arrT, method);
     if (call.arguments.length === 0 && elem.kind === "string") {
       const receiver = L.lowerExpr(access.expression);
       const cmp = defaultStringCmpHelper(L, loc);
@@ -1705,7 +1707,7 @@ function lowerOptionalDefaultArg(
         L.liftedFns.push(buildArraySortFn(helper, STRING, 2, copyFirst, null, loc));
       }
       const fnArg: IrExpr = { kind: "closure", fnName: cmp, captures: [], type: fnT, loc };
-      return holeFencedCall(L, { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc }, `Array.prototype.${method}`, loc, SORT_UNDEF);
+      return { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
     }
     if (call.arguments.length !== 1) {
       L.noLowering(
@@ -1748,9 +1750,425 @@ function lowerOptionalDefaultArg(
         ),
       );
     }
-    const sortCall: IrExpr = { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
-    return elem.kind === "union" ? sortCall : holeFencedCall(L, sortCall, `Array.prototype.${method}`, loc, SORT_UNDEF);
+    return { kind: "call", callee: helper, args: [receiver, fnArg], type: arrT, loc };
   }
+
+/** The WasmGC lanes' `sort` / `toSorted`: V8's TimSort (backend/wasm/sort.ts), behind
+ * an interned `%arr.<method>.<n>(a[, f])` so the receiver and comparator evaluate
+ * first, in order, like every other array helper. The sort itself handles undefined
+ * and holes (V8's pre-processing), and a comparator that throws or mutates the
+ * receiver. The default order is the sort's own for string and number elements; other
+ * primitive elements get `(a, b) => compare(String(a), String(b))`. */
+function lowerWasmArraySortCall(
+  L: Lowerer,
+  call: ts.CallExpression,
+  access: ts.PropertyAccessExpression,
+  elem: IrType,
+  arrT: IrType & { kind: "array" },
+  method: "sort" | "toSorted",
+): IrExpr {
+  const loc = locOf(call);
+  if (call.arguments.length > 1 || call.arguments.some(ts.isSpreadElement)) {
+    L.noLowering(`.${method} with ${call.arguments.length} arguments`, call);
+  }
+  const argNode = call.arguments[0];
+  const isUndefinedArg = argNode !== undefined && isUndefinedTyped(L, argNode);
+  if (argNode !== undefined && !isUndefinedArg) {
+    const badGate = lowerBadSortComparator(L, argNode, access.expression, arrT, loc);
+    if (badGate !== null) return badGate;
+    const receiver = L.lowerExpr(access.expression);
+    const fnArg = adaptVariadicCallback(L, argNode, L.lowerExpr(argNode), [elem, elem]);
+    if (
+      fnArg.type.kind !== "func" ||
+      fnArg.type.params.length > 2 ||
+      !fnArg.type.params.every((p) => typeEquals(p, elem)) ||
+      !SORT_ANSWERS.has(fnArg.type.ret.kind)
+    ) {
+      L.badType(argNode, L.typeOf(argNode));
+    }
+    // A value that may be undefined behind a cast takes the default order, as in Node.
+    const fallback = mayHoldSlotUndef(L, fnArg) ? (defaultSortOrder(L, elem, loc) ?? "fence") : null;
+    return wasmSortHelperCall(L, method, arrT, receiver, fnArg, loc, fallback);
+  }
+  const receiver = L.lowerExpr(access.expression);
+  const order = defaultSortOrder(L, elem, loc);
+  if (order === null) {
+    L.noLowering(
+      `.${method} without a comparator`,
+      call,
+      "the default string-conversion ordering lowers only for primitive elements — pass a comparator",
+    );
+  }
+  const cmp = order === "native" ? null : order;
+  const sorted = wasmSortHelperCall(L, method, arrT, receiver, cmp, loc);
+  const effects = isUndefinedArg && argNode !== undefined ? undefinedArgEffects(L, argNode) : null;
+  if (effects === null) return sorted;
+  // The discarded `undefined` argument still evaluates, after the receiver.
+  const saved = L.declareHiddenLocal("%sortRecv", arrT);
+  const savedRef: IrExpr = { kind: "varRef", localId: saved.id, type: arrT, loc };
+  return {
+    kind: "seqExpr",
+    stmts: [
+      { kind: "varDecl", localId: saved.id, init: receiver, loc },
+      { kind: "exprStmt", expr: effects, loc: effects.loc },
+    ],
+    result: wasmSortHelperCall(L, method, arrT, savedRef, cmp, loc),
+    type: arrT,
+    loc,
+  };
+}
+
+/** How `elem` sorts without a comparator: "native" for the sort's own string and
+ * number order, the comparator closure for other primitives, null where the default
+ * order has no lowering. */
+function defaultSortOrder(L: Lowerer, elem: IrType, loc: SrcLoc): "native" | IrExpr | null {
+  if (elem.kind === "string" || elem.kind === "f64") return "native";
+  if (!isPrimitiveSortElem(L, elem)) return null;
+  return { kind: "closure", fnName: defaultToStringCmpHelper(L, elem, loc), captures: [], type: funcOf([elem, elem], F64), loc };
+}
+
+/** What a comparator argument of static type undefined leaves to evaluate once its
+ * value is discarded, null when nothing is left. An undefined has no IR value of its
+ * own, so the shapes that answer one are taken apart here: `(f(), undefined)` keeps
+ * `f()`, `void e` keeps `e`, a conditional keeps its test and its arms. Only the global
+ * `undefined` is nothing: a shadowing local reads as itself. */
+function undefinedArgEffects(L: Lowerer, node: ts.Expression): IrExpr | null {
+  const e = peelSortArg(node);
+  const loc = locOf(e);
+  const zero: IrExpr = { kind: "numLit", value: 0, type: F64, loc };
+  const asNumber = (x: IrExpr | null): IrExpr =>
+    x === null
+      ? zero
+      : x.type.kind === "f64"
+        ? x
+        : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: x, loc: x.loc }], result: zero, type: F64, loc: x.loc };
+  if (isGlobalUndefined(L, e)) return null;
+  if (ts.isVoidExpression(e)) return undefinedArgEffects(L, e.expression);
+  if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    const left = undefinedArgEffects(L, e.left);
+    const right = undefinedArgEffects(L, e.right);
+    if (left === null) return right;
+    if (right === null) return left;
+    return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: left, loc }], result: asNumber(right), type: F64, loc };
+  }
+  if (ts.isConditionalExpression(e)) {
+    const cond = L.lowerCondition(e.condition);
+    const then = undefinedArgEffects(L, e.whenTrue);
+    const else_ = undefinedArgEffects(L, e.whenFalse);
+    return { kind: "ternary", cond, then: asNumber(then), else_: asNumber(else_), type: F64, loc };
+  }
+  const value = L.lowerExpr(e);
+  return droppableStatic(value) || isUnitType(value.type) && value.kind === "varRef" ? null : value;
+}
+
+/** Whether a comparator argument is undefined by its checker type, casts aside. */
+function isUndefinedTyped(L: Lowerer, node: ts.Expression): boolean {
+  return (L.typeOf(peelSortArg(node)).flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) !== 0;
+}
+
+/** A comparator argument behind its parentheses and type assertions. */
+function peelSortArg(node: ts.Expression): ts.Expression {
+  let e = node;
+  while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e)) e = e.expression;
+  return e;
+}
+
+/** The comparator answers ToNumber is modelled for on the static path. */
+const SORT_ANSWERS: ReadonlySet<string> = new Set(["f64", "bool", "void", "string"]);
+
+function isPrimitiveSortElem(L: Lowerer, elem: IrType): boolean {
+  if (elem.kind === "bool") return true;
+  if (elem.kind !== "union") return false;
+  return (L.unions.get(elem.unionId)?.arms ?? []).every((a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a));
+}
+
+/** `(a, b) => a' < b' ? -1 : a' > b' ? 1 : 0` over the elements' ToString images, each
+ * converted once per comparison, as V8's SortCompareDefault does. */
+function defaultToStringCmpHelper(L: Lowerer, elem: IrType, loc: SrcLoc): string {
+  const key = `sortCmpStr:${typeKey(elem)}`;
+  const existing = L.arrHofHelpers.get(key);
+  if (existing) return existing;
+  const name = `%arr.sortCmpStr.${L.arrHofHelpers.size}`;
+  L.arrHofHelpers.set(key, name);
+  const ref = (localId: string): IrExpr => ({ kind: "varRef", localId, type: STRING, loc });
+  const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const cmp = (op: "<" | ">"): IrExpr => ({ kind: "strCmp", op, left: ref("x.0"), right: ref("y.0"), utf16: true, type: BOOL, loc });
+  L.liftedFns.push({
+    name,
+    params: [
+      { localId: "a.0", name: "a", type: elem },
+      { localId: "b.0", name: "b", type: elem },
+    ],
+    returnType: F64,
+    locals: [
+      { id: "a.0", name: "a", type: elem, mutable: false },
+      { id: "b.0", name: "b", type: elem, mutable: false },
+      { id: "x.0", name: "x", type: STRING, mutable: false },
+      { id: "y.0", name: "y", type: STRING, mutable: false },
+    ],
+    body: [
+      { kind: "varDecl", localId: "x.0", init: { kind: "toString", operand: { kind: "varRef", localId: "a.0", type: elem, loc }, type: STRING, loc }, loc },
+      { kind: "varDecl", localId: "y.0", init: { kind: "toString", operand: { kind: "varRef", localId: "b.0", type: elem, loc }, type: STRING, loc }, loc },
+      {
+        kind: "return",
+        value: {
+          kind: "ternary",
+          cond: cmp("<"),
+          then: num(-1),
+          else_: { kind: "ternary", cond: cmp(">"), then: num(1), else_: num(0), type: F64, loc },
+          type: F64,
+          loc,
+        },
+        loc,
+      },
+    ],
+    loc,
+  });
+  return name;
+}
+
+/** The call of the interned `%arr.<method>.<n>(a[, f])`. */
+function wasmSortHelperCall(
+  L: Lowerer,
+  method: "sort" | "toSorted",
+  arrT: IrType & { kind: "array" },
+  receiver: IrExpr,
+  fnArg: IrExpr | null,
+  loc: SrcLoc,
+  fallback: "native" | "fence" | IrExpr | null = null,
+): IrExpr {
+  const key = `w${method}:${typeKey(arrT)}:${fnArg === null ? "default" : typeKey(fnArg.type)}:${fallback === null ? "" : "undef"}`;
+  let helper = L.arrHofHelpers.get(key);
+  if (!helper) {
+    helper = `%arr.${method}.${L.arrHofHelpers.size}`;
+    L.arrHofHelpers.set(key, helper);
+    const a: IrExpr = { kind: "varRef", localId: "a.0", type: arrT, loc };
+    const fnT = fnArg?.type;
+    L.liftedFns.push({
+      name: helper,
+      params: [
+        { localId: "a.0", name: "a", type: arrT },
+        ...(fnT !== undefined ? [{ localId: "f.0", name: "f", type: fnT }] : []),
+      ],
+      returnType: arrT,
+      locals: [
+        { id: "a.0", name: "a", type: arrT, mutable: false },
+        ...(fnT !== undefined ? [{ id: "f.0", name: "f", type: fnT, mutable: false }] : []),
+      ],
+      body: [
+        ...(fnT !== undefined && fallback !== null
+          ? [{
+              kind: "if" as const,
+              cond: isUndefExpr({ kind: "varRef", localId: "f.0", type: fnT, loc }, false, loc),
+              then: [
+                fallback === "fence"
+                  ? {
+                      kind: "runtimeFence" as const,
+                      code: "SC1090",
+                      message: `Array.prototype.${method} without a comparator over elements with no default order on this tier (SEMANTICS.md S024)`,
+                      loc,
+                    }
+                  : sortReturn(a, method, arrT, fallback === "native" ? [] : [fallback], loc),
+              ],
+              else_: null,
+              loc,
+            }]
+          : []),
+        sortReturn(a, method, arrT, fnT !== undefined ? [{ kind: "varRef", localId: "f.0", type: fnT, loc }] : [], loc),
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: helper, args: fnArg !== null ? [receiver, fnArg] : [receiver], type: arrT, loc };
+}
+
+function sortReturn(a: IrExpr, method: "sort" | "toSorted", arrT: IrType, args: IrExpr[], loc: SrcLoc): IrStmt {
+  return { kind: "return", value: { kind: "arrIntrinsic", method, receiver: a, args, type: arrT, loc }, loc };
+}
+
+/** A comparator whose checker type (behind `as any`) cannot be callable: the receiver
+ * and the argument evaluate, then V8's gate throws, naming the value. Null when the
+ * argument may be callable. */
+function lowerBadSortComparator(
+  L: Lowerer,
+  argNode: ts.Expression,
+  receiverNode: ts.Expression,
+  arrT: IrType,
+  loc: SrcLoc,
+): IrExpr | null {
+  const inner = peelSortArg(argNode);
+  const t = L.typeOf(inner);
+  const isNull = inner.kind === ts.SyntaxKind.NullKeyword || (t.flags & ts.TypeFlags.Null) !== 0;
+  const primitive = ts.TypeFlags.NumberLike | ts.TypeFlags.StringLike | ts.TypeFlags.BooleanLike;
+  if (!isNull && ((t.flags & primitive) === 0 || (t.flags & ts.TypeFlags.Union) !== 0)) return null;
+  const receiver = L.lowerExpr(receiverNode);
+  const text: IrExpr = isNull
+    ? { kind: "strLit", value: "null", type: STRING, loc }
+    : { kind: "toString", operand: L.lowerExpr(inner), type: STRING, loc };
+  const prefix: IrExpr = { kind: "strLit", value: "The comparison function must be either a function or undefined: ", type: STRING, loc };
+  const key = `sortBadCmp:${typeKey(arrT)}`;
+  let helper = L.arrHofHelpers.get(key);
+  if (!helper) {
+    helper = `%arr.sortBadCmp.${L.arrHofHelpers.size}`;
+    L.arrHofHelpers.set(key, helper);
+    L.liftedFns.push({
+      name: helper,
+      params: [
+        { localId: "a.0", name: "a", type: arrT },
+        { localId: "m.0", name: "m", type: STRING },
+      ],
+      returnType: arrT,
+      locals: [
+        { id: "a.0", name: "a", type: arrT, mutable: false },
+        { id: "m.0", name: "m", type: STRING, mutable: false },
+      ],
+      body: [
+        throwTypeError({ kind: "varRef", localId: "m.0", type: STRING, loc }, loc),
+        { kind: "return", value: { kind: "varRef", localId: "a.0", type: arrT, loc }, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: helper, args: [receiver, concatAll([prefix, text], loc)], type: arrT, loc };
+}
+
+/** The WasmGC lanes' `sort` / `toSorted` on a typed array: the elements as numbers
+ * through `typedSort` (V8's merge sort with a comparator, numeric order without),
+ * written back only when it finished, so a throwing comparator leaves the array as it
+ * was. `toSorted` does the same over a slice. */
+function lowerWasmBytesSortCall(
+  L: Lowerer,
+  call: ts.CallExpression,
+  access: ts.PropertyAccessExpression,
+  bytesT: IrType & { kind: "bytes" },
+  method: "sort" | "toSorted",
+): IrExpr {
+  const loc = locOf(call);
+  if (call.arguments.length > 1 || call.arguments.some(ts.isSpreadElement)) {
+    L.noLowering(`.${method} with ${call.arguments.length} arguments on a typed array`, call);
+  }
+  const argNode = call.arguments[0];
+  const isUndefinedArg = argNode !== undefined && isUndefinedTyped(L, argNode);
+  if (argNode !== undefined && !isUndefinedArg) {
+    const badGate = lowerBadSortComparator(L, argNode, access.expression, bytesT, loc);
+    if (badGate !== null) return badGate;
+  }
+  const receiver = L.lowerExpr(access.expression);
+  let fnArg: IrExpr | null = null;
+  if (argNode !== undefined && !isUndefinedArg) {
+    fnArg = L.lowerExpr(argNode);
+    if (
+      fnArg.type.kind !== "func" ||
+      fnArg.type.params.length > 2 ||
+      !fnArg.type.params.every((p) => p.kind === "f64") ||
+      !SORT_ANSWERS.has(fnArg.type.ret.kind)
+    ) {
+      L.badType(argNode, L.typeOf(argNode));
+    }
+  }
+  const guarded = fnArg !== null && mayHoldSlotUndef(L, fnArg);
+  const key = `w${method}:${typeKey(bytesT)}:${fnArg === null ? "default" : typeKey(fnArg.type)}:${guarded}`;
+  let helper = L.arrHofHelpers.get(key);
+  const fnT = fnArg?.type;
+  if (!helper) {
+    helper = `%bytes.${method}.${L.arrHofHelpers.size}`;
+    L.arrHofHelpers.set(key, helper);
+    L.liftedFns.push(buildWasmBytesSortFn(helper, bytesT, fnT, method === "toSorted", guarded, loc));
+  }
+  const sorted = (recv: IrExpr): IrExpr => ({
+    kind: "call",
+    callee: helper,
+    args: fnArg !== null ? [recv, fnArg] : [recv],
+    type: bytesT,
+    loc,
+  });
+  const effects = isUndefinedArg && argNode !== undefined ? undefinedArgEffects(L, argNode) : null;
+  if (effects === null) return sorted(receiver);
+  const saved = L.declareHiddenLocal("%bytesSortRecv", bytesT);
+  return {
+    kind: "seqExpr",
+    stmts: [
+      { kind: "varDecl", localId: saved.id, init: receiver, loc },
+      { kind: "exprStmt", expr: effects, loc: effects.loc },
+    ],
+    result: sorted({ kind: "varRef", localId: saved.id, type: bytesT, loc }),
+    type: bytesT,
+    loc,
+  };
+}
+
+function buildWasmBytesSortFn(name: string, bytesT: IrType & { kind: "bytes" }, fnT: IrType | undefined, copyFirst: boolean, guarded: boolean, loc: SrcLoc): IrFunction {
+  const listT = arrayOf(F64);
+  const ref = (localId: string, type: IrType): IrExpr => ({ kind: "varRef", localId, type, loc });
+  const a = ref("a.0", bytesT);
+  const list = ref("l.0", listT);
+  const i = ref("i.0", F64);
+  const typedSort = (args: IrExpr[]): IrExpr => ({
+    kind: "arrIntrinsic",
+    method: "typedSort",
+    receiver: { kind: "bytesIntrinsic", method: "toArray", receiver: a, args: [], type: listT, loc },
+    args,
+    type: listT,
+    loc,
+  });
+  const sortedList = fnT === undefined ? typedSort([]) : typedSort([ref("f.0", fnT)]);
+  const body: IrStmt[] = [
+    ...(copyFirst
+      ? [{
+          kind: "assign" as const,
+          localId: "a.0",
+          value: { kind: "bytesIntrinsic" as const, method: "slice" as const, receiver: a, args: [], type: bytesT, loc },
+          loc,
+        }]
+      : []),
+    {
+      kind: "varDecl",
+      localId: "l.0",
+      init:
+        guarded && fnT !== undefined
+          ? { kind: "ternary", cond: isUndefExpr(ref("f.0", fnT), false, loc), then: typedSort([]), else_: sortedList, type: listT, loc }
+          : sortedList,
+      loc,
+    },
+    {
+      kind: "varDecl",
+      localId: "n.0",
+      init: { kind: "arrIntrinsic", method: "length", receiver: list, args: [], type: F64, loc },
+      loc,
+    },
+    {
+      kind: "for",
+      init: { kind: "varDecl", localId: "i.0", init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+      cond: { kind: "bin", op: "<", left: i, right: ref("n.0", F64), type: BOOL, loc },
+      update: {
+        kind: "assign",
+        localId: "i.0",
+        value: { kind: "bin", op: "+", left: i, right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc },
+        loc,
+      },
+      body: [{ kind: "bytesSet", arr: a, index: i, value: { kind: "arrayGet", arr: list, index: i, type: F64, loc }, loc }],
+      loc,
+    },
+    { kind: "return", value: a, loc },
+  ];
+  return {
+    name,
+    params: [
+      { localId: "a.0", name: "a", type: bytesT },
+      ...(fnT !== undefined ? [{ localId: "f.0", name: "f", type: fnT }] : []),
+    ],
+    returnType: bytesT,
+    locals: [
+      { id: "a.0", name: "a", type: bytesT, mutable: true },
+      ...(fnT !== undefined ? [{ id: "f.0", name: "f", type: fnT, mutable: false }] : []),
+      { id: "l.0", name: "l", type: listT, mutable: false },
+      { id: "n.0", name: "n", type: F64, mutable: false },
+      { id: "i.0", name: "i", type: F64, mutable: true },
+    ],
+    body,
+    loc,
+  };
+}
 
 /** Unit U: `%arr.indexOf.<n>(a, x)` — the indexOf intrinsic as a helper
  * call, so the hole fence can guard it as an expression. */
@@ -1778,9 +2196,6 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
   });
   return name;
 }
-
-/** Unit U: why sort fences an undefined element of a plain-typed array. */
-const SORT_UNDEF = "Node sorts undefined last without calling the comparator; this tier's sort does not model that for a plain-typed array";
 
 /** JS's default sort comparator for STRING elements, interned once:
    *
@@ -5602,6 +6017,9 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     if (!L.isStdlibMember(access)) return null;
     const loc = locOf(call);
     const nArgs = call.arguments.length;
+    if (L.undefSlots && (name === "sort" || name === "toSorted")) {
+      return lowerWasmBytesSortCall(L, call, access, receiverIr, name);
+    }
     if (receiverIr.elem === "u8" && name === "toSorted") {
       return lowerBytesToSortedCall(L, call, access, receiverIr);
     }

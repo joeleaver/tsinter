@@ -1055,6 +1055,10 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                     })();
             return E.newTemp(e.type, `scr_arr_len(${r.name}) ? ${present} : ${absent}`);
           }
+          case "sort":
+          case "toSorted":
+          case "typedSort":
+            throw new Error("the WasmGC lanes' sort intrinsic on the C lane");
           default: {
             const _exhaustive: never = method;
             void _exhaustive;

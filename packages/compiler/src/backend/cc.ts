@@ -23,6 +23,7 @@ let qjsPatchMemo: string | null = null;
 async function qjsPatchDigest(): Promise<string> {
   qjsPatchMemo ??= createHash("sha256")
     .update(await readFile(join(vendorEngineDir(), "quickjs.c")))
+    .update(await readFile(join(vendorEngineDir(), "tsinter_timsort.h")))
     .digest("hex")
     .slice(0, 12);
   return qjsPatchMemo;

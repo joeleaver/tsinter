@@ -70,7 +70,7 @@ const who = process.argv.length > 2 ? process.argv[2] : "world";
 
 **Process shape** — `process.argv[0]` is `"scriptc"` and `argv[1]` is the binary's path (positions line up with Node; `argv[2]` onward are your args). The uncaught-exception stderr line reads `Uncaught <value>` instead of Node's stack-trace block (exit code and pre-throw stdout are identical). Runtime errors carry `message` and Node's `code`, but not `errno`/`syscall`/`path`.
 
-**Comparator call sequences differ in `sort` and `toSorted`** (stable insertion sort here, TimSort in V8 — sorted results are byte-identical for consistent comparators), and **`localeCompare` compares code units**, not ICU collation.
+**`sort`, `toSorted` and `localeCompare` depend on the backend.** On `--backend wasm` and `wasm-native`, sorting is V8's own algorithm, so a comparator sees exactly Node's calls in Node's order, and `localeCompare` collates by ICU's root collation whatever the host's locale. On the `c` and `llvm` backends, sorted results are byte-identical for consistent comparators but the call sequence differs (an insertion sort for typed values, a merge sort for dynamic ones), and `localeCompare` collates ASCII only and stops by name on anything else.
 
 ## Dynamic-tier limits
 

@@ -1,5 +1,4 @@
 // Sort with a comparator: records by two keys, numbers descending.
-// (Sized small: the static lowering's sort is an insertion sort today, quadratic.)
 interface Rec {
   k: number;
   name: string;

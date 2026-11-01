@@ -9252,6 +9252,10 @@ class LlEmitter {
         B.line(`${t} = load ptr, ptr ${slot}`);
         return this.own({ name: t, type: e.type });
       }
+      case "sort":
+      case "toSorted":
+      case "typedSort":
+        throw new Error("the WasmGC lanes' sort intrinsic on the LLVM lane");
       default: {
         const _exhaustive: never = method;
         void _exhaustive;

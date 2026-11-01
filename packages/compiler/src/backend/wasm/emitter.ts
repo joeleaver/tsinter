@@ -240,6 +240,7 @@ import {
   INJECT_THROW,
 } from "./generators.js";
 import { StrBuilder, emitFlat, emitFlatCast, emitFlatInline, emitIfFlat, setFlatCrossing } from "./strings.js";
+import { ArraySort, emitNumberCompareDefault, type SortInstance } from "./sort.js";
 import { Ropes } from "./ropes.js";
 import { Slices, type SliceOpKind, type WinForm } from "./slices.js";
 import { CasingBuilder } from "./casing.js";
@@ -9591,6 +9592,7 @@ class Assembler {
       arrVec: () => this.dynVecInfo(),
       arrPush: () => this.vecs.pushOne(this.dynVecInfo()),
       arrNewLen: () => this.vecs.newLen(this.dynVecInfo()),
+      arraySort: () => this.arraySort,
       strCpAt: () => this.strs.cpAt(),
       errT: () => this.exc().errT,
       errName: () => ERR_NAME,
@@ -34496,12 +34498,269 @@ class Assembler {
         code.call(this.vecs.withHelper(info));
         this.emitPendingCheck();
         return;
+      case "sort":
+      case "toSorted":
+      case "typedSort":
+        this.emitArrSort(e, rt, info);
+        return;
       default: {
         const rest: never = e.method;
         this.refuse(`arrIntrinsic:${rest as string}`, e.loc);
         code.unreachable();
       }
     }
+  }
+
+  private arraySortField: ArraySort | null = null;
+
+  /** V8's sorts (sort.ts), one instance per element and comparator type. */
+  private get arraySort(): ArraySort {
+    this.arraySortField ??= new ArraySort(this.mb, () => this.exc().kindG);
+    return this.arraySortField;
+  }
+
+  /** `arr.sort` / `arr.toSorted` / the typed-array element sort: the comparator (or
+   * the default order's nothing) picks the instance; a comparator's exception
+   * surfaces at the pending check below. */
+  private emitArrSort(e: Extract<IrExpr, { kind: "arrIntrinsic" }>, rt: IrType & { kind: "array" }, info: VecInfo): void {
+    const code = this.fn.code;
+    const f = e.args[0];
+    const inst = this.sortInstanceFor(e.method === "typedSort", rt, info, f, e.loc);
+    if (inst === null) {
+      code.unreachable();
+      return;
+    }
+    const pushCtx = (): void => {
+      if (f !== undefined) this.walkExpr(f);
+      else code.i32Const(0);
+    };
+    // A union's own undefined where it has one: its observers read that, and the
+    // vector's reserved-tag hole only through arrayGet.
+    const unionUndef = rt.elem.kind === "union" ? this.undefinedArmTag(rt.elem.unionId) : -1;
+    const undef = (c: Code): void => {
+      if (unionUndef >= 0) c.globalGet(this.unions.unitGlobal(unionUndef));
+      else this.vecs.emitUndef(c, info);
+    };
+    if (e.method === "toSorted") {
+      this.walkExpr(e.receiver);
+      pushCtx();
+      code.call(this.arraySort.vecToSorted(inst, info, undef));
+      this.emitPendingCheck();
+      return;
+    }
+    const vec = this.acquireScratch(this.vecs.vecRef(info));
+    this.walkExpr(e.receiver);
+    code.localSet(vec);
+    code.localGet(vec);
+    pushCtx();
+    if (e.method === "typedSort") {
+      code.call(this.arraySort.vecTypedSort(inst, info, f !== undefined));
+    } else {
+      code.call(this.arraySort.vecSort(inst, info, undef, undef));
+    }
+    code.drop();
+    this.emitPendingCheck();
+    code.localGet(vec);
+    this.releaseScratch(this.vecs.vecRef(info), vec);
+  }
+
+  /** The sort instance over `info`'s elements. With a comparator, compare calls that
+   * closure; without, the default order: strings by UTF-16 code unit, numbers by their
+   * decimal spellings (SortCompareDefault, with its two-small-integers shortcut), and
+   * a typed array's numbers numerically. */
+  private sortInstanceFor(
+    typed: boolean,
+    rt: IrType & { kind: "array" },
+    info: VecInfo,
+    f: IrExpr | undefined,
+    loc: SrcLoc,
+  ): SortInstance | null {
+    const elem: ValType = info.elemVal.kind === "ref" ? { ...info.elemVal, nullable: true } : info.elemVal;
+    const base = {
+      elem,
+      arrayType: info.bufType,
+      packed: info.storage === "i8" || info.storage === "i16",
+    };
+    const classify = this.sortClassify(rt, info);
+    if (f === undefined) {
+      const key = `${info.key}:${typed ? "num" : "default"}`;
+      const hit = this.sortInstances.get(key);
+      if (hit !== undefined) return hit;
+      const compare = this.mb.declareFunc(this.mb.funcType([I32, elem, elem], [F64]), `%w.sort.${key}.compare`);
+      const inst: SortInstance = { ...base, key, ctx: I32, compare, classify };
+      this.sortInstances.set(key, inst);
+      const c = new Code();
+      if (typed) {
+        this.emitNumericCompare(c);
+        this.mb.setBody(compare, [], c.bytes());
+      } else if (rt.elem.kind === "f64") {
+        emitNumberCompareDefault(c, 1, 2, 3, 4, this.arraySort.smiCompare(), () => this.f64ToStrHelper(), () => this.strCmpHelper(true));
+        this.mb.setBody(compare, [I32, I32], c.bytes());
+      } else if (rt.elem.kind === "string") {
+        c.localGet(1);
+        this.emitFlat(c);
+        c.localGet(2);
+        this.emitFlat(c);
+        c.call(this.strCmpHelper(true));
+        c.f64ConvertI32S();
+        this.mb.setBody(compare, [], c.bytes());
+      } else {
+        throw new Error("emitter bug: a default-order sort over an element the lowering gives a comparator");
+      }
+      return inst;
+    }
+    const ct = f.type;
+    if (ct.kind !== "func") throw new Error("sort comparator is not a function");
+    const pair = this.closSigFor(ct, loc, false, true);
+    if (pair === null) return null;
+    // Every union shares one vector and closure representation; their undefined arms
+    // differ, so the classifier is part of what an instance is.
+    const key = `${info.key}:clos${pair.clos}:class${classify}`;
+    const hit = this.sortInstances.get(key);
+    if (hit !== undefined) return hit;
+    const ctx: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    const compare = this.mb.declareFunc(this.mb.funcType([ctx, elem, elem], [F64]), `%w.sort.${key}.compare`);
+    const inst: SortInstance = { ...base, key, ctx, compare, classify };
+    this.sortInstances.set(key, inst);
+    const c = new Code();
+    const nonNull = info.elemVal.kind === "ref" && !info.elemVal.nullable;
+    c.localGet(0);
+    for (let i = 0; i < ct.params.length; i++) {
+      c.localGet(1 + i);
+      if (nonNull) c.refAsNonNull();
+    }
+    c.localGet(0);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    // ToNumber of the answer. An undefined f64 is a NaN, and NaN is 0 to the sort.
+    switch (ct.ret.kind) {
+      case "f64":
+        break;
+      case "bool":
+        c.i32Const(1);
+        c.i32Eq();
+        c.f64ConvertI32U();
+        break;
+      case "void":
+        c.f64Const(0);
+        break;
+      case "string":
+        this.emitFlat(c);
+        c.call(this.strToNumHelper());
+        break;
+      default:
+        throw new Error(`emitter bug: a sort comparator answering ${ct.ret.kind}`);
+    }
+    this.mb.setBody(compare, [], c.bytes());
+    return inst;
+  }
+
+  private readonly sortInstances = new Map<string, SortInstance>();
+  private readonly sortClassifiers = new Map<string, number>();
+
+  /** %w.sort.classify:<elem>(x) → 0 an element, 1 its kind's undefined. A hole IS its
+   * kind's undefined on this tier (S119), and sorts where Node's hole would: past the
+   * elements, which only the hole fence's observers could tell from undefined. */
+  private sortClassify(rt: IrType & { kind: "array" }, info: VecInfo): number {
+    const unionUndefTag = rt.elem.kind === "union" ? this.undefinedArmTag(rt.elem.unionId) : -1;
+    const key = `${info.key}:${unionUndefTag}`;
+    const hit = this.sortClassifiers.get(key);
+    if (hit !== undefined) return hit;
+    const elem: ValType = info.elemVal.kind === "ref" ? { ...info.elemVal, nullable: true } : info.elemVal;
+    const idx = this.mb.declareFunc(this.mb.funcType([elem], [I32]), `%w.sort.classify:${key}`);
+    this.sortClassifiers.set(key, idx);
+    const c = new Code();
+    c.localGet(0);
+    if (info.elemKind === "f64") {
+      c.i64ReinterpretF64();
+      c.i64Const(UNDEF_F64_BITS);
+      c.i64Eq();
+    } else if (info.elemKind === "bool") {
+      c.i32Const(UNDEF_BOOL);
+      c.i32Eq();
+    } else if (rt.elem.kind === "union") {
+      if (elem.kind !== "ref") throw new Error("union vector element is not a ref");
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(1);
+      c.else_();
+      c.localGet(0);
+      c.structGet(elem.typeIndex, 0);
+      c.i32Const(UNDEF_UNION_TAG);
+      c.i32Eq();
+      c.localGet(0);
+      c.structGet(elem.typeIndex, 0);
+      c.i32Const(unionUndefTag);
+      c.i32Eq();
+      c.i32Or();
+      c.end();
+    } else if (rt.elem.kind === "dyn") {
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(1);
+      c.else_();
+      c.localGet(0);
+      c.structGet(this.dyn.dynT(), DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.end();
+    } else {
+      c.refIsNull();
+    }
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** (ctx, x, y) → f64: %TypedArray%.prototype.sort's default order, numeric with -0
+   * below +0 and NaN last. */
+  private emitNumericCompare(c: Code): void {
+    const X = 1;
+    const Y = 2;
+    const ret = (v: number): void => {
+      c.f64Const(v);
+      c.return_();
+    };
+    // x != x: NaN sorts last, NaNs tie
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne();
+    c.ifVoid();
+    c.localGet(Y);
+    c.localGet(Y);
+    c.f64Ne();
+    c.ifResult(F64);
+    c.f64Const(0);
+    c.else_();
+    c.f64Const(1);
+    c.end();
+    c.return_();
+    c.end();
+    c.localGet(Y);
+    c.localGet(Y);
+    c.f64Ne();
+    c.ifVoid();
+    ret(-1);
+    c.end();
+    c.localGet(X);
+    c.localGet(Y);
+    c.f64Lt();
+    c.ifVoid();
+    ret(-1);
+    c.end();
+    c.localGet(X);
+    c.localGet(Y);
+    c.f64Gt();
+    c.ifVoid();
+    ret(1);
+    c.end();
+    // equal: only the zeros' signs can tell them apart
+    c.f64Const(1);
+    c.localGet(X);
+    c.f64Copysign();
+    c.f64Const(1);
+    c.localGet(Y);
+    c.f64Copysign();
+    c.f64Sub();
   }
 
   /** Clears buf[len - 1] after a pop/shift (ref elements only): the
