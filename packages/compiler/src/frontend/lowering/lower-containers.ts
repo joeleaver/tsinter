@@ -7357,6 +7357,21 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
     return { kind: "call", callee: helper, args: [receiver], type: resultT, loc };
   }
 
+/** The pairs argument, lowered, in the array type the checker gave it. The
+   * lowering can disagree with the checker (`Object.entries(x).map(...)`
+   * where x itself only lowered checked-dynamic — the lowered chain is a
+   * dyn value the checker typed as a tuple array): such an argument is
+   * refused by name (GH #107: it reached the helper call and was an ICE). */
+  function fromEntriesArg(L: Lowerer, call: ts.CallExpression, argNode: ts.Expression, argIr: IrType & { kind: "array" }): IrExpr {
+    const receiver = L.lowerExpr(argNode);
+    if (typeEquals(receiver.type, argIr)) return receiver;
+    L.unsupported(
+      "SC1090",
+      call,
+      `Object.fromEntries over a '${L.fmt(receiver.type)}' value where the checker typed '${L.fmt(argIr)}' (the pairs did not lower to a static array)`,
+    );
+  }
+
 /** `Object.fromEntries(pairs)` over a `[string, V][]` VALUE into the
    * checker's own index-signature result shape (`{ [k: string]: V }` —
    * always declared-field-free from the lib signature): an interned helper
@@ -7421,7 +7436,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
         `Object.fromEntries over '${L.fmt(argIr)}' (the tuple's '${L.fmt(valT)}' value cannot flow into the '${L.fmt(iv)}' signature slot)`,
       );
     }
-    const receiver = L.lowerExpr(argNode);
+    const receiver = fromEntriesArg(L, call, argNode, argIr);
     const key = `obj.fromEntries:${argIr.elem.shapeId}:${resultT.shapeId}`;
     let helper = L.arrHofHelpers.get(key);
     if (!helper) {
@@ -7499,7 +7514,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       kind: "record",
       shapeId: L.shapes.intern([], false, valT, []),
     };
-    const receiver = L.lowerExpr(argNode);
+    const receiver = fromEntriesArg(L, call, argNode, argIr);
     const key = `obj.fromEntries:strrows:${resultT.shapeId}`;
     let helper = L.arrHofHelpers.get(key);
     if (!helper) {

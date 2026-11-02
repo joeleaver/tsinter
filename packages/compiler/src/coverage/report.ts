@@ -99,7 +99,9 @@ export function renderCoverage(input: CoverageInput, opts: { color?: boolean; so
     // (SC1xxx from checkPreflight — lowering-style blockers that shape
     // the module graph, reported as blockers instead of masquerading as
     // "TypeScript errors").
-    const config = input.diagnostics.filter((d) => d.code === "SC0002");
+    // An entry the checker's program does not contain (SC0005) reads the
+    // same way: nothing to analyze, and the message says why.
+    const config = input.diagnostics.filter((d) => d.code === "SC0002" || d.code === "SC0005");
     if (config.length > 0) {
       out.push(`  ${c(RED, "not analyzable")}: ${config[0]!.message}`);
       return out.join("\n");

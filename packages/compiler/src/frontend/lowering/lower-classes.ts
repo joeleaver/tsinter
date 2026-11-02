@@ -6,7 +6,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, UNDEFINED_T, URL_T, VOID, arrayOf, isSupportedMapKey, isUnitType, typeEquals } from "../../ir/nodes.js";
-import { MAX_GENERIC_INSTANCES, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
+import { MAX_GENERIC_INSTANCES, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
@@ -290,7 +290,9 @@ export interface GenericClassInfo {
     if (!isJsSourceFile(fnLike.getSourceFile())) return null;
     if (fnLike.asteriskToken !== undefined) return null;
     if (fnLike.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
-    const stmts = fnLike.body.statements;
+    const block = blockBodyOf(fnLike);
+    if (!block) return null;
+    const stmts = block.statements;
     const last = stmts[stmts.length - 1];
     if (!last || !ts.isReturnStatement(last)) return null;
     const returns: ts.ReturnStatement[] = [];
@@ -4117,7 +4119,13 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
       // (JS allows this in method defaults; it is param 0 here).
       const declared = L.declareParams(fnLike.parameters, sig.params);
       params.push(...declared.params);
-      const body = [...declared.prologue, ...L.lowerStmts(fnLike.body.statements)];
+      // blockBodyOf, never `.body`: a JSDoc `@type` on a method or setter
+      // makes tsgo's client AST answer the TYPE node as `.body` (an
+      // upstream typescript-go decoding bug; GH #107 — the lowerStmts
+      // crash). The real Block is still among the children.
+      const block = blockBodyOf(fnLike);
+      if (!block) L.unsupported("SC1090", fnLike, "methods whose block body the frontend cannot locate");
+      const body = [...declared.prologue, ...L.lowerStmts(block.statements)];
       const fn: IrFunction = {
         name: `%${className}.${mName}`,
         params,
@@ -4174,9 +4182,13 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
     fnCtx.isAsync = isAsync;
     L.fnStack.push(fnCtx);
     try {
-      entry.member.body.forEachChild(checkThis);
+      // blockBodyOf: see lowerClassMethodMemberInner (a JSDoc @type hides
+      // the body from tsgo's client AST).
+      const block = blockBodyOf(entry.member);
+      if (!block) L.unsupported("SC1090", entry.member, "methods whose block body the frontend cannot locate");
+      block.forEachChild(checkThis);
       const declared = L.declareParams(entry.member.parameters, entry.params);
-      const body = [...declared.prologue, ...L.lowerStmts(entry.member.body.statements)];
+      const body = [...declared.prologue, ...L.lowerStmts(block.statements)];
       const fn: IrFunction = {
         name: `%${info.def.name}.static:${name}`,
         params: declared.params,

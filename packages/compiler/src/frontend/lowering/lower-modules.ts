@@ -706,6 +706,21 @@ function deferJsCollectionDiags(L: Lowerer, sf: ts.SourceFile, diagsBefore: numb
 /** A scalar-literal expression a single-value `module.exports =` can carry
  * without any declaration to alias to: string/number/boolean literals,
  * substitution-free templates, and negated numbers. */
+/** True when a module-scope variable or class declaration of `sf` binds
+ * `name` — the bindings that own a `%g.<tag><name>` global. */
+function topLevelBindsName(sf: ts.SourceFile, name: string): boolean {
+  for (const s of sf.statements) {
+    if (ts.isVariableStatement(s)) {
+      for (const d of s.declarationList.declarations) {
+        if (boundIdentifiersOf(d.name).some((id) => id.text === name)) return true;
+      }
+    } else if (ts.isClassDeclaration(s) && s.name?.text === name) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function cjsScalarLiteral(e: ts.Expression): boolean {
   if (ts.isNumericLiteral(e) || ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) return true;
   if (e.kind === ts.SyntaxKind.TrueKeyword || e.kind === ts.SyntaxKind.FalseKeyword) return true;
@@ -909,7 +924,13 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
                 }
               }
             }
-            const g: IrGlobal = { id: `%g.${tag}${name}`, name, type: t, mutable: false };
+            // The export's own storage must not take the id of a same-named
+            // module-scope binding (`var count = 0; ... exports.count =
+            // function () { return count; }` — two globals under one id was
+            // an ICE, GH #107): a collision moves the export to its
+            // `%export.` id, the mutable-source case's spelling.
+            const id = topLevelBindsName(sf, name) ? `%g.${tag}%export.${name}` : `%g.${tag}${name}`;
+            const g: IrGlobal = { id, name, type: t, mutable: false };
             L.globalsBySymbol.set(symbol, g);
             // Importer aliases resolve to a DISTINCT late-bound symbol with
             // the same declaration — key the node too (globalOf's fallback).

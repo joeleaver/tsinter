@@ -211,6 +211,17 @@ export interface StartupCrash {
   loc: { file: string; start: number; end: number };
 }
 
+/** The entry is not a source file of the program tsgo builds for it — a
+ * missing file, or a declaration file under node_modules (a library's
+ * type surface: tsgo never makes one a program source). compile() and
+ * analyze() report it as SC0005 (entryLoadDiag), never a thrown error
+ * (GH #107: the survey's `.d.ts` entries crashed analyze()). */
+export class EntryLoadError extends Error {
+  constructor(readonly entryPath: string) {
+    super(`could not load ${entryPath}`);
+  }
+}
+
 function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { disposeAll: () => void } {
   const config = adoptProjectConfig7(host, entryPath);
   const nodeTypes = config.configFile ? resolveNodeTypes7(entryPath) : null;
@@ -234,7 +245,10 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const coreRoots = [entryPath, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
   const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
   const entry = program.getSourceFile(entryPath);
-  if (!entry) throw new Error(`could not load ${entryPath}`);
+  if (!entry) {
+    program.dispose();
+    throw new EntryLoadError(entryPath);
+  }
   let projectWorld: ts.Program | null = null;
   return {
     program,
@@ -300,7 +314,13 @@ export function loadProgram(
       (npmShadow?.hideFile(path) ?? false) || projectDtsRuntimeSibling(path) !== null,
   };
   const host = new ts.Ts7Host({ cwd: dirname(entryPath), fsShadow });
-  const load = loadProgram7(host, entryPath);
+  let load: ReturnType<typeof loadProgram7>;
+  try {
+    load = loadProgram7(host, entryPath);
+  } catch (e) {
+    host.close();
+    throw e;
+  }
   return {
     ...load,
     dispose: () => {

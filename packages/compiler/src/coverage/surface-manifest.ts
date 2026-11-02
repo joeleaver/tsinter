@@ -90,7 +90,7 @@ const COVERAGE_NOTES: string[] = [
   "stdlib and node-builtin member entries name surface whose LOWERED call forms are constrained (arity, argument shapes); declared call forms outside the lowered set are refused per site, with code SC2020 for standard-library and node-builtin surface.",
   "Entries with status 'unsupported' or 'dynamic-only' describe where the named code is raised: forms of the construct outside the supported subset are refused with that code — not that every form of the named feature is refused. Supported forms appear as their own static entries where a table projects them.",
   "Entries with status 'dynamic-only' compile when the build embeds the dynamic engine (--dynamic); without the flag each use site is refused with the entry's code.",
-  "Process-level diagnostic codes are not surface entries: SC0001-SC0004 are preflight gates, SC1110 is a comptime evaluation failure, SC3001 is the alternate-backend tier refusal, SC9001/SC9002 are internal errors.",
+  "Process-level diagnostic codes are not surface entries: SC0001-SC0005 are preflight gates, SC1110 is a comptime evaluation failure, SC3001 is the alternate-backend tier refusal, SC9001/SC9002 are internal errors.",
   "No scheduling metadata is published; entry ids are the stable diff keys across releases.",
 ];
 

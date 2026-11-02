@@ -1,0 +1,15 @@
+void-ternary-value.ts:7:18 - error SC1090: a conditional expression whose arms produce no value (void), used as a value (write it as an if statement) is not supported yet
+
+  6 | function report(flag: boolean): void {
+  7 |   const result = flag ? console.log("yes") : console.log("no");
+    |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  8 |   console.log(result);
+
+void-ternary-value.ts:8:15 - error SC2004: uses of 'result' inherit the blocker on its declaration
+
+  7 |   const result = flag ? console.log("yes") : console.log("no");
+  8 |   console.log(result);
+    |               ^~~~~~
+  9 | }
+
+  hint: the declaration of 'result' did not compile — fix the diagnostic reported there and these sites clear with it

@@ -8467,6 +8467,12 @@
     "<repo>/tests/fixtures/node-types/stream-capture.ts"
    ],
    "diags": []
+  },
+  "<repo>/tests/diagnostics/void-ternary-value.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/void-ternary-value.ts"
+   ],
+   "diags": []
   }
  }
 }

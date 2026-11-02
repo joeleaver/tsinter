@@ -13,7 +13,7 @@ import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, j
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
-import { ffiBindingDiag, ffiSignatureDiag, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
+import { blockedBindingUseDiag, ffiBindingDiag, ffiSignatureDiag, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
@@ -28,6 +28,7 @@ import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUn
 import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
+import { lowerVoidTernaryStatement } from "./lower-stmts.js";
 
 /** How a parameter participates in CALL-SITE COMPLETION (the frontend
  * completes every call to the one full signature, so the IR and backends
@@ -145,8 +146,11 @@ export interface GenericInstance {
   /** Implicit instances only: eager-lowering lifecycle. "lowering" while
    * the body builds (a re-demand is same-key recursion: the caller uses
    * the PINNED fallback returnType and returnPinned locks it); "done" once
-   * returnType holds the inferred (or pinned) truth. */
-  implicitState?: "lowering" | "done";
+   * returnType holds the inferred (or pinned) truth; "failed" when the body
+   * poisoned — the instance has no function, so every later demand fences
+   * (GH #107: a second call site reused the key and called a function the
+   * module never got). */
+  implicitState?: "lowering" | "done" | "failed";
   /** Same-key recursion observed the fallback return type mid-lowering, so
    * the ABI is locked to it — the return post-pass coerces every return
    * value to the pinned type instead of adopting the inferred one. */
@@ -1459,8 +1463,13 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         // local arrows (`(cmd) => [cmd.name()].concat(cmd.aliases())`),
         // whose inferred return is simply the expression's own type.
         if (fnCtx.inferReturn) {
-          const value = L.lowerExpr(decl.body);
-          if (value.type.kind === "void") {
+          const voidTernary = isAsync ? null : lowerVoidTernaryStatement(L, decl.body, true);
+          const value: IrExpr = voidTernary ? { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(decl.body) } : L.lowerExpr(decl.body);
+          if (voidTernary) {
+            body.push(voidTernary);
+            bodyReturn = resolveInferredReturn(L, inst, fnCtx.inferReturn, body, decl);
+            appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(decl));
+          } else if (value.type.kind === "void") {
             body.push({ kind: "exprStmt", expr: value, loc: locOf(decl.body) });
             bodyReturn = resolveInferredReturn(L, inst, fnCtx.inferReturn, body, decl);
             appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(decl));
@@ -1544,7 +1553,10 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         final = DYN; // no valued return: JS completes with undefined — the dyn undefined, today's slot
       } else if (distinct.length === 1) {
         const t = distinct[0]!;
-        final = !sawBare ? t : t.kind === "dyn" ? DYN : (L.withUndefinedArmOf(t) ?? DYN);
+        // A bare unit (every valued return is `null`, or `undefined` —
+        // the other returns fenced away) has no standalone slot type; the
+        // dyn unit carries it (GH #107: a nullT return type was an ICE).
+        final = isUnitType(t) ? DYN : !sawBare ? t : t.kind === "dyn" ? DYN : (L.withUndefinedArmOf(t) ?? DYN);
       } else {
         final = DYN; // disagreeing returns: the checked-dynamic join
       }
@@ -1953,7 +1965,21 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     argTypes: Map<ts.Symbol, ts.Type>,): GenericInstance {
     const key = shapes.map((s) => typeKey(s.type)).join(",");
     let inst = info.instances.get(key);
-    if (inst) return inst;
+    if (inst?.implicitState === "failed") {
+      // The instance's body did not compile (its own diagnostic is
+      // recorded where the body failed): this use inherits that blocker.
+      L.pushDiag(blockedBindingUseDiag(info.baseName, locOf(blame)));
+      throw new PoisonError();
+    }
+    if (inst) {
+      // Same-key recursion while the body is still lowering: this caller
+      // types its call with the fallback return the instance promised, so
+      // that type is now the ABI — lock it (resolveInferredReturn coerces
+      // every return onto it instead of adopting the inferred one; GH #107:
+      // an unlocked instance settled on `func` under a `dyn`-typed call).
+      if (inst.implicitState === "lowering") inst.returnPinned = true;
+      return inst;
+    }
     if (info.instances.size >= MAX_GENERIC_INSTANCES) {
       L.unsupported(
         "SC1090",
@@ -1989,7 +2015,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       L.implicitFns.push(fn);
     } catch (e) {
       if (!(e instanceof PoisonError)) throw e;
-      inst.implicitState = "done";
+      inst.implicitState = "failed";
       throw e;
     }
     inst.implicitState = "done";
@@ -5331,12 +5357,65 @@ const inliningPredicates = new Set<ts.Symbol>();
    * is a compile error here, not a silent divergence). Self-references inside
    * the body lower to `selfRef`, not a capture: a box holding its own
    * closure would be an RC cycle. */
-  export function lowerNestedFunctionDecl(L: Lowerer, stmt: ts.FunctionDeclaration): IrStmt {
+  export function lowerNestedFunctionDecl(L: Lowerer, stmt: ts.FunctionDeclaration): IrStmt[] {
     if (!stmt.name) L.unsupported("SC1090", stmt, "anonymous function declarations");
     const { funcType } = L.lambdaSignature(stmt);
+    const loc = locOf(stmt);
+    // A REASSIGNED declaration (Babel's lazy-require helper `function
+    // _chalk() { const data = ...; _chalk = function () { return data; };
+    // return data; }`, regenerator's `define = function (...) {...}` in a
+    // catch): a function declaration's name is an ordinary mutable binding
+    // of its scope in JS, so the slot is mutable, and the body reads the
+    // BINDING (a capture), never itself — after the write, a call through
+    // the name inside the old body reaches the new function, exactly Node.
+    // The slot is declared empty and assigned after, so the closure can
+    // capture its own binding's box (GH #107: the immutable slot was an
+    // ICE). The new value must ride the declaration's func type; a value
+    // that cannot is refused at the assignment by the ordinary coercion.
+    const sym = L.checker.getSymbolAtLocation(stmt.name);
+    if (sym && !bindingNeverReassigned(L, sym, stmt)) {
+      // A replacement function whose return type differs cannot ride the
+      // slot's func type: name that shape at the declaration instead of a
+      // value-check fence deep inside a later call.
+      const name = stmt.name.text;
+      const visit = (n: ts.Node): void => {
+        if (
+          ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          ts.isIdentifier(n.left) && n.left.text === name && L.resolveValueSymbol(n.left) === sym
+        ) {
+          let rhs: ts.Expression = n.right;
+          while (ts.isParenthesizedExpression(rhs)) rhs = rhs.expression;
+          if (ts.isFunctionExpression(rhs) || ts.isArrowFunction(rhs)) {
+            let ret: IrType | null = null;
+            const diagsBefore = L.diags.length;
+            try {
+              ret = L.lambdaSignature(rhs).funcType.ret;
+            } catch (e) {
+              if (!(e instanceof PoisonError)) throw e;
+              L.diags.length = diagsBefore;
+            }
+            if (ret !== null && !typeEquals(ret, funcType.ret)) {
+              L.unsupported(
+                "SC1090",
+                n,
+                `a function declaration ('${name}', returning '${L.fmt(funcType.ret)}') reassigned to a function returning '${L.fmt(ret)}'`,
+              );
+            }
+          }
+        }
+        n.forEachChild(visit);
+      };
+      stmt.getSourceFile().forEachChild(visit);
+      const local = L.declareLocal(stmt.name, stmt.name.text, funcType, true);
+      const init = L.lowerLambda(stmt, { selfBinding: false });
+      return [
+        { kind: "varDecl", localId: local.id, init: null, loc },
+        { kind: "assign", localId: local.id, value: init, loc },
+      ];
+    }
     const local = L.declareLocal(stmt.name, stmt.name.text, funcType, false);
     const init = L.lowerLambda(stmt);
-    return { kind: "varDecl", localId: local.id, init, loc: locOf(stmt) };
+    return [{ kind: "varDecl", localId: local.id, init, loc }];
   }
 
 /** Signature checks + param shapes + IR func type for any lambda-like
@@ -5523,7 +5602,7 @@ const inliningPredicates = new Set<ts.Symbol>();
 /** Lifts an arrow function / function expression / nested declaration /
    * object-literal shorthand method to a module-level function and yields
    * the `closure` expression creating it. */
-  export function lowerLambda(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration,): IrExpr {
+  export function lowerLambda(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
     const loc = locOf(node);
     const { shapes, funcType } = L.lambdaSignature(node);
     // A lambda IS a value: the exact-arity rule applies at birth. The
@@ -5543,8 +5622,10 @@ const inliningPredicates = new Set<ts.Symbol>();
     const fnName = `%fn${L.lambdaCounter++}${baseName ? `_${baseName}` : ""}`;
     // Named function expressions/declarations can self-reference by name; an
     // object-literal method's name is a PROPERTY, not a binding — no self.
+    // A reassigned nested declaration (selfBinding false) reads its name
+    // through the enclosing binding instead (lowerNestedFunctionDecl).
     const selfSymbol =
-      nameIdent && !ts.isMethodDeclaration(node) && !ts.isAccessor(node)
+      nameIdent && !ts.isMethodDeclaration(node) && !ts.isAccessor(node) && opts?.selfBinding !== false
         ? (L.checker.getSymbolAtLocation(nameIdent) ?? null)
         : null;
 
@@ -5584,8 +5665,13 @@ const inliningPredicates = new Set<ts.Symbol>();
       }
 
       let body: IrStmt[];
-      if (ts.isBlock(node.body!)) {
-        body = L.lowerStmts(node.body!.statements);
+      // Only an ARROW has an expression body; every other function-like's
+      // body is its Block, recovered by kind (blockBodyOf — a JSDoc @type
+      // makes tsgo's client AST answer the type node as `.body`).
+      const block = ts.isArrowFunction(node) ? (ts.isBlock(node.body) ? node.body : null) : blockBodyOf(node);
+      if (!ts.isArrowFunction(node) && !block) L.unsupported("SC1090", node, "functions whose block body the frontend cannot locate");
+      if (block) {
+        body = L.lowerStmts(block.statements);
       } else {
         // Bare-expression arrow body: `x => e` is `x => { return e; }`
         // (or an expression statement when the signature returns void — or
@@ -5602,8 +5688,13 @@ const inliningPredicates = new Set<ts.Symbol>();
           // `(name) => void doThing(name)`, the fire-and-forget arrow).
           let stripped: ts.Expression = bodyExpr;
           while (ts.isParenthesizedExpression(stripped)) stripped = stripped.expression;
+          // A ternary with a void arm (`(er, v) => er ? rej(er) : res(v)`)
+          // is likewise a statement here (lowerVoidTernaryStatement).
+          const voidTernary = isAsync ? null : lowerVoidTernaryStatement(L, stripped);
           if (ts.isVoidExpression(stripped)) {
             body = [L.lowerExprStatement(stripped)];
+          } else if (voidTernary) {
+            body = [voidTernary];
           } else {
             let value = L.lowerExpr(bodyExpr);
             // `async (): Promise<void> => p`: the function's promise is
@@ -7736,7 +7827,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
  * 09-lower-stmts-undefined crash signature) while the actual Block sits
  * elsewhere in the children — so recover it by kind, never by slot. Null
  * when the declaration truly has no block. */
-function blockBodyOf(decl: ts.FunctionLikeDeclaration): ts.Block | null {
+export function blockBodyOf(decl: ts.FunctionLikeDeclaration): ts.Block | null {
   const body = decl.body;
   if (body === undefined) return null;
   if (ts.isBlock(body)) return body;

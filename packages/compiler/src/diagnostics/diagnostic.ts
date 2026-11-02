@@ -6,8 +6,9 @@
  * Code bands:
  *   SC0xxx  preflight gates: TypeScript errors passed through (SC0001),
  *            project-config incompatibilities (SC0002), malformed imported
- *            JSON modules (SC0003), and upstream tsgo checker panics
- *            surfaced as source-anchored diagnostics (SC0004)
+ *            JSON modules (SC0003), upstream tsgo checker panics
+ *            surfaced as source-anchored diagnostics (SC0004), and an
+ *            entry file the checker's program does not contain (SC0005)
  *   SC1xxx  supported-TypeScript-not-yet: valid TS outside the current subset
  *   SC2xxx  scriptc type rules (types we cannot compile yet)
  *   SC3xxx  backend coverage: the program is compilable (the C backend
@@ -364,6 +365,24 @@ export function checkerPanicDiag(detail: string, loc: SrcLoc): ScrDiagnostic {
     code: "SC0004",
     message: `the TypeScript checker crashed answering a query here (an upstream typescript-go bug): ${stable}`,
     loc,
+  };
+}
+
+/** The entry file is not a source of the program the checker builds for
+ * it (program.ts EntryLoadError): a file that does not exist, or a
+ * declaration file inside node_modules — a library's type surface, which
+ * tsgo never takes as a program source. A gate, never a thrown error. */
+export function entryLoadDiag(entryPath: string, exists: boolean): ScrDiagnostic {
+  const isDts = /\.d\.[cm]?ts$|\.d\.[^./]+\.ts$/.test(entryPath);
+  const why = !exists
+    ? "the file does not exist"
+    : isDts
+      ? "it is a declaration file (.d.ts) the TypeScript checker did not load as a program source (inside node_modules it is a library's type surface); it has no code to compile"
+      : "the TypeScript checker did not include it in the program it built for it";
+  return {
+    code: "SC0005",
+    message: `the entry '${entryPath}' cannot be compiled: ${why}`,
+    loc: { file: entryPath, start: 0, end: 0 },
   };
 }
 

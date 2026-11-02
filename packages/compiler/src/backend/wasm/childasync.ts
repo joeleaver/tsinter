@@ -277,7 +277,12 @@ export class ChildAsyncBuilder {
    * child.stderr's non-null arm). */
   streamType(): number {
     if (this.streamTField === null) {
-      if (!this.deps.pipes) throw new Error("emitter bug: a child stream in a module the pipe prescan did not mark");
+      // A module the pipe prescan did not mark can still DECLARE a
+      // childStream slot whose producer never made it into the IR (`const
+      // out = child.stdout;` in a statement fenced at runtime — esbuild's
+      // service setup, GH #107: this threw out of compile). The type is
+      // minted for the slot's declaration; no value of it can exist, since
+      // no reachable child.stdout/stderr read produces one.
       this.streamTField = this.mb.structType([
         { storage: I32, mutable: false },
         { storage: I32, mutable: false },

@@ -552,7 +552,67 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       }
       return lowerTaggedTemplate(L, expr);
     }
-    if (ts.isParenthesizedExpression(expr)) return L.lowerExpr(expr.expression);
+    if (ts.isParenthesizedExpression(expr)) {
+      const inner = L.lowerExpr(expr.expression);
+      // A JSDoc cast of a checked-dynamic value to a composite type, as the
+      // receiver of a WRITE (`(/** @type {{x: number}} */ (q)).x = 9`): the
+      // member write would go through the checked cast's COPY, and Node
+      // writes the original — refused by name (the #107 review).
+      // (The checker may already type the inner read as the cast, so the
+      // inner value arrives as that checked cast: a dynCheck to a
+      // composite IS the copy.)
+      const composite = (t: IrType | null): boolean =>
+        t !== null && (t.kind === "record" || t.kind === "object" || t.kind === "union" || t.kind === "array");
+      if (
+        isJsSourceFile(expr.getSourceFile()) && parenIsWriteReceiver(expr) &&
+        ((inner.kind === "dynCheck" && composite(inner.type)) || inner.type.kind === "dyn")
+      ) {
+        const cast = inner.kind === "dynCheck" ? inner.type : L.mapTypeOf(L.typeOf(expr));
+        if (composite(cast)) {
+          L.unsupported(
+            "SC1090",
+            expr,
+            `JSDoc @type casts that change a value's type ('${L.fmt(DYN)}' cast to '${L.fmt(cast!)}' — a comment cast has no runtime check; narrow with instanceof instead)`,
+          );
+        }
+      }
+      // A JSDoc cast in JavaScript (`/** @type {Dimension} */ (node)`):
+      // the parentheses carry a type the inner value does not have. A
+      // reference value cast to a DIFFERENT class/union/record has no
+      // lowering (no checked downcast exists for comment casts): name it
+      // (GH #107: the value kept its own class under the cast's type — an
+      // ICE, or a thrown lowerer bug at a union read). Same-type casts and
+      // casts of primitives and dyn values erase as before.
+      if (
+        (inner.type.kind === "object" || inner.type.kind === "union" || inner.type.kind === "record") &&
+        isJsSourceFile(expr.getSourceFile())
+      ) {
+        const cast = L.mapTypeOf(L.typeOf(expr));
+        if (cast && cast.kind !== "dyn" && cast.kind !== "jsval" && !typeEquals(cast, inner.type)) {
+          // A cast never changes identity: only a widening that keeps the
+          // reference — a subclass to its base (`upcast`) — lowers. A cast
+          // that would need a conversion (an object or record re-shaped
+          // into a record, which COPIES) stays refused: a write through it
+          // would land on the copy (`(/** @type {{x: number}} */ (this)).x
+          // = 0`).
+          const diagsBefore = L.diags.length;
+          try {
+            const widened = L.coerceInto(expr, inner, cast);
+            if (typeEquals(widened.type, cast) && widened.kind === "upcast" && widened.value === inner) return widened;
+          } catch (e) {
+            if (!(e instanceof PoisonError)) throw e;
+            L.diags.length = diagsBefore;
+          }
+          L.diags.length = diagsBefore;
+          L.unsupported(
+            "SC1090",
+            expr,
+            `JSDoc @type casts that change a value's type ('${L.fmt(inner.type)}' cast to '${L.fmt(cast)}' — a comment cast has no runtime check; narrow with instanceof instead)`,
+          );
+        }
+      }
+      return inner;
+    }
     // Type-level wrappers: `satisfies` and `!` erase completely; the runtime
     // value is the inner expression's. `as` erases too UNLESS the inner
     // value is dyn ('unknown') — then the cast is THE dynamic boundary and
@@ -2404,6 +2464,26 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
   }
 
 
+/** True when `paren` (through further parentheses) is the receiver of a
+ * member/element write: an assignment or compound-assignment target,
+ * `++`/`--`, or `delete`. */
+function parenIsWriteReceiver(paren: ts.Expression): boolean {
+  let n: ts.Node = paren;
+  while (ts.isParenthesizedExpression(n.parent)) n = n.parent;
+  const access = n.parent;
+  if (!(ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) || access.expression !== n) return false;
+  let target: ts.Node = access;
+  while (ts.isParenthesizedExpression(target.parent)) target = target.parent;
+  const p = target.parent;
+  if (ts.isBinaryExpression(p) && p.left === target) {
+    const k = p.operatorToken.kind;
+    return k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment;
+  }
+  if ((ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) &&
+    (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken)) return true;
+  return ts.isDeleteExpression(p);
+}
+
 /** `c ? a : b` — see the inline comments. `expected` plays the contextual
    * array type's role when the caller knows the slot's array type and tsc's
    * API doesn't surface it (a ternary as a SPREAD source — lowerArrayLiteral
@@ -2653,6 +2733,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       const else_ = dynJoin ? intoDyn(elseRaw) : L.coerceInto(expr.whenFalse, elseRaw, type);
       if (then.type.kind !== type.kind || else_.type.kind !== type.kind) {
         L.badType(expr, L.typeOf(expr));
+      }
+      // Both arms void, in a position that READS the value (statement
+      // positions lower as an if — lowerVoidTernaryStatement): the
+      // ternary has no value representation (GH #107: this was an ICE).
+      if (type.kind === "void") {
+        L.unsupported("SC1090", expr, "a conditional expression whose arms produce no value (void), used as a value (write it as an if statement)");
       }
       return { kind: "ternary", cond, then, else_, type, loc };
       } finally {
@@ -8572,8 +8658,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       ) {
         const bi = L.builtinMemberOf(expr.left);
         if (bi && bi.module === "events" && bi.member === "defaultMaxListeners") {
-          const rhs = L.lowerExpr(expr.right);
-          if (rhs.type.kind === "dyn" || rhs.kind === "unitLit" || L.dynConvertible(rhs.type)) {
+          let rhs = L.lowerExpr(expr.right);
+          if (isUnitType(rhs.type)) rhs = { kind: "dynFrom", value: rhs, type: DYN, loc: rhs.loc };
+          if (rhs.type.kind === "dyn" || L.dynConvertible(rhs.type)) {
             const valTmp = L.declareHiddenLocal("%setVal", rhs.type);
             const valRef = (): IrExpr => ({ kind: "varRef", localId: valTmp.id, type: rhs.type, loc });
             const dynVal: IrExpr =
@@ -8658,7 +8745,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           const recv = probeLower(L, expr.left.expression);
           if (recv && recv.type.kind === "dyn") {
             const recvTmp = L.declareHiddenLocal("%setRecv", DYN);
-            const rhsVal = L.lowerExpr(expr.right);
+            // A bare unit RHS (`a.x = b.y = void 0`, the bundler's export
+            // reset) has no standalone slot: it rides as the dyn unit, the
+            // value the dyn write stores anyway (GH #107: an undefinedT
+            // temp was an ICE).
+            let rhsVal = L.lowerExpr(expr.right);
+            if (isUnitType(rhsVal.type)) rhsVal = { kind: "dynFrom", value: rhsVal, type: DYN, loc: rhsVal.loc };
             const valTmp = L.declareHiddenLocal("%setVal", rhsVal.type);
             const valRef = (): IrExpr => ({ kind: "varRef", localId: valTmp.id, type: rhsVal.type, loc });
             const stored = L.coerceToExpected(valRef(), DYN);
@@ -11353,7 +11445,16 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
       return null;
     }
     if (value.type.kind !== "union") {
-      throw new Error("lowerer bug: union-typed receiver lowered to a non-union");
+      // The checker's union comes from something the lowering does not
+      // model — a JSDoc cast in JavaScript (`/** @type {A | B} */ (node)
+      // .op`, whose value lowers as its declared base class): there is no
+      // runtime narrowing to read through, so name it (GH #107: this was
+      // a thrown lowerer bug out of analyze()).
+      L.unsupported(
+        "SC1090",
+        expr,
+        `reading '${expr.name.text}' through a receiver the checker types '${L.checker.typeToString(L.typeOf(expr.expression))}' but whose value is '${L.fmt(value.type)}' (a JSDoc @type cast has no lowering — the value keeps its own type)`,
+      );
     }
     const def = L.unions.get(value.type.unionId);
     if (!def) throw new Error(`lowerer bug: unknown union ${value.type.unionId}`);

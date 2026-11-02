@@ -205,6 +205,20 @@ export interface FnCtx {
    * doesn't implement; see rejectJumpCrossingFinally). Per function: a
    * nested function's jumps never bind to enclosing constructs. */
   ctl: { kind: "loop" | "switch" | "block" | "tryFinally" | "finallyBlock"; labels?: string[] }[];
+  /** `var` bindings hoisted to this function's root (hoistVarBinding,
+   * predeclareForwardVar), keyed by the checker's merged symbol — every
+   * same-name `var` in one function is one symbol, so one slot. PER
+   * CONTEXT, never per Lowerer: one source function lowers more than once
+   * (implicit-any instances, generic instantiations), and each lowering
+   * declares its own slot (GH #107: a Lowerer-wide map handed the second
+   * instance the FIRST instance's local). Module-scope vars live in
+   * globalsBySymbol instead. */
+  hoistedVars: Map<ts.Symbol, IrLocal>;
+  /** Nested function DECLARATIONS this function lowered eagerly by the
+   * forward-hoisting machinery (predeclareForwardFnDecl, the switch-clause
+   * hoist): the statement loop skips the source statement when it arrives.
+   * Per context for the same reason as hoistedVars. */
+  hoistedFnDecls: Set<ts.FunctionDeclaration>;
 }
 
 export function newFnCtx(
@@ -224,6 +238,8 @@ export function newFnCtx(
     selfType,
     returnType,
     ctl: [],
+    hoistedVars: new Map(),
+    hoistedFnDecls: new Set(),
   };
 }
 
@@ -1214,16 +1230,8 @@ export class Lowerer {
    * lowerVarDecl consumes the entry when the source declaration arrives and
    * emits the initializing `assign` instead of a fresh declaration. */
   readonly tdzPredeclared = new Map<ts.Symbol, IrLocal>();
-  /** Nested function DECLARATIONS lowered eagerly by the forward-hoisting
-   * machinery (predeclareForwardFnDecl — a reference above the declaration
-   * in the same function, JS's function hoisting): the statement loop skips
-   * the source statement when it arrives. */
-  readonly hoistedFnDecls = new Set<ts.FunctionDeclaration>();
-  /** `var` bindings hoisted to their function root (hoistVarBinding), keyed
-   * by the checker's merged symbol — every same-name `var` in one function
-   * is one symbol, so one slot. Module-scope vars live in globalsBySymbol
-   * instead. */
-  readonly hoistedVars = new Map<ts.Symbol, IrLocal>();
+  /* `var` hoisting and forward-hoisted nested function declarations are
+   * tracked per function context: FnCtx.hoistedVars / hoistedFnDecls. */
   /** Per-file `var` module globals whose type carries an undefined arm:
    * lowerFileInit assigns them the interned undefined right after the
    * run-once guard — JS hoists module vars to `undefined` at entry, so a
@@ -8088,7 +8096,7 @@ export class Lowerer {
     return isTopLevelFnSymbol(this, ident);
   }
 
-  lowerNestedFunctionDecl(stmt: ts.FunctionDeclaration): IrStmt {
+  lowerNestedFunctionDecl(stmt: ts.FunctionDeclaration): IrStmt[] {
     return lowerNestedFunctionDecl(this, stmt);
   }
 
@@ -8096,8 +8104,8 @@ export class Lowerer {
     return lambdaSignature(this, node);
   }
 
-  lowerLambda(node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration,): IrExpr {
-    return lowerLambda(this, node);
+  lowerLambda(node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
+    return lowerLambda(this, node, opts);
   }
 
   lowerArrayMethodCall(call: ts.CallExpression,

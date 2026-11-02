@@ -448,14 +448,13 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
    * SAME function lowers the declaration eagerly at the reference (varDecl
    * pushed before the current statement's IR, registered in the list's
    * scope frame) and the statement loop skips the source statement when it
-   * arrives (L.hoistedFnDecls). Same-function only: the declaration's own
+   * arrives (FnCtx.hoistedFnDecls). Same-function only: the declaration's own
    * lowering runs under the ctx that owns its statement list, and a
    * cross-function early capture would need lowering under a DIFFERENT
    * ctx than the one currently open — that shape keeps the honest fence. */
   export function predeclareForwardFnDecl(L: Lowerer, symbol: ts.Symbol): boolean {
     const decl = L.checker.valueDeclarationOf(symbol);
     if (!decl || !ts.isFunctionDeclaration(decl) || !decl.body || decl.typeParameters) return false;
-    if (L.hoistedFnDecls.has(decl)) return false; // defensive: never twice
     for (let i = L.activeStmtLists.length - 1; i >= 0; i--) {
       const entry = L.activeStmtLists[i]!;
       const idx = entry.stmts.indexOf(decl);
@@ -473,13 +472,14 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
       const depth = L.fnStack.indexOf(entry.ctx);
       const frameIdx = entry.ctx.scopes.indexOf(entry.frame);
       if (depth < 0 || frameIdx < 0) return false;
-      L.hoistedFnDecls.add(decl);
+      if (entry.ctx.hoistedFnDecls.has(decl)) return false; // defensive: never twice
+      entry.ctx.hoistedFnDecls.add(decl);
       const fnTail = L.fnStack.splice(depth + 1);
       const scopeTail = entry.ctx.scopes.splice(frameIdx + 1);
       try {
-        entry.out.push(L.lowerNestedFunctionDecl(decl));
+        entry.out.push(...L.lowerNestedFunctionDecl(decl));
       } catch (e) {
-        L.hoistedFnDecls.delete(decl);
+        entry.ctx.hoistedFnDecls.delete(decl);
         throw e;
       } finally {
         entry.ctx.scopes.push(...scopeTail);
@@ -574,12 +574,12 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
    * classic capture semantics fall out: closures made in a loop share the
    * single boxed binding, where `let` gets a fresh box per iteration. */
   export function hoistVarBinding(L: Lowerer, symbol: ts.Symbol, nameNode: ts.Identifier): IrLocal {
-    const existing = L.hoistedVars.get(symbol);
+    const existing = L.ctx.hoistedVars.get(symbol);
     if (existing) return existing;
     // The parameter merge: the symbol already binds a function-root local.
     const bound = L.bindingIn(L.ctx, symbol);
     if (bound) {
-      L.hoistedVars.set(symbol, bound);
+      L.ctx.hoistedVars.set(symbol, bound);
       return bound;
     }
     const type = varBindingType(L, nameNode);
@@ -597,7 +597,7 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
     // engine undefined for jsval).
     const wrapped = type.kind === "dyn" ? dynUndefinedExpr(locOf(nameNode)) : L.unassignedSlotInit(type, locOf(nameNode));
     root.out.push({ kind: "varDecl", localId: local.id, init: wrapped, loc: locOf(nameNode) });
-    L.hoistedVars.set(symbol, local);
+    L.ctx.hoistedVars.set(symbol, local);
     return local;
   }
 
@@ -615,7 +615,6 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
    * would yield if the capture ran early, and guessing "it won't" is the
    * silent-wrong-output sin. */
   export function predeclareForwardVar(L: Lowerer, symbol: ts.Symbol): boolean {
-    if (L.hoistedVars.has(symbol)) return false; // would have resolved
     const decl = L.checker.valueDeclarationOf(symbol);
     if (!decl || !ts.isVariableDeclaration(decl) || !isVarDeclared(decl)) return false;
     const nameNode = ts.isIdentifier(decl.name) ? decl.name : null;
@@ -636,6 +635,7 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
     }
     if (!owner) return false;
     const ctx = owner.ctx;
+    if (ctx.hoistedVars.has(symbol)) return false; // would have resolved
     // Only a slot that can hold `undefined` can carry the pre-
     // initialization reads: an undefined-armed union (the interned arm),
     // a checked-dynamic binding (the dyn undefined), or a jsval 'any'
@@ -652,7 +652,7 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
     ctx.locals.push(local);
     ctx.scopes[0]!.set(symbol, local);
     root.out.push({ kind: "varDecl", localId: local.id, init: wrapped, loc: locOf(decl) });
-    L.hoistedVars.set(symbol, local);
+    ctx.hoistedVars.set(symbol, local);
     return true;
   }
 
@@ -984,7 +984,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     if (ts.isFunctionDeclaration(stmt)) {
       // Already lowered eagerly by the forward-hoisting machinery
       // (predeclareForwardFnDecl) — the varDecl is in the list's output.
-      if (L.hoistedFnDecls.has(stmt)) return null;
+      if (L.ctx.hoistedFnDecls.has(stmt)) return null;
       return L.lowerNestedFunctionDecl(stmt);
     }
     // Enum declarations: constant-member enums emit nothing (member reads
@@ -3969,9 +3969,9 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     });
     const out: IrStmt[] = [];
     for (const { decl } of fns.values()) {
-      if (!cross.has(decl) || L.hoistedFnDecls.has(decl)) continue;
-      L.hoistedFnDecls.add(decl);
-      out.push(L.lowerNestedFunctionDecl(decl));
+      if (!cross.has(decl) || L.ctx.hoistedFnDecls.has(decl)) continue;
+      L.ctx.hoistedFnDecls.add(decl);
+      out.push(...L.lowerNestedFunctionDecl(decl));
     }
     return out;
   }
@@ -4645,7 +4645,34 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     return { kind: "assign", localId: g.id, value: L.lowerExprExpecting(rhs, g.type), loc: locOf(rhs) };
   }
 
-/** Expression-position statements: assignments, calls. Shared with
+/** `c ? f() : g()` whose value nobody reads (a statement, a void
+   * arrow's concise body — `(er, v) => er ? rej(er) : res(v)`), with a
+   * VOID arm: an arm that produces no value has no ternary
+   * representation (GH #107: the void ternary was an ICE), and in this
+   * position none is needed — it is `if (c) f(); else g();`, exactly
+   * Node's evaluation. Arms lower as statements, so nested void
+   * ternaries chain. Null when the expression is not such a ternary.
+   * `wholeVoid`: the caller USES the value (an implicit-any instance's
+   * concise body is its return), so only a ternary whose every arm is void
+   * — whose value is undefined either way — may lower as a statement; a
+   * mixed one (`c ? x : log("none")`) must keep its value arm. */
+  export function lowerVoidTernaryStatement(L: Lowerer, expr: ts.Expression, wholeVoid = false): IrStmt | null {
+    while (ts.isParenthesizedExpression(expr)) expr = expr.expression;
+    if (!ts.isConditionalExpression(expr)) return null;
+    const hasVoid = (t: ts.Type): boolean =>
+      (t.flags & ts.TypeFlags.Void) !== 0 || (t.isUnionType() && t.getTypes().some((p) => (p.flags & ts.TypeFlags.Void) !== 0));
+    if (wholeVoid) {
+      if ((L.typeOf(expr).flags & ts.TypeFlags.Void) === 0) return null;
+    } else if (!hasVoid(L.typeOf(expr)) && !hasVoid(L.typeOf(expr.whenTrue)) && !hasVoid(L.typeOf(expr.whenFalse))) {
+      return null;
+    }
+    const cond = L.lowerCondition(expr.condition);
+    const arm = (e: ts.Expression): IrStmt[] => [lowerExprStatement(L, e)];
+    if (cond.kind === "boolLit") return { kind: "block", body: arm(cond.value ? expr.whenTrue : expr.whenFalse), loc: locOf(expr) };
+    return { kind: "if", cond, then: arm(expr.whenTrue), else_: arm(expr.whenFalse), loc: locOf(expr) };
+  }
+
+  /** Expression-position statements: assignments, calls. Shared with
    * for-loop init/update. Parens unwrap first — `(x = v);` is the plain
    * assignment, and `({ a, b } = e);` (destructuring ASSIGNMENT, which JS
    * requires parenthesized in statement position) lands in the
@@ -4790,6 +4817,10 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     // statement position discards it anyway; value-position deletes keep
     // the expression fence.
     if (ts.isDeleteExpression(expr)) return lowerDeleteStatement(L, expr);
+    {
+      const voidTernary = lowerVoidTernaryStatement(L, expr);
+      if (voidTernary) return voidTernary;
+    }
     // Statement-position `void e` — the fire-and-forget idiom (`void
     // poll();`, `void main();` — lint-visible "I meant to drop this
     // promise"): the operand evaluates for effect and the undefined result

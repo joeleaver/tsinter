@@ -1,4 +1,5 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { CcCompileError, compileC, compileLibArchive, resolveCc, targetPlatform } from "./backend/cc.js";
 import { emitModule } from "./backend/emission/emitter.js";
@@ -8,7 +9,7 @@ import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backen
 import { EngineFormatError } from "./backend/wasm/engine.js";
 import { compileWasmNative, nativeTargetOs, translateForNativeRunner } from "./backend/wasm-native.js";
 import { Wasm2cHostImportError } from "./backend/wasm2c.js";
-import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
+import { checkerPanicDiag, entryLoadDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
 import { loadLibraryProfile, profileRemediation, profileTeaching, type LibraryProfile } from "./library/profile.js";
 import { decorateLibraryRefusals, evaluateLibraryFences } from "./library/fence-eval.js";
@@ -27,7 +28,7 @@ import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.
 import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
-import { canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
+import { EntryLoadError, canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
@@ -402,6 +403,17 @@ function packagesNamedByDiag(message: string, optedIn: ReadonlySet<string>): Set
  * status the shared loops record becomes compileLibrary's SC4020
  * static-or-refuse teaching, and the detection closes over the opted-in
  * packages' own bare edges (no island exists to serve a dep from). */
+/** runFrontend, with an entry the checker's program does not contain
+ * answered as the SC0005 gate instead of a thrown error. */
+function frontendOrGate(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend | ScrDiagnostic {
+  try {
+    return runFrontend(entryPath, npmStatic);
+  } catch (e) {
+    if (!(e instanceof EntryLoadError)) throw e;
+    return entryLoadDiag(entryPath, existsSync(entryPath));
+  }
+}
+
 function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
   const statuses: NpmStaticStatus[] = [];
   const npmSites = new Map<string, SrcLoc>();
@@ -603,7 +615,19 @@ export function analyze(entryPath: string, opts: AnalyzeOptions = {}): AnalyzeRe
     }
     ffi = loaded.profile;
   }
-  const fe = runFrontend(entryPath, opts.npmStatic);
+  const fe = frontendOrGate(entryPath, opts.npmStatic);
+  if (!("preflight" in fe)) {
+    return {
+      coverage: {
+        file: entryPath,
+        dynamic: opts.dynamic ?? false,
+        stats: { statementsTotal: 0, statementsFailed: 0, statementsIsland: 0, functionsSkipped: 0 },
+        diagnostics: [fe],
+        preflightFailed: true,
+      },
+      sourceTexts: new Map(),
+    };
+  }
   try {
     const emptyStats = { statementsTotal: 0, statementsFailed: 0, statementsIsland: 0, functionsSkipped: 0 };
 
@@ -679,7 +703,8 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     }
     ffi = loaded.profile;
   }
-  const fe = runFrontend(entryPath, opts.npmStatic);
+  const fe = frontendOrGate(entryPath, opts.npmStatic);
+  if (!("preflight" in fe)) return { ok: false, diagnostics: [fe], sourceTexts: new Map() };
   let lowered: LowerResult;
   let entryText: string;
   let sourceTexts: Map<string, string>;
