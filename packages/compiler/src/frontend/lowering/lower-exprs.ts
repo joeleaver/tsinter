@@ -547,6 +547,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           }
         }
         if (pieces.length === 0) return { kind: "strLit", value: "", type: STRING, loc };
+        if (pieces.length === 1) return undefinedAsText(L, pieces[0]!, loc);
         return pieces.reduce((acc, p) => ({ kind: "strConcat", left: acc, right: p, type: STRING, loc }));
       }
       return lowerTaggedTemplate(L, expr);
@@ -574,7 +575,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         if (target && target.kind !== "union" && !typeEquals(target, inner.type)) {
           const helper = L.narrowedArmHelper(inner.type.unionId, target, loc);
           if (helper) {
-            return { kind: "call", callee: helper, args: [inner], type: target, loc };
+            return { kind: "call", callee: helper, args: [assertedRecvGuard(L, expr, inner, loc)], type: target, loc };
           }
         }
         return inner;
@@ -3017,6 +3018,8 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         return droppableStatic(e.left) && droppableStatic(e.right);
       case "toBool":
         return droppableStatic(e.operand);
+      case "toString":
+        return e.operand.type.kind === "string" && droppableStatic(e.operand);
       case "unionIsTag":
         return droppableStatic(e.value);
       case "unionWrap":
@@ -3157,10 +3160,115 @@ export function holeFencedArray(L: Lowerer, recv: IrExpr, what: string, loc: Src
  * that TypeError, with Node's text, instead of answering a NaN's or a
  * stored 2's method. The operand passes through an interned
  * `%undef.recv.<n>(x)` check helper. */
+/** Unit U (SEMANTICS.md S119 (i)): is this plain-typed record field an own
+ * key? A checked dynamic value can fill a required field from a key it
+ * lacks, and the slot's undefined cannot tell that from an explicit one;
+ * the module's two flags answer (exactly, or at a named fence). Null where
+ * the question does not arise. */
+export function plainFieldPresent(L: Lowerer, read: IrExpr, loc: SrcLoc): IrExpr | null {
+  const k = read.type.kind;
+  if (!L.undefSlots || k === "union" || k === "dyn" || k === "jsval" || isUnitType(read.type)) return null;
+  return {
+    kind: "unary",
+    op: "!",
+    operand: { kind: "libCall", fn: "undef.fieldAbsent", args: [isUndefExpr(read, false, loc)], type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+}
+
+/** Does a record field read in a spread supply the key? An optional field
+ * holding undefined does not, and a plain field answers through the S119
+ * (i) flags. Null where the field is always present. */
+function spreadFieldPresent(L: Lowerer, read: IrExpr & { kind: "recordGet" }, loc: SrcLoc): IrExpr | null {
+  const t = read.type;
+  if (t.kind === "union") {
+    const tag = L.armTag(t.unionId, UNDEFINED_T);
+    return tag >= 0 ? { kind: "unionIsTag", unionId: t.unionId, tag, negated: true, value: read, type: BOOL, loc } : null;
+  }
+  return plainFieldPresent(L, read, loc);
+}
+
+/** GH #86 re-review (SEMANTICS.md S119): `e!.m`, `e![0]`, `(e as T).m` on a
+ * union holding undefined or null. The assertion lets the value through,
+ * as in Node, and the member read is what throws — `Cannot read properties
+ * of null (reading 'm')` with the value's own name. A plain slot has no
+ * null to carry past the assertion, and a record field read has no
+ * catchable path, so the check runs on the union, before the narrowing. */
+export function assertedRecvGuard(L: Lowerer, node: ts.Expression, inner: IrExpr, loc: SrcLoc): IrExpr {
+  if (!L.undefSlots || inner.type.kind !== "union") return inner;
+  let n: ts.Node = node;
+  while (ts.isParenthesizedExpression(n.parent) || ts.isNonNullExpression(n.parent)) n = n.parent;
+  const p = n.parent;
+  // A write target (`e!.k = v`): the write itself throws `Cannot set
+  // properties of undefined (setting 'k')`, after `v` evaluates.
+  if ((ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === n && ts.isBinaryExpression(p.parent) && p.parent.left === p && p.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken) return inner;
+  let member: string | null = null;
+  if (ts.isPropertyAccessExpression(p) && p.expression === n && p.questionDotToken === undefined) member = p.name.text;
+  else if (ts.isElementAccessExpression(p) && p.expression === n && p.questionDotToken === undefined) {
+    const a = p.argumentExpression;
+    if (ts.isStringLiteral(a) || ts.isNoSubstitutionTemplateLiteral(a) || ts.isNumericLiteral(a)) member = a.text;
+  }
+  if (member === null) return inner;
+  const unionId = inner.type.unionId;
+  const arms = L.unions.get(unionId)?.arms ?? [];
+  const units = arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+  if (units.length === 0) return inner;
+  const t = inner.type;
+  const key = `assertedrecv:${unionId}:${member}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%union.recv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    const body: IrStmt[] = units.map((i) => ({
+      kind: "if",
+      cond: { kind: "unionIsTag", unionId, tag: i, negated: false, value: x, type: BOOL, loc },
+      then: [
+        {
+          kind: "throw",
+          value: {
+            kind: "libCall",
+            fn: "error.new",
+            args: [{ kind: "strLit", value: `Cannot read properties of ${arms[i]!.kind === "undefinedT" ? "undefined" : "null"} (reading '${member}')`, type: STRING, loc }],
+            type: { kind: "object", className: "%TypeError" },
+            loc,
+          },
+          loc,
+        },
+      ],
+      else_: null,
+      loc,
+    }));
+    body.push({ kind: "return", value: x, loc });
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body,
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [inner], type: t, loc };
+}
+
 export function undefRecvGuard(L: Lowerer, operand: IrExpr, member: string, loc: SrcLoc): IrExpr {
+  return undefThrowGuard(L, operand, `Cannot read properties of undefined (reading '${member}')`, loc);
+}
+
+/** Unit U (SEMANTICS.md S119): ToObject of a slot holding undefined —
+ * Object.keys/values/entries/hasOwn and an Object.assign target throw
+ * Node's TypeError instead of walking a shape that is not there. */
+export function undefToObjectGuard(L: Lowerer, operand: IrExpr, loc: SrcLoc): IrExpr {
+  return undefThrowGuard(L, operand, "Cannot convert undefined or null to object", loc);
+}
+
+/** The interned check: `operand`, or Node's TypeError `message`. */
+export function undefThrowGuard(L: Lowerer, operand: IrExpr, message: string, loc: SrcLoc): IrExpr {
   if (!mayHoldSlotUndef(L, operand)) return operand;
   const t = operand.type;
-  const key = `undefrecv:${typeKey(t)}:${member}`;
+  const key = `undefrecv:${typeKey(t)}:${message}`;
   let name = L.retagHelpers.get(key);
   if (!name) {
     name = `%undef.recv.${L.retagHelpers.size}`;
@@ -3181,7 +3289,7 @@ export function undefRecvGuard(L: Lowerer, operand: IrExpr, member: string, loc:
               value: {
                 kind: "libCall",
                 fn: "error.new",
-                args: [{ kind: "strLit", value: `Cannot read properties of undefined (reading '${member}')`, type: STRING, loc }],
+                args: [{ kind: "strLit", value: message, type: STRING, loc }],
                 type: { kind: "object", className: "%TypeError" },
                 loc,
               },
@@ -3197,6 +3305,171 @@ export function undefRecvGuard(L: Lowerer, operand: IrExpr, member: string, loc:
     });
   }
   return { kind: "call", callee: name, args: [operand], type: t, loc };
+}
+
+/** Unit U (SEMANTICS.md S119 (a)): the receiver of a member read or a
+ * method call (`s.length`, `m[2].toUpperCase()`, `xs.push(…)`), lowered
+ * behind the undefined check — a receiver holding its slot's undefined
+ * throws Node's catchable `TypeError: Cannot read properties of undefined
+ * (reading '<member>')` instead of trapping. `this` and an optional
+ * chain's receiver (`s?.length`, which answers undefined itself) never
+ * check. */
+export function lowerMemberRecv(L: Lowerer, access: ts.PropertyAccessExpression): IrExpr {
+  const receiver = L.lowerExpr(access.expression);
+  if (access.questionDotToken) return receiver;
+  return undefRecvGuardFor(L, access, receiver);
+}
+
+/** A string intrinsic whose result can be the slot's undefined. */
+function mayHoldStrAt(e: IrExpr): boolean {
+  return e.kind === "strIntrinsic" && e.undefOob !== undefined;
+}
+
+/** lowerMemberRecv's check over an already-lowered receiver. */
+export function undefRecvGuardFor(L: Lowerer, access: ts.PropertyAccessExpression, receiver: IrExpr): IrExpr {
+  if (access.expression.kind === ts.SyntaxKind.ThisKeyword) return receiver;
+  const k = receiver.type.kind;
+  if (k !== "string" && k !== "array" && k !== "record" && k !== "object" && k !== "regex") return receiver;
+  if ((receiver.kind === "strIntrinsic" && receiver.undefOob === undefined && !mayHoldStrAt(receiver)) || receiver.kind === "regexIntrinsic") return receiver;
+  // A BINDING read (a variable, a field of one) keeps its own shape — the
+  // string rope/view machinery recognises `s = s.slice(1)` and `s.length`
+  // on the binding itself, and a call around it would flatten the binding
+  // at every read (quadratic loops). It is MARKED instead: the backend
+  // tests the binding's value slot for undefined (a plain null test, no
+  // flattening) ahead of the operation and throws the same TypeError.
+  if (pureReemittable(receiver)) return markUndefRecv(L, receiver, access.name.text);
+  return undefRecvGuard(L, receiver, access.name.text, locOf(access));
+}
+
+/** Unit U (SEMANTICS.md S119 (a)): a spread source (`[...xs]`) that may
+ * hold its slot's undefined: Node throws `TypeError: <xs> is not iterable`
+ * (`message`: arraySpreadSpelling's V8 text) — through an interned check helper (the
+ * spread copies anyway, so the call costs nothing in complexity); a source
+ * V8's spelling does not cover meets a named fence. */
+export function undefIterGuard(L: Lowerer, src: IrExpr, spelling: string | null /* the whole V8 message */, loc: SrcLoc): IrExpr {
+  if (!mayHoldSlotUndef(L, src) || (src.type.kind !== "array" && src.type.kind !== "string" && src.type.kind !== "func")) return src;
+  if (src.kind === "closure") return src;
+  const t = src.type;
+  const isFn = t.kind === "func";
+  const key = `undefiter:${typeKey(t)}:${spelling ?? "\0"}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%undef.iter.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    const fail: IrStmt =
+      spelling !== null
+        ? {
+            kind: "throw",
+            value: {
+              kind: "libCall",
+              fn: "error.new",
+              args: [{ kind: "strLit", value: spelling, type: STRING, loc }],
+              type: { kind: "object", className: "%TypeError" },
+              loc,
+            },
+            loc,
+          }
+        : {
+            kind: "runtimeFence",
+            code: "SC1090",
+            message: isFn
+              ? "calling a function-typed value holding undefined (Node throws a catchable TypeError: <the callee> is not a function — SEMANTICS.md S119 (a)) [SC1090 at a call]"
+              : "iterating a value holding undefined (Node throws a catchable TypeError: <the source> is not iterable — SEMANTICS.md S119 (a)) [SC1090 at an iteration]",
+            loc,
+          };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body: [{ kind: "if", cond: isUndefExpr(x, false, loc), then: [fail], else_: null, loc }, { kind: "return", value: x, loc }],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [src], type: t, loc };
+}
+
+/** Unit U (SEMANTICS.md S119 (a)): the receiver of an index read `x[i]`
+ * (a string or an array) that may hold its slot's undefined. A literal
+ * index names the member Node's TypeError reads (`(reading '0')`) — exact,
+ * through the mark or the guard; a run-time index's text is rendered by the
+ * backend at the read (the mark's member "\0"). */
+export function undefIndexRecv(L: Lowerer, recv: IrExpr, index: IrExpr, loc: SrcLoc): IrExpr {
+  if (!L.undefSlots || !mayHoldSlotUndef(L, recv)) return recv;
+  const member = index.kind === "numLit" ? String(index.value) : "\0";
+  if (pureReemittable(recv)) return markUndefRecv(L, recv, member);
+  if (member === "\0") return recv; // the backend's arrayGet test covers a non-binding array
+  return undefRecvGuard(L, recv, member, loc);
+}
+
+/** Unit U (SEMANTICS.md S119 (a)): a binding-read receiver marked for the
+ * backend's undefined test (`undefRecv` = the member Node's TypeError
+ * names) — the read itself is unchanged. */
+export function markUndefRecv(L: Lowerer, receiver: IrExpr, member: string): IrExpr {
+  if (!mayHoldSlotUndef(L, receiver)) return receiver;
+  const k = receiver.type.kind;
+  if (k !== "string" && k !== "array") return receiver;
+  return { ...receiver, undefRecv: member } as unknown as IrExpr;
+}
+
+/** Unit U (SEMANTICS.md S119): `a + b` where at least one side is a
+ * string-typed value that may hold its slot's undefined. JS's `+` only
+ * concatenates when an operand IS a string at run time: `undefined + 1`,
+ * `undefined + true` and `undefined + undefined` are the number NaN, which
+ * this string-typed result cannot hold — so exactly then the program ends
+ * at a named fence (S122) instead of printing "undefined1". Every other
+ * combination concatenates as before ("undefined" + a real string). `build`
+ * makes the concatenation from the (once-evaluated) operands. */
+export function undefPlusGuard(L: Lowerer, left: IrExpr, right: IrExpr, loc: SrcLoc, build: (l: IrExpr, r: IrExpr) => IrExpr): IrExpr {
+  const maybeUndefStr = (e: IrExpr): boolean => e.type.kind === "string" && mayHoldSlotUndef(L, e);
+  const numeric = (e: IrExpr): boolean => e.type.kind === "f64" || e.type.kind === "bool";
+  // A union operand: which of its arms are NOT strings at run time (a
+  // number, boolean, null or undefined arm makes `+` numeric against
+  // undefined). Its string arm concatenates, so the test is on the tag.
+  const unionNonString = (e: IrExpr): number[] | null => {
+    if (e.type.kind !== "union") return null;
+    const def = L.unions.get(e.type.unionId);
+    if (!def || def.arms.some((a) => a.kind !== "string" && a.kind !== "f64" && a.kind !== "bool" && !isUnitType(a))) return null;
+    const tags = def.arms.flatMap((a, i) => (a.kind === "string" ? [] : [i]));
+    return tags.length > 0 ? tags : null;
+  };
+  const lU = maybeUndefStr(left);
+  const rU = maybeUndefStr(right);
+  const side: "left" | "right" | "both" | null =
+    lU && rU ? "both" : lU && numeric(right) ? "left" : rU && numeric(left) ? "right" : null;
+  if (side === null && (lU || rU)) {
+    const other = lU ? right : left;
+    const tags = unionNonString(other);
+    if (tags !== null) {
+      // The union operand runs once, into a hidden local the concatenation
+      // and the tag test both read.
+      return bindOnce(L, other, loc, (read) => {
+        const result = lU ? build(left, read) : build(read, right);
+        if (result.kind !== "strConcat") return result;
+        const unionId = (read.type as IrType & { kind: "union" }).unionId;
+        let test: IrExpr = { kind: "unionIsTag", unionId, tag: tags[0]!, negated: false, value: read, type: BOOL, loc };
+        for (const t of tags.slice(1)) {
+          test = { kind: "logical", op: "||", left: test, right: { kind: "unionIsTag", unionId, tag: t, negated: false, value: read, type: BOOL, loc }, type: BOOL, loc };
+        }
+        return { ...result, undefNaN: { side: lU ? "left" : "right", when: test, message: plusNaNMessage(L, loc) } };
+      });
+    }
+  }
+  const result = build(left, right);
+  if (side === null || result.kind !== "strConcat") return result;
+  // The annotation keeps the concatenation's own shape (the rope and view
+  // machinery recognise `s += x` by it); the backend tests inline.
+  return { ...result, undefNaN: { side, message: plusNaNMessage(L, loc) } };
+}
+
+function plusNaNMessage(L: Lowerer, loc: SrcLoc): string {
+  const sf = L.program.getSourceFile(loc.file);
+  const line = sf !== undefined ? ts.getLineAndCharacterOfPosition(sf, loc.start).line + 1 : 0;
+  return (
+    "'+' of a string-typed value holding undefined and a non-string (Node answers the number NaN, which this string-typed result cannot hold — SEMANTICS.md S119) " +
+    `[SC1090 at ${loc.file}:${line}]`
+  );
 }
 
 /** Unit U (SEMANTICS.md S119): ToNumber of a number that may hold the f64
@@ -3474,8 +3747,8 @@ export function pureReemittable(e: IrExpr): boolean {
    * spine, when the node is the TAIL of an optional chain whose token sits
    * deeper — `x?.trim().toLowerCase()` reads nothing past the guard when x
    * is nullish, so the whole tail must lower inside it. Walks
-   * property/element accesses and call steps only (parens and `!` break
-   * the chain per the grammar: `(a?.b).c` throws on undefined in JS);
+   * property/element accesses, call steps and `!` (which erases: `a?.b!.c`
+   * is `a?.b.c`); parens end the chain (`(a?.b).c` throws on undefined);
    * the node's OWN token — and a call's immediate callee token — are the
    * plain entries' cases, not tails, and handled markers make the chain
    * lowering's re-dispatch walk past its own step. `f?.()` steps stay out
@@ -3490,6 +3763,10 @@ export function pureReemittable(e: IrExpr): boolean {
       // An active chain's bound receiver read is a LEAF — its own token
       // was consumed by the chain that bound it.
       if (L.chainRecvByNode.has(cur)) return null;
+      if (ts.isNonNullExpression(cur)) {
+        cur = cur.expression;
+        continue;
+      }
       if (ts.isCallExpression(cur)) {
         // `f?.()` steps route through their own entry (or are being
         // handled); a deeper token under one is that chain's business.
@@ -3545,6 +3822,10 @@ export function pureReemittable(e: IrExpr): boolean {
     const tail = chainTailDot(L, expr);
     if (!tail) return false;
     const recvT = L.mapTypeOf(L.typeOf(tail.expression));
+    // Unit U (SEMANTICS.md S119): a plain-typed receiver can hold its
+    // slot's undefined, and the whole tail short-circuits with it.
+    if (L.undefSlots && recvT !== null && recvT !== undefined &&
+        (recvT.kind === "string" || recvT.kind === "array" || recvT.kind === "record" || recvT.kind === "object" || recvT.kind === "f64" || recvT.kind === "bool")) return true;
     if (recvT?.kind !== "union") return false;
     const def = L.unions.get(recvT.unionId);
     return !!def && def.arms.some(isUnitType);
@@ -3558,7 +3839,8 @@ export function pureReemittable(e: IrExpr): boolean {
   export function chainGuardedByQuestionDot(expr: ts.Expression): boolean {
     let cur: ts.Expression = expr;
     for (;;) {
-      if (ts.isParenthesizedExpression(cur) || ts.isNonNullExpression(cur)) {
+      // `!` erases; parens end a chain (`(a?.b).c` throws on undefined)
+      if (ts.isNonNullExpression(cur)) {
         cur = cur.expression;
         continue;
       }
@@ -4307,9 +4589,10 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         if (expr.questionDotToken) return read;
         return { kind: "dynCheck", value: read, type: F64, loc: locOf(expr) };
       }
+      const guarded = expr.questionDotToken ? receiver : undefRecvGuardFor(L, expr, receiver);
       return kind === "string"
-        ? { kind: "strIntrinsic", method: "length", receiver, args: [], type: F64, loc: locOf(expr) }
-        : { kind: "arrIntrinsic", method: "length", receiver, args: [], type: F64, loc: locOf(expr) };
+        ? { kind: "strIntrinsic", method: "length", receiver: guarded, args: [], type: F64, loc: locOf(expr) }
+        : { kind: "arrIntrinsic", method: "length", receiver: guarded, args: [], type: F64, loc: locOf(expr) };
     }
     if (
       kind === "string"
@@ -4548,7 +4831,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         // interned helper as Array.from(s); the result rides the array
         // machinery below like any string[] source.
         if (src.type.kind === "string") {
-          src = strCharsCall(L, src, locOf(el));
+          src = strCharsCall(L, undefIterGuard(L, src, arraySpreadSpelling(el.expression) || null, locOf(el)), locOf(el));
         }
         // `[...typedArray]`: represented typed arrays are dense numeric
         // iterables, so drain their elements into the fresh number[] that
@@ -4624,7 +4907,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           );
         }
         spreads.push(i);
-        return src;
+        return undefIterGuard(L, src, arraySpreadSpelling(el.expression) || null, locOf(el));
       }
       // A HOLE (`[,]` — an elision): the slot materializes the undefined
       // arm — reads, length, and JSON answer exactly Node (JSON.stringify
@@ -5915,7 +6198,17 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
             if (conditionalSpreadOf(later.expression)) continue;
             const lt = L.mapTypeOf(L.typeOf(later.expression));
             if (lt?.kind === "record") {
-              for (const lf of L.shapes.get(lt.shapeId)?.fields ?? []) laterNames.add(lf.name);
+              // S119 (i): on the WasmGC lanes a later spread may lack a
+              // key, so the earlier value stays a contributor — unless it
+              // has no slot in the target, which the fence below answers.
+              for (const lf of L.shapes.get(lt.shapeId)?.fields ?? []) {
+                if (!L.undefSlots) laterNames.add(lf.name);
+                else {
+                  const tt = fieldTypes.get(lf.name);
+                  const sf = srcShape.fields.find((x) => x.name === lf.name);
+                  if (tt !== undefined && sf !== undefined && !typeEquals(sf.type, tt) && L.widthLiftPlan(sf.type, tt) === null) laterNames.add(lf.name);
+                }
+              }
             }
             continue;
           }
@@ -5987,10 +6280,14 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
               obj,
               shapeId: srcType.shapeId,
               field: f.name,
+              spreadCopy: true,
               type: f.type,
               loc: locOf(prop),
             };
           }
+          // S119 (i): where this spread may lack the key, what an earlier
+          // contributor put there stays (Node copies own keys only).
+          const rawRead = value;
           // A liftable field widens into the target slot (arm wrap,
           // re-tag, nested reshape) — the same per-field rule the slot
           // coercion applies.
@@ -6003,8 +6300,28 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
             );
           }
           const at = fields.findIndex((x) => x.name === f.name);
-          if (at >= 0) fields[at] = { name: f.name, value };
-          else fields.push({ name: f.name, value });
+          if (at >= 0) {
+            const present = L.undefSlots && rawRead.kind === "recordGet" ? spreadFieldPresent(L, rawRead, locOf(prop)) : null;
+            const earlier = fields[at]!.value;
+            if (present !== null) {
+              const lit = earlier.kind === "numLit" || earlier.kind === "strLit" || earlier.kind === "boolLit" || earlier.kind === "ternary" || earlier.kind === "seqExpr";
+              if (lit || pureReemittable(earlier)) {
+                value = { kind: "ternary", cond: present, then: value, else_: earlier, type: targetType, loc: locOf(prop) };
+              } else {
+                // the earlier value still evaluates, at its own position
+                const tmp = L.declareHiddenLocal("%sprEarlier", targetType);
+                const tmpRef: IrExpr = { kind: "varRef", localId: tmp.id, type: targetType, loc: locOf(prop) };
+                value = {
+                  kind: "seqExpr",
+                  stmts: [{ kind: "varDecl", localId: tmp.id, init: earlier, loc: locOf(prop) }],
+                  result: { kind: "ternary", cond: present, then: value, else_: tmpRef, type: targetType, loc: locOf(prop) },
+                  type: targetType,
+                  loc: locOf(prop),
+                };
+              }
+            }
+            fields[at] = { name: f.name, value };
+          } else fields.push({ name: f.name, value });
         }
         continue;
       }
@@ -6210,6 +6527,15 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         fields.push({ name: f.name, value: absent });
       }
     }
+    // S119 (i): a spread copies keys, not values — a missing key stays
+    // missing in the copy, so its read notes no explicit undefined.
+    for (const prop of expr.properties) {
+      if (!ts.isSpreadAssignment(prop)) continue;
+      const at = locOf(prop);
+      for (const f of fields) {
+        if (f.value.kind === "recordGet" && f.value.loc.start >= at.start && f.value.loc.end <= at.end) f.value.spreadCopy = true;
+      }
+    }
     return { kind: "recordLit", fields, type, loc };
   }
 
@@ -6320,20 +6646,17 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         if (def && fDef && def.arms.some((a) => L.armTag(fUnion.unionId, a) >= 0)) {
           // Arm-by-arm validated re-tag, inline in the helper: matching
           // arms map by identity (unit arms re-wrap, value arms narrow and
-          // wrap); anything else throws the catchable TypeError.
+          // wrap); anything else ends the program (S122).
           return {
             stmts: (write) => {
               const chain = (i: number): IrStmt[] => {
                 if (i >= def.arms.length) {
+                  // GH #86 review (SEMANTICS.md S122): a check Node never
+                  // makes — it ends the program (the helper is shared).
                   return [{
-                    kind: "throw",
-                    value: {
-                      kind: "libCall",
-                      fn: "error.new",
-                      args: [{ kind: "strLit", value: `expected ${L.fmt(fUnion)} at $.${f.name}`, type: STRING, loc }],
-                      type: { kind: "object", className: "%TypeError" },
-                      loc,
-                    },
+                    kind: "runtimeFence",
+                    code: "SC1100",
+                    message: `expected ${L.fmt(fUnion)} at $.${f.name} [SC1100 at an object spread's runtime-keyed source]`,
                     loc,
                   }];
                 }
@@ -6819,8 +7142,14 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         // fenced.
         const index = L.lowerExpr(expr.argumentExpression);
         if (index.type.kind === "f64" && L.mapTypeOf(L.typeOf(expr))?.kind === "string") {
-          const recv = L.lowerExpr(expr.expression);
-          return { kind: "strIntrinsic", method: "charAt", receiver: recv, args: [index], type: STRING, loc: locOf(expr) };
+          const rawRecv = L.lowerExpr(expr.expression);
+          if (L.undefSlots) {
+            // Unit U (SEMANTICS.md S119): past the end, a fraction or NaN
+            // names no element — `undefined`, charAt's "" is its own.
+            const wholeLit = index.kind === "numLit" && Number.isInteger(index.value);
+            return bindOnce(L, rawRecv, locOf(expr), (r) => bindOnce(L, index, locOf(expr), (i) => { const recv = undefIndexRecv(L, r, index.kind === "numLit" ? index : i, locOf(expr)); return ({ kind: "strIntrinsic", method: "charAt", receiver: recv, args: [i], undefOob: wholeLit ? "at" : "index", type: STRING, loc: locOf(expr) }); }));
+          }
+          return { kind: "strIntrinsic", method: "charAt", receiver: rawRecv, args: [index], type: STRING, loc: locOf(expr) };
         }
         L.unsupported(
           "SC1090",
@@ -6885,7 +7214,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     // narrowed THIS occurrence (`if (a[0] !== undefined) use(a[0])` — tsc
     // narrows literal-index element accesses).
     return L.maybeNarrow(
-      { kind: "arrayGet", arr, index, type: elemT, loc: locOf(expr) },
+      { kind: "arrayGet", arr: arr.type.kind === "array" ? undefIndexRecv(L, arr, index, locOf(expr)) : arr, index, type: elemT, loc: locOf(expr) },
       expr,
     );
   }
@@ -7027,7 +7356,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       );
     }
     return L.maybeNarrow(
-      { kind: "recordKeyGet", obj, shapeId, key, ...(overflowOnly ? { overflowOnly: true as const } : {}), type: declared, loc },
+      { kind: "recordKeyGet", obj, shapeId, key: undefinedAsText(L, key, loc), ...(overflowOnly ? { overflowOnly: true as const } : {}), type: declared, loc },
       expr,
     );
   }
@@ -7102,6 +7431,10 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
 /** `a[i] = v` in statement position → arraySet (element writes, like local
    * assignment, produce no value in our subset). */
   export function lowerElementWrite(L: Lowerer, expr: ts.BinaryExpression): IrStmt {
+    return undefWriteGuard(L, lowerElementWriteRaw(L, expr));
+  }
+
+  function lowerElementWriteRaw(L: Lowerer, expr: ts.BinaryExpression): IrStmt {
     const target = expr.left as ts.ElementAccessExpression;
     // `process.env[key] = v` — the computed twin of the dotted env write:
     // setenv(3), string keys and string values only.
@@ -7588,6 +7921,8 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       }
     }
     if (pieces.length === 0) return { kind: "strLit", value: "", type: STRING, loc };
+    // Unit U (S119): a lone substitution is ToString, not the slot itself.
+    if (pieces.length === 1) return undefinedAsText(L, pieces[0]!, loc);
     return pieces.reduce((acc, p) => ({ kind: "strConcat", left: acc, right: p, type: STRING, loc }));
   }
 
@@ -7678,7 +8013,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
         if (target && target.kind !== "union" && !typeEquals(target, inner.type)) {
           const helper = L.narrowedArmHelper(inner.type.unionId, target, locOf(expr));
           if (helper) {
-            return { kind: "call", callee: helper, args: [inner], type: target, loc: locOf(expr) };
+            return { kind: "call", callee: helper, args: [assertedRecvGuard(L, expr, inner, locOf(expr))], type: target, loc: locOf(expr) };
           }
         }
       }
@@ -7871,7 +8206,8 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
             kind: "fieldIncDec",
             op,
             prefix,
-            obj: target.obj,
+            // Unit U (S119 (a)): `k.v++` reads first, Node's TypeError names it.
+            obj: expr.operand.expression.kind === ts.SyntaxKind.ThisKeyword ? target.obj : undefRecvGuard(L, target.obj, target.field, loc),
             className: target.className,
             field: target.field,
             fieldDyn: target.fieldType.kind === "dyn",
@@ -8456,12 +8792,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       case ts.SyntaxKind.PlusToken:
         if (bothNum) return { kind: "bin", op: "+", left, right, type: F64, loc };
         if (left.type.kind === "string" || right.type.kind === "string") {
-          return {
+          return undefPlusGuard(L, left, right, loc, (l, r) => ({
             kind: "strConcat",
-            left: L.ensureString(left, expr.left),
-            right: L.ensureString(right, expr.right),
+            left: L.ensureString(l, expr.left),
+            right: L.ensureString(r, expr.right),
             type: STRING, loc,
-          };
+          }));
         }
         L.unsupported("SC1043", expr);
         break;
@@ -9931,13 +10267,20 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     }
     const shape = L.shapes.get(recv.type.shapeId);
     if (!shape) throw new Error(`lowerer bug: unknown shape ${recv.type.shapeId}`);
+    // Unit U (SEMANTICS.md S119): a slot holding undefined is no object:
+    // Node's TypeError, ahead of the statically decided answer.
+    const inGuard = undefThrowGuard(L, recv, `Cannot use 'in' operator to search for '${key}' in undefined`, loc);
+    const guardedIn = (answer: IrExpr): IrExpr =>
+      inGuard === recv ? answer : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: inGuard, loc }], result: answer, type: BOOL, loc };
     const field = shape.fields.find((f) => f.name === key);
     if (field) {
       if (field.type.kind === "union" && L.armTag(field.type.unionId, UNDEFINED_T) >= 0) {
         // Undefined-armed slot: an OPTIONAL field's key is present iff the
         // arm is not undefined; a required field's always is (board #178 —
         // L.markPresence answers which once the shape's flags are final).
-        const read: IrExpr = { kind: "recordGet", obj: recv, shapeId: recv.type.shapeId, field: key, type: field.type, loc };
+        // The read goes through the guard itself, so a computed receiver
+        // (`"k" in get()`) is evaluated exactly once.
+        const read: IrExpr = { kind: "recordGet", obj: inGuard, shapeId: recv.type.shapeId, field: key, type: field.type, loc };
         return L.markPresence(
           { kind: "unionIsTag", unionId: field.type.unionId, tag: L.armTag(field.type.unionId, UNDEFINED_T), negated: true, value: read, type: BOOL, loc },
           recv.type.shapeId,
@@ -9948,7 +10291,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // shape — statically true, but folding may only drop a
       // side-effect-free receiver read.
       if (recv.kind === "varRef" || recv.kind === "recordGet" || recv.kind === "fieldGet" || pureRecvNode) {
-        return { kind: "boolLit", value: true, type: BOOL, loc };
+        const present = plainFieldPresent(L, { kind: "recordGet", obj: recv, shapeId: recv.type.shapeId, field: key, type: field.type, loc }, loc);
+        return guardedIn(present ?? { kind: "boolLit", value: true, type: BOOL, loc });
       }
       L.unsupported("SC1090", expr, "statically-decided 'in' on computed receivers (bind the value to a variable first)");
     }
@@ -9957,7 +10301,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // declared non-optional fields.
     if (shape.fields.some((f) => f.name === `%get:${key}` || f.name === `%set:${key}`)) {
       if (recv.kind === "varRef" || recv.kind === "recordGet" || recv.kind === "fieldGet" || pureRecvNode) {
-        return { kind: "boolLit", value: true, type: BOOL, loc };
+        return guardedIn({ kind: "boolLit", value: true, type: BOOL, loc });
       }
       L.unsupported("SC1090", expr, "statically-decided 'in' on computed receivers (bind the value to a variable first)");
     }
@@ -9965,7 +10309,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       L.unsupported("SC1090", expr, "'in' over index-signature keys (read the key and test '!== undefined' instead)");
     }
     if (recv.kind === "varRef" || recv.kind === "recordGet" || recv.kind === "fieldGet" || pureRecvNode) {
-      return { kind: "boolLit", value: false, type: BOOL, loc };
+      return guardedIn({ kind: "boolLit", value: false, type: BOOL, loc });
     }
     L.unsupported("SC1090", expr, "statically-decided 'in' on computed receivers (bind the value to a variable first)");
   }
@@ -10018,7 +10362,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
                 recvT.shapeId,
                 f.name,
               )
-            : { kind: "boolLit", value: true, type: BOOL, loc };
+            : (accessor ? null : plainFieldPresent(L, { kind: "recordGet", obj: r, shapeId: recvT.shapeId, field: f.name, type: f.type, loc }, loc)) ?? { kind: "boolLit", value: true, type: BOOL, loc };
         body.push({ kind: "if", cond: eq, then: [ret(answer)], else_: null, loc });
       }
       const ksT = arrayOf(STRING);
@@ -10315,11 +10659,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    *     member fence);
    *   - a nullable receiver (the JS `s.match(re).groups` idiom) throws
    *     Node's exact TypeError on the unit arms;
-   *   - every declared name is a key (nonparticipating groups hold "" —
-   *     divergence 51's rule, exactly the slice elements they project);
-   *   - ES2025 duplicate names (distinct alternatives) project the first
-   *     participating occurrence: at most one participates, and a
-   *     participating-empty "" falls through to slots that are "" anyway;
+   *   - every declared name is a key (a nonparticipating group holds
+   *     exactly the slice element it projects: undefined on the WasmGC
+   *     lanes, "" on c/llvm — SEMANTICS.md S064);
+   *   - ES2025 duplicate names (distinct alternatives) project the
+   *     participating occurrence: at most one participates (on c/llvm a
+   *     participating-empty "" falls through to slots that are "" anyway);
    *   - key order is group declaration order (declaredOrder), Node's own.
    * The record has no prototype — Node's groups object is null-prototype,
    * observable only through util.inspect's "[Object: null prototype]"
@@ -10470,8 +10815,11 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           values.set(name, elem(idxs[0]!));
           return;
         }
-        // Duplicates: the first non-"" occurrence (at most one
-        // participates; all-"" answers "" like any nonparticipating slot).
+        // Duplicates: the participating occurrence (at most one
+        // participates). On the WasmGC lanes (undefSlots) a
+        // nonparticipating slot is undefined, so the test is exact; on
+        // the c/llvm lanes it is "" (SEMANTICS.md S064), so the first
+        // non-"" occurrence answers and all-"" answers "".
         const id = `g${i}.0`;
         locals.push({ id, name: `g${i}`, type: STRING, mutable: true });
         body.push({ kind: "varDecl", localId: id, init: elem(idxs[0]!), loc });
@@ -10479,7 +10827,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         for (const idx of idxs.slice(1)) {
           body.push({
             kind: "if",
-            cond: { kind: "strEq", negated: false, left: gRef, right: { kind: "strLit", value: "", type: STRING, loc }, type: BOOL, loc },
+            cond: L.undefSlots
+              ? isUndefExpr(gRef, false, loc)
+              : { kind: "strEq", negated: false, left: gRef, right: { kind: "strLit", value: "", type: STRING, loc }, type: BOOL, loc },
             then: [{ kind: "assign", localId: id, value: elem(idx), loc }],
             else_: null,
             loc,
@@ -11145,10 +11495,74 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         loc,
       };
     }
-    return target.container === "class"
+    return undefWriteGuard(L, target.container === "class"
       ? { kind: "fieldSet", obj: target.obj, className: target.className, field: target.field, value, loc }
-      : { kind: "recordSet", obj: target.obj, shapeId: target.shapeId, field: target.field, value, loc };
+      : { kind: "recordSet", obj: target.obj, shapeId: target.shapeId, field: target.field, value, loc });
   }
+
+/** Unit U (SEMANTICS.md S119 (a)): a write through a receiver that may hold
+ * its slot's undefined throws Node's catchable `Cannot set properties of
+ * undefined (setting '<key>')`, after the key and the value evaluated, as
+ * V8 does. `this` never holds it. The test is inline; the throw is an
+ * interned helper per key spelling (a run-time key's helper takes it). */
+export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
+  if (!L.undefSlots) return write;
+  if (write.kind !== "arraySet" && write.kind !== "recordSet" && write.kind !== "fieldSet" && write.kind !== "recordKeySet") return write;
+  // ToPropertyKey of a key holding undefined is the text "undefined".
+  if (write.kind === "recordKeySet") write = { ...write, key: undefinedAsText(L, write.key, write.loc) };
+  const obj = write.kind === "arraySet" ? write.arr : write.obj;
+  if (!mayHoldSlotUndef(L, obj)) return write;
+  if (obj.kind === "varRef" && obj.localId === L.resolveThis()?.id) return write;
+  const loc = write.loc;
+  const stmts: IrStmt[] = [];
+  const once = (e: IrExpr): IrExpr => {
+    if (pureReemittable(e)) return e;
+    const t = L.declareHiddenLocal("%undef", e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const o = once(obj);
+  let key: IrExpr | null = null;
+  if (write.kind === "arraySet") key = once(write.index);
+  if (write.kind === "recordKeySet") key = once(write.key);
+  const value = once(write.value);
+  const helperOf = (name: string, params: IrExpr[], message: IrExpr, paramTypes: IrType[]): string => {
+    let fn = L.retagHelpers.get(name);
+    if (!fn) {
+      fn = `%undef.set.${L.retagHelpers.size}`;
+      L.retagHelpers.set(name, fn);
+      L.liftedFns.push({
+        name: fn,
+        params: paramTypes.map((t, i) => ({ localId: `k.${i}`, name: `k${i}`, type: t })),
+        returnType: VOID,
+        locals: paramTypes.map((t, i) => ({ id: `k.${i}`, name: `k${i}`, type: t, mutable: false })),
+        body: [{ kind: "throw", value: { kind: "libCall", fn: "error.new", args: [message], type: { kind: "object", className: "%TypeError" }, loc }, loc }],
+        loc,
+      });
+    }
+    void params;
+    return fn;
+  };
+  const text = (s: string): IrExpr => ({ kind: "strLit", value: s, type: STRING, loc });
+  let call: IrExpr;
+  const staticKey = write.kind === "recordSet" || write.kind === "fieldSet" ? write.field : key?.kind === "numLit" ? String(key.value) : key?.kind === "strLit" ? key.value : null;
+  if (staticKey !== null) {
+    const fn = helperOf(`undefset:${staticKey}`, [], text(`Cannot set properties of undefined (setting '${staticKey}')`), []);
+    call = { kind: "call", callee: fn, args: [], type: VOID, loc };
+  } else {
+    const t = key!.type;
+    const k: IrExpr = { kind: "varRef", localId: "k.0", type: t, loc };
+    const kText: IrExpr = t.kind === "string" ? k : { kind: "toString", operand: k, type: STRING, loc };
+    const msg: IrExpr = { kind: "strConcat", left: { kind: "strConcat", left: text("Cannot set properties of undefined (setting '"), right: kText, type: STRING, loc }, right: text("')"), type: STRING, loc };
+    const fn = helperOf(`undefsetk:${typeKey(t)}`, [k], msg, [t]);
+    call = { kind: "call", callee: fn, args: [key!], type: VOID, loc };
+  }
+  stmts.push({ kind: "if", cond: isUndefExpr(o, false, loc), then: [{ kind: "exprStmt", expr: call, loc }], else_: null, loc });
+  if (write.kind === "arraySet") stmts.push({ ...write, arr: o, index: key!, value });
+  else if (write.kind === "recordKeySet") stmts.push({ ...write, obj: o, key: key!, value });
+  else stmts.push({ ...write, obj: o, value });
+  return { kind: "block", body: stmts, loc };
+}
 
 /** `Promise.reject(reason)` on THE Promise global: a pre-rejected
    * promise. The reason is pinned to the Error hierarchy (the executor
@@ -11318,7 +11732,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       : { kind: "numLit", value: 1, type: F64, loc };
     let value: IrExpr;
     if (op === "+" && target.fieldType.kind === "string") {
-      value = { kind: "strConcat", left: read, right: L.ensureString(rhs, rhsNode ?? access), type: STRING, loc };
+      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, rhsNode ?? access), type: STRING, loc }));
     } else if (target.fieldType.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op, left: read, right: rhs, type: F64, loc };
     } else if (
@@ -11395,7 +11809,7 @@ export function primitiveCtorClosure(
     const s: IrExpr = { kind: "varRef", localId: "v.0", type: STRING, loc };
     const value: IrExpr =
       name === "String"
-        ? s
+        ? undefinedAsText(L, s, loc)
         : name === "Number"
           ? { kind: "libCall", fn: "num.fromString", args: [s], type: F64, loc }
           : { kind: "strEq", negated: true, left: s, right: { kind: "strLit", value: "", type: STRING, loc }, type: BOOL, loc };

@@ -66,9 +66,20 @@ test("json runtime: parser, dyn, dynCheck failure path, stringify buffer", async
       `Uncaught SyntaxError: Unexpected non-whitespace character after JSON at position 2`,
       `Uncaught SyntaxError: Unexpected token 'n', "nul" is not valid JSON`,
       `Uncaught RangeError: Maximum call stack size exceeded`,
-      `Uncaught TypeError: expected number at $.items[2].price, got string`,
-      `Uncaught TypeError: expected object at $, got undefined`,
       ``,
     ].join("\n"),
   );
+});
+
+// GH #86 review (SEMANTICS.md S122): dynCheck's failure is a check Node
+// never makes, so it ends the program at the fence line, exit 1.
+test("json runtime: the dynCheck failure path ends the program at the fence line", async () => {
+  const r = await execFileAsync(bin, ["fail"]).then(
+    () => null,
+    (e: { code?: number; stdout?: string; stderr?: string }) => e,
+  );
+  expect(r).not.toBeNull();
+  expect(r!.code).toBe(1);
+  expect(r!.stdout).toBe("");
+  expect(r!.stderr).toBe("tsinter: unsupported: expected number at $.items[2].price, got string [SC1100]\n");
 });

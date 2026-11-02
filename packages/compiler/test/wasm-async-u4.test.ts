@@ -1238,14 +1238,14 @@ test("D23 DYNPROMISE: NOT-LIFTED: a class-instance fulfilment is the deferred co
   // Node v24 prints "sync\nclass 3 true\n" and exits 0; this tier traps.
   const { stdout, stderr } = await runRowTrap("D23", "'use strict';\nclass P { constructor() { this.x = 3; } get() { return this.x; } }\nfunction id(v) { return v; }\nasync function mk() { return new P(); }\nid(mk()).then((v) => console.log('class', v.x, v instanceof P));\nconsole.log('sync');", "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:5]\n");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:5]\n");
 });
 
 test("D24 DYNPROMISE: console.log of a boxed promise is the named inspect fence", async () => {
   // Node v24 prints "before\nPromise { 1 }\nafter\n" and exits 0; this tier traps.
   const { stdout, stderr } = await runRowTrap("D24", "'use strict';\nfunction id(v) { return v; }\nasync function g() { return 1; }\nconsole.log('before');\nconsole.log(id(g()));\nconsole.log('after');", "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: util.inspect of a promise value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: util.inspect of a promise value is not supported yet [SC1090]\n");
 });
 
 test("D25 DYNPROMISE: a module mixing a typed same-type Promise.race with an any-held await (the await no longer copies, board #184)", async () => {
@@ -1407,11 +1407,12 @@ test("R20 REACTION: a late catch against rejectionHandled", async () => {
 });
 
 test("R21 REACTION: a handler returning a non-promise thenable is a named run-time refusal", async () => {
-  // Node v24 prints "sync\nthenable.then called\ngot 42\n" — this tier rejects with a named run-time refusal (adopting a non-promise thenable is not built).
-  const { stdout, stderr, exitCode } = await runRow("R21", "'use strict';\nfunction id(v) { return v; }\nasync function g() { return 1; }\nconst thenFn = function (res) { console.log('thenable.then called'); res(42); };\nconst thenable = { then: thenFn };\nid(g()).then(() => thenable).then((v) => console.log('got', v), (e) => console.log('rejected', String(e)));\nconsole.log('sync');", "cjs");
-  expect(stdout).toBe("sync\nrejected Error: adopting a non-promise thenable returned from a promise reaction is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // Node v24 prints "sync\nthenable.then called\ngot 42\n" — this tier stops at a named run-time fence (adopting a
+  // non-promise thenable is not built); since GH #86 (SEMANTICS.md S122) the fence ends the program — the rejection
+  // handler never sees it.
+  const { stdout, stderr } = await runRowTrap("R21", "'use strict';\nfunction id(v) { return v; }\nasync function g() { return 1; }\nconst thenFn = function (res) { console.log('thenable.then called'); res(42); };\nconst thenable = { then: thenFn };\nid(g()).then(() => thenable).then((v) => console.log('got', v), (e) => console.log('rejected', String(e)));\nconsole.log('sync');", "cjs");
+  expect(stdout).toBe("sync\n");
+  expect(stderr).toBe("tsinter: unsupported: adopting a non-promise thenable returned from a promise reaction is not supported yet [SC1090]\n");
 });
 
 test("R22 REACTION: a finally handler receives no argument", async () => {

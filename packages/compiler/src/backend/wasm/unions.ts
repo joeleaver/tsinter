@@ -29,7 +29,7 @@
 import { Code } from "./code.js";
 import { UNDEF_UNION_TAG } from "./undef.js";
 import { emitFlat } from "./strings.js";
-import { isUnitType, type IrType } from "../../ir/nodes.js";
+import { isUnitType, UNDEFINED_T, type IrType } from "../../ir/nodes.js";
 import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.js";
 
 /** One arm as a helper needs it: the KIND decides the dispatch answer,
@@ -480,6 +480,12 @@ export class UnionBuilder {
         c.refCast(fromStruct);
         c.structGet(fromStruct, PAYLOAD);
         c.structNew(toStruct);
+      }, () => {
+        // Unit U (SEMANTICS.md S119): a union with no undefined arm holding
+        // undefined re-tags as undefined: the target's arm, or its reserved
+        // tag.
+        const tTag = toTag(UNDEFINED_T);
+        c.globalGet(this.unitGlobal(tTag >= 0 ? tTag : UNDEF_UNION_TAG));
       });
       this.mb.setBody(idx, [I32], c.bytes());
       return idx;

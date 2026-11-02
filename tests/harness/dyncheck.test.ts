@@ -80,7 +80,7 @@ console.log("unreachable", c.host);
     );
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $.port, got string");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got string");
   });
 
   test("missing field throws as undefined", async () => {
@@ -92,7 +92,7 @@ console.log("unreachable", c.port);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $.port, got undefined");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got undefined");
   });
 
   test("optional field: a PRESENT wrong-typed key throws with the arms named", async () => {
@@ -108,7 +108,7 @@ console.log("unreachable", c.host);
     );
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain(
-      "Uncaught TypeError: expected number | undefined at $.port, got string",
+      "tsinter: unsupported: expected number | undefined at $.port, got string",
     );
   });
 
@@ -120,7 +120,7 @@ console.log("unreachable", n);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $, got null");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $, got null");
   });
 
   test("JSON null misses a null-armed union's OTHER arm with the arms named", async () => {
@@ -134,7 +134,7 @@ console.log("unreachable", x.a === null);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected null | string at $.a, got number");
+    expect(r.stderr).toContain("tsinter: unsupported: expected null | string at $.a, got number");
   });
 
   test("union with no matching arm throws with all arms named", async () => {
@@ -146,7 +146,7 @@ console.log("unreachable", s.kind);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected object | object at $, got object");
+    expect(r.stderr).toContain("tsinter: unsupported: expected object | object at $, got object");
   });
 
   test("nested paths point at the offending element", async () => {
@@ -159,7 +159,7 @@ console.log("unreachable", d.server.host);
     );
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain(
-      "Uncaught TypeError: expected number at $.server.ports[2], got string",
+      "tsinter: unsupported: expected number at $.server.ports[2], got string",
     );
   });
 
@@ -176,7 +176,7 @@ console.log("unreachable", t.label);
     );
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain(
-      "Uncaught TypeError: expected string at $.children[0].children[0].label, got number",
+      "tsinter: unsupported: expected string at $.children[0].children[0].label, got number",
     );
   });
 
@@ -189,10 +189,10 @@ console.log("unreachable", c.port);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected object at $, got array");
+    expect(r.stderr).toContain("tsinter: unsupported: expected object at $, got array");
   });
 
-  test("a failed check is CATCHABLE and execution recovers", async () => {
+  test("a failed check ENDS the program, even inside try/catch (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "catchable",
       `type Config = { port: number };
@@ -206,9 +206,11 @@ function load(raw: string): number {
 console.log(load('{"port":8080}'), load('{"port":"x"}'), load('{"port":1}'));
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("8080 -1 1\n");
-    expect(r.stderr).toBe("");
+    // Node erases the cast and prints "8080 x 1"; the check is this
+    // tier's own, so the catch never runs.
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected number at $.port, got string [SC1100]\n");
   });
 
   test("width tolerance really is check-and-extract: extras dropped, no throw", async () => {
@@ -231,7 +233,7 @@ console.log("unreachable", rows.length);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected array of length 2 at $[1], got array");
+    expect(r.stderr).toContain("tsinter: unsupported: expected array of length 2 at $[1], got array");
   });
 
   test("tuple positions fail with index paths and per-position types", async () => {
@@ -243,7 +245,7 @@ console.log("unreachable", s.range[0]);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $.range[1], got string");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.range[1], got string");
   });
 
   test("an object where a tuple is expected names the array shape", async () => {
@@ -254,10 +256,10 @@ console.log("unreachable", t[1]);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected array at $, got object");
+    expect(r.stderr).toContain("tsinter: unsupported: expected array at $, got object");
   });
 
-  test("tuple failure-path RC stress: partial tuples release on unwind", async () => {
+  test("tuple failure path: a partial tuple's mismatch inside try ends the program (GH #86 review, SEMANTICS.md S122; no unwind path remains to stress)", async () => {
     const r = await compileAndRun(
       "tuple-rc-failure",
       `let recovered = 0;
@@ -272,11 +274,12 @@ for (let i = 0; i < 100; i = i + 1) {
 console.log(recovered);
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("100\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected string at $[1][1], got number [SC1100]\n");
   });
 
-  test("failure-path RC stress: repeated mismatches through catch stay clean", async () => {
+  test("failure path: a record's mismatch inside try ends the program (GH #86 review, SEMANTICS.md S122; no unwind path remains to stress)", async () => {
     // Meaningful mostly under SCRIPTC_SAN=1 (ASan + RC audit at exit): every
     // iteration builds a partial record/array that must release on unwind.
     const r = await compileAndRun(
@@ -300,8 +303,9 @@ for (let i = 0; i < 100; i = i + 1) {
 console.log(recovered);
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("200\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected string at $.tags[2], got number [SC1100]\n");
   });
 
   test("index-signature shapes CAPTURE extras — and a wrong-typed extra throws with its key path", async () => {
@@ -315,13 +319,13 @@ console.log("unreachable", bag["a"]);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected string at $.b, got number");
+    expect(r.stderr).toContain("tsinter: unsupported: expected string at $.b, got number");
   });
 
-  test("a dynamic write colliding with a declared field validates: mismatch throws, field untouched", async () => {
+  test("a dynamic write colliding with a declared field validates: a mismatch ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
     // JS would store anything under the key; scriptc validates against
-    // the declared slot's type instead (SEMANTICS.md divergence) — and the
-    // throw is catchable with the field's own type in the message.
+    // the declared slot's type instead (SEMANTICS.md S009's amendment) —
+    // a check Node never makes, so a mismatch is a fence.
     const r = await compileAndRun(
       "index-write-collision",
       `interface P { input?: string; [k: string]: unknown }
@@ -336,11 +340,12 @@ try {
 console.log("kept:", p.input !== undefined ? p.input : "gone");
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("caught: expected string | undefined at $.input, got number\nkept: 1\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected string | undefined at $.input, got number [SC1100]\n");
   });
 
-  test("overflow churn through failed collisions stays clean", async () => {
+  test("a failed collision inside a loop ends the program at the first mismatch (GH #86 review, SEMANTICS.md S122; no unwind path remains to stress)", async () => {
     // Meaningful mostly under SCRIPTC_SAN=1: every iteration hands ownership
     // of a fresh dyn value to the write helper, which must release it on
     // the validation-failure path.
@@ -361,8 +366,9 @@ for (let i = 0; i < 100; i = i + 1) {
 console.log(recovered, p.host);
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("100 h\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected string at $.host, got number [SC1100]\n");
   });
 
   /* ── the checked-dynamic FUNCTION boundary ─────────────────────────
@@ -381,7 +387,7 @@ console.log("unreachable", f(1));
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected function at $, got number");
+    expect(r.stderr).toContain("tsinter: unsupported: expected function at $, got number");
   });
 
   test("a boxed function's thunk validates arguments per declared param, positionally", async () => {
@@ -395,7 +401,7 @@ console.log("unreachable");
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $[0], got string");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got string");
   });
 
   test("a MISSING argument is undefined and fails a required param's check", async () => {
@@ -410,7 +416,7 @@ console.log("unreachable");
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $[0], got undefined");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got undefined");
   });
 
   test("an adapter validates the RESULT into the target's return type", async () => {
@@ -423,10 +429,10 @@ console.log("unreachable", asNum());
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected number at $, got string");
+    expect(r.stderr).toContain("tsinter: unsupported: expected number at $, got string");
   });
 
-  test("boundary TypeErrors are catchable and calls keep working after", async () => {
+  test("a boundary mismatch inside try ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "dynfn-recover",
       `function twice(x: number): number { return x * 2; }
@@ -444,8 +450,9 @@ const good = u as (x: number) => number;
 console.log(caught, good(21));
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("50 42\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected number at $[0], got string [SC1100]\n");
   });
 
   test("adapter/box churn stays clean (RC stress across the boundary)", async () => {
@@ -470,11 +477,11 @@ console.log(total);
     expect(r.stdout).toBe("5050\n");
   });
 
-  test("a lying `any` into a typed slot throws catchably where Node proceeds silently", async () => {
+  test("a lying `any` into a typed slot ends the program where Node proceeds silently (GH #86 review, SEMANTICS.md S122)", async () => {
     // The static-any lane's exit stance (the checked cast's rule applied
     // to implicit any→typed flows): Node assigns the mismatched value and
-    // carries on; scriptc throws the catchable TypeError. Loud, never a
-    // silent wrong answer — the divergence is deliberate and documented.
+    // carries on; scriptc ends the program at the fence (the catch never
+    // runs). Loud, never a silent wrong answer.
     const r = await compileAndRun(
       "any-lying-exit",
       `const a: any = "not a number";
@@ -487,15 +494,16 @@ try {
 console.log("recovered");
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("TypeError\nrecovered\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: expected number.*got string \[SC1100\]\n$/);
   });
 
-  test("a lying cast into a union that cannot represent the value throws the stranded trap catchably", async () => {
+  test("a lying cast into a union that cannot represent the value ends the program at the stranded fence (GH #86 review, SEMANTICS.md S122)", async () => {
     // The stranded-source trap (coerceToExpected): a checker-approved
     // value no union arm can hold — a unit smuggled through `null!` / `as
-    // any`, or a scalar cast at a record union — compiles to the
-    // catchable TypeError where Node lets the impossible value ride
+    // any`, or a scalar cast at a record union — compiles to the fence
+    // that ends the program where Node lets the impossible value ride
     // (divergence 38's stance; the Node-exact families live in corpus
     // 2253).
     const r = await compileAndRun(
@@ -516,16 +524,19 @@ try {
 console.log("recovered");
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("TypeError true\nscalar: TypeError\nrecovered\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe(
+      "tsinter: unsupported: null is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]\n",
+    );
   });
 
-  test("a unit smuggled into a PLAIN non-nullable slot throws the stranded trap catchably", async () => {
+  test("a unit smuggled into a PLAIN non-nullable slot ends the program at the stranded fence (GH #86 review, SEMANTICS.md S122)", async () => {
     // The stranded-UNIT trap without a union in sight: `null!` / `null as
     // any as T` into a plain typed slot (string, array, class, function).
-    // Node lets the impossible value ride until it is used; the flow
-    // throws here instead (divergence 38's stance extended — SEMANTICS.md
-    // 335).
+    // Node lets the impossible value ride until it is used (and throws its
+    // own TypeError THERE, not at the flow); the flow ends the program
+    // here instead.
     const r = await compileAndRun(
       "plain-stranded-unit-trap",
       `try {
@@ -549,8 +560,11 @@ try {
 console.log("recovered");
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("TypeError true\narray: TypeError\nfunc: TypeError\nrecovered\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe(
+      "tsinter: unsupported: null is not representable in a 'string' slot (a value narrowed or asserted past the type still held it) [SC1090 at a narrowed value's conversion]\n",
+    );
   });
 
   test("a checker-approved function mismatch strands per piece: mismatched params compile at the flow, void results trap after the call", async () => {
@@ -697,7 +711,7 @@ console.log("unreachable", req.url);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("Uncaught TypeError: expected IncomingMessage at $, got string");
+    expect(r.stderr).toContain("tsinter: unsupported: expected IncomingMessage at $, got string");
   });
 
   test("a non-function listener on a dyn handle throws Node's ERR_INVALID_ARG_TYPE", async () => {

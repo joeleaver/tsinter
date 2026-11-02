@@ -78,7 +78,7 @@ import {
   F64 as IR_F64,
   REF_TRUTHY_KINDS,
 } from "../../ir/nodes.js";
-import { computeMayThrow } from "../emission/may-throw.js";
+import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import {
   CI_POST,
@@ -171,6 +171,7 @@ import {
   ENTRY_VALUE,
   FN_CLOS,
   FN_NAME,
+  FN_SRC,
   FN_SIG,
   VIEW_SIG,
   VIEW_TOKEN,
@@ -203,7 +204,7 @@ import { TlsBuilder } from "./tls.js";
 import { X509Builder } from "./tls-x509.js";
 import { CryptoBuilder, RANDOM_CHUNK, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
 import { ZlibBuilder, ZLIB_ERRORS } from "./zlib.js";
-import { PEM_ASN1, PEM_BAD_BASE64, PEM_BAD_END_LINE, PEM_NONCANON, PEM_TRAILING, PEM_UNSUPPORTED } from "./tls-x509.js";
+import { PEM_ASN1, PEM_ASN1_FIELD_MISSING, PEM_ASN1_HEADER, PEM_ASN1_TOO_LONG, PEM_ASN1_WRONG_TAG, PEM_BAD_BASE64, PEM_BAD_END_LINE, PEM_NONCANON, PEM_TRAILING, PEM_UNSUPPORTED } from "./tls-x509.js";
 import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
 import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
 import { A, Fn, type X } from "./asm.js";
@@ -260,6 +261,10 @@ import { escapeRegExpText } from "./regexp-escape.js";
  * practical limit, purely a safety net against a pathological or
  * unanticipated shape hanging the compiler. */
 const FOLD_DEPTH_CAP = 32;
+
+/** GH #86: the stderr line a runtime fence ends the program with —
+ * `tsinter: unsupported: <message> [SC#### at <file>:<line>]`. */
+export const FENCE_FATAL_PREFIX = "tsinter: unsupported: ";
 import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { StrdecBuilder } from "./strdec.js";
@@ -377,6 +382,30 @@ function canonicalBool(e: WExpr): boolean {
     default:
       return false;
   }
+}
+
+/** S119 (i): can a checked dynamic value fill a record in this module? A
+ * composite dynCheck, an island exit, or a function boxed into a dynamic
+ * value (its thunk checks the arguments). */
+function moduleCanLackKey(mod: { functions: unknown }): boolean {
+  let found = false;
+  const seen = new Set<unknown>();
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const n = v as { kind?: unknown; type?: { kind?: unknown } };
+    const tk = n.type?.kind;
+    if ((n.kind === "dynCheck" || n.kind === "jsExit") && tk !== "f64" && tk !== "string" && tk !== "bool" && tk !== "dyn") found = true;
+    if (n.kind === "recordGet" && (n as { spreadCopy?: true }).spreadCopy === true) found = true;
+    if (n.kind === "dynFrom" && (n as { value?: { type?: { kind?: unknown } } }).value?.type?.kind === "func") found = true;
+    for (const x of Object.values(v)) visit(x);
+  };
+  visit(mod.functions);
+  return found;
 }
 
 function capturesOwnBinding(init: unknown, localId: string): boolean {
@@ -1340,6 +1369,17 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     // Unit G2: an interface's 'close' listeners run inside close(), and a
     // throw from one reaches close()'s caller.
     "rl.close",
+    // GH #91: `k in obj` with a runtime key throws here (Node's TypeError
+    // on a primitive receiver, the named refusals); the native lanes'
+    // scr_dyn_has_key never throws.
+    "dyn.hasKey",
+    // Unit U: the packed argument list's own check (a slot's undefined).
+    "path.hostJoin", "path.hostResolve",
+    // GH #86 review: Node's ERR_INVALID_ARG_TYPE at a builtin's parameter.
+    "dyn.argStr",
+    // GH #86 review: a runtime options record's invalid highWaterMark or
+    // unknown readable encoding throws Node's TypeError on this tier.
+    "readable.initDyn", "writable.initDyn",
   ]);
   let found = false;
   const scan = (node: unknown): void => {
@@ -1351,6 +1391,11 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     if (node !== null && typeof node === "object") {
       const rec = node as Record<string, unknown>;
       if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && keys.has(rec["fn"])) {
+        found = true;
+        return;
+      }
+      // GH #93: repeat's RangeErrors are catchable on this tier.
+      if (rec["kind"] === "strIntrinsic" && rec["method"] === "repeat") {
         found = true;
         return;
       }
@@ -1383,6 +1428,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
       // a throwing call here.
       if (out["kind"] === "strConcat") {
         return { kind: "libCall", fn: "cp.execSync", args: [out["left"], out["right"]], type: out["type"], loc: out["loc"] };
+      }
+      if (out["kind"] === "strIntrinsic" && out["method"] === "repeat") {
+        return { kind: "libCall", fn: "cp.execSync", args: [out["receiver"], ...(out["args"] as unknown[])], type: out["type"], loc: out["loc"] };
       }
       if (out["kind"] === "dynHasKey" && netKeys) {
         return { kind: "libCall", fn: "cp.execSync", args: [out["value"]], type: out["type"], loc: out["loc"] };
@@ -2818,6 +2866,9 @@ class Assembler {
   /** Unit U (SEMANTICS.md S119): the module was lowered with undefSlots —
    * every typed slot can hold its kind's undefined. */
   private readonly undefSlots: boolean;
+  /** S119 (i): a value here can reach typed storage from dynamic code, so
+   * a record may lack a key. A wholly typed module pays nothing. */
+  private readonly undefMarksLive: boolean;
   /** Strings unit S3: whether this module can build a slice view
    * (hasStrView — slices.ts). */
   private readonly strViewsLive: boolean;
@@ -3091,6 +3142,7 @@ class Assembler {
     this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper(), this.strViewsLive);
     this.nodesLive = this.strViewsLive || hasStrConcat(mod);
     this.undefSlots = (mod as { undefSlots?: true }).undefSlots === true;
+    this.undefMarksLive = this.undefSlots && moduleCanLackKey(mod as unknown as { functions: unknown });
     setFlatCrossing(this.nodesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
     // Phase 2 E0/E1: a module that reaches the island engine carries it
     // (engine.ts), and the engine's code owns memory 0 — so the decision
@@ -3667,8 +3719,368 @@ class Assembler {
     c.globalSet(exc.kindG);
   }
 
+  private dynArgStrFunc: number | null = null;
+
+  /** %w.dyn.argStr(d, name, expected, wide) → string: IrLibFn "dyn.argStr". */
+  private dynArgStrHelper(): number {
+    if (this.dynArgStrFunc !== null) return this.dynArgStrFunc;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef, this.strRef, this.strRef, I32], [this.strRef]), "%w.dyn.argStr");
+    this.dynArgStrFunc = idx;
+    const dynT = this.dyn.dynT();
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(0);
+    c.structGet(dynT, DYN_REF);
+    emitFlatCast(c, this.strType);
+    c.return_();
+    c.end();
+    c.localGet(3);
+    c.ifVoid();
+    // a Buffer, typed array or URL Node takes here, in a form this
+    // lowering does not carry
+    c.localGet(0);
+    c.call(this.dyn.isBinaryLike());
+    c.localGet(3);
+    c.i32Const(2);
+    c.i32Eq();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.i32And();
+    c.i32Or();
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) => {
+      x.localGet(1);
+      this.pushStrLitInto(x, " argument held in a dynamic value as a Buffer, typed array, URL or file descriptor is not supported yet");
+      x.call(this.concatHelper());
+    }, null);
+    c.end();
+    c.end();
+    // wide 3: Node's own answer for a non-path is not an error (existsSync
+    // answers false) — the caller tests for the undefined
+    c.localGet(3);
+    c.i32Const(3);
+    c.i32Eq();
+    c.ifVoid();
+    c.refNull(this.strType);
+    c.return_();
+    c.end();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      this.pushStrLitInto(x, 'The "');
+      x.localGet(1);
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, '" argument must be ');
+      x.call(this.concatHelper());
+      x.localGet(2);
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, ". Received ");
+      x.call(this.concatHelper());
+      x.localGet(0);
+      x.call(this.dyn.specificType());
+      x.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    c.refNull(this.strType);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   private reportUncaughtFunc: number | null = null;
   private renderUncaughtFunc: number | null = null;
+  private fenceFatalFunc: number | null = null;
+
+  /** %w.err.fence(message) — GH #86: a RUNTIME FENCE (a construct this
+   * build cannot run, reached) ends the program. Prints `tsinter:
+   * unsupported: <message>` to fd 2 and traps: no try/catch, finally,
+   * promise reaction, 'uncaughtException' or 'exit' listener runs after it
+   * (a trap is uncatchable in this tier — it emits no exception-handling
+   * opcodes, abi.ts — and unlike reportUncaughtHelper this never drains
+   * the exit listeners). The trap is the tier's exit 1, as for a stack
+   * overflow (SEMANTICS.md S117 (b)). Never returns. */
+  fenceFatalHelper(): number {
+    if (this.fenceFatalFunc !== null) return this.fenceFatalFunc;
+    const strRef: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+    const idx = this.mb.declareFunc(this.mb.funcType([strRef], []), "%w.err.fence");
+    this.fenceFatalFunc = idx;
+    const out = this.ensureHelpers();
+    const c = new Code();
+    this.pushStrLitInto(c, FENCE_FATAL_PREFIX);
+    c.call(out.stage);
+    c.localGet(0);
+    c.call(out.stage);
+    c.i32Const(0x0a);
+    c.call(out.putc);
+    c.i32Const(FD_STDERR);
+    c.call(out.flush);
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** GH #86: end the program at a runtime fence — `pushMessage` leaves the
+   * fence's text (a flat string) on `c`'s stack; `codeLit`, when the text
+   * does not already carry it, is appended as ` [SC####]`. Emits the
+   * helper call and an `unreachable`, so whatever the caller emits next
+   * (the unwind a catchable throw would have taken) is dead code the
+   * validator accepts. */
+  emitFenceFatal(c: Code, pushMessage: (c: Code) => void, codeLit: string | null = null): void {
+    pushMessage(c);
+    // every fence names its code: a named "not supported yet" refusal is
+    // SC1090's; "" marks a text that already carries `[<code> …]`
+    const code = codeLit ?? "SC1090";
+    if (code !== "") {
+      this.pushStrLitInto(c, ` [${code}]`);
+      c.call(this.concatHelper());
+    }
+    c.call(this.fenceFatalHelper());
+    c.unreachable();
+  }
+
+  /** Unit U (SEMANTICS.md S119 (a)): a string or array operation whose
+   * receiver is a BINDING read the lowerer marked (`undefRecv`, the member
+   * name): ahead of the operation, the binding's VALUE slot is read again
+   * (a pure local/global/field read — no flattening, no shadow, so the
+   * rope and view machinery keep their shapes and costs) and tested for
+   * the slot's undefined; holding it, Node's catchable `TypeError: Cannot
+   * read properties of undefined (reading '<member>')` is thrown. The
+   * mark makes the function may-throw (may-throw.ts). */
+  private emitMarkedRecvCheck(e: WExpr): void {
+    // the receiver slot of a string/array intrinsic, an index read, or a
+    // lowered helper call (its first argument — the HOF helpers)
+    const r = (
+      e.kind === "strIntrinsic" || e.kind === "arrIntrinsic" ? e.receiver
+        : e.kind === "arrayGet" ? e.arr
+          : e.kind === "call" ? e.args[0]
+            : undefined
+    ) as (WExpr & { undefRecv?: string }) | undefined;
+    const member = r?.undefRecv;
+    if (r === undefined || typeof member !== "string") return;
+    // an array index read tests its own receiver, after its index
+    // evaluated (the arrayGet case)
+    if (member === "\0" && e.kind === "arrayGet") return;
+    const code = this.fn.code;
+    const bare = { ...r } as WExpr & { undefRecv?: string };
+    delete bare.undefRecv;
+    this.walkValue(bare);
+    this.emitIsUndefOnStack(r.type);
+    // openIf/close (not a bare if): the unwind's branch depths count it
+    this.openIf();
+    if (member === "\0") {
+      // a string index read with a run-time index (the lowerer bound it, so
+      // this reads it again): Node's text names the index
+      this.walkExpr((e as WExpr & { args: WExpr[] }).args[0]!);
+      code.call(this.undefIndexThrowHelper());
+      this.emitUnwind();
+    } else {
+      code.call(this.undefThunk(`Cannot read properties of undefined (reading '${member}')`, (c2, text) =>
+        this.emitSetCellError(c2, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, text), null),
+      ));
+      this.emitUnwind();
+    }
+    this.close();
+  }
+
+  private readonly undefThunks = new Map<string, number>();
+
+  /** One `() → ()` helper per message: the undefined tests sit at every
+   * member access, so their cold arms stay a call (GH #86 re-review: these
+   * inline arms were most of the guards' module size). */
+  private undefThunk(text: string, build: (c: Code, text: string) => void): number {
+    const hit = this.undefThunks.get(text);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), `%w.undef.${this.undefThunks.size}`);
+    this.undefThunks.set(text, idx);
+    const c = new Code();
+    build(c, text);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private readonly pathArgsCheck = new Map<boolean, number>();
+
+  /** %w.path.args(parts) → parts: Node's validateString over a packed
+   * path.join / path.resolve argument list holding a slot's undefined.
+   * join walks forward and names "path"; resolve walks from the end, names
+   * paths[i], and stops at an absolute path. */
+  private pathArgsCheckHelper(resolve: boolean): number {
+    const hit = this.pathArgsCheck.get(resolve);
+    if (hit !== undefined) return hit;
+    const info = this.strVecInfo();
+    const vr = this.vecs.vecRef(info);
+    const idx = this.mb.declareFunc(this.mb.funcType([vr], [vr]), `%w.path.args:${resolve ? "resolve" : "join"}`);
+    this.pathArgsCheck.set(resolve, idx);
+    const c = new Code();
+    const [I, N, S, B] = [1, 2, 3, 4];
+    c.localGet(0);
+    c.structGet(info.struct, 0); // VEC_LEN
+    c.localSet(N);
+    if (resolve) {
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+    }
+    c.block();
+    c.loop();
+    c.localGet(I);
+    if (resolve) {
+      c.i32Const(0);
+      c.i32LtS();
+    } else {
+      c.localGet(N);
+      c.i32GeS();
+    }
+    c.brIf(1);
+    c.localGet(0);
+    c.structGet(info.struct, 1); // VEC_BUF
+    c.localGet(I);
+    c.arrayGet(info.bufType);
+    c.localTee(S);
+    c.refIsNull();
+    c.ifVoid();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      if (resolve) {
+        this.pushStrLitInto(x, 'The "paths[');
+        x.localGet(I);
+        x.f64ConvertI32S();
+        x.call(this.f64ToStrHelper());
+        x.call(this.concatHelper());
+        this.pushStrLitInto(x, ']" argument must be of type string. Received undefined');
+        x.call(this.concatHelper());
+      } else {
+        this.pushStrLitInto(x, 'The "path" argument must be of type string. Received undefined');
+      }
+    }, "ERR_INVALID_ARG_TYPE");
+    c.localGet(0);
+    c.return_();
+    c.end();
+    if (resolve) {
+      // an absolute path ends the walk: nothing before it is read
+      c.localGet(S);
+      emitFlatCast(c, this.strType);
+      c.arrayLen();
+      c.ifVoid();
+      c.localGet(S);
+      emitFlatCast(c, this.strType);
+      c.i32Const(0);
+      c.arrayGetU(this.strType);
+      c.i32Const(47);
+      c.i32Eq();
+      c.ifVoid();
+      // the arguments before it are never read: the tail alone resolves
+      c.localGet(N);
+      c.localGet(I);
+      c.i32Sub();
+      c.localTee(N);
+      c.arrayNewDefault(info.bufType);
+      c.localSet(B);
+      c.localGet(B);
+      c.i32Const(0);
+      c.localGet(0);
+      c.structGet(info.struct, 1); // VEC_BUF
+      c.localGet(I);
+      c.localGet(N);
+      c.arrayCopy(info.bufType, info.bufType);
+      c.localGet(N);
+      c.localGet(B);
+      c.refCast(info.bufType);
+      c.structNew(info.struct);
+      c.return_();
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+    } else {
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+    }
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(0);
+    this.mb.setBody(idx, [I32, I32, info.elemVal, { kind: "ref", nullable: true, typeIndex: info.bufType }], c.bytes());
+    return idx;
+  }
+
+  private undefIndexThrowFunc: number | null = null;
+
+  /** %w.undef.index(i): fills the cell with Node's TypeError for a read of
+   * index `i` of undefined — the one shared cold path of every run-time
+   * index read. */
+  private undefIndexThrowHelper(): number {
+    if (this.undefIndexThrowFunc !== null) return this.undefIndexThrowFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64], []), "%w.undef.index");
+    this.undefIndexThrowFunc = idx;
+    const c = new Code();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      this.pushStrLitInto(x, "Cannot read properties of undefined (reading '");
+      x.localGet(0);
+      x.call(this.f64ToStrHelper());
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, "')");
+      x.call(this.concatHelper());
+    }, null);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** Whether the receiver of a member read needs no undefined test
+   * (may-throw.ts's provenPresent, which the analysis shares). */
+  private recvProven(obj: WExpr): boolean {
+    const fn = this.fn as FnState & { present?: Set<string> };
+    fn.present ??= presentLocals(fn.fn as unknown as Parameters<typeof presentLocals>[0]);
+    return provenPresent(obj, fn.present);
+  }
+
+  /** Unit U (SEMANTICS.md S119 (a)), the lead's ruling: a record, class or
+   * array receiver (the reference on the stack) that may hold its slot's
+   * undefined (null) meets a member read or a method call: Node's catchable
+   * `TypeError: Cannot read properties of undefined (reading '<member>')`,
+   * through one shared cold helper per message; only a receiver
+   * provenPresent vouches for skips the null test, and the function reads
+   * as may-throw (may-throw.ts). `what`: a named fence's text instead,
+   * where Node's text names something this tier does not spell. Leaves the
+   * receiver on the stack. */
+  private emitUndefRecvFence(obj: WExpr, member: string, c: Code, what?: string): void {
+    if (!this.undefSlots) return;
+    if (this.recvProven(obj)) return;
+    const t = this.mapType(obj.type, obj.loc);
+    if (t === null || t.kind !== "ref") return;
+    const tmp = this.acquireScratch(t);
+    c.localTee(tmp);
+    c.refIsNull();
+    // openIf/close (not a bare if): the unwind's branch depths count it
+    this.openIf();
+    if (what !== undefined) {
+      c.call(this.undefThunk(what, (c2, text) => this.emitFenceFatal(c2, (x) => this.pushStrLitInto(x, text))));
+      c.unreachable();
+    } else {
+      const setter = member.startsWith("set:");
+      const name = member.replace(/^[gs]et:/, "");
+      c.call(this.undefThunk(setter ? `Cannot set properties of undefined (setting '${name}')` : `Cannot read properties of undefined (reading '${name}')`, (c2, text) =>
+        this.emitSetCellError(c2, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, text), null),
+      ));
+      this.emitUnwind();
+    }
+    this.close();
+    c.localGet(tmp);
+    this.releaseScratch(t, tmp);
+  }
+
+  /** The literal-message form of emitFenceFatal, into the current
+   * function — the runtimeFence statement's (its message is pre-rendered
+   * with its code and place by the lowerer). */
+  private emitFenceFatalLit(message: string): void {
+    this.emitFenceFatal(this.fn.code, (c) => this.pushStrLitInto(c, message), "");
+  }
 
   /** %w.err.reportUncaught() — the wasm tier's missing half of S010's
    * pattern: an unhandled promise rejection already prints "Unhandled
@@ -3738,6 +4150,7 @@ class Assembler {
     const out = this.ensureHelpers();
     const c = new Code();
     const K = 0;
+    const E = 1;
     this.pushStrLitInto(c, "Uncaught ");
     c.call(out.stage);
     c.globalGet(exc.kindG);
@@ -3791,10 +4204,36 @@ class Assembler {
       c.i32Const(0);
     }
     c.ifVoid();
-    c.globalGet(exc.refG);
-    c.refCast(exc.errT);
-    c.call(this.errToStrHelper());
-    c.call(out.stage);
+    if (this.domexLive) {
+      // GH #86 review: Node prints `DOMException [<name>]: <message>`
+      c.globalGet(exc.refG);
+      c.refCast(exc.errT);
+      c.localSet(E);
+      this.emitIsDomexInto(c, E);
+      c.ifVoid();
+      this.pushStrLitInto(c, "DOMException [");
+      c.call(out.stage);
+      c.localGet(E);
+      c.structGet(exc.errT, ERR_NAME);
+      emitFlatCast(c, this.strType);
+      c.call(out.stage);
+      this.pushStrLitInto(c, "]: ");
+      c.call(out.stage);
+      c.localGet(E);
+      c.structGet(exc.errT, ERR_MESSAGE);
+      emitFlatCast(c, this.strType);
+      c.call(out.stage);
+      c.else_();
+      c.localGet(E);
+      c.call(this.errToStrHelper());
+      c.call(out.stage);
+      c.end();
+    } else {
+      c.globalGet(exc.refG);
+      c.refCast(exc.errT);
+      c.call(this.errToStrHelper());
+      c.call(out.stage);
+    }
     c.else_();
     this.pushStrLitInto(c, "[object Object]");
     c.call(out.stage);
@@ -3810,7 +4249,7 @@ class Assembler {
     c.call(out.putc);
     c.i32Const(FD_STDERR);
     c.call(out.flush);
-    this.mb.setBody(idx, [I32], c.bytes());
+    this.mb.setBody(idx, [I32, { kind: "ref", nullable: true, typeIndex: exc.errT }], c.bytes());
     return idx;
   }
 
@@ -3893,6 +4332,7 @@ class Assembler {
   /** #227's builder (fetch.ts): fetch(), its values and its poll phase. */
   private get fetch(): FetchBuilder {
     this.fetchField ??= new FetchBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       dyn: () => this.dyn,
       strRef: () => this.strRef,
       strType: () => this.strType,
@@ -4222,13 +4662,7 @@ class Assembler {
       this.pushStrLitInto(c, field);
       c.call(this.strEqHelper());
       c.ifVoid();
-      this.emitSetCellError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.pushStrLitInto(x, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`),
-        null,
-      );
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`), null);
       c.call(this.reportUncaughtHelper());
       c.end();
     }
@@ -4694,7 +5128,25 @@ class Assembler {
     c.end();
     kindIn([DK.FUNC]);
     c.ifVoid();
-    this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a function value is not supported yet"), null);
+    // GH #86 review: Node's DataCloneError quotes the function's source
+    // text. A box built from a known function carries it; one that reached
+    // here without it (a function that crossed anonymously) is a fence.
+    this.dyn.fnPayload(c, (x) => x.localGet(0));
+    c.structGet(this.dyn.fnT(), FN_SRC);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => {
+      this.dyn.fnPayload(x, (y) => y.localGet(0));
+      x.structGet(this.dyn.fnT(), FN_SRC);
+      emitFlatCast(x, this.strType);
+      this.pushStrLitInto(x, " could not be cloned.");
+      x.call(this.concatHelper());
+    }, null);
+    c.refNull(dynT);
+    ret();
+    c.end();
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "structuredClone of a function value is not supported yet"), null);
     c.refNull(dynT);
     ret();
     c.end();
@@ -4704,7 +5156,7 @@ class Assembler {
     if (this.netModule || this.fetchModule) {
       kindIn([DK.HANDLE]);
       c.ifVoid();
-      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, `structuredClone of a ${this.dyn.handleNoun()} is not supported yet`), null);
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, `structuredClone of a ${this.dyn.handleNoun()} is not supported yet`), null);
       c.refNull(dynT);
       ret();
       c.end();
@@ -4791,12 +5243,12 @@ class Assembler {
       }
     }
     if (dyn.urlLive) {
-      // Unit I: Node refuses to clone a URL (DataCloneError); the copy below
-      // would be a plain object, so it refuses by name.
+      // Unit I: Node refuses to clone a URL — its DataCloneError (GH #86
+      // review: Node's own catchable error, not a fence).
       dyn.objPayload(c, (x) => x.localGet(0));
       c.refTest(dyn.objUrlT());
       c.ifVoid();
-      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a URL held in a dynamic value is not supported yet"), null);
+      this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => this.pushStrLitInto(x, "Cannot clone object of unsupported type."), null);
       c.refNull(dynT);
       ret();
       c.end();
@@ -4807,7 +5259,7 @@ class Assembler {
       dyn.objPayload(c, (x) => x.localGet(0));
       c.refTest(dyn.objRegexT());
       c.ifVoid();
-      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of an island RegExp is not supported yet"), null);
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "structuredClone of an island RegExp is not supported yet"), null);
       c.refNull(dynT);
       ret();
       c.end();
@@ -6471,19 +6923,15 @@ class Assembler {
    * unwinds (recordKeySetHelper's own body has nothing left to do after
    * this — a void function's implicit end is the return). */
   private emitRecordKeyMiss(c: Code, K: number): void {
-    this.emitSetCellError(
-      c,
-      "%TypeError",
-      "TypeError",
-      (cc) => {
-        this.pushStrLitInto(cc, "Cannot add property '");
-        cc.localGet(K);
-        cc.call(this.concatHelper());
-        this.pushStrLitInto(cc, "' to a fixed-shape object");
-        cc.call(this.concatHelper());
-      },
-      null,
-    );
+    // GH #86 review (SEMANTICS.md S033, S122): Node adds the property, so
+    // the miss is a tsinter limit — it ENDS the program.
+    this.emitFenceFatal(c, (cc) => {
+      this.pushStrLitInto(cc, "Cannot add property '");
+      cc.localGet(K);
+      cc.call(this.concatHelper());
+      this.pushStrLitInto(cc, "' to a fixed-shape object");
+      cc.call(this.concatHelper());
+    });
   }
 
   /** %w.rks.<n> — the dynamic-keyed record WRITE helper for one shape:
@@ -6849,6 +7297,27 @@ class Assembler {
       return;
     }
     const st = this.unions.armStruct(genKey, tag, this.mapTypeSoft(vt));
+    // Unit U (SEMANTICS.md S119): a plain slot holding undefined yields
+    // undefined — V's own arm, so `.next().value === undefined` holds.
+    const undefTag = this.undefSlots ? vArms.findIndex((a) => a.kind === "undefinedT") : -1;
+    if (undefTag >= 0 && vt.kind !== "dyn" && vt.kind !== "jsval") {
+      const mt = this.mapType(vt, loc);
+      if (mt !== null) {
+        const x = this.acquireScratch(mt);
+        this.walkExpr(v);
+        code.localTee(x);
+        this.emitIsUndefOnStack(vt);
+        this.openIfResult(this.unions.baseRef());
+        code.globalGet(this.unions.unitGlobal(undefTag));
+        code.else_();
+        code.i32Const(tag);
+        code.localGet(x);
+        code.structNew(st);
+        this.close();
+        this.releaseScratch(mt, x);
+        return;
+      }
+    }
     code.i32Const(tag);
     this.walkExpr(v);
     code.structNew(st);
@@ -7750,13 +8219,7 @@ class Assembler {
       // listener; the engine's ledger does not reach the tier's dispatch
       // yet — a named error instead of a silently different stop.
       c.call(e.outDone);
-      this.emitSetCellError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.pushStrLitInto(x, "an island promise rejection with an 'unhandledRejection' listener registered is not supported yet (SEMANTICS.md S103)"),
-        null,
-      );
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "an island promise rejection with an 'unhandledRejection' listener registered is not supported yet (SEMANTICS.md S103)"), null);
       c.call(this.reportUncaughtHelper());
     }
     // The static report's own order (promises.ts emitReport): 'exit'
@@ -7876,6 +8339,7 @@ class Assembler {
 
   private get events(): EventsBuilder {
     this.eventsField ??= new EventsBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       strRef: () => this.strRef,
       strEq: () => this.strEqHelper(),
       thunkSig: () => this.dyn.thunkSig(),
@@ -7914,6 +8378,7 @@ class Assembler {
 
   private get stream(): StreamBuilder {
     this.streamField ??= new StreamBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       rootRef: () => this.classes.ref(this.classes.info("%Readable", undefined, false)!),
       rootStruct: () => this.classes.info("%Readable", undefined, false)!.struct,
       bytesRef: () => this.bytesB.bytesRef(),
@@ -8544,13 +9009,7 @@ class Assembler {
     // `emitSetCellError(c, ...)` — the explicit-buffer variant — is the
     // correct call here, mirroring `emitSetCellErrorLit`'s own internal
     // delegation with MY `c` instead of `this.fn.code`.
-    this.emitSetCellError(
-      c,
-      "%Error",
-      "Error",
-      (cc) => this.pushStrLitInto(cc, "a non-Error completion-callback argument is not supported yet (SEMANTICS.md S051)"),
-      null,
-    );
+    this.emitFenceFatal(c, (cc) => this.pushStrLitInto(cc, "a non-Error completion-callback argument is not supported yet (SEMANTICS.md S051)"), null);
     c.call(this.reportUncaughtHelper());
     c.unreachable(); // reportUncaughtHelper never returns; satisfies the ifResult's errRefType arm
     c.end();
@@ -9274,6 +9733,78 @@ class Assembler {
     code.end();
   }
 
+  /** Node's getHighWaterMark TypeError over the rendering `pushRecv`
+   * leaves (GH #86 review): fills the cell; the caller checks it. */
+  private emitHwmInvalid(code: Code, pushRecv: (c: Code) => void): void {
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => {
+      this.pushStrLitInto(cc, "The property 'options.highWaterMark' is invalid. Received ");
+      pushRecv(cc);
+      cc.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_VALUE");
+  }
+
+  /** Node's ERR_UNKNOWN_ENCODING TypeError naming the string `pushName`
+   * leaves; fills the cell. */
+  private emitUnknownEncoding(code: Code, pushName: (c: Code) => void): void {
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => {
+      this.pushStrLitInto(cc, "Unknown encoding: ");
+      pushName(cc);
+      cc.call(this.concatHelper());
+    }, "ERR_UNKNOWN_ENCODING");
+  }
+
+  private plainQuotableFunc: number | null = null;
+
+  /** %w.str.plainQuotable(s) → i32: every unit printable ASCII and none
+   * of `'` and `\` — util.inspect renders such a string as `'s'`. */
+  private plainQuotableHelper(): number {
+    if (this.plainQuotableFunc !== null) return this.plainQuotableFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [I32]), "%w.str.plainQuotable");
+    this.plainQuotableFunc = idx;
+    const c = new Code();
+    const I = 1;
+    const U = 2;
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(0);
+    c.arrayLen();
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(0);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.localTee(U);
+    c.i32Const(0x20);
+    c.i32LtU();
+    c.localGet(U);
+    c.i32Const(0x7e);
+    c.i32GtU();
+    c.i32Or();
+    c.localGet(U);
+    c.i32Const(0x27);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(U);
+    c.i32Const(0x5c);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.i32Const(1);
+    this.mb.setBody(idx, [I32, I32], c.bytes());
+    return idx;
+  }
+
   /** DYN-ADAPTER PHASE (1812): the scalar half of a `.initDyn`
    * construction — highWaterMark/encoding/autoDestroy, measured
    * directly against Node (m-initdyn-scalars.cjs). SCOPED: 1812's own
@@ -9323,19 +9854,62 @@ class Assembler {
     code.ifResult(F64);
     code.localGet(HWMVAL);
     code.else_();
-    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "the highWaterMark value for this dyn options record is not supported yet (out of scope: only a valid non-negative integer is built)"), null);
-    code.call(this.reportUncaughtHelper());
-    code.unreachable();
+    // GH #86 review: Node's getHighWaterMark throws here — its TypeError,
+    // catchable, the number rendered as util.inspect renders it.
+    this.emitHwmInvalid(code, (cc) => {
+      cc.localGet(HWMVAL);
+      cc.call(this.f64ToStrHelper());
+    });
+    code.f64Const(0);
     code.end();
     this.releaseScratch(F64, HWMVAL);
     code.else_();
-    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "a non-numeric highWaterMark for this dyn options record is not supported yet"), null);
-    code.call(this.reportUncaughtHelper());
-    code.unreachable();
+    // A string or boolean is Node's same TypeError (a string quoted as
+    // util.inspect quotes a plain printable one); any other kind, or a
+    // string inspect would escape, stays the fence.
+    code.localGet(HWM);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BOOL);
+    code.i32Eq();
+    code.ifResult(F64);
+    this.emitHwmInvalid(code, (cc) => {
+      cc.localGet(HWM);
+      cc.call(this.dyn.toStr());
+    });
+    code.f64Const(0);
+    code.else_();
+    code.localGet(HWM);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.STR);
+    code.i32Eq();
+    code.ifResult(I32);
+    code.localGet(HWM);
+    code.structGet(dynT, DYN_REF);
+    emitFlatCast(code, this.strType);
+    code.call(this.plainQuotableHelper());
+    code.else_();
+    code.i32Const(0);
+    code.end();
+    code.ifResult(F64);
+    this.emitHwmInvalid(code, (cc) => {
+      this.pushStrLitInto(cc, "'");
+      cc.localGet(HWM);
+      cc.structGet(dynT, DYN_REF);
+      emitFlatCast(cc, this.strType);
+      cc.call(this.concatHelper());
+      this.pushStrLitInto(cc, "'");
+      cc.call(this.concatHelper());
+    });
+    code.f64Const(0);
+    code.else_();
+    this.emitFenceFatal(code, (cc) => this.pushStrLitInto(cc, "a highWaterMark of this kind in a dynamic options record is not supported yet"), null);
+    code.end();
+    code.end();
     code.end();
     code.end();
     code.structSet(this.stream.stateT(), hwmField);
     this.releaseScratch(dynRefT, HWM);
+    this.emitPendingCheck();
     // encoding.
     const ENC = this.acquireScratch(dynRefT);
     this.emitInitDynGet(code, hasOpts, dynOpts, "encoding");
@@ -9370,18 +9944,70 @@ class Assembler {
     code.call(this.stream.setEncodingHexCore());
     code.drop();
     code.else_();
-    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "this dyn options record's encoding name is not supported yet (only 'utf8'/'hex' are built)"), null);
-    code.call(this.reportUncaughtHelper());
-    code.unreachable();
+    if (sides === FIN_SIDE_R) {
+      // GH #86 review: the readable state's StringDecoder — "" is falsy
+      // (no decoder, as absent), a name Buffer does not know is Node's
+      // ERR_UNKNOWN_ENCODING TypeError, catchable; a known name this tier
+      // does not build stays the fence.
+      code.localGet(ENCVAL);
+      code.arrayLen();
+      code.i32Eqz();
+      code.ifVoid();
+      code.else_();
+      code.localGet(ENCVAL);
+      code.call(this.bytesB.isEncodingHelper());
+      code.i32Eqz();
+      code.ifVoid();
+      this.emitUnknownEncoding(code, (cc) => cc.localGet(ENCVAL));
+      code.else_();
+      this.emitFenceFatal(code, (cc) => this.pushStrLitInto(cc, "this dyn options record's encoding name is not supported yet (only 'utf8'/'hex' are built)"), null);
+      code.end();
+      code.end();
+    } else {
+      this.emitFenceFatal(code, (cc) => this.pushStrLitInto(cc, "this dyn options record's encoding name is not supported yet (only 'utf8'/'hex' are built)"), null);
+    }
     code.end();
     code.end();
     this.releaseScratch(this.strRef, ENCVAL);
     code.else_();
-    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "a non-string encoding for this dyn options record is not supported yet"), null);
-    code.call(this.reportUncaughtHelper());
-    code.unreachable();
+    if (sides === FIN_SIDE_R) {
+      // a number or boolean: falsy is no decoder (as absent); truthy is
+      // Node's "Unknown encoding: <String(v)>"
+      code.localGet(ENC);
+      code.structGet(dynT, DYN_KIND);
+      code.i32Const(DK.NUM);
+      code.i32Eq();
+      code.localGet(ENC);
+      code.structGet(dynT, DYN_KIND);
+      code.i32Const(DK.BOOL);
+      code.i32Eq();
+      code.i32Or();
+      code.ifVoid();
+      code.localGet(ENC);
+      code.structGet(dynT, DYN_NUM);
+      code.f64Const(0);
+      code.f64Ne();
+      code.localGet(ENC);
+      code.structGet(dynT, DYN_NUM);
+      code.localGet(ENC);
+      code.structGet(dynT, DYN_NUM);
+      code.f64Eq();
+      code.i32And();
+      code.ifVoid();
+      this.emitUnknownEncoding(code, (cc) => {
+        cc.localGet(ENC);
+        cc.call(this.dyn.toStr());
+      });
+      code.end();
+      code.else_();
+      this.emitFenceFatal(code, (cc) => this.pushStrLitInto(cc, "a non-string encoding for this dyn options record is not supported yet"), null);
+      code.end();
+    } else {
+      this.emitFenceFatal(code, (cc) => this.pushStrLitInto(cc, "a non-string encoding for this dyn options record is not supported yet"), null);
+    }
     code.end();
     code.end();
+    this.emitPendingCheck();
     this.releaseScratch(dynRefT, ENC);
     // autoDestroy: measured `!== false`, not truthiness (m-initdyn-
     // scalars.cjs: a truthy string, and 0, both still leave it true;
@@ -9600,6 +10226,8 @@ class Assembler {
       errCode: () => ERR_CODE,
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
+      ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
       excKind: () => this.exc().kindG,
       strCmpU16: () => this.strCmpHelper(true),
       strSlice: () => this.strs.slice(),
@@ -9683,14 +10311,7 @@ class Assembler {
       ...(this.nullProtoLive
         ? {
             nullProtoToStr: (c: Code): void => {
-              this.emitSetCellError(
-                c,
-                "%Error",
-                "Error",
-                (x) => this.pushStrLitInto(x, NULL_PROTO_TOSTR_REFUSAL),
-                null,
-              );
-              c.call(this.reportUncaughtHelper());
+              this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, NULL_PROTO_TOSTR_REFUSAL), null);
             },
           }
         : {}),
@@ -9698,8 +10319,7 @@ class Assembler {
         ? {
             accessors: {
               refuse: (c: Code): void => {
-                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, ACCESSOR_READ_REFUSAL), null);
-                c.call(this.reportUncaughtHelper());
+                this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, ACCESSOR_READ_REFUSAL), null);
               },
             },
           }
@@ -9708,8 +10328,7 @@ class Assembler {
         ? {
             protoLink: {
               refuse: (c: Code): void => {
-                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, PROTO_LINK_REFUSAL), null);
-                c.call(this.reportUncaughtHelper());
+                this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, PROTO_LINK_REFUSAL), null);
               },
             },
           }
@@ -9723,8 +10342,7 @@ class Assembler {
             typed: {
               get: (elem: "u32" | "i32" | "f32") => this.bytesB.get(elem),
               refuse: (c: Code, what: string): void => {
-                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, what), null);
-                c.call(this.reportUncaughtHelper());
+                this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, what), null);
               },
             },
           }
@@ -9743,8 +10361,7 @@ class Assembler {
                 ["search", () => this.urlEngine.searchFn()],
               ] as const,
               refuse: (c: Code): void => {
-                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "deep equality over a URL held in a dynamic value is not supported yet"), null);
-                c.call(this.reportUncaughtHelper());
+                this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "deep equality over a URL held in a dynamic value is not supported yet"), null);
               },
             },
           }
@@ -9769,6 +10386,7 @@ class Assembler {
       lit: (c, s) => this.pushStrLitInto(c, s),
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       excKind: () => this.exc().kindG,
       clearExc: (c) => this.emitCellClearInto(c),
       newDynVec: (c) => {
@@ -9805,6 +10423,7 @@ class Assembler {
       inspF64: () => this.inspF64Helper(),
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       excKind: () => this.exc().kindG,
       bytesRefU8: () => this.bytesB.bytesRef(),
       bytesLen: () => this.bytesB.length(),
@@ -10021,7 +10640,7 @@ class Assembler {
     c.call(dyn.toStr());
     c.return_();
     c.end();
-    this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "converting this dynamic value to a URLSearchParams string is not supported yet"), null);
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "converting this dynamic value to a URLSearchParams string is not supported yet"), null);
     c.refNull(this.strType);
     this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
     return idx;
@@ -10517,6 +11136,7 @@ class Assembler {
    * see the "fsp.lchmodChk" case's own comment for why). */
   private get fsl(): FsLaddersBuilder {
     this.fslField ??= new FsLaddersBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       strRef: () => this.strRef,
       strType: () => this.strType,
       dynRef: () => this.dyn.dynRef(),
@@ -10899,6 +11519,7 @@ class Assembler {
   private get tls(): TlsBuilder {
     const strVec = (): VecInfo => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
     this.tlsField ??= new TlsBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       net: () => this.net,
       strRef: () => this.strRef,
       strType: () => this.strType,
@@ -11156,6 +11777,11 @@ class Assembler {
       [X509_NO_START, "error:0480006C:PEM routines::no start line", "ERR_OSSL_PEM_NO_START_LINE"],
       [PEM_BAD_BASE64, "error:04800064:PEM routines::bad base64 decode", "ERR_OSSL_PEM_BAD_BASE64_DECODE"],
       [PEM_BAD_END_LINE, "error:04800066:PEM routines::bad end line", "ERR_OSSL_PEM_BAD_END_LINE"],
+      // GH #86 review: the reasons the certificate's outer header decides
+      [PEM_ASN1_HEADER, "error:0680007B:asn1 encoding routines::header too long", "ERR_OSSL_ASN1_HEADER_TOO_LONG"],
+      [PEM_ASN1_TOO_LONG, "error:0680009B:asn1 encoding routines::too long", "ERR_OSSL_ASN1_TOO_LONG"],
+      [PEM_ASN1_WRONG_TAG, "error:068000A8:asn1 encoding routines::wrong tag", "ERR_OSSL_ASN1_WRONG_TAG"],
+      [PEM_ASN1_FIELD_MISSING, "error:06800079:asn1 encoding routines::field missing", "ERR_OSSL_ASN1_FIELD_MISSING"],
     ];
     const fences: [number, string][] = [
       [PEM_ASN1, "new crypto.X509Certificate of a PEM block whose body is not a certificate's DER"],
@@ -11178,7 +11804,7 @@ class Assembler {
       code.i32Const(k);
       code.i32Eq();
       this.openIf();
-      this.emitSetCellErrorLit("%Error", "Error", `${what} is not supported yet (SEMANTICS.md S093)`, null);
+      this.emitFenceFatal(this.fn.code, (fc) => this.pushStrLitInto(fc, `${what} is not supported yet (SEMANTICS.md S093)`), null);
       this.emitUnwind();
       this.close();
     }
@@ -11191,6 +11817,7 @@ class Assembler {
   /** INC-29 U4: the dgram builder (dgram.ts). */
   private get dgram(): DgramBuilder {
     this.dgramField ??= new DgramBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       net: () => this.net,
       strRef: () => this.strRef,
       strType: () => this.strType,
@@ -12162,12 +12789,12 @@ class Assembler {
     return idx;
   }
 
-  /** Throw the lowering fence (scr_throw_lowering_fence: an Error, code
-   * SC2020) whose message is the string on the stack. */
+  /** End the program at the lowering fence (GH #86) whose rendered text
+   * (message + "[SC2020 at file:line]") is the string on the stack. */
   private emitNetFence(c: Code): void {
     const S = this.netFenceTmp();
     c.globalSet(S);
-    this.emitSetCellError(c, "%Error", "Error", (c2) => c2.globalGet(S), "SC2020");
+    this.emitFenceFatal(c, (c2) => c2.globalGet(S), "");
   }
 
   private netFenceTmpField: number | null = null;
@@ -12487,7 +13114,7 @@ class Assembler {
     c.end();
     c.end();
     // Anything else: the loud fence, naming the property.
-    this.emitSetCellError(c, "%Error", "Error", (c2) => {
+    this.emitFenceFatal(c, (c2) => {
       this.pushStrLitInto(c2, "reading the property '");
       c2.localGet(KEY);
       c2.call(this.concatHelper());
@@ -12543,7 +13170,7 @@ class Assembler {
       c.i32Eq();
     };
     const fence = (what: string): void => {
-      this.emitSetCellError(c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `${what} on a net handle is not supported yet`), null);
+      this.emitFenceFatal(c, (c2) => this.pushStrLitInto(c2, `${what} on a net handle is not supported yet`), null);
       c.refNull(dynT);
       c.return_();
     };
@@ -12651,7 +13278,7 @@ class Assembler {
       }
       c.end();
       // Another event name: not modelled.
-      this.emitSetCellError(c, "%Error", "Error", (c2) => {
+      this.emitFenceFatal(c, (c2) => {
         this.pushStrLitInto(c2, `'${method}' for the event '`);
         c2.localGet(A0);
         c2.structGet(dynT, DYN_REF);
@@ -12726,23 +13353,78 @@ class Assembler {
         this.emitNetDynListener(c, "cb", A1, D);
         c.localSet(CB);
         c.else_();
-        // An encoding: absent, or utf8.
+        // An encoding (Writable.write's own ladder): falsy is the default
+        // utf8; utf8 is built; a name Buffer does not know — a string, or
+        // a truthy number or boolean — is Node's ERR_UNKNOWN_ENCODING
+        // TypeError, catchable (GH #86 review); a known name this tier
+        // does not build, and any other kind, stays the fence.
+        const unknownEnc = (pushName: (x: Code) => void): void => {
+          this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+            this.pushStrLitInto(c2, "Unknown encoding: ");
+            pushName(c2);
+            c2.call(this.concatHelper());
+          }, "ERR_UNKNOWN_ENCODING");
+          c.refNull(dynT);
+          c.return_();
+        };
         isKind(A1, DK.UNDEF);
         isKind(A1, DK.NULL);
         c.i32Or();
         c.i32Eqz();
         c.ifVoid();
         isKind(A1, DK.STR);
-        c.ifResult(I32);
+        c.ifVoid();
+        c.localGet(A1);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.strType);
+        c.arrayLen();
+        c.i32Eqz();
         strArg(A1, "utf8");
+        c.i32Or();
         strArg(A1, "utf-8");
         c.i32Or();
-        c.else_();
-        c.i32Const(0);
-        c.end();
         c.i32Eqz();
         c.ifVoid();
+        c.localGet(A1);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.strType);
+        c.call(this.bytesB.isEncodingHelper());
+        strArg(A1, "buffer");
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        unknownEnc((x) => {
+          x.localGet(A1);
+          x.structGet(dynT, DYN_REF);
+          emitFlatCast(x, this.strType);
+        });
+        c.end();
         fence(`'${method}' with an encoding other than utf8`);
+        c.end();
+        c.else_();
+        isKind(A1, DK.NUM);
+        isKind(A1, DK.BOOL);
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(A1);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.localGet(A1);
+        c.structGet(dynT, DYN_NUM);
+        c.localGet(A1);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Eq();
+        c.i32And();
+        c.ifVoid();
+        unknownEnc((x) => {
+          x.localGet(A1);
+          x.call(this.dyn.toStr());
+        });
+        c.end();
+        c.else_();
+        fence(`'${method}' with an encoding other than utf8`);
+        c.end();
         c.end();
         c.end();
         isKind(A2, DK.FUNC);
@@ -12824,6 +13506,7 @@ class Assembler {
   private get http(): HttpBuilder {
     const errRef = (): ValType => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT });
     this.httpField ??= new HttpBuilder(this.mb, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       net: () => this.net,
       strRef: () => this.strRef,
       strType: () => this.strType,
@@ -13566,7 +14249,7 @@ class Assembler {
     const arg = (i: number): void => this.walkExpr(e.args[i]!);
     const once = (i: number): boolean | null => this.netOnce(e.args[i], e.fn, e.loc);
     const fence = (what: string): true => {
-      this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `${what} is not supported yet`), null);
+      this.emitFenceFatal(code, (c2) => this.pushStrLitInto(c2, `${what} is not supported yet`), null);
       this.emitPendingCheck();
       const soft = this.mapTypeSoft(e.type);
       if (soft.kind === "ref") code.refNull(soft.typeIndex);
@@ -14225,9 +14908,10 @@ class Assembler {
 
   private readonly httpFns = new Map<string, number>();
 
-  /** Throw a named fence ("<what> is not supported yet") and return `ret`. */
+  /** A named fence ("<what> is not supported yet"): ends the program
+   * (GH #86); the `ret` after it is dead code. */
   private httpFence($: A, what: X, ret?: X): void {
-    this.emitSetCellError($.c, "%Error", "Error", () => what(), null);
+    this.emitFenceFatal($.c, () => what(), null);
     $.ret(ret);
   }
 
@@ -14419,8 +15103,22 @@ class Assembler {
         $.put(L, $.anew(this.http.hentArrT, $.shrU($.l(N), $.i(1))));
         $.for(I, $.i(0), $.shrU($.l(N), $.i(1)), () => {
           $.put(EL, at($.shl($.l(I), $.i(1))));
-          // A falsy name is skipped by writeHead's append loop; a
-          // non-string one is fenced.
+          // A falsy name is skipped by writeHead's append loop; a TRUTHY
+          // non-string one meets Node's token check (GH #86 review:
+          // Node's ERR_INVALID_HTTP_TOKEN, catchable — String(name) in
+          // its text); a falsy non-string one is fenced.
+          const ek = this.dk($, $.l(EL));
+          const truthyNonStr = $.or(
+            $.or($.eq(ek, $.i(DK.OBJ)), $.eq(ek, $.i(DK.ARR))),
+            $.or(
+              $.andThen($.eq(ek, $.i(DK.BOOL)), $.dne(this.dynTag($, $.l(EL)), $.d(0))),
+              $.andThen($.eq(ek, $.i(DK.NUM)), $.and($.dne(this.dynTag($, $.l(EL)), $.d(0)), $.deq(this.dynTag($, $.l(EL)), this.dynTag($, $.l(EL))))),
+            ),
+          );
+          $.if(truthyNonStr, () => {
+            $.drop($.call(this.httpNameArgFn(), $.l(EL)));
+            $.ret($.nul(this.http.hentArrT));
+          });
           $.if($.ne(this.dk($, $.l(EL)), $.i(DK.STR)), () =>
             this.httpFence($, this.httpLit($, "a header name that is not a string in a headers array"), $.nul(this.http.hentArrT)),
           );
@@ -14449,6 +15147,26 @@ class Assembler {
       const REASON = f.local(this.strRef);
       const HD = f.local(dynRefT);
       const L = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hentArrT });
+      // GH #86 review: a string, boolean, null or undefined status code
+      // that is not a valid code after ToInt32(ToNumber(·)) meets Node's
+      // own checks (headers already sent, then the RangeError naming
+      // String(code)), catchable; one that IS valid (Node takes "200")
+      // and every other kind stay the fence.
+      const sk = this.dk($, $.l(SC));
+      $.if($.or($.or($.eq(sk, $.i(DK.STR)), $.eq(sk, $.i(DK.BOOL))), $.or($.eq(sk, $.i(DK.NULL)), $.eq(sk, $.i(DK.UNDEF)))), () => {
+        const n = $.raw((c) => {
+          c.localGet(SC);
+          c.call(this.jsToNumberHelper());
+          c.call(this.toInt32Helper());
+        });
+        $.if($.or($.lt(n, $.i(100)), $.gt(n, $.i(999))), () => {
+          $.run(this.http.writeHeadBadStatusFn(), $.l(R), $.raw((c) => {
+            c.localGet(SC);
+            c.call(this.dyn.toStr());
+          }));
+          $.ret();
+        });
+      });
       $.if($.ne(this.dk($, $.l(SC)), $.i(DK.NUM)), () => this.httpFence($, this.httpLit($, "writeHead with a status code that is not a number")));
       $.put(HD, $.l(A2));
       $.if($.eq(this.dk($, $.l(A1)), $.i(DK.STR)), () => $.put(REASON, this.dynStr($, $.l(A1))), () => {
@@ -14846,7 +15564,7 @@ class Assembler {
         $.if(is("freeSockets"), () => $.ret($.call(this.httpAgentTableFn(h.agentField("freeSockets"), 1), a)));
         $.if(is("requests"), () => $.ret($.call(this.httpAgentTableFn(h.agentField("requests"), 5), a)));
       });
-      this.emitSetCellError($.c, "%Error", "Error", (c2) => {
+      this.emitFenceFatal($.c, (c2) => {
         this.pushStrLitInto(c2, "reading the property '");
         c2.localGet(KEY);
         c2.call(this.concatHelper());
@@ -14898,7 +15616,7 @@ class Assembler {
           $.ret();
         });
       });
-      this.emitSetCellError($.c, "%Error", "Error", (c2) => {
+      this.emitFenceFatal($.c, (c2) => {
         this.pushStrLitInto(c2, "setting the property '");
         c2.localGet(KEY);
         c2.call(this.concatHelper());
@@ -15073,7 +15791,7 @@ class Assembler {
           $.if(strArg(A0, "timeout"), () => add(o, HL.OUT_TIMEOUT, "void"));
           $.if($.both($.deq(tag, $.d(5)), strArg(A0, "response")), () => add($.cast(h.creqT(), ref), HL.CREQ_RESPONSE, "inc"));
         });
-        this.emitSetCellError(c, "%Error", "Error", (c2) => {
+        this.emitFenceFatal(c, (c2) => {
           this.pushStrLitInto(c2, `'${method}' for the event '`);
           c2.localGet(A0);
           c2.structGet(dynT, DYN_REF);
@@ -15240,7 +15958,7 @@ class Assembler {
         $.run(this.httpHandleKeySetFn(), $.l(0), $.l(1), $.l(2));
         $.ret();
       });
-      this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, "setting a property on a net handle is not supported yet"), null);
+      this.emitFenceFatal($.c, (c2) => this.pushStrLitInto(c2, "setting a property on a net handle is not supported yet"), null);
     });
   }
 
@@ -15253,13 +15971,13 @@ class Assembler {
       $.if($.dge(this.dynTag($, $.l(0)), $.d(3)), () => {
         if (hInv !== null) $.ret($.call(hInv, $.l(0), $.l(1), $.l(2)));
         else {
-          this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'${method}' on an http handle is not supported yet`), null);
+          this.emitFenceFatal($.c, (c2) => this.pushStrLitInto(c2, `'${method}' on an http handle is not supported yet`), null);
           $.ret($.nul(this.dyn.dynT()));
         }
       });
       if (nInv !== null) $.do($.call(nInv, $.l(0), $.l(1), $.l(2)));
       else {
-        this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'${method}' on a net handle is not supported yet`), null);
+        this.emitFenceFatal($.c, (c2) => this.pushStrLitInto(c2, `'${method}' on a net handle is not supported yet`), null);
         $.do($.nul(this.dyn.dynT()));
       }
     });
@@ -15917,12 +16635,21 @@ class Assembler {
             f.optional === true && f.type.kind === "union" && this.unionDef(f.type.unionId).arms.every((a) => isUnitType(a))
               ? this.undefinedArmTag(f.type.unionId)
               : -1;
+          // S119 (i): a missing key is no own key on this side either.
+          const plain = this.undefMarksLive && f.type.kind !== "union" && f.type.kind !== "dyn" && f.type.kind !== "jsval" && !isUnitType(f.type);
           if (absentTag >= 0) {
             c.localGet(0);
             c.structGet(info.struct, slot);
             c.structGet(this.unions.base(), 0);
             c.i32Const(absentTag);
             c.i32Ne();
+            c.ifVoid();
+          } else if (plain) {
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            this.emitIsUndefOnStack(f.type, c);
+            c.call(this.fieldAbsentHelper());
+            c.i32Eqz();
             c.ifVoid();
           }
           c.localGet(o);
@@ -15931,7 +16658,7 @@ class Assembler {
           c.structGet(info.struct, slot);
           c.call(inner);
           c.call(dyn.objPut());
-          if (absentTag >= 0) c.end();
+          if (absentTag >= 0 || plain) c.end();
         }
         if (info.overflow !== null) {
           // The overflow TAIL: unlike dynCheck/dynMatch's width-CAPTURE
@@ -16156,6 +16883,8 @@ class Assembler {
         if (box === null) return false;
         c.localGet(0);
         c.refNull(this.strType);
+        c.refNull(this.strType);
+        c.i32Const(0);
         c.call(box);
         return true;
       }
@@ -17104,6 +17833,17 @@ class Assembler {
       this.emitWalkerFail(w, want, val, (x) => x.localGet(1), (x) => x.localGet(0));
       c.end();
     };
+    // Unit U (SEMANTICS.md S119): a dynamic `undefined` entering a typed
+    // slot is no mismatch on the WasmGC lanes — the slot holds it, as
+    // Node's does. (A union with an undefined arm takes it below.)
+    if (this.undefSlots && t.kind !== "dyn" && t.kind !== "jsval" && !(t.kind === "union" && this.undefinedArmTag(t.unionId) >= 0)) {
+      this.emitKindIs(c, DK.UNDEF);
+      c.ifVoid();
+      if (t.kind === "string") c.refNull(this.strType);
+      else this.emitSlotUndef(t, loc, c);
+      c.return_();
+      c.end();
+    }
     switch (t.kind) {
       case "f64":
         kindGuard(DK.NUM);
@@ -17249,6 +17989,14 @@ class Assembler {
               c.localGet(r);
               c.globalGet(this.unions.unitGlobal(utag));
               c.structSet(info.struct, slot);
+            } else if (this.undefSlots) {
+              // Unit U (SEMANTICS.md S119): a missing required key reads
+              // as the field's own undefined, as Node's does.
+              c.localGet(r);
+              this.emitSlotUndef(f.type, loc, c);
+              c.structSet(info.struct, slot);
+              c.i32Const(1);
+              c.globalSet(this.undefFlag("missing"));
             } else {
               // Missing and required: the failure names the FIELD's path
               // and a null `got`, which kindName renders "undefined" —
@@ -17263,6 +18011,17 @@ class Assembler {
               );
             }
             c.else_();
+            if (this.undefMarksLive && utag < 0 && !isUnitType(f.type)) {
+              // S119 (i): the key is present, holding undefined: explicit.
+              c.localGet(m);
+              c.structGet(dyn.dynT(), DYN_KIND);
+              c.i32Const(DK.UNDEF);
+              c.i32Eq();
+              c.ifVoid();
+              c.i32Const(1);
+              c.globalSet(this.undefFlag("explicit"));
+              c.end();
+            }
             c.localGet(r);
             c.localGet(m);
             dyn.pushPathKey(c, (x) => x.localGet(1), (x) => this.pushStrLitInto(x, f.name));
@@ -17774,7 +18533,7 @@ class Assembler {
     if (pair === null) return null;
     const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
     const idx = this.mb.declareFunc(
-      this.mb.funcType([closRef, this.strRef], [this.dyn.dynRef()]),
+      this.mb.funcType([closRef, this.strRef, this.strRef, I32], [this.dyn.dynRef()]),
       `%w.dyn.fnBox:${key}`,
     );
     this.dynFnBoxes.set(key, idx);
@@ -17799,6 +18558,8 @@ class Assembler {
       // form's last declared parameter IS its rest array (unit A1), so it
       // is excluded the same way.
       t.rest === true && t.restAbi === "jsval" ? t.params.length - 1 : t.params.length,
+      (x) => x.localGet(2),
+      (x) => x.localGet(3),
     );
     this.mb.setBody(idx, [], c.bytes());
     return idx;
@@ -19409,6 +20170,14 @@ class Assembler {
         const vec = this.acquireScratch(this.vecs.vecRef(info));
         const i = this.acquireScratch(I32);
         this.walkExpr(s.iterable);
+        // backstop for an iterable the lowerer's not-iterable check did not
+        // cover (S119 (a)): a named fence, never a bare trap
+        this.emitUndefRecvFence(
+          s.iterable as WExpr,
+          "",
+          code,
+          "for...of over an array-typed value holding undefined (Node throws a catchable TypeError: <the iterable> is not iterable — SEMANTICS.md S119 (a))",
+        );
         code.localSet(vec);
         code.i32Const(0);
         code.localSet(i);
@@ -19457,6 +20226,7 @@ class Assembler {
         if (idx === undefined) throw new Error(`recordSet field ${s.field} not on shape ${s.shapeId}`);
         this.walkExpr(s.obj);
         this.walkValue(s.value);
+        this.emitNoteExplicitUndef(s.value as WExpr, s.value.type, s.loc);
         code.structSet(info.struct, idx);
         return;
       }
@@ -19542,13 +20312,7 @@ class Assembler {
             code.localSet(v);
             this.emitIsDomexInto(code, o);
             this.openIf();
-            this.emitSetCellError(
-              code,
-              "%Error",
-              "Error",
-              (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`),
-              null,
-            );
+            this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`), null);
             code.call(this.reportUncaughtHelper());
             this.close();
             code.localGet(o);
@@ -19589,16 +20353,15 @@ class Assembler {
         // SC9002 is the checker-proved-unreachable fallthrough trap
         // (appendImplicitUndefinedReturn): wasm's own `unreachable` IS
         // that trap — reached only if the checker's proof is wrong, and
-        // then it fails loudly. Every other code is a JS deferred fence:
-        // a REACHABLE catchable Error (message pre-rendered by the
-        // lowerer, the SC code in the %code slot), unwinding exactly
-        // like a throw — scr_throw_lowering_fence, ported.
+        // then it fails loudly.
         if (s.code === "SC9002") {
           code.unreachable();
           return;
         }
-        this.emitSetCellErrorLit("%Error", "Error", s.message, s.code);
-        this.emitUnwind();
+        // GH #86: every other code is a JS deferred fence — it ENDS the
+        // program (its rendered diagnostic on stderr, then the trap); no
+        // user code can catch it.
+        this.emitFenceFatalLit(s.message);
         return;
 
       case "throw":
@@ -20339,10 +21102,14 @@ class Assembler {
     }
     if (e.kind === "strConcat") {
       // Read flat on the spot: one flat copy, never a node to flatten.
-      this.walkExpr(e.left);
-      if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
-      this.walkExpr(e.right);
-      if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
+      if (e.undefNaN !== undefined) {
+        this.emitConcatOperandsNaNFenced(e, true);
+      } else {
+        this.walkExpr(e.left);
+        if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
+        this.walkExpr(e.right);
+        if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText(this.fn.code, true);
+      }
       this.fn.code.call(this.ropes.flatCat());
       this.emitPendingCheck(); // past the length limit: RangeError
       return;
@@ -20350,6 +21117,7 @@ class Assembler {
     if (this.strViewsLive && e.kind === "strIntrinsic" && VIEW_PRODUCER_METHODS.has(e.method)) {
       // Read flat on the spot (strings unit S3): the span copied out of
       // the receiver's window — never a view to materialise.
+      this.emitMarkedRecvCheck(e);
       this.emitSliceOp(e, false);
       return;
     }
@@ -20584,6 +21352,7 @@ class Assembler {
   }
 
   private walkExprValue(e: WExpr): void {
+    if (this.undefSlots) this.emitMarkedRecvCheck(e);
     const code = this.fn.code;
     switch (e.kind) {
       case "boolLit":
@@ -20638,7 +21407,13 @@ class Assembler {
         }
         // Direct calls pass a null closure — the uniform-ABI dead arg.
         code.refNull(this.fnClosPair(callee).clos);
-        for (const a of e.args) this.walkValue(a);
+        // A class method called directly: its receiver (`this`) meets the
+        // S119 (a) undefined-receiver fence like a virtual call's.
+        const methodRecv = callee.params[0]?.localId === "this.0" && !e.callee.endsWith(".constructor") ? e.args[0] : undefined;
+        for (const a of e.args) {
+          this.walkValue(a);
+          if (a === methodRecv) this.emitUndefRecvFence(a, e.callee.slice(e.callee.lastIndexOf(".") + 1), code);
+        }
         code.call(index);
         if (this.mayThrow.has(e.callee)) this.emitPendingCheck();
         return;
@@ -20697,6 +21472,14 @@ class Assembler {
         const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
         const c = this.acquireScratch(closRef);
         this.walkExpr(e.callee);
+        // A function-typed slot holding undefined, called: Node's catchable
+        // TypeError "<f> is not a function" — a named fence (S119 (a)).
+        this.emitUndefRecvFence(
+          e.callee as WExpr,
+          "()",
+          code,
+          "calling a function-typed value holding undefined (Node throws a catchable TypeError: <the callee> is not a function — SEMANTICS.md S119 (a))",
+        );
         code.localSet(c);
         // Board #234: `r(x)` with `x` an `any` and `r` possibly a typed
         // settler (`new Promise<T>((r) => r(x))`): a held promise is
@@ -21109,10 +21892,14 @@ class Assembler {
       case "strConcat":
         // A VALUE: a concatenation node at 13 code units or more
         // (strings unit S2, ropes.ts) — `s += x` in a loop is linear.
-        this.walkValue(e.left);
-        if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText();
-        this.walkValue(e.right);
-        if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText();
+        if (e.undefNaN !== undefined) {
+          this.emitConcatOperandsNaNFenced(e, false);
+        } else {
+          this.walkValue(e.left);
+          if (this.undefSlots && mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText();
+          this.walkValue(e.right);
+          if (this.undefSlots && mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText();
+        }
         code.call(this.ropes.cat());
         this.emitPendingCheck(); // past the length limit: RangeError
         return;
@@ -21220,6 +22007,30 @@ class Assembler {
         }
         this.walkExpr(e.arr);
         this.walkExpr(e.index);
+        // An array slot holding undefined, indexed: Node's catchable
+        // TypeError "Cannot read properties of undefined (reading '<i>')",
+        // the index evaluated first as V8 does (S119 (a)). A literal index
+        // the lowerer marked was tested already (emitMarkedRecvCheck).
+        const mark = (e.arr as { undefRecv?: string }).undefRecv;
+        if (this.undefSlots && (mark === undefined || mark === "\0") && !this.recvProven(e.arr as WExpr) && e.index.type.kind === "f64") {
+          const vr = this.mapType(at, e.loc);
+          if (vr !== null) {
+            const ai = this.acquireScratch(F64);
+            const ar = this.acquireScratch(vr);
+            code.localSet(ai);
+            code.localTee(ar);
+            code.refIsNull();
+            this.openIf();
+            code.localGet(ai);
+            code.call(this.undefIndexThrowHelper());
+            this.emitUnwind();
+            this.close();
+            code.localGet(ar);
+            code.localGet(ai);
+            this.releaseScratch(vr, ar);
+            this.releaseScratch(F64, ai);
+          }
+        }
         if (this.undefSlots) {
           // Unit U (SEMANTICS.md S119): an index naming no element reads
           // undefined. A union vector's absent slot (null) is mapped to
@@ -21371,6 +22182,7 @@ class Assembler {
           if (idx === undefined) throw new Error(`recordLit field ${f.name} not on shape ${e.type.shapeId}`);
           code.localGet(rec);
           this.walkValue(f.value);
+          this.emitNoteExplicitUndef(f.value as WExpr, f.value.type, e.loc);
           code.structSet(info.struct, idx);
         }
         code.localGet(rec);
@@ -21387,6 +22199,33 @@ class Assembler {
         const idx = info.fieldIndex.get(e.field);
         if (idx === undefined) throw new Error(`recordGet field ${e.field} not on shape ${e.shapeId}`);
         this.walkExpr(e.obj);
+        if (e.spreadCopy === true && this.undefSlots && !this.recvProven(e.obj as WExpr)) {
+          // `{ ...r }` over a slot holding undefined copies nothing: JS's
+          // spread ignores undefined, so the field is a missing key
+          // (SEMANTICS.md S119 (i)).
+          const rt = this.mapType(e.obj.type, e.loc);
+          const ft = this.mapType(e.type, e.loc);
+          if (rt === null || ft === null) {
+            code.unreachable();
+            return;
+          }
+          const o = this.acquireScratch(rt);
+          code.localTee(o);
+          code.refIsNull();
+          this.openIfResult(ft);
+          if (this.undefMarksLive) {
+            code.i32Const(1);
+            code.globalSet(this.undefFlag("missing"));
+          }
+          this.emitSlotUndef(e.type, e.loc);
+          code.else_();
+          code.localGet(o);
+          code.structGet(info.struct, idx);
+          this.close();
+          this.releaseScratch(rt, o);
+          return;
+        }
+        this.emitUndefRecvFence(e.obj, e.field, code);
         code.structGet(info.struct, idx);
         return;
       }
@@ -22418,7 +23257,7 @@ class Assembler {
           this.close();
           this.close();
           this.openIf();
-          this.emitSetCellError(code, "%Error", "Error", (x) => this.pushStrLitInto(x,
+          this.emitFenceFatal(code, (x) => this.pushStrLitInto(x,
             "a statically thrown object read as an 'any' rejection reason or catch value " +
             "(it has no island form that keeps its identity) is not supported yet [SC1063]"), null);
           this.emitUnwind();
@@ -22750,13 +23589,7 @@ class Assembler {
               this.pushStrLitInto(code, field);
               code.call(this.strEqHelper());
               this.openIf();
-              this.emitSetCellError(
-                code,
-                "%Error",
-                "Error",
-                (c) => this.pushStrLitInto(c, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`),
-                null,
-              );
+              this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`), null);
               code.call(this.reportUncaughtHelper());
               this.close();
             }
@@ -22764,7 +23597,7 @@ class Assembler {
             code.localGet(d);
             code.localGet(k);
             code.localGet(v);
-            code.call(this.dyn.keySet());
+            code.call((e as { sloppy?: boolean }).sloppy === true ? this.dyn.sloppySet("keySet") : this.dyn.keySet());
             this.emitPendingCheck();
             this.releaseScratch(errRef, er);
             this.releaseScratch(dynRef, v);
@@ -22775,7 +23608,7 @@ class Assembler {
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
           this.walkExpr(e.args[2]!);
-          code.call(this.dyn.keySet());
+          code.call((e as { sloppy?: boolean }).sloppy === true ? this.dyn.sloppySet("keySet") : this.dyn.keySet());
           this.emitPendingCheck();
           return;
         }
@@ -22783,6 +23616,35 @@ class Assembler {
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
           code.call(this.dyn.hasOwn());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.argStr") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.i32Const((e.args[3] as { value: number }).value);
+          code.call(this.dynArgStrHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.hasKey") {
+          // `k in obj` with a runtime key on a dyn receiver (GH #91). JS
+          // evaluates the KEY first (args are [receiver, key]); the
+          // presence walk is dyn.ts's hasKey. May throw (the primitive
+          // receiver's TypeError, the named refusals) — a wasm-only throw,
+          // so the may-throw view reads it as one (spawnSyncMayThrowView).
+          const d = this.acquireScratch(this.dyn.dynRef());
+          const k = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[1]!);
+          code.localSet(k);
+          this.walkExpr(e.args[0]!);
+          code.localSet(d);
+          code.localGet(d);
+          code.localGet(k);
+          code.call(this.dyn.hasKey());
+          this.releaseScratch(this.strRef, k);
+          this.releaseScratch(this.dyn.dynRef(), d);
           this.emitPendingCheck();
           return;
         }
@@ -22842,7 +23704,7 @@ class Assembler {
             code.i32Eq();
             code.i32Or();
             code.ifVoid();
-            this.emitSetCellErrorLit("%Error", "Error", "spreading null or undefined from this expression into a call is not supported yet", null);
+            this.emitFenceFatal(this.fn.code, (fc) => this.pushStrLitInto(fc, "spreading null or undefined from this expression into a call is not supported yet"), null);
             code.end();
             this.emitPendingCheck();
             code.localGet(src);
@@ -22998,9 +23860,7 @@ class Assembler {
             const first = fenceMessages[0]!;
             code.drop();
             code.drop();
-            this.emitSetCellErrorLit("%Error", "Error", first.message, first.code);
-            this.emitUnwind();
-            code.unreachable();
+            this.emitFenceFatalLit(first.message);
             return;
           }
           code.call(this.dyn.defineProps());
@@ -23948,12 +24808,7 @@ class Assembler {
           code.call(this.date.parseGetTimeHelper());
           code.globalGet(this.date.fencedFlag());
           this.openIf();
-          this.emitSetCellErrorLit(
-            "%Error",
-            "Error",
-            'date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ("YYYY[-MM[-DD]][THH:mm[:ss[.sss]][Z|±HH:MM]]")',
-            "SC1090",
-          );
+          this.emitFenceFatal(this.fn.code, (fc) => this.pushStrLitInto(fc, 'date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ("YYYY[-MM[-DD]][THH:mm[:ss[.sss]][Z|±HH:MM]]")'), "SC1090");
           this.emitUnwind();
           this.close();
           return;
@@ -24242,6 +25097,10 @@ class Assembler {
           const m = e.fn.slice("path.host".length);
           const member = (m[0]!.toLowerCase() + m.slice(1)) as PathHostMember;
           for (const a of e.args) this.walkExpr(a);
+          if (this.undefSlots && (member === "join" || member === "resolve")) {
+            code.call(this.pathArgsCheckHelper(member === "resolve"));
+            this.emitPendingCheck();
+          }
           code.call(this.path.hostHelper(member));
           return;
         }
@@ -24336,6 +25195,15 @@ class Assembler {
           code.call(this.hostNumFuncOrThrow());
           return;
         }
+        if (e.fn === "undef.fieldAbsent") {
+          if (!this.undefMarksLive) {
+            code.i32Const(0); // no value can lack a key: the plain answer
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.call(this.fieldAbsentHelper());
+          return;
+        }
         if (e.fn === "process.isTTY") {
           code.i32Const(HOST_NUM_KIND_IS_TTY);
           this.walkExpr(e.args[0]!);
@@ -24343,6 +25211,15 @@ class Assembler {
           code.call(this.hostNumFuncOrThrow());
           code.f64Const(0);
           code.f64Ne();
+          // GH #88: Node's non-TTY stream has no isTTY property — the read
+          // is `undefined`, the bool slot's undefined (2) under Unit U
+          // (SEMANTICS.md S119): 1 stays 1, 0 becomes 2.
+          if (this.undefSlots) {
+            code.i32Const(1);
+            code.i32Xor();
+            code.i32Const(1);
+            code.i32Add();
+          }
           return;
         }
         if (e.fn === "process.columns") {
@@ -26844,6 +27721,32 @@ class Assembler {
        * behind this same refusal, closed until the full surface's pin
        * suite was green). */
       case "strIntrinsic": {
+        if (e.undefOob !== undefined && this.undefSlots) {
+          // Unit U (SEMANTICS.md S119): s[i] / s.at(i) past the end.
+          const { undefOob: mode, ...plain } = e;
+          this.walkExpr(plain as WExpr);
+          const r = this.acquireScratch(this.strRef);
+          code.localTee(r);
+          code.arrayLen();
+          code.i32Eqz();
+          if (mode === "index") {
+            const x = this.acquireScratch(F64);
+            this.walkExpr(e.args[0]! as WExpr);
+            code.localTee(x);
+            code.localGet(x);
+            code.f64Trunc();
+            code.f64Ne();
+            code.i32Or();
+            this.releaseScratch(F64, x);
+          }
+          this.openIfResult(this.strRef);
+          code.refNull(this.strType);
+          code.else_();
+          code.localGet(r);
+          this.close();
+          this.releaseScratch(this.strRef, r);
+          return;
+        }
         const m = e.method;
         // Captured before the switch: with every `m` member now handled
         // by an explicit case (toLowerCase/toUpperCase joined the rest
@@ -26953,6 +27856,7 @@ class Assembler {
           case "repeat":
             this.walkExpr(e.args[0]!);
             code.call(this.strs.repeat());
+            this.emitPendingCheck();
             return;
           case "trim":
             code.call(this.strs.trim("both"));
@@ -27109,18 +28013,12 @@ class Assembler {
         code.structGet(exc.caughtT, 2);
         code.refCast(checked.struct);
         code.else_();
-        this.emitSetCellErrorLit(
-          "%TypeError",
-          "TypeError",
-          // The '%' prefix is on RUNTIME class names only — a user class
-          // keeps its own spelling, and an unconditional strip ate its
-          // first letter (the C emitter's conditional strip, ported).
-          `caught value is not an instance of ${e.className.startsWith("%") ? e.className.slice(1) : e.className} (checked cast)`,
-          null,
-        );
-        // The unwind leaves the arm unreachable — wasm's polymorphic
-        // stack supplies the block's result type from here.
-        this.emitUnwind();
+        // GH #86 review (SEMANTICS.md S009, S122): Node erases `as`, so a
+        // failed checked cast is a check Node never makes — it ENDS the
+        // program. The '%' prefix is on RUNTIME class names only — a user
+        // class keeps its own spelling (the C emitter's conditional strip).
+        const castMsg = `caught value is not an instance of ${e.className.startsWith("%") ? e.className.slice(1) : e.className} (checked cast)`;
+        this.emitFenceFatal(code, (x) => this.pushStrLitInto(x, castMsg), "SC1100");
         this.close();
         this.releaseScratch(this.caughtRef(), c);
         return;
@@ -27235,6 +28133,9 @@ class Assembler {
             // string appears, at read time.
             if (e.fnName !== undefined && e.fnName !== "") this.pushStrLitInto(code, e.fnName);
             else code.refNull(this.strType);
+            if (e.srcText !== undefined) this.pushStrLitInto(code, e.srcText);
+            else code.refNull(this.strType);
+            code.i32Const(e.fnProto ?? 0);
             code.call(box);
             return;
           }
@@ -27326,6 +28227,17 @@ class Assembler {
           }
         }
         code.else_();
+        // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
+        if (this.undefSlots) {
+          code.localGet(d);
+          code.structGet(dynT, DYN_KIND);
+          code.i32Const(DK.UNDEF);
+          code.i32Eq();
+          this.openIfResult(want.val);
+          if (t.kind === "string") code.refNull(this.strType);
+          else this.emitSlotUndef(t, e.loc);
+          code.else_();
+        }
         // The ROOT path (`$`): a scalar target names the whole value.
         // Nested walkers push real path nodes (stage 2) — the type and
         // its renderer exist now so that the message grammar is settled
@@ -27337,6 +28249,7 @@ class Assembler {
         // The unwind leaves the arm unreachable — wasm's polymorphic
         // stack supplies the block's result type from here.
         this.emitUnwind();
+        if (this.undefSlots) this.close();
         this.close();
         this.releaseScratch(dynRef, d);
         return;
@@ -27403,7 +28316,7 @@ class Assembler {
           code.i32Const(DK.HANDLE);
           code.i32Eq();
           code.ifVoid();
-          this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'in' or Object.hasOwn on a ${this.dyn.handleNoun()} is not supported yet`), null);
+          this.emitFenceFatal(code, (c2) => this.pushStrLitInto(c2, `'in' or Object.hasOwn on a ${this.dyn.handleNoun()} is not supported yet`), null);
           code.end();
         }
         code.localGet(d);
@@ -27433,15 +28346,21 @@ class Assembler {
         // the own-member read) at the one kind whose members the runtime
         // models; `"call" in f` still answers false, because `call` is
         // INHERITED, which is what S015 actually registers.
+        // GH #86 review: the FUNC arm asks hasOwn — name, length, the
+        // function's own property table (`f.x = 1`), and `prototype`'s
+        // named fence (the box does not record a constructor).
         const pushFuncArm = (): void => {
-          if (e.key !== "name" && e.key !== "length") {
-            code.i32Const(0);
-            return;
-          }
           code.localGet(d);
           code.structGet(this.dyn.dynT(), DYN_KIND);
           code.i32Const(DK.FUNC);
           code.i32Eq();
+          this.openIfResult(I32);
+          code.localGet(d);
+          this.pushStrLit(e.key);
+          code.call(this.dyn.hasOwn());
+          code.else_();
+          code.i32Const(0);
+          this.close();
         };
         // The ARRAY arm: "length" is always there, a canonical index is
         // there when it is in range, and no other spelling ever is.
@@ -27465,6 +28384,13 @@ class Assembler {
           this.openIfResult(I32);
           if (e.key === "length") {
             code.i32Const(1);
+          } else if (arrIdx! < 2 ** 31 - 1) {
+            // GH #86 review: an in-range index asks hasOwn, which answers a
+            // hole (a null slot) false and fences over an index that may
+            // be one (SEMANTICS.md S016, S119 (b)).
+            code.localGet(d);
+            this.pushStrLit(e.key);
+            code.call(this.dyn.hasOwn());
           } else {
             this.dyn.arrLen(code, (c) => this.dyn.arrPayload(c, (x) => x.localGet(d)));
             code.f64ConvertI32U();
@@ -27714,7 +28640,7 @@ class Assembler {
             code.i32Eq();
             code.i32Or();
             code.ifVoid();
-            this.emitSetCellErrorLit("%Error", "Error", "spreading null or undefined from this expression into a call is not supported yet", null);
+            this.emitFenceFatal(this.fn.code, (fc) => this.pushStrLitInto(fc, "spreading null or undefined from this expression into a call is not supported yet"), null);
             code.end();
             this.emitPendingCheck();
             code.localGet(src);
@@ -27962,6 +28888,7 @@ class Assembler {
           return;
         }
         this.walkExpr(e.obj);
+        this.emitUndefRecvFence(e.obj, e.field, code);
         code.structGet(field.info.struct, field.index);
         return;
       }
@@ -28402,6 +29329,7 @@ class Assembler {
         const recvRef = this.classes.ref(info);
         const r = this.acquireScratch(recvRef);
         this.walkExpr(recv);
+        this.emitUndefRecvFence(recv, e.method, code);
         code.localSet(r);
         code.refNull(pair.clos); // the uniform ABI's dead closure argument
         code.localGet(r);
@@ -29808,6 +30736,8 @@ class Assembler {
             }
             this.walkExpr(e.value);
             code.refNull(this.strType);
+            code.refNull(this.strType);
+            code.i32Const(0);
             code.call(box);
             return;
           }
@@ -29932,7 +30862,7 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             this.pushStrLit(e.name);
             this.walkExpr(e.args[1]!);
-            code.call(this.dyn.keySet());
+            code.call((e as { sloppy?: boolean }).sloppy === true ? this.dyn.sloppySet("keySet") : this.dyn.keySet());
             this.emitPendingCheck();
             return;
           }
@@ -29958,14 +30888,15 @@ class Assembler {
             return;
           }
           case "setIdx": {
-            if (e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
+            const sloppyWrite = (e as { sloppy?: boolean }).sloppy === true;
+            if (!sloppyWrite && e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
               this.emitIslandNumIndex(e.args[0]!, e.args[1]!.value, e.args[2]!);
               return;
             }
             this.walkExpr(e.args[0]!);
             this.emitJsvalIndexKeyString(e.args[1]!);
             this.walkExpr(e.args[2]!);
-            code.call(this.dyn.islandSetIdx());
+            code.call(sloppyWrite ? this.dyn.sloppySet("islandSetIdx") : this.dyn.islandSetIdx());
             this.emitPendingCheck();
             return;
           }
@@ -31074,12 +32005,7 @@ class Assembler {
               code.i32Eq();
               code.i32Or();
               code.ifVoid();
-              this.emitSetCellErrorLit(
-                "%Error",
-                "Error",
-                "spreading null or undefined from this expression into an island call is not supported yet",
-                null,
-              );
+              this.emitFenceFatal(this.fn.code, (fc) => this.pushStrLitInto(fc, "spreading null or undefined from this expression into an island call is not supported yet"), null);
               code.end();
               this.emitPendingCheck();
             }
@@ -31279,6 +32205,17 @@ class Assembler {
             }
           }
           code.else_();
+          // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
+          if (this.undefSlots) {
+            code.localGet(d);
+            code.structGet(dynT, DYN_KIND);
+            code.i32Const(DK.UNDEF);
+            code.i32Eq();
+            this.openIfResult(resT);
+            if (t.kind === "string") code.refNull(this.strType);
+            else this.emitSlotUndef(t, e.loc);
+            code.else_();
+          }
           const urlExit = t.kind === "string" && this.urlDynLive;
           if (urlExit) {
             // Unit I: a URL held in a dynamic value reaching a string slot
@@ -31298,19 +32235,21 @@ class Assembler {
             code.i32Const(0);
             code.end();
             code.ifVoid();
-            this.emitSetCellError(code, "%Error", "Error", (c) =>
-              this.pushStrLitInto(c, "passing a URL held in a dynamic value where a string is expected is not supported yet"),
-            null);
+            this.emitFenceFatal(code, (c) =>
+              this.pushStrLitInto(c, "passing a URL held in a dynamic value where a string is expected is not supported yet"), null);
             code.else_();
           }
-          this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
+          // GH #86 review (SEMANTICS.md S122): the island exit's type check
+          // is tsinter's own (Node has no boundary) — it ends the program.
+          this.emitFenceFatal(code, (c) => {
             this.pushStrLitInto(c, `expected ${wantDesc}, got `);
             c.localGet(d);
             c.call(this.dyn.typeOf());
             c.call(this.concatHelper());
-          }, null);
+          }, "SC1100");
           if (urlExit) code.end();
           this.emitUnwind();
+          if (this.undefSlots) this.close();
           this.close();
           this.releaseScratch(dynRef, d);
           return;
@@ -31428,15 +32367,26 @@ class Assembler {
         this.dyn.viewField(code, (c) => c.localGet(d), VIEW_TOKEN);
         code.refCast(vt.typeIndex);
         code.else_();
-        this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
+        // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
+        code.localGet(d);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        code.i32Const(DK.UNDEF);
+        code.i32Eq();
+        this.openIfResult(vt);
+        code.refNull(vt.typeIndex);
+        code.else_();
+        // GH #86 review (SEMANTICS.md S115, S122): a check Node never makes
+        // — it ends the program.
+        this.emitFenceFatal(code, (c) => {
           this.pushStrLitInto(c, "Cannot store ");
           c.localGet(d);
           c.call(this.dyn.typeOf());
           c.call(this.concatHelper());
           this.pushStrLitInto(c, ` into ${e.what} (SEMANTICS.md S115)`);
           c.call(this.concatHelper());
-        }, null);
+        });
         code.refNull(vt.typeIndex);
+        this.close();
         this.close();
         this.releaseScratch(dynRef, d);
         this.emitPendingCheck();
@@ -31647,6 +32597,14 @@ class Assembler {
       // their struct/bufType rather than minting a second.
       vecF64: () => this.vecs.info("vec(f64)", F64, F64, "f64"),
       concat: () => this.concatHelper(),
+      repeatRange: (c, countLocal) =>
+        this.emitSetCellError(c, "%RangeError", "RangeError", (x) => {
+          this.pushStrLitInto(x, "Invalid count value: ");
+          x.localGet(countLocal);
+          x.call(this.f64ToStrHelper());
+          x.call(this.concatHelper());
+        }, null),
+      repeatTooLong: (c) => c.call(this.strTooLongHelper()),
       bytesRef: () => this.bytesB.bytesRef(),
       bytesGet: (elem) => this.bytesB.get(elem),
       bytesLength: () => this.bytesB.length(),
@@ -31720,6 +32678,7 @@ class Assembler {
         rowVec,
         rowsVec,
         numVec,
+        ...(this.undefSlots ? { undefCaps: true } : {}),
         slice: () => this.strs.slice(),
         join: () => this.vecs.join(rowVec, this.strRef),
         getSubstitution: () => this.getSubstitutionHelper(),
@@ -31759,8 +32718,8 @@ class Assembler {
 
   /** `new RegExp(p, f)` over strings known only at run time: call
    * %w.rec.compile and, on a null result, throw what it left — V8's
-   * SyntaxError, or the named fence Error (message and `code`, SEMANTICS.md
-   * S102). Leaves the (non-null) %w.re.Regex on the stack. */
+   * SyntaxError — or end the program at the named fence (SEMANTICS.md
+   * S102, GH #86). Leaves the (non-null) %w.re.Regex on the stack. */
   private emitRuntimeRegexNew(pushPattern: () => void, pushFlags: () => void): void {
     const code = this.fn.code;
     const rc = this.regexCompiler;
@@ -31778,13 +32737,16 @@ class Assembler {
     this.openIf();
     this.emitSetCellError(code, "%SyntaxError", "SyntaxError", (c) => c.call(rc.errMessageFn()), null);
     code.else_();
-    this.emitSetCellErrorCoded(
-      code,
-      "%Error",
-      "Error",
-      (c) => c.call(rc.errMessageFn()),
-      (c) => c.call(rc.errCodeFn()),
-    );
+    // GH #86: S102's named fence ends the program — `<message> [<key>]`.
+    this.emitFenceFatal(code, (c) => {
+      c.call(rc.errMessageFn());
+      this.pushStrLitInto(c, " [");
+      c.call(this.concatHelper());
+      c.call(rc.errCodeFn());
+      c.call(this.concatHelper());
+      this.pushStrLitInto(c, "]");
+      c.call(this.concatHelper());
+    }, "");
     this.close();
     this.emitUnwind();
     this.close();
@@ -31872,20 +32834,14 @@ class Assembler {
     const idx = this.mb.declareFunc(this.dyn.thunkSig(), "%w.dyn.ctorThunk");
     this.bytesCtorThunkFn = idx;
     const c = new Code();
-    this.emitSetCellError(
-      c,
-      "%Error",
-      "Error",
-      (x) => {
+    this.emitFenceFatal(c, (x) => {
         this.pushStrLitInto(x, "calling the ");
         x.localGet(0);
         emitFlatCast(x, this.strType);
         x.call(this.concatHelper());
         this.pushStrLitInto(x, " constructor read from a dynamic value is not supported yet");
         x.call(this.concatHelper());
-      },
-      null,
-    );
+      }, null);
     c.refNull(this.dyn.dynT());
     this.mb.setBody(idx, [], c.bytes());
     return idx;
@@ -32058,7 +33014,8 @@ class Assembler {
   }
 
   /** Builds one honest match-slice row — [wholeMatch, cap1, cap2, ...],
-   * nonparticipating captures rendered "" (S064) — shared by match's own
+   * nonparticipating captures Node's undefined under undefSlots ("" in
+   * hand-built IR without it — S064's c/llvm reading) — shared by match's own
    * array arm and matchAll/matchAllInto's per-iteration rows: the same
    * shape from three call sites (regexIntrinsic:match, :matchAll,
    * :matchAllInto). Unlike split's own capture splice (scoped to LITERAL
@@ -32119,7 +33076,9 @@ class Assembler {
       code.i32Const(-1);
       code.i32Eq();
       code.ifResult(strRefT);
-      this.pushStrLitInto(code, "");
+      // Unit U: Node's undefined (the null string slot) under undefSlots.
+      if (this.undefSlots && strRefT.kind === "ref") code.refNull(strRefT.typeIndex);
+      else this.pushStrLitInto(code, "");
       code.else_();
       code.localGet(subjLocal);
       code.localGet(startLocal);
@@ -34138,6 +35097,18 @@ class Assembler {
         const found = this.acquireScratch(I32);
         code.localSet(found);
         code.localGet(found);
+        // Unit U (SEMANTICS.md S119): a value slot holding its kind's
+        // undefined (`map.set(k, xs[9])`) answers the get's undefined arm
+        // — Node's undefined either way — never a value arm wrapping it.
+        if (this.undefSlots) {
+          this.openIfResult(I32);
+          code.localGet(val);
+          this.emitIsUndefOnStack(rt.value);
+          code.i32Eqz();
+          code.else_();
+          code.i32Const(0);
+          this.close();
+        }
         this.openIfResult(this.unions.baseRef());
         code.i32Const(valueTag);
         code.localGet(val);
@@ -34849,6 +35820,83 @@ class Assembler {
 
   private holesMadeField: number | null = null;
 
+  /** Unit U (SEMANTICS.md S119 (i)): the two flags that keep a plain record
+   * field's undefined exact or loud: "missing" — a checked value lacked a
+   * required key; "explicit" — a may-be-undefined value was stored in a
+   * plain field and held undefined. */
+  private undefFlag(which: "missing" | "explicit"): number {
+    const hit = this.undefFlags.get(which);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    this.undefFlags.set(which, g);
+    return g;
+  }
+  private readonly undefFlags = new Map<string, number>();
+  private fieldAbsentFunc: number | null = null;
+
+  /** %w.undef.absent(isUndef) → is this plain field a missing key? */
+  private fieldAbsentHelper(): number {
+    if (this.fieldAbsentFunc !== null) return this.fieldAbsentFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%w.undef.absent");
+    this.fieldAbsentFunc = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.globalGet(this.undefFlag("missing"));
+    c.i32And();
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+    c.globalGet(this.undefFlag("explicit"));
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) =>
+      this.pushStrLitInto(x, "telling a missing record key from a field holding an explicit undefined, in a program that has both, is not supported yet (SEMANTICS.md S119 (i))"));
+    c.end();
+    c.i32Const(1);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** The value of a plain record field is on the stack: note an explicit
+   * undefined (S119 (i)). Only in a module where a value can lack a key,
+   * and only for a value that may hold undefined. */
+  private emitNoteExplicitUndef(value: WExpr, t: IrType, loc: SrcLoc | undefined): void {
+    if (!this.undefMarksLive) return;
+    if (t.kind === "union" || t.kind === "dyn" || t.kind === "jsval" || t.kind === "void" || t.kind === "caught" || isUnitType(t)) return;
+    const noUndef = (v: WExpr): boolean => {
+      switch (v.kind) {
+        case "numLit": case "strLit": case "boolLit": case "bin": case "unary": case "strConcat": case "toString":
+        case "toBool": case "strEq": case "strCmp": case "unionIsTag": case "isUndef": case "arrayLit": case "recordLit":
+        case "closure": case "new": case "regexLit": case "classRef":
+          return true;
+        // a copy carries keys, not values: a missing key stays missing
+        case "recordGet":
+          return v.spreadCopy === true;
+        case "ternary":
+          return noUndef(v.then as WExpr) && noUndef(v.else_ as WExpr);
+        default:
+          return false;
+      }
+    };
+    if (noUndef(value)) return;
+    const vt = this.mapType(t, loc);
+    if (vt === null) return;
+    const code = this.fn.code;
+    const x = this.acquireScratch(vt);
+    code.localTee(x);
+    this.emitIsUndefOnStack(t);
+    code.ifVoid();
+    code.i32Const(1);
+    code.globalSet(this.undefFlag("explicit"));
+    code.end();
+    code.localGet(x);
+    this.releaseScratch(vt, x);
+  }
+
   /** Unit U (SEMANTICS.md S119): the module's "a hole was made" flag — an
    * i32 global the first write past an array's end sets. */
   private holesMadeGlobal(): number {
@@ -34857,6 +35905,47 @@ class Assembler {
       w.sleb(0);
     });
     return this.holesMadeField;
+  }
+
+  /** Unit U (SEMANTICS.md S119 (h)): a concatenation's two operands, each
+   * as the concatenation reads it (`flat` or as values), behind the `+`
+   * NaN fence: where JS's `+` answers the number NaN (the string side
+   * undefined against a number/boolean, or both string sides undefined)
+   * the program ends at the pre-rendered fence; otherwise an undefined
+   * operand reads as the text "undefined", as before. */
+  private emitConcatOperandsNaNFenced(e: Extract<WExpr, { kind: "strConcat" }>, flat: boolean): void {
+    const code = this.fn.code;
+    const vt = flat ? this.strRef : STR_VAL;
+    const nan = e.undefNaN!;
+    const walk = (x: WExpr): void => (flat ? this.walkExpr(x) : this.walkValue(x));
+    const l = this.acquireScratch(vt);
+    const r = this.acquireScratch(vt);
+    walk(e.left as WExpr);
+    code.localSet(l);
+    walk(e.right as WExpr);
+    code.localSet(r);
+    if (nan.side === "left" || nan.side === "both") {
+      code.localGet(l);
+      code.refIsNull();
+    }
+    if (nan.side === "right" || nan.side === "both") {
+      code.localGet(r);
+      code.refIsNull();
+    }
+    if (nan.side === "both") code.i32And();
+    if (nan.when !== undefined) {
+      this.walkExpr(nan.when as WExpr);
+      code.i32And();
+    }
+    code.ifVoid();
+    this.emitFenceFatal(code, (x) => this.pushStrLitInto(x, nan.message), "");
+    code.end();
+    code.localGet(l);
+    if (mayBeSlotUndef(e.left as WExpr)) this.emitStrUndefAsText(code, flat);
+    code.localGet(r);
+    if (mayBeSlotUndef(e.right as WExpr)) this.emitStrUndefAsText(code, flat);
+    this.releaseScratch(vt, r);
+    this.releaseScratch(vt, l);
   }
 
   /** Unit U: the string value on the stack, with its undefined (null)
@@ -35170,7 +36259,7 @@ class Assembler {
     c.structGet(dynT, DYN_KIND);
     c.localSet(k);
     const fence = (ctor: string): void => {
-      this.emitSetCellError(c, "%Error", "Error", (x) => {
+      this.emitFenceFatal(c, (x) => {
         this.pushStrLitInto(x, `'${ctor}.prototype.${name}' on an island value is not supported yet`);
       }, null);
       c.refNull(dynT);
@@ -36530,13 +37619,25 @@ class Assembler {
    *   - anything else (a string, array, object, bytes, handle ...) goes
    *     through Buffer.from's ladder in Node — a conversion for a string,
    *     an array or an array-like, the same TypeError for a plain object
-   *     or a Map — which this libCall cannot run (the encoding is not
-   *     carried): a named catchable Error (SEMANTICS.md S094).
+   *     or a Map — which this libCall cannot run for what Node CONVERTS
+   *     (the encoding is not carried): the S094 fence, which ends the
+   *     program (S122); a plain object no rung converts throws Node's
+   *     TypeError.
    * Always throws. */
   private bufNewStringFailHelper(): number {
     const dynRef = this.dyn.dynRef();
     return this.tailDef("buf.newStringFail", [dynRef], [this.bytesB.bytesRef()], (c, local) => {
       const K = local(I32);
+      const fromTypeFail = (): void =>
+        this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+          this.pushStrLitInto(
+            x,
+            "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received ",
+          );
+          x.localGet(0);
+          x.call(this.dyn.specificType());
+          x.call(this.concatHelper());
+        }, "ERR_INVALID_ARG_TYPE");
       c.localGet(0);
       c.structGet(this.dyn.dynT(), DYN_KIND);
       c.localSet(K);
@@ -36553,23 +37654,41 @@ class Assembler {
         if (i > 0) c.i32Or();
       });
       c.ifVoid();
-      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
-        this.pushStrLitInto(
-          x,
-          "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received ",
-        );
-        x.localGet(0);
-        x.call(this.dyn.specificType());
-        x.call(this.concatHelper());
-      }, "ERR_INVALID_ARG_TYPE");
+      fromTypeFail();
       c.else_();
-      this.emitSetCellError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.pushStrLitInto(x, "new Buffer(value, encoding) over a string or object value is not supported yet (SEMANTICS.md S094)"),
-        null,
-      );
+      // GH #86 review: a plain object Buffer.from's ladder cannot convert —
+      // no `length`, `buffer`, `type` or `valueOf` member of its own (a
+      // plain object's inherited valueOf answers itself) — is Node's same
+      // TypeError, catchable. Everything Node CONVERTS (a string, an array,
+      // an array-like) stays the fence: the encoding is not carried.
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifResult(I32);
+      this.dyn.objPayload(c, (x) => x.localGet(0));
+      c.structGet(this.dyn.objT(), OBJ_PROTO);
+      c.i32Eqz();
+      // an error's rendering ("an instance of Error") is not the dyn
+      // specificType's: it stays the fence
+      c.localGet(0);
+      c.call(this.dyn.isError());
+      c.i32Eqz();
+      c.i32And();
+      for (const key of ["length", "buffer", "type", "valueOf"]) {
+        this.dyn.objPayload(c, (x) => x.localGet(0));
+        this.pushStrLitInto(c, key);
+        c.call(this.dyn.objGet());
+        c.refIsNull();
+        c.i32And();
+      }
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.ifVoid();
+      fromTypeFail();
+      c.else_();
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "new Buffer(value, encoding) over a string, an array or an array-like value is not supported yet (SEMANTICS.md S094)"), null);
+      c.end();
       c.end();
       c.end();
       c.refNull(this.bytesB.bytesType());
@@ -44582,6 +45701,7 @@ class Assembler {
 
   private get dc(): DcBuilder {
     this.dcField ??= new DcBuilder(this.mb, this.dyn, {
+      fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       strRef: () => this.strRef,
       strType: () => this.strType,
       lit: (c, s) => this.pushStrLitInto(c, s),
@@ -44995,6 +46115,11 @@ class Assembler {
     if (t.kind === "bool") {
       push();
       c.structGet(promT, PROM_F64);
+      if (this.undefSlots) {
+        // the slot's undefined (2) survives the promise (S119)
+        c.i32TruncF64S();
+        return true;
+      }
       c.f64Const(0);
       c.f64Ne();
       return true;
@@ -45014,7 +46139,9 @@ class Assembler {
     }
     push();
     c.structGet(promT, PROM_REF);
-    c.refCast(val.typeIndex);
+    // a slot holding undefined rides through as null (S119)
+    if (this.undefSlots) c.refCastNull(val.typeIndex);
+    else c.refCast(val.typeIndex);
     return true;
   }
 
@@ -45347,6 +46474,18 @@ class Assembler {
     c.i32Const(wantDK);
     c.i32Ne();
     c.ifVoid();
+    // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
+    if (this.undefSlots) {
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifVoid();
+      if (t.kind === "string") c.refNull(this.strType);
+      else this.emitSlotUndef(t, undefined, c);
+      c.return_();
+      c.end();
+    }
     const urlExit = t.kind === "string" && this.urlDynLive;
     if (urlExit) {
       // Unit I: jsExit's named refusal of a URL held in a dynamic value.
@@ -45361,17 +46500,18 @@ class Assembler {
       c.i32Const(0);
       c.end();
       c.ifVoid();
-      this.emitSetCellError(c, "%Error", "Error", (x) =>
-        this.pushStrLitInto(x, "passing a URL held in a dynamic value where a string is expected is not supported yet"),
-      null);
+      this.emitFenceFatal(c, (x) =>
+        this.pushStrLitInto(x, "passing a URL held in a dynamic value where a string is expected is not supported yet"), null);
       c.else_();
     }
-    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+    // GH #86 review (SEMANTICS.md S122): the island exit's type check is
+    // tsinter's own (Node has no boundary) — it ends the program.
+    this.emitFenceFatal(c, (x) => {
       this.pushStrLitInto(x, `expected ${wantDesc}, got `);
       x.localGet(0);
       x.call(this.dyn.typeOf());
       x.call(this.concatHelper());
-    }, null);
+    }, "SC1100");
     if (urlExit) c.end();
     this.pushZeroInto(c, val);
     c.return_();
@@ -46984,13 +48124,7 @@ class Assembler {
       c.i32Const(DK.FUNC);
       c.i32Eq();
       c.ifVoid();
-      this.emitSetCellError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.pushStrLitInto(x, "resolving a promise with a non-promise thenable is not supported yet"),
-        "SC1090",
-      );
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "resolving a promise with a non-promise thenable is not supported yet"), "SC1090");
       c.call(this.reportUncaughtHelper());
       c.end();
       c.end();
@@ -47694,13 +48828,7 @@ class Assembler {
     c.i32Const(DK.FUNC);
     c.i32Eq();
     c.ifVoid();
-    this.emitSetCellError(
-      c,
-      "%Error",
-      "Error",
-      (x) => this.pushStrLitInto(x, "adopting a non-promise thenable returned from a promise reaction is not supported yet"),
-      "SC1090",
-    );
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "adopting a non-promise thenable returned from a promise reaction is not supported yet"), "SC1090");
     this.emitRejectFromCellAndReturn(c, DST);
     c.end();
     c.end();
@@ -47788,12 +48916,14 @@ class Assembler {
    * into the exception cell from the dyn value in local `d`. The caller
    * unwinds or settles. */
   private emitArrExitFail(c: Code, d: number): void {
-    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+    // GH #86 review (SEMANTICS.md S122): Node has no boundary here, so the
+    // check is tsinter's own — it ENDS the program.
+    this.emitFenceFatal(c, (x) => {
       this.pushStrLitInto(x, "expected an array, got ");
       x.localGet(d);
       x.call(this.dyn.typeOf());
       x.call(this.concatHelper());
-    }, null);
+    }, "SC1100");
   }
 
   private bridgeArrSettleField: number | null = null;

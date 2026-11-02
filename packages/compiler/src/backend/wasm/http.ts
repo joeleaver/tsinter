@@ -41,6 +41,12 @@ const EQ_HEAP = -0x13;
 const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
 
 export interface HttpDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   net: () => NetBuilder;
   strRef: () => ValType;
   strType: () => number;
@@ -4607,6 +4613,20 @@ export class HttpBuilder {
    * ERR_INVALID_ARG_VALUE (built by the caller) when its length is odd;
    * `orig` is String(statusCode) for the status error (null = render the
    * number). */
+  /** (res, text): writeHead's own two first checks for a status code that
+   * is not a number and is not a valid code (GH #86 review — the checked-
+   * dynamic writeHead): headers already sent, then Node's RangeError
+   * "Invalid status code: <String(code)>". Always throws. */
+  writeHeadBadStatusFn(): number {
+    return this.fn("writeHeadBadStatus", [this.resRef(), this.strRef], [], (f, $) => {
+      $.if($.notNull($.get(this.OT, O_HEADER, $.l(0))), () => {
+        this.throwHeadersSent($, "write");
+        $.ret();
+      });
+      this.throwErr($, "%RangeError", this.cat($, this.lit($, "Invalid status code: "), $.l(1)), "ERR_HTTP_INVALID_STATUS_CODE");
+    });
+  }
+
   writeHeadFn(): number {
     return this.fn("writeHead", [this.resRef(), F64, this.strRef, I32, this.ref(this.hentArrT), I32], [], (f, $) => {
       const [R, SC0, REASON, KIND, LIST, N] = [0, 1, 2, 3, 4, 5];
@@ -6794,10 +6814,10 @@ export class HttpBuilder {
 
   /* ── the statically typed surface's readers and writers ──────────── */
 
-  /** A named fence: a catchable Error "<what> is not supported yet". */
+  /** A named fence: "<what> is not supported yet" — ends the program
+   * (GH #86). */
   private fenceErr($: A, what: string): void {
-    this.deps.newError($.c, "%Error", "Error", (c) => this.deps.pushStrLit(c, `${what} is not supported yet`), (c) => c.refNull(this.strT));
-    this.deps.throwStack($.c);
+    this.deps.fence($.c, (c) => this.deps.pushStrLit(c, `${what} is not supported yet`));
   }
 
   /** server's requireHostHeader (the createServer option; default true). */

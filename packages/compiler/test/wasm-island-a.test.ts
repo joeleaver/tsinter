@@ -133,13 +133,13 @@ test("A1-OSPREAD-02 a function source spreads its own ENUMERABLE members (define
 });
 
 test("A1-OSPREAD-03 spreading a caught error into an island literal refuses by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("A1-OSPREAD-03", "// @dynamic\n\"use strict\";\n// a caught error spread into an island literal\ntry {\n  throw new TypeError(\"boom\");\n} catch (e) {\n  /** @type {*} */\n  const any = e;\n  try {\n    /** @type {*} */\n    const o = { ...any, extra: 1 };\n    console.log(JSON.stringify(o));\n  } catch (e2) {\n    console.log(`${e2.name}: ${e2.message}`);\n  }\n}", "js");
+  const { stdout, stderr } = await runRowTrap("A1-OSPREAD-03", "// @dynamic\n\"use strict\";\n// a caught error spread into an island literal\ntry {\n  throw new TypeError(\"boom\");\n} catch (e) {\n  /** @type {*} */\n  const any = e;\n  try {\n    /** @type {*} */\n    const o = { ...any, extra: 1 };\n    console.log(JSON.stringify(o));\n  } catch (e2) {\n    console.log(`${e2.name}: ${e2.message}`);\n  }\n}", "js");
   // Node prints {"extra":1}: an Error's members are non-enumerable. The
   // dyn error encoding's would copy, marker included (S021/S025), so the
-  // spread refuses by name (SEMANTICS.md S043's unit-A1 amendment).
-  expect(stdout).toBe("Error: spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // spread refuses by name (SEMANTICS.md S043's unit-A1 amendment) — and,
+  // GH #86 (SEMANTICS.md S122): a fence ends the program, so the program's own catch never sees it.
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet [SC1090]\n");
 });
 
 test("A1-SPREAD-03 the nullish spread text names the source as V8 renders it", async () => {
@@ -156,22 +156,27 @@ test("A1-SPREAD-04 a spread call on an any-typed callee is a real spread, not ap
   expect(exitCode).toBe(0);
 });
 
-test("A1-SPREAD-05 a nullish spread source with no known V8 rendering refuses by name, on both call paths; a numeric key renders its value", async () => {
-  const { stdout, stderr, exitCode } = await runRow("A1-SPREAD-05", "// @dynamic\n\"use strict\";\n/** @type {*} */\nconst o = { x: null };\nconst id = (...a) => a.length;\ntry {\n  id(...o?.x);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[99999999999999999999]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[7]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\n/** @param {*} g */\nfunction cs(g) {\n  try {\n    g(...o?.x);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\ncs((...a) => a.length);\nconsole.log(`${id(...(o?.y ?? [1, 2]))}`);", "js");
+test("A1-SPREAD-05 a nullish spread source with no known V8 rendering refuses by name on the checked-dynamic call path", async () => {
+  const { stdout, stderr } = await runRowTrap("A1-SPREAD-05", "// @dynamic\n\"use strict\";\n/** @type {*} */\nconst o = { x: null };\nconst id = (...a) => a.length;\ntry {\n  id(...o?.x);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[99999999999999999999]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[7]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\n/** @param {*} g */\nfunction cs(g) {\n  try {\n    g(...o?.x);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\ncs((...a) => a.length);\nconsole.log(`${id(...(o?.y ?? [1, 2]))}`);", "js");
   // Node: "TypeError: (intermediate value) is not iterable (cannot read
-  // property null)"; the index lines as here (V8 prints a numeric key's
-  // VALUE, which the front end now renders the same way); "(intermediate value)" again, then 2. The static
-  // callee's three ride the checked-dynamic call path (an `any` source),
-  // the any-callee one the island callSpread.
+  // property null)" — GH #86 (SEMANTICS.md S122): a fence ends the program: the first refusal stops it (the rest of the
+  // program is A1-SPREAD-05b's).
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: spreading null or undefined from this expression into a call is not supported yet [SC1090]\n");
+});
+
+test("A1-SPREAD-05b a numeric key renders its value; the island callSpread refuses by name", async () => {
+  const { stdout, stderr } = await runRowTrap("A1-SPREAD-05b", "// @dynamic\n\"use strict\";\n/** @type {*} */\nconst o = { x: null };\nconst id = (...a) => a.length;\ntry {\n  id(...o[99999999999999999999]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[7]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\n/** @param {*} g */\nfunction cs(g) {\n  try {\n    g(...o?.x);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\ncs((...a) => a.length);\nconsole.log(`${id(...(o?.y ?? [1, 2]))}`);", "js");
+  // Node: the index lines as here (V8 prints a numeric key's VALUE, which
+  // the front end now renders the same way); "(intermediate value)" for
+  // the any-callee spread, then 2. The static callee's two ride the
+  // checked-dynamic call path (an `any` source), the any-callee one the
+  // island callSpread, whose refusal ends the program (GH #86 (SEMANTICS.md S122): a fence ends the program).
   expect(stdout).toBe(
-    "Error: spreading null or undefined from this expression into a call is not supported yet\n" +
-      "TypeError: o[100000000000000000000] is not iterable (cannot read property undefined)\n" +
-      "TypeError: o[7] is not iterable (cannot read property undefined)\n" +
-      "Error: spreading null or undefined from this expression into an island call is not supported yet\n" +
-      "2\n",
+    "TypeError: o[100000000000000000000] is not iterable (cannot read property undefined)\n" +
+      "TypeError: o[7] is not iterable (cannot read property undefined)\n",
   );
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  expect(stderr).toBe("tsinter: unsupported: spreading null or undefined from this expression into an island call is not supported yet [SC1090]\n");
 });
 
 test("A1-DEFPROPS-01 an accessor descriptor Object.defineProperties cannot hold raises its fence at the call", async () => {
@@ -266,33 +271,30 @@ test("A2-KEYS-01 the checked-dynamic key surfaces over island getters, linked ob
 
 // ── A2 refusals: this tier's named answers, Node's beside each ──────────
 
-test("A2-REF-01 a write over an island getter, own or inherited, refuses by name", async () => {
-  const src =
-    '// @dynamic\n"use strict";\n/** @type {*} */\nconst o = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\ntry {\n  o.g = 5;\n  console.log("assigned");\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\nconst c = Object.create(o);\ntry {\n  c.g = 6;\n  console.log("assigned");\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\nc.n = 7;\nconsole.log(`${c.n} ${o.n} ${c.g}`);';
-  const { stdout, stderr, exitCode } = await runRow("A2-REF-01", src, "js");
+test("A2-REF-01 a write over an island getter refuses by name", async () => {
+  const src = "// @dynamic\n\"use strict\";\n/** @type {*} */\nconst o = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\ntry {\n  o.g = 5;\n  console.log(\"assigned\");\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\nconst c = Object.create(o);\ntry {\n  c.g = 6;\n  console.log(\"assigned\");\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\nc.n = 7;\nconsole.log(`${c.n} ${o.n} ${c.g}`);";
+  const { stdout, stderr } = await runRowTrap("A2-REF-01", src, "js");
   // Node (strict code): "TypeError: Cannot set property g of #<Object>
   // which has only a getter" for both writes; sloppy code ignores them.
-  expect(stdout).toBe(
-    "Error: assigning to the getter-only property 'g' of an island object is not supported yet\n" +
-      "Error: assigning to the getter-only property 'g' of an island object is not supported yet\n" +
-      "7 1 2\n",
-  );
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // GH #86 (SEMANTICS.md S122): a fence ends the program: the own-getter write stops it (the inherited one, below the
+  // first, refuses with the same text).
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: assigning to the getter-only property 'g' of an island object is not supported yet [SC1090]\n");
 });
 
-test("A2-REF-02 Object.create over an array, a function or a null-prototype object refuses by name", async () => {
-  const src =
-    '// @dynamic\n"use strict";\n/** @param {*} p */\nfunction tryCreate(p) {\n  try {\n    Object.create(p);\n    console.log("created");\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\n/** @returns {*} */\nfunction arr() {\n  return [1];\n}\n/** @returns {*} */\nfunction fn() {\n  return () => 1;\n}\ntryCreate(arr());\ntryCreate(fn());\ntryCreate(Object.create(null));';
-  const { stdout, exitCode } = await runRow("A2-REF-02", src, "js");
-  // Node: "created" three times.
-  expect(stdout).toBe(
-    "Error: Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet\n" +
-      "Error: Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet\n" +
-      "Error: Object.create over a null-prototype or built-in object on the island is not supported yet\n",
-  );
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each prototype kind is its own program.
+for (const [id, call, msg] of [
+  ["A2-REF-02a", "tryCreate(arr());", "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"],
+  ["A2-REF-02b", "tryCreate(fn());", "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"],
+  ["A2-REF-02c", "tryCreate(Object.create(null));", "Object.create over a null-prototype or built-in object on the island is not supported yet"],
+] as const) {
+  test(`${id} Object.create over ${call} refuses by name`, async () => {
+    const { stdout, stderr } = await runRowTrap(id, "// @dynamic\n\"use strict\";\n/** @param {*} p */\nfunction tryCreate(p) {\n  try {\n    Object.create(p);\n    console.log(\"created\");\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\n/** @returns {*} */\nfunction arr() {\n  return [1];\n}\n/** @returns {*} */\nfunction fn() {\n  return () => 1;\n}\n" + call, "js");
+    // Node: "created".
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
 test("A2-REF-03 a getter written before a data member refuses at compile time (it would enumerate out of order)", async () => {
   const diags = await refuseRow(
@@ -313,14 +315,23 @@ test("A2-REF-04 a typed conversion of an object carrying an island getter: the t
   await expect(build("A2-REF-04", src, "ts")).rejects.toThrow(/SC1090|a function called from dynamic code with a typed/);
 });
 
-test("A2-REF-05 Object.assign onto an island getter refuses by name; deep equality over a linked object refuses uncaught", async () => {
-  const src =
-    '// @dynamic\nimport assert from "node:assert";\nconst t: any = {\n  n: 1,\n  get g() {\n    return 1;\n  },\n};\nconst tu: unknown = t;\nif (typeof tu === "object" && tu !== null) {\n  try {\n    Object.assign(tu, { g: 2 });\n    console.log("assigned");\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}\nfunction mk(): any {\n  return { a: 1 };\n}\nconst a: unknown = Object.create(mk());\nconst b: unknown = JSON.parse("{}");\nconsole.log("before");\nassert.deepStrictEqual(a, b);\nconsole.log("after");';
+test("A2-REF-05 Object.assign onto an island getter throws Node's TypeError (GH #86 review: Node throws there too); deep equality over a linked object then ends the program", async () => {
+  const src = "// @dynamic\nimport assert from \"node:assert\";\nconst t: any = {\n  n: 1,\n  get g() {\n    return 1;\n  },\n};\nconst tu: unknown = t;\nif (typeof tu === \"object\" && tu !== null) {\n  try {\n    Object.assign(tu, { g: 2 });\n    console.log(\"assigned\");\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}\nfunction mk(): any {\n  return { a: 1 };\n}\nconst a: unknown = Object.create(mk());\nconst b: unknown = JSON.parse(\"{}\");\nconsole.log(\"before\");\nassert.deepStrictEqual(a, b);\nconsole.log(\"after\");";
   const { stdout, stderr } = await runRowTrap("A2-REF-05", src, "ts");
   // Node: "TypeError: Cannot set property g of #<Object> which has only a
-  // getter", before, after.
-  expect(stdout).toBe("Error: copying onto the getter-only property 'g' of an island object is not supported yet\nbefore\n");
-  expect(stderr).toContain("Uncaught Error: deep equality over an island object built by Object.create(proto) is not supported yet");
+  // getter", before, after — the Object.assign TypeError is Node's own
+  // (catchable); the deep equality is the fence that ends the program
+  // (SEMANTICS.md S122).
+  expect(stdout).toBe("TypeError: Cannot set property g of #<Object> which has only a getter\nbefore\n");
+  expect(stderr).toBe("tsinter: unsupported: deep equality over an island object built by Object.create(proto) is not supported yet [SC1090]\n");
+});
+
+test("A2-REF-05b deep equality over a linked object refuses uncaught", async () => {
+  const src = "// @dynamic\nimport assert from \"node:assert\";\nconst t: any = {\n  n: 1,\n  get g() {\n    return 1;\n  },\n};\nconst tu: unknown = t;\nfunction mk(): any {\n  return { a: 1 };\n}\nconst a: unknown = Object.create(mk());\nconst b: unknown = JSON.parse(\"{}\");\nconsole.log(\"before\");\nassert.deepStrictEqual(a, b);\nconsole.log(\"after\");";
+  const { stdout, stderr } = await runRowTrap("A2-REF-05b", src, "ts");
+  // Node: before, after.
+  expect(stdout).toBe("before\n");
+  expect(stderr).toContain("tsinter: unsupported: deep equality over an island object built by Object.create(proto) is not supported yet");
 });
 
 test("A2-CORPUS-2474 the island-literal-forms corpus program", async () => {
@@ -467,24 +478,38 @@ test("F1-RE-01 a RegExp held in an any: accessors, test, String(), inspect, keys
   expect(exitCode).toBe(0);
 });
 
-test("F1-RE-02 the unmodeled RegExp surface refuses by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("F1-RE-02", "// @dynamic\n// the unmodeled RegExp surface refuses by name\nconst g: any = /x/g;\nconst r: any = /x/;\nfor (const f of [() => g.test(\"x\"), () => r.exec(\"x\"), () => typeof r.exec, () => { r.lastIndex = 3; }]) {\n  try {\n    console.log(`ok ${f()}`);\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}", "ts");
-  // Node: ok true / ok x / ok function / ok undefined.
-  expect(stdout).toBe("Error: 'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet\nError: 'RegExp.prototype.exec' on an island value is not supported yet\nError: 'RegExp.prototype.exec' read as a value on an island value is not supported yet\nError: assigning a member of an island RegExp is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
+// (case k runs `for (const f of [() => g.test("x"), () => r.exec("x"), () => typeof r.exec, () => { r.lastIndex = 3; }].slice(${k}, ${k} + 1)) {` only). Node: ok true / ok x / ok function / ok undefined.
+for (const [k, msg] of [
+  [0, "'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet"],
+  [1, "'RegExp.prototype.exec' on an island value is not supported yet"],
+  [2, "'RegExp.prototype.exec' read as a value on an island value is not supported yet"],
+  [3, "assigning a member of an island RegExp is not supported yet"],
+] as const) {
+  test(`F1-RE-02 case ${k}: the unmodeled RegExp surface refuses by name`, async () => {
+    const src = "// @dynamic\n// the unmodeled RegExp surface refuses by name\nconst g: any = /x/g;\nconst r: any = /x/;\n" + `for (const f of [() => g.test("x"), () => r.exec("x"), () => typeof r.exec, () => { r.lastIndex = 3; }].slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${f()}`);\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}";
+    const { stdout, stderr } = await runRowTrap(`F1-RE-02-${k}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
-test("F1-RE-04 an island RegExp holds no own members: member writes and Object.create over one refuse by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("F1-RE-04", "// @dynamic\n// an island RegExp holds no own members: every member write, and Object.create over one, refuses by name\nconst r: any = /a/;\nconst tries: (() => any)[] = [\n  () => { r.test = () => true; return r.test(\"b\"); },\n  () => { r.toString = () => \"X\"; return r.toString(); },\n  () => { r.foo = 1; return r.foo; },\n  () => { r.source = \"zz\"; return r.source; },\n  () => Object.create(r).source,\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${r.test(\"a\")} ${r.test(\"b\")} ${r.toString()} ${r.source}`);", "ts");
-  // Node: ok true / ok X / ok 1 / "Cannot set property source of [object
-  // Object] which has only a getter" / "RegExp.prototype.source getter
-  // called on non-RegExp object" / true true X a. Each refusal keeps the
-  // regex's own readers exact (the last line's built-ins answer).
-  expect(stdout).toBe("assigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nObject.create over a null-prototype or built-in object on the island is not supported yet\ntrue false /a/ a\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
+// (case k runs `for (const t of tries.slice(${k}, ${k} + 1)) {` only). Node: ok true / ok X / ok 1 / "Cannot set property source of [object Object] which has only a getter" / "RegExp.prototype.source getter called on non-RegExp object" / true true X a.
+for (const [k, msg] of [
+  [0, "assigning a member of an island RegExp is not supported yet"],
+  [1, "assigning a member of an island RegExp is not supported yet"],
+  [2, "assigning a member of an island RegExp is not supported yet"],
+  [3, "assigning a member of an island RegExp is not supported yet"],
+  [4, "Object.create over a null-prototype or built-in object on the island is not supported yet"],
+] as const) {
+  test(`F1-RE-04 case ${k}: an island RegExp holds no own members: member writes and Object.create over one refuse by name`, async () => {
+    const src = "// @dynamic\n// an island RegExp holds no own members: every member write, and Object.create over one, refuses by name\nconst r: any = /a/;\nconst tries: (() => any)[] = [\n  () => { r.test = () => true; return r.test(\"b\"); },\n  () => { r.toString = () => \"X\"; return r.toString(); },\n  () => { r.foo = 1; return r.foo; },\n  () => { r.source = \"zz\"; return r.source; },\n  () => Object.create(r).source,\n];\n" + `for (const t of tries.slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${r.test(\"a\")} ${r.test(\"b\")} ${r.toString()} ${r.source}`);";
+    const { stdout, stderr } = await runRowTrap(`F1-RE-04-${k}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
 test("F1-RE-05 lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike", async () => {
   const { stdout, stderr, exitCode } = await runRow("F1-RE-05", "// @dynamic\n// lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike\nconst r: any = /a/;\nconst u: unknown = r;\nif (typeof u === \"object\" && u !== null) {\n  console.log(`${\"lastIndex\" in u} ${Object.hasOwn(u, \"lastIndex\")} ${\"foo\" in u} ${Object.hasOwn(u, \"source\")}`);\n}", "ts");
@@ -524,33 +549,51 @@ test("I-URL-01 a URL held in an any: its getters, String(), toString(), JSON, ty
   expect(exitCode).toBe(0);
 });
 
-test("I-URL-02 the URL members this tier does not expose refuse by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("I-URL-02", "// @dynamic\n// the URL members this tier does not expose refuse by name\nconst hu: any = new URL(\"https://example.dev:8080/p#frag\");\nfor (const name of [\"hash\", \"port\", \"origin\", \"searchParams\"]) {\n  try {\n    console.log(`ok ${hu[name]}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}", "ts");
-  // Node: ok #frag / ok 8080 / ok https://example.dev:8080 / ok (the
-  // URLSearchParams' empty string).
-  expect(stdout).toBe("reading 'hash' of a URL held in a dynamic value is not supported yet\nreading 'port' of a URL held in a dynamic value is not supported yet\nreading 'origin' of a URL held in a dynamic value is not supported yet\nreading 'searchParams' of a URL held in a dynamic value is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
+// (case k runs `for (const name of ["hash", "port", "origin", "searchParams"].slice(${k}, ${k} + 1)) {` only). Node: ok #frag / ok 8080 / ok https://example.dev:8080 / ok (the URLSearchParams' empty string).
+for (const [k, msg] of [
+  [0, "reading 'hash' of a URL held in a dynamic value is not supported yet"],
+  [1, "reading 'port' of a URL held in a dynamic value is not supported yet"],
+  [2, "reading 'origin' of a URL held in a dynamic value is not supported yet"],
+  [3, "reading 'searchParams' of a URL held in a dynamic value is not supported yet"],
+] as const) {
+  test(`I-URL-02 case ${k}: the URL members this tier does not expose refuse by name`, async () => {
+    const src = "// @dynamic\n// the URL members this tier does not expose refuse by name\nconst hu: any = new URL(\"https://example.dev:8080/p#frag\");\n" + `for (const name of ["hash", "port", "origin", "searchParams"].slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${hu[name]}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}";
+    const { stdout, stderr } = await runRowTrap(`I-URL-02-${k}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
-test("I-URL-03 a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("I-URL-03", "// @dynamic\n// a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name\nconst hu: any = new URL(\"https://example.dev/p\");\nconst tries: (() => any)[] = [\n  () => { hu.href = \"https://other.dev/\"; return hu.href; },\n  () => { hu.foo = 1; return hu.foo; },\n  () => Object.create(hu).href,\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${hu.href} ${JSON.stringify(hu)}`);", "ts");
-  // Node: ok https://other.dev/ / ok 1 / "Receiver must be an instance of
-  // class URL" / https://other.dev/ "https://other.dev/" (the href setter
-  // reparses). The refusals keep the getters exact.
-  expect(stdout).toBe("assigning a member of a URL held in a dynamic value is not supported yet\nassigning a member of a URL held in a dynamic value is not supported yet\nObject.create over a null-prototype or built-in object on the island is not supported yet\nhttps://example.dev/p \"https://example.dev/p\"\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
+// (case k runs `for (const t of tries.slice(${k}, ${k} + 1)) {` only). Node: ok https://other.dev/ / ok 1 / "Receiver must be an instance of class URL" / https://other.dev/ "https://other.dev/".
+for (const [k, msg] of [
+  [0, "assigning a member of a URL held in a dynamic value is not supported yet"],
+  [1, "assigning a member of a URL held in a dynamic value is not supported yet"],
+  [2, "Object.create over a null-prototype or built-in object on the island is not supported yet"],
+] as const) {
+  test(`I-URL-03 case ${k}: a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name`, async () => {
+    const src = "// @dynamic\n// a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name\nconst hu: any = new URL(\"https://example.dev/p\");\nconst tries: (() => any)[] = [\n  () => { hu.href = \"https://other.dev/\"; return hu.href; },\n  () => { hu.foo = 1; return hu.foo; },\n  () => Object.create(hu).href,\n];\n" + `for (const t of tries.slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${hu.href} ${JSON.stringify(hu)}`);";
+    const { stdout, stderr } = await runRowTrap(`I-URL-03-${k}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
-test("I-URL-04 a URL held in a dynamic value refuses by name at a string slot and as constructor", async () => {
-  const { stdout, stderr, exitCode } = await runRow("I-URL-04", "// @dynamic\n// a URL held in a dynamic value passed back where a string is expected\nconst u: any = new URL(\"https://a.com/p?q=1\");\ntry {\n  const v = new URL(u);\n  console.log(`ok ${v.href}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\ntry {\n  const s: string = u;\n  console.log(`ok ${s.length}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\ntry {\n  console.log(`ok ${typeof u.constructor}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\nconsole.log(\"end\");", "ts");
-  // Node: ok https://a.com/p?q=1 (new URL reads the href) / ok undefined
-  // (a string-typed slot holds the object) / ok function / end.
-  expect(stdout).toBe("passing a URL held in a dynamic value where a string is expected is not supported yet\npassing a URL held in a dynamic value where a string is expected is not supported yet\nreading 'constructor' of a URL held in a dynamic value is not supported yet\nend\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each case is its own program. Node: ok https://a.com/p?q=1
+// (new URL reads the href) / ok undefined (a string-typed slot holds the
+// object) / ok function / end.
+for (const [k, src, msg] of [
+  ["a", "// @dynamic\n// a URL held in a dynamic value passed back where a string is expected\nconst u: any = new URL(\"https://a.com/p?q=1\");\ntry {\n  const v = new URL(u);\n  console.log(`ok ${v.href}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\nconsole.log(\"end\");", "passing a URL held in a dynamic value where a string is expected is not supported yet"],
+  ["b", "// @dynamic\n// a URL held in a dynamic value passed back where a string is expected\nconst u: any = new URL(\"https://a.com/p?q=1\");\ntry {\n  const s: string = u;\n  console.log(`ok ${s.length}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\nconsole.log(\"end\");", "passing a URL held in a dynamic value where a string is expected is not supported yet"],
+  ["c", "// @dynamic\n// a URL held in a dynamic value passed back where a string is expected\nconst u: any = new URL(\"https://a.com/p?q=1\");\ntry {\n  console.log(`ok ${typeof u.constructor}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\nconsole.log(\"end\");", "reading 'constructor' of a URL held in a dynamic value is not supported yet"],
+] as const) {
+  test(`I-URL-04${k} a URL held in a dynamic value refuses by name at a string slot and as constructor`, async () => {
+    const { stdout, stderr } = await runRowTrap(`I-URL-04${k}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
 test("I-TYPED-01 a non-u8 typed array held in an any: length, index reads, constructor, BYTES_PER_ELEMENT", async () => {
   const { stdout, stderr, exitCode } = await runRow("I-TYPED-01", "// @dynamic\n// a non-u8 typed array held in an any: length, index reads, constructor, BYTES_PER_ELEMENT\nconst words = new Uint32Array([7, 900000001]);\nconst hw: any = words;\nconsole.log(`${hw.length} ${hw[0]} ${hw[1]} ${hw[2]} ${hw.constructor.name} ${hw.BYTES_PER_ELEMENT} ${hw.byteLength} ${typeof hw}`);\nconst floats = new Float32Array([1.5, -0.25]);\nconst hf: any = floats;\nconsole.log(`${hf.length} ${hf[1]} ${hf.constructor.name} ${hf.constructor.length} ${typeof hf.constructor}`);\nconst ints = new Int32Array([-3]);\nconst hi: any = ints;\nconst again: any = ints;\nconsole.log(`${hi[0]} ${hi.constructor.name} ${hi === again} ${hi === hw} ${hi.constructor === again.constructor} ${!!hi}`);\nconst bytes = new Uint8Array([1]);\nconst hb: any = bytes;\nconsole.log(`${hb.constructor.name} ${hb.constructor === hb.constructor}`);", "ts");
@@ -559,15 +602,28 @@ test("I-TYPED-01 a non-u8 typed array held in an any: length, index reads, const
   expect(exitCode).toBe(0);
 });
 
-test("I-TYPED-02 every reader that would walk or convert a dynamic typed array refuses by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("I-TYPED-02", "// @dynamic\n// every reader that would walk or convert a dynamic typed array refuses by name\nconst hw: any = new Uint32Array([7, 8]);\nconst tries: (() => any)[] = [\n  () => JSON.stringify(hw),\n  () => hw.map((x: any) => x),\n  () => { hw[0] = 1; },\n  () => { const s: any = { ...hw }; return s; },\n  () => hw.at(0),\n  () => hw.constructor(2),\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconst u: unknown = hw;\nif (typeof u === \"object\" && u !== null) {\n  const more: (() => any)[] = [() => Object.keys(u), () => \"0\" in u, () => Object.hasOwn(u, \"0\")];\n  for (const t of more) {\n    try {\n      console.log(`ok ${t()}`);\n    } catch (e) {\n      console.log(`${(e as Error).message}`);\n    }\n  }\n}", "ts");
-  // Node: ok {"0":7,"1":8} / ok 7,8 / ok undefined / ok [object Object] /
-  // ok 1 / Constructor Uint32Array requires 'new' / ok 0,1 / ok true /
-  // ok true. `"0" in u` is the one reader answered (Node's true).
-  expect(stdout).toBe("JSON.stringify of a typed array held in a dynamic value is not supported yet\ncalling 'map' on a typed array held in a dynamic value is not supported yet\nassigning a member of a typed array held in a dynamic value is not supported yet\nspreading a typed array held in a dynamic value is not supported yet\ncalling 'at' on a typed array held in a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\nwalking the keys of a typed array held in a dynamic value is not supported yet\nok true\n'in' or Object.hasOwn on a typed array held in a dynamic value is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced reader is its own program (case k runs tries[k]
+// only; case 6 skips them all and walks `more` from m). Node: ok
+// {"0":7,"1":8} / ok 7,8 / ok undefined / ok [object Object] / ok 1 /
+// Constructor Uint32Array requires 'new' / ok 0,1 / ok true / ok true.
+// `"0" in u` is the one reader answered (Node's true).
+for (const [k, m, out, msg] of [
+  [0, 0, "", "JSON.stringify of a typed array held in a dynamic value is not supported yet"],
+  [1, 0, "", "calling 'map' on a typed array held in a dynamic value is not supported yet"],
+  [2, 0, "", "assigning a member of a typed array held in a dynamic value is not supported yet"],
+  [3, 0, "", "spreading a typed array held in a dynamic value is not supported yet"],
+  [4, 0, "", "calling 'at' on a typed array held in a dynamic value is not supported yet"],
+  [5, 0, "", "calling 'constructor' on a typed array held in a dynamic value is not supported yet"],
+  [6, 0, "", "walking the keys of a typed array held in a dynamic value is not supported yet"],
+  [6, 1, "ok true\n", "'in' or Object.hasOwn on a typed array held in a dynamic value is not supported yet"],
+] as const) {
+  test(`I-TYPED-02 case ${k}/${m}: every reader that would walk or convert a dynamic typed array refuses by name`, async () => {
+    const src = "// @dynamic\n// every reader that would walk or convert a dynamic typed array refuses by name\nconst hw: any = new Uint32Array([7, 8]);\nconst tries: (() => any)[] = [\n  () => JSON.stringify(hw),\n  () => hw.map((x: any) => x),\n  () => { hw[0] = 1; },\n  () => { const s: any = { ...hw }; return s; },\n  () => hw.at(0),\n  () => hw.constructor(2),\n];\n" + `for (const t of tries.slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconst u: unknown = hw;\nif (typeof u === \"object\" && u !== null) {\n  const more: (() => any)[] = [() => Object.keys(u), () => \"0\" in u, () => Object.hasOwn(u, \"0\")];\n  " + `for (const t of more.slice(${m})) {` + "\n    try {\n      console.log(`ok ${t()}`);\n    } catch (e) {\n      console.log(`${(e as Error).message}`);\n    }\n  }\n}";
+    const { stdout, stderr } = await runRowTrap(`I-TYPED-02-${k}-${m}`, src, "ts");
+    expect(stdout).toBe(out);
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
 test("I-TYPED-03 an unaudited reader of a dynamic typed array traps (never a silent {} / [] / undefined)", async () => {
   // structuredClone's walk was not taught the typed kind: it reaches its
@@ -583,15 +639,23 @@ test("I-TYPED-04 converting a dynamic typed array to a string refuses by name, u
   expect(stderr).toContain("converting a typed array held in a dynamic value to a string is not supported yet");
 });
 
-test("I-CTOR-01 the constructor boxes answer name, length and BYTES_PER_ELEMENT; other statics and calls refuse by name", async () => {
-  const { stdout, stderr, exitCode } = await runRow("I-CTOR-01", "// @dynamic\n// the constructor boxes: name, length and BYTES_PER_ELEMENT answer; other statics and calls refuse by name\nconst a: any = new Uint8Array([1, 2]);\nconst b: any = Buffer.from(\"hi\");\nconst w: any = new Uint32Array(2);\nconsole.log(`${a.constructor.BYTES_PER_ELEMENT} ${b.constructor.BYTES_PER_ELEMENT} ${w.constructor.BYTES_PER_ELEMENT} ${a.constructor.name} ${w.constructor.length}`);\nconst tries: (() => any)[] = [\n  () => a.constructor.from,\n  () => w.constructor.of,\n  () => a.constructor.prototype,\n  () => b.constructor.isBuffer,\n  () => a.constructor(1),\n  () => w.constructor(1),\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${typeof t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}", "ts");
-  // Node: the first line, then ok function / ok function / ok object /
-  // ok function / Constructor Uint8Array requires 'new' / Constructor
-  // Uint32Array requires 'new'.
-  expect(stdout).toBe("1 1 4 Uint8Array 3\nreading 'from' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'of' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'prototype' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'isBuffer' of a typed-array constructor read from a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
+// (case k runs `for (const t of tries.slice(${k}, ${k} + 1)) {` only). Node: the first line, then ok function / ok function / ok object / ok function / Constructor Uint8Array requires 'new' / Constructor Uint32Array requires 'new'.
+for (const [k, msg] of [
+  [0, "reading 'from' of a typed-array constructor read from a dynamic value is not supported yet"],
+  [1, "reading 'of' of a typed-array constructor read from a dynamic value is not supported yet"],
+  [2, "reading 'prototype' of a typed-array constructor read from a dynamic value is not supported yet"],
+  [3, "reading 'isBuffer' of a typed-array constructor read from a dynamic value is not supported yet"],
+  [4, "calling 'constructor' on a typed array held in a dynamic value is not supported yet"],
+  [5, "calling 'constructor' on a typed array held in a dynamic value is not supported yet"],
+] as const) {
+  test(`I-CTOR-01 case ${k}: the constructor boxes answer name, length and BYTES_PER_ELEMENT; other statics and calls refuse by name`, async () => {
+    const src = "// @dynamic\n// the constructor boxes: name, length and BYTES_PER_ELEMENT answer; other statics and calls refuse by name\nconst a: any = new Uint8Array([1, 2]);\nconst b: any = Buffer.from(\"hi\");\nconst w: any = new Uint32Array(2);\nconsole.log(`${a.constructor.BYTES_PER_ELEMENT} ${b.constructor.BYTES_PER_ELEMENT} ${w.constructor.BYTES_PER_ELEMENT} ${a.constructor.name} ${w.constructor.length}`);\nconst tries: (() => any)[] = [\n  () => a.constructor.from,\n  () => w.constructor.of,\n  () => a.constructor.prototype,\n  () => b.constructor.isBuffer,\n  () => a.constructor(1),\n  () => w.constructor(1),\n];\n" + `for (const t of tries.slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${typeof t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}";
+    const { stdout, stderr } = await runRowTrap(`I-CTOR-01-${k}`, src, "ts");
+    expect(stdout).toBe("1 1 4 Uint8Array 3\n");
+    expect(stderr).toBe(`tsinter: unsupported: ${msg} [SC1090]\n`);
+  });
+}
 
 test("I-CORPUS-766 the union boundary program", async () => {
   const { stdout, stderr, exitCode } = await runCorpusRow("I-CORPUS-766", "766-any-union-boundary.ts");
@@ -860,13 +924,12 @@ test("P-FLAT-04 flat stops at 1000 nested levels with V8's RangeError, catchably
   expect(exitCode).toBe(0);
 });
 
-test("P-FLAT-05 flat with an object depth refuses by name, catchably (ToPrimitive is not run)", async () => {
-  // Node: [1,2,[3]] / [1,2,[3]] / [[1,[2,[3]]]] / [1,[2,[3]]].
-  const { stdout, stderr, exitCode } = await runRow("P-FLAT-05", "// @dynamic\n// flat with an object depth (ToPrimitive runs valueOf/toString in Node) refuses by name\n'use strict';\n/** @returns {any} */\nfunction v() {\n  return { valueOf() { return 2; } };\n}\n/** @returns {any} */\nfunction s() {\n  return { toString() { return \"2\"; } };\n}\n/** @returns {any} */\nfunction mk() {\n  return [[1, [2, [3]]]];\n}\nfor (const d of [v(), s(), {}, [1]]) {\n  try {\n    console.log(JSON.stringify(mk().flat(d)));\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}", "js");
-  const fence = "TypeError: mk(...).flat: non-primitive depth arguments on a dynamic receiver are not supported yet\n";
-  expect(stdout).toBe(fence.repeat(4));
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+test("P-FLAT-05 flat with an object depth refuses by name (ToPrimitive is not run); the refusal ends the program", async () => {
+  // Node: [1,2,[3]] / [1,2,[3]] / [[1,[2,[3]]]] / [1,[2,[3]]]. GH #86 (SEMANTICS.md S122): a fence ends the program
+  // (it was a catchable TypeError), so the first depth stops it.
+  const { stdout, stderr } = await runRowTrap("P-FLAT-05", "// @dynamic\n// flat with an object depth (ToPrimitive runs valueOf/toString in Node) refuses by name\n'use strict';\n/** @returns {any} */\nfunction v() {\n  return { valueOf() { return 2; } };\n}\n/** @returns {any} */\nfunction s() {\n  return { toString() { return \"2\"; } };\n}\n/** @returns {any} */\nfunction mk() {\n  return [[1, [2, [3]]]];\n}\nfor (const d of [v(), s(), {}, [1]]) {\n  try {\n    console.log(JSON.stringify(mk().flat(d)));\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}", "js");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: mk(...).flat: non-primitive depth arguments on a dynamic receiver are not supported yet [SC1090]\n");
 });
 
 test("P-CORPUS-2633 the island promise crossing program", async () => {

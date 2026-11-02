@@ -92,6 +92,12 @@ const E_X = 5;
 type Env = { a: number; b: number; cc: number; n: number; x: number };
 
 export interface DgramDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   net: () => NetBuilder;
   strRef: () => ValType;
   strType: () => number;
@@ -251,8 +257,9 @@ export class DgramBuilder {
     this.err($, cls, msg, code)();
     this.deps.throwStack($.c);
   }
+  /** A named fence: ends the program (GH #86). */
   private fence($: A, what: string): void {
-    this.throwErr($, "%Error", this.lit($, `${what} is not supported yet`), null);
+    this.deps.fence($.c, () => this.lit($, `${what} is not supported yet`)());
   }
   private trap($: A): void {
     this.deps.namedTrap($.c, HOST_FAILURE);
@@ -1186,7 +1193,9 @@ export class DgramBuilder {
       });
       // completion callbacks and lists: the compiler-rendered fence
       $.if($.either($.andThen($.notNull($.l(CB)), $.eq(this.kind($, $.l(CB)), $.i(K_FUNC))), $.eq(this.kind($, $.l(BUF)), $.i(K_ARR))), () => {
-        this.throwErr($, "%Error", $.l(FENCE), "SC2020");
+        // the rendered SC2020 fence (its code and place in the text) ends
+        // the program (GH #86)
+        this.deps.fence($.c, () => $.l(FENCE)(), "");
         $.ret($.i(0));
       });
       // the datagram: the buffer (sliced), as bytes

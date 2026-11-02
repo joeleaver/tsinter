@@ -25,6 +25,13 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
+
+/** GH #86 (SEMANTICS.md S122): the S069 fence ENDS the program with this
+ * stderr line — it is no longer a catchable Error. */
+const S069_FENCE =
+  'tsinter: unsupported: date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — ' +
+  'the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ' +
+  '("YYYY[-MM[-DD]][THH:mm[:ss[.sss]][Z|±HH:MM]]") [SC1090]\n';
 import { LIB_FN_SIGS } from "../src/ir/validate.js";
 import { F64, STRING } from "../src/ir/nodes.js";
 
@@ -211,17 +218,18 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
     test(`FENCED: ${JSON.stringify(s)}`, async () => {
       const path = await build(
         `fence-${rows.indexOf(s)}.ts`,
-        `try {
+        // GH #86: the fence ends the program — the catch never runs
+        `console.log("before");
+         try {
            new Date(${JSON.stringify(s)}).getTime();
            console.log("NOT FENCED");
          } catch (e) {
-           if (e instanceof Error) {
-             console.log(e.name, \`\${(e as NodeJS.ErrnoException).code}\`);
-           }
+           console.log("caught");
          }`,
       );
-      const { stdout } = await runWasm(path);
-      expect(stdout).toBe("Error SC1090\n");
+      const { stdout, stderr } = await runWasmToTrap(path);
+      expect(stdout).toBe("before\n");
+      expect(stderr).toBe(S069_FENCE);
     });
   }
 });
@@ -241,7 +249,9 @@ describe("date.parseGetTime — offset-less date-times are local time under the 
     "-271821-04-20T00:00", "-271821-04-19T23:59", "0099-12-31T23:59:59", "2020T12:00", "2020-06T12:00",
     "2020-13-01T00:00", "0005-13-01T00:00",
   ];
-  const fenced = new Set(["0005-13-01T00:00"]); // D-delta: still the S069 fence
+  // D-delta: still the S069 fence — the LAST row: since GH #86 the
+  // fence ends the program (SEMANTICS.md S122)
+  const fenced = new Set(["0005-13-01T00:00"]);
   for (const tz of ["America/Chicago", "Asia/Kolkata", "Australia/Lord_Howe", "Europe/London", "UTC", "Pacific/Chatham", "Invalid/Zone"]) {
     test(`TZ=${tz} — SINGLE-EDIT: localToUtc's max of the two offsets turned into a min, or the clamp dropped`, async () => {
       const path = await build(
@@ -249,7 +259,7 @@ describe("date.parseGetTime — offset-less date-times are local time under the 
         rows
           .map((s) =>
             fenced.has(s)
-              ? `try { new Date(${JSON.stringify(s)}).getTime(); console.log("NOT FENCED"); } catch (e) { console.log("fenced"); }`
+              ? `try { new Date(${JSON.stringify(s)}).getTime(); console.log("NOT FENCED"); } catch (e) { console.log("caught"); }`
               : `console.log(new Date(${JSON.stringify(s)}).getTime());`,
           )
           .join("\n"),
@@ -258,9 +268,10 @@ describe("date.parseGetTime — offset-less date-times are local time under the 
       const saved = process.env["TZ"];
       process.env["TZ"] = tz;
       try {
-        const want = rows.map((s) => (fenced.has(s) ? "fenced" : String(new Date(s).getTime()))).join("\n") + "\n";
-        const { stdout } = await runWasm(path);
+        const want = rows.filter((s) => !fenced.has(s)).map((s) => String(new Date(s).getTime())).join("\n") + "\n";
+        const { stdout, stderr } = await runWasmToTrap(path);
         expect(stdout).toBe(want);
+        expect(stderr).toBe(S069_FENCE);
       } finally {
         if (had) process.env["TZ"] = saved;
         else delete process.env["TZ"];
@@ -354,7 +365,7 @@ describe("date.parseGetTime — digit-free strings answer Node's NaN, genuine di
 // swallowed — f() answered 0 and the program carried on) and uncaught at
 // top level (it exited 0 with no output).
 describe("date.parseGetTime — the S069 fence propagates (board #233)", () => {
-  test("through a function, caught by the caller", async () => {
+  test("through a function, a caller's catch never sees it (GH #86)", async () => {
     const path = await build(
       "fence-fn-caught.ts",
       `function f(s: string): number { return new Date(s).getTime(); }
@@ -363,19 +374,20 @@ describe("date.parseGetTime — the S069 fence propagates (board #233)", () => {
        catch (e) { if (e instanceof Error) console.log(e.name, \`\${(e as NodeJS.ErrnoException).code}\`); }
        console.log("after");`,
     );
-    const { stdout } = await runWasm(path);
-    expect(stdout).toBe("Error SC1090\nafter\n");
+    const { stdout, stderr } = await runWasmToTrap(path);
+    expect(stdout).toBe("");
+    expect(stderr).toBe(S069_FENCE);
   });
   for (const [name, src] of [
     ["top level", `console.log("before");\nconsole.log(new Date("bogus 2020").getTime());\nconsole.log("after");`],
     ["inside a function", `function f(): number { return new Date("bogus 2020").getTime(); }\nconsole.log("before");\nconsole.log(f());\nconsole.log("after");`],
   ] as const) {
-    test(`uncaught ${name}: a loud uncaught Error, never a value or exit 0`, async () => {
+    test(`uncaught ${name}: the fence line, never a value or exit 0`, async () => {
       const path = await build(`fence-uncaught-${name.replace(/ /g, "-")}.ts`, src);
       await expect(runWasm(path)).rejects.toThrow();
       const { stdout, stderr } = await runWasmToTrap(path);
       expect(stdout).toBe("before\n");
-      expect(stderr).toMatch(/^Uncaught Error: date\.parseGetTime: this string is not one of the two modelled date formats/);
+      expect(stderr).toBe(S069_FENCE);
     });
   }
 });

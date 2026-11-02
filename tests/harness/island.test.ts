@@ -394,7 +394,7 @@ console.log(greet("world"), 6 * 7);
    * as the dyn boundary — SEMANTICS.md documents both under the headline
    * divergence). Valid casts live in the corpus (760–764). */
 
-  test("a lying primitive exit throws a catchable TypeError naming both types", async () => {
+  test("a lying primitive exit ends the program naming both types, even inside try/catch (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "any-lying-primitive",
       `const s: any = "abc";
@@ -409,11 +409,11 @@ console.log("unreachable", direct);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("caught\n");
-    expect(r.stderr).toContain("TypeError: expected number, got string");
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: expected number, got string [SC1100]\n");
   });
 
-  test("a composite exit inherits dynCheck's path-annotated failures", async () => {
+  test("a composite exit inherits dynCheck's path-annotated fence (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "any-lying-record",
       `const r = JSON.parse('{"a":1,"b":2}') as { a: number; b: string };
@@ -421,11 +421,11 @@ console.log("unreachable", r.b);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("TypeError");
-    expect(r.stderr).toContain("$.b"); // the dynCheck walker's path
+    // the dynCheck walker's path
+    expect(r.stderr).toBe("tsinter: unsupported: expected string at $.b, got number [SC1100]\n");
   });
 
-  test("an implicit exit at a typed slot validates exactly like an explicit cast", async () => {
+  test("an implicit exit at a typed slot validates exactly like an explicit cast — a mismatch ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "any-implicit-exit",
       `function takes(n: number): number {
@@ -441,30 +441,35 @@ try {
 }
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("42\nimplicit exit caught\n");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("42\n");
+    expect(r.stderr).toBe("tsinter: unsupported: expected number, got string [SC1100]\n");
   });
 
-  test("island values survive the RC audit through churn and try/catch unwinds", async () => {
+  test("island values survive the RC audit through churn; a failing exit inside try ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
     const r = await compileAndRun(
       "any-churn-unwind",
-      `let recovered = 0;
+      `let total = 0;
 for (let i = 0; i < 300; i = i + 1) {
   const v: any = { n: i, s: \`x\${i}\` };
-  try {
-    // A fresh island copy (S115 (d)); s is a string: throws.
-    const bad = JSON.parse(JSON.stringify(v)) as { n: number; s: number };
-    console.log("unreachable", bad.n);
-  } catch {
-    recovered = recovered + 1;
-  }
+  // A fresh island copy (S115 (d)) that fits: churn without failures.
+  const ok = JSON.parse(JSON.stringify(v)) as { n: number; s: string };
+  total = total + ok.n;
 }
-console.log(recovered);
+console.log(total);
+const w: any = { n: 1, s: "x" };
+try {
+  // s is a string: the check ends the program, the catch never runs.
+  const bad = JSON.parse(JSON.stringify(w)) as { n: number; s: number };
+  console.log("unreachable", bad.n);
+} catch {
+  console.log("caught");
+}
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("300\n");
-    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("44850\n");
+    expect(r.stderr).toBe("tsinter: unsupported: expected number at $.s, got string [SC1100]\n");
   });
 
   /* ── the island-backed ambient surface (Math, methods, globals) ───────
@@ -472,7 +477,7 @@ console.log(recovered);
    * behavior Node cannot oracle: the `.at()` undefined-refusal divergence
    * and the fiber re-anchor for surface calls inside async bodies. */
 
-  test("out-of-range .at() throws a catchable TypeError instead of returning undefined", async () => {
+  test("out-of-range .at() ends the program instead of returning undefined, even inside try/catch (GH #86 review, SEMANTICS.md S122)", async () => {
     // `at` is declared returning `string` (undefined is unrepresentable);
     // out of range the engine yields undefined and the validated exit
     // refuses it — strictly, catchably — where Node would hand back
@@ -492,8 +497,8 @@ console.log("unreachable", direct);
 `,
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("in range b c\ncaught\n");
-    expect(r.stderr).toContain("TypeError: expected string, got undefined");
+    expect(r.stdout).toBe("in range b c\n");
+    expect(r.stderr).toBe("tsinter: unsupported: expected string, got undefined [SC1100]\n");
   });
 
   test("island-backed calls re-anchor the engine on fibers (an engine call after await)", async () => {
@@ -516,12 +521,12 @@ main();
     expect(r.stderr).toBe("");
   });
 
-  test("a typed record crossing into an 'any' binding is a live view (unit H)", async () => {
+  test("a typed record crossing into an 'any' binding is a live view (unit H); a write that does not fit ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
     // In Node `const d: any = point` aliases; a typed record crosses the
     // boundary as a live VIEW of the static record (SEMANTICS.md S115), so
     // writes through either side are seen through the other — Node's
-    // "3 3" — and a write that does not fit the declared type throws by
-    // name.
+    // "3 3" — and a write that does not fit the declared type ends the
+    // program at its named fence (the catch never runs).
     const r = await compileAndRun(
       "any-view-alias",
       `const point = { x: 1.5 };
@@ -531,9 +536,10 @@ console.log(\`\${d.x}\`, point.x);
 try { d.x = "no"; } catch (e) { console.log((e as Error).message); }
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe(
-      "3 3\nCannot store string into the 'x' field of a '{ x: number }' shared from typed code (it holds numbers only — SEMANTICS.md S115)\n",
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("3 3\n");
+    expect(r.stderr).toBe(
+      "tsinter: unsupported: Cannot store a value that is not a number into the 'x' field of a '{ x: number }' shared from typed code (it holds numbers only — SEMANTICS.md S115) [SC1090 at a write from dynamic code]\n",
     );
   });
 

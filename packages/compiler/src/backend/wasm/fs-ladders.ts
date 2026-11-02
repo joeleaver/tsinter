@@ -61,6 +61,12 @@ import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, OBJ_LEN, OBJ_ENTRIES, ENTRY_KEY, ENTRY_VALUE, BYTES_PAYLOAD_REF } from "./dyn.js";
 
 export interface FsLaddersDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   strRef: () => ValType;
   strType: () => number;
   dynRef: () => ValType;
@@ -618,7 +624,7 @@ export class FsLaddersBuilder {
       c.return_();
       c.end();
 
-      this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+      this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
       this.mb.setBody(idx, [I32], c.bytes());
     });
   }
@@ -795,7 +801,7 @@ export class FsLaddersBuilder {
       c.i32Ne();
       c.i32Or();
       c.ifVoid();
-      this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+      this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
       c.refNull(this.deps.strType());
       c.return_();
       c.end();
@@ -854,7 +860,7 @@ export class FsLaddersBuilder {
         c.return_();
         c.end();
 
-        this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+        this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
         this.mb.setBody(idx, [I32], c.bytes());
       },
     );
@@ -892,7 +898,7 @@ export class FsLaddersBuilder {
       c.return_();
       c.end();
 
-      this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+      this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
       this.mb.setBody(idx, [I32], c.bytes());
     });
   }
@@ -932,7 +938,7 @@ export class FsLaddersBuilder {
       c.return_();
       c.end();
 
-      this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+      this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
       this.mb.setBody(idx, [I32], c.bytes());
     });
   }
@@ -1091,7 +1097,7 @@ export class FsLaddersBuilder {
       c.end();
       c.end();
 
-      this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+      this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
       this.mb.setBody(idx, [I32, I32, this.deps.dynRef(), F64], c.bytes());
     });
   }
@@ -1278,7 +1284,7 @@ export class FsLaddersBuilder {
         c.end();
         c.end();
 
-        this.deps.setCellError(c, "%Error", "Error", (cc) => cc.localGet(FENCE), null);
+        this.deps.fence(c, (cc) => cc.localGet(FENCE), "");
         this.mb.setBody(idx, [F64, F64, I32, F64, F64], c.bytes());
       },
     );

@@ -64,8 +64,11 @@ test("finished() on an emitClose:false Readable traps loudly by name, not a sile
   // ever fired from) is scheduled only when RS_EMIT_CLOSE is true
   // (destroyErrDefaultCore's own pre-existing gate) — a stream
   // constructed with emitClose:false would register a watcher that
-  // could NEVER fire, silently. Now: a named runtime trap at
+  // could NEVER fire, silently. Now: a named runtime fence at
   // registration time, the callback (finRegisterCbCore) entry point.
+  // GH #86 (SEMANTICS.md S122): the fence ends the program AT the
+  // finished() call — it used to be a deferred uncaught report that let
+  // the rest of the synchronous code ('sync') run first.
   const path = await build("emitclose-cb.ts", [
     "import { Readable, finished } from 'node:stream';",
     "const r = new Readable({ read() { this.push(null); }, emitClose: false });",
@@ -74,8 +77,8 @@ test("finished() on an emitClose:false Readable traps loudly by name, not a sile
     "console.log('sync');",
   ]);
   const { stdout, stderr } = await runWasmToTrap(path);
-  expect(stdout).toBe(["sync", ""].join("\n"));
-  expect(stderr).toBe("Uncaught Error: finished()/eos() on a stream constructed with emitClose:false is not supported yet\n");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: finished()/eos() on a stream constructed with emitClose:false is not supported yet [SC1090]\n");
 });
 
 test("stream/promises.finished() on an emitClose:false Writable ALSO traps loudly (gate finding v4: the promise entry point hangs identically)", async () => {
@@ -106,7 +109,7 @@ test("stream/promises.finished() on an emitClose:false Writable ALSO traps loudl
   ]);
   const { stdout, stderr } = await runWasmToTrap(path);
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: finished()/eos() on a stream constructed with emitClose:false is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: finished()/eos() on a stream constructed with emitClose:false is not supported yet [SC1090]\n");
 });
 
 test("finished() on a Duplex held through a Readable-typed binding still watches BOTH sides (F0b, reviewer probe n2 — SAME-branch upcast, expressible and observable today)", async () => {

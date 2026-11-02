@@ -626,13 +626,12 @@ export function emitStmt(E: CEmitter, s: IrStmt): void {
         break;
       }
       case "runtimeFence": {
-        // The deferred JS compile fence: throw a catchable Error naming
-        // the construct (message) with the SC code stamped on `code`,
-        // then unwind exactly like `throw`.
+        // The deferred JS compile fence (GH #86): ENDS the program with its
+        // rendered diagnostic on stderr — scr_fence_fatal never returns, so
+        // no user code catches it. The unwind after it is dead code that
+        // keeps the function's control flow shaped like a throw's.
         const bytes = Buffer.from(s.message, "utf8");
-        E.line(
-          `scr_throw_error_msg_code(SCR_ERR_ERROR, ${cStringLiteral(bytes)}, ${bytes.length}, "${s.code}");${E.srcComment(s.loc)}`,
-        );
+        E.line(`scr_fence_fatal(${cStringLiteral(bytes)}, ${bytes.length});${E.srcComment(s.loc)}`);
         E.emitUnwind();
         break;
       }

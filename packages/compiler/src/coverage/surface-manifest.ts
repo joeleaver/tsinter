@@ -302,7 +302,9 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
         kind: "node-builtin",
         name: `${mod}.${member}`,
         status: "static",
-        note: "constant value read",
+        note: (mod === "os" && member === "EOL") || (mod === "path" && (member === "sep" || member === "delimiter"))
+          ? "constant value read; the host OS's value on the wasm and wasm-native lanes (SEMANTICS.md S118)"
+          : "constant value read",
       });
     }
   }

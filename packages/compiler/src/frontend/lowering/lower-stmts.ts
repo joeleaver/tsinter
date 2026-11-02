@@ -5,7 +5,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, holeFencedArray, mayHoldSlotUndef, undefinedAsAbsent, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -229,6 +229,136 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
     }
     return out;
   }
+
+/** GH #86 review: V8's TypeError text for destructuring a nullish value
+ * (Node v24.18.1, measured): `const { a } = o` → "Cannot destructure
+ * property 'a' of 'o' as it is undefined.", an empty / rest-first /
+ * computed-first pattern → "Cannot destructure 'o' as it is undefined.",
+ * a first element with a default → "Cannot read properties of undefined
+ * (reading 'a')", `const [a] = o` → "o is not iterable". The source
+ * expression renders as V8's CallPrinter does for the shapes handled here
+ * — an identifier, `this`, a property-access chain of those, and a call
+ * of one (`f(...)`); null for anything else (the caller keeps the fence). */
+/** Unit U (SEMANTICS.md S119): `isUndef(read)` → V8's destructuring
+ * TypeError `msg`, or a named fence where its text is not known here. */
+function undefDestrCheck(read: IrExpr, msg: string | null, loc: SrcLoc): IrStmt {
+  return {
+    kind: "if",
+    cond: { kind: "isUndef", operand: read, type: BOOL, loc },
+    then: [msg !== null
+      ? { kind: "throw", value: { kind: "libCall", fn: "error.new", args: [{ kind: "strLit", value: msg, type: STRING, loc }], type: { kind: "object", className: "%TypeError" }, loc }, loc }
+      : { kind: "runtimeFence", code: "SC1031", message: "destructuring a value holding undefined (Node throws a catchable TypeError naming the source, which this tier does not spell here — SEMANTICS.md S119 (a))", loc }],
+    else_: null,
+    loc,
+  };
+}
+
+/** undefDestrCheck in expression position (a destructuring assignment is
+ * an expression): an interned helper over the source. */
+function undefDestrGuard(L: Lowerer, init: IrExpr, msg: string | null, loc: SrcLoc): IrExpr {
+  const t = init.type;
+  const key = `undefdestr:${typeKey(t)}:${msg ?? "\0"}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%undef.recv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body: [undefDestrCheck(x, msg, loc), { kind: "return", value: x, loc }],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [init], type: t, loc };
+}
+
+function renderDestrSource(e: ts.Expression): string | null {
+  const render = renderDestrSource;
+    // `!` and `as` erase before V8 ever sees the source
+    if (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e) || ts.isAsExpression(e)) return render(e.expression);
+    if (ts.isConditionalExpression(e)) return "(intermediate value)(intermediate value)(intermediate value)";
+    if (ts.isIdentifier(e)) return e.text;
+    if (e.kind === ts.SyntaxKind.ThisKeyword) return "this";
+    if (e.kind === ts.SyntaxKind.NullKeyword) return "null";
+    if (ts.isPropertyAccessExpression(e) && !e.questionDotToken && ts.isIdentifier(e.name)) {
+      const base = render(e.expression);
+      return base === null || base.endsWith("(...)") ? null : `${base}.${e.name.text}`;
+    }
+    // V8 prints a string-literal element access as a member: o["p"] is o.p
+    if (ts.isElementAccessExpression(e) && !e.questionDotToken && ts.isStringLiteral(e.argumentExpression)) {
+      const base = render(e.expression);
+      return base === null || base.endsWith("(...)") ? null : `${base}.${e.argumentExpression.text}`;
+    }
+    // ...and any other key as it is spelled: o[0], o[k]
+    if (ts.isElementAccessExpression(e) && !e.questionDotToken && (ts.isNumericLiteral(e.argumentExpression) || ts.isIdentifier(e.argumentExpression))) {
+      const base = render(e.expression);
+      return base === null || base.endsWith("(...)") ? null : `${base}[${e.argumentExpression.getText()}]`;
+    }
+    if (ts.isCallExpression(e) && !e.questionDotToken) {
+      const callee = render(e.expression);
+      return callee === null || callee.endsWith("(...)") ? null : `${callee}(...)`;
+    }
+    return null;
+}
+
+function destructureNullishMessage(decl: ts.VariableDeclaration, unit: "undefined" | "null"): string | null {
+  const render = renderDestrSource;
+  const init = decl.initializer;
+  if (init === undefined) return null;
+  const pat = decl.name;
+  if (ts.isArrayBindingPattern(pat)) {
+    let e: ts.Expression = init;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    return ts.isIdentifier(e) ? `${e.text} is not iterable` : null;
+  }
+  if (!ts.isObjectBindingPattern(pat)) return null;
+  const src = render(init);
+  if (src === null) return null;
+  return destructurePatternMessage(pat, src, unit);
+}
+
+/** The text for an object pattern over a nullish source V8 spells `src`. */
+function destructurePatternMessage(pat: ts.ObjectBindingPattern, src: string, unit: "undefined" | "null"): string | null {
+  const first = pat.elements[0];
+  if (first === undefined || first.dotDotDotToken !== undefined) return `Cannot destructure '${src}' as it is ${unit}.`;
+  const keyNode = first.propertyName ?? first.name;
+  if (keyNode === undefined) return null;
+  let key: string | null = null;
+  if (ts.isIdentifier(keyNode)) key = keyNode.text;
+  else if (ts.isStringLiteral(keyNode)) key = keyNode.text;
+  else if (ts.isComputedPropertyName(keyNode)) return `Cannot destructure '${src}' as it is ${unit}.`;
+  if (key === null) return null;
+  if (first.initializer !== undefined) return `Cannot read properties of ${unit} (reading '${key}')`;
+  return `Cannot destructure property '${key}' of '${src}' as it is ${unit}.`;
+}
+
+/** GH #86 review: an object-pattern PARAMETER over a nullish argument
+ * throws V8's destructuring TypeError in the prologue, before any member
+ * read — V8 spells the source by value there: 'undefined', 'object null'. */
+export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern, srcRef: () => IrExpr, srcType: IrType, out: IrStmt[]): void {
+  if (!L.undefSlots) return;
+  const loc = locOf(pattern);
+  const thrower = (msg: string): IrStmt[] => [{
+    kind: "throw",
+    value: { kind: "libCall", fn: "error.new", args: [{ kind: "strLit", value: msg, type: STRING, loc }], type: { kind: "object", className: "%TypeError" }, loc },
+    loc,
+  }];
+  if (srcType.kind === "dyn") {
+    const u = destructurePatternMessage(pattern, "undefined", "undefined");
+    const n = destructurePatternMessage(pattern, "object null", "null");
+    if (u === null || n === null) return;
+    out.push({ kind: "if", cond: { kind: "dynTest", test: "undefined", value: srcRef(), type: BOOL, loc }, then: thrower(u), else_: null, loc });
+    out.push({ kind: "if", cond: { kind: "dynTest", test: "null", value: srcRef(), type: BOOL, loc }, then: thrower(n), else_: null, loc });
+    return;
+  }
+  if ((srcType.kind === "record" || srcType.kind === "object") && mayHoldSlotUndef(L, srcRef())) {
+    const u = destructurePatternMessage(pattern, "undefined", "undefined");
+    if (u !== null) out.push({ kind: "if", cond: { kind: "isUndef", operand: srcRef(), type: BOOL, loc }, then: thrower(u), else_: null, loc });
+  }
+}
 
 /** The TDZ kinds: pointer-backed representations, where the box's empty
    * NULL slot IS the not-yet-initialized sentinel — plus the scalars
@@ -1211,9 +1341,37 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         const utmp = L.declareHiddenLocal("%destrU", init.type);
         out.push({ kind: "varDecl", localId: utmp.id, init, loc });
         const uref: IrExpr = { kind: "varRef", localId: utmp.id, type: init.type, loc };
+        // GH #86 review: Node throws a TypeError here — V8's own text, for
+        // the patterns and source expressions whose rendering is known
+        // (destructureNullishMessage), catchable; any other shape keeps the
+        // fence (its text would not be Node's).
+        const unionId = init.type.unionId;
+        for (const unit of ["undefined", "null"] as const) {
+          const unitTag = def.arms.findIndex((a) => a.kind === (unit === "undefined" ? "undefinedT" : "nullT"));
+          if (unitTag < 0) continue;
+          const msg = destructureNullishMessage(decl, unit);
+          if (msg === null) continue;
+          out.push({
+            kind: "if",
+            cond: { kind: "unionIsTag", unionId, tag: unitTag, negated: false, value: uref, type: BOOL, loc },
+            then: [{
+              kind: "throw",
+              value: {
+                kind: "libCall",
+                fn: "error.new",
+                args: [{ kind: "strLit", value: msg, type: STRING, loc }],
+                type: { kind: "object", className: "%TypeError" },
+                loc,
+              },
+              loc,
+            }],
+            else_: null,
+            loc,
+          });
+        }
         out.push({
           kind: "if",
-          cond: { kind: "unionIsTag", unionId: init.type.unionId, tag, negated: true, value: uref, type: BOOL, loc },
+          cond: { kind: "unionIsTag", unionId, tag, negated: true, value: uref, type: BOOL, loc },
           then: [{
             kind: "runtimeFence",
             code: "SC1031",
@@ -1224,6 +1382,42 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           loc,
         });
         init = { kind: "unionNarrow", unionId: init.type.unionId, tag, value: uref, type: arm, loc };
+      }
+    }
+    // GH #86 review: a checked-dynamic source holding undefined or null —
+    // Node's own destructuring TypeError (V8's text, where the pattern and
+    // source shapes render), before any member read could throw the
+    // member-read text instead. Other shapes keep the member reads' path.
+    if (isJsSourceFile(decl.getSourceFile()) && isUnitType(init.type) && ts.isObjectBindingPattern(decl.name)) {
+      init = L.coerceToExpected(init, DYN); // `const { a } = undefined`
+    }
+    if (isJsSourceFile(decl.getSourceFile()) && init.type.kind === "dyn") {
+      const msgU = destructureNullishMessage(decl, "undefined");
+      const msgN = destructureNullishMessage(decl, "null");
+      if (msgU !== null && msgN !== null) {
+        const dtmp = L.declareHiddenLocal("%destrD", init.type);
+        out.push({ kind: "varDecl", localId: dtmp.id, init, loc });
+        const dref: IrExpr = { kind: "varRef", localId: dtmp.id, type: init.type, loc };
+        for (const [test, msg] of [["undefined", msgU], ["null", msgN]] as const) {
+          out.push({
+            kind: "if",
+            cond: { kind: "dynTest", test, value: dref, type: BOOL, loc },
+            then: [{
+              kind: "throw",
+              value: {
+                kind: "libCall",
+                fn: "error.new",
+                args: [{ kind: "strLit", value: msg, type: STRING, loc }],
+                type: { kind: "object", className: "%TypeError" },
+                loc,
+              },
+              loc,
+            }],
+            else_: null,
+            loc,
+          });
+        }
+        init = dref;
       }
     }
     // `const { groups } = re.exec(s)!` / `const { groups: { year } } = m`
@@ -1266,6 +1460,12 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     }
     const tmp = L.declareHiddenLocal("%destr", init.type);
     out.push({ kind: "varDecl", localId: tmp.id, init, loc });
+    // Unit U (SEMANTICS.md S119): a record or class slot holding undefined
+    // throws V8's destructuring text; a source V8's text does not spell
+    // here meets a named fence, never the member read's text.
+    if (ts.isObjectBindingPattern(decl.name) && (init.type.kind === "record" || init.type.kind === "object") && mayHoldSlotUndef(L, init)) {
+      out.push(undefDestrCheck({ kind: "varRef", localId: tmp.id, type: init.type, loc }, destructureNullishMessage(decl, "undefined"), loc));
+    }
     // V8's destructuring TypeError spells STATIC sources: an identifier
     // source reads "<name> is not iterable", an identifier-callee call
     // "<name> is not a function or its return value is not iterable";
@@ -1298,6 +1498,30 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     out: IrStmt[],
     dynSpell?: string,): void {
     if (ts.isArrayBindingPattern(pattern)) {
+      // Unit U (SEMANTICS.md S119 (a)): a string or array source holding
+      // its slot's undefined is not iterable — V8's destructuring TypeError
+      // (the identifier's spelling, else the runtime-kind wording) before
+      // any position binds.
+      if (L.undefSlots && (srcType.kind === "string" || srcType.kind === "array") && mayHoldSlotUndef(L, srcRef())) {
+        const loc = locOf(pattern);
+        out.push({
+          kind: "if",
+          cond: { kind: "isUndef", operand: srcRef(), type: BOOL, loc },
+          then: [{
+            kind: "throw",
+            value: {
+              kind: "libCall",
+              fn: "error.new",
+              args: [{ kind: "strLit", value: dynSpell ?? "undefined is not iterable (cannot read property Symbol(Symbol.iterator))", type: STRING, loc }],
+              type: { kind: "object", className: "%TypeError" },
+              loc,
+            },
+            loc,
+          }],
+          else_: null,
+          loc,
+        });
+      }
       // Tuple sources: each position is a field read of the tuple's record
       // shape — the positional twin of object destructuring below.
       const tupleShape =
@@ -2315,6 +2539,28 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       });
       return undefArmDefault(L, blame, init, { kind: "varRef", localId: tmp.id, type: elemT, loc }, bodyT);
     }
+    // Unit U (SEMANTICS.md S119): on the WasmGC lanes an in-bounds
+    // plain-typed element can still hold undefined (a regex row's
+    // nonparticipating capture, a hole's gap) — the default fires for it
+    // too, as in JS.
+    if (L.undefSlots && mayHoldSlotUndef(L, read)) {
+      const tmp = L.declareHiddenLocal("%delem", elemT);
+      out.push({
+        kind: "varDecl",
+        localId: tmp.id,
+        init: { kind: "ternary", cond: inRange, then: read, else_: { kind: "slotUndef", type: elemT, loc }, type: elemT, loc },
+        loc,
+      });
+      const v: IrExpr = { kind: "varRef", localId: tmp.id, type: elemT, loc };
+      return {
+        kind: "ternary",
+        cond: { kind: "isUndef", operand: v, type: BOOL, loc },
+        then: L.lowerExprExpecting(init, bodyT),
+        else_: L.coerceInto(blame, v, bodyT),
+        type: bodyT,
+        loc,
+      };
+    }
     // No undefined arm in bounds: the default fires exactly past the end.
     return {
       kind: "ternary",
@@ -2435,7 +2681,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         kind: "recordLit",
         fields: rem.map((f) => ({
           name: f.name,
-          value: { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: f.name, type: f.type, loc } as IrExpr,
+          value: { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: f.name, spreadCopy: true, type: f.type, loc } as IrExpr,
         })),
         type: { kind: "record", shapeId: L.shapes.intern(rem.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) }))) },
         loc,
@@ -2461,7 +2707,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       if (!srcField) {
         L.unsupported("SC1031", el, `the rest field '${f.name}' the source's shape does not carry`);
       }
-      const read: IrExpr = { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: srcField.name, type: srcField.type, loc };
+      const read: IrExpr = { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: srcField.name, spreadCopy: true, type: srcField.type, loc };
       return { name: f.name, value: L.coerceInto(el, read, f.type) };
     });
     return { kind: "recordLit", fields, type: restT, loc };
@@ -4043,7 +4289,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     if (obj.type.kind === "record") {
       const shape = L.shapes.get(obj.type.shapeId);
       if (shape?.indexValue && shape.fields.length === 0 && !shape.tuple) {
-        return { kind: "recordKeyDelete", obj, shapeId: obj.type.shapeId, key: lowerKey(), loc };
+        return { kind: "recordKeyDelete", obj, shapeId: obj.type.shapeId, key: undefinedAsText(L, lowerKey(), locOf(expr)), loc };
       }
       // `delete r.f` of a declared OPTIONAL field (undefined-armed slot) is
       // the undefined-arm write: a monomorphic shape cannot remove its
@@ -5032,7 +5278,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       };
       value = L.coerceInto(expr, wrapped, target.type);
     } else if (compound === "+" && target.type.kind === "string") {
-      value = { kind: "strConcat", left: read, right: L.ensureString(rhs, expr.right), type: STRING, loc };
+      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, expr.right), type: STRING, loc }));
     } else if (target.type.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op: compound, left: read, right: rhs, type: F64, loc };
     } else if (
@@ -5326,6 +5572,19 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           );
         }
       }
+    }
+    // Unit U (SEMANTICS.md S119): `({ x } = r)` over a record or class slot
+    // holding undefined: V8's text, or a named fence.
+    if (ts.isObjectLiteralExpression(target) && (init.type.kind === "record" || init.type.kind === "object") && mayHoldSlotUndef(L, init)) {
+      const first = target.properties[0];
+      const src = rhs !== null ? renderDestrSource(rhs) : null;
+      let msg: string | null = null;
+      if (src !== null) {
+        if (first === undefined || ts.isSpreadAssignment(first)) msg = `Cannot destructure '${src}' as it is undefined.`;
+        else if (ts.isShorthandPropertyAssignment(first)) msg = first.objectAssignmentInitializer !== undefined ? `Cannot read properties of undefined (reading '${(first.name as ts.Identifier).text}')` : `Cannot destructure property '${(first.name as ts.Identifier).text}' of '${src}' as it is undefined.`;
+        else if (ts.isPropertyAssignment(first) && ts.isIdentifier(first.name)) msg = ts.isBinaryExpression(first.initializer) ? `Cannot read properties of undefined (reading '${first.name.text}')` : `Cannot destructure property '${first.name.text}' of '${src}' as it is undefined.`;
+      }
+      init = undefDestrGuard(L, init, msg, loc);
     }
     const tmp = L.declareHiddenLocal("%destr", init.type);
     const out: IrStmt[] = [{ kind: "varDecl", localId: tmp.id, init, loc }];
@@ -6165,7 +6424,93 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * specific diagnostics; other iterables fail on their types. The loop
    * variable is a fresh const binding per iteration (its own scope, like a
    * loop body). */
+  /** Unit U (SEMANTICS.md S119 (a)): `for (… of xs)` over a string or
+   * array slot that may hold its undefined throws Node's catchable
+   * `TypeError: <xs> is not iterable` (V8's spelling of the iterable) ahead
+   * of the loop. Checked when the iterable is a side-effect-free read
+   * (a binding, a member or literal-index chain of one), lowered once more
+   * for the test; anything else meets the backend's named fence. */
   export function lowerForOf(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
+    if (!L.undefSlots || stmt.awaitModifier) return lowerForOfImpl(L, stmt);
+    const k = L.mapTypeOf(L.typeOf(stmt.expression))?.kind;
+    if (k !== "array") return lowerForOfImpl(L, stmt); // strings: the desugar checks (notIterableCheck)
+    const pureSyntax = (n: ts.Expression): boolean => {
+      while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n)) n = n.expression;
+      if (ts.isIdentifier(n) || n.kind === ts.SyntaxKind.ThisKeyword) return true;
+      if (ts.isPropertyAccessExpression(n)) return !n.questionDotToken && pureSyntax(n.expression);
+      if (ts.isElementAccessExpression(n)) {
+        return !n.questionDotToken && pureSyntax(n.expression) && (ts.isNumericLiteral(n.argumentExpression) || ts.isIdentifier(n.argumentExpression));
+      }
+      return false;
+    };
+    const spelling = iterableSpelling(stmt.expression);
+    if (!pureSyntax(stmt.expression) || spelling === null) return lowerForOfImpl(L, stmt);
+    const probe = L.lowerExpr(stmt.expression);
+    if (!mayHoldSlotUndef(L, probe) || probe.type.kind !== "array") return lowerForOfImpl(L, stmt);
+    const check = notIterableCheck(probe, stmt.expression, locOf(stmt.expression));
+    const loop = lowerForOfImpl(L, stmt);
+    return { kind: "block", body: [check, loop], loc: locOf(stmt) };
+  }
+
+  /** Unit U: `if (x === undefined) throw TypeError(<V8's for-of text>)` for
+   * the evaluated iterable `x` of source `src` — "<x> is not iterable"
+   * (identifier, member and literal-index chains), "<f> is not a function
+   * or its return value is not iterable" (an identifier-callee call), a
+   * named fence otherwise. */
+  function notIterableCheck(x: IrExpr, src: ts.Expression, loc: SrcLoc): IrStmt {
+    let n = src;
+    while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n)) n = n.expression;
+    const spelled = iterableSpelling(n);
+    const text =
+      spelled !== null
+        ? `${spelled} is not iterable`
+        : ts.isCallExpression(n) && ts.isIdentifier(n.expression)
+          ? `${n.expression.text} is not a function or its return value is not iterable`
+          : null;
+    const fail: IrStmt =
+      text !== null
+        ? {
+            kind: "throw",
+            value: {
+              kind: "libCall",
+              fn: "error.new",
+              args: [{ kind: "strLit", value: text, type: STRING, loc }],
+              type: { kind: "object", className: "%TypeError" },
+              loc,
+            },
+            loc,
+          }
+        : {
+            kind: "runtimeFence",
+            code: "SC1090",
+            message: "for...of over a value holding undefined (Node throws a catchable TypeError: <the iterable> is not iterable — SEMANTICS.md S119 (a))",
+            loc,
+          };
+    return { kind: "if", cond: { kind: "isUndef", operand: x, type: BOOL, loc }, then: [fail], else_: null, loc };
+  }
+
+  /** V8's spelling of a simple iterable in "<x> is not iterable" — an
+   * identifier, `this`, member and literal/identifier-index chains of
+   * those; null for anything else. */
+  function iterableSpelling(e: ts.Expression): string | null {
+    let n = e;
+    while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n)) n = n.expression;
+    if (ts.isIdentifier(n)) return n.text;
+    if (n.kind === ts.SyntaxKind.ThisKeyword) return "this";
+    if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.name)) {
+      const b = iterableSpelling(n.expression);
+      return b === null ? null : `${b}.${n.name.text}`;
+    }
+    if (ts.isElementAccessExpression(n)) {
+      const b = iterableSpelling(n.expression);
+      const a = n.argumentExpression;
+      const k = ts.isNumericLiteral(a) ? a.getText() : ts.isIdentifier(a) ? a.text : null;
+      return b === null || k === null ? null : `${b}[${k}]`;
+    }
+    return null;
+  }
+
+  function lowerForOfImpl(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
     // Labels consume HERE (nested statements must never see them). The
     // plain array/string paths carry them; the container/matchAll/stdin
     // desugars drop them — a labeled jump naming those loops fences at the
@@ -6519,6 +6864,10 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         const loc = locOf(decl.name);
         const tmp = L.declareHiddenLocal("%destr", elemType);
         const binds: IrStmt[] = [];
+        // Unit U: V8 names a for-of's source '.for'
+        if (L.undefSlots && ts.isObjectBindingPattern(decl.name) && (elemType.kind === "record" || elemType.kind === "object")) {
+          binds.push(undefDestrCheck({ kind: "varRef", localId: tmp.id, type: elemType, loc }, destructurePatternMessage(decl.name, ".for", "undefined"), loc));
+        }
         L.lowerBindingPattern(
           decl.name,
           () => ({ kind: "varRef", localId: tmp.id, type: elemType, loc }),
@@ -7460,6 +7809,10 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         kind: "block",
         body: [
           { kind: "varDecl", localId: s.id, init: iterable, loc },
+          // Unit U (SEMANTICS.md S119 (a)): a string slot holding undefined
+          // is not iterable — V8's TypeError, spelled from the source
+          // (a named fence where V8's spelling is not modelled).
+          ...(L.undefSlots && mayHoldSlotUndef(L, iterable) ? [notIterableCheck(sRef(), stmt.expression, loc)] : []),
           { kind: "varDecl", localId: i.id, init: { kind: "numLit", value: 0, type: F64, loc }, loc },
           {
             kind: "while",

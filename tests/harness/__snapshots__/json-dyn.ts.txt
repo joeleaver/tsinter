@@ -5,7 +5,7 @@ json-dyn.ts:12:9 - error SC1100: switch statements on 'unknown' values are not s
      |         ^~~~~~~~~~~~~~~
   13 |   case 5:
 
-  hint: validate with 'as <type>' first — the cast checks the dynamic value at runtime and throws on mismatch
+  hint: validate with 'as <type>' first — the cast checks the dynamic value at runtime and a mismatch ends the program
 
 json-dyn.ts:21:35 - error SC1101: converting typed values to 'unknown' is not supported yet
 

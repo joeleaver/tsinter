@@ -3732,14 +3732,13 @@ class LlEmitter {
         break;
       }
       case "runtimeFence": {
-        // The deferred JS compile fence: throw a catchable Error naming
-        // the construct (message) with the SC code stamped on `code`,
-        // then unwind exactly like `throw`. SCR_ERR_ERROR = 0.
+        // The deferred JS compile fence (GH #86): ENDS the program with its
+        // rendered diagnostic on stderr — scr_fence_fatal never returns, so
+        // no user code catches it. The unwind after it is dead code that
+        // keeps the function's control flow shaped like a throw's.
         const bytes = Buffer.byteLength(s.message, "utf8");
-        this.declare(`declare void @scr_throw_error_msg_code(i32, ptr, i64, ptr)`);
-        B.line(
-          `call void @scr_throw_error_msg_code(i32 0, ptr ${this.cstr(s.message)}, i64 ${bytes}, ptr ${this.cstr(s.code)})`,
-        );
+        this.declare(`declare void @scr_fence_fatal(ptr, i64)`);
+        B.line(`call void @scr_fence_fatal(ptr ${this.cstr(s.message)}, i64 ${bytes})`);
         this.emitUnwind();
         break;
       }

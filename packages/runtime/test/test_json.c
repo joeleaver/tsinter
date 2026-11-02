@@ -60,8 +60,19 @@ static bool dyn_str_is(const ScrDyn *d, const char *want) {
   return d && d->kind == SCR_DYN_STR && str_is(d->v.str, want);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   scr_init();
+
+  /* ── dynCheck failure (GH #86 review, SEMANTICS.md S122): a check Node
+   * never makes ENDS the program — `test_json fail` runs only that path,
+   * which prints the fence line and exits 1 (json.test.ts pins it). ── */
+  if (argc > 1 && strcmp(argv[1], "fail") == 0) {
+    ScrDyn *got = parse_ok("\"nope\"", "fail-path operand");
+    ScrDynPath root = { NULL, "items", 0 };
+    ScrDynPath idx = { &root, NULL, 2 };
+    ScrDynPath leaf = { &idx, "price", 0 };
+    scr_dyn_check_fail(&leaf, "number", got);
+  }
 
   /* ── primitives ─────────────────────────────────────────────────── */
   ScrDyn *d = parse_ok("null", "parse null");
@@ -186,20 +197,6 @@ int main(void) {
     scr_str_release(t);
     check(too == NULL && scr_exc_pending(), "depth cap throws");
     if (scr_exc_pending()) scr_exc_print_uncaught();
-  }
-
-  /* ── dynCheck failure messages (the emitted builders' shared path) ── */
-  {
-    ScrDyn *got = parse_ok("\"nope\"", "fail-path operand");
-    ScrDynPath root = { NULL, "items", 0 };
-    ScrDynPath idx = { &root, NULL, 2 };
-    ScrDynPath leaf = { &idx, "price", 0 };
-    scr_dyn_check_fail(&leaf, "number", got);
-    check(scr_exc_pending(), "check_fail throws");
-    scr_exc_print_uncaught(); /* "TypeError: expected number at $.items[2].price, got string" */
-    scr_dyn_check_fail(NULL, "object", NULL);
-    scr_exc_print_uncaught(); /* "TypeError: expected object at $, got undefined" */
-    scr_dyn_release(got);
   }
 
   /* ── stringify buffer ───────────────────────────────────────────── */

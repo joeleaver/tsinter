@@ -136,6 +136,9 @@ export interface StrDeps {
    * accumulation, dyn.ts's own toStr() precedent: "the only string-
    * building primitive the tier has"). */
   concat: () => number;
+  /** GH #93: repeat's RangeErrors, left pending in the cell. */
+  repeatRange: (c: Code, countLocal: number) => void;
+  repeatTooLong: (c: Code) => void;
   /** INC-25 P5's fromCharCodeBytes: typedarrays.ts's own (bytes, f64
    * index) -> f64 element read (already widened/sign-extended per elem
    * kind — CP1 §10's enumeration, all four kinds validate.ts's `bytes`
@@ -963,10 +966,11 @@ export class StrBuilder {
     });
   }
 
-  /** %w.str.repeat — (s, f64 count) → str. Negative or +Infinity counts
-   * are the spec's RangeError → trap (S003 bridge); a result longer than
-   * V8's String::kMaxLength (ropes.ts MAX_STRING_LENGTH, Node's own
-   * RangeError threshold) traps too (S008). */
+  /** %w.str.repeat — (s, f64 count) → str. A negative or infinite count
+   * throws Node's RangeError ("Invalid count value: <count>"); a result
+   * longer than V8's String::kMaxLength (ropes.ts MAX_STRING_LENGTH) throws
+   * "Invalid string length" (GH #93). Both leave the exception pending and
+   * answer "": the caller checks. */
   repeat(): number {
     return this.cached("repeat", () => {
       const idx = this.mb.declareFunc(
@@ -974,22 +978,30 @@ export class StrBuilder {
         "%w.str.repeat",
       );
       const c = new Code();
-      const S = 0, X = 1, L = 2, N = 3, TOT = 4, K = 5, R = 6;
+      const S = 0, X = 1, L = 2, N = 3, TOT = 4, K = 5, R = 6, ORIG = 7;
       c.localGet(S);
       c.arrayLen();
       c.localSet(L);
+      c.localGet(X);
+      c.localSet(ORIG);
       this.emitToIntInf(c, X);
+      const bad = (): void => {
+        this.deps.repeatRange(c, ORIG);
+        c.i32Const(0);
+        c.arrayNewDefault(this.strType);
+        c.return_();
+      };
       c.localGet(X);
       c.f64Const(0);
       c.f64Lt();
       c.ifVoid();
-      c.unreachable(); // RangeError: Invalid count value
+      bad();
       c.end();
       c.localGet(X);
       c.f64Const(Number.POSITIVE_INFINITY);
       c.f64Eq();
       c.ifVoid();
-      c.unreachable(); // RangeError: Invalid count value
+      bad();
       c.end();
       // count 0 or the empty receiver → "" (BEFORE the size cap: a huge
       // finite count over "" is legal JS and returns "").
@@ -1015,7 +1027,10 @@ export class StrBuilder {
       c.f64Const(MAX_STRING_LENGTH);
       c.f64Gt();
       c.ifVoid();
-      c.unreachable(); // past V8's String::kMaxLength — RangeError's trap (S008)
+      this.deps.repeatTooLong(c);
+      c.i32Const(0);
+      c.arrayNewDefault(this.strType);
+      c.return_();
       c.end();
       c.localGet(X);
       c.i32TruncF64S();
@@ -1051,7 +1066,7 @@ export class StrBuilder {
       c.end();
       c.end();
       c.localGet(R);
-      this.mb.setBody(idx, [I32, I32, I32, I32, this.strRef()], c.bytes());
+      this.mb.setBody(idx, [I32, I32, I32, I32, this.strRef(), F64], c.bytes());
       return idx;
     });
   }

@@ -204,6 +204,12 @@ const E_N = 3;
 type Env = { a: number; b: number; n: number };
 
 export interface TlsDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   net: () => NetBuilder;
   strRef: () => ValType;
   strType: () => number;
@@ -442,9 +448,10 @@ export class TlsBuilder {
     this.err($, cls, msg, code)();
     this.deps.throwStack($.c);
   }
-  /** A named fence: "<what> is not supported yet". */
+  /** A named fence: "<what> is not supported yet" — ends the program
+   * (GH #86). */
   private fence($: A, what: X): void {
-    this.throwErr($, "%Error", this.cat($, what, this.lit($, " is not supported yet")), null);
+    this.deps.fence($.c, () => this.cat($, what, this.lit($, " is not supported yet"))());
   }
   /** ERR_INVALID_ARG_TYPE: `The "<name>" property|argument must be <expected>. Received ...` */
   private argType($: A, name: string, expected: string, d: X): void {

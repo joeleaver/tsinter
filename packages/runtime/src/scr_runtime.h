@@ -519,6 +519,12 @@ void scr_undef_global_read(ScrStr *name);
 void scr_error_set_code(ScrError *e, const char *code);
 ScrStr *scr_error_code(ScrError *e);
 void scr_throw_error_msg_code(int kind, const char *message, size_t len, const char *code);
+/* GH #86: a RUNTIME FENCE (a construct this build cannot run, reached)
+ * ends the program: stdout is settled, `tsinter: unsupported: <msg>` goes
+ * to stderr, and the process exits 1 with no unwinding — no catch, finally,
+ * promise reaction or exit listener runs after it. A library build routes
+ * the same line through the trap funnel. Borrows msg. */
+_Noreturn void scr_fence_fatal(const char *msg, size_t len);
 /* The compiler-resolved Node-parity throw (error.nodeThrow): builtin
  * error of `kind`, `code` stamped when non-empty. Borrows both. */
 void scr_throw_node_coded(double kind, const ScrStr *code, const ScrStr *msg);
@@ -3241,12 +3247,11 @@ typedef struct ScrDynPath {
   size_t index;
 } ScrDynPath;
 
-/* The dynCheck failure path: builds "TypeError: expected <want> at <path>,
- * got <kind>" (got == NULL renders as "undefined" — a missing object
- * member) and THROWS it through the exception cell (catchable; uncaught it
- * prints as "Uncaught TypeError: ..." and exits 1). This is
- * scriptc-specific behavior — JS `as` never checks (SEMANTICS.md). */
-void scr_dyn_check_fail(const ScrDynPath *path, const char *want, const ScrDyn *got);
+/* The dynCheck failure path: builds "expected <want> at <path>, got <kind>
+ * [SC1100]" (got == NULL renders as "undefined" — a missing object member)
+ * and ENDS the program at that fence (scr_fence_fatal — GH #86 review,
+ * SEMANTICS.md S122: JS `as` never checks, so nothing may catch it). */
+_Noreturn void scr_dyn_check_fail(const ScrDynPath *path, const char *want, const ScrDyn *got);
 
 /* ── native handles in the checked-dynamic tree (SCR_DYN_HANDLE) ────────────────────────
  * Per-tag dispatch ops, registered by the handle's owning unit
@@ -3497,8 +3502,9 @@ void scr_dyn_arg_value_fail(const char *name, const char *reason, const ScrDyn *
 /* The ERR_INVALID_ARG_VALUE/%j "Received" renderer (inspect-lite:
  * strings quote, scalars print plain, deep shapes sketch). */
 const char *scr_dyn_inspect_lite(const ScrDyn *v, char *buf, size_t cap);
-/* A ladder's post-validation refuse: throws the compiler-rendered SC2020
- * statement-fence text verbatim (Node's validation errors run first). */
+/* A ladder's post-validation refuse: ends the program at the compiler-
+ * rendered SC2020 statement-fence text (scr_fence_fatal, GH #86) — Node's
+ * validation errors run first. */
 void scr_throw_lowering_fence(const ScrStr *msg);
 /* ERR_OUT_OF_RANGE's "Received" number rendering (Node's
  * addNumericalSeparator underscores past 2^32) — scr_bytes.c's renderer,

@@ -6292,6 +6292,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "path.hostRelative":
           case "path.hostToNamespacedPath":
           case "os.hostChoice":
+          case "undef.fieldAbsent":
+          case "dyn.argStr":
           case "stream.hostDefaultHwm":
           case "url.pathToFileURLHost":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);

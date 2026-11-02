@@ -115,6 +115,12 @@ export function alsBlockedFamily(fn: string): string | null {
 }
 
 export interface DcDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   strRef: () => ValType;
   strType: () => number;
   lit: (c: Code, s: string) => void;
@@ -528,14 +534,37 @@ export class DcBuilder {
       c.ifVoid();
       pair((x) => this.deps.lit(x, "#<Object>"), "an object");
       c.else_();
-      this.deps.setCellError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.deps.lit(x, "calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet"),
-        null,
-      );
+      // GH #86 review: the kinds whose V8 rendering this tier can spell
+      // throw Node's TypeError too — a Uint8Array/Buffer, a promise, and
+      // an error (Error.prototype.toString's "name: message").
+      is(DK.BYTES);
+      c.ifVoid();
+      pair((x) => this.deps.lit(x, "[object Uint8Array]"), "an object");
+      c.else_();
+      is(DK.PROMISE);
+      c.ifVoid();
+      pair((x) => this.deps.lit(x, "#<Promise>"), "an object");
+      c.else_();
+      is(DK.OBJ);
+      c.ifResult(I32);
+      c.localGet(V);
+      c.call(this.dyn.isError());
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.ifVoid();
+      pair((x) => {
+        x.localGet(V);
+        x.call(this.dyn.toStr());
+      }, "an object");
+      c.else_();
+      // a class instance (#<Name>), a handle, a null-prototype object …:
+      // V8 names the constructor, which this tier does not carry
+      this.deps.fence(c, (x) => this.deps.lit(x, "calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet"));
       c.return_();
+      c.end();
+      c.end();
+      c.end();
       c.end();
       for (let i = 0; i < 6; i++) c.end();
       this.deps.setCellError(
@@ -1562,7 +1591,7 @@ export class DcBuilder {
     c.i32Const(DK.FUNC);
     c.i32Eq();
     c.ifVoid();
-    this.deps.setCellError(c, "%Error", "Error", (x) => this.deps.lit(x, message), null);
+    this.deps.fence(c, (x) => this.deps.lit(x, message));
     this.nullDyn(c);
     c.return_();
     c.end();
@@ -1943,13 +1972,7 @@ export class DcBuilder {
         c.i32Const(DK.PROMISE);
         c.i32Ne();
         c.ifVoid();
-        this.deps.setCellError(
-          c,
-          "%Error",
-          "Error",
-          (x) => this.deps.lit(x, "tracePromise without subscribers over a function returning a non-promise is not supported yet"),
-          null,
-        );
+        this.deps.fence(c, (x) => this.deps.lit(x, "tracePromise without subscribers over a function returning a non-promise is not supported yet"));
         nullP(c);
         c.return_();
         c.end();

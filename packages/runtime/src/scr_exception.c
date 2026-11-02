@@ -35,6 +35,28 @@ _Noreturn void scr_trap_fmt(const char *fmt, ...) {
 }
 #endif /* !SCR_LIB */
 
+/* GH #86 (scr_runtime.h): the runtime fence's end of the program. */
+_Noreturn void scr_fence_fatal(const char *msg, size_t len) {
+  static const char prefix[] = "tsinter: unsupported: ";
+#ifdef SCR_LIB
+  static char buf[1024];
+  size_t n = sizeof prefix - 1;
+  memcpy(buf, prefix, n);
+  size_t take = len > sizeof buf - n - 1 ? sizeof buf - n - 1 : len;
+  memcpy(buf + n, msg, take);
+  n += take;
+  buf[n++] = '\n';
+  scr_trap_len(buf, n);
+#else
+  fflush(stdout);
+  fputs(prefix, stderr);
+  fwrite(msg, 1, len, stderr);
+  fputc('\n', stderr);
+  fflush(stderr);
+  _Exit(1);
+#endif
+}
+
 static ScrExcCell scr_main_exc; /* fiber zero (the main stack) */
 static ScrExcCell *scr_cur = &scr_main_exc;
 

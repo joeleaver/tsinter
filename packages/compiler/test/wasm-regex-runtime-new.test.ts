@@ -8,8 +8,8 @@
  *
  * wasm-regex-runtime-compiler.test.ts holds the compiler itself to the
  * build-time pipeline and to Node over the whole pattern pool; these rows
- * prove the wiring: the call site's throw (SyntaxError or the named
- * Error, catchable), the value's use by every regex operation, the
+ * prove the wiring: the call site's throw (V8's catchable SyntaxError, or
+ * the named fence that ends the program — GH #86, S122), the value's use by every regex operation, the
  * island boundary, and the build-time fixes made alongside. */
 import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -91,41 +91,70 @@ test("RTN-02 an invalid run-time pattern or flags string throws V8's SyntaxError
   expect(wasm).toBe(node);
 });
 
-test("RTN-03 a run-time pattern outside the tier throws a named Error carrying the refusal key", async () => {
-  const { wasm, node } = await both(
-    "rtn03",
+// GH #86 (SEMANTICS.md S122): the S102 fence ENDS the program — stderr
+// `tsinter: unsupported: <message> [<key>]`, exit 1 — so a program's own
+// try/catch no longer sees it. One program per key, each pinning its text.
+const RTN03_ROWS: [string, string, string][] = [
+  ["a", "iu", "unicode-casefold"],
+  ["a", "v", "unicode-sets-flag"],
+  ["(?i:a)", "", "modifiers"],
+  ["a]", "", "annexb-extended-pattern-char"],
+  ["\\\\p{Script=Greek}", "u", "unported-unicode-property"],
+  ["a{2", "", "annexb-brace-literal"],
+  ["[\\\\d-z]", "", "annexb-class-range-escape"],
+  ["' + 'x'.repeat(9000) + '", "", "pattern-too-large"],
+];
+
+test("RTN-03 Node builds every pattern the tier fences", () => {
+  const entry = join(scratch, "rtn03-node.ts");
+  const rows = RTN03_ROWS.map(([p, f]) => `['${p}', '${f}']`).join(", ");
+  return writeFile(
+    entry,
     MK +
       [
-        "const rows: [string, string][] = [['a', 'iu'], ['a', 'v'], ['(?i:a)', ''], ['a]', ''], ['\\\\p{Script=Greek}', 'u'], ['a{2', ''], ['[\\\\d-z]', ''], ['x'.repeat(9000), '']];",
+        `const rows: [string, string][] = [${rows}];`,
         "for (const [p, f] of rows) {",
-        "  try {",
-        "    const r = mk(p, f);",
-        "    console.log('built', r.source.length > 40 ? r.source.length : r.source, r.flags);",
-        "  } catch (e) {",
-        "    const err = e as NodeJS.ErrnoException;",
-        "    console.log(err.name, err.message, err.code);",
-        "  }",
+        "  const r = mk(p, f);",
+        "  console.log('built', r.source.length > 40 ? r.source.length : r.source, r.flags);",
         "}",
-      ].join("\n"),
-  );
-  expect(node).toBe(
-    ["built a iu", "built a v", "built (?i:a) ", "built a] ", "built \\p{Script=Greek} u", "built a{2 ", "built [\\d-z] ", "built 9000 ", ""].join("\n"),
-  );
-  const fence = (key: string): string => `Error new RegExp(): '${key}' is not supported yet libCall:regex.new:${key}`;
-  expect(wasm).toBe(
-    [
-      fence("unicode-casefold"),
-      fence("unicode-sets-flag"),
-      fence("modifiers"),
-      fence("annexb-extended-pattern-char"),
-      fence("unported-unicode-property"),
-      fence("annexb-brace-literal"),
-      fence("annexb-class-range-escape"),
-      fence("pattern-too-large"),
-      "",
-    ].join("\n"),
-  );
+      ].join("\n") +
+      "\n",
+  ).then(() => {
+    const node = execFileSync(process.execPath, [entry], { encoding: "utf8" });
+    expect(node).toBe(
+      ["built a iu", "built a v", "built (?i:a) ", "built a] ", "built \\p{Script=Greek} u", "built a{2 ", "built [\\d-z] ", "built 9000 ", ""].join("\n"),
+    );
+  });
 });
+
+test.for(RTN03_ROWS.map((r) => [r[2], r] as const))(
+  "RTN-03 a run-time pattern outside the tier ends the program at the named fence carrying the refusal key: %s",
+  async ([key, [p, f]]) => {
+    const name = `rtn03-${key}`;
+    const entry = join(scratch, `${name}.ts`);
+    await writeFile(
+      entry,
+      MK +
+        [
+          "console.log('before');",
+          "try {",
+          `  const r = mk('${p}', '${f}');`,
+          "  console.log('built', r.source.length);",
+          "} catch (e) {",
+          "  console.log('caught', (e as Error).message);",
+          "} finally {",
+          "  console.log('finally');",
+          "}",
+        ].join("\n") +
+        "\n",
+    );
+    const res = await compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+    if (!res.ok) throw new Error(`${name} refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+    const run = await runWasmToTrap(res.binaryPath);
+    expect(String(run.stdout)).toBe("before\n");
+    expect(String(run.stderr)).toBe(`tsinter: unsupported: new RegExp(): '${key}' is not supported yet [libCall:regex.new:${key}]\n`);
+  },
+);
 
 test("RTN-04 a run-time RegExp crossing into `any` is an island RegExp", async () => {
   const { wasm, node } = await both(

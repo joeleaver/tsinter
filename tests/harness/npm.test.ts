@@ -91,15 +91,15 @@ async function build(entry: string): Promise<string> {
 
 describe(`typed-callback boundary (scriptc-only${sanitize ? ", sanitized" : ""})`, () => {
   // The one deliberate DIVERGENCE at the typed-callback boundary: a package
-  // argument the declared param type refuses becomes a TypeError thrown
-  // back into the island before the body runs (Node would run the body
-  // with the lie) — so this program is asserted directly, never
-  // differentially. SEMANTICS.md documents it with the dyn→static edges.
-  test("a lying engine argument throws a TypeError into the package", async () => {
+  // argument the declared param type refuses ENDS the program before the
+  // body runs (Node would run the body with the lie; the check is this
+  // tier's own, so since GH #86 review it is a fence the package cannot
+  // catch — SEMANTICS.md S122) — asserted directly, never differentially.
+  test("a lying engine argument ends the program before the body runs", async () => {
     const binary = await build(join(fixturesRoot, "npm/divergent/main.ts"));
     const res = await runBinary(binary, []);
-    expect(res.stdout.toString("utf8")).toBe("caught:true:expected number, got string\n");
-    expect(res.exitCode).toBe(0);
+    expect(res.stdout.toString("utf8")).toBe("");
+    expect(res.exitCode).toBe(1);
   }, 120_000);
 
   // A typed RECORD parameter on a callback the package calls is refused at

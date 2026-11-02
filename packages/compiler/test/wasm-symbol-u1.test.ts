@@ -709,7 +709,7 @@ test("B-i gate 9 (Reflect.ownKeys over a symbol-computed key) — both modes nam
 // deferred diagnostic text is never IN the module — base 2abbd214's and
 // this worktree's compiled module for the same source are BYTE-
 // IDENTICAL — it reaches STDERR through the host's own uncaught-error
-// report, "Uncaught Error: <text> [<CODE> at <file>:<line>]\n", exitCode
+// report, "tsinter: unsupported: <text> [<CODE> at <file>:<line>]\n", exitCode
 // unaffected by the trap that follows). Each row asserts the
 // RuntimeError via runWasmToTrap (never .exitCode), empty stdout, AND
 // the deferred code + text on stderr (the file:line suffix is the
@@ -721,29 +721,29 @@ const B_II_ROWS: { id: string; src: string; expected: string }[] = [
   {
     id: "row1",
     src: "function f(v){return `${typeof v}`}\nconsole.log(f(Symbol('d')));\n",
-    expected: "Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at ",
+    expected: "tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at ",
   },
   {
     id: "row2",
     src: "const w = Symbol.iterator;\nconsole.log(typeof w);\n",
-    expected: "Uncaught Error: 'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
+    expected: "tsinter: unsupported: 'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
   },
   {
     id: "row3",
     src: "console.log(Symbol.for('Symbol.iterator') === Symbol.iterator);\n",
-    expected: "Uncaught Error: 'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
+    expected: "tsinter: unsupported: 'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
   },
   {
     id: "row4",
     src: "const x = Symbol.asyncIterator;\nconsole.log(typeof x);\n",
-    expected: "Uncaught Error: 'Symbol.asyncIterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
+    expected: "tsinter: unsupported: 'Symbol.asyncIterator' is part of the standard library types but has no scriptc lowering yet [SC2020 at ",
   },
   {
     id: "row5",
     src:
       "function g(v){ try { return `${v}` } catch (e) { return 'CAUGHT|' + e.message; } }\n" +
       "console.log(g(Symbol('d')));\n",
-    expected: "Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at ",
+    expected: "tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at ",
   },
 ];
 
@@ -753,8 +753,8 @@ const B_II_ROWS: { id: string; src: string; expected: string }[] = [
 // either mode — the crossing-into-`any` question never arises for it).
 const B_II_DYN_OVERRIDE: Record<string, string> = {
   row1:
-    "Uncaught Error: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at ",
-  row5: "Uncaught Error: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at ",
+    "tsinter: unsupported: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at ",
+  row5: "tsinter: unsupported: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at ",
 };
 
 for (const row of B_II_ROWS) {
@@ -775,10 +775,10 @@ for (const row of B_II_ROWS) {
       const expected = dynamic && B_II_DYN_OVERRIDE[row.id] !== undefined ? B_II_DYN_OVERRIDE[row.id]! : row.expected;
       expect(stderr.startsWith(expected)).toBe(true);
       // The suffix shape (":<line>]\n" at the very end) and exactly ONE
-      // "Uncaught Error" in the whole message — tighter than the prefix
+      // fence line in the whole message — tighter than the prefix
       // match alone.
       expect(stderr).toMatch(/:\d+\]\n$/);
-      expect(stderr.match(/Uncaught Error/g)?.length).toBe(1);
+      expect(stderr.match(/tsinter: unsupported: /g)?.length).toBe(1);
     });
   }
 }

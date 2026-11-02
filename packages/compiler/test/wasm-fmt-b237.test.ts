@@ -4,7 +4,8 @@
  *
  * #237: a RUNTIME format string's specifier meeting an argument whose
  * conversion the tier has no lowering for refuses BY NAME at run time
- * (SEMANTICS.md S099) — only when that specifier actually consumes that
+ * (SEMANTICS.md S099; since GH #86 the refusal ends the program, S122) —
+ * only when that specifier actually consumes that
  * argument; the same argument under a supported specifier, or as a rest
  * argument, prints Node's text. #239: a checked-dynamic size runs
  * validateNumber's type gate (ERR_INVALID_ARG_TYPE) before the range
@@ -16,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -35,21 +36,45 @@ async function runRow(name: string, src: string, ext: "ts" | "js" = "ts"): Promi
   return stdout.toString();
 }
 
-const J = 'function j(s: string): string { return [s].join(""); }';
-const fence = (what: string): string =>
-  `caught '${what}' is part of the standard library types but has no scriptc lowering yet [SC2020]`;
+/** GH #86 (SEMANTICS.md S122): a row that reaches a fence ends there —
+ * the trap, with stdout up to the fence and the fence line on stderr (the
+ * row's own path reads `<ROW>`). */
+async function runRowTrap(name: string, src: string): Promise<{ stdout: string; stderr: string }> {
+  const entry = join(scratch, `${name}.ts`);
+  await writeFile(entry, `${src}\n`);
+  const res = await compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+  if (!res.ok) throw new Error(`${name} refused: ${res.diagnostics[0]?.message}`);
+  const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
+  return { stdout: String(stdout), stderr: String(stderr).split(entry).join("<ROW>") };
+}
 
-test("FMT-FENCE-01: %o over an array-carrying argument refuses by name when it meets it", async () => {
-  const out = await runRow("fence01", [
+const J = 'function j(s: string): string { return [s].join(""); }';
+/** The fence line. The fence lives in a per-shape format helper shared by
+ * every call site of that shape, so it names no single line (GH #86). */
+const fence = (what: string): string =>
+  `tsinter: unsupported: '${what}' is part of the standard library types but has no scriptc lowering yet [SC2020 at a util.format argument]\n`;
+
+test("FMT-FENCE-01: %o over an array-carrying argument refuses by name when it meets it (GH #86: the fence ends the program)", async () => {
+  const r = await runRowTrap("fence01", [
     J,
     "const arr = [1, \"two\", { three: 3 }];",
+    "console.log(\"before\");",
     "try { console.log(j(\"%o\"), arr); } catch (e) { console.log(\"caught\", (e as Error).message); }",
+    "console.log(\"after\");",
+  ].join("\n"));
+  expect(r.stdout).toBe("before\n");
+  expect(r.stderr).toBe(fence("util.format %o over arrays"));
+});
+
+test("FMT-FENCE-01b: the same array under a supported specifier or as a rest argument prints Node's text", async () => {
+  const out = await runRow("fence01b", [
+    J,
+    "const arr = [1, \"two\", { three: 3 }];",
     "console.log(j(\"%o %s\"), 1, arr);",
     "console.log(j(\"%s\"), arr);",
     "console.log(j(\"none\"), arr);",
   ].join("\n"));
   expect(out).toBe([
-    fence("util.format %o over arrays"),
     "1 [ 1, 'two', [Object] ]",
     "[ 1, 'two', [Object] ]",
     "none [ 1, 'two', { three: 3 } ]",
@@ -57,24 +82,28 @@ test("FMT-FENCE-01: %o over an array-carrying argument refuses by name when it m
   ].join("\n"));
 });
 
-test("FMT-FENCE-02: %s of a function value refuses (Node prints its source); %O and the rest form print", async () => {
-  const out = await runRow("fence02", [
+test("FMT-FENCE-02: %s of a function value refuses (Node prints its source) — GH #86: the fence ends the program", async () => {
+  const r = await runRowTrap("fence02", [
     J,
     "const f = (): number => 1;",
-    "try { console.log(j(\"%s\"), f); } catch (e) { console.log(\"caught\", (e as Error).message); }",
     "console.log(j(\"fn\"), f);",
+    "try { console.log(j(\"%s\"), f); } catch (e) { console.log(\"caught\", (e as Error).message); }",
+    "console.log(\"after\");",
+  ].join("\n"));
+  expect(r.stdout).toBe("fn [Function: f]\n");
+  expect(r.stderr).toBe(fence("util.format %s of function values (Node's %s prints the function's source text)"));
+});
+
+test("FMT-FENCE-02b: %d of a 'number[]' value refuses; %O and %j print", async () => {
+  const r = await runRowTrap("fence02b", [
+    J,
     "console.log(j(\"%O\"), [1]);",
-    "try { console.log(j(\"%d\"), [1]); } catch (e) { console.log(\"caught\", (e as Error).message); }",
     "console.log(j(\"%j\"), [1]);",
+    "try { console.log(j(\"%d\"), [1]); } catch (e) { console.log(\"caught\", (e as Error).message); }",
+    "console.log(\"after\");",
   ].join("\n"));
-  expect(out).toBe([
-    fence("util.format %s of function values (Node's %s prints the function's source text)"),
-    "fn [Function: f]",
-    "[ 1 ]",
-    fence("util.format %d of 'number[]' values"),
-    "[1]",
-    "",
-  ].join("\n"));
+  expect(r.stdout).toBe("[ 1 ]\n[1]\n");
+  expect(r.stderr).toBe(fence("util.format %d of 'number[]' values"));
 });
 
 test("FMT-UTIL-01: util.format over a runtime string (formerly the SC2020 compile fence)", async () => {
@@ -109,8 +138,8 @@ test("FMT-ORDER-01: every argument evaluates once, in order, before the scan", a
   expect(out).toBe(["v1||v3 v4", "4", ""].join("\n"));
 });
 
-test("FMT-DYN-01: %d / %i / %f over checked-dynamic values take Number / ToString per runtime kind; an own valueOf refuses", async () => {
-  const out = await runRow("dyn01", [
+test("FMT-DYN-01: %d / %i / %f over checked-dynamic values take Number / ToString per runtime kind; an own valueOf refuses (GH #86: and ends the program)", async () => {
+  const { stdout: out, stderr } = await runRowTrap("dyn01", [
     J,
     "function v(fmt: any, a: any): void { console.log(fmt, a, a, a); }",
     "const vals: any = JSON.parse('[\"17\", \"\", true, null, {}, [], [5], [1, 2], \"-0\"]');",
@@ -130,9 +159,9 @@ test("FMT-DYN-01: %d / %i / %f over checked-dynamic values take Number / ToStrin
     "NaN|1|1",
     "-0|-0|-0",
     "NaN|{ a: 1, n: '%d' }",
-    fence("util.format %d of a value with its own valueOf"),
     "",
   ].join("\n"));
+  expect(stderr).toBe(fence("util.format %d of a value with its own valueOf").replace("at a util.format argument", "at a Number() of a dynamic value"));
 });
 
 test("ALLOC-DYN-01: a checked-dynamic size's type gate is ERR_INVALID_ARG_TYPE; allocUnsafeSlow (JS sources only) validates alike", async () => {

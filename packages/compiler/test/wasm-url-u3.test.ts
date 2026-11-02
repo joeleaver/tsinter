@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -471,9 +471,14 @@ describe("INC-29 U3 SEMANTICS.md S089 rows", () => {
     const got = await run("'use strict';\ntry { new URL('nope'); } catch (e) { console.log(e.name, e.message, e.code, e.input); }\n", "cjs");
     expect(got).toEqual(["TypeError Invalid URL ERR_INVALID_URL undefined"]);
   }, 60000);
-  test("URL-REG-02 S089 (b): a dynamic array as a URLSearchParams name throws a named Error — Node: ret \"x\" (the array converts to \"1,2\"); a number and an object with its own toString convert as in Node — SINGLE-EDIT: the array kind admitted to dyn.toStringCoerce", async () => {
-    const got = await run("'use strict';\nconst p = new URLSearchParams('1,2=x&7=n&[object Object]=o');\nconst show = (f) => { try { console.log('ret', JSON.stringify(f())); } catch (e) { console.log(e.name + '|' + e.message); } };\nshow(() => p.get([1, 2]));\nshow(() => p.get(7));\nconst o = { toString() { return 7; } };\nshow(() => p.get(o));\n", "cjs");
-    expect(got).toEqual(["Error|converting this dynamic value to a URLSearchParams string is not supported yet", 'ret "n"', 'ret "n"']);
+  test("URL-REG-02 S089 (b): a dynamic array as a URLSearchParams name is a named fence that ends the program (GH #86, SEMANTICS.md S122) — Node: ret \"x\" (the array converts to \"1,2\"); a number and an object with its own toString convert as in Node — SINGLE-EDIT: the array kind admitted to dyn.toStringCoerce", async () => {
+    const file = join(scratch, `p${seq++}.cjs`);
+    await writeFile(file, "'use strict';\nconst p = new URLSearchParams('1,2=x&7=n&[object Object]=o');\nconst show = (f) => { try { console.log('ret', JSON.stringify(f())); } catch (e) { console.log(e.name + '|' + e.message); } };\nshow(() => p.get(7));\nconst o = { toString() { return 7; } };\nshow(() => p.get(o));\nshow(() => p.get([1, 2]));\nconsole.log('after');\n");
+    const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: true, backend: "wasm" });
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+    const r = await runWasmToTrap(res.binaryPath);
+    expect(r.stdout).toBe('ret "n"\nret "n"\n');
+    expect(r.stderr).toBe("tsinter: unsupported: converting this dynamic value to a URLSearchParams string is not supported yet [SC1090]\n");
   }, 60000);
 });
 

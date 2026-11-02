@@ -148,6 +148,12 @@ export const EMITTER_NAME = 2;
 export const EMITTER_PREFIX_FIELDS = 2;
 
 export interface EventsDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   strRef: () => ValType;
   strEq: () => number;
   /** dyn.ts's uniform call-glue signature — `(clos: eq, args: dyn[]) ->
@@ -1168,9 +1174,7 @@ export class EventsBuilder {
     vecPushOne: number,
   ): void {
     if (i >= adapters.length) {
-      this.deps.reportUncaught(c, "%TypeError", "TypeError", (cc) =>
-        this.deps.lit(cc, "listeners()/rawListeners() over a dyn-registered or 'error'-bucket listener is not supported yet"),
-      );
+      this.deps.fence(c, (cc) => this.deps.lit(cc, "listeners()/rawListeners() over a dyn-registered or 'error'-bucket listener is not supported yet"));
       return;
     }
     const { prefixClos, adapterFn } = adapters[i]!;

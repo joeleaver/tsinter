@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -77,7 +77,7 @@ test("fieldIncDec:dyn — prefix/postfix ++/-- battery over a checked-dynamic fi
   expect(stderr).toBe("");
 });
 
-test("fieldIncDec:dyn — the non-number arm: a catchable TypeError, instanceof-true, message byte-identical to S009's own established format (NOT Node's silent NaN — SEMANTICS.md S009's third amendment)", async () => {
+test("fieldIncDec:dyn — the non-number arm: S009's check ends the program at its fence (Node answers a silent NaN — a check Node never makes, so GH #86 review / SEMANTICS.md S122 makes it fatal)", async () => {
   const path = await build("nonnumber.js", [
     "'use strict';",
     "class C {",
@@ -92,16 +92,15 @@ test("fieldIncDec:dyn — the non-number arm: a catchable TypeError, instanceof-
     "  console.log('caught', typeof e, e instanceof TypeError, e.message);",
     "}",
   ]);
-  const { stdout, stderr } = await runWasm(path);
-  // "expected number at $, got string" is S009's OWN established message
-  // format (increment 17/21's amendments already produce it byte-for-
-  // byte via the SAME dynCheckHelper/checkFail machinery) — NOT a Node
-  // string (real Node: c.inc() returns NaN silently, never throws).
-  expect(stdout).toBe(["caught object true expected number at $, got string", ""].join("\n"));
-  expect(stderr).toBe("");
+  const { stdout, stderr } = await runWasmToTrap(path);
+  // "expected number at $, got string" is S009's OWN message format (the
+  // SAME dynCheckHelper/checkFail machinery) — real Node returns NaN
+  // silently; the catch never runs.
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: expected number at $, got string [SC1100]\n");
 });
 
-test("fieldIncDec:dyn — prefix on the non-number arm reaches the SAME dynCheck before any arithmetic runs (mechanism-reachability: prefix and postfix share one check site)", async () => {
+test("fieldIncDec:dyn — prefix on the non-number arm reaches the SAME dynCheck fence before any arithmetic runs (mechanism-reachability: prefix and postfix share one check site)", async () => {
   const path = await build("nonnumber-prefix.js", [
     "'use strict';",
     "class C {",
@@ -116,7 +115,7 @@ test("fieldIncDec:dyn — prefix on the non-number arm reaches the SAME dynCheck
     "  console.log('caught', e instanceof TypeError, e.message);",
     "}",
   ]);
-  const { stdout, stderr } = await runWasm(path);
-  expect(stdout).toBe(["caught true expected number at $, got null", ""].join("\n"));
-  expect(stderr).toBe("");
+  const { stdout, stderr } = await runWasmToTrap(path);
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: expected number at $, got null [SC1100]\n");
 });

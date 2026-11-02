@@ -285,10 +285,11 @@ describe("wasm-host-ladders-p6: fs.mkdtempSyncChk", () => {
     const { rm: rmReal } = await import("node:fs/promises");
     await rmReal(r.madeDirs[0]!, { recursive: true, force: true });
   });
-  test("a Buffer prefix fences even when every validation passes (the C's own condition, quoted: `prefix->kind != SCR_DYN_STR`) — no oracle line (2595 never supplies a Buffer prefix) — the fence is a REAL catchable Error, caught here by the program's own try/catch — SINGLE-EDIT: the fence gate dropping the prefix-is-STR half of the condition", async () => {
+  test("a Buffer prefix fences even when every validation passes (the C's own condition, quoted: `prefix->kind != SCR_DYN_STR`) — no oracle line (2595 never supplies a Buffer prefix) — the fence ENDS the program (GH #86, SEMANTICS.md S122) — the program's own try/catch never sees it — SINGLE-EDIT: the fence gate dropping the prefix-is-STR half of the condition", async () => {
     const bin = await buildProgram(`const fs = require('fs');\ntry { fs.mkdtempSync(Buffer.from('/x-'), {}); } catch (e) { console.log(e.name, e.message.includes('SC2020')); }\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout.trim()).toBe("Error true");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
   });
 });
 
@@ -303,10 +304,12 @@ describe("wasm-host-ladders-p6: fs.readFileChk", () => {
     const r = await runWasm(bin);
     expect(r.stdout.trim()).toBe(`TypeError|ERR_INVALID_ARG_TYPE|The "cb" argument must be of type function. Received undefined`);
   });
-  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4: no row previously reached this key's fence — bug 3's own class, a bad cast on a fully-valid path, is invisible to every throwing row) — the fence is a REAL catchable Error, caught here by the program's own try/catch — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
+  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4: no row previously reached this key's fence — bug 3's own class, a bad cast on a fully-valid path, is invisible to every throwing row) — the fence ENDS the program (GH #86, SEMANTICS.md S122) — the program's own try/catch never sees it — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
     const bin = await buildProgram(`const fs = require('fs');\ntry { fs.readFile('/tmp/x', () => {}); } catch (e) { console.log(e.name, e.message.includes('SC2020'), e.message.includes('argument')); }\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout.trim()).toBe("Error true false");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
+    expect(r.stderr).not.toContain("argument");
   });
 });
 
@@ -316,10 +319,12 @@ describe("wasm-host-ladders-p6: fs.opendirChk", () => {
     const r = await runWasm(bin);
     expect(r.stdout.trim()).toBe(`TypeError|ERR_INVALID_ARG_VALUE|The argument 'encoding' is invalid encoding. Received 'no'`);
   });
-  test("assertEncoding's FALSY GATE: an empty-string encoding passes (reaches the fence, never 'invalid encoding') — measured directly against Node — the fence is a REAL catchable Error, caught here by the program's own try/catch — SINGLE-EDIT: the empty-string short-circuit removed from assertEncoding — this IS M-3", async () => {
+  test("assertEncoding's FALSY GATE: an empty-string encoding passes (reaches the fence, never 'invalid encoding') — measured directly against Node — the fence ENDS the program (GH #86, SEMANTICS.md S122) — the program's own try/catch never sees it — SINGLE-EDIT: the empty-string short-circuit removed from assertEncoding — this IS M-3", async () => {
     const bin = await buildProgram(`const fs = require('fs');\ntry { fs.opendirSync('.', { encoding: '' }); } catch (e) { console.log('THREW', e.message.includes('SC2020'), e.message.includes('invalid encoding')); }\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout.trim()).toBe("THREW true false");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
+    expect(r.stderr).not.toContain("invalid encoding");
   });
   test("M-3's own TRUTHY-INVALID control: 'zz' still throws under the SAME gate that lets '' pass — a gate that accepts everything must not pass this row — SINGLE-EDIT: the falsy gate widened to accept every string", async () => {
     const bin = await buildProgram(`${SHOW_PRELUDE}const fs = require('fs');\nshow(() => fs.opendirSync('.', { encoding: 'zz' }));\n`);
@@ -344,10 +349,12 @@ describe("wasm-host-ladders-p6: fs.watchFileChk", () => {
     const r = await runWasm(bin);
     expect(r.stdout.trim()).toBe(`TypeError|ERR_INVALID_ARG_TYPE|The "path" argument must be of type string or an instance of Buffer or URL. Received an instance of Object`);
   });
-  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4) — the fence is a REAL catchable Error, caught here by the program's own try/catch — the trailing process.exit(0) is DEFENSIVE, not load-bearing: the tier's own fence throws before a real watcher is ever armed, so nothing here needs it under wasm; it matters only if this same source were run under real Node, where a still-live fs.watchFile would otherwise keep the process alive — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
+  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4) — the fence ENDS the program (GH #86, SEMANTICS.md S122) — the program's own try/catch never sees it — the trailing process.exit(0) is DEFENSIVE, not load-bearing: the tier's own fence throws before a real watcher is ever armed, so nothing here needs it under wasm; it matters only if this same source were run under real Node, where a still-live fs.watchFile would otherwise keep the process alive — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
     const bin = await buildProgram(`const fs = require('fs');\ntry { fs.watchFile('/tmp/x', () => {}); } catch (e) { console.log(e.name, e.message.includes('SC2020'), e.message.includes('argument')); }\nprocess.exit(0);\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout.trim()).toBe("Error true false");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
+    expect(r.stderr).not.toContain("argument");
   });
 });
 
@@ -372,10 +379,12 @@ describe("wasm-host-ladders-p6: fs.streamOptsChk", () => {
     const r = await runWasm(bin);
     expect(r.stdout.trim()).toBe(`RangeError|ERR_OUT_OF_RANGE|The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received -1`);
   });
-  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4) — the fence is a REAL catchable Error, caught here by the program's own try/catch — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
+  test("EVERYTHING VALID traverses the full ladder to its tail (delta-03 D4/C2-D4) — the fence ENDS the program (GH #86, SEMANTICS.md S122) — the program's own try/catch never sees it — SINGLE-EDIT: none, a breadth row proving the tail is reached, not a mutable behavior", async () => {
     const bin = await buildProgram(`const fs = require('fs');\ntry { fs.createReadStream('/tmp/x'); } catch (e) { console.log(e.name, e.message.includes('SC2020'), e.message.includes('argument')); }\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout.trim()).toBe("Error true false");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
+    expect(r.stderr).not.toContain("argument");
   });
 });
 
@@ -453,10 +462,11 @@ describe("wasm-host-ladders-p6: fs.readChk", () => {
     const r = await runWasm(bin);
     expect(r.stdout.trim()).toBe(`RangeError|ERR_OUT_OF_RANGE|The value of "position" is out of range. It must be >= -1 && <= 9007199254740991. Received 9_007_199_254_740_992`);
   });
-  test("a length that COERCES via |=0 from a non-numeric string ('utf-8' -> NaN -> 0), never type/integer-validated — oracle 2595 L18's own gate-neutral partner: a VALID length silently accepted — every check then passes, reaching the fence (a REAL catchable Error, caught here by SHOW_PRELUDE's own try/catch) — additive check on the coercion itself — SINGLE-EDIT: jsToNumber/toInt32 swapped for a type-check throw", async () => {
+  test("a length that COERCES via |=0 from a non-numeric string ('utf-8' -> NaN -> 0), never type/integer-validated — oracle 2595 L18's own gate-neutral partner: a VALID length silently accepted — every check then passes, reaching the fence (which ends the program — GH #86, SEMANTICS.md S122 — SHOW_PRELUDE's try/catch never sees it) — additive check on the coercion itself — SINGLE-EDIT: jsToNumber/toInt32 swapped for a type-check throw", async () => {
     const bin = await buildProgram(`${SHOW_PRELUDE}const fs = require('fs');\nshow(() => fs.read(3, Buffer.allocUnsafe(4), 0, 'utf-8', 0, () => {}));\n`);
-    const r = await runWasm(bin);
-    expect(r.stdout).toContain("SC2020");
+    const r = await runWasmToTrap(bin);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC2020 at .*\.cjs:\d+\]\n$/);
   });
 });
 

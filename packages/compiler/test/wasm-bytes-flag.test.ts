@@ -250,6 +250,11 @@ async function buildHarness(
       pushMessage(c);
       c.drop();
     },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
     excKind: () => excKindG,
     strCmpU16: () => strCmpU16Fn,
     strSlice: () => strSliceFn,
@@ -282,6 +287,11 @@ async function buildHarness(
       pushMessage(c);
       c.drop();
     },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
     excKind: () => excKindG,
     clearExc: (c) => {
       c.i32Const(0);
@@ -308,6 +318,11 @@ async function buildHarness(
     dyn: () => dyn,
     inspF64: () => stub([F64], [strRef], "%stub.inspF64"),
     throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
       pushMessage(c);
       c.drop();
     },

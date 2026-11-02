@@ -923,6 +923,13 @@ export interface AmbientSurfaceRow {
 }
 
 export const AMBIENT_SURFACE_FNS: readonly AmbientSurfaceRow[] = [
+  {
+    id: "node-builtin.os.hostChoice",
+    kind: "node-builtin",
+    name: "host OS constants (os.EOL, path.sep, path.delimiter)",
+    fns: ["os.hostChoice"],
+    note: "the run-time choice of a constant's value by the host OS on the wasm and wasm-native lanes (SEMANTICS.md S118)",
+  },
   // ── the Date slice (lowerDateCall): Date.now/Date.UTC and the composed
   // new Date(...).getTime()/.toISOString() forms — the worked-example
   // "stdlib.date." family of the ask-5 spec.

@@ -4130,7 +4130,7 @@ double scr_bit_not(double a) {
 /* ── checked catch-binding cast (`e as C`) ────────────────────────────
  * The caught analog of the dyn boundary's checked casts: an OBJ payload
  * inside the class's preorder interval extracts (retained, +1); every
- * other payload throws a catchable TypeError naming the class. Node's
+ * other payload ends the program at a named fence (S122). Node's
  * `as` is erasure — the runtime check is the documented trust-but-verify
  * stance for dynamic values, extended to exception payloads. */
 void *scr_caught_check_obj(const ScrCaught *c, size_t pre, size_t post,
@@ -4138,10 +4138,13 @@ void *scr_caught_check_obj(const ScrCaught *c, size_t pre, size_t post,
   if (scr_caught_instanceof(c, pre, post)) return c->retain_fn(c->payload);
   char msg[160];
   int len = snprintf(msg, sizeof msg,
-                     "caught value is not an instance of %s (checked cast)",
+                     "caught value is not an instance of %s (checked cast) [SC1100]",
                      cls);
-  scr_throw_error_msg(SCR_ERR_TYPE, msg, (size_t)len);
-  return NULL; /* callers are compiler-emitted pending checks */
+  /* GH #86 review (SEMANTICS.md S009, S122): Node erases `as` — a failed
+   * checked cast is a check only this tier makes, so it ENDS the program. */
+  if (len < 0) len = 0;
+  if ((size_t)len >= sizeof msg) len = (int)sizeof msg - 1;
+  scr_fence_fatal(msg, (size_t)len);
 }
 
 /* ── Set → array drain ([...set]) ─────────────────────────────────────

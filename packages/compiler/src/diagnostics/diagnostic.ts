@@ -253,7 +253,7 @@ export const UNSUPPORTED: Record<string, UnsupportedEntry> = {
   SC1100: {
     feature: "operations on 'unknown' values",
     milestone: "later",
-    hint: "validate with 'as <type>' first — the cast checks the dynamic value at runtime and throws on mismatch",
+    hint: "validate with 'as <type>' first — the cast checks the dynamic value at runtime and a mismatch ends the program",
   },
   SC1101: {
     feature: "converting typed values to 'unknown'",

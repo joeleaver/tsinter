@@ -106,7 +106,7 @@ import { lowerAssertModuleCall, lowerAssertDirectCall } from "./lower-assert.js"
 import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
-import { lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
+import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
@@ -2160,6 +2160,9 @@ export class Lowerer {
     // Board #178: every shape's optional flags are final now.
     this.markCheckedShapesOptional(functions);
     this.resolvePresenceTests(functions);
+    this.locateRuntimeFences(functions);
+    this.markSloppyWrites(functions);
+    this.stampCloneFunctionSources(functions);
 
     // Computed before the module gate: retention resolves every class name
     // the emitted program references, flushing deferred class diagnostics
@@ -3141,6 +3144,167 @@ export class Lowerer {
       }
       const rec = n as { kind?: unknown; type?: IrType };
       if ((rec.kind === "dynCheck" || rec.kind === "jsExit") && rec.type !== undefined) markType(rec.type);
+      for (const v of Object.values(n as Record<string, unknown>)) visit(v);
+    };
+    visit(roots);
+  }
+
+  /** GH #86 review (WasmGC lanes): JS ignores a write to a primitive
+   * receiver in sloppy code and throws in strict code, so a dynamic write
+   * records which its source is: ES modules, a 'use strict' prologue (the
+   * file's or an enclosing function's) and class bodies are strict; a
+   * CommonJS source otherwise is sloppy. The flag rides the IR node's own
+   * loc, so every lowering of a keyed write is covered at one place. */
+  private markSloppyWrites(roots: unknown): void {
+    if (!this.undefSlots) return;
+    const hasDirective = (stmts: readonly ts.Statement[]): boolean => {
+      for (const st of stmts) {
+        if (!ts.isExpressionStatement(st) || !ts.isStringLiteral(st.expression)) return false;
+        if (st.expression.text === "use strict") return true;
+      }
+      return false;
+    };
+    const infos = new Map<string, { strict: boolean; ranges: [number, number][] }>();
+    const infoOf = (file: string): { strict: boolean; ranges: [number, number][] } | null => {
+      const hit = infos.get(file);
+      if (hit !== undefined) return hit;
+      const sf = this.program.getSourceFile(file);
+      if (sf === undefined) return null;
+      const info = { strict: isNodeEsmFile(sf) || hasDirective(sf.statements), ranges: [] as [number, number][] };
+      if (!info.strict) {
+        ts.walkPreorder(sf, (n) => {
+          if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+            info.ranges.push([n.pos, n.end]);
+          } else if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n) || ts.isConstructorDeclaration(n)) {
+            const body = n.body;
+            if (body !== undefined && ts.isBlock(body) && hasDirective(body.statements)) info.ranges.push([n.pos, n.end]);
+          }
+          return undefined;
+        });
+      }
+      infos.set(file, info);
+      return info;
+    };
+    const seen = new Set<unknown>();
+    const visit = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seen.has(n)) return;
+      seen.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) visit(item);
+        return;
+      }
+      const rec = n as { kind?: unknown; fn?: unknown; op?: unknown; loc?: SrcLoc; sloppy?: boolean };
+      if (((rec.kind === "libCall" && rec.fn === "dyn.keySet") || (rec.kind === "jsOp" && (rec.op === "setProp" || rec.op === "setIdx"))) && rec.loc !== undefined) {
+        const info = infoOf(rec.loc.file);
+        const at = rec.loc.start;
+        if (info !== null && !info.strict && !info.ranges.some(([a, b]) => a <= at && at < b)) rec.sloppy = true;
+      }
+      for (const v of Object.values(n as Record<string, unknown>)) visit(v);
+    };
+    visit(roots);
+  }
+
+  /** GH #86 review: Node's `structuredClone(fn)` throws a DataCloneError
+   * quoting the function's source text, so a module that clones dynamic
+   * values stamps each function boxed by name of its IR function with that
+   * text (the IR function's span; `export` is not part of a function's
+   * text). Other modules pay nothing. */
+  private stampCloneFunctionSources(functions: IrFunction[]): void {
+    const clones = JSON.stringify(functions, (k, v) => (k === "loc" ? undefined : v)).includes('"dyn.structuredClone"');
+    const byName = new Map(functions.map((f) => [f.name, f]));
+    // the function-like nodes of a file, by start: does each own `prototype`
+    const kinds = new Map<string, Map<number, 1 | 2>>();
+    const kindsOf = (file: string): Map<number, 1 | 2> => {
+      const hit = kinds.get(file);
+      if (hit !== undefined) return hit;
+      const m = new Map<number, 1 | 2>();
+      kinds.set(file, m);
+      const sf = this.program.getSourceFile(file);
+      if (sf === undefined) return m;
+      ts.walkPreorder(sf, (n) => {
+        if (ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) m.set(n.getStart(sf), 2);
+        else if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) {
+          const async = /^(export\s+(default\s+)?)?async\b/.test(n.getText(sf));
+          m.set(n.getStart(sf), async && n.asteriskToken === undefined ? 2 : 1);
+        }
+        return undefined;
+      });
+      return m;
+    };
+    // a binding every write of which is one closure holds that function
+    const boundFn = new Map<string, string | null>();
+    const seenW = new Set<unknown>();
+    const writes = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seenW.has(n)) return;
+      seenW.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) writes(item);
+        return;
+      }
+      const rec = n as { kind?: unknown; localId?: unknown; init?: { kind?: unknown; fnName?: unknown } | null; value?: { kind?: unknown; fnName?: unknown } };
+      if ((rec.kind === "varDecl" || rec.kind === "assign") && typeof rec.localId === "string") {
+        const v = rec.kind === "varDecl" ? rec.init : rec.value;
+        if (rec.kind !== "varDecl" || v !== null) {
+          const name = v?.kind === "closure" && typeof v.fnName === "string" ? v.fnName : null;
+          const had = boundFn.get(rec.localId);
+          boundFn.set(rec.localId, had === undefined || had === name ? name : null);
+        }
+      }
+      for (const v of Object.values(n as Record<string, unknown>)) writes(v);
+    };
+    writes(functions);
+    const seen = new Set<unknown>();
+    const visit = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seen.has(n)) return;
+      seen.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) visit(item);
+        return;
+      }
+      const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: 1 | 2 };
+      if (rec.kind === "dynFrom" && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
+        const fnName = rec.value.kind === "closure" ? rec.value.fnName : boundFn.get(rec.value.localId as string);
+        const loc = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;
+        if (loc !== undefined) {
+          const k = kindsOf(loc.file).get(loc.start);
+          if (k !== undefined) rec.fnProto = k;
+          const text = clones ? this.program.getSourceFile(loc.file)?.text.slice(loc.start, loc.end) : undefined;
+          if (text !== undefined && text !== "") rec.srcText = text.replace(/^export\s+(default\s+)?/, "");
+        }
+      }
+      for (const v of Object.values(n as Record<string, unknown>)) visit(v);
+    };
+    visit(functions);
+  }
+
+  /** GH #86: a runtime fence ENDS the program with its diagnostic on
+   * stderr (no user code can catch it), so every fence's text names its
+   * place the way a compile diagnostic would: `<message> [SC#### at
+   * <file>:<line>]`. Most lowering sites render that already; the rest
+   * (the S119 hole fences, the destructuring fence, util's `[SC####]`
+   * ones) get it here, from the statement's own loc. SC9002 (the
+   * checker-proved-unreachable trap) is never rendered. */
+  private locateRuntimeFences(roots: unknown): void {
+    const seen = new Set<unknown>();
+    const located = / \[SC\d+ at [^\]]+\]$/;
+    const visit = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seen.has(n)) return;
+      seen.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) visit(item);
+        return;
+      }
+      const rec = n as { kind?: unknown; code?: unknown; message?: unknown; loc?: SrcLoc };
+      if (rec.kind === "runtimeFence" && typeof rec.code === "string" && rec.code !== "SC9002" && typeof rec.message === "string" && !located.test(rec.message) && rec.loc !== undefined) {
+        const sf = this.program.getSourceFile(rec.loc.file);
+        if (sf !== undefined) {
+          const line = ts.getLineAndCharacterOfPosition(sf, rec.loc.start).line + 1;
+          const tag = ` [${rec.code}]`;
+          const at = ` [${rec.code} at ${rec.loc.file}:${line}]`;
+          (rec as { message: string }).message = rec.message.endsWith(tag) ? rec.message.slice(0, -tag.length) + at : rec.message + at;
+        }
+        return;
+      }
       for (const v of Object.values(n as Record<string, unknown>)) visit(v);
     };
     visit(roots);
@@ -4272,7 +4436,7 @@ export class Lowerer {
                   } satisfies IrExpr,
                 };
               }
-              const get: IrExpr = { kind: "recordGet", obj: r, shapeId: fromId, field: f.name, type: lift.src, loc };
+              const get: IrExpr = { kind: "recordGet", obj: r, shapeId: fromId, field: f.name, spreadCopy: true, type: lift.src, loc };
               return { name: f.name, value: this.applyWidthLift(lift.lift, get, f.type, loc) };
             }),
             type: toT,
@@ -4344,8 +4508,8 @@ export class Lowerer {
   /** Interned `%arr.empty.<n>(a)` — the EMPTY-array lift's build side: a
    * unit-only-element array reshapes into any data-element array by
    * answering a FRESH empty array, after a runtime non-empty trap (a
-   * genuinely inhabited `(null | undefined)[]` cannot reshape — the
-   * catchable-TypeError stance every checked extraction takes). */
+   * genuinely inhabited `(null | undefined)[]` cannot reshape — a check
+   * Node never makes, so it ends the program: SEMANTICS.md S122). */
   emptyArrayLiftHelper(fromT: IrType & { kind: "array" }, toT: IrType & { kind: "array" }, loc: SrcLoc): string {
     const key = `emptyarr:${typeKey(fromT.elem)}:${typeKey(toT.elem)}`;
     const existing = this.widthHelpers.get(key);
@@ -4369,16 +4533,13 @@ export class Lowerer {
             type: BOOL,
             loc,
           },
+          // GH #86 review (SEMANTICS.md S122): a check Node never makes —
+          // it ends the program; the helper is shared, so no single line.
           then: [
             {
-              kind: "throw",
-              value: {
-                kind: "libCall",
-                fn: "error.new",
-                args: [{ kind: "strLit", value: `expected ${this.fmt(toT)} (a non-empty ${this.fmt(fromT)} has no elements the target can hold)`, type: STRING, loc }],
-                type: { kind: "object", className: "%TypeError" },
-                loc,
-              },
+              kind: "runtimeFence",
+              code: "SC1090",
+              message: `expected ${this.fmt(toT)} (a non-empty ${this.fmt(fromT)} has no elements the target can hold) [SC1090 at an empty-array conversion]`,
               loc,
             },
           ],
@@ -4953,22 +5114,20 @@ export class Lowerer {
     this.retagHelpers.set(key, name);
     const impl = `${name}.impl`;
     const params: IrParam[] = toT.params.map((t, i) => ({ localId: `a.${i}`, name: `a${i}`, type: t }));
+    // GH #86 review (SEMANTICS.md S122): a call the checker admitted but
+    // this build cannot lower is a tsinter limit — it ENDS the program.
+    // The adapter serves every call through the slot, so no single line.
     const strandThrow = (why: string): IrStmt => ({
-      kind: "throw",
-      value: {
-        kind: "libCall",
-        fn: "error.new",
-        args: [{ kind: "strLit", value: why, type: STRING, loc }],
-        type: { kind: "object", className: "%TypeError" },
-        loc,
-      },
+      kind: "runtimeFence",
+      code: "SC1090",
+      message: `${why} [SC1090 at a call through a function-typed slot]`,
       loc,
     });
     let body: IrStmt[];
     if (strandParams) {
       body = [
         strandThrow(
-          `a '${this.fmt(fromT)}' function invoked through a '${this.fmt(toT)}' slot (the parameter types cannot convert — the checker's loose function compatibility admitted the assignment, but the call has no exact lowering)`,
+          `a '${this.fmt(fromT)}' function invoked through a '${this.fmt(toT)}' slot (the parameter types cannot convert — the assignment type-checks, but the call has no exact lowering)`,
         ),
       ];
     } else {
@@ -5011,7 +5170,7 @@ export class Lowerer {
         body = [
           { kind: "exprStmt", expr: call, loc },
           strandThrow(
-            `a '${this.fmt(fromT)}' function invoked through a '${this.fmt(toT)}' slot (the result cannot convert to '${this.fmt(toT.ret)}' — the checker's loose function compatibility admitted the assignment, but the call has no exact lowering)`,
+            `a '${this.fmt(fromT)}' function invoked through a '${this.fmt(toT)}' slot (the result cannot convert to '${this.fmt(toT.ret)}' — the assignment type-checks, but the call has no exact lowering)`,
           ),
         ];
       } else {
@@ -5364,24 +5523,9 @@ export class Lowerer {
         returnType: expected,
         locals: [],
         body: [
-          {
-            kind: "throw",
-            value: {
-              kind: "libCall",
-              fn: "error.new",
-              args: [
-                {
-                  kind: "strLit",
-                  value: `${what} is not representable in a '${this.fmt(expected)}' slot (a value narrowed or asserted past the type still held it)`,
-                  type: STRING,
-                  loc,
-                },
-              ],
-              type: { kind: "object", className: "%TypeError" },
-              loc,
-            },
-            loc,
-          },
+          // GH #86 review (SEMANTICS.md S122): a check Node never makes — it
+          // ends the program; the helper is shared, so no single line.
+          { kind: "runtimeFence", code: "SC1090", message: `${what} is not representable in a '${this.fmt(expected)}' slot (a value narrowed or asserted past the type still held it) [SC1090 at a narrowed value's conversion]`, loc },
         ],
         loc,
       });
@@ -5442,24 +5586,9 @@ export class Lowerer {
         returnType: toT,
         locals: takesOperand ? [{ id: "v.0", name: "v", type: src, mutable: false }] : [],
         body: [
-          {
-            kind: "throw",
-            value: {
-              kind: "libCall",
-              fn: "error.new",
-              args: [
-                {
-                  kind: "strLit",
-                  value: `${what} is not representable in the target union (a value narrowed or asserted past it still held it)`,
-                  type: STRING,
-                  loc,
-                },
-              ],
-              type: { kind: "object", className: "%TypeError" },
-              loc,
-            },
-            loc,
-          },
+          // GH #86 review (SEMANTICS.md S122): a check Node never makes — it
+          // ends the program; the helper is shared, so no single line.
+          { kind: "runtimeFence", code: "SC1090", message: `${what} is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]`, loc },
         ],
         loc,
       });
@@ -5513,29 +5642,18 @@ export class Lowerer {
       const tag = mapping[i]!;
       const cond: IrExpr = { kind: "unionIsTag", unionId: fromId, tag: i, negated: false, value: u, type: BOOL, loc };
       let then: IrStmt[];
-      if (tag < 0) {
+      if (tag < 0 && this.undefSlots && arm.kind === "undefinedT") {
+        // Unit U (SEMANTICS.md S119): every union holds undefined on the
+        // WasmGC lanes, so a cast or `!` lets it ride, as Node does.
+        then = [{ kind: "return", value: { kind: "slotUndef", type: toT, loc }, loc }];
+      } else if (tag < 0) {
         const what = isUnitType(arm)
           ? (arm.kind === "undefinedT" ? "undefined" : "null")
           : `a '${this.fmt(arm)}' value`;
         then = [
-          {
-            kind: "throw",
-            value: {
-              kind: "libCall",
-              fn: "error.new",
-              args: [
-                {
-                  kind: "strLit",
-                  value: `${what} is not representable in the target union (a value narrowed or asserted past it still held it)`,
-                  type: STRING,
-                  loc,
-                },
-              ],
-              type: { kind: "object", className: "%TypeError" },
-              loc,
-            },
-            loc,
-          },
+          // GH #86 review (SEMANTICS.md S122): a check Node never makes — it
+          // ends the program; the helper is shared, so no single line.
+          { kind: "runtimeFence", code: "SC1090", message: `${what} is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]`, loc },
         ];
       } else {
         const value: IrExpr = isUnitType(arm)
@@ -5555,7 +5673,9 @@ export class Lowerer {
     });
     // Unreachable when tags are exhaustive (they are, by construction);
     // satisfies the all-paths-return rule and keeps a corrupted tag loud.
-    body.push({
+    // On the WasmGC lanes the one tag left is the slot's undefined, which
+    // stays undefined (SEMANTICS.md S119).
+    body.push(this.undefSlots ? { kind: "return", value: { kind: "slotUndef", type: toT, loc }, loc } : {
       kind: "throw",
       value: { kind: "strLit", value: "scriptc: internal error: invalid union tag", type: STRING, loc },
       loc,
@@ -5593,6 +5713,19 @@ export class Lowerer {
     const body: IrStmt[] = [];
     from.arms.forEach((arm, i) => {
       if (i === tag) return; // the fall-through extraction below
+      // Unit U (SEMANTICS.md S119): the plain slot holds undefined on the
+      // WasmGC lanes, so `x!` / `x as T` let it ride, as Node does; only
+      // the next step that needs a value throws Node's TypeError.
+      if (this.undefSlots && arm.kind === "undefinedT") {
+        body.push({
+          kind: "if",
+          cond: { kind: "unionIsTag", unionId: fromId, tag: i, negated: false, value: u, type: BOOL, loc },
+          then: [{ kind: "return", value: { kind: "slotUndef", type: target, loc }, loc }],
+          else_: null,
+          loc,
+        });
+        return;
+      }
       const what = isUnitType(arm)
         ? (arm.kind === "undefinedT" ? "undefined" : "null")
         : `a '${this.fmt(arm)}' value`;
@@ -5600,24 +5733,9 @@ export class Lowerer {
         kind: "if",
         cond: { kind: "unionIsTag", unionId: fromId, tag: i, negated: false, value: u, type: BOOL, loc },
         then: [
-          {
-            kind: "throw",
-            value: {
-              kind: "libCall",
-              fn: "error.new",
-              args: [
-                {
-                  kind: "strLit",
-                  value: `${what} is not representable in the target union (a value narrowed or asserted past it still held it)`,
-                  type: STRING,
-                  loc,
-                },
-              ],
-              type: { kind: "object", className: "%TypeError" },
-              loc,
-            },
-            loc,
-          },
+          // GH #86 review (SEMANTICS.md S122): a check Node never makes — it
+          // ends the program; the helper is shared, so no single line.
+          { kind: "runtimeFence", code: "SC1090", message: `${what} is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]`, loc },
         ],
         else_: null,
         loc,
@@ -5815,7 +5933,8 @@ export class Lowerer {
     });
     // Unreachable when tags are exhaustive (they are, by construction);
     // satisfies the all-paths-return rule and keeps a corrupted tag loud.
-    body.push({
+    // On the WasmGC lanes the one tag left is the slot's undefined.
+    body.push(this.undefSlots ? { kind: "return", value: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, loc } : {
       kind: "throw",
       value: { kind: "strLit", value: "scriptc: internal error: invalid union tag", type: STRING, loc },
       loc,
@@ -7132,6 +7251,8 @@ export class Lowerer {
           const pickedT = shape.bodyType;
           srcType = pickedT;
           srcRef = () => ({ kind: "varRef", localId: src.id, type: pickedT, loc });
+        } else if (ts.isObjectBindingPattern(decl.name)) {
+          paramPatternGuards(this, decl.name, srcRef, srcType, prologue);
         }
         this.lowerBindingPattern(decl.name, srcRef, srcType, true, prologue);
         return;

@@ -340,7 +340,7 @@ test("R26 DOMEX: SEMANTICS.md S007: an uncaught DOMException traps with the tier
   const src = "'use strict';\nconsole.log(\"before\");\nthrow new DOMException(\"fatal\", \"AbortError\");\n";
   const { stdout, stderr } = await runRowTrap("R26", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught AbortError: fatal\n");
+  expect(stderr).toBe("Uncaught DOMException [AbortError]: fatal\n");
 });
 
 test("R27 DOMEX: String and template of a caught DOMException and a caught atob error", async () => {
@@ -359,7 +359,7 @@ test("W01 DOMEX-WRITE: strict writes to a caught DOMException's name, message an
   // A named refusal (board #198); Node prints "threw true\nthrew true\nthrew true\nAbortError m 20\nthrew true\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("W01", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("W02 DOMEX-WRITE: sloppy writes to caught DOMExceptions refuse by name where Node ignores them", async () => {
@@ -367,7 +367,7 @@ test("W02 DOMEX-WRITE: sloppy writes to caught DOMExceptions refuse by name wher
   // A named refusal (board #198); Node prints "after InvalidCharacterError 5\nafter2 m AbortError\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("W02", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("W03 DOMEX-WRITE: board #198: strict writes to a caught atob DOMException refuse by name", async () => {
@@ -375,7 +375,7 @@ test("W03 DOMEX-WRITE: board #198: strict writes to a caught atob DOMException r
   // A named refusal (board #198); Node prints "threw true\nthrew true\nthrew true\nR M R: M\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("W03", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("W04 DOMEX-WRITE: a strict write through an untyped parameter refuses by name", async () => {
@@ -383,7 +383,7 @@ test("W04 DOMEX-WRITE: a strict write through an untyped parameter refuses by na
   // A named refusal (board #198); Node prints "before\nthrew true\nAbortError\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("W04", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("W05 DOMEX-WRITE: a sloppy write through an untyped parameter refuses by name", async () => {
@@ -391,30 +391,29 @@ test("W05 DOMEX-WRITE: a sloppy write through an untyped parameter refuses by na
   // A named refusal (board #198); Node prints "before\nm\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("W05", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's message is not supported yet (Node's message is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's message is not supported yet (Node's message is getter-only) [SC1090]\n");
 });
 
 test("W06 DOMEX-WRITE: a write in a .catch handler meets the existing named assignment fence", async () => {
   const src = "'use strict';\nPromise.reject(new DOMException(\"m\", \"AbortError\")).catch((e) => {\n  try { e.code = 9; console.log(\"wrote\", e.code); } catch (x) { console.log(\"threw\", x instanceof TypeError, x.message); }\n});\nconsole.log(\"sync\");\n";
-  // This tier's answer (the existing SC1090 run-time fence on member assignment, every lane); Node prints "sync\nthrew true Cannot set property code of  which has only a getter\n".
-  const { stdout, stderr, exitCode } = await runRow("W06", src, "cjs");
-  expect(stdout).toBe("sync\nthrew false assignment to non-variables are not supported yet [SC1090 at <ROW>:3]\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // This tier's answer (the existing SC1090 run-time fence on member assignment, every lane — since GH #86 it ends the program, SEMANTICS.md S122); Node prints "sync\nthrew true Cannot set property code of  which has only a getter\n".
+  const { stdout, stderr } = await runRowTrap("W06", src, "cjs");
+  expect(stdout).toBe("sync\n");
+  expect(stderr).toBe("tsinter: unsupported: assignment to non-variables are not supported yet [SC1090 at <ROW>:3]\n");
 });
 
 test("W07 DOMEX-WRITE: an Error-typed binding holding a DOMException: the name write refuses by name", async () => {
   const src = "let a: Error = new Error(\"a\");\na.message = \"b\";\nconsole.log(a.message);\ntry { atob(\"*\"); } catch (e) { console.log(\"atob threw\"); }\nlet d: Error = new DOMException(\"m\", \"AbortError\");\nconsole.log(\"before\");\nd.name = \"X\";\nconsole.log(\"after\", d.name);\nexport {};\n";
   const { stdout, stderr } = await runRowTrap("W07", src, "ts");
   expect(stdout).toBe("b\natob threw\nbefore\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("W08 DOMEX-WRITE: an Error-typed parameter holding a DOMException: the message write refuses by name", async () => {
   const src = "function f(e: Error): void { e.message = \"changed\"; }\ntry { atob(\"*\"); } catch (e) { console.log(\"x\"); }\nconst plain = new Error(\"p\");\nf(plain);\nconsole.log(plain.message);\nconst d = new DOMException(\"m\", \"AbortError\");\nconsole.log(\"before\");\nf(d);\nconsole.log(\"after\", d.message);\nexport {};\n";
   const { stdout, stderr } = await runRowTrap("W08", src, "ts");
   expect(stdout).toBe("x\nchanged\nbefore\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's message is not supported yet (Node's message is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's message is not supported yet (Node's message is getter-only) [SC1090]\n");
 });
 
 test("W09 DOMEX-WRITE: control, board #199: strict writes to an ordinary caught Error keep this tier's answer", async () => {
@@ -440,7 +439,7 @@ test("X01 DOMEX-WRITE: Object.assign of a name onto a caught DOMException refuse
   // A named refusal (board #198); Node prints "threw2 true\nthrewN true\nAbortError m\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("X01", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's name is not supported yet (Node's name is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's name is not supported yet (Node's name is getter-only) [SC1090]\n");
 });
 
 test("X02 DOMEX-WRITE: Object.assign of a message from a spread source onto a caught DOMException refuses by name", async () => {
@@ -448,7 +447,7 @@ test("X02 DOMEX-WRITE: Object.assign of a message from a spread source onto a ca
   // A named refusal (board #198); Node prints "before\nthrewN true\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("X02", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's message is not supported yet (Node's message is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's message is not supported yet (Node's message is getter-only) [SC1090]\n");
 });
 
 test("X03 DOMEX-WRITE: board #198: sloppy Object.assign of a code onto a caught atob DOMException refuses by name", async () => {
@@ -456,7 +455,7 @@ test("X03 DOMEX-WRITE: board #198: sloppy Object.assign of a code onto a caught 
   // A named refusal (board #198). Node's stdout is the same, and Node exits 1 with "TypeError: Cannot set property code of  which has only a getter".
   const { stdout, stderr } = await runRowTrap("X03", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's code is not supported yet (Node's code is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's code is not supported yet (Node's code is getter-only) [SC1090]\n");
 });
 
 test("X04 DOMEX-WRITE: Object.assign of an unrelated key then a code onto a caught DOMException refuses at the code", async () => {
@@ -464,7 +463,7 @@ test("X04 DOMEX-WRITE: Object.assign of an unrelated key then a code onto a caug
   // A named refusal (board #198); Node prints "before\nthrew true\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("X04", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: writing a DOMException's code is not supported yet (Node's code is getter-only)\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's code is not supported yet (Node's code is getter-only) [SC1090]\n");
 });
 
 test("X05 DOMEX-WRITE: control: an unrelated key assigns onto a caught TypeError and a caught DOMException", async () => {
@@ -836,11 +835,10 @@ test("R22 CLONE: a typed DOMException clones with its name and message, and the 
 // ----------------------------------------------------------------------
 // UNCLONE — values that do not clone: Node's DataCloneError, a named refusal, or an existing fence
 
-test("R43 UNCLONE: a function is a named refusal", async () => {
+test("R43 UNCLONE: a function throws Node's DataCloneError, quoting its source text (GH #86 review)", async () => {
   const src = "'use strict';\nconst c = (x) => structuredClone(x);\ntry { c(() => 1); console.log(\"cloned\"); } catch (e) { console.log(e.name, e.code, e.message); }\n";
-  // This tier's answer (a named refusal: Node's DataCloneError message embeds the function's source text); Node prints "DataCloneError 25 () => 1 could not be cloned.\n".
   const { stdout, stderr, exitCode } = await runRow("R43", src, "cjs");
-  expect(stdout).toBe("Error undefined structuredClone of a function value is not supported yet\n");
+  expect(stdout).toBe("DataCloneError 25 () => 1 could not be cloned.\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -863,11 +861,10 @@ test("R45 UNCLONE: a typed promise, alone and nested, throws DataCloneError", as
 
 test("R46 UNCLONE: a symbol stops at its crossing into a dynamic value", async () => {
   const src = "'use strict';\nconst c = (x) => structuredClone(x);\ntry { c(Symbol(\"s\")); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the existing SC1101 crossing fence); Node prints "DataCloneError Symbol(s) could not be cloned.\n".
-  const { stdout, stderr, exitCode } = await runRow("R46", src, "cjs");
-  expect(stdout).toBe("Error converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:3]\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // This tier's answer (the existing SC1101 crossing fence, which ends the program — GH #86, SEMANTICS.md S122); Node prints "DataCloneError Symbol(s) could not be cloned.\n".
+  const { stdout, stderr } = await runRowTrap("R46", src, "cjs");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:3]\n");
 });
 
 test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", async () => {
@@ -875,7 +872,7 @@ test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", asy
   // This tier's answer (the existing SC2020 fence); Node prints "true 0\na+ g\n2\ntrue\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R47", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: 'new Date' is part of the standard library types but has no scriptc lowering yet [SC2020 at <ROW>:3]\n");
+  expect(stderr).toBe("tsinter: unsupported: 'new Date' is part of the standard library types but has no scriptc lowering yet [SC2020 at <ROW>:3]\n");
 });
 
 test("R48 UNCLONE: a class instance stops at its crossing", async () => {
@@ -883,7 +880,7 @@ test("R48 UNCLONE: a class instance stops at its crossing", async () => {
   // This tier's answer (the existing SC1101 crossing fence); Node prints "false 1 {\"x\":1}\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R48", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
 });
 
 // ----------------------------------------------------------------------
@@ -1014,7 +1011,7 @@ test("R65 SPREAD: a Set stops at its crossing into a dynamic value", async () =>
   // This tier's answer (the existing SC1101 crossing fence); Node prints "2\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R65", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
 });
 
 test("R66 SPREAD: a Map stops at its crossing into a dynamic value", async () => {
@@ -1022,7 +1019,7 @@ test("R66 SPREAD: a Map stops at its crossing into a dynamic value", async () =>
   // This tier's answer (the existing SC1101 crossing fence); Node prints "1\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R66", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
 });
 
 test("R67 SPREAD: a generator stops at its crossing into a dynamic value", async () => {
@@ -1030,7 +1027,7 @@ test("R67 SPREAD: a generator stops at its crossing into a dynamic value", async
   // This tier's answer (the existing SC1101 crossing fence); Node prints "2\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R67", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:5]\n");
+  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:5]\n");
 });
 
 test("R68 SPREAD: the spread TypeErrors of a forwarding call", async () => {
@@ -1120,14 +1117,22 @@ test("R77 ASSIGN: plain sources only", async () => {
   expect(exitCode).toBe(0);
 });
 
-test("R78 ASSIGN: array, function and Uint8Array targets refuse by name", async () => {
-  const src = "'use strict';\nfunction t(x) { try { const r = Object.assign(x, ...[{ a: 1 }]); return typeof r + \":\" + JSON.stringify(r); } catch (e) { return e.message; } }\nconsole.log(t([1]));\nconsole.log(t(() => 0));\nconsole.log(t(new Uint8Array(1)));\n";
-  // This tier's answer (a named refusal; the two-argument form keeps board #193's answer); Node prints "object:[1]\nfunction:undefined\nobject:{\"0\":0,\"a\":1}\n".
-  const { stdout, stderr, exitCode } = await runRow("R78", src, "cjs");
-  expect(stdout).toBe("Object.assign onto a non-plain-object target is not supported yet\nObject.assign onto a non-plain-object target is not supported yet\nObject.assign onto a non-plain-object target is not supported yet\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
-});
+// R78: one row per target (GH #86: the fence ends the program, SEMANTICS.md
+// S122, so only the first target of a combined row would ever be reached).
+for (const [id, target, nodeSays] of [
+  ["R78a", "[1]", "object:[1]"],
+  ["R78b", "() => 0", "function:undefined"],
+  ["R78c", "new Uint8Array(1)", 'object:{"0":0,"a":1}'],
+] as const) {
+  test(`${id} ASSIGN: a ${target} target refuses by name`, async () => {
+    const src = `'use strict';\nfunction t(x) { try { const r = Object.assign(x, ...[{ a: 1 }]); return typeof r + ":" + JSON.stringify(r); } catch (e) { return e.message; } }\nconsole.log("before");\nconsole.log(t(${target}));\n`;
+    // This tier's answer (a named refusal; the two-argument form keeps board #193's answer); Node prints "before\n<nodeSays>\n".
+    void nodeSays;
+    const { stdout, stderr } = await runRowTrap(id, src, "cjs");
+    expect(stdout).toBe("before\n");
+    expect(stderr).toBe("tsinter: unsupported: Object.assign onto a non-plain-object target is not supported yet [SC1090]\n");
+  });
+}
 
 test("R79 ASSIGN: a null-prototype object as target and as source", async () => {
   const src = "'use strict';\nconst np = Object.create(null);\nnp.a = 1;\nconst plain = Object.assign({}, ...[np]);\nconsole.log(JSON.stringify(plain), plain);\nconst t = Object.assign(Object.create(null), ...[{ b: 2 }]);\nconsole.log(t);\n";
@@ -1142,7 +1147,7 @@ test("A01 ASSIGN: an array target of the spread form refuses by name", async () 
   // This tier's answer (a named refusal; the two-argument form keeps board #193's answer); Node prints "[9,2] [9,2]\nobject object object\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("A01", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: Object.assign onto a non-plain-object target is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: Object.assign onto a non-plain-object target is not supported yet [SC1090]\n");
 });
 
 test("A02 ASSIGN: control, board #193: the two-argument form on array and scalar targets", async () => {
@@ -1235,7 +1240,7 @@ test("R87a NULLPROTO: String(o) refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87a", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87b NULLPROTO: a template refuses by name", async () => {
@@ -1243,7 +1248,7 @@ test("R87b NULLPROTO: a template refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87b", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87c NULLPROTO: o + \"\" refuses by name", async () => {
@@ -1251,7 +1256,7 @@ test("R87c NULLPROTO: o + \"\" refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87c", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87d NULLPROTO: \"x\" + o refuses by name", async () => {
@@ -1259,7 +1264,7 @@ test("R87d NULLPROTO: \"x\" + o refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87d", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87e NULLPROTO: [o].join() refuses by name", async () => {
@@ -1267,7 +1272,7 @@ test("R87e NULLPROTO: [o].join() refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87e", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87f NULLPROTO: a nested array's toString refuses by name", async () => {
@@ -1275,28 +1280,28 @@ test("R87f NULLPROTO: a nested array's toString refuses by name", async () => {
   // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87f", src, "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87g NULLPROTO: a template of a caught null-prototype object refuses by name", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log(`T ${e}`); }\n";
   const { stdout, stderr } = await runRowTrap("R87g", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87h NULLPROTO: String of a caught null-prototype object refuses by name", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log(\"S\", String(e)); }\n";
   const { stdout, stderr } = await runRowTrap("R87h", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87i NULLPROTO: a template in a .catch handler over a rejected null-prototype object", async () => {
   const src = "'use strict';\nPromise.reject(Object.create(null)).catch((e) => console.log(`R ${e}`));\n";
   const { stdout, stderr } = await runRowTrap("R87i", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87j NULLPROTO: control: a caught plain object reads [object Object]", async () => {
@@ -1312,14 +1317,14 @@ test("R87k NULLPROTO: concatenation with a caught null-prototype object refuses 
   // This tier's answer (the named ToString refusal, uncatchable where Node's TypeError is caught); Node prints "x\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R87k", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87l NULLPROTO: [e].join() over a caught null-prototype object refuses by name", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log([e].join()); }\n";
   const { stdout, stderr } = await runRowTrap("R87l", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R87m NULLPROTO: control: a rejected plain object through a .catch handler", async () => {
@@ -1330,13 +1335,22 @@ test("R87m NULLPROTO: control: a rejected plain object through a .catch handler"
   expect(exitCode).toBe(0);
 });
 
-test("R88 NULLPROTO: o.toString() throws; hasOwnProperty and valueOf meet the existing method fence", async () => {
-  const src = "'use strict';\nconst o = Object.create(null);\nfor (const f of [() => o.toString(), () => o.hasOwnProperty(\"a\"), () => o.valueOf()]) {\n  try { console.log(f()); } catch (e) { console.log(e.name, e.message); }\n}\n";
-  // This tier's answer (the existing SC1090 method-call fence on lines 2 and 3); Node prints "TypeError o.toString is not a function\nTypeError o.hasOwnProperty is not a function\nTypeError o.valueOf is not a function\n".
-  const { stdout, stderr, exitCode } = await runRow("R88", src, "cjs");
-  expect(stdout).toBe("TypeError o.toString is not a function\nError method calls like 'o.hasOwnProperty' is not supported yet [SC1090 at <ROW>:3]\nError method calls like 'o.valueOf' is not supported yet [SC1090 at <ROW>:3]\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+// R88: one row per fenced method (GH #86: the method-call fence ends the
+// program, SEMANTICS.md S122, so a combined row stops at the first one).
+test("R88 NULLPROTO: o.toString() throws; hasOwnProperty meets the existing method fence", async () => {
+  const src = "'use strict';\nconst o = Object.create(null);\nfor (const f of [() => o.toString(), () => o.hasOwnProperty(\"a\")]) {\n  try { console.log(f()); } catch (e) { console.log(e.name, e.message); }\n}\n";
+  // This tier's answer (the existing SC1090 method-call fence on line 3); Node prints "TypeError o.toString is not a function\nTypeError o.hasOwnProperty is not a function\n".
+  const { stdout, stderr } = await runRowTrap("R88", src, "cjs");
+  expect(stdout).toBe("TypeError o.toString is not a function\n");
+  expect(stderr).toBe("tsinter: unsupported: method calls like 'o.hasOwnProperty' is not supported yet [SC1090 at <ROW>:3]\n");
+});
+
+test("R88b NULLPROTO: valueOf meets the existing method fence", async () => {
+  const src = "'use strict';\nconst o = Object.create(null);\nfor (const f of [() => o.valueOf()]) {\n  try { console.log(f()); } catch (e) { console.log(e.name, e.message); }\n}\n";
+  // This tier's answer (the existing SC1090 method-call fence on line 3); Node prints "TypeError o.valueOf is not a function\n".
+  const { stdout, stderr } = await runRowTrap("R88b", src, "cjs");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: method calls like 'o.valueOf' is not supported yet [SC1090 at <ROW>:3]\n");
 });
 
 test("R89 NULLPROTO: a null-prototype object as a computed key refuses by name", async () => {
@@ -1344,7 +1358,7 @@ test("R89 NULLPROTO: a null-prototype object as a computed key refuses by name",
   // This tier's answer (the named ToString refusal); Node prints "TypeError Cannot convert object to primitive value\nTypeError Cannot convert object to primitive value\nTypeError Cannot convert object to primitive value\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R89", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 test("R89b NULLPROTO: board #204 (closed): String(e) === undefined still converts, and the conversion refuses by name", async () => {
@@ -1352,7 +1366,7 @@ test("R89b NULLPROTO: board #204 (closed): String(e) === undefined still convert
   // This tier's answer (the named ToString refusal); Node prints "" and String(e) throws a TypeError (exit 1).
   const { stdout, stderr } = await runRowTrap("R89b", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
 });
 
 // ----------------------------------------------------------------------

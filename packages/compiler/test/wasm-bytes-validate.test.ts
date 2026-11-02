@@ -521,6 +521,11 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
       pushMessage(c);
       c.drop();
     },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
     excKind: () => excKindG,
     strCmpU16: () => strCmpU16Fn,
     strSlice: () => strSliceFn,
@@ -553,6 +558,11 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
       pushMessage(c);
       c.drop();
     },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
     excKind: () => excKindG,
     clearExc: (c) => {
       c.i32Const(0);
@@ -579,6 +589,11 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     dyn: () => dyn,
     inspF64: () => f64ToStrFn,
     throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    // GH #86: the fence-fatal hook, stubbed the same structural way
+    fence: (c, pushMessage) => {
       pushMessage(c);
       c.drop();
     },

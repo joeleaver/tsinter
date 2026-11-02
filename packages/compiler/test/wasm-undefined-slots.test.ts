@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 const run = promisify(execFile);
 const scratch = mkdtempSync(join(tmpdir(), "tsinter-unit-u-"));
@@ -394,9 +394,13 @@ describe("unit U: the same rows on the wasm-native lane", () => {
 });
 
 /* The loud residue (S119 (b)/(c)): where Node tells a HOLE from undefined
- * — printing, the hole-skipping callbacks, indexOf(undefined) — or sorts
- * undefined last, this tier throws a named, catchable Error. Node's own
- * answer is shown beside each row's expectation. */
+ * — printing, the hole-skipping callbacks, indexOf(undefined), `in` and
+ * for-in — or sorts undefined last, this tier stops at a named fence. Since
+ * GH #86 (SEMANTICS.md S122) the fence ENDS the program: stderr carries
+ * `tsinter: unsupported: <operation> over an array … [SC1090 at <file>:<line>]`,
+ * the module traps (exit 1), and the program's own catch never runs — so
+ * each fence is its own row (they were one try/catch row per family).
+ * Node's own answer is shown beside each row. */
 describe("unit U: the hole and sort fences are loud and named", () => {
   const fenced = async (id: string, src: string): Promise<string> => {
     const file = join(scratch, `${id}.ts`);
@@ -405,84 +409,107 @@ describe("unit U: the hole and sort fences are loud and named", () => {
     expect(r.code).toBe(0);
     return r.stdout;
   };
-  test("printing / forEach / map / indexOf(undefined) over an array that still holds a hole", async () => {
-    // Node: [ <3 empty items>, 7 ]; forEach visits 7 only; map keeps the holes.
-    const out = await fenced(
-      "f1",
-      `const a: number[] = [];
+  /** A row that reaches a fence: the output before it, and its line with
+   * the row's own path read as `<F>`. */
+  const fencedTrap = async (id: string, src: string): Promise<{ stdout: string; stderr: string }> => {
+    const file = join(scratch, `${id}.ts`);
+    writeFileSync(file, `${src}\n`);
+    const res = await compile(file, { outPath: join(scratch, `${id}.wasm`), outDir: scratch, backend: "wasm" });
+    if (!res.ok) throw new Error(`${id} refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
+    const r = await runWasmToTrap(res.binaryPath);
+    return { stdout: String(r.stdout), stderr: String(r.stderr).split(file).join("<F>") };
+  };
+  const HOLES = (what: string, line: number): string =>
+    `tsinter: unsupported: ${what} over an array that may hold holes (a write past an array's end leaves undefined where Node keeps a hole, ` +
+    `and ${what} tells them apart — SEMANTICS.md S119) [SC1090 at <F>:${line}]\n`;
+  // Node: [ <3 empty items>, 7 ]; forEach visits 7 only; map keeps the
+  // holes; indexOf(undefined) skips them (-1).
+  for (const [what, call] of [
+    ["printing (util.inspect)", "console.log(a);"],
+    ["Array.prototype.forEach", "a.forEach((x) => console.log(x));"],
+    ["Array.prototype.map", "console.log(a.map((x) => x + 1).length);"],
+    ["Array.prototype.indexOf", "console.log(a.indexOf(a[0]));"],
+  ] as const) {
+    test(`${what} over an array that still holds a hole`, async () => {
+      const r = await fencedTrap(
+        `f1-${what.replace(/\W+/g, "_")}`,
+        `const a: number[] = [];
 a[3] = 7;
-const tries: [string, () => void][] = [
-  ["print", () => console.log(a)],
-  ["forEach", () => a.forEach((x) => console.log(x))],
-  ["map", () => console.log(a.map((x) => x + 1).length)],
-  ["indexOf", () => console.log(a.indexOf(a[0]))],
-];
-for (const [what, f] of tries) {
-  try {
-    f();
-    console.log(what, "ran");
-  } catch (e) {
-    console.log(what, (e as Error).message.split(" over ")[0]);
+console.log(a.indexOf(7));
+try {
+  ${call}
+  console.log("ran");
+} catch (e) {
+  console.log("caught");
+}`,
+      );
+      expect(r).toEqual({ stdout: "3\n", stderr: HOLES(what, 5) });
+    });
   }
-}
-console.log(a.indexOf(7));`,
-    );
-    expect(out).toBe(
-      "print printing (util.inspect)\nforEach Array.prototype.forEach\nmap Array.prototype.map\nindexOf Array.prototype.indexOf\n3\n",
-    );
-  });
-  test("GH #85: an elision is a hole — forEach and map over [1, , 3] are fenced, not run over the hole", async () => {
-    // Node: forEach prints `0 1` and `2 3`; map answers [ 2, <1 empty item>, 6 ].
-    const out = await fenced(
-      "f85",
+  test("GH #85: an elision is a hole — forEach over [1, , 3] is fenced, not run over the hole", async () => {
+    // Node: forEach prints `0 1` and `2 3`.
+    const r = await fencedTrap(
+      "f85a",
       `const a: (number | undefined)[] = [1, , 3];
+console.log(a.length, a[1]);
 try {
   a.forEach((v, i) => console.log(i, v));
 } catch (e) {
-  console.log((e as Error).message.split(" over ")[0]);
-}
+  console.log("caught");
+}`,
+    );
+    expect(r).toEqual({ stdout: "3 undefined\n", stderr: HOLES("Array.prototype.forEach", 4) });
+  });
+  test("GH #85: an elision is a hole — map over [1, , 3] is fenced", async () => {
+    // Node: map answers [ 2, <1 empty item>, 6 ].
+    const r = await fencedTrap(
+      "f85b",
+      `const a: (number | undefined)[] = [1, , 3];
 try {
   console.log(a.map((v) => (v ?? 0) * 2));
 } catch (e) {
-  console.log((e as Error).message.split(" over ")[0]);
-}
-console.log(a.length, a[1]);`,
+  console.log("caught");
+}`,
     );
-    expect(out).toBe("Array.prototype.forEach\nArray.prototype.map\n3 undefined\n");
+    expect(r).toEqual({ stdout: "", stderr: HOLES("Array.prototype.map", 3) });
   });
-  test("the 'in' operator and for-in over an array that holds a hole", async () => {
-    // Node: `0 in a` is false and for-in visits 3 only.
-    const out = await fenced(
-      "fin",
+  test("the 'in' operator over an array that holds a hole", async () => {
+    // Node: `0 in a` is false.
+    const r = await fencedTrap(
+      "fin-a",
       `const a: number[] = [];
 a[3] = 7;
 try {
   console.log(0 in a);
 } catch (e) {
-  console.log((e as Error).message.split(" over ")[0]);
-}
+  console.log("caught");
+}`,
+    );
+    expect(r).toEqual({ stdout: "", stderr: HOLES("the 'in' operator", 4) });
+  });
+  test("for-in over an array that holds a hole", async () => {
+    // Node: for-in visits 3 only.
+    const r = await fencedTrap(
+      "fin-b",
+      `const a: number[] = [];
+a[3] = 7;
 try {
   for (const k in a) console.log(k);
 } catch (e) {
-  console.log((e as Error).message.split(" over ")[0]);
+  console.log("caught");
 }`,
     );
-    expect(out).toBe("the 'in' operator\nfor-in\n");
+    expect(r).toEqual({ stdout: "", stderr: HOLES("for-in", 4) });
   });
-  test("structuredClone of a value holding a plain-typed undefined throws the checked crossing's TypeError (S119 (g))", async () => {
-    // Node: { a: undefined, s: 'x' }.
+  test("structuredClone of a value holding a plain-typed undefined clones it (GH #86 re-review)", async () => {
     const out = await fenced(
       "fsc",
       `const xs: number[] = [1];
 interface P { a: number; s: string }
 const o: P = { a: xs[3], s: "x" };
-try {
-  console.log(structuredClone(o));
-} catch (e) {
-  console.log((e as Error).name, (e as Error).message);
-}`,
+console.log(structuredClone(o));`,
     );
-    expect(out).toBe("TypeError expected number at $.a, got undefined\n");
+    expect(out).toBe("{ a: undefined, s: 'x' }\n");
   });
   test("a program that never made a hole prints its explicit undefineds (no fence)", async () => {
     const out = await fenced(

@@ -174,7 +174,7 @@
       "name": "operations on 'unknown' values",
       "status": "unsupported",
       "code": "SC1100",
-      "note": "validate with 'as <type>' first — the cast checks the dynamic value at runtime and throws on mismatch"
+      "note": "validate with 'as <type>' first — the cast checks the dynamic value at runtime and a mismatch ends the program"
     },
     {
       "id": "diagnostic.sc1101",
@@ -1140,13 +1140,20 @@
       "kind": "node-builtin",
       "name": "os.EOL",
       "status": "static",
-      "note": "constant value read"
+      "note": "constant value read; the host OS's value on the wasm and wasm-native lanes (SEMANTICS.md S118)"
     },
     {
       "id": "node-builtin.os.homedir",
       "kind": "node-builtin",
       "name": "os.homedir",
       "status": "static"
+    },
+    {
+      "id": "node-builtin.os.hostChoice",
+      "kind": "node-builtin",
+      "name": "host OS constants (os.EOL, path.sep, path.delimiter)",
+      "status": "static",
+      "note": "the run-time choice of a constant's value by the host OS on the wasm and wasm-native lanes (SEMANTICS.md S118)"
     },
     {
       "id": "node-builtin.os.networkInterfaces",
@@ -1208,7 +1215,7 @@
       "kind": "node-builtin",
       "name": "path.delimiter",
       "status": "static",
-      "note": "constant value read"
+      "note": "constant value read; the host OS's value on the wasm and wasm-native lanes (SEMANTICS.md S118)"
     },
     {
       "id": "node-builtin.path.dirname",
@@ -1332,7 +1339,7 @@
       "kind": "node-builtin",
       "name": "path.sep",
       "status": "static",
-      "note": "constant value read"
+      "note": "constant value read; the host OS's value on the wasm and wasm-native lanes (SEMANTICS.md S118)"
     },
     {
       "id": "node-builtin.path.toNamespacedPath",

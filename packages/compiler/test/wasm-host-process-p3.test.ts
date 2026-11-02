@@ -780,17 +780,15 @@ describe("P3 forced-host: host-fact reads", () => {
     expect(stdout).toBe("4242 4343\n");
   });
   // `process.<stream>.isTTY` is typed BOOL here (lower-builtins.ts's own
-  // "process.isTTY" libCall, `type: BOOL`), not Node's own `boolean |
-  // undefined` — a pre-existing, out-of-P3-scope simplification (matches
-  // SEMANTICS.md's stderr-is-always-a-pipe framing nearby): this tier
-  // always answers a real boolean, never returns `undefined` for a
-  // non-TTY stream the way Node's own Socket-backed stdio does.
-  test("isTTY: forced true for fd 0, false for fd 1/2 (BOOL-typed, never undefined)", async () => {
+  // "process.isTTY" libCall, `type: BOOL`); GH #88: a non-TTY stream
+  // answers the bool slot's undefined (Unit U, SEMANTICS.md S119), Node's
+  // missing property — a TTY answers true.
+  test("isTTY: forced true for fd 0, undefined for fd 1/2 (Node's non-TTY stream has no isTTY)", async () => {
     const bin = await buildProgram(`
       console.log(process.stdin.isTTY, process.stdout.isTTY, process.stderr.isTTY);
     `);
     const { stdout } = await runForced(bin, { isTTY: (fd) => (fd === 0 ? 1 : 0) });
-    expect(stdout).toBe("true false false\n");
+    expect(stdout).toBe("true undefined undefined\n");
   });
   test("columns: the -1 sentinel takes the undefined union arm", async () => {
     const bin = await buildProgram(`

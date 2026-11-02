@@ -1683,8 +1683,8 @@ export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new 
  * non-global regex the matched slice [whole, ...captures] (RegExpBuiltinExec,
  * lastIndex-aware when sticky), for a global one every whole match — wrapped
  * into the array arm, or the interned null-arm instance for no match. A
- * NONPARTICIPATING capture holds "" where Node's slot is undefined
- * (SEMANTICS.md S064). Never throws. */
+ * NONPARTICIPATING capture holds Node's undefined in an undefSlots module
+ * (the WasmGC lanes) and "" elsewhere (SEMANTICS.md S064). Never throws. */
 export type IrRegexIntrinsicMethod =
   | "test"
   | "match"
@@ -1841,6 +1841,14 @@ export type IrLibFn =
    * own-member presence, ARR answers 'length'/a valid index — exactly
    * the compile-time dynHasKey fold, per value. Never throws. */
   | "dyn.hasKey"
+  /** A dynamic value reaching a builtin's string parameter (WasmGC lanes,
+   * GH #86 review): a string passes; anything else throws Node's
+   * ERR_INVALID_ARG_TYPE for that parameter. Args: the value, the parameter
+   * name, Node's "must be ..." text, and 1 when the parameter also takes
+   * a Buffer/TypedArray/URL (2: a file descriptor too) — those, which this
+   * lowering has no form for, are a named fence, not an error Node does
+   * not throw. */
+  | "dyn.argStr"
   /** Object.defineProperties over dyn values (args: target, descriptors —
    * both borrowed dyn; result: the target, +1 — JS's return value).
    * Value descriptors become plain own properties on OBJ and FUNC targets
@@ -4086,6 +4094,12 @@ export type IrLibFn =
    * .isTTY reads). A real boolean: false where Node's non-TTY streams
    * expose undefined (documented divergence). Never throws. */
   | "process.isTTY"
+  /** Unit U (WasmGC lanes, SEMANTICS.md S119 (i)): is a plain record field
+   * whose read holds undefined (the arg) a MISSING key rather than an
+   * explicit undefined? False when no checked value lacked a key; true
+   * when one did and nothing wrote a may-be-undefined field; a named fence
+   * when both happened. */
+  | "undef.fieldAbsent"
   /** process.stdin.destroy(): a deliberate no-op (no stream machinery
    * exists to tear down; documented in SEMANTICS.md). */
   | "process.stdinDestroy"
@@ -4335,7 +4349,15 @@ export type IrExpr =
    * frontend pre-coerces plain arm operands into the union, so both sides
    * arrive union-typed). */
   | { kind: "logical"; op: "&&" | "||"; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
-  | { kind: "strConcat"; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
+  /** `undefNaN` (WasmGC lanes only, Unit U — SEMANTICS.md S119 (h)): JS
+   * `+` whose string-typed side may hold the slot undefined while the
+   * other side is a number/boolean ("left"/"right": that side undefined)
+   * or another such string ("both": both undefined) — Node's answer is
+   * the NUMBER NaN there, which this string result cannot hold, so the
+   * backend ends the program at the pre-rendered fence `message`. `when`:
+   * the other operand is a union, and this pure test says it does not
+   * hold a string at run time. */
+  | { kind: "strConcat"; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc; undefNaN?: { side: "left" | "right" | "both"; message: string; when?: IrExpr } }
   | { kind: "strEq"; negated: boolean; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
   /** String ordering. Ordinary source comparisons omit `utf16` and retain
    * scriptc's documented code-point order; the default Array sort comparator
@@ -4407,6 +4429,12 @@ export type IrExpr =
       method: IrStrIntrinsicMethod;
       receiver: IrExpr;
       args: IrExpr[];
+      /** WasmGC lanes, on charAt only (Unit U, SEMANTICS.md S119): `s[i]`
+       * and `s.at(i)`, whose out-of-range answer is `undefined`, not "":
+       * the backend turns charAt's empty answer into the string slot's
+       * undefined, and for "index" also a fractional or NaN index, which
+       * names no element. args[0] is then a pure read. */
+      undefOob?: "index" | "at";
       type: IrType;
       loc: SrcLoc;
     }
@@ -4810,7 +4838,7 @@ export type IrExpr =
   | { kind: "recordLit"; fields: { name: string; value: IrExpr; overflow?: true; drop?: true }[]; type: IrType; loc: SrcLoc }
   /** Record field read `r.f` — mirrors `fieldGet`: refcounted fields come
    * out retained (+1). */
-  | { kind: "recordGet"; obj: IrExpr; shapeId: string; field: string; type: IrType; loc: SrcLoc }
+  | { kind: "recordGet"; obj: IrExpr; shapeId: string; field: string; spreadCopy?: true; type: IrType; loc: SrcLoc }
   /** Dynamic-keyed record read `r[k]` (string key, evaluated at runtime).
    * Declared fields are tried FIRST (an emitted string-switch — field
    * access exactness is preserved: a declared name always answers from the
@@ -4845,8 +4873,12 @@ export type IrExpr =
    * TypeError), the interned signature key (dynCheck's exact-unwrap fast
    * path), and `fnName` — the best-effort static spelling for inspect
    * ([Function: name]) and Node-shaped call errors. The operand is
-   * borrowed; the result is owned (+1). Never throws. */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; type: IrType; loc: SrcLoc }
+   * borrowed; the result is owned (+1). Never throws. `srcText` (only in a
+   * module that calls structuredClone): a function value's source text,
+   * which Node's DataCloneError quotes. `fnProto`: a function value whose
+   * kind is known — 1 it owns `prototype`, 2 it does not (arrows, methods,
+   * async functions). */
+  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: 1 | 2; type: IrType; loc: SrcLoc }
   /** Island value → dyn conversion (`type` is always dyn; the operand
    * is always jsval): the jsval→dyn crossing — an 'any'-typed engine
    * value flowing into an 'unknown'/'object'/JS-residue slot wraps BY

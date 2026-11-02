@@ -3681,6 +3681,9 @@ const TIER_FLOOR: string[] = [
   // (SEMANTICS.md S120) — new programs passing from their first run.
   "2826-locale-compare-collation.ts",
   "2827-locale-compare-sort.ts",
+  // GH #91: `k in obj` with a runtime key on a dynamic value (dyn.hasKey)
+  // — a new program, passing from its first run.
+  "2845-in-dynamic-runtime-key.mjs",
 ];
 
 interface RunResult {
@@ -8686,13 +8689,32 @@ describe("INC-29 U1 node:net rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("N1-REG-02 S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and Object.assign onto or from one are named Errors, and so is a non-utf8 or unknown encoding to a modelled write or end", async () => {
-    const r = await runN1Source("// S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and\n// Object.assign (onto one or from one) are named Errors, and so is an\n// encoding argument other than utf8 to a modelled write or end.\n'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst srv = net.createServer();\nconst c = net.connect(1, '127.0.0.1');\nc.on('error', function () {});\nconst s = wrap(function (x) { return x; })(c);\nconst v = wrap(function (x) { return x; })(srv);\nfunction t(name, f) {\n  try { console.log(name, String(f())); } catch (e) { console.log(name, e.name, e.message); }\n}\nt('in', () => 'on' in s);\nt('in server', () => 'close' in v);\nt('hasOwn', () => Object.hasOwn(s, 'connecting'));\nt('assign from', () => Object.keys(Object.assign({}, s)).length);\nt('assign onto', () => Object.assign(s, { zz: 1 }) === s);\nt('assign from server', () => Object.keys(Object.assign({}, v)).length);\nt('write latin1', () => s.write('x', 'latin1'));\nt('write unknown encoding', () => s.write('x', 'nope'));\nt('end hex', () => s.end('00', 'hex') === s);\nc.destroy();\n", "cjs");
+  test("N1-REG-02 S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and Object.assign onto or from one, and a non-utf8 or unknown encoding to a modelled write or end, are named fences that end the program (GH #86, SEMANTICS.md S122) — one program per case", async () => {
     // Node v24.18.1 prints: "in true\nin server true\nhasOwn true\nassign from 16\nassign onto true\nassign from server 15\nwrite latin1 true\nwrite unknown encoding TypeError Unknown encoding: nope\nend hex true\n"
-    expect(r.stdout.toString("utf8")).toBe("in Error 'in' or Object.hasOwn on a net handle is not supported yet\nin server Error 'in' or Object.hasOwn on a net handle is not supported yet\nhasOwn Error 'in' or Object.hasOwn on a net handle is not supported yet\nassign from Error Object.assign from a net handle is not supported yet\nassign onto Error Object.assign onto a net handle is not supported yet\nassign from server Error Object.assign from a net handle is not supported yet\nwrite latin1 Error 'write' with an encoding other than utf8 on a net handle is not supported yet\nwrite unknown encoding Error 'write' with an encoding other than utf8 on a net handle is not supported yet\nend hex Error 'end' with an encoding other than utf8 on a net handle is not supported yet\n");
-    expect(r.stderr.toString("utf8")).toBe("");
-    expect(r.exitCode).toBe(0);
-  }, 60000);
+    // GH #86: a fence ends the program, so each case runs alone after the
+    // same prelude; the program's own try/catch never sees it.
+    const pre = "// S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and\n// Object.assign (onto one or from one) are named Errors, and so is an\n// encoding argument other than utf8 to a modelled write or end.\n'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst srv = net.createServer();\nconst c = net.connect(1, '127.0.0.1');\nc.on('error', function () {});\nconst s = wrap(function (x) { return x; })(c);\nconst v = wrap(function (x) { return x; })(srv);\nfunction t(name, f) {\n  try { console.log(name, String(f())); } catch (e) { console.log(name, e.name, e.message); }\n}\n";
+    const cases: [string, string][] = [["t('in', () => 'on' in s);", "'in' or Object.hasOwn on a net handle is not supported yet"], ["t('in server', () => 'close' in v);", "'in' or Object.hasOwn on a net handle is not supported yet"], ["t('hasOwn', () => Object.hasOwn(s, 'connecting'));", "'in' or Object.hasOwn on a net handle is not supported yet"], ["t('assign from', () => Object.keys(Object.assign({}, s)).length);", "Object.assign from a net handle is not supported yet"], ["t('assign onto', () => Object.assign(s, { zz: 1 }) === s);", "Object.assign onto a net handle is not supported yet"], ["t('assign from server', () => Object.keys(Object.assign({}, v)).length);", "Object.assign from a net handle is not supported yet"], ["t('write latin1', () => s.write('x', 'latin1'));", "'write' with an encoding other than utf8 on a net handle is not supported yet"], ["t('end hex', () => s.end('00', 'hex') === s);", "'end' with an encoding other than utf8 on a net handle is not supported yet"]];
+    for (const [line, msg] of cases) {
+      const r = await runN1Source(pre + line + "\nc.destroy();\n", "cjs");
+      expect({ line, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({
+        line,
+        stdout: "",
+        stderr: `tsinter: unsupported: ${msg} [SC1090]\n`,
+        exitCode: 1,
+      });
+    }
+    // GH #86 review: an encoding Buffer does not know is Node's own
+    // ERR_UNKNOWN_ENCODING TypeError (Writable.write's ladder), catchable;
+    // so are a truthy number and boolean; a falsy one and "" are the
+    // default utf8 — Node's answers, as Node prints them.
+    const enc = await runN1Source(pre + "t('write unknown encoding', () => s.write('x', 'nope'));\nt('write number encoding', () => s.write('x', 5));\nt('write true encoding', () => s.write('x', true));\nt('write empty encoding', () => s.write('x', ''));\nt('write false encoding', () => s.write('x', false));\nt('end unknown encoding', () => s.end('x', 'nope') === s);\nc.destroy();\n", "cjs");
+    expect({ stdout: enc.stdout.toString("utf8"), stderr: enc.stderr.toString("utf8"), exitCode: enc.exitCode }).toEqual({
+      stdout: "write unknown encoding TypeError Unknown encoding: nope\nwrite number encoding TypeError Unknown encoding: 5\nwrite true encoding TypeError Unknown encoding: true\nwrite empty encoding true\nwrite false encoding true\nend unknown encoding TypeError Unknown encoding: nope\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  }, 180000);
   test("N1-REG-03 S037 (INC-29 U1 amendment): slice() of a Buffer that crossed an untyped call is a Uint8Array's slice here, a copy (Node: a view, so a write through it shows in the source); a 'data' chunk keeps the Buffer flag and its slice is a view", async () => {
     const r = await runN1Source("// S037's INC-29 U1 amendment: a Buffer that crossed an untyped call is a\n// Uint8Array on this side, so its slice() is a copy (Node: a view, and the\n// write through it shows in the source). A 'data' chunk keeps the Buffer\n// flag, and its slice is a view.\n'use strict';\nconst net = require('net');\nfunction pass(x) { return x; }\nconst raw = pass(Buffer.from('abcd'));\nconst p = raw.slice(1, 3);\np[0] = 65;\nconsole.log('through the slice:', raw[1]);\nconst server = net.createServer(function (sock) {\n  sock.end('wxyz');\n});\nserver.listen(0, function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  c.on('data', function (d) {\n    const q = d.slice(1, 3);\n    q[0] = 90;\n    console.log('chunk', d.toString(), q.length);\n  });\n  c.on('end', function () { server.close(); });\n});\n", "cjs");
     // Node v24.18.1 prints "through the slice: 65" (the view).
@@ -8810,20 +8832,43 @@ describe("INC-29 U2 node:http rows", () => {
     const r = await runN2("main.cjs", "'use strict';\n// Header validation and the headers-sent errors, each caught and printed\n// as name|code|message; the response that follows is still well formed.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    fn();\n    console.log(label + ': ok');\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.code + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('token', function () { res.setHeader('bad name', 'v'); });\n  attempt('char', function () { res.setHeader('x-a', 'a\\nb'); });\n  attempt('undefined value', function () { res.setHeader('x-b', undefined); });\n  attempt('getHeader(5)', function () { res.getHeader(5); });\n  attempt('status 99', function () { res.writeHead(99); });\n  attempt('status msg', function () { res.writeHead(200, 'bad\\nmsg'); });\n  attempt('write null', function () { res.write(null); });\n  attempt('write number', function () { res.write(5); });\n  attempt('fine', function () { res.setHeader('X-Ok', ['a', 'b']); });\n  console.log('getHeader:', JSON.stringify(res.getHeader('x-ok')), 'names:', JSON.stringify(res.getHeaderNames()));\n  console.log('statusMessage kept:', JSON.stringify(res.statusMessage));\n  res.statusMessage = 'Made';\n  res.writeHead(201, { 'X-W': 'w' });\n  console.log('headersSent:', res.headersSent);\n  attempt('set after', function () { res.setHeader('x-c', 'c'); });\n  attempt('remove after', function () { res.removeHeader('x-ok'); });\n  attempt('writeHead after', function () { res.writeHead(202); });\n  res.end('done');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      const d = pass(res);\n      console.log(d.statusCode, d.statusMessage, JSON.stringify(d.headers['x-ok']), d.headers['x-w'], body);\n      server.close();\n    });\n  });\n});\n");
     expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "token: TypeError|ERR_INVALID_HTTP_TOKEN|Header name must be a valid HTTP token [\"bad name\"]\nchar: TypeError|ERR_INVALID_CHAR|Invalid character in header content [\"x-a\"]\nundefined value: TypeError|ERR_HTTP_INVALID_HEADER_VALUE|Invalid value \"undefined\" for header \"x-b\"\ngetHeader(5): TypeError|ERR_INVALID_ARG_TYPE|The \"name\" argument must be of type string. Received type number (5)\nstatus 99: RangeError|ERR_HTTP_INVALID_STATUS_CODE|Invalid status code: 99\nstatus msg: TypeError|ERR_INVALID_CHAR|Invalid character in statusMessage\nwrite null: TypeError|ERR_STREAM_NULL_VALUES|May not write null values to stream\nwrite number: TypeError|ERR_INVALID_ARG_TYPE|The \"chunk\" argument must be of type string or an instance of Buffer or Uint8Array. Received type number (5)\nfine: ok\ngetHeader: [\"a\",\"b\"] names: [\"x-ok\"]\nstatusMessage kept: \"bad\\nmsg\"\nheadersSent: true\nset after: Error|ERR_HTTP_HEADERS_SENT|Cannot set headers after they are sent to the client\nremove after: Error|ERR_HTTP_HEADERS_SENT|Cannot remove headers after they are sent to the client\nwriteHead after: Error|ERR_HTTP_HEADERS_SENT|Cannot write headers after they are sent to the client\n201 Made \"a, b\" w done\n", stderr: "", exitCode: 0 });
   }, 60000);
-  test("N2-REG-01 S088 (f): a member of a checked-dynamic http handle this tier does not model throws a named Error (Node: req.trailers is an object, req.setTimeout and req.on return the request, res.addTrailers undefined, res.sendDate a boolean)", async () => {
-    const r = await runN2("main.cjs", "'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('req.trailers', function () { return req.trailers; });\n  attempt('req.setTimeout', function () { return req.setTimeout(10); });\n  attempt('res.addTrailers', function () { return res.addTrailers({}); });\n  attempt('res.sendDate', function () { return res.sendDate; });\n  attempt('req.on(readable)', function () { return req.on('readable', function () {}); });\n  req.pipe(res);\n  attempt('a second pipe', function () { return req.pipe(res); });\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n");
-    // Node v24.18.1 prints: "req.trailers: object\nreq.setTimeout: object\nres.addTrailers: undefined\nres.sendDate: boolean\nreq.on(readable): object\na second pipe: object\nagent.sockets twice the same object: true\nfenced\n"
-    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "req.trailers: Error|reading the property 'trailers' of an http handle is not supported yet\nreq.setTimeout: Error|'setTimeout' on an http handle is not supported yet\nres.addTrailers: Error|'addTrailers' on an http handle is not supported yet\nres.sendDate: Error|reading the property 'sendDate' of an http handle is not supported yet\nreq.on(readable): Error|'on' for the event 'readable' on an http handle is not supported yet\na second pipe: Error|piping an IncomingMessage into a second destination is not supported yet\nagent.sockets twice the same object: false\nfenced\n", stderr: "", exitCode: 0 });
-  }, 60000);
+  test("N2-REG-01 S088 (f): a member of a checked-dynamic http handle this tier does not model is a named fence that ends the program (GH #86, SEMANTICS.md S122) — one program per member; Node: req.trailers is an object, req.setTimeout and req.on return the request, res.addTrailers undefined, res.sendDate a boolean", async () => {
+    // Node v24.18.1 prints (all cases in one program): "req.trailers: object\nreq.setTimeout: object\nres.addTrailers: undefined\nres.sendDate: boolean\nreq.on(readable): object\na second pipe: object\nagent.sockets twice the same object: true\nfenced\n"
+    // The fence-free remainder: (e)'s single pipe and (d)'s snapshot tables.
+    const ok = await runN2("main.cjs", "'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n");
+    expect({ stdout: ok.stdout.toString("utf8"), stderr: ok.stderr.toString("utf8"), exitCode: ok.exitCode }).toEqual({ stdout: "agent.sockets twice the same object: false\nfenced\n", stderr: "", exitCode: 0 });
+    const cases: [string, string][] = [["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('req.trailers', function () { return req.trailers; });\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "reading the property 'trailers' of an http handle is not supported yet"], ["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('req.setTimeout', function () { return req.setTimeout(10); });\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "'setTimeout' on an http handle is not supported yet"], ["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('res.addTrailers', function () { return res.addTrailers({}); });\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "'addTrailers' on an http handle is not supported yet"], ["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('res.sendDate', function () { return res.sendDate; });\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "reading the property 'sendDate' of an http handle is not supported yet"], ["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  attempt('req.on(readable)', function () { return req.on('readable', function () {}); });\n  req.pipe(res);\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "'on' for the event 'readable' on an http handle is not supported yet"], ["'use strict';\n// SEMANTICS.md S088 (f): members of the checked-dynamic http handles this\n// tier does not model throw a named, catchable Error (Node: they work);\n// (e) a request pipes into one destination; (d) the agent's tables are\n// snapshots.\nconst http = require('http');\nfunction pass(x) { return x; }\nfunction attempt(label, fn) {\n  try {\n    const v = fn();\n    console.log(label + ': ' + typeof v);\n  } catch (e) {\n    console.log(label + ': ' + e.name + '|' + e.message);\n  }\n}\nconst server = http.createServer(function (rq, rs) {\n  const req = pass(rq);\n  const res = pass(rs);\n  req.pipe(res);\n  attempt('a second pipe', function () { return req.pipe(res); });\n  const agent = pass(new http.Agent());\n  console.log('agent.sockets twice the same object:', agent.sockets === agent.sockets);\n  res.write('fenced');\n});\nserver.listen(0, '127.0.0.1', function () {\n  http.get({ host: '127.0.0.1', port: server.address().port, path: '/' }, function (res) {\n    let body = '';\n    res.on('data', function (d) { body += d; });\n    res.on('end', function () {\n      console.log(body);\n      server.close();\n    });\n  });\n});\n", "piping an IncomingMessage into a second destination is not supported yet"]];
+    for (const [src, msg] of cases) {
+      const r = await runN2("main.cjs", src);
+      expect({ msg, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({
+        msg,
+        stdout: "",
+        stderr: `tsinter: unsupported: ${msg} [SC1090]\n`,
+        exitCode: 1,
+      });
+    }
+  }, 300000);
   test("N2-OPT-02 an options record's requireHostHeader: false reaches the server: a Host-less HTTP/1.1 request runs the listener (200), as in Node \u2014 SINGLE-EDIT: serverRequireHost ignoring its flag", async () => {
     const r = await runN2("main.cjs", "'use strict';\n// The options record's requireHostHeader: false reaches the server, so a\n// Host-less HTTP/1.1 request runs the listener (200), as in Node.\nconst http = require('http');\nconst net = require('net');\nconst server = http.createServer({ requireHostHeader: false }, function (req, res) {\n  res.end('listener ran');\n});\nserver.listen(0, '127.0.0.1', function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  let got = '';\n  c.on('data', function (d) { got += d.toString('latin1'); });\n  c.on('end', function () {\n    console.log(got.split('\\r\\n')[0]);\n    server.close();\n  });\n  c.write('GET / HTTP/1.1\\r\\nConnection: close\\r\\n\\r\\n');\n});\n");
     expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "HTTP/1.1 200 OK\n", stderr: "", exitCode: 0 });
   }, 60000);
-  test("N2-REG-03 S088 (g): a null the static type does not admit (a server request's statusCode) is fenced by name (Node: null); on the same typed surface setHeader keeps a number and writeHead checks its status before it takes the reason, as in Node", async () => {
+  test("N2-REG-05 GH #86 review: the checked-dynamic writeHead's status code that is not a number and not a valid code (a string, a boolean, null, undefined) is Node's ERR_HTTP_INVALID_STATUS_CODE RangeError naming String(code), and a truthy non-string header name in a flat headers array is Node's ERR_INVALID_HTTP_TOKEN — catchable, the response still answers (Node's own output)", async () => {
+    const r = await runN2("main.cjs", "'use strict';\nconst http = require('http');\nfunction id(x) { return x; }\nconst vals = JSON.parse('[\"abc\", \"99\", true, null, false]');\nconst server = http.createServer(function (req, res0) {\n  const res = id(res0);\n  for (const v of vals) {\n    try { res.writeHead(v); console.log('status', String(v), 'ok'); } catch (e) { console.log('status', String(v), e.name, e.code, e.message); }\n  }\n  try { res.writeHead(undefined); console.log('status undefined ok'); } catch (e) { console.log('status undefined', e.name, e.code, e.message); }\n  const names = JSON.parse('[[5, \"b\"], [true, \"b\"]]');\n  for (const h of names) {\n    try { res.writeHead(200, h); console.log('name', JSON.stringify(h), 'ok'); } catch (e) { console.log('name', JSON.stringify(h), e.name, e.code, e.message); }\n  }\n  res.writeHead(201);\n  res.end('done');\n});\nserver.listen(0, function () {\n  http.get({ port: server.address().port, host: '127.0.0.1' }, function (r) {\n    console.log('client', r.statusCode);\n    r.resume();\n    r.on('end', function () { server.close(); });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("status abc RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: abc\nstatus 99 RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: 99\nstatus true RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: true\nstatus null RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: null\nstatus false RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: false\nstatus undefined RangeError ERR_HTTP_INVALID_STATUS_CODE Invalid status code: undefined\nname [5,\"b\"] TypeError ERR_INVALID_HTTP_TOKEN Header name must be a valid HTTP token [\"5\"]\nname [true,\"b\"] TypeError ERR_INVALID_HTTP_TOKEN Header name must be a valid HTTP token [\"true\"]\nclient 201\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N2-REG-03 S088 (g): a null the static type does not admit (a server request's statusCode) is a named fence that ends the program (GH #86, SEMANTICS.md S122; Node: null); on the same typed surface setHeader keeps a number and writeHead checks its status before it takes the reason, as in Node", async () => {
     const r = await runN2("main.ts", "// SEMANTICS.md S088 (g): a null the static type does not admit is fenced.\n// The typed ServerResponse lowerings around it are Node's: setHeader keeps\n// a number, and writeHead checks its status before it takes the reason.\nimport * as http from \"node:http\";\n\nconst server = http.createServer((req, res) => {\n  res.statusMessage = \"Before\";\n  res.setHeader(\"X-Count\", 5);\n  console.log(\"getHeader is the string:\", res.getHeader(\"X-Count\") === \"5\");\n  try {\n    res.writeHead(99, \"Odd\");\n  } catch (e) {\n    console.log(\"writeHead threw:\", (e as Error).message);\n  }\n  console.log(\"statusMessage after:\", res.statusMessage);\n  res.statusMessage = \"OK\";\n  try {\n    console.log(\"server request statusCode:\", req.statusCode);\n  } catch (e) {\n    console.log(\"statusCode threw:\", (e as Error).message);\n  }\n  res.end(\"done\");\n});\nserver.listen(0, \"127.0.0.1\", () => {\n  http.get({ host: \"127.0.0.1\", port: server.address().port, path: \"/\" }, (res) => {\n    res.on(\"data\", () => {});\n    res.on(\"end\", () => {\n      console.log(res.statusCode, res.headers[\"x-count\"]);\n      server.close();\n    });\n  });\n});\n");
     // Node v24.18.1 prints: "getHeader is the string: false\nwriteHead threw: Invalid status code: 99\nstatusMessage after: Before\nserver request statusCode: null\n200 5\n"
-    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "getHeader is the string: false\nwriteHead threw: Invalid status code: 99\nstatusMessage after: Before\nstatusCode threw: reading 'statusCode' of a server request (null) is not supported yet\n200 5\n", stderr: "", exitCode: 0 });
+    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "getHeader is the string: false\nwriteHead threw: Invalid status code: 99\nstatusMessage after: Before\n", stderr: "tsinter: unsupported: reading 'statusCode' of a server request (null) is not supported yet [SC1090]\n", exitCode: 1 });
   }, 60000);
+  // The fence-free companion (GH #86 review): the same program without the
+  // statusCode read, so the client's `200 5` line stays pinned against Node.
+  test("N2-REG-03b the typed surface around N2-REG-03's fence, and the client's view of the reply, as in Node", async () => {
+    const ok = await runN2("main.ts", "// N2-REG-03's fence-free companion (GH #86 review): the typed surface\n// around the fenced statusCode read, with the client's view of the reply.\n// The typed ServerResponse lowerings around it are Node's: setHeader keeps\n// a number, and writeHead checks its status before it takes the reason.\nimport * as http from \"node:http\";\n\nconst server = http.createServer((req, res) => {\n  res.statusMessage = \"Before\";\n  res.setHeader(\"X-Count\", 5);\n  console.log(\"getHeader is the string:\", res.getHeader(\"X-Count\") === \"5\");\n  try {\n    res.writeHead(99, \"Odd\");\n  } catch (e) {\n    console.log(\"writeHead threw:\", (e as Error).message);\n  }\n  console.log(\"statusMessage after:\", res.statusMessage);\n  res.statusMessage = \"OK\";\n  res.end(\"done\");\n});\nserver.listen(0, \"127.0.0.1\", () => {\n  http.get({ host: \"127.0.0.1\", port: server.address().port, path: \"/\" }, (res) => {\n    res.on(\"data\", () => {});\n    res.on(\"end\", () => {\n      console.log(res.statusCode, res.headers[\"x-count\"]);\n      server.close();\n    });\n  });\n});\n");
+    expect({ stdout: ok.stdout.toString("utf8"), stderr: ok.stderr.toString("utf8"), exitCode: ok.exitCode }).toEqual({ stdout: "getHeader is the string: false\nwriteHead threw: Invalid status code: 99\nstatusMessage after: Before\n200 5\n", stderr: "", exitCode: 0 });
+  }, 120000);
 });
 
 // ── self-capturing boxed declarations ─────────────────────────────────────
@@ -9143,11 +9188,11 @@ describe("INC-29 U4 review rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("U4-R-13 finding 8: a non-minimal length inside the signatureAlgorithm, which OpenSSL re-encodes (Node prints the re-encoded PEM), is a named Error (S090 (c))", async () => {
+  test("U4-R-13 finding 8: a non-minimal length inside the signatureAlgorithm, which OpenSSL re-encodes (Node prints the re-encoded PEM), is a named fence that ends the program (S090 (c); GH #86, SEMANTICS.md S122)", async () => {
     const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst pem = fs.readFileSync(\"@CERTS@ncsig.pem\", \"utf8\");\ntry {\n  tls.setDefaultCACertificates([pem]);\n  const d = tls.getCACertificates(\"default\");\n  console.log(\"n=\" + d.length, d[0] === pem, d[0].slice(28, 60));\n} catch (e) {\n  console.log(\"X\", (e as Error).message);\n}\n", {"ncsig.pem": "-----BEGIN CERTIFICATE-----\nMIIBfTCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAgFw0yNjA3MTYyMDM3MDhaGA8y\nMTI2MDYyMjIwMzcwOFowGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABCptYeKnhGNJcYOB724Ml4mdlE+Al6R8NLGM\n/9vo28/vBWfaaLsYR869s+rxbQBQP7v+dQUwjbdzpMGsdPiroHmjQjBAMA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBT7ISW3gYKaXUJu\nZYa2OrD6IBZbBTCBCgYIKoZIzj0EAwIDSAAwRQIhAIvYpWlTassrtznGQZgk/p9z\nG2W8rSJOwcIRMnaKvHVKAiAQmDLtT18L5cJKd3YhR4oaAXioB0uNtchl56VqTtr8\niw==\n-----END CERTIFICATE-----\n"}, "ts");
-    expect(r.stdout.toString("utf8")).toBe("X tls.setDefaultCACertificates of a certificate whose DER OpenSSL would re-encode (a non-minimal or indefinite length inside it) is not supported yet\n");
-    expect(r.stderr.toString("utf8")).toBe("");
-    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString("utf8")).toBe("");
+    expect(r.stderr.toString("utf8")).toBe("tsinter: unsupported: tls.setDefaultCACertificates of a certificate whose DER OpenSSL would re-encode (a non-minimal or indefinite length inside it) is not supported yet [SC1090]\n");
+    expect(r.exitCode).toBe(1);
   }, 60000);
   test("U4-R-14 a leaf whose only CN is empty: Node's subject.CN is falsy, so 'Cert does not contain a DNS name'", async () => {
     const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst cdir = \"@CERTS@\";\nconst ca = fs.readFileSync(\"tests/fixtures/server/certs/ca.pem\", \"utf8\");\nconst server = tls.createServer({ key: fs.readFileSync(cdir + \"cnempty2-key.pem\"), cert: fs.readFileSync(cdir + \"cnempty2.pem\") }, (s) => { s.end(); });\nserver.listen(0, \"127.0.0.1\", () => {\n  const c = tls.connect({ host: \"127.0.0.1\", port: server.address().port, servername: \"localhost\", ca }, () => {\n    console.log(\"OK\", c.authorized);\n    c.end();\n  });\n  c.on(\"error\", (e) => console.log(\"ERR\", (e as NodeJS.ErrnoException).code, e.message));\n  c.on(\"close\", () => server.close());\n});\n", {"cnempty2.pem": "-----BEGIN CERTIFICATE-----\nMIIBIzCBzKADAgECAhQNQ8UaZC+ca2T2txqJPKbPcaImBDAKBggqhkjOPQQDAjAb\nMRkwFwYDVQQDDBB0c25hdGl2ZSB0ZXN0IENBMB4XDTI2MDEwMTAwMDAwMFoXDTM1\nMTIzMDAwMDAwMFowCzEJMAcGA1UEAwwAMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD\nQgAEvoykbu0MED62A1qIgMcXwb8Y4HFUqaDFypmt2VvLrZgyp6qusfc9CfHgOOFe\njWzTAKRsMSBMAtSFmdhnL9mcSTAKBggqhkjOPQQDAgNGADBDAh97vvqS+czJ1F51\nbAvRnt3ymA8gFWoT6DAmjtS5EXHsAiAs/d8VWDIIw6AsN9quiCOj3iTCzk4wrU+/\n+rtpRuM11A==\n-----END CERTIFICATE-----\n", "cnempty2-key.pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmFT6+bxofa1WEiLd\nHnXsCgbAn4gSLtplLLZpKY4U0tyhRANCAAS+jKRu7QwQPrYDWoiAxxfBvxjgcVSp\noMXKma3ZW8utmDKnqq6x9z0J8eA44V6NbNMApGwxIEwC1IWZ2Gcv2ZxJ\n-----END PRIVATE KEY-----\n"}, "ts");
@@ -9261,13 +9306,27 @@ describe("unit H small library tail rows", () => {
     }, 60000);
   }
 
-  test("H-BUF-03 new Buffer(value, encoding) over a string, an array and an object is fenced by name (SEMANTICS.md S094); Node converts the string and the array through Buffer.from and throws ERR_INVALID_ARG_TYPE for the plain object", async () => {
-    const r = await runH("main.cjs", "'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nconst s = JSON.parse('\"abc\"');\nshow(() => new Buffer(s, 'hex'));\nshow(() => new Buffer([1, 2], 'utf8'));\nshow(() => new Buffer({ a: 1 }, 'utf8'));\nconsole.log('after');\n");
-    const fence = "Error|undefined|new Buffer(value, encoding) over a string or object value is not supported yet (SEMANTICS.md S094)\n";
-    expect(r.stdout.toString("utf8")).toBe(fence + fence + fence + "after\n");
-    expect(r.stderr.toString("utf8")).toBe("");
-    expect(r.exitCode).toBe(0);
-  }, 60000);
+  test("H-BUF-03 new Buffer(value, encoding) over a string or an array is a named fence that ends the program (SEMANTICS.md S094; GH #86, S122) — one program per value (Node converts both through Buffer.from); a plain object no Buffer.from rung converts throws Node's ERR_INVALID_ARG_TYPE, catchable (GH #86 review)", async () => {
+    const pre = "'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nconst s = JSON.parse('\"abc\"');\n";
+    for (const line of ["show(() => new Buffer(s, 'hex'));", "show(() => new Buffer([1, 2], 'utf8'));", "show(() => new Buffer({ length: 2 }, 'utf8'));"]) {
+      const r = await runH("main.cjs", pre + line + "\nconsole.log('after');\n");
+      expect({ line, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({
+        line,
+        stdout: "",
+        stderr: "tsinter: unsupported: new Buffer(value, encoding) over a string, an array or an array-like value is not supported yet (SEMANTICS.md S094) [SC1090]\n",
+        exitCode: 1,
+      });
+    }
+    // Node v24.18.1's own output for these (DEP0005 suppressed by the
+    // harness's oracle flags): the plain objects throw Buffer.from's
+    // TypeError and the program goes on.
+    const r = await runH("main.cjs", pre + "show(() => new Buffer({ a: 1 }, 'utf8'));\nshow(() => new Buffer(JSON.parse('{\"k\":[1]}'), 'hex'));\nconsole.log('after');\n");
+    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({
+      stdout: "TypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received an instance of Object\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received an instance of Object\nafter\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  }, 180000);
 
   test("H-AW-03 Atomics.wait over an Int32Array the source does not show is SharedArrayBuffer-backed refuses by name at compile time (Node throws TypeError '[object Int32Array] is not a shared typed array.'): a plain new Int32Array(n), a plain ArrayBuffer, a let binding, a parameter; the const, static readonly and direct forms compile", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tail-h-aw-"));
@@ -9376,10 +9435,10 @@ describe("board #218 untyped Map / WeakMap / WeakSet rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("B218-04 a failing deepStrictEqual over a weak collection refuses by name while rendering its message (Node prints its diff; the program below prints 'caught AssertionError')", async () => {
+  test("B218-04 a failing deepStrictEqual over a weak collection ends the program at a named fence while rendering its message (GH #86, SEMANTICS.md S122) (Node prints its diff; the program below prints 'caught AssertionError')", async () => {
     const r = await runB("main.cjs", "'use strict';\nconst assert = require('assert');\ntry {\n  assert.deepStrictEqual(new WeakMap(), new WeakMap());\n  console.log('equal');\n} catch (e) {\n  console.log('caught', e.name);\n}\n");
     expect(r.stdout.toString("utf8")).toBe("");
-    expect(r.stderr.toString("utf8")).toBe("Uncaught cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet\n");
+    expect(r.stderr.toString("utf8")).toBe("tsinter: unsupported: cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet [SC1090]\n");
     expect(r.exitCode).toBe(1);
   }, 60000);
 });
@@ -9522,10 +9581,19 @@ t("seq-text", "0garbage");
 `));
   }, 60000);
 
-  test("CR-X509-02 the named fences (S093): a PEM body that is not a certificate's DER (Node's text is the ASN.1 decoder's reason), a header line, bytes after the certificate inside the block (d2i_X509_AUX's trust data), and a validity month outside 1-12 — each a catchable Error naming the construct — SINGLE-EDIT: the trailing-bytes check removed from the first-only reader", async () => {
+  test("CR-X509-02 the named fences (S093): a PEM body that is not a certificate's DER (Node's text is the ASN.1 decoder's reason), a header line, bytes after the certificate inside the block (d2i_X509_AUX's trust data), and a validity month outside 1-12 — each a named fence that ends the program (GH #86, SEMANTICS.md S122), one program per case — SINGLE-EDIT: the trailing-bytes check removed from the first-only reader", async () => {
     const dir = mkdtempSync(join(tmpdir(), "crypto-fence-"));
     try {
-      const path = join(dir, "main.ts");
+      const fence = (what: string): string => `tsinter: unsupported: ${what} is not supported yet (SEMANTICS.md S093) [SC1090]\n`;
+      const cases: [string, string][] = [
+        ["asn1", "new crypto.X509Certificate of a PEM block whose body is not a certificate's DER"],
+        ["header", "new crypto.X509Certificate of a PEM block with header lines, a line over 253 bytes or an empty body"],
+        ["trailing", "new crypto.X509Certificate of a PEM block with bytes after the certificate (X509_CERT_AUX trust data)"],
+        ["month-13", "X509Certificate.validFrom / validTo of a time that is not a canonical RFC 5280 UTCTime or GeneralizedTime"],
+      ];
+      for (const [label, what] of cases) {
+      const only = (l: string, call: string): string => (l === label ? call : "");
+      const path = join(dir, `${label}.ts`);
       writeFileSync(path, `import * as crypto from "node:crypto";
 ${PEM_PRELUDE}
 function t(label: string, x: Buffer): void {
@@ -9535,33 +9603,27 @@ function t(label: string, x: Buffer): void {
     console.log(label, (e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);
   }
 }
-t("asn1", Buffer.from("-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n"));
-t("header", Buffer.from("-----BEGIN CERTIFICATE-----\\nProc-Type: 4,ENCRYPTED\\n\\n" + BODY + "\\n-----END CERTIFICATE-----\\n"));
-const b64 = Buffer.concat([DER, Buffer.from([5, 0])]).toString("base64");
+${only("asn1", `t("asn1", Buffer.from("-----BEGIN CERTIFICATE-----\\nMAMCAQU=\\n-----END CERTIFICATE-----\\n"));
+`)}${only("header", `t("header", Buffer.from("-----BEGIN CERTIFICATE-----\\nProc-Type: 4,ENCRYPTED\\n\\n" + BODY + "\\n-----END CERTIFICATE-----\\n"));
+`)}const b64 = Buffer.concat([DER, Buffer.from([5, 0])]).toString("base64");
 let lines = "";
 for (let i = 0; i < b64.length; i += 64) lines += b64.slice(i, i + 64) + "\\n";
-t("trailing", Buffer.from("-----BEGIN CERTIFICATE-----\\n" + lines + "-----END CERTIFICATE-----\\n"));
-const bad = Buffer.from(DER);
+${only("trailing", `t("trailing", Buffer.from("-----BEGIN CERTIFICATE-----\\n" + lines + "-----END CERTIFICATE-----\\n"));
+`)}const bad = Buffer.from(DER);
 const at = bad.indexOf(Buffer.from("260717175211Z"));
 bad[at + 2] = 0x31;
 bad[at + 3] = 0x33;
-t("month-13", bad);
-`);
-      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+${only("month-13", `t("month-13", bad);
+`)}`);
+      const res = await compile(path, { outPath: join(dir, `${label}.wasm`), outDir: dir, dynamic: false, backend: "wasm" });
       if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
       const r = await runWasm(res.binaryPath);
-      const fence = (label: string, what: string): string => `${label} Error undefined ${what} is not supported yet (SEMANTICS.md S093)\n`;
-      expect(r.stdout.toString("utf8")).toBe(
-        fence("asn1", "new crypto.X509Certificate of a PEM block whose body is not a certificate's DER") +
-          fence("header", "new crypto.X509Certificate of a PEM block with header lines, a line over 253 bytes or an empty body") +
-          fence("trailing", "new crypto.X509Certificate of a PEM block with bytes after the certificate (X509_CERT_AUX trust data)") +
-          fence("month-13", "X509Certificate.validFrom / validTo of a time that is not a canonical RFC 5280 UTCTime or GeneralizedTime"),
-      );
-      expect(r.exitCode).toBe(0);
+      expect({ label, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ label, stdout: "", stderr: fence(what), exitCode: 1 });
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 60000);
+  }, 240000);
 
   test("CR-HOST-01 tsinter.random is imported exactly by the modules that draw (randomUUID, randomBytes, the composed toString), never by a hash- or certificate-only module, and a host without it fails to instantiate with a LinkError — SINGLE-EDIT: the minting condition widened to every crypto key", async () => {
     const dir = mkdtempSync(join(tmpdir(), "crypto-host-"));
@@ -9778,17 +9840,35 @@ describe("Unit B diagnostics_channel and AsyncLocalStorage rows", () => {
       else expect(r.stderr.toString("utf8")).toMatch(/^Uncaught Error: (subscriber|transform) boom\n$/);
     }, 60000);
   }
-  test("DCALS-F1 the S092 fences (Node: ReflectApply's TypeError naming [object Uint8Array]; tracePromise answering the raw 5 with no subscribers; a promise adopting the thenable; setImmediate answering an Immediate object) — SINGLE-EDIT: dc.ts applyNotFn's fence arm, tracePromise's early exit, promiseBody's thenableFence", async () => {
-    const r = await runDc("main.cjs", fenceSrc);
-    expect(r.stdout.toString("utf8")).toBe(
-      "apply-bytes Error calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet\n" +
-        "early-exit-nonpromise Error tracePromise without subscribers over a function returning a non-promise is not supported yet\n" +
-        "thenable Error tracePromise over a function returning a non-promise thenable is not supported yet\n" +
-        "typeof setImmediate result undefined\n",
-    );
-    expect(r.stderr.toString("utf8")).toBe("");
-    expect(r.exitCode).toBe(0);
-  }, 60000);
+  test("DCALS-F1 the S092 fences — each ends the program (GH #86, SEMANTICS.md S122), one program per fence (Node: tracePromise answering the raw 5 with no subscribers; a promise adopting the thenable; setImmediate answering an Immediate object); apply over a Uint8Array, a promise or an error is ReflectApply's TypeError, as in Node — SINGLE-EDIT: dc.ts applyNotFn's bytes/promise/error arms, tracePromise's early exit, promiseBody's thenableFence", async () => {
+    // fenceSrc's prelude, then one case each (GH #86: a fence ends the
+    // program, so the cases after a fence would never run).
+    const head = fenceSrc.slice(0, fenceSrc.indexOf("t('apply-bytes'"));
+    const sub = "tc.subscribe({ end: () => {} });\n";
+    const cases: [string, string][] = [
+      ["t('early-exit-nonpromise', () => tc.tracePromise(() => 5));\n", "tracePromise without subscribers over a function returning a non-promise is not supported yet"],
+      [sub + "t('thenable', () => tc.tracePromise(() => id({ then: () => {} })));\n", "tracePromise over a function returning a non-promise thenable is not supported yet"],
+    ];
+    for (const [line, msg] of cases) {
+      expect(fenceSrc).toContain(line.replace(sub, ""));
+      const r = await runDc("main.cjs", head + line);
+      expect({ msg, stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ msg, stdout: "", stderr: `tsinter: unsupported: ${msg} [SC1090]\n`, exitCode: 1 });
+    }
+    // GH #86 review: apply over a Uint8Array, a promise or an error is
+    // V8's ReflectApply TypeError, as Node prints it (catchable).
+    const applyLine = "t('apply-bytes', () => als.run(1, id(Buffer.from('x'))));\nt('apply-promise', () => als.run(1, id(Promise.resolve(1))));\nt('apply-error', () => als.run(1, id(new Error('boom'))));\nt('apply-error-empty', () => als.run(1, id(new RangeError(''))));\n";
+    expect(fenceSrc).toContain("t('apply-bytes', () => als.run(1, id(Buffer.from('x'))));\n");
+    const ra = await runDc("main.cjs", head + applyLine);
+    expect({ stdout: ra.stdout.toString("utf8"), stderr: ra.stderr.toString("utf8"), exitCode: ra.exitCode }).toEqual({
+      stdout: "apply-bytes TypeError Function.prototype.apply was called on [object Uint8Array], which is an object and not a function\napply-promise TypeError Function.prototype.apply was called on #<Promise>, which is an object and not a function\napply-error TypeError Function.prototype.apply was called on Error: boom, which is an object and not a function\napply-error-empty TypeError Function.prototype.apply was called on RangeError, which is an object and not a function\n",
+      stderr: "",
+      exitCode: 0,
+    });
+    const tail = "console.log('typeof setImmediate result', typeof tc.traceCallback(setImmediate, 0, {}, null, () => {}));\n";
+    expect(fenceSrc).toContain(tail);
+    const r = await runDc("main.cjs", head + sub + tail);
+    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "typeof setImmediate result undefined\n", stderr: "", exitCode: 0 });
+  }, 240000);
   test("DCALS-F2 traceCallback over a traced function whose callback parameter declares fewer than two parameters refuses by name (Node: asyncStart 5, ctx.result 5 — the frontend would lower cb(null, 5) with the arguments dropped) — SINGLE-EDIT: lower-builtins.ts traceCallback's arity check", async () => {
     const r = await runDc("main.cjs", arityRefuseSrc);
     expect(r.stdout.toString("utf8")).toBe("");
@@ -10120,14 +10200,26 @@ describe("#227 fetch rows", () => {
     }, 60000);
   }
 
-  test("F-FENCE-01 a Response's body (a ReadableStream) and JSON.stringify of a Headers value throw named Errors (SEMANTICS.md S098 (d)); Node answers a stream and '{}'", async () => {
+  test("F-FENCE-01 a Response's body (a ReadableStream) and JSON.stringify of a Headers value are named fences that end the program (SEMANTICS.md S098 (d); GH #86, S122); Node answers a stream and '{}'", async () => {
     const { wasm, node } = await bothF("fences.ts");
     expect(node.stdout.toString("utf8")).toBe("body ok false\njson ok {}\ntypeof: object\n");
-    expect(wasm.stdout.toString("utf8")).toBe(
-      "body: Error Response.body (a ReadableStream) is not supported yet\njson: Error JSON.stringify of a fetch value is not supported yet\ntypeof: object\n",
-    );
-    expect(wasm.exitCode).toBe(0);
-  }, 60000);
+    // the first fence (the body read) ends the program
+    expect({ stdout: wasm.stdout.toString("utf8"), stderr: wasm.stderr.toString("utf8"), exitCode: wasm.exitCode }).toEqual({
+      stdout: "",
+      stderr: "tsinter: unsupported: Response.body (a ReadableStream) is not supported yet [SC1090]\n",
+      exitCode: 1,
+    });
+    // the same fixture without the body read meets the JSON.stringify fence
+    const src = subst(readFileSync(join(fixturesDir, "wasm", "fences.ts"), "utf8"));
+    const bodyTry = src.slice(src.indexOf("  try {\n    const b = r.body;"), src.indexOf("  try {\n    const s = JSON.stringify"));
+    expect(bodyTry.length).toBeGreaterThan(0);
+    const json = await runF("fences.ts", src.replace(bodyTry, ""), false);
+    expect({ stdout: json.stdout.toString("utf8"), stderr: json.stderr.toString("utf8"), exitCode: json.exitCode }).toEqual({
+      stdout: "",
+      stderr: "tsinter: unsupported: JSON.stringify of a fetch value is not supported yet [SC1090]\n",
+      exitCode: 1,
+    });
+  }, 120000);
 
   test("F-UNH-01 an unhandled 'fetch failed' rejection ends the run with exit 1 and this tier's report (SEMANTICS.md S007); Node prints the error with its cause", async () => {
     const { wasm, node } = await bothF("unhandled.ts");

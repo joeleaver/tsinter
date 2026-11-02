@@ -41,7 +41,7 @@ import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
-import { holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable } from "./lower-exprs.js";
+import { plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable } from "./lower-exprs.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -601,12 +601,13 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
       };
       body = [];
       const shown = order.filter((fname) => byName.has(fname));
-      if (shown.length > 0 && shown.every((fname) => presence(fname, byName.get(fname)!) !== null)) {
+      const presentOf = (fname: string, ft: IrType): IrExpr | null => presence(fname, ft) ?? plainFieldPresent(L, get(fname, ft), loc);
+      if (shown.length > 0 && shown.every((fname) => presentOf(fname, byName.get(fname)!) !== null)) {
         // Every key may be absent: Node's empty form `{}` (before the
         // depth cutoff, like any empty object).
-        let anyPresent: IrExpr = presence(shown[0]!, byName.get(shown[0]!)!)!;
+        let anyPresent: IrExpr = presentOf(shown[0]!, byName.get(shown[0]!)!)!;
         for (const fname of shown.slice(1)) {
-          anyPresent = { kind: "logical", op: "||", left: anyPresent, right: presence(fname, byName.get(fname)!)!, type: BOOL, loc };
+          anyPresent = { kind: "logical", op: "||", left: anyPresent, right: presentOf(fname, byName.get(fname)!)!, type: BOOL, loc };
         }
         body.push({ kind: "if", cond: { kind: "unary", op: "!", operand: anyPresent, type: BOOL, loc }, then: [ret(str("{}", loc))], else_: null, loc });
       }
@@ -617,7 +618,7 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
           concatAll([str(`${inspectKey(fname)}: `, loc), child(ft, get(fname, ft))], loc),
           boolLit(false, loc),
         );
-        const has = presence(fname, ft);
+        const has = presentOf(fname, ft);
         body.push(has === null ? put : { kind: "if", cond: has, then: [put], else_: null, loc });
       }
       body.push(ret(end(str("", loc), str("{", loc), str("}", loc), false, boolLit(false, loc))));
@@ -1338,7 +1339,7 @@ function dynToStringHelper(L: Lowerer, loc: SrcLoc): string {
   const when = (cond: IrExpr, then: IrStmt[]): IrStmt => ({ kind: "if", cond, then, else_: null, loc });
   const fence = (what: string): IrStmt => {
     const d = noLoweringDiag(what, loc);
-    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code}]`, loc };
+    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code} at a util.format argument]`, loc }; // a shared per-shape helper: no single line (GH #86)
   };
   const cat = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "strConcat", left: l, right: r, type: STRING, loc });
   const body: IrStmt[] = [
@@ -1428,7 +1429,7 @@ function dynToNumberHelper(L: Lowerer, loc: SrcLoc): string {
   const when = (cond: IrExpr, then: IrStmt[]): IrStmt => ({ kind: "if", cond, then, else_: null, loc });
   const fence = (what: string): IrStmt => {
     const d = noLoweringDiag(what, loc);
-    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code}]`, loc };
+    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code} at a Number() of a dynamic value]`, loc }; // a shared per-shape helper: no single line (GH #86)
   };
   const body: IrStmt[] = [
     when(test("number"), [ret({ kind: "dynCheck", value: v, type: F64, loc })]),
@@ -1867,7 +1868,7 @@ function formatArgHelper(L: Lowerer, arg: RuntimeFormatArg, surface: "console" |
       : tryConvert(L, arg.node, () => convertSpecArg(L, code, arg.node, v, loc));
     const then: IrStmt[] = "ir" in res
       ? [{ kind: "return", value: res.ir, loc }]
-      : [{ kind: "runtimeFence", code: res.diag.code, message: `${res.diag.message} [${res.diag.code}]`, loc }];
+      : [{ kind: "runtimeFence", code: res.diag.code, message: `${res.diag.message} [${res.diag.code} at a util.format argument]`, loc }];
     body.push({ kind: "if", cond: cmp("===", spec, num(code, loc), loc), then, else_: null, loc });
   }
   body.push({ kind: "if", cond: cmp("===", spec, num(99, loc), loc), then: [{ kind: "return", value: str("", loc), loc }], else_: null, loc });

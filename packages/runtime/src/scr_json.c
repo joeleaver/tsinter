@@ -897,7 +897,7 @@ void scr_dyn_arg_value_fail(const char *name, const char *reason, const ScrDyn *
  * AFTER its Node-order validations pass — Node's validation errors come
  * first, the honest refuse second. Borrowed; always throws catchably. */
 void scr_throw_lowering_fence(const ScrStr *msg) {
-  scr_throw_error_msg_code(SCR_ERR_ERROR, msg->data, msg->len, "SC2020");
+  scr_fence_fatal(msg->data, msg->len); /* GH #86: never catchable */
 }
 
 static void scr_dyn_handle_release(void *h, ScrDynHandleTag tag) {
@@ -1818,7 +1818,7 @@ static const char *scr_dyn_kind_name(const ScrDyn *d) {
   return "unknown";
 }
 
-void scr_dyn_check_fail(const ScrDynPath *path, const char *want, const ScrDyn *got) {
+_Noreturn void scr_dyn_check_fail(const ScrDynPath *path, const char *want, const ScrDyn *got) {
   ScrJsonBuf b;
   scr_jb_init(&b);
   scr_jb_puts(&b, "expected ");
@@ -1827,10 +1827,12 @@ void scr_dyn_check_fail(const ScrDynPath *path, const char *want, const ScrDyn *
   scr_dyn_path_render(&b, path);
   scr_jb_puts(&b, ", got ");
   scr_jb_puts(&b, scr_dyn_kind_name(got));
-  /* A real TypeError instance: catch bindings narrow it with instanceof
-   * and read the path off e.message; the uncaught line ("Uncaught
-   * TypeError: expected ...") is byte-identical to the old string form. */
-  scr_throw_error(SCR_ERR_TYPE, scr_jb_finish(&b));
+  scr_jb_puts(&b, " [SC1100]");
+  /* GH #86 review (SEMANTICS.md S122): Node erases `as` and never checks a
+   * dynamic value against a static type, so the mismatch is a check only
+   * this tier makes — it ENDS the program at the fence line. */
+  ScrStr *msg = scr_jb_finish(&b);
+  scr_fence_fatal(msg->data, msg->len);
 }
 
 /* ── parser ────────────────────────────────────────────────────────────── */

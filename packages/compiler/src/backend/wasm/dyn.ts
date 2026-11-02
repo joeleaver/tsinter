@@ -197,6 +197,11 @@ export const FN_THUNK = 1;
 export const FN_SIG = 2;
 export const FN_NAME = 3;
 export const FN_ARITY = 4;
+/** A function's source text, where the box was built from a known one in a
+ * module that clones (GH #86 review); null otherwise. */
+export const FN_SRC = 5;
+/** Whether the function owns `prototype`: 1 yes, 2 no, 0 not known. */
+export const FN_PROTO = 6;
 
 /** `$dynView`'s field indices (unit H, SEMANTICS.md S115): the static
  * value as the identity token, the interned type-key id, the type's
@@ -347,6 +352,18 @@ export interface DynDeps {
    * twin of `throwTypeError`: the invoke surface's "not supported yet"
    * fences are `Error`, not `TypeError`, exactly as C throws them. */
   throwError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
+  /** Unit U (SEMANTICS.md S119 (b)): the module's "a hole was made" i32
+   * global, when the module was lowered with undefSlots — an array that
+   * crossed in from typed storage holds the element's `undefined` where
+   * Node may keep a hole, so `in`/Object.hasOwn over such an index fences
+   * once the program has made one. */
+  holesMade?: () => number;
   /** The exception cell's kind global — 0 when nothing is pending. The
    * invoke helpers test it after a sub-helper that may have thrown, which
    * is C's `if (scr_exc_pending()) return NULL`. */
@@ -939,9 +956,8 @@ export class DynBuilder {
         this.deps.lit(c, name);
         c.call(this.deps.strEq());
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) =>
-          this.deps.lit(x, `reading '${name}' of a URL held in a dynamic value is not supported yet`),
-        );
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, `reading '${name}' of a URL held in a dynamic value is not supported yet`));
         c.refNull(this.dynT());
         c.return_();
         c.end();
@@ -1041,9 +1057,8 @@ export class DynBuilder {
   /** A catchable named refusal of `what` on a dynamic typed array, then
    * `pushNull` (the enclosing function's error answer). */
   typedFence(c: Code, what: string, pushNull: (c: Code) => void): void {
-    this.deps.throwError(c, "%Error", "Error", (x) =>
-      this.deps.lit(x, `${what} a typed array held in a dynamic value is not supported yet`),
-    );
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, `${what} a typed array held in a dynamic value is not supported yet`));
     pushNull(c);
   }
 
@@ -1146,9 +1161,8 @@ export class DynBuilder {
         this.deps.lit(c, name);
         c.call(this.deps.strEq());
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) =>
-          this.deps.lit(x, `'TypedArray.prototype.${name}' on a typed array held in a dynamic value is not supported yet`),
-        );
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, `'TypedArray.prototype.${name}' on a typed array held in a dynamic value is not supported yet`));
         c.refNull(this.dynT());
         c.return_();
         c.end();
@@ -1264,9 +1278,8 @@ export class DynBuilder {
     c.i32Const(0);
     c.end();
     c.ifVoid();
-    this.deps.throwError(c, "%Error", "Error", (x) =>
-      this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"),
-    );
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"));
     pushNull(c);
     c.return_();
     c.end();
@@ -1287,9 +1300,8 @@ export class DynBuilder {
     c.i32Const(0);
     c.end();
     c.ifVoid();
-    this.deps.throwError(c, "%Error", "Error", (x) =>
-      this.deps.lit(x, "assigning a member of a URL held in a dynamic value is not supported yet"),
-    );
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, "assigning a member of a URL held in a dynamic value is not supported yet"));
     pushNull(c);
     c.return_();
     c.end();
@@ -1364,9 +1376,8 @@ export class DynBuilder {
         this.deps.lit(c, name);
         c.call(this.deps.strEq());
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) =>
-          this.deps.lit(x, `'RegExp.prototype.${name}' read as a value on an island value is not supported yet`),
-        );
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, `'RegExp.prototype.${name}' read as a value on an island value is not supported yet`));
         c.refNull(this.dynT());
         c.return_();
         c.end();
@@ -1573,9 +1584,8 @@ export class DynBuilder {
           c.i32Or();
         }
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) =>
-          this.deps.lit(x, "Object.create over a null-prototype or built-in object on the island is not supported yet"),
-        );
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "Object.create over a null-prototype or built-in object on the island is not supported yet"));
         c.refNull(dynT);
         c.return_();
         c.end();
@@ -1591,9 +1601,8 @@ export class DynBuilder {
         c.refNull(dynT);
       });
       this.arm(c, K, [DK.JSVAL], () => c.unreachable());
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"));
       c.refNull(dynT);
       this.mb.setBody(idx, [I32, this.deps.strRef()], c.bytes());
     });
@@ -1977,6 +1986,8 @@ export class DynBuilder {
       { storage: I32, mutable: false },
       { storage: this.deps.strRef(), mutable: false },
       { storage: I32, mutable: false },
+      { storage: this.deps.strRef(), mutable: false },
+      { storage: I32, mutable: false },
     ]);
     return this.fnType;
   }
@@ -2017,6 +2028,8 @@ export class DynBuilder {
     sig: number,
     pushName: (c: Code) => void,
     arity: number,
+    pushSrc?: (c: Code) => void,
+    pushProto?: (c: Code) => void,
   ): void {
     this.boxFunc(c, (x) => {
       pushClos(x);
@@ -2024,6 +2037,10 @@ export class DynBuilder {
       x.i32Const(sig);
       pushName(x);
       x.i32Const(arity);
+      if (pushSrc !== undefined) pushSrc(x);
+      else x.refNull(this.deps.strType());
+      if (pushProto !== undefined) pushProto(x);
+      else x.i32Const(0);
       x.structNew(this.fnT());
     });
   }
@@ -2099,9 +2116,8 @@ export class DynBuilder {
           c.i32Const(-2);
           c.i32Eq();
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) =>
-            this.deps.lit(x, "calling an error's constructor read from a dynamic value is not supported yet on the wasm lane"),
-          );
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "calling an error's constructor read from a dynamic value is not supported yet on the wasm lane"));
           c.refNull(dynT);
           c.return_();
           c.end();
@@ -2286,7 +2302,7 @@ export class DynBuilder {
     this.deps.lit(c, "' on a dynamic value is not supported yet");
     c.call(this.deps.concat());
     c.localSet(msgLocal);
-    this.deps.throwError(c, "%Error", "Error", (x) => x.localGet(msgLocal));
+    this.deps.fence(c, (x) => x.localGet(msgLocal));
     c.refNull(this.dynT());
   }
 
@@ -3119,7 +3135,7 @@ export class DynBuilder {
       c.call(this.viewSetI());
       c.return_();
       c.end();
-      this.deps.throwTypeError(c, (x) => {
+      this.deps.fence(c, (x) => {
         this.deps.lit(x, "Cannot add property '");
         x.localGet(1);
         x.call(concat);
@@ -3668,7 +3684,7 @@ export class DynBuilder {
   defineProps(): number {
     if (!this.viewsLive) return this.definePropsRaw();
     return this.viewFront("definePropsV", [this.dynRef(), this.dynRef()], [this.dynRef()], [], () => this.definePropsRaw(), (c) => {
-      this.deps.throwTypeError(c, (x) => {
+      this.deps.fence(c, (x) => {
         this.deps.lit(x, "Cannot define properties on ");
         this.viewField(x, (y) => y.localGet(0), VIEW_LABEL);
         x.call(this.deps.concat());
@@ -3796,7 +3812,7 @@ export class DynBuilder {
           c.call(this.viewSame());
           c.i32Eqz();
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) => {
+          this.deps.fence(c, (x) => {
             this.deps.lit(x, `a '${method}' callback changed `);
             this.viewField(x, (y) => y.localGet(0), VIEW_LABEL);
             x.call(this.deps.concat());
@@ -5608,7 +5624,7 @@ export class DynBuilder {
             this.deps.lit(c, "' of a typed-array constructor read from a dynamic value is not supported yet");
             c.call(this.deps.concat());
             c.localSet(MSG);
-            this.deps.throwError(c, "%Error", "Error", (x) => x.localGet(MSG));
+            this.deps.fence(c, (x) => x.localGet(MSG));
             c.refNull(this.dynT());
             c.return_();
             c.end();
@@ -5686,7 +5702,7 @@ export class DynBuilder {
       this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(0)));
       c.i32GtS();
       c.ifVoid();
-      this.deps.throwError(c, "%Error", "Error", (x) => {
+      this.deps.fence(c, (x) => {
         this.deps.lit(x, "writing an island array at index ");
         x.localGet(1);
         x.call(this.deps.concat());
@@ -5730,9 +5746,8 @@ export class DynBuilder {
           this.objPayload(c, (x) => x.localGet(0));
           c.refTest(this.objRegexT());
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) =>
-            this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"),
-          );
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"));
           c.return_();
           c.end();
         }
@@ -5752,7 +5767,7 @@ export class DynBuilder {
           c.localGet(SETM);
           this.isAccessorCell(c);
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) => {
+          this.deps.fence(c, (x) => {
             this.deps.lit(x, "assigning to the getter-only property '");
             x.localGet(1);
             x.call(concat);
@@ -5782,7 +5797,19 @@ export class DynBuilder {
       c.ifVoid();
       this.arrPayload(c, (x) => x.localGet(0));
       c.localSet(A);
-      // Pad to the index: C's `while (len <= idx) push(undefined)`.
+      // Pad to the index: C's `while (len <= idx) push(undefined)`. A gap
+      // padded here is a hole in Node (S016) — mark the module's "a hole
+      // was made" flag so `in`/Object.hasOwn over such an index fence
+      // instead of answering true (GH #86 review).
+      if (this.deps.holesMade !== undefined) {
+        c.localGet(IDX);
+        this.arrLen(c, (x) => x.localGet(A));
+        c.i32GtU();
+        c.ifVoid();
+        c.i32Const(1);
+        c.globalSet(this.deps.holesMade());
+        c.end();
+      }
       c.block();
       c.loop();
       this.arrLen(c, (x) => x.localGet(A));
@@ -5834,9 +5861,8 @@ export class DynBuilder {
       c.f64ConvertI32U();
       c.f64Gt();
       c.ifVoid();
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane"));
       c.return_();
       c.end();
       c.localGet(A);
@@ -5890,9 +5916,8 @@ export class DynBuilder {
       c.structGet(dynT, DYN_NUM);
       c.call(this.deps.bytesSet());
       c.else_();
-      this.deps.throwTypeError(c, (x) =>
-        this.deps.lit(x, "non-number values on a dynamic bytes write are not supported yet"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "non-number values on a dynamic bytes write are not supported yet"));
       c.end();
       c.return_();
       c.end();
@@ -6013,11 +6038,71 @@ export class DynBuilder {
         this.deps.lit(c, "'");
         c.call(concat);
         c.localSet(MSG);
+        // GH #86 review (SEMANTICS.md S016): a string's own members — an
+        // in-range index and `length` — are READ-ONLY in V8, which says
+        // so: "Cannot assign to read only property '<k>' of string '<s>'".
+        c.localGet(K);
+        c.i32Const(DK.STR);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(1);
+        this.deps.lit(c, "length");
+        c.call(this.deps.strEq());
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(1);
+        c.call(this.canonIdx());
+        c.localTee(IDX);
+        c.i32Const(0);
+        c.i32GeS();
+        c.localGet(IDX);
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.deps.strType());
+        c.arrayLen();
+        c.i32LtS();
+        c.i32And();
+        c.end();
+        c.ifVoid();
+        this.deps.lit(c, "Cannot assign to read only property '");
+        c.localGet(1);
+        c.call(concat);
+        this.deps.lit(c, "' of string '");
+        c.call(concat);
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.deps.strType());
+        c.call(concat);
+        this.deps.lit(c, "'");
+        c.call(concat);
+        c.localSet(MSG);
+        c.end();
+        c.end();
         // `arm` closes with a `return`; the throw has to happen inside.
         this.deps.throwTypeError(c, (x) => x.localGet(MSG));
       });
       c.end();
+      // undefined/null: Node's own TypeError. Any other receiver reaching
+      // here (an array's non-index key, a bytes/promise value) is one Node
+      // writes to and this tree cannot store — GH #86 review (SEMANTICS.md
+      // S016, S122): it ends the program at the named fence.
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
       this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+      c.else_();
+      this.deps.fence(c, (x) => {
+        x.localGet(MSG);
+        this.deps.lit(x, " (the checked-dynamic tree has no member slot for it — SEMANTICS.md S016)");
+        x.call(concat);
+      });
+      c.end();
       this.mb.setBody(
         idx,
         [
@@ -6062,6 +6147,8 @@ export class DynBuilder {
       const K = 2;
       const IDX = 3;
       const FP = 4;
+      const R = 5;
+      const E = 6;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -6139,6 +6226,44 @@ export class DynBuilder {
         c.i32Const(0);
         c.end();
         c.end();
+        // GH #86 review: an in-range index of an ARRAY whose slot is a hole
+        // answers false, as HasProperty does — a null slot is the tree's own
+        // hole (flatInto's rule); an element's `undefined` that crossed in
+        // from typed storage may be a hole Node keeps, which the tree
+        // cannot tell from an explicit undefined once the program has made
+        // a hole — that one fences (SEMANTICS.md S119 (b)).
+        c.localTee(R);
+        c.localGet(K);
+        c.i32Const(DK.ARR);
+        c.i32Eq();
+        c.i32And();
+        c.localGet(IDX);
+        c.i32Const(0);
+        c.i32GeS();
+        c.i32And();
+        c.ifVoid();
+        this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(0)), (x) => x.localGet(IDX));
+        c.localTee(E);
+        c.refIsNull();
+        c.ifVoid();
+        c.i32Const(0);
+        c.localSet(R);
+        c.else_();
+        if (this.deps.holesMade !== undefined) {
+          c.localGet(E);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.UNDEF);
+          c.i32Eq();
+          c.globalGet(this.deps.holesMade());
+          c.i32And();
+          c.ifVoid();
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "'in' or Object.hasOwn over an array index that may be a hole (a write past an array's end leaves undefined where Node keeps a hole — SEMANTICS.md S119)"));
+          c.end();
+        }
+        c.end();
+        c.end();
+        c.localGet(R);
       });
       // BYTES: canonical in-range indices ONLY — NOT "length", unlike the
       // ARR/STR arm just above. Measured directly: `Object.hasOwn([1,2],
@@ -6202,6 +6327,37 @@ export class DynBuilder {
         c.i32Const(0);
         c.end();
         c.i32Or();
+        // GH #86 review: Node's ordinary functions OWN `prototype` and
+        // arrows and methods do not. A box built from a function of known
+        // kind answers (FN_PROTO); one that crossed anonymously fences
+        // rather than answer false for a constructor.
+        c.localTee(R);
+        c.i32Eqz();
+        c.localGet(1);
+        this.deps.lit(c, "prototype");
+        c.call(this.deps.strEq());
+        c.i32And();
+        c.ifVoid();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_PROTO);
+        c.i32Const(1);
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_PROTO);
+        c.i32Const(2);
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "'prototype' in or Object.hasOwn on a function held in a dynamic value (whether it is a constructor is not recorded) is not supported yet"));
+        c.end();
+        c.localGet(R);
       });
       // C routes an island receiver to the ENGINE's own Object.hasOwn;
       // unconstructible here, and `false` would be a silent wrong answer.
@@ -6209,9 +6365,145 @@ export class DynBuilder {
       c.i32Const(0);
       this.mb.setBody(
         idx,
-        [I32 /* K=2 */, I32 /* IDX=3 */, { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=4 */],
+        [I32 /* K=2 */, I32 /* IDX=3 */, { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=4 */, I32 /* R=5 */, this.dynRef() /* E=6 */],
         c.bytes(),
       );
+    });
+  }
+
+  /** A write in sloppy code (GH #86 review): a string, number or boolean
+   * receiver ignores it, as JS does; everything else writes as `base`
+   * (keySet or islandSetIdx) does — undefined and null still throw. */
+  sloppySet(base: "keySet" | "islandSetIdx"): number {
+    return this.cached(`sloppy:${base}`, [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const c = new Code();
+      const K = 3;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.STR, DK.NUM, DK.BOOL], () => {});
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(base === "keySet" ? this.keySet() : this.islandSetIdx());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.isBinaryLike(d) → i32: a Uint8Array/Buffer, a typed array, or a
+   * URL held in a dynamic value (dyn.argStr's wide parameters). */
+  isBinaryLike(): number {
+    return this.cached("isBinaryLike", [this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      const K = 1;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.localSet(K);
+      this.typedArm(c, 0, K, () => c.i32Const(1));
+      this.arm(c, K, [DK.BYTES], () => c.i32Const(1));
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifResult(I32);
+      this.objPayload(c, (x) => x.localGet(0));
+      c.refTest(this.objUrlT());
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.hasKey(d, k) → i32 — `k in d` with a RUNTIME string key (the
+   * `dyn.hasKey` libCall; the compile-time `dynHasKey` fold, per value).
+   * HasProperty as far as the tree models it:
+   *  - a primitive receiver (undefined, null, boolean, number, string)
+   *    throws Node's TypeError "Cannot use 'in' operator to search for
+   *    'k' in <String(d)>" — `in` never boxes its right operand;
+   *  - OBJ answers through `memberLookup` — the own entry, then each
+   *    prototype link where Object.create links exist, accessor members
+   *    included, an island RegExp's own lastIndex too; an INHERITED
+   *    Object.prototype name still answers false (SEMANTICS.md S015);
+   *  - ARR, a tag call's strings array, FUNC (name, length, its own
+   *    property table) and a Uint8Array's canonical indices answer exactly
+   *    as Object.hasOwn does (hasOwn below, reused);
+   *  - what the tree cannot answer is refused BY NAME, never answered
+   *    false: a non-index key on a Uint8Array/Buffer or a typed array
+   *    (its prototype's names), a net/http handle (S087 (f)), and an
+   *    island (engine) value.
+   * Borrows both; may throw (the pending check follows the call). */
+  hasKey(): number {
+    return this.cached("hasKey", [this.dynRef(), this.deps.strRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "'in' on", (x) => x.i32Const(0)));
+      this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR], () => {
+        this.deps.throwTypeError(c, (x) => {
+          this.deps.lit(x, "Cannot use 'in' operator to search for '");
+          x.localGet(1);
+          x.call(this.deps.concat());
+          this.deps.lit(x, "' in ");
+          x.call(this.deps.concat());
+          x.localGet(0);
+          x.call(this.toStr());
+          x.call(this.deps.concat());
+        });
+        c.i32Const(0);
+      });
+      if (this.handleLive()) {
+        this.arm(c, K, [DK.HANDLE], () => {
+          this.handleFence(c, "'in' or Object.hasOwn");
+          c.i32Const(0);
+        });
+      }
+      this.arm(c, K, [DK.OBJ], () => {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.localGet(1);
+        c.call(this.memberLookup());
+        c.refIsNull();
+        c.i32Eqz();
+        if (this.regexLive) {
+          // Unit F1: a RegExp's lastIndex is an own data property.
+          this.objPayload(c, (x) => x.localGet(0));
+          c.refTest(this.objRegexT());
+          c.localGet(1);
+          this.deps.lit(c, "lastIndex");
+          c.call(this.deps.strEq());
+          c.i32And();
+          c.i32Or();
+        }
+      });
+      // A Uint8Array/Buffer: canonical indices are hasOwn's answer below;
+      // every other key asks the prototype (Buffer's or Uint8Array's
+      // methods, `length` the inherited accessor), which is not modelled.
+      this.arm(c, K, [DK.BYTES], () => {
+        c.localGet(1);
+        c.call(this.canonIdx());
+        c.i32Const(0);
+        c.i32LtS();
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "'in' with a non-index key on a Uint8Array or Buffer held in a dynamic value is not supported yet"));
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(0);
+        c.localGet(1);
+        c.call(this.hasOwn());
+      });
+      this.arm(c, K, [DK.JSVAL], () => {
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "'in' on an engine (island) value held in a dynamic value is not supported yet"));
+        c.i32Const(0);
+      });
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.hasOwn());
+      this.mb.setBody(idx, [I32 /* K=2 */], c.bytes());
     });
   }
 
@@ -6822,7 +7114,7 @@ export class DynBuilder {
         c.i32Const(DK.HANDLE);
         c.i32Eq();
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `Object.assign ${what} a ${this.handleNoun()} is not supported yet`));
+        this.deps.fence(c, (x) => this.deps.lit(x, `Object.assign ${what} a ${this.handleNoun()} is not supported yet`));
         c.refNull(dynT);
         c.return_();
         c.end();
@@ -6902,7 +7194,28 @@ export class DynBuilder {
           c.localGet(TV);
           this.isAccessorCell(c);
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) => {
+          // GH #86 review: Object.assign's Set throws over a getter-only
+          // member in Node too — V8's TypeError, the receiver rendered
+          // "#<Object>" for a plain-prototype target; any other target
+          // (a null or linked prototype, which V8 renders otherwise) stays
+          // the fence.
+          c.localGet(O);
+          c.structGet(objT, OBJ_PROTO);
+          c.i32Const(OBJ_PROTO_PLAIN);
+          c.i32Eq();
+          c.ifVoid();
+          this.deps.throwTypeError(c, (x) => {
+            this.deps.lit(x, "Cannot set property ");
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_KEY);
+            x.call(this.deps.concat());
+            this.deps.lit(x, " of #<Object> which has only a getter");
+            x.call(this.deps.concat());
+          });
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          this.deps.fence(c, (x) => {
             this.deps.lit(x, "copying onto the getter-only property '");
             x.localGet(E);
             x.structGet(entryT, ENTRY_KEY);
@@ -7054,9 +7367,8 @@ export class DynBuilder {
       c.refIsNull();
       c.i32Eqz();
       c.ifVoid();
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet"));
       c.refNull(this.dynT());
       c.return_();
       c.end();
@@ -7659,9 +7971,8 @@ export class DynBuilder {
       c.i32Const(DK.OBJ);
       c.i32Ne();
       c.ifVoid();
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "Object.assign onto a non-plain-object target is not supported yet"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "Object.assign onto a non-plain-object target is not supported yet"));
       c.refNull(dynT);
       c.return_();
       c.end();
@@ -7996,9 +8307,9 @@ export class DynBuilder {
   }
 
   /** %w.dyn.checkFail(path, want, got) — `scr_dyn_check_fail`: render
-   * "expected <want> at <path>, got <kind>" and leave a catchable
-   * TypeError in the exception cell. Returns normally; the CALLER unwinds
-   * (see DynDeps.throwTypeError). */
+   * "expected <want> at <path>, got <kind>" and END the program at that
+   * fence (GH #86 review, SEMANTICS.md S122: a check Node never makes).
+   * Never returns; the callers' unwinds after it are dead code. */
   checkFail(): number {
     return this.cached("checkFail", [this.pathRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
       const c = new Code();
@@ -8018,7 +8329,9 @@ export class DynBuilder {
       c.call(this.kindName());
       c.call(concat);
       c.localSet(MSG);
-      this.deps.throwTypeError(c, (w) => w.localGet(MSG));
+      // GH #86 review (SEMANTICS.md S122): a check Node never makes — the
+      // checked-dynamic boundary's mismatch ENDS the program.
+      this.deps.fence(c, (w) => w.localGet(MSG), "SC1100");
       this.mb.setBody(idx, [this.deps.strRef()], c.bytes());
     });
   }
@@ -8648,9 +8961,8 @@ export class DynBuilder {
       c.i32Const(DK.FUNC);
       c.i32Eq();
       c.ifVoid();
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "a function as a property descriptor on a dynamic value is not supported yet"),
-      );
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "a function as a property descriptor on a dynamic value is not supported yet"));
       c.refNull(dynT);
       c.return_();
       c.end();
@@ -8681,12 +8993,7 @@ export class DynBuilder {
       c.i32Ne();
       c.i32Or();
       c.ifVoid();
-      this.deps.throwError(
-        c,
-        "%Error",
-        "Error",
-        (x) => this.deps.lit(x, "accessor (get/set) property descriptors on a dynamic value are not supported yet"),
-      );
+      this.deps.fence(c, (x) => this.deps.lit(x, "accessor (get/set) property descriptors on a dynamic value are not supported yet"));
       c.refNull(dynT);
       c.return_();
       c.end();
@@ -8720,16 +9027,11 @@ export class DynBuilder {
       c.localGet(ENUMB);
       c.i32Eqz();
       c.ifVoid();
-      this.deps.throwError(
-        c,
-        "%Error",
-        "Error",
-        (x) =>
+      this.deps.fence(c, (x) =>
           this.deps.lit(
             x,
             "Object.defineProperties: a non-enumerable property descriptor on a plain-object dynamic value is not supported yet",
-          ),
-      );
+          ));
       c.refNull(dynT);
       c.return_();
       c.else_();
@@ -8983,7 +9285,7 @@ export class DynBuilder {
   /** INC-29 U1: the loud fence for an operation the handle surface does
    * not model (a plain Error, the invoke ladder's own stance). */
   private handleFence(c: Code, what: string): void {
-    this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `${what} on a ${this.handleNoun()} is not supported yet`));
+    this.deps.fence(c, (x) => this.deps.lit(x, `${what} on a ${this.handleNoun()} is not supported yet`));
   }
 
   /** INC-29 U1: push the handle's class name from its tag in DYN_NUM. */
@@ -9228,7 +9530,7 @@ export class DynBuilder {
         this.deps.lit(c, ": non-number index arguments on a dynamic receiver are not supported yet");
         c.call(this.deps.concat());
         c.localSet(MSG);
-        this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+        this.deps.fence(c, (x) => x.localGet(MSG));
         c.f64Const(0);
         this.mb.setBody(idx, [this.dynRef(), this.deps.strRef(), F64], c.bytes());
       },
@@ -9571,9 +9873,8 @@ export class DynBuilder {
          * a `catch (e) { e instanceof TypeError }` handler does not
          * mistake a missing feature for a type error. */
         const throwUnsupported = (proto: string): void => {
-          this.deps.throwError(c, "%Error", "Error", (x) =>
-            this.deps.lit(x, `'${proto}.prototype.${method}' on a dynamic value is not supported yet`),
-          );
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, `'${proto}.prototype.${method}' on a dynamic value is not supported yet`));
           c.refNull(dynT);
         };
         /** `local = payload vector`, then `N = its length`. */
@@ -9735,9 +10036,8 @@ export class DynBuilder {
                 c.f64Const(0);
                 c.f64Ge();
                 c.ifVoid();
-                this.deps.throwError(c, "%Error", "Error", (x) =>
-                  this.deps.lit(x, "'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet"),
-                );
+                this.deps.fence(c, (x) =>
+                  this.deps.lit(x, "'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet"));
                 c.refNull(dynT);
                 c.return_();
                 c.end();
@@ -9752,9 +10052,8 @@ export class DynBuilder {
               });
               c.return_();
             } else {
-              this.deps.throwError(c, "%Error", "Error", (x) =>
-                this.deps.lit(x, `'RegExp.prototype.${method}' on an island value is not supported yet`),
-              );
+              this.deps.fence(c, (x) =>
+                this.deps.lit(x, `'RegExp.prototype.${method}' on an island value is not supported yet`));
               c.refNull(dynT);
               c.return_();
             }
@@ -9877,12 +10176,11 @@ export class DynBuilder {
               c.i32Eq();
               c.i32Or();
               c.ifVoid();
-              this.deps.throwError(c, "%Error", "Error", (x) =>
+              this.deps.fence(c, (x) =>
                 this.deps.lit(
                   x,
                   "'Function.prototype.apply' with an array-like argsArray on a dynamic value is not supported yet",
-                ),
-              );
+                ));
               c.refNull(dynT);
               c.return_();
               c.end();
@@ -10160,7 +10458,7 @@ export class DynBuilder {
                 this.deps.lit(c, ": non-primitive depth arguments on a dynamic receiver are not supported yet");
                 c.call(concat);
                 c.localSet(MSG);
-                this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+                this.deps.fence(c, (x) => x.localGet(MSG));
                 c.refNull(dynT);
                 c.return_();
                 c.end();
@@ -11809,9 +12107,8 @@ export class DynBuilder {
           // 32-bit kinds take typedArm's same refusal above); catchable,
           // where the arm below would trap.
           this.arm(c, K, [DK.BYTES], () => {
-            this.deps.throwError(c, "%Error", "Error", (x) =>
-              this.deps.lit(x, "calling 'constructor' on a typed array held in a dynamic value is not supported yet"),
-            );
+            this.deps.fence(c, (x) =>
+              this.deps.lit(x, "calling 'constructor' on a typed array held in a dynamic value is not supported yet"));
             c.refNull(dynT);
           });
         }

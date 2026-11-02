@@ -24,7 +24,9 @@
  * The native lanes run the same algorithms in scr_regex.c, held equal by
  * the regex differential fuzz (packages/compiler/test/regex-state-fuzz.test.ts).
  * Positions are UTF-16 indices; a capture that did not participate reads
- * "" in a row (S064) and -1 in a position list. */
+ * Node's `undefined` in a row and a split piece under undefSlots (the
+ * WasmGC lanes — "" only in hand-built IR without it, S064's c/llvm
+ * reading) and -1 in a position list. */
 import { A, Fn, type X } from "./asm.js";
 import { F64, I32, type ModuleBuilder, type ValType } from "./module.js";
 import { LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE, LRE_FLAG_UNICODE_SETS, RE_HEADER_FLAGS, RE_HEADER_REGISTER_COUNT } from "./regex-opcodes.js";
@@ -59,6 +61,11 @@ export interface RegexStateDeps {
    * more) — and the window reader behind the view entry points (execV,
    * bexecV, matchV, searchV), whose subject is a str VALUE matched in
    * place through interp.execW. */
+  /** Unit U (SEMANTICS.md S119, S064): the module holds `undefined` in its
+   * string slots (undefSlots) — a capture that did not participate is then
+   * Node's `undefined` (a null ref) in every row and split piece; without
+   * it (hand-built IR) the old "" stands. */
+  undefCaps?: boolean;
   views?: {
     span: () => number;
     window: ($: A, x: number, b: number, off: number, len: number) => void;
@@ -190,6 +197,14 @@ export class RegexStateBuilder {
     return $.anew(this.d.strT, $.i(0));
   }
 
+  /** A capture that did not participate, in a row or a split piece:
+   * Node's `undefined` (null) under undefSlots, else "" (S064's c/llvm
+   * reading). `t` is the slot's ref type (str, or the view eqref). */
+  private missCap($: A, t: ValType): X {
+    if (this.d.undefCaps === true && t.kind === "ref") return $.nul(t.typeIndex);
+    return this.emptyStr($);
+  }
+
   private sub($: A, S: X, a: X, b: X): X {
     return $.call(this.d.slice(), S, $.i2d(a), $.i2d(b));
   }
@@ -212,8 +227,8 @@ export class RegexStateBuilder {
     return this.d.views === undefined ? this.strRefT : { kind: "ref", nullable: true, typeIndex: -0x13 };
   }
 
-  /** The honest match row: [whole, ...captures], "" for a capture that
-   * did not participate (S064). */
+  /** The honest match row: [whole, ...captures], `undefined` for a
+   * capture that did not participate (missCap). */
   row(): number {
     return this.fn("row", [this.strRefT, this.capT, I32], [this.rowT], ($) => {
       const S = $.l(0);
@@ -229,7 +244,7 @@ export class RegexStateBuilder {
         $.run(
           this.d.vecs.pushOne(this.d.rowVec),
           $.l(OUT),
-          $.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.piece($, S, $.l(CS), $.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))))),
+          $.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.missCap($, this.pieceT), this.piece($, S, $.l(CS), $.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))))),
         );
       });
       $.do($.l(OUT));
@@ -304,7 +319,7 @@ export class RegexStateBuilder {
         $.run(
           this.d.vecs.pushOne(this.d.rowVec),
           $.l(OUT),
-          $.sel(EQ, $.lt($.l(CS), $.i(0)), this.emptyStr($), $.call(this.views.span(), B, $.add(OFF, $.l(CS)), $.sub($.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))), $.l(CS)))),
+          $.sel(EQ, $.lt($.l(CS), $.i(0)), this.missCap($, EQ), $.call(this.views.span(), B, $.add(OFF, $.l(CS)), $.sub($.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))), $.l(CS)))),
         );
       });
       $.do($.l(OUT));
@@ -836,7 +851,7 @@ export class RegexStateBuilder {
                     $.put(P, $.l(EN));
                     $.for(K, $.i(1), $.l(N), () => {
                       $.put(CS, $.aget(capT, $.l(CAP), $.shl($.l(K), $.i(1))));
-                      push($.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.piece($, S, $.l(CS), $.aget(capT, $.l(CAP), $.add($.shl($.l(K), $.i(1)), $.i(1))))));
+                      push($.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.missCap($, this.pieceT), this.piece($, S, $.l(CS), $.aget(capT, $.l(CAP), $.add($.shl($.l(K), $.i(1)), $.i(1))))));
                     });
                     $.put(Q, $.l(P));
                   },

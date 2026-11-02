@@ -6,7 +6,8 @@
  *    direct `re.exec(s)` / `s.match(re)` call (or null) in its declaring
  *    function keeps the match's capture positions and subject in hidden
  *    locals, so `m.index`, `m.input` and `m.groups` read Node's values
- *    (the result itself stays the honest string[] row, S064);
+ *    (the result itself stays the honest string[] row — its
+ *    nonparticipating captures undefined on the WasmGC lanes, S064);
  *  - FUNCTION replacers — `s.replace(re, fn)`, `s.replaceAll(re, fn)` and
  *    the string-pattern forms: the regex forms collect every match first
  *    (Symbol.replace's own order — the `collect` intrinsic) and call the
@@ -453,15 +454,12 @@ export function lowerExecCompanionRead(L: Lowerer, expr: ts.PropertyAccessExpres
       {
         kind: "if",
         cond: bin("===", { kind: "arrIntrinsic", method: "length", receiver: ref(P, NUMS, loc), args: [], type: F64, loc }, num(0, loc), loc),
+        // GH #86: a runtime fence — it ends the program (one helper serves
+        // every read site, so the text names no single line).
         then: [{
-          kind: "throw",
-          value: {
-            kind: "libCall",
-            fn: "error.new",
-            args: [strLit(`'.${name}' of a global match() result (Node: undefined) is not supported: the every-match array has no ${name}`, loc)],
-            type: { kind: "object", className: "%Error" },
-            loc,
-          },
+          kind: "runtimeFence",
+          code: "SC1120",
+          message: `'.${name}' of a global match() result (Node: undefined) is not supported: the every-match array has no ${name} [SC1120 at a read of a match result]`,
           loc,
         }],
         else_: null,
@@ -766,7 +764,9 @@ function buildReplaceHelper(
         return L.coerceInto(blame, at(row, num(0, loc), STRING), pt);
       case "capture": {
         const cap = at(row, num(j, loc), STRING);
-        if (pt.kind === "string") return cap; // S064: a nonparticipating capture is ""
+        // S064: a nonparticipating capture is the row's own slot — Node's
+        // undefined on the WasmGC lanes, "" on c/llvm
+        if (pt.kind === "string") return cap;
         const arms = pt.kind === "union" ? L.unions.get(pt.unionId)?.arms ?? [] : [];
         if (!arms.some((a) => a.kind === "undefinedT")) return L.coerceInto(blame, cap, pt);
         // `p?: string` / `string | undefined`: Node's undefined exactly
@@ -780,7 +780,8 @@ function buildReplaceHelper(
       case "groups": {
         // `{ [name: string]: string | undefined }`: Node's undefined for a
         // group that did not participate, exactly; a `string`-valued
-        // annotation keeps the "" projection (S064).
+        // annotation takes the row projection (undefined on the WasmGC
+        // lanes, "" on c/llvm — S064).
         const def = pt.kind === "record" ? L.shapes.get(pt.shapeId) : undefined;
         const iv = def?.indexValue;
         const ivArms = iv?.kind === "union" ? L.unions.get(iv.unionId)?.arms ?? [] : [];
@@ -841,7 +842,7 @@ function buildReplaceHelper(
  * passes the same object: lastIndex neither crosses nor comes back. That
  * was unobservable while this tier had no lastIndex (board #301 gave it
  * one), so a VALUE crossing (a literal crossing directly is a fresh object
- * either way) throws a named Error when it is global or sticky — the
+ * either way) ends the program at a named fence (GH #86) when it is global or sticky — the
  * flags whose methods read and write lastIndex on either side — or
  * already holds a lastIndex other than 0. Answers `re` itself otherwise. */
 export function regexCrossingChecked(L: Lowerer, re: IrExpr): IrExpr {
@@ -854,18 +855,13 @@ export function regexCrossingChecked(L: Lowerer, re: IrExpr): IrExpr {
     const bad = (cond: IrExpr): IrStmt => ({
       kind: "if",
       cond,
+      // GH #86: a runtime fence — it ends the program (one helper serves
+      // every crossing, so the text names no single line).
       then: [{
-        kind: "throw",
-        value: {
-          kind: "libCall",
-          fn: "error.new",
-          args: [strLit(
-            "passing a global or sticky RegExp value, or one whose lastIndex is not 0, into dynamically-typed code is not supported (the engine gets a fresh RegExp, so lastIndex would not be shared); pass a regex literal, or drop the g/y flag",
-            loc,
-          )],
-          type: { kind: "object", className: "%Error" },
-          loc,
-        },
+        kind: "runtimeFence",
+        code: "SC1090",
+        message:
+          "passing a global or sticky RegExp value, or one whose lastIndex is not 0, into dynamically-typed code is not supported (the engine gets a fresh RegExp, so lastIndex would not be shared); pass a regex literal, or drop the g/y flag [SC1090 at a RegExp value's crossing]",
         loc,
       }],
       else_: null,

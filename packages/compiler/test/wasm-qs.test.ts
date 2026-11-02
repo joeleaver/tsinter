@@ -249,10 +249,10 @@ describe("qs.stringify of an object literal with accessors refuses by name (ever
     }
     const res = await build(`'use strict';\nconst qs = require('querystring');\nconsole.log('before');\nconsole.log(qs.stringify({ get g() { return 'got'; }, a: 1 }));\n`, "cjs");
     if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
-    // The fence reports by name, then traps (the tier's exit-1 channel).
+    // The fence ends the program (GH #86, SEMANTICS.md S122): its line, then the trap.
     const r = await runWasmToTrap(res.binaryPath);
     expect(r.stdout).toBe("before\n");
-    expect(r.stderr).toContain(`Uncaught Error: ${WHAT} is not supported yet [SC1090`);
+    expect(r.stderr).toMatch(new RegExp(`^tsinter: unsupported: ${WHAT.replace(/[./]/g, "\\$&")} is not supported yet \\[SC1090 at .*p\\d+\\.cjs:4\\]\\n$`));
   }, 120000);
 });
 

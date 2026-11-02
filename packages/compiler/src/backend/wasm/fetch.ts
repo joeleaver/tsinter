@@ -24,6 +24,12 @@ import { DK, DYN_KIND, DYN_NUM, DYN_REF, type DynBuilder } from "./dyn.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 export interface FetchDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   dyn: () => DynBuilder;
   strRef: () => ValType;
   strType: () => number;
@@ -655,7 +661,7 @@ export class FetchBuilder {
       const GIVEN = f.local(I32);
       const BT = this.deps.bytesType();
       const fence = (what: string): void => {
-        this.throwErr($, "%Error", "Error", this.lit($, `fetch() ${what} is not supported yet`));
+        this.deps.fence($.c, () => (this.lit($, `fetch() ${what} is not supported yet`))());
         $.ret($.nul(dyn.dynT()));
       };
       // The input: a string (Node also takes a URL or a Request).
@@ -1294,10 +1300,10 @@ export class FetchBuilder {
         $.if(is("bodyUsed"), () => $.ret(this.boxBool($, $.get(ST, S_USED, $.l(R)))));
         $.if(is("headers"), () => $.ret(this.boxHandle($, TAG_HEADERS, $.get(ST, S_HDRS, $.l(R)))));
         $.if(is("body"), () => {
-          this.throwErr($, "%Error", "Error", this.lit($, "Response.body (a ReadableStream) is not supported yet"));
+          this.deps.fence($.c, () => (this.lit($, "Response.body (a ReadableStream) is not supported yet"))());
           $.ret($.nul(dyn.dynT()));
         });
-        this.throwErr($, "%Error", "Error", this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of a Response is not supported yet")));
+        this.deps.fence($.c, () => (this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of a Response is not supported yet")))());
         $.ret($.nul(dyn.dynT()));
       });
       $.if($.deq(tag, $.d(TAG_SIGNAL)), () => {
@@ -1306,15 +1312,15 @@ export class FetchBuilder {
         $.if(is("reason"), () =>
           $.ret($.sel(this.dynRef, $.get(this.sigT(), G_ABORTED, $.l(G)), $.call(dyn.fromError(), $.get(this.sigT(), G_REASON, $.l(G))), this.undef($))),
         );
-        this.throwErr($, "%Error", "Error", this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of an AbortSignal is not supported yet")));
+        this.deps.fence($.c, () => (this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of an AbortSignal is not supported yet")))());
         $.ret($.nul(dyn.dynT()));
       });
       $.if($.deq(tag, $.d(TAG_ARRAYBUFFER)), () => {
         $.if(is("byteLength"), () => $.ret(this.boxNum($, $.i2d($.get(this.deps.bytesType(), 2, $.get(this.abT(), 0, this.payload($, this.abT(), $.l(0))))))));
-        this.throwErr($, "%Error", "Error", this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of an ArrayBuffer is not supported yet")));
+        this.deps.fence($.c, () => (this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of an ArrayBuffer is not supported yet")))());
         $.ret($.nul(dyn.dynT()));
       });
-      this.throwErr($, "%Error", "Error", this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of a Headers value is not supported yet")));
+      this.deps.fence($.c, () => (this.cat($, this.cat($, this.lit($, "reading the property '"), $.l(1)), this.lit($, "' of a Headers value is not supported yet")))());
       $.do($.nul(dyn.dynT()));
     });
   }
@@ -1347,11 +1353,11 @@ export class FetchBuilder {
     return this.fn(`invoke:${method}`, [this.dynRef, arrRefT, this.strRef], [this.dynRef], (f, $) => {
       const tag = $.get(dyn.dynT(), DYN_NUM, $.l(0));
       const otherwise = (): void => {
-        this.throwErr($, "%Error", "Error", this.lit($, `'${method}' on this fetch value is not supported yet`));
+        this.deps.fence($.c, () => (this.lit($, `'${method}' on this fetch value is not supported yet`))());
         $.ret($.nul(dyn.dynT()));
       };
       if (fenced !== undefined) {
-        this.throwErr($, "%Error", "Error", this.lit($, fenced));
+        this.deps.fence($.c, () => (this.lit($, fenced))());
         $.ret($.nul(dyn.dynT()));
         return;
       }

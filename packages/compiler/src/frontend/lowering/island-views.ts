@@ -21,6 +21,7 @@
  * lane). Inside a view's own set accessor an island value entering a
  * nested typed slot must BE a view of that slot's type (jsUnview — it
  * unwraps, no copy) or the write throws a named TypeError. */
+import { plainFieldPresent } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import {
@@ -73,6 +74,17 @@ const throwStmt = (kind: 0 | 1 | 2, message: IrExpr, loc: SrcLoc): IrStmt => ({
   expr: { kind: "libCall", fn: "error.nodeThrow", args: [num(kind, loc), str("", loc), message], type: VOID, loc },
   loc,
 });
+/** GH #86 review (SEMANTICS.md S122): a write dynamic code makes that typed
+ * storage cannot hold is a check Node never makes — it ENDS the program
+ * with the named fence (runtimeFence). */
+const fenceStmt = (message: string, loc: SrcLoc): IrStmt => ({
+  kind: "runtimeFence",
+  code: "SC1090",
+  // the view's accessor helpers serve every write site, so the text names
+  // the operation rather than one line
+  message: `${message} [SC1090 at a write from dynamic code]`,
+  loc,
+});
 const cat = (...parts: IrExpr[]): IrExpr =>
   parts.reduce((a, b) => ({ kind: "strConcat", left: a, right: b, type: STRING, loc: a.loc }));
 
@@ -88,13 +100,17 @@ function convertIn(
   current: () => IrExpr,
 ): { stmts: IrStmt[]; value: IrExpr } {
   const tyOf: IrExpr = { kind: "jsOp", op: "typeof", args: [v], type: STRING, loc };
-  const refuse = (expected: string): IrStmt =>
-    throwStmt(1, cat(str("Cannot store ", loc), tyOf, str(` into ${what} shared from typed code (it holds ${expected} only — SEMANTICS.md S115)`, loc)), loc);
+  const refuse = (tag: string, expected: string): IrStmt =>
+    fenceStmt(`Cannot store a value that is not a ${tag} into ${what} shared from typed code (it holds ${expected} only — SEMANTICS.md S115)`, loc);
   const prim = (tag: string, expected: string, exitT: IrType): { stmts: IrStmt[]; value: IrExpr } => ({
     stmts: [{
       kind: "if",
       cond: { kind: "strEq", negated: true, left: tyOf, right: str(tag, loc), type: BOOL, loc },
-      then: [refuse(expected)],
+      // Unit U (SEMANTICS.md S119): the slot holds undefined, so writing it
+      // is no mismatch on the WasmGC lanes.
+      then: L.undefSlots
+        ? [{ kind: "if", cond: { kind: "strEq", negated: true, left: tyOf, right: str("undefined", loc), type: BOOL, loc }, then: [refuse(tag, expected)], else_: null, loc }]
+        : [refuse(tag, expected)],
       else_: null,
       loc,
     }],
@@ -120,7 +136,7 @@ function convertIn(
   // No conversion: the write refuses by name; `current` (the slot's own
   // value, never reached) keeps the store well-typed.
   return {
-    stmts: [throwStmt(1, str(`Cannot store into ${what} shared from typed code: a '${fmtS(L, t)}' slot cannot be written from dynamic code yet (SEMANTICS.md S115)`, loc), loc)],
+    stmts: [fenceStmt(`Cannot store into ${what} shared from typed code: a '${fmtS(L, t)}' slot cannot be written from dynamic code yet (SEMANTICS.md S115)`, loc)],
     value: current(),
   };
 }
@@ -179,7 +195,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
         {
           kind: "if",
           cond: { kind: "bin", op: ">", left: i, right: len(), type: BOOL, loc },
-          then: [throwStmt(0, str(`Writing past the end of ${what} shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)`, loc), loc)],
+          then: [fenceStmt(`Writing past the end of ${what} shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)`, loc)],
           else_: null,
           loc,
         },
@@ -202,7 +218,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
         {
           kind: "if",
           cond: { kind: "bin", op: ">", left: n, right: len(), type: BOOL, loc },
-          then: [throwStmt(0, str(`Growing the length of ${what} shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)`, loc), loc)],
+          then: [fenceStmt(`Growing the length of ${what} shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)`, loc)],
           else_: null,
           loc,
         },
@@ -246,7 +262,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
         loc,
       });
     });
-    setBody.push(throwStmt(0, str(`${what} shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)`, loc), loc));
+    setBody.push(fenceStmt(`${what} shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)`, loc));
     impls.push({ suffix: "set", params: [{ id: "i.0", type: F64 }, { id: "v.0", type: JSVAL }], ret: VOID, locals, body: setBody });
     impls.push({
       suffix: "trunc",
@@ -255,7 +271,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
       body: [{
         kind: "if",
         cond: { kind: "bin", op: "!==", left: ref("n.0", F64, loc), right: num(arity, loc), type: BOOL, loc },
-        then: [throwStmt(0, str(`${what} shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)`, loc), loc)],
+        then: [fenceStmt(`${what} shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)`, loc)],
         else_: null,
         loc,
       }],
@@ -293,7 +309,9 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
           loc,
         });
       } else {
-        keysBody.push(push);
+        // S119 (i): a missing key is no own key of the view either.
+        const present = plainFieldPresent(L, { kind: "recordGet", obj: x(), shapeId: shape.id, field: f.name, type: ft, loc }, loc);
+        keysBody.push(present === null ? push : { kind: "if", cond: present, then: [push], else_: null, loc });
       }
     }
     const ksT = arrayOf(STRING);
@@ -401,7 +419,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
         { kind: "recordKeySet", obj: x(), shapeId: shape.id, key: k, value: ref("c.ov", shape.indexValue, loc), overflowOnly: true, loc },
       );
     } else {
-      setBody.push(throwStmt(1, cat(str("Cannot add property '", loc), k, str(`': ${what} shared from typed code has a fixed shape (SEMANTICS.md S115)`, loc)), loc));
+      setBody.push(fenceStmt(`Cannot add a property to ${what} shared from typed code: it has a fixed shape (SEMANTICS.md S115)`, loc));
     }
     impls.push({ suffix: "set", params: [{ id: "k.0", type: STRING }, { id: "v.0", type: JSVAL }], ret: VOID, locals: setLocals, body: setBody });
   }

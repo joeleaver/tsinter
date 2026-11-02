@@ -146,7 +146,7 @@ test("semantics C-4: an ARRAY descriptor value is object-like — no throw, defi
   expect(stdout).toBe("undefined\n");
 });
 
-test("semantics S061: an accessor descriptor (get/set PRESENCE) throws a plain Error, not TypeError — non-callable get, OBJ target", async () => {
+test("semantics S061: an accessor descriptor (get/set PRESENCE) is a named fence that ends the program (GH #86, SEMANTICS.md S122) — non-callable get, OBJ target", async () => {
   const { stdout, stderr } = await compileAndRun(
     [
       "const o: any = {};",
@@ -161,11 +161,11 @@ test("semantics S061: an accessor descriptor (get/set PRESENCE) throws a plain E
   );
   expect(stdout).toBe("");
   expect(stderr).toBe(
-    "Uncaught Error: accessor (get/set) property descriptors on a dynamic value are not supported yet\n",
+    "tsinter: unsupported: accessor (get/set) property descriptors on a dynamic value are not supported yet [SC1090]\n",
   );
 });
 
-test("semantics S061: a CALLABLE get on a FUNC target throws identically — presence is the trigger regardless of target kind or callability", async () => {
+test("semantics S061: a CALLABLE get on a FUNC target fences identically — presence is the trigger regardless of target kind or callability", async () => {
   const { stdout, stderr } = await compileAndRun(
     [
       "function g() {}",
@@ -184,7 +184,7 @@ test("semantics S061: a CALLABLE get on a FUNC target throws identically — pre
   );
   expect(stdout).toBe("");
   expect(stderr).toBe(
-    "Uncaught Error: accessor (get/set) property descriptors on a dynamic value are not supported yet\n",
+    "tsinter: unsupported: accessor (get/set) property descriptors on a dynamic value are not supported yet [SC1090]\n",
   );
 });
 
@@ -204,8 +204,8 @@ test("semantics S062: a non-enumerable OBJ-target write refuses by name (Node su
   );
   expect(stdout).toBe("");
   expect(stderr).toBe(
-    "Uncaught Error: Object.defineProperties: a non-enumerable property descriptor on a plain-object " +
-      "dynamic value is not supported yet\n",
+    "tsinter: unsupported: Object.defineProperties: a non-enumerable property descriptor on a plain-object " +
+      "dynamic value is not supported yet [SC1090]\n",
   );
 });
 
@@ -261,18 +261,18 @@ test("surface: keySet (f.x=1) on a FUNC creates an ENUMERABLE property (Node's o
   expect(stdout).toBe("1 [ 'x' ] [Function: g] { x: 1 }\n");
 });
 
-test("surface bound: an ARR non-index write and a primitive receiver STILL throw (S016's other side)", async () => {
+test("surface bound: an ARR non-index write ends the program at S016's fence (GH #86 review, S122: Node writes the member)", async () => {
   const { stdout, stderr } = await compileAndRun(
     ["const a: any = [1, 2, 3];", "a.nope = 1;", "console.log('unreachable');"].join("\n"),
     true,
   );
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught TypeError: Cannot create property 'nope' on array\n");
+  expect(stderr).toBe("tsinter: unsupported: Cannot create property 'nope' on array (the checked-dynamic tree has no member slot for it — SEMANTICS.md S016) [SC1090]\n");
 });
 
 test("surface bound: a NUMBER receiver still throws the primitive-write text (unchanged by P4)", async () => {
   const { stdout, stderr } = await compileAndRun(
-    ["const n: any = 5;", "n.x = 1;", "console.log('unreachable');"].join("\n"),
+    ["'use strict';", "const n: any = 5;", "n.x = 1;", "console.log('unreachable');"].join("\n"),
     true,
   );
   expect(stdout).toBe("");

@@ -258,6 +258,13 @@ name.
 
 ## S008 — Wasm tier: string `repeat`/`pad`/`join` past the length limit trap
 
+*GH #93 amendment (wasm and wasm-native): `repeat` no longer traps — a
+negative or infinite count throws Node's catchable `RangeError: Invalid
+count value: <count>`, a result past the limit `RangeError: Invalid string
+length`, and a count of any other kind goes through ToNumber as in Node
+(`"a".repeat("x")` is `""`). What follows holds for the c and llvm lanes,
+and for `pad` and `join` on every lane.*
+
 `String.prototype.repeat` with a negative or infinite count traps (the
 spec's RangeError through the S003 bridge, exit 1 like Node). The SIZE
 limit is Node's own — V8's String::kMaxLength, 0x1fffffe8 (2^29 − 24)
@@ -281,6 +288,18 @@ and absent for `join`; it is now Node's threshold for all three.
 catchable RangeError and exactly-the-limit acceptance match Node.
 
 ## S009 — A checked cast on a catch binding validates instead of erasing *(inherited)*
+
+*GH #86 review amendment (S122): a check Node never makes is never
+catchable. A failed checked cast — here, and in every amendment below
+(dynCheck's `expected <type> at <path>, got <kind>`, the island exits'
+`expected <type>, got <typeof>`) — now ENDS the program at the fence line
+`tsinter: unsupported: <text> [SC1100]` on every lane; where the text
+below says "throws a catchable `TypeError`", read that. On the wasm and
+wasm-native lanes (GH #86 re-review) a dynamic `undefined` is no mismatch:
+the typed slot holds it (S119), as Node's binding does, so a cast, a
+checked read, a missing required key, an island exit and a typed parameter
+all let it through; only a value of the wrong type — and `null` where the
+slot has no null to carry — fences. The c and llvm lanes keep the check.*
 
 `e as C` on a catch binding is a RUNTIME check: a payload that is an
 instance of `C` passes through, and anything else throws a catchable
@@ -703,7 +722,12 @@ String (`hasOwnProperty`, `valueOf`, `slice` as a VALUE rather than a
 call, ...). The PRESENCE operator answers the same way for the same
 reason — `"toString" in u` is `true` in Node and `false` here, as is
 `"slice" in u` on a dyn array — because there is no chain to walk, only
-the own-entry table the read consults. The same holds for the class
+the own-entry table the read consults. (GH #86 review, wasm and
+wasm-native: a function's OWN `prototype` — which Node's ordinary functions
+have and arrows and methods lack — is recorded on the boxed function when
+the box is built from a known function; a box that lost it ends
+`"prototype" in f` / `Object.hasOwn(f, "prototype")` at a named fence (S122)
+instead of answering false.) The same holds for the class
 prototype of an untyped JavaScript `new Map()`, `new WeakMap()` or
 `new WeakSet()`, which the wasm tier builds as a dyn object tagged with its
 class (board #218): `typeof m.get` is `"undefined"`, `"size" in m` is
@@ -787,6 +811,14 @@ and `Object.hasOwn(a, '1')` answer `true` here and `false` there. Values
 and entries follow keys. This is the SILENT one — nothing throws, the
 program simply enumerates members Node never created.
 
+*GH #86 review amendment (wasm and wasm-native lanes): `'1' in a` and
+`Object.hasOwn(a, '1')` over such an index are no longer silent — a padding
+write sets the module's "a hole was made" flag (S119), and `in`/`hasOwn`
+over an index holding `undefined` once that flag is set ends the program at
+a named fence (S122), as S119 (b)'s observers do; an unpadded index answers
+exactly. `Object.keys`, values and entries stay as this paragraph says. The
+c and llvm lanes keep the silent answer.*
+
 The index write is not the only route to a padded slot. `map` binds its
 output to the length it captured before the first step (the spec's own
 shape), so a callback that SHRINKS the receiver leaves the steps it
@@ -796,14 +828,26 @@ skipped holding `undefined` where Node leaves holes: `a.map(cb)` on
 parts company only at `Object.keys` — `["0","1","2","3"]` here,
 `["0","1"]` in Node. Same storage fact, same silence.
 
-**A non-index key throws where Node writes.** `a['nope'] = 1` raises a
+**A non-index key ends the program where Node writes** (GH #86 review,
+S122: on the wasm and wasm-native lanes it is a fence — `tsinter:
+unsupported: Cannot create property 'nope' on array (the checked-dynamic
+tree has no member slot for it — SEMANTICS.md S016) [SC1090]`, exit 1; the
+c and llvm lanes keep the catchable form below). A write on a string,
+number or boolean is not this case: on the wasm and wasm-native lanes a
+dynamic write follows its source's strictness as Node does (GH #86 review)
+— ignored in sloppy code (a CommonJS file or a TypeScript file with no
+import/export, without a 'use strict' prologue, outside a class body),
+V8's TypeError in strict code. `a['nope'] = 1` raised a
 catchable "Cannot create property 'nope' on array" (V8's strict-mode
 primitive-write shape with the array kind name substituted) where Node
 adds the property and reads it back. `length` is the same throw and the
 more common shape: `a['length'] = 1` truncates a three-element array in
 Node and throws here.
 
-**String receivers get the wrong V8 text for the read-only cases.** An
+**String receivers get the wrong V8 text for the read-only cases** —
+*fixed on the wasm and wasm-native lanes by the GH #86 review (Node throws
+there, so the error must be Node's: "Cannot assign to read only property
+'<k>' of string '<s>'"); the c and llvm lanes keep what follows.* An
 in-range index or `length` on a dyn string raises "Cannot create property
 '0' on string 'abc'" where Node raises "Cannot assign to read only
 property '0' of string 'abc'" — a different V8 message for the same
@@ -1203,6 +1247,10 @@ its thrown plain object and non-Error class instance print
 divergence itself.
 
 ## S023 — The dyn INVOKE surface fences unmodeled (kind, method) pairs at RUNTIME *(inherited)*
+
+*GH #86 amendment: on the wasm and wasm-native lanes these fences END the
+program (S122) — "throws a catchable Error" below holds on the c and llvm
+lanes only.*
 
 `recv.m(...)` on a checked-dynamic receiver dispatches on the receiver's
 runtime KIND, so which pairs are implemented cannot be decided at compile
@@ -1846,6 +1894,12 @@ own pin), no pin covers it today. No corpus program can pin the trap
 itself for the same S003 reason.
 
 ## S033 — A dynamic-keyed write naming no declared field on a signature-free record throws *(wasm tier)*
+
+*GH #86 review amendment (S122): Node adds the property, so the refusal is
+a tsinter limit — on the wasm and wasm-native lanes it ENDS the program
+(`tsinter: unsupported: Cannot add property '<k>' to a fixed-shape object
+[SC1090]`, exit 1) instead of throwing the catchable TypeError described
+below; the c and llvm lanes keep the catchable form.*
 
 `r[k] = v` reaches this construct for a shape with NO index signature only
 when every declared field shares exactly one common type (the frontend's
@@ -3306,9 +3360,10 @@ Node, where no boundary exists:
   bridged promise is a distinct static promise whose payload is the
   vector); a crossed static promise and a bridge of a bridge DO answer
   themselves (`true`, as in Node).
-- **A non-array fulfilment rejects.** The static promise (or the async
-  function's own promise) rejects with the jsExit array arm's own
-  catchable `TypeError: expected an array, got <typeof>` (S009's
+- **A non-array fulfilment ends the program** (GH #86 review, S122 —
+  it rejected until then). The static promise (or the async function's
+  own promise) rejected with the jsExit array arm's own
+  `TypeError: expected an array, got <typeof>` (S009's
   footing: scriptc's boundary text, no Node oracle), where Node's
   awaiter receives the value as it is (`ok object`, `ok number`). That
   rejection is the bridge's own, so a promise derived from it that
@@ -5346,7 +5401,12 @@ byte-exact) — each stating BOTH the current wasm answer and, in its own
 comment, Node's differing answer for the identical program, so each is
 demonstrably a divergence guard rather than a tautology.
 
-## S064 — a NONPARTICIPATING capture reads "" where Node holds `undefined` *(wasm tier; native lanes ship the same divergence)*
+## S064 — a NONPARTICIPATING capture reads "" where Node holds `undefined` *(the c and llvm lanes; the wasm and wasm-native lanes are Node-exact since GH #89 — see the last amendment)*
+
+**Lanes, today:** the c and llvm lanes only. On the WasmGC lanes a
+capture that did not participate is Node's `undefined` everywhere this
+entry lists (GH #89's amendment at the end); the text below is the
+c/llvm lanes' rule and the history of how it came to be.
 
 A capture group that did not participate in the match reads as the
 empty string in every result this tier produces — `match`'s slice,
@@ -5402,6 +5462,33 @@ captures, offset, input and groups; the call through the replacer's own
 signature cannot). **Tested by:** corpus 2796 (the unannotated,
 `string | undefined`, optional and groups spellings, Node-exact) and the
 regex state fuzz (`string | undefined` captures).
+
+**Amendment (GH #89, after Unit U): the WasmGC lanes are Node-exact;
+the entry is the c and llvm lanes' only.** Unit U (S119) let a
+`string` slot hold `undefined` on the wasm and wasm-native lanes (a null
+string reference), so the rationale above — "`string[]` has no
+representable absent element" — no longer holds there, and those lanes
+give Node's `undefined` for a nonparticipating capture in every reader:
+an `exec`/`match` row and a `matchAll` row (`m[2] === undefined`,
+`typeof`, `??`, templates and `String()` print `undefined`,
+`JSON.stringify` writes `null`, `join` writes nothing, an array
+destructuring default fires for it), the `.groups` projection (a key
+whose value is `undefined`, dropped by `JSON.stringify`; with ES2025
+duplicate names the participating occurrence, exactly), `split()`'s
+spliced slots (S066), and every function-replacer capture argument
+however it is annotated (a plain `string` parameter and a
+`string`-valued groups parameter included). `/(a*)*/.exec("b")` is
+`["", undefined]` and `/(a*)+/.exec("b")` `["", ""]`, as in Node.
+`$n` / `$<name>` in a replacement STRING stay `""`, as in Node
+(GetSubstitution). What a member access on such a slot does is S119
+(a): `m[2].length` traps where Node throws a catchable `TypeError`;
+`m[2]?.length` is exact. Printing a match array keeps S116 (c). The c
+and llvm lanes keep everything above unchanged (their IR has no
+undefined string). **Tested by:** `packages/compiler/test/wasm-regex-
+undefined-captures.test.ts` (Node, wasm and wasm-native, rows run
+against Node at test time — not corpus programs, since the c and llvm
+lanes keep ""), and the element-level split/match pins in
+`wasm-emitter.test.ts`, which now expect Node's `null`/`undefined`.
 
 ## S065 — an invalid pattern: a regex literal refuses at compile time and `new RegExp` throws Node's catchable `SyntaxError` with V8's text *(every lane since follow-up unit D, below; the NATIVE lanes used to abort at first use)*
 
@@ -5618,7 +5705,8 @@ that one splices and one throws — S044's own reason for existing. The
 splice fits the IR's `string[]` result contract: the capture count is
 compile-time known and every spliced element is a string, except
 NONPARTICIPATING slots, which are `undefined` in Node and ride S064's
-`""` rendering here.
+`""` rendering here (on the c and llvm lanes; the WasmGC lanes splice
+Node's `undefined` since GH #89 — S064's amendment).
 
 **Rationale:** the wasm tier's compile-time knowledge of the pattern's
 capture structure makes an exact splice straightforward; the native
@@ -5644,7 +5732,8 @@ rather than to the native fix's timing.
 
 **Amendment (board #301): every lane splices — the per-lane split is
 over.** The native lanes' `split()` now splices capture values into the
-result like the wasm tier (nonparticipating slots "" per S064), so the
+result like the wasm tier (nonparticipating slots "" per S064 on the
+native lanes), so the
 TypeError arm above is retired and board #118 is closed. Both sides run
 the same algorithm (`backend/wasm/regex-state.ts`'s split, `scr_regex.c`'s
 `scr_regex_split_core`): Symbol.split with the limit argument (ToUint32;
@@ -5966,6 +6055,9 @@ sixth site, `tests/corpus/2709-math-static-scalar.ts:3`, is a corpus file and st
 a residual.)
 
 ## S069 — `date.parseGetTime`: outside its two modelled grammars, the wasm tier FENCES by a named catchable Error; the native lanes answer NaN silently *(per-lane split)*
+
+*GH #86 amendment: on the wasm and wasm-native lanes the fence ENDS the
+program (S122) instead of throwing a catchable Error.*
 
 The number was a WITHDRAWN DRAFT in design-number-v6.txt §9.2, for a different subject (a parseInt fence
 later replaced by a transcription and never shipped) — a reader of that document should not mistake this
@@ -6856,7 +6948,7 @@ On the wasm lane `net.Server` and `net.Socket` are built in the module, transcri
 - **(c) Events on different sockets follow the host's reads.** Each socket's and server's own events keep Node's order, but which of two sockets' events comes first when both are ready at one poll (two clients' data, a client's `'connect'` and the server's `'connection'`) follows the order the host's own event loop read them, not this process's: a Node run of the same program can give the other order (as two Node runs can, since the kernel decides it). Likewise which loop iteration an event lands in is the host's: the events the host read in one of its iterations are one poll phase here, so two events the host read in one iteration and a Node run would read in two (or the reverse) put an immediate queued from the first on the other side of the second.
 - **(d) A connection the host accepted after the module closed its server is closed with a FIN.** The host accepts on its own event loop; a connection it accepted before the module's close reached it, and whose event the module then reads for a server that is no longer listening, is closed by the host, so the peer sees the connection close after it was accepted (an end of file, or a reset when its own bytes are unread), and the server emits no `'connection'` for it; under Node the same timing either accepts the connection (its `'connection'` runs) or leaves it in the closed listener's backlog for the kernel to reset.
 - **(e) A connect the host refuses at once fails asynchronously, without Node's local-address detail.** Node's `connect` can fail synchronously in libuv (an address the kernel rejects outright) and builds `"connect <CODE> <address>:<port> - Local (<address>:<port>)"`; the harness host reports every connect failure as an event, so the module builds `"connect <CODE> <address>:<port>"`, emitted as Node emits an asynchronous connect failure.
-- **(f) The checked-dynamic handle's unmodelled surface is a named Error.** A Socket or Server reached through a dynamic value supports the members this unit models (`on`, `once`, `addListener`, `write`, `end`, `setNoDelay`, `destroy`, `destroySoon`, `pause`, `resume`; `destroyed`, `writable`, `readable`, `bytesWritten`, `remoteAddress`; the server's `on`, `once` and `close`); any other property read, method or event name, `destroy(err)`, `in` and `Object.hasOwn` on one, `Object.assign` onto or from one, its keys, values and entries, inspecting one, `JSON.stringify` of one and `structuredClone` of one throw a catchable Error naming the construct ("… on a net handle is not supported yet"), where Node answers. The fence covers unmodelled ARGUMENTS to modelled members as well: `write` and `end` with an encoding other than `utf8` — including an encoding Node itself rejects, where Node throws `ERR_UNKNOWN_ENCODING` ("Unknown encoding: <name>") — are the same named Error. Every other operation on one (`typeof`, `String()`, a template, truthiness, `===`, `includes` / `indexOf`, `instanceof Error`, `Array.isArray`, a sort or join) answers as Node does.
+- **(f) The checked-dynamic handle's unmodelled surface is a named Error.** A Socket or Server reached through a dynamic value supports the members this unit models (`on`, `once`, `addListener`, `write`, `end`, `setNoDelay`, `destroy`, `destroySoon`, `pause`, `resume`; `destroyed`, `writable`, `readable`, `bytesWritten`, `remoteAddress`; the server's `on`, `once` and `close`); any other property read, method or event name, `destroy(err)`, `in` and `Object.hasOwn` on one, `Object.assign` onto or from one, its keys, values and entries, inspecting one, `JSON.stringify` of one and `structuredClone` of one throw a catchable Error naming the construct ("… on a net handle is not supported yet"), where Node answers. The fence covers unmodelled ARGUMENTS to modelled members as well: `write` and `end` with an encoding Buffer knows other than `utf8` (or any non-string, non-primitive encoding) are the same named fence, which since GH #86 ends the program (S122). An encoding Node itself rejects — a string Buffer does not know, a truthy number or boolean — throws Node's own catchable `ERR_UNKNOWN_ENCODING` TypeError ("Unknown encoding: <name>"), and a falsy one (`""`, `0`, `false`) is the default utf8, as in Node (GH #86 review). Every other operation on one (`typeof`, `String()`, a template, truthiness, `===`, `includes` / `indexOf`, `instanceof Error`, `Array.isArray`, a sort or join) answers as Node does.
 - **(g) `close(cb)` on a checked-dynamic server that is not listening is a named Error,** where Node hands `cb` an `ERR_SERVER_NOT_RUNNING` error on the `'close'` tick. The statically typed `close(cb)` (whose callback takes no argument) is Node-exact.
 - **(h) A connect error or listen error the host cannot name is EIO.** An error the host's Node raises without a negative `errno` reaches the module as `EIO` (-5); Node would surface its own error unchanged. Not observed with real sockets on this host.
 - **(i) A checked-dynamic Buffer's `slice` and `at` exist only in modules that use node:net.** The two members are built where a net module needs them (a `'data'` chunk reached through a dynamic value); the same call in a module without node:net is the trap it was before this unit (exit 1, empty stderr), so one program's dynamic `buf.slice()` / `buf.at()` works or traps depending on whether node:net is reachable (board #215). (`slice` of a Buffer that crossed the generic path copies: S037's INC-29 U1 amendment.)
@@ -6875,7 +6967,7 @@ On the wasm lane node:http is built in the module (`packages/compiler/src/backen
 - **(c) An agent's TCP keep-alive is recorded, not applied.** `keepSocketAlive` calls `socket.setKeepAlive(true, keepAliveMsecs)` as Node does; node:net's host contract has no keep-alive operation, so the socket's kernel option is left alone. Nothing a program reads changes; on a long-idle pooled socket the kernel sends no keep-alive probes.
 - **(d) An agent's tables read through a dynamic value are snapshots.** `agent.sockets`, `agent.freeSockets` and `agent.requests` read through a checked-dynamic Agent are a fresh null-prototype object per read, holding arrays of the handles: their contents are Node's at the moment of the read, but two reads are different objects (`agent.sockets === agent.sockets` is false; Node: true) and a write to one does not reach the agent.
 - **(e) An IncomingMessage pipes into one destination.** A second `pipe()` from the same request or response throws a named Error ("piping an IncomingMessage into a second destination is not supported yet"); Node pipes into both.
-- **(f) The checked-dynamic http handles' unmodelled surface is a named Error.** An IncomingMessage, ServerResponse, ClientRequest or Agent reached through a dynamic value supports the members the corpus reaches — the request's `method`, `url` (also written), `statusCode`, `statusMessage`, `headers`, `rawHeaders`, `httpVersion` and its two parts, `complete`, `aborted`, `readable`, `destroyed`, `readableEnded`, `req`, `on` / `once` / `addListener` / `prependListener` for `data`, `end`, `close`, `error` and `aborted`, `pause`, `resume`, `pipe` (into a response or a client request) and `destroy()`; the response's `statusCode` and `statusMessage` (both also written), the response's and client request's `headersSent`, `writableEnded`, `finished`, `writableFinished`, `writableCorked`, `writableLength`, `writableNeedDrain`, `destroyed`, `req`, the client request's `method`, `path`, `host`, `protocol` and `reusedSocket`, the listener methods for `close`, `finish`, `error`, `drain`, `timeout` (and the client request's `response`), `setHeader`, `appendHeader`, `getHeader`, `getHeaders`, `getHeaderNames`, `hasHeader`, `removeHeader`, `writeHead` (a reason, a headers object or a flat array), `write` and `end` (a string or Buffer, an encoding Buffer knows, a callback), `cork`, `uncork`, `flushHeaders` and `destroy()`; the Agent's `maxSockets`, `maxFreeSockets`, `maxTotalSockets`, `totalSocketCount`, `keepAlive`, `keepAliveMsecs`, `defaultPort` (the numeric ones and keepAlive also written), `protocol`, `scheduling`, the three tables (d), `getName` and `destroy`. Any other property read or write, method or event, `destroy(err)`, a header value that is not a string, a number or an array of them, `writeHead` with an array of `[name, value]` pairs, and an encoding outside Buffer's own throw a catchable Error naming the construct ("… on an http handle is not supported yet", or S087 (f)'s "… on a net handle is not supported yet" for the generic operations S087 (f) lists — `in`, `Object.hasOwn`, `Object.assign`, keys, inspection, `JSON.stringify`, `structuredClone`), where Node answers.
+- **(f) The checked-dynamic http handles' unmodelled surface is a named Error.** An IncomingMessage, ServerResponse, ClientRequest or Agent reached through a dynamic value supports the members the corpus reaches — the request's `method`, `url` (also written), `statusCode`, `statusMessage`, `headers`, `rawHeaders`, `httpVersion` and its two parts, `complete`, `aborted`, `readable`, `destroyed`, `readableEnded`, `req`, `on` / `once` / `addListener` / `prependListener` for `data`, `end`, `close`, `error` and `aborted`, `pause`, `resume`, `pipe` (into a response or a client request) and `destroy()`; the response's `statusCode` and `statusMessage` (both also written), the response's and client request's `headersSent`, `writableEnded`, `finished`, `writableFinished`, `writableCorked`, `writableLength`, `writableNeedDrain`, `destroyed`, `req`, the client request's `method`, `path`, `host`, `protocol` and `reusedSocket`, the listener methods for `close`, `finish`, `error`, `drain`, `timeout` (and the client request's `response`), `setHeader`, `appendHeader`, `getHeader`, `getHeaders`, `getHeaderNames`, `hasHeader`, `removeHeader`, `writeHead` (a reason, a headers object or a flat array), `write` and `end` (a string or Buffer, an encoding Buffer knows, a callback), `cork`, `uncork`, `flushHeaders` and `destroy()`; the Agent's `maxSockets`, `maxFreeSockets`, `maxTotalSockets`, `totalSocketCount`, `keepAlive`, `keepAliveMsecs`, `defaultPort` (the numeric ones and keepAlive also written), `protocol`, `scheduling`, the three tables (d), `getName` and `destroy`. Any other property read or write, method or event, `destroy(err)`, a header value that is not a string, a number or an array of them, `writeHead` with an array of `[name, value]` pairs, and an encoding outside Buffer's own are named fences (ending the program since GH #86, S122) naming the construct ("… on an http handle is not supported yet", or S087 (f)'s "… on a net handle is not supported yet" for the generic operations S087 (f) lists — `in`, `Object.hasOwn`, `Object.assign`, keys, inspection, `JSON.stringify`, `structuredClone`), where Node answers. Where Node itself THROWS at one of these points the error is Node's (GH #86 review): a `writeHead` status code that is a string, a boolean, null or undefined and not a valid code after ToInt32(ToNumber) throws `ERR_HTTP_INVALID_STATUS_CODE` ("Invalid status code: <String(code)>", after the headers-sent check), and a truthy number, boolean or array header name in a flat headers array throws `ERR_INVALID_HTTP_TOKEN`; a status string Node takes ("200") stays the fence.
 - **(g) A null or array the static type does not admit is fenced.** On the statically typed surface `req.method` of a client response, `req.statusCode` and `req.statusMessage` of a server request (all null in Node), `res.statusMessage` before it is set or written (undefined), a `set-cookie` header read as a string or spread into a record (an array in Node), a header set to an array read back through the typed `getHeader`, and `res.socket` of a response whose socket went back to its agent (null) throw a named Error instead of answering a value the static type says cannot occur. Through a dynamic value the same reads are Node's.
 - **(h) RETIRED (INC-29 follow-up unit, the http option carry).** Five options the lowering lost now reach every backend with Node's values: `requireHostHeader` in `createServer`'s options; an Agent's `scheduling` (validated, read back, and choosing the free socket); a negative `keepAliveMsecs`, `maxSockets`, `maxFreeSockets`, `timeout` or `port` on an Agent (kept, as Node's `|| default` keeps it); a request's `timeout: 0` (it clears the agent's socket timeout); and `agent: false` with a Connection header (its own one-shot Agent). Pinned by corpus 2743 and 2744 and rows N2-OPT-01 and N2-OPT-02.
 - **(i) RETIRED (the same unit).** On the statically typed ServerResponse `setHeader(name, n)` keeps the number (`getHeader` answers it), and `writeHead(status, reason, …)` checks the status code before it takes the reason, as Node does. Pinned by corpus 2743 and row N2-REG-03.
@@ -6984,12 +7076,12 @@ is exact for every program that does not write `undefined` into a field that is 
 widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
 cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.
 
-## S092 — node:diagnostics_channel and AsyncLocalStorage on the wasm lane: ReflectApply's TypeError text is rendered for primitives, plain objects and arrays only, tracePromise fences a non-promise without subscribers and a non-promise thenable, setImmediate as a function value answers undefined and calls its callback with `this` undefined, and channels are never collected *(wasm lane only)*
+## S092 — node:diagnostics_channel and AsyncLocalStorage on the wasm lane: ReflectApply's TypeError text is rendered for primitives, plain objects, arrays, Uint8Arrays, promises and errors only, tracePromise fences a non-promise without subscribers and a non-promise thenable, setImmediate as a function value answers undefined and calls its callback with `this` undefined, and channels are never collected *(wasm lane only)*
 
 On the wasm lane `diagnostics_channel` (channels, `subscribe` / `unsubscribe` / `publish`, `bindStore` / `unbindStore` / `runStores`, tracing channels with `traceSync`, `traceCallback` and `tracePromise`) and `AsyncLocalStorage` (`run`, `exit`, `getStore`, `enterWith`, `disable`) are built in the module (`packages/compiler/src/backend/wasm/dc.ts`), transcribed from Node v24.18.1's `lib/diagnostics_channel.js`, `lib/internal/async_local_storage/async_context_frame.js` and `lib/internal/async_context_frame.js` (v24 runs AsyncContextFrame by default). No host operation is added. The ActiveChannel prototype swap, the copy-on-write subscriber list, the wrapStoreRun chain (the last-bound store outermost, a throwing transform skipped), a subscriber's or transform's throw re-raised from a nextTick job (`triggerUncaughtException`, rendered as S007 says), `run`'s ObjectIs shortcut and its restore through `enterWith(prior)`, and the frame carried by every promise job, timer, interval, immediate and nextTick callback (captured when it is scheduled) are Node's. These differ:
 
-- **(a) ReflectApply's TypeError text is rendered for some values only.** Calling a non-function through `run`, `exit`, `runStores` or a trace call throws V8's `Function.prototype.apply was called on <value>, which is <kind> and not a function` for undefined, null, booleans, numbers, strings, plain objects (`#<Object>`) and arrays (`[object Array]`). Any other non-function dynamic value (a Buffer, an error object, a null-prototype object, a Map stand-in, a promise, a handle) throws a catchable Error ("calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet").
-- **(b) tracePromise fences two returns.** With no subscribers, a traced function returning a non-promise throws a catchable Error ("tracePromise without subscribers over a function returning a non-promise is not supported yet") where Node returns the value itself (the IR types the call as a promise). With subscribers, a traced function returning an object with a callable `then` throws a catchable Error ("tracePromise over a function returning a non-promise thenable is not supported yet") where Node adopts the thenable.
+- **(a) ReflectApply's TypeError text is rendered for some values only.** Calling a non-function through `run`, `exit`, `runStores` or a trace call throws V8's `Function.prototype.apply was called on <value>, which is <kind> and not a function` for undefined, null, booleans, numbers, strings, plain objects (`#<Object>`), arrays (`[object Array]`) and, since the GH #86 review, a Uint8Array or Buffer (`[object Uint8Array]`), a promise (`#<Promise>`) and an error (Error.prototype.toString's `name: message`). Any other non-function dynamic value (a class instance, a null-prototype object, a Map stand-in, a handle — V8 names its constructor, which this tier does not carry) is a named fence ("calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet") that ends the program (S122).
+- **(b) tracePromise fences two returns.** With no subscribers, a traced function returning a non-promise is a named fence ("tracePromise without subscribers over a function returning a non-promise is not supported yet") where Node returns the value itself (the IR types the call as a promise). With subscribers, a traced function returning an object with a callable `then` is a named fence ("tracePromise over a function returning a non-promise thenable is not supported yet") where Node adopts the thenable. Both end the program (S122).
 - **(c) setImmediate as a function value** (`traceCallback(setImmediate, …)`) validates its callback and schedules it as Node does, but answers undefined where Node returns an Immediate, and calls the callback with `this` undefined where Node passes the Immediate.
 - **(d) Channels are never garbage-collected.** Node keeps channels in a WeakRefMap: a channel nothing references can be collected, after which `hasSubscribers(name)` answers false and `channel(name)` makes a new object. Here every channel lives for the whole run; in Node the difference shows only through garbage-collection timing.
 - **(e) The re-raise of a throwing subscriber or transform rides this tier's nextTick queue**, so S082's ordering applies to it: microtasks already queued run before the uncaught error ends the program, where a CommonJS Node runs the tick first.
@@ -7007,7 +7099,7 @@ On the wasm lane the lowered node:crypto keys are computed in the module (`packa
 - **(a) An error carries name, message and code only.** The PEM errors have no `library` or `reason` (Node's have both); the same shape as S090 (a).
 - **(b) Randomness is the host's entropy.** The bytes come from `tsinter.random` (abi.ts), an OS entropy read the host services (getrandom(2), arc4random_buf, crypto.getRandomValues). Their quality is the host's, as `seed`'s is for S068; Node's come from OpenSSL's CSPRNG. Values are never compared differentially, only their shape.
 - **(c) A certificate is read at its outer DER structure.** As S090 (c): a certificate OpenSSL's `d2i_X509` rejects deeper inside (an OID's or a time's contents, an extension) is accepted here. On the PEM path such a failure is the ASN.1 decoder's own error in Node; here a PEM block whose body is not a certificate at this outer level is a named Error (below) rather than Node's ASN.1 text, and on the raw-DER path it is Node's `no start line`, as Node's is.
-- **(d) A few PEM forms and validity times are fenced by name.** Each is a catchable `Error` whose message names the construct and ends "is not supported yet (SEMANTICS.md S093)": a PEM block whose body is not a certificate's DER (Node: the ASN.1 decoder's reason, e.g. `header too long`); a block with header lines, a line over 253 bytes or an empty body (as S090 (c)); a certificate whose DER OpenSSL would re-encode (as S090 (c)); bytes after the certificate inside the block, which `d2i_X509_AUX` reads as `X509_CERT_AUX` trust data (a `TRUSTED CERTIFICATE` block without them is read, as Node reads it); and a validity time other than a canonical RFC 5280 UTCTime (`YYMMDDHHMMSSZ`, 50-99 as 19xx) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) with every field in range (Node prints other forms, fractions and offsets included, or "Bad time value").
+- **(d) A few PEM forms and validity times are fenced by name.** Each is a named fence whose message names the construct and ends "is not supported yet (SEMANTICS.md S093)", which since GH #86 ends the program (S122) — Node throws for most of these inputs, but its text is OpenSSL's reason for that particular input (`header too long`, `wrong tag`, `too long`, `field missing`, `not dek info` …), which the outer-level reader here does not decide, so no catchable error here could be Node's: a PEM block whose body is not a certificate's DER, past what its outer header decides (where that header fails, even with bytes after the first value, the tier throws Node's own error since the GH #86 review: `header too long`, `too long`, `wrong tag`, or `field missing` for an empty SEQUENCE, with their `ERR_OSSL_ASN1_*` codes; a failure deeper inside needs OpenSSL's whole template); a block with header lines, a line over 253 bytes or an empty body (as S090 (c)); a certificate whose DER OpenSSL would re-encode (as S090 (c)); bytes after the certificate inside the block, which `d2i_X509_AUX` reads as `X509_CERT_AUX` trust data (a `TRUSTED CERTIFICATE` block without them is read, as Node reads it); and a validity time other than a canonical RFC 5280 UTCTime (`YYMMDDHHMMSSZ`, 50-99 as 19xx) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) with every field in range (Node prints other forms, fractions and offsets included, or "Bad time value").
 - **(e) Sizes past the engine.** `randomBytes(n)` for a size the engine cannot allocate as one array is an uncatchable trap (V8: "requested new array is too large" at 2^31 - 1 bytes), where Node allocates it; hashing a single input of 512 MiB or more is outside the SHA-1 length counter (which holds 2^29 bytes).
 
 **Scope:** the wasm lane. The llvm and c lanes run `scr_lib.c`'s own crypto slice and are not changed by this entry.
@@ -7020,7 +7112,7 @@ On the wasm lane the lowered node:crypto keys are computed in the module (`packa
 
 - **(a) A static readonly field rebound at run time.** TypeScript admits a write to a `static readonly` field inside the class's static block, and an `any` cast admits one anywhere. A field initialized with a shared array and then rebound to an unshared one is still admitted, and the wait sleeps where Node throws TypeError. A `const` cannot be rebound.
 - **(b) The native lanes' edges.** The llvm and c lanes trap on an out-of-range index (Node: the catchable RangeError) and treat a NaN timeout as 0 (Node: wait forever).
-- **(c) A string or object value is fenced.** `new Buffer(value, encoding)` lowers here when `value` is not typed as a string. At run time Node sends any value other than a number through `Buffer.from(value, encoding)`. That converts a string, an array or an array-like object (an own `length`, a `{ type: "Buffer", data }` record, an object whose `valueOf` answers a string or an object). It throws the same "first argument" TypeError for any other object ("Received an instance of Object", "... of Map"). This libCall does not carry the encoding and does not inspect an object's members, so on the wasm lane every string, array, object or Buffer value throws a catchable `Error` "new Buffer(value, encoding) over a string or object value is not supported yet (SEMANTICS.md S094)". The native lanes throw the number arm's TypeError for every value.
+- **(c) A string or object value is fenced.** `new Buffer(value, encoding)` lowers here when `value` is not typed as a string. At run time Node sends any value other than a number through `Buffer.from(value, encoding)`. That converts a string, an array or an array-like object (an own `length`, a `{ type: "Buffer", data }` record, an object whose `valueOf` answers a string or an object). It throws the same "first argument" TypeError for any other object ("Received an instance of Object", "... of Map"). This libCall does not carry the encoding, so on the wasm lane every value Node CONVERTS — a string, an array, an array-like or a `{ type, data }` record, a Buffer, an object with its own `valueOf` — is a named fence, "new Buffer(value, encoding) over a string, an array or an array-like value is not supported yet (SEMANTICS.md S094)", which ends the program (S122). A plain object with none of `length`, `buffer`, `type` or `valueOf` of its own throws Node's own catchable "first argument" TypeError ("Received an instance of Object", GH #86 review); an error object stays the fence (Node: "an instance of Error", which this tier's rendering does not spell). The native lanes throw the number arm's TypeError for every value.
 
 **Scope:** (a) every lane; (b) the llvm and c lanes; (c) the wasm lane.
 
@@ -7124,6 +7216,11 @@ Until 2026-10-26 a clause (d) registered that the llvm and c lanes' deflate byte
 **Tested by:** `packages/compiler/test/zlib-lanes.test.ts`, the one shared table: corpus 1404 and 2756 and the fixtures `fixtures/zlib/deflate-bytes.ts` (deflate bytes over every kind of input at every boundary size) and `fixtures/zlib/inflate-errors.ts` (every error input, every truncation of several streams, a byte flip at every offset of one, seeded mutation fuzz) compiled for the wasm, c and llvm lanes, each lane's stdout equal to Node's run of the same program (Z-LANES-01..04; replacing a system libz on the native lanes turns Z-LANES-02..04 red); 1404 and 2756 on the c, llvm and wasm differential lanes; the "zlib unit rows" block of `tests/harness/wasm-differential.test.ts` (ZL-RT-01 round trips, ZL-HEX-01 deflate bytes, ZL-ERR-01 every error kind's name, message and code, ZL-HOST-01 no import); `packages/compiler/test/wasm-zlib.test.ts` (the wasm port in-process: Z-DEF-01..03 deflate bytes at every boundary size, 300 fuzzed lengths and every level 0-9 against live Node; Z-RT-01; Z-INF-01 Node-produced streams across levels, strategies, memLevels and windowBits; Z-ERR-01 one input per error with Node's errno pinned per (a); Z-ERR-02 every truncation of seven streams; Z-ERR-03 seeded mutation fuzz); the npm case `zlib-shims` (the island's node:zlib shim on the c lane: zlib, raw and gzip bytes at levels 0, 1, default and 9, "Missing dictionary", and (e)'s level validation: NaN, 3.7, 10, -Infinity and a string). (b) is measured, not pinned; (c) is not measured. Measured against Node v24.18.1.
 
 ## S102 — a run-time `new RegExp` pattern or flags string outside this tier, or a syntax error whose V8 wording or precedence is unmeasured, throws a catchable named Error where Node builds the regex or throws a SyntaxError *(every lane since follow-up unit D — see its amendment below; wasm lane only before it)*
+
+*GH #86 amendment: on the wasm and wasm-native lanes the named fence ENDS
+the program (S122), printing `tsinter: unsupported: <message> [<code>]`;
+"throws … catchable" below holds on the c and llvm lanes only. The
+SyntaxError arm is unchanged (it is Node's).*
 
 `new RegExp(pattern, flags)` over strings known only at run time compiles
 in the module (S065's run-time arm). For a pattern outside the tier it
@@ -7998,7 +8095,7 @@ removed): every group and the fence row went red.
 Board #301 modelled lastIndex (S003's regex amendment). What it leaves:
 
 (a) **Companions, and the every-match array.** A match result is the
-honest `string[]` row (S064); its `.index`, `.input` and `.groups` live
+honest `string[]` row (S064 on c/llvm); its `.index`, `.input` and `.groups` live
 in hidden COMPANION locals of the binding it is assigned to
 (`frontend/lowering/lower-regex.ts`) — a binding every write of which is
 a direct `re.exec(s)` / `s.match(re)` call, or null, inside its declaring
@@ -8035,7 +8132,8 @@ wasm island fences member writes on its RegExp — unit F1's amendment).
 `util.inspect` print the row's elements only — `[ 'a', 'a', '' ]` — where
 Node prints the array's own `index`, `input` and `groups` properties too
 (`[ 'a', 'a', undefined, index: 1, input: 'xay', groups: undefined ]`;
-the `''` is S064). PRE-EXISTING (it predates board #301 on every lane)
+the c and llvm lanes print `''` there, S064; the WasmGC lanes print
+`undefined`). PRE-EXISTING (it predates board #301 on every lane)
 and SILENT: recorded here when this unit measured it, and reported for
 its own fix — the row has no slot for the properties, so the fix is a
 representation question (the companions are per binding, not per
@@ -8067,8 +8165,10 @@ the rest — are retired with that model (follow-up unit H).
   quickjs-ng's texts throughout (S103).
 - **(d) A read the checker types as a primitive exits validated.** With
   `xs: any[]` holding a non-array at run time (only a lying annotation or
-  cast can do that), `xs.length` and the like throw `TypeError: expected
-  number, got undefined` where Node reads `undefined`.
+  cast can do that), `xs.length` and the like end the program at `expected
+  number, got undefined` where Node reads `undefined` (c and llvm lanes;
+  on the wasm and wasm-native lanes the slot holds it, S119, GH #86
+  re-review).
 - **(e) Printing island values.** `console.log`, `util.format`'s
   specifiers and `util.inspect` render plain data as Node does on every
   lane — on wasm through the dyn walker (an island value IS a dyn value
@@ -8110,6 +8210,20 @@ v24.18.1.
 
 ## S115 — a TYPED composite is SHARED with dynamic code (`any` and `unknown` alike) as a live view, whose writes must fit the declared types and shape; a dynamic value enters typed storage only when it is fresh or its own view — every other exit, typed callback parameters and package results included, is refused at compile time *(llvm, c and wasm under `--dynamic`; (c) per lane)*
 
+*GH #86 review amendment (S122): a write through a view that does not fit
+(the wrong kind, a hole, a grown length, a tuple's length, a new member on
+a fixed shape, a non-view value into a nested typed slot, a callback that
+changes the view a method walks) is a check Node never makes — Node stores
+whatever it is given — so it now ENDS the program at its named fence
+(`tsinter: unsupported: … (SEMANTICS.md S115) [SC1090 …]`, exit 1) instead
+of throwing the catchable `TypeError`/`Error` the text below describes; the
+texts that interpolated the value's `typeof` now name the expected kind
+("Cannot store a value that is not a number into …"). On the c and llvm
+lanes the same holds for every refusal the compiled view accessors make;
+the native island's own Proxy traps (a non-index member on an array view,
+`defineProperty`, `delete`, freezing) still throw inside the engine —
+S122's c/llvm island residue.*
+
 Joe's ruling D2 as approved 2026-10-26 (follow-up unit H, boards
 #259/#268). Node has one object on both sides of every assignment; this
 tier keeps typed composites (`string[]`, `number[]`, records, tuples, and
@@ -8144,7 +8258,9 @@ leaving into typed storage follows (d)). So:
   empty Array or object, cached per static value while it lives; on
   wasm it is a dyn array/object box carrying the static value.
 - **(b) A write through a view must fit the static type; the shape is
-  fixed.** Each refusal is a catchable error where Node succeeds:
+  fixed.** Each refusal ends the program where Node succeeds (S122):
+  - (`undefined` stores on the wasm and wasm-native lanes, S119, for a
+    primitive slot and a composite one alike)
   - a value of the wrong primitive kind: `TypeError: Cannot store
     <typeof> into <container> shared from typed code (it holds <kind>
     only — SEMANTICS.md S115)` (`<container>` is e.g. `a 'number[]'
@@ -8649,7 +8765,9 @@ for byte; macOS and Windows targets refuse by name).
 
 Joe's ruling (2026-10-28): a value TypeScript types as a plain `T` holds
 `undefined` wherever JavaScript produces it — an array read past the end
-(`xs[i]`, destructuring `const [a, b] = argv`), `pop()` of an empty array, a
+(`xs[i]`, destructuring `const [a, b] = argv`), a string read past its end
+(`s[9]`, `s.at(9)`, a fractional or NaN index — `charAt` stays `""`, as in
+Node), `pop()` of an empty array, a
 missing key of a `Record<string, T>` or index signature, a write past an
 array's end (the gap), a `T | undefined = undefined` default the checker
 narrows to `T` (GH #77), a `T`-typed field read before its first assignment
@@ -8659,8 +8777,11 @@ has one `undefined`: an f64 holds one signaling NaN (bits
 `0xFFF4756E64656600` — arithmetic quiets it, so `undefined + 1` is an
 ordinary `NaN`), a bool holds 2, a string and every other reference kind
 hold null, and a union holds its undefined arm or, lacking one, a reserved
-tag no arm has. Every observer answers Node's answer: printing and
-`String`/templates/concatenation (`undefined`, never quoted), `typeof`,
+tag no arm has. The observers listed here answer Node's answer (the filed
+exceptions follow this paragraph): printing and
+`String`/templates (a lone `${u}` too)/concatenation and
+a key (`r[u]` is the key `"undefined"`) (`undefined`, never
+quoted), `typeof`,
 `=== undefined` / `== null` / `??` / `?.` on a plain-typed value, strict
 equality (`xs[5] === xs[6]`), truthiness, `Number.isNaN` (false) and
 `isNaN` (true), `x++`'s value (`NaN`), relational comparison of strings
@@ -8678,17 +8799,77 @@ string holding it is ToString'd (`"undefined"`); a destructuring default
 (`const {p = 9} = o`, `[z = 6]`, parameter patterns) and `x ??= e` fire
 for it; and a `Record` value holding it drops from `JSON.stringify`. A
 member read of a number, boolean or union holding `undefined`
-(`n.toFixed(2)`, `b.toString()`, `u.toString()`) throws Node's `TypeError:
-Cannot read properties of undefined (reading '…')`.
+(`n.toFixed(2)`, `b.toString()`, `u.toString()`), and a member read or a
+method call on a STRING or ARRAY slot holding it (`s.length`,
+`m[2].toUpperCase()`, `xs[5].indexOf(1)`, `f().map(g)`, `const p = m[3];
+p.length`, a literal-index read `s[0]`), throws Node's catchable
+`TypeError: Cannot read properties of undefined (reading '…')`, text and
+all — a variable's or a field's own read is tested on its value slot (a
+null test ahead of the operation: the binding keeps its rope or view, so
+`s = s.slice(1)` and `s += x` loops stay linear). Iterating, spreading and
+destructuring one (`for (const c of s)`, `[...a]`, `const [x] = a`,
+`Array.from(s)`) throw V8's `TypeError` (`s is not iterable`, `ss[3] is not
+iterable`, `get is not a function or its return value is not iterable`,
+`undefined is not iterable (cannot read property Symbol(Symbol.iterator))`),
+and calling a function-typed slot holding it (`f()`, `o.f()`) throws
+`TypeError: f is not a function`. A Map or Set holds it as a key, a value or an element of
+its own (`new Map([["k", m[1]]])`: `get` answers `undefined`, `has` true,
+iteration and printing show it).
 
-What still parts from Node, each loudly:
+`Object.keys`/`values`/`entries`/`hasOwn` and an `Object.assign` target over a
+record or index-signature slot holding `undefined` throw Node's `TypeError:
+Cannot convert undefined or null to object`; `"k" in r` throws `Cannot use
+'in' operator to search for 'k' in undefined`; and `toString` / `hasOwnProperty`
+on such a slot throw Node's `Cannot read properties of undefined`, whatever
+produced it (`!`, `as`, a return, a binding).
 
-(a) **A member of a reference or string slot holding `undefined`.** `r.x`,
-`s.length`, `s.slice(1)`, `f()` on a record/class/array/string/function slot
-holding `undefined` trap (the WasmGC null dereference — uncatchable, exit 1)
-where Node throws a catchable `TypeError`. Uncaught, both exit 1 (S007);
-only a program that catches that `TypeError` differs. (`?.` on such a slot
-is exact.)
+**Known divergences, filed for the next unit.** These are NOT yet exact or
+loud, and each is registered here until its issue closes: conversions and
+the remaining observers of a record or array slot holding `undefined`
+(`${rs[0]}`, `String(r)`, for-in, `Array.isArray`, GH #101); a top-level
+`JSON.stringify(u)` and `new Error(u)` of a string slot holding it (GH #102);
+`in` over a dynamic `null` (GH #103); bare traps at builtins that take such a
+slot, among them `parseInt(u)`, `re.test(u)` and `c instanceof C` (GH #104);
+and the evaluation order of the arguments behind a `dyn.argStr` parameter
+check (GH #105).
+
+What else parts from Node, each loudly:
+
+A WRITE through a slot holding `undefined` (`rs[0].a = 1`, `xs[0][0] = 1`,
+`rc["q"][0] = 2`, `k.v = 1`, `e!.k = 1`) throws Node's catchable `TypeError:
+Cannot set properties of undefined (setting '<key>')`, after the key and the
+value evaluated, as V8 does; a read-modify-write (`k.v++`) reads first, so
+its text is the read's. `?.` on a plain-typed slot short-circuits the whole
+tail (`ss[1]?.trim().length`), through `!` too (`ps[0]?.b!.c`: `!` erases
+and does not end a chain; parentheses do). A spread of a record slot
+holding `undefined` copies nothing (`{ ...r }` is `{}`; its fields are
+missing keys, (i)), and destructuring one throws V8's text (`const { x } =
+r`, `({ x } = r)`, `.for` in a `for…of` head).
+
+(a) **Where Node's text names something this tier does not spell.** A
+member read, an index read (`a[i]` with a run-time index included, the
+index rendered as V8 renders it, after it evaluated) or a method call on a
+record, class-instance or array slot holding `undefined` throws Node's
+catchable `TypeError: Cannot read properties of undefined (reading '…')`
+(the lead's ruling, reversing an earlier fence) — tested on every receiver
+but `this`, a value built on the spot and a `const` local initialized from
+one, through one shared cold path per message. What ends the program at a
+named fence instead (S122) is what Node's text cannot be spelled for: a
+`for…of` over an array whose iterable is not a variable/member/literal-index
+read, a spread source V8's spelling does not cover, a call through a callee
+that is not a plain name, member chain or simple element access, and a destructuring of a source V8
+spells some other way. None of them traps bare.
+
+(h) **`+` of a string-typed value holding `undefined` and a non-string.**
+`m[1] + 1`, `xs[3] + true` and `xs[3] + xs[4]` (both undefined) are the
+NUMBER `NaN` in Node, and so is `u + ns[1]` where the other side is a union
+(`number | string`, `boolean | string`, `string | null`) holding a
+non-string at run time (a null there is NaN too; undefined + null). The
+expression is string-typed here, which cannot hold a number, so exactly
+then — tested at run time, on the union's tag — the program ends at a named
+fence (S122, SC1090). With a real string on either side it concatenates
+`"undefined"` exactly as Node does (`xs[3] + "s"`, `s += xs[9]`, `u + ns[1]`
+when the union holds a string).
 
 (b) **Holes.** A write past the end stores the element's `undefined` in the
 gap, and so does an elision in an array literal (`[1, , 3]`, GH #85), so everything that reads a hole as `undefined` in Node is exact: index
@@ -8698,13 +8879,16 @@ into `any`. The observers that tell a hole from `undefined` — printing
 (`console.log`/`util.inspect`), `forEach`/`map`/`filter`/`some`/`every`/
 `reduce`/`reduceRight`/`flatMap`, `indexOf` of an `undefined` needle, the
 `in` operator over an array index and for-in over an array —
-throw a named, catchable `Error` ("<operation> over an array that may hold
-holes …", code SC1090) once the program has made a hole anywhere (a write
+end the program at a named fence ("<operation> over an array that may hold
+holes …", code SC1090 — S122 since GH #86; it was a catchable `Error`) once the program has made a hole anywhere (a write
 past an end, or an elision) and the array holds an element's `undefined`. An array whose holes were all filled
 (the out-of-order fill) is exact everywhere; in a program that made a hole,
 an array holding an EXPLICIT `undefined` fences too (the over-approximation
 the missing per-element hole mark costs). `new Array(n)` stays a compile
-refusal.
+refusal. Since the GH #86 review the same holds for `in`/`Object.hasOwn` over an
+index of a typed array after it crossed into a dynamic value (`[1, , 3]`
+passed to an untyped JavaScript function): the element's `undefined` there
+may be a hole, so the answer fences once the program has made one.
 
 (c) **`sort` moves a hole as `undefined`.** Node's sort leaves holes after
 the undefineds it moves to the end; here both are the element's undefined at
@@ -8719,12 +8903,35 @@ a `NaN` with its quiet bit set, where Node keeps the signaling bits — the
 same `NaN` to every observer but a write back to bytes (S036's territory).
 The host's own numbers (its imports) are trusted never to be that pattern.
 
-(e) **A union with no undefined arm holding `undefined`**, re-tagged into
-another union (a generator's yield, a re-tag helper), traps.
+(e) *Retired by the GH #86 re-review:* a union with no undefined arm holding
+`undefined`, re-tagged into another union (a generator's yield, a re-tag
+helper), stays `undefined`, as in Node.
 
-(g) **`structuredClone` of a value holding a plain-typed `undefined`**
-(`structuredClone({ a: xs[3] })`) throws the checked crossing's catchable
-TypeError ("expected number at $.a, got undefined") where Node clones it.
+(i) **A missing required key and an explicit `undefined`.** A checked
+dynamic value lacking a required key (`JSON.parse('{}') as { z: string }`)
+fills the field with its `undefined`, as a read in Node answers. Node then
+tells that field from one holding an explicit `undefined`, and the slot
+cannot, so the module keeps two flags. A fill sets "missing". Storing a
+value that holds `undefined` in a plain record field (a literal field or a
+write, tested only where the value may hold it, and only in a module where
+a dynamic value can fill a record), or a checked dynamic value whose key is
+present and holds `undefined`, sets "explicit". Every key observer asks the
+same question of a plain field holding `undefined`: only "missing" set, the
+key is absent, otherwise it is present; with both set it cannot know, and
+the program ends at a named fence (S122), the over-approximation S119 (b)'s
+holes make. The observers: `Object.keys`, `values`, `entries`, for-in,
+printing, `in`, `Object.hasOwn`, object spread and rest, `Object.assign`
+(a source's absent key copies nothing, so `{ ...base, ...over }` and
+`Object.assign({}, base, over)` keep the base value), the crossing into a
+dynamic value and a view's keys, and through them `structuredClone` and
+deep equality; JSON.stringify drops both, as Node does. A copy carries keys,
+not values, so spread, rest, `Object.assign` and a width copy note nothing;
+copying a field by hand (`{ note: u.note }`) is an explicit store, as in
+Node, and fences in a program that also lacks a key and observes one.
+
+(j) **`fs.existsSync` of a non-path** answers `false`, as Node does (a slot
+holding `undefined`, a dynamic non-string; a dynamic Buffer, typed array or
+URL stays S122's fence), without Node's DEP0187 process warning on stderr.
 
 (f) **`util.format`'s `%j`, `%o`, `%O`** with a string-typed argument
 holding `undefined` render the string `"undefined"` (`%s` and `%d` are
@@ -8821,3 +9028,145 @@ five contraction starters and fuzzed over 400,000 starter-and-mark strings.
 `test/wasm-collation-tables-drift.test.ts` re-renders
 the table from the pinned inputs; `tests/diagnostics/locale-compare.ts`
 pins the refusals. Corpus 2826 and 2827 (ASCII, every lane).
+
+## S121 — `process.stdin/stdout/stderr.isTTY` on a stream that is not a terminal reads `false`, where Node's stream has no such property (`undefined`) *(c and llvm lanes)*
+
+Node defines `isTTY` only on a `tty.ReadStream`/`tty.WriteStream`; a pipe
+or file stream has no such property, so `process.stdout.isTTY` reads
+`undefined` (`typeof` "undefined", printed `undefined`). On the c and llvm
+lanes the read is a C `bool` from `isatty(3)`, which has no `undefined`, so
+a non-terminal stream reads `false` (`typeof` "boolean", printed `false`).
+Truthiness, `!`, `?:` and `if` agree with Node; printing, `typeof`,
+`String()`, `=== undefined` and `=== false` do not. The WasmGC lanes (wasm,
+wasm-native) are exact since GH #88: a non-terminal stream answers the bool
+slot's `undefined` (S119), a terminal one `true`. **Rationale:** the c and
+llvm lanes are transitional (they retire at N4) and keep S003/S006/S032's
+no-`undefined` slots; giving them an `undefined` bool is not worth the work.
+**Tested by:** `packages/compiler/test/wasm-istty-undefined.test.ts` (the
+WasmGC lanes against Node, stdout and stderr piped); no corpus program,
+since the c and llvm lanes would differ.
+
+## S122 — A run-time fence ends the program: a construct this build cannot run, reached, prints `tsinter: unsupported: <diagnostic>` on stderr and exits 1, and nothing in the program can catch it *(wasm and wasm-native; on the c and llvm lanes the deferred compile fences and the SC2020 ladder fences only)*
+
+A fence is the tier's refusal of something Node would run. Most refuse
+the build; some can only be decided at run time and are DEFERRED to the
+point the program reaches them: a JavaScript statement or member whose
+construct has no static lowering (`runtimeFence` — SC1030, SC1090, SC2011,
+SC2020 …, the code and the file and line in the text), the S119 hole and
+undefined fences, a runtime options record's unmodelled member (the
+SC2020 ladder fences), S102's out-of-tier `new RegExp`, S069's unmodelled
+date string, S023's unmodelled invoke pairs, S116's global-match
+`.index`/`.input` and global-or-sticky crossing, and every named "… is not
+supported yet" refusal of the dynamic-value, island, handle, stream, fetch,
+http, tls, dgram, diagnostics_channel, inspect and JSON surfaces.
+
+Until GH #86 a deferred fence was an ordinary `Error` (often catchable by
+design, as several entries here said), so a program's own `try`/`catch`
+could swallow it and run on with output Node never prints, exit 0 — the
+real-app trial's chess.js PGN path did exactly that. Since GH #86 reaching
+any of them ENDS the program: stdout is settled, one line
+`tsinter: unsupported: <message> [<code> at <file>:<line>]` goes to stderr
+(a fence inside a shared runtime helper carries its code but no single
+place), and the process exits with status 1. No `catch`, `finally`,
+promise reaction, `'uncaughtException'` or `'exit'` listener runs after it
+— on the WasmGC lanes the module traps (this tier emits no exception-
+handling opcodes, so a trap is uncatchable — abi.ts; the wasm-native
+runner then also prints its trap text, `RuntimeError: unreachable`, S117
+(d)), and on the c and llvm lanes `scr_fence_fatal` exits without
+unwinding. Where an entry here still describes one of these as throwing a
+"named", "loud" or "catchable" `Error`, read "ends the program, as S122
+says".
+
+**The ruling (GH #86 review, Joe as lead):** an error is catchable ONLY
+where Node also throws at that point — and then it is Node's error: the
+same class, the same message, the same `code`. Every error that exists
+only because of a tsinter limit or a check tsinter alone makes is a fence
+and ends the program. So the checked-dynamic boundary's checks are fences
+too, though they model a type error rather than a missing construct —
+Node never makes them, so a program catching one would silently run its
+own error path where Node runs on:
+
+- a dynamic value that does not fit the typed slot it enters — dynCheck's
+  `expected <type> at <path>, got <kind>` (an `as` cast, an `any` flowing
+  into a typed slot, a boxed function's argument or result, an
+  index-signature write colliding with a declared field — S009 and its
+  amendments), the island exit's `expected <type>, got <typeof>` and
+  `expected an array, got <typeof>`, and a failed checked cast on a catch
+  binding (`caught value is not an instance of <C> (checked cast)`) — code
+  SC1100;
+- S115's writes into a typed composite shared with dynamic code (a value
+  of the wrong kind, a hole, a grown length, a tuple's fixed length, a new
+  member on a fixed shape, a non-view value into a nested typed slot, a
+  callback that changes the view a method walks) — but `undefined` is no
+  wrong kind on the wasm and wasm-native lanes, where the slot holds it;
+- a narrowed or asserted value's re-check, where the value is not
+  undefined (`null is not representable in a '…' slot`, `a 'number' value
+  is not representable in the target union`: a plain slot has no null, and
+  a lying cast's value has no arm; `!` and `as` let undefined through on
+  the wasm and wasm-native lanes, S119, and `e!.m` / `e![0]` throw Node's
+  `Cannot read properties of null (reading 'm')` themselves), an
+  empty-array reshape whose source is not empty, and a call through a function-typed slot the checker
+  admitted but this build cannot lower (`… the call has no exact lowering`);
+- S033's `Cannot add property '<k>' to a fixed-shape object`;
+- S016's non-index member on a dynamic array (or any other receiver the
+  dyn tree cannot store a member on) — `Cannot create property '<k>' on
+  <kind> (the checked-dynamic tree has no member slot for it — SEMANTICS.md
+  S016)`;
+
+Where one of these coincides with a throw Node makes at that same point, it
+is Node's error instead: a keyed write on `undefined`/`null` ("Cannot set
+properties of …"), a strict-mode write on a number/boolean/string receiver
+("Cannot create property '<k>' on number '5'"; sloppy code ignores that
+write, as Node does), and — since this review —
+a write to a string's own read-only members, an in-range index or
+`length`, which now answers V8's own "Cannot assign to read only property
+'<k>' of string '<s>'" (it answered the "Cannot create property" text
+before). Node-parity throws (ERR_* validation, V8's TypeError/RangeError/
+SyntaxError texts) stay what they are.
+
+A fence that meets a point where Node itself throws is not a fence for those inputs: there the error is Node's own, catchable, class and message and code (the GH #86 review's ruling). So a checked-dynamic stream construction's invalid `highWaterMark` throws `ERR_INVALID_ARG_VALUE` and a readable's unknown encoding `ERR_UNKNOWN_ENCODING`; a socket write's unknown encoding `ERR_UNKNOWN_ENCODING` (S087 (f)); the dynamic `writeHead`'s invalid status code `ERR_HTTP_INVALID_STATUS_CODE` and a non-string header name `ERR_INVALID_HTTP_TOKEN` (S088 (f)); `Object.assign` over a plain island object's getter-only member V8's "Cannot set property g of #<Object> which has only a getter"; `structuredClone` of a URL held in a dynamic value its DataCloneError ("Cannot clone object of unsupported type."); a wrong-typed path or data argument at a typed builtin parameter (`path.*`, the sync `fs` calls, `new URL`) `ERR_INVALID_ARG_TYPE` or `ERR_INVALID_URL`; ReflectApply over a Uint8Array, a promise or an error (S092 (a)); `new Buffer(<plain object>, enc)` (S094 (c)); and destructuring undefined or null in a JavaScript source V8's "Cannot destructure property 'a' of 'o' as it is undefined." family (the source rendered as V8 renders an identifier, `this`, a property chain or a call; an array pattern over an identifier "o is not iterable"). `structuredClone` of a function throws Node's DataCloneError (`<source text> could not be cloned.`, code 25) where the value was boxed from a known function: the module stamps each function it boxes with its source span (only a module that calls structuredClone pays). In a TypeScript source the text is the source as written, types included, because Node has no text of its own there — what it quotes is its type-stripper's output. A dynamic value reaching a string parameter of `path.*` or the sync `fs` path and data parameters throws Node's ERR_INVALID_ARG_TYPE for that parameter (`dyn.argStr`, the check at the dyn-to-builtin boundary; a slot holding `undefined` too), `new URL` ToString's a dynamic input as Node does, and an uncaught DOMException reports as `DOMException [<name>]: <message>` after S007's prefix. A Buffer, typed array, URL or (where the member takes one) file descriptor held in a dynamic value at such a parameter is a named fence, as are `fs.existsSync` and `fs.realpathSync` over a non-string (Node: false with a deprecation warning; ENOENT on the coerced path), `path.parse`/`path.format` (no lowering at all), and a wrong-type status at the statically typed `res.writeHead`. `"prototype" in f` answers where the value's function is known at the boxing (a function, an arrow, an async function, directly or through a binding every write of which is that function); a function read out of a record or passed through a parameter is the S015 fence, and `in` on a statically typed function is the build's existing SC fence. These stay fences although Node throws, because Node's text cannot be produced here: `structuredClone` of a function that reached the clone without its text (one stored and re-boxed through a typed slot, which crosses anonymously) or of a socket, `new X509Certificate` over a PEM body whose outer header is sound but which OpenSSL rejects deeper in (S093 (d)), the null-prototype object converted to a primitive (Node: "Cannot convert object to primitive value" — the conversion sites cannot propagate a catchable error), a DOMException member write and a write over an island getter (Node throws only in strict code; the source's strictness now reaches a dynamic write on a primitive, these two surfaces do not read it yet), a nullish spread into a call whose V8 rendering is unknown, a destructuring whose pattern or source V8 renders otherwise (an object-pattern parameter over `undefined` or `null` is V8's "of 'undefined'" / "of 'object null'" text; a member read with a string, number or identifier key renders as V8 does; a union-typed source keeps its fence), and fetch()'s input fences (Node rejects with undici's error and cause).
+
+**Residue on the c and llvm lanes** (transitional, they retire at N4): the
+deferred compile fences (and with them every frontend-built check above:
+S115's view writes, the narrowed-value re-checks, the empty-array reshape,
+the function-slot strand), the SC2020 ladder fences, dynCheck's failure
+(`scr_dyn_check_fail`), the catch-binding cast (`scr_caught_check_obj`), the
+island exits (`isl_exit_fail`) and the non-view island unview end the
+program as above. Still catchable there: the C runtime's other named "not
+supported yet" refusals (S023's invoke pairs, S102's `new RegExp` fence and
+the dyn/handle surfaces), S033's and S016's write refusals, and the native
+island's Proxy-trap refusals of S115 (a non-index member on an array view,
+`defineProperty`, `delete`, freezing — thrown inside QuickJS). The
+embedded island engine's own fences (S103, S108 — thrown inside QuickJS
+under `--dynamic`) stay catchable by island code on every lane.
+
+**Rationale:** rule 1 — a refusal must be loud; a catchable fence let a
+program substitute its own error path for the construct it could not run,
+or for a check Node never makes.
+**Tested by:** `packages/compiler/test/wasm-fence-fatal.test.ts` (try/catch,
+finally, an async function's rejection handler, a timer callback and an
+`'exit'` listener around a fence, on the wasm and wasm-native lanes, and
+the deferred-fence rows on the c and llvm lanes); the rows that pinned the
+old catchable text (errors.test.ts and the wasm unit rows) now pin this
+line. The boundary checks: tests/harness/dyncheck.test.ts and island.test.ts
+(c lane), wasm-emitter.test.ts's S009/S033/S016/jsExit rows (wasm and, for
+the island exits, c), wasm-any-array-shared.test.ts's H-VERR rows (S115,
+wasm and c), wasm-adopt.test.ts's TY rows, wasm-fieldincdec.test.ts and
+wasm-review-repros.test.ts's a1/a2 rows (the undefined these checks now
+let through, against Node).
+
+## S123 — An object spread's keys take the shape's order, not the first contributor's *(every lane)*
+
+`{ ...over, ...base }`, with sources that list the same keys in different
+orders or overlap partly (`const d = { note: "d" }; { ...d, b: 2 }`-shaped
+sources), is a static record whose keys follow the checker's merged type,
+where Node keeps the order each key was first contributed in. So
+`{ ...over, ...base }` over `{ host, port }` and `{ port, host }` prints
+`{ port: 80, host: 'x' }` where Node prints `{ host: 'x', port: 80 }`, and the
+same order reaches `Object.keys`, `JSON.stringify` and printing. `Object.assign`
+over records takes the same order. The values are exact. **Rationale:** found
+by the GH #86 sweep, older than it and silent: a record's field order is part
+of its shape, so the merged order would need a reshape at the literal.
+Registered so the divergence is honest until that is built; it has no test
+that pins it as desired. **Tested by:** nothing pins this order; the review
+rows avoid it.

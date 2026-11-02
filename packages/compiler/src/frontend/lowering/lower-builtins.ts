@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { conditionalSpreadOf, ensureString, lowerDynObjectLiteral } from "./lower-exprs.js";
+import { conditionalSpreadOf, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, undefinedAsText } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -805,11 +805,122 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     }
   }
 
+/** GH #86 review: Node's own name for each string parameter of the tabled
+   * builtins, and what it requires there. A value that is not a string
+   * (dynamic in a JavaScript source, or a slot holding undefined) throws
+   * Node's ERR_INVALID_ARG_TYPE for that parameter instead of failing the
+   * tier's own string check. */
+  const FS_PATH_TEXT = "of type string or an instance of Buffer or URL";
+  const FS_DATA_TEXT = "of type string or an instance of Buffer, TypedArray, or DataView";
+  const PATH_PARAMS: Record<string, readonly string[]> = {
+    normalize: ["path"], dirname: ["path"], basename: ["path", "suffix"], extname: ["path"], isAbsolute: ["path"], relative: ["from", "to"],
+  };
+  const FS_PARAMS: Record<string, readonly string[]> = {
+    readFileSync: ["path"], writeFileSync: ["path"], appendFileSync: ["path"], mkdirSync: ["path"], rmSync: ["path"], rmdirSync: ["path"],
+    readdirSync: ["path"], statSync: ["path"], lstatSync: ["path"], unlinkSync: ["path"], accessSync: ["path"],
+    chmodSync: ["path"], chownSync: ["path"], openSync: ["path"], copyFileSync: ["src", "dest"], mkdtempSync: ["prefix"],
+  };
+  /** The members whose path parameter also takes a file descriptor: a
+   * dynamic number there is the fd form, not Node's type error. */
+  const FS_FD_MEMBERS: ReadonlySet<string> = new Set(["readFileSync", "writeFileSync", "appendFileSync"]);
+  const isPathModule = (m: string): boolean => m === "path" || m === "path/posix" || m === "path/win32";
+
+  /** A builtin argument of any type: a JavaScript object literal builds as
+   * the dynamic object it is (its contextual string type has no shape). */
+  function lowerArgLoose(L: Lowerer, node: ts.Expression): IrExpr {
+    let lit: ts.Expression = node;
+    while (ts.isParenthesizedExpression(lit)) lit = lit.expression;
+    return ts.isObjectLiteralExpression(lit) && isJsSourceFile(lit.getSourceFile()) ? lowerDynObjectLiteral(L, lit) : L.lowerExpr(node);
+  }
+
+  /** One builtin string parameter, checked as `dyn.argStr` says; the plain
+   * lowering outside the WasmGC lanes, for a value proved to be a string,
+   * and for a value that cannot box. */
+  export function checkedStrParam(L: Lowerer, node: ts.Expression, name: string, expected: string, wide: boolean | "fd"): IrExpr {
+    if (!L.undefSlots) return L.lowerExprExpecting(node, STRING);
+    const loc = locOf(node);
+    const mapped = L.mapTypeOf(L.typeOf(node));
+    const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
+    if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return raw;
+    const boxed: IrExpr | null = raw.type.kind === "dyn"
+      ? raw
+      : raw.type.kind === "string" || L.dynConvertible(raw.type)
+        ? { kind: "dynFrom", value: raw, type: DYN, loc }
+        : null;
+    if (boxed === null) return L.coerceInto(node, raw, STRING);
+    return {
+      kind: "libCall",
+      fn: "dyn.argStr",
+      args: [
+        boxed,
+        { kind: "strLit", value: name, type: STRING, loc },
+        { kind: "strLit", value: expected, type: STRING, loc },
+        { kind: "numLit", value: wide === "fd" ? 2 : wide ? 1 : 0, type: F64, loc },
+      ],
+      type: STRING,
+      loc,
+    };
+  }
+
+  /** fs.existsSync on the WasmGC lanes: Node's validation failure is
+   * swallowed, so anything that is not a path answers false — a slot
+   * holding undefined and a dynamic non-string included. Null where the
+   * value is proved a string, or cannot box. */
+  function lowerExistsProbe(L: Lowerer, node: ts.Expression, fn: BuiltinModuleFn, loc: SrcLoc): IrExpr | null {
+    if (!L.undefSlots) return null;
+    const mapped = L.mapTypeOf(L.typeOf(node));
+    const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
+    if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return null;
+    const boxed: IrExpr | null = raw.type.kind === "dyn"
+      ? raw
+      : raw.type.kind === "string" || L.dynConvertible(raw.type)
+        ? { kind: "dynFrom", value: raw, type: DYN, loc }
+        : null;
+    if (boxed === null) return null;
+    const tmp = L.declareHiddenLocal("%existsPath", STRING);
+    const ref: IrExpr = { kind: "varRef", localId: tmp.id, type: STRING, loc };
+    return {
+      kind: "seqExpr",
+      stmts: [{
+        kind: "varDecl",
+        localId: tmp.id,
+        init: {
+          kind: "libCall",
+          fn: "dyn.argStr",
+          args: [boxed, { kind: "strLit", value: "path", type: STRING, loc }, { kind: "strLit", value: "", type: STRING, loc }, { kind: "numLit", value: 3, type: F64, loc }],
+          type: STRING,
+          loc,
+        },
+        loc,
+      }],
+      result: {
+        kind: "ternary",
+        cond: isUndefExpr(ref, false, loc),
+        then: { kind: "boolLit", value: false, type: BOOL, loc },
+        else_: { kind: "libCall", fn: fn.fn, args: [ref], type: BOOL, loc },
+        type: BOOL,
+        loc,
+      },
+      type: BOOL,
+      loc,
+    };
+  }
+
   export function lowerBuiltinModuleCall(L: Lowerer, expr: ts.CallExpression,
     bi: { module: string; member: string },
     fn: BuiltinModuleFn,
     loc: SrcLoc,): IrExpr {
     const name = expr.expression.getText();
+    if (bi.module === "fs" && bi.member === "existsSync" && expr.arguments.length === 1) {
+      const probe = lowerExistsProbe(L, expr.arguments[0]!, fn, loc);
+      if (probe !== null) return probe;
+    }
+    // realpathSync ToStrings its argument: `p += ""`, as Node's own does.
+    if (L.undefSlots && bi.module === "fs" && bi.member === "realpathSync" && expr.arguments.length === 1) {
+      const raw = lowerArgLoose(L, expr.arguments[0]!);
+      if (raw.type.kind === "dyn") return { kind: "libCall", fn: fn.fn, args: [{ kind: "libCall", fn: "dyn.toStringCoerce", args: [raw], type: STRING, loc }], type: fn.result, loc };
+      if (raw.type.kind === "string") return { kind: "libCall", fn: fn.fn, args: [undefinedAsText(L, raw, loc)], type: fn.result, loc };
+    }
     if (bi.module === "child_process" && bi.member === "spawnSync") {
       return L.lowerSpawnSyncCall(expr, loc);
     }
@@ -1048,7 +1159,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       expr.arguments.length === 1 &&
       L.mapTypeOf(L.typeOf(expr.arguments[0]!))?.kind !== "f64"
     ) {
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       return { kind: "libCall", fn: "fs.readFileSyncBytes", args: [path], type: BYTES_U8, loc };
     }
     if (bi.module === "fs/promises" && bi.member === "readFile" && expr.arguments.length === 1) {
@@ -1121,7 +1232,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           "the recursive flag must be a boolean literal and mode a number; other options have no lowering",
         );
       }
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const mode: IrExpr | null = modeNode ? L.lowerExprExpecting(modeNode, F64) : null;
       if (!recursive) {
         return mode
@@ -1168,7 +1279,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           "the recursive flag must be a boolean literal and mode a number; other options have no lowering",
         );
       }
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const mode: IrExpr | null = modeNode ? L.lowerExprExpecting(modeNode, F64) : null;
       const type: IrType = { kind: "promise", inner: VOID };
       if (!recursive) {
@@ -1197,7 +1308,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           "the recursive/force flags must be boolean literals; maxRetries/retryDelay are numbers; other options have no lowering",
         );
       }
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const flag = (v: boolean): IrExpr => ({ kind: "boolLit", value: v, type: BOOL, loc });
       const recursive = flag(opts.bools["recursive"] === true);
       const force = flag(opts.bools["force"] === true);
@@ -1223,7 +1334,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       if (expr.arguments.length < 1 || expr.arguments.length > 2) {
         L.noLowering(`accessSync with ${expr.arguments.length} arguments`, expr);
       }
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const mode: IrExpr = expr.arguments[1]
         ? L.lowerExprExpecting(expr.arguments[1], F64)
         : { kind: "numLit", value: 0, type: F64, loc };
@@ -1239,7 +1350,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
             "byte writes take Uint8Array/Buffer data",
           );
         }
-        const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+        const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
         const data = L.lowerExprExpecting(expr.arguments[1]!, BYTES_U8);
         return { kind: "libCall", fn: "fs.writeFileSyncBytes", args: [path, data], type: VOID, loc };
       }
@@ -1262,8 +1373,8 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           t.isStringLiteralType() && (t.value === "utf8" || t.value === "utf-8") &&
           L.mapTypeOf(L.typeOf(expr.arguments[1]!))?.kind === "string"
         ) {
-          const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
-          const data = L.lowerExprExpecting(expr.arguments[1]!, STRING);
+          const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
+          const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
           return { kind: "libCall", fn: "fs.writeFileSync", args: [path, data], type: VOID, loc };
         }
       }
@@ -1303,8 +1414,8 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           'the supported options are { mode: <number>, encoding: "utf8" } over string data',
         );
       }
-      const path = L.lowerExprExpecting(expr.arguments[0]!, STRING);
-      const data = L.lowerExprExpecting(expr.arguments[1]!, STRING);
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
+      const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
       if (modeNode === null) {
         // encoding-only options change nothing: the plain write.
         return { kind: "libCall", fn: "fs.writeFileSync", args: [path, data], type: VOID, loc };
@@ -1346,7 +1457,13 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         const packed: IrExpr = { kind: "arrayLit", elems, spreads, type: arrayOf(STRING), loc };
         return { kind: "libCall", fn: fn.fn, args: [packed], type: fn.result, loc };
       }
-      const elems = expr.arguments.map((a) => L.lowerExprExpecting(a, STRING));
+      // A string-typed argument holding undefined meets the runtime's own
+      // check of the packed array, which walks it as Node's join and
+      // resolve do (resolve stops at an absolute path).
+      const elems = expr.arguments.map((a, i) =>
+        isPathModule(bi.module) && L.mapTypeOf(L.typeOf(a))?.kind !== "string"
+          ? checkedStrParam(L, a, bi.member === "resolve" ? `paths[${i}]` : "path", "of type string", false)
+          : L.lowerExprExpecting(a, STRING));
       const packed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(STRING), loc };
       return { kind: "libCall", fn: fn.fn, args: [packed], type: fn.result, loc };
     }
@@ -1361,10 +1478,10 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // non-string paths throw ERR_INVALID_ARG_TYPE where the dynCheck
       // throws its path-annotated TypeError. The fd forms (a number
       // argument) and literal-utf8 reads keep their existing lowerings.
-      const pathV = L.lowerExpr(expr.arguments[0]!);
+      const pathV = lowerArgLoose(L, expr.arguments[0]!);
       if (pathV.type.kind === "string" || pathV.type.kind === "dyn") {
         const pathArg: IrExpr = pathV.type.kind === "dyn"
-          ? { kind: "dynCheck", value: pathV, type: STRING, loc }
+          ? (L.undefSlots ? checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true) : { kind: "dynCheck", value: pathV, type: STRING, loc })
           : pathV;
         if (expr.arguments.length === 1) {
           return { kind: "libCall", fn: "fs.readFileSyncBuf", args: [pathArg], type: BYTES_U8, loc };
@@ -1427,7 +1544,15 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         );
       }
     }
-    const args = expr.arguments.map((a, i) => L.lowerExprExpecting(a, fn.params[i]));
+    const paramNames = isPathModule(bi.module) ? PATH_PARAMS[bi.member] : bi.module === "fs" ? FS_PARAMS[bi.member] : undefined;
+    const args = expr.arguments.map((a, i) => {
+      if (bi.module === "fs" && i === 1 && (bi.member === "writeFileSync" || bi.member === "appendFileSync")) {
+        return checkedStrParam(L, a, "data", FS_DATA_TEXT, true);
+      }
+      const pn = paramNames?.[i];
+      if (pn === undefined) return L.lowerExprExpecting(a, fn.params[i]);
+      return bi.module === "fs" ? checkedStrParam(L, a, pn, FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true) : checkedStrParam(L, a, pn, "of type string", false);
+    });
     for (let i = args.length; i < fn.params.length; i++) {
       const dflt = fn.defaults![i - required]!;
       args.push({ kind: "strLit", value: dflt, type: STRING, loc });
@@ -3849,7 +3974,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         "an input string and an optional base are the lowered form",
       );
     }
-    const input = L.lowerExprExpecting(args[0]!, STRING);
+    // GH #86 review: Node ToString's the input (new URL(5) is ERR_INVALID_URL)
+    const input0 = L.undefSlots ? L.lowerExpr(args[0]!) : null;
+    const input: IrExpr = input0 !== null && input0.type.kind === "dyn"
+      ? { kind: "libCall", fn: "dyn.toStringCoerce", args: [input0], type: STRING, loc }
+      : L.undefSlots ? undefinedAsText(L, L.lowerExprExpecting(args[0]!, STRING), loc) : L.lowerExprExpecting(args[0]!, STRING);
     const baseNode = args[1];
     if (!baseNode) return noBase(input);
     const baseT = L.mapTypeOf(L.typeOf(baseNode));
@@ -3899,7 +4028,10 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         if (Array.isArray(x)) return x.every(pure);
         if (x === null || typeof x !== "object") return true;
         const o = x as Record<string, unknown>;
-        if (typeof o.kind === "string" && "type" in o && !pureKinds.has(o.kind)) return false;
+        // (one arm runs, so the input's ToString happens once)
+        // ToString of a string slot (its undefined's text) reads and calls nothing
+        if (o.kind === "toString" && (o.operand as { type?: { kind?: string } } | undefined)?.type?.kind === "string") return pure(o.operand);
+        if (typeof o.kind === "string" && "type" in o && !pureKinds.has(o.kind) && o.fn !== "dyn.toStringCoerce") return false;
         return Object.entries(o).every(([k, v]) => k === "type" || k === "loc" || pure(v));
       };
       if (read.kind !== "varRef" || !pure(input)) {
@@ -4942,8 +5074,9 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
   }
 
 /** `process.stdin/stdout/stderr.isTTY` → isatty(3) on the stream's fd
-   * (a REAL boolean: Node's non-TTY streams expose `undefined` here — the
-   * documented divergence; truthiness tests, the actual usage, agree), and
+   * (Node's non-TTY streams have no isTTY property — `undefined`: the
+   * WasmGC lanes answer the bool slot's undefined there (Unit U, GH #88);
+   * the c and llvm lanes answer `false` — SEMANTICS.md S121), and
    * `process.stdout/stderr.columns` → ioctl(TIOCGWINSZ) on the fd, with
    * Node's non-TTY answer intact: the read is `number | undefined` and a
    * non-TTY (or ioctl-refusing) stream yields the undefined arm. The

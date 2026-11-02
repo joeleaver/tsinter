@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { rootCertificates } from "node:tls";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -41,6 +41,17 @@ async function runTs(src: string): Promise<{ stdout: string; stderr: string; exi
   const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
   return runWasm(res.binaryPath);
+}
+
+/** A program expected to end at a runtime fence (GH #86, SEMANTICS.md
+ * S122): the trap, and what it printed before it. */
+async function runTsTrap(src: string): Promise<{ stdout: string; stderr: string }> {
+  const file = join(scratch, `p${seq++}.ts`);
+  await writeFile(file, src);
+  const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+  const r = await runWasmToTrap(res.binaryPath);
+  return { stdout: String(r.stdout), stderr: String(r.stderr) };
 }
 
 /** The same driver under Node, in a child process. */
@@ -120,9 +131,14 @@ describe("INC-29 U4 the CA store, host-free", () => {
       ["-----BEGIN CERTIFICATE-----\nX-Note: hi\n\n" + body(ca) + "\n-----END CERTIFICATE-----\n"],
       [wrap(body(ca), 300)],
     ];
-    const r = await runTs(`const SETS: string[][] = ${JSON.stringify(sets)};\n${SET_DRIVER}`);
-    expect(r.stdout).toBe(
-      "X Error tls.setDefaultCACertificates of a PEM block with header lines or a line over 253 bytes is not supported yet\n".repeat(2),
-    );
+    // GH #86 (SEMANTICS.md S122): the fence ends the program (the driver's
+    // try/catch never sees it), so each PEM form runs as its own program.
+    for (const set of sets) {
+      const r = await runTsTrap(`const SETS: string[][] = ${JSON.stringify([set])};\n${SET_DRIVER}`);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe(
+        "tsinter: unsupported: tls.setDefaultCACertificates of a PEM block with header lines or a line over 253 bytes is not supported yet [SC1090]\n",
+      );
+    }
   }, 120000);
 });

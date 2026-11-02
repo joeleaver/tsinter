@@ -153,12 +153,12 @@ console.log("sync done");
 });
 
 // `e as C` on a catch binding is a CHECKED cast: a payload outside C's
-// hierarchy throws a catchable TypeError where Node's erasure would read
-// undefined off the value — dynCheck's documented trust-but-verify stance
-// extended to exception payloads. This is exactly the case that cannot be
-// a differential test; pinned so the divergence stays deliberate.
+// hierarchy ends the program at a fence where Node's erasure would read
+// undefined off the value (GH #86 review, SEMANTICS.md S009, S122: a check
+// Node never makes is never catchable). This is exactly the case that
+// cannot be a differential test; pinned so the divergence stays deliberate.
 describe("checked catch-binding casts", () => {
-  test("a mismatched `as Error` throws the catchable TypeError", async () => {
+  test("a mismatched `as Error` ends the program, even inside try/catch", async () => {
     const r = await compileAndRun(
       "caught-check-mismatch",
       `try {
@@ -172,12 +172,12 @@ describe("checked catch-binding casts", () => {
 }
 `,
     );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("checked: caught value is not an instance of Error (checked cast)\n");
-    expect(r.stderr).toBe("");
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe("tsinter: unsupported: caught value is not an instance of Error (checked cast) [SC1100]\n");
   });
 
-  test("an uncaught mismatch propagates as the TypeError", async () => {
+  test("an uncaught mismatch ends the program at the same fence", async () => {
     const r = await compileAndRun(
       "caught-check-uncaught",
       `try {
@@ -189,7 +189,7 @@ describe("checked catch-binding casts", () => {
     );
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toBe(
-      "Uncaught TypeError: caught value is not an instance of Error (checked cast)\n",
+      "tsinter: unsupported: caught value is not an instance of Error (checked cast) [SC1100]\n",
     );
   });
 
@@ -216,7 +216,7 @@ console.log(two(1, 2, loud()));
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: surplus arguments with side effects .* are not supported yet \[SC1090 at .*surplus-args-effectful\.cjs:9\]\n$/,
+      /^tsinter: unsupported: surplus arguments with side effects .* are not supported yet \[SC1090 at .*surplus-args-effectful\.cjs:9\]\n$/,
     );
   });
 
@@ -238,7 +238,7 @@ console.log('unreached');
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: extending 'exports\.I' above the statement that assigns it .* \[SC1090 at .*extends-above-assignment\.cjs:2\]\n$/,
+      /^tsinter: unsupported: extending 'exports\.I' above the statement that assigns it .* \[SC1090 at .*extends-above-assignment\.cjs:2\]\n$/,
     );
   });
 
@@ -260,7 +260,7 @@ console.log(new exports.O().a());
     );
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
-    expect(r.stderr).toMatch(/^Uncaught Error: .* \[SC1090 at .*extends-reassigned-property\.cjs:\d+\]\n$/);
+    expect(r.stderr).toMatch(/^tsinter: unsupported: .* \[SC1090 at .*extends-reassigned-property\.cjs:\d+\]\n$/);
   });
 
   test("a LEAF class whose collection fenced defers to its statement (JS lane)", async () => {
@@ -291,7 +291,7 @@ console.log("unreachable");
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("before\n");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: constructor-assigned fields shadowing methods are not supported yet \[SC1090 at .*leaf-shadowing-class-defers\.cjs:5\]\n$/,
+      /^tsinter: unsupported: constructor-assigned fields shadowing methods are not supported yet \[SC1090 at .*leaf-shadowing-class-defers\.cjs:5\]\n$/,
     );
   });
 
@@ -324,7 +324,7 @@ console.log(i.foo());
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("before\n");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: constructor-assigned fields shadowing methods are not supported yet \[SC1090 at .*derived-shadowing-class-defers\.cjs:11\]\n$/,
+      /^tsinter: unsupported: constructor-assigned fields shadowing methods are not supported yet \[SC1090 at .*derived-shadowing-class-defers\.cjs:11\]\n$/,
     );
   });
 
@@ -344,15 +344,26 @@ console.log(max(1, 2));
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: destructuring the member 'max' of the builtin global 'Math' \(a detached member loses its receiver-keyed lowering — call it through the global\) is not supported yet \[SC1031 at .*destructure-surfaced-global\.cjs:2\]\n$/,
+      /^tsinter: unsupported: destructuring the member 'max' of the builtin global 'Math' \(a detached member loses its receiver-keyed lowering — call it through the global\) is not supported yet \[SC1031 at .*destructure-surfaced-global\.cjs:2\]\n$/,
     );
   });
 
-  test("an OPAQUE global's destructured member binds a token; uses fence lazily per site (JS lane)", async () => {
+  test("an OPAQUE global's destructured member binds a token only where every use is an identity use (JS lane)", async () => {
     // The node-suite webcrypto prologue: `const { subtle } =
-    // globalThis.crypto` binds the member identity token, so the program
-    // RUNS past the destructure (the eager pattern fence used to kill it
-    // at that line) and each use meets its own named fence.
+    // globalThis.crypto` binds the member identity token when the program
+    // only tests or compares it. A member call on the binding is not an
+    // identity use, so since GH #74 (ab0e91e8) the destructure statement
+    // itself fences, naming that use — the first control does run past it.
+    const ok = await compileAndRun(
+      "destructure-opaque-global-identity",
+      `'use strict';
+const { subtle } = globalThis.crypto;
+console.log('bound', !!subtle);
+`,
+      "cjs",
+    );
+    expect(ok.exitCode).toBe(0);
+    expect(ok.stdout).toBe("bound true\n");
     const r = await compileAndRun(
       "destructure-opaque-global",
       `'use strict';
@@ -363,9 +374,9 @@ subtle.digest('SHA-256');
       "cjs",
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("bound true\n");
+    expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: method calls like 'subtle\.digest' is not supported yet \[SC1090 at .*destructure-opaque-global\.cjs:4\]\n$/,
+      /^tsinter: unsupported: the builtin 'crypto\.subtle' used as a value through the binding 'subtle' .* \[SC1090 at .*destructure-opaque-global\.cjs:4\]\n$/,
     );
   });
 
@@ -390,7 +401,7 @@ console.log('after');
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: expressions nested deeper than 200 levels are not supported yet \[SC1090 at .*deep-nesting-chain\.cjs:2\]\n$/,
+      /^tsinter: unsupported: expressions nested deeper than 200 levels are not supported yet \[SC1090 at .*deep-nesting-chain\.cjs:2\]\n$/,
     );
   });
 
@@ -411,7 +422,7 @@ process.on('__proto__', () => {});
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(
-      /^Uncaught Error: 'process\.on\("__proto__", \.\.\.\)' is part of the standard library types but has no scriptc lowering yet \[SC2020 at .*process-on-proto\.cjs:2\]\n$/,
+      /^tsinter: unsupported: 'process\.on\("__proto__", \.\.\.\)' is part of the standard library types but has no scriptc lowering yet \[SC2020 at .*process-on-proto\.cjs:2\]\n$/,
     );
   });
 });

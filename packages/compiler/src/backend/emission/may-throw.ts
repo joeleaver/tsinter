@@ -3,6 +3,52 @@
 import type { IrArrIntrinsicMethod, IrBytesIntrinsicMethod, IrLibFn, IrModule } from "../../ir/nodes.js";
 import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS, moduleHasJsvalValues } from "../../ir/nodes.js";
 
+/** S119 (a) on the WasmGC lanes: a receiver a member read need not test
+ * for the slot's undefined. `this`, a value built right there, a guard
+ * helper's result, and a `const` local initialized from one of those; every
+ * other receiver is tested, and its test may throw Node's TypeError, so the
+ * emitter and this analysis must agree (both call this). */
+export function provenPresent(obj: unknown, present: ReadonlySet<string>): boolean {
+  const o = obj as { kind?: string; localId?: string; callee?: unknown };
+  switch (o.kind) {
+    case "new":
+    case "recordLit":
+    case "arrayLit":
+    case "closure":
+      return true;
+    case "varRef":
+      return o.localId === "this.0" || present.has(o.localId as string);
+    case "call":
+      return typeof o.callee === "string" && (o.callee.startsWith("%undef.recv.") || o.callee.startsWith("%union.recv."));
+    default:
+      return false;
+  }
+}
+
+/** The `const` locals of `fn` provenPresent can vouch for. */
+export function presentLocals(fn: { body: unknown; locals: readonly { id: string; mutable?: boolean; tdz?: boolean; boxed?: boolean }[] }): Set<string> {
+  const candidates = new Set(fn.locals.filter((l) => l.mutable !== true && l.tdz !== true && l.boxed !== true).map((l) => l.id));
+  const out = new Set<string>();
+  const decls = new Map<string, number>();
+  const visit = (n: unknown): void => {
+    if (Array.isArray(n)) {
+      for (const item of n) visit(item);
+      return;
+    }
+    if (n === null || typeof n !== "object") return;
+    const r = n as Record<string, unknown>;
+    if (r["kind"] === "varDecl" && candidates.has(r["localId"] as string)) {
+      const id = r["localId"] as string;
+      decls.set(id, (decls.get(id) ?? 0) + 1);
+      if (r["init"] !== undefined && r["init"] !== null && provenPresent(r["init"], out)) out.add(id);
+    }
+    for (const key of Object.keys(r)) if (key !== "loc" && key !== "type") visit(r[key]);
+  };
+  visit(fn.body);
+  for (const [id, n] of decls) if (n !== 1) out.delete(id);
+  return out;
+}
+
 /** Cheap may-throw analysis (cost discipline: functions that transitively
  * CANNOT throw pay for no pending-exception checks). A function may throw
  * iff it contains a `throw`, calls a may-throw function (direct `call` or
@@ -42,8 +88,11 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
       list.push(`%${cls.name}.${m}`);
     }
   }
+  const undefSlots = (mod as { undefSlots?: true }).undefSlots === true;
+  const fnByName = new Map(mod.functions.map((fn) => [fn.name, fn]));
   for (const fn of mod.functions) {
     const f: Facts = { throws: false, callees: [], callsValue: false };
+    const present = undefSlots ? presentLocals(fn) : new Set<string>();
     // TDZ locals (forward-captured consts): every read tests the box and
     // throws the catchable ReferenceError while it is empty.
     const tdzIds = new Set(fn.locals.filter((l) => l.tdz).map((l) => l.id));
@@ -56,13 +105,27 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
       }
       if (node === null || typeof node !== "object") return;
       const rec = node as Record<string, unknown>;
+      // Unit U (S119 (a)): a binding-read receiver marked for the backend's
+      // undefined test throws Node's catchable TypeError.
+      if (typeof rec["undefRecv"] === "string") f.throws = true;
+      if (undefSlots) {
+        // S119 (a): a member read, an index read or a method call tests its
+        // receiver (provenPresent) and throws Node's TypeError.
+        const recv =
+          (rec["kind"] === "recordGet" && rec["spreadCopy"] !== true) || rec["kind"] === "fieldGet" ? rec["obj"]
+            : rec["kind"] === "arrayGet" ? rec["arr"]
+              : rec["kind"] === "virtualCall" ? (rec["args"] as unknown[])[0]
+                : rec["kind"] === "call" && fnByName.get(rec["callee"] as string)?.params[0]?.localId === "this.0" && !(rec["callee"] as string).endsWith(".constructor") ? (rec["args"] as unknown[])[0]
+                  : undefined;
+        if (recv !== undefined && !provenPresent(recv, present)) f.throws = true;
+      }
       switch (rec["kind"]) {
         case "throw":
         case "rethrow":
-        // The deferred JS compile fence throws catchably when executed.
-        case "runtimeFence":
           f.throws = true;
           break;
+        // A runtime fence ENDS the program (GH #86, SEMANTICS.md S122) —
+        // it never unwinds into a caller, so it seeds nothing.
         case "varRef":
           if (tdzIds.size > 0 && tdzIds.has(rec["localId"] as string)) f.throws = true;
           break;

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch = "";
 beforeAll(async () => {
@@ -117,6 +117,21 @@ async function runC(id: string, src: string): Promise<{ stdout: string; exitCode
   });
 }
 
+/** runC with stderr too: the fence rows compare the fence line. */
+async function runCFull(id: string, src: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const entry = join(scratch, `${id}.ts`);
+  await writeFile(entry, `${src}\n`);
+  const res = await compile(entry, { outPath: join(scratch, `${id}.c.out`), outDir: scratch, backend: "c", dynamic: true });
+  if (!res.ok) throw new Error(`${id} refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+  const { execFile } = await import("node:child_process");
+  return await new Promise((resolve) => {
+    execFile(res.binaryPath, [], { encoding: "utf8" }, (err, stdout, stderr) => {
+      const code = err ? (err as { code?: unknown }).code : 0;
+      resolve({ stdout, stderr, exitCode: typeof code === "number" ? code : 1 });
+    });
+  });
+}
+
 /** A row both lanes must answer identically (wasm, and c for the native
  * island's Proxy views): the wasm stdout, after checking c agrees. */
 async function bothRow(id: string, src: string): Promise<string> {
@@ -184,32 +199,67 @@ test("H-UNVIEW-01 a view returning to its own static type unwraps to the same va
 
 // ── writes through a view must fit the static type and shape (S115 (b)) ───
 
-const VERR_SRC =
-  "// @dynamic\nconst xs: number[] = [1, 2, 3];\nconst v: any = xs;\nconst tup: [string, number] = [\"a\", 1];\nconst t: any = tup;\ntype R = { x: number; y?: string };\nconst rec: R = { x: 1 };\nconst r: any = rec;\n" +
-  "const tries: [string, () => void][] = [\n  [\"wrong kind\", () => { v[0] = \"s\"; }],\n  [\"hole\", () => { v[7] = 1; }],\n  [\"grow length\", () => { v.length = 9; }],\n  [\"named member\", () => { v.foo = 1; }],\n  [\"tuple push\", () => { t.push(2); }],\n  [\"tuple slot\", () => { t[1] = \"x\"; }],\n  [\"record add\", () => { r.z = 1; }],\n  [\"nested fresh\", () => { const g: number[][] = [[1]]; const gv: any = g; gv[0] = [2]; }],\n];\n" +
-  "for (const [name, f] of tries) {\n  try { f(); console.log(name, \"ok\"); } catch (e) { console.log(name, (e as Error).name, (e as Error).message); }\n}\nv.length = 1;\nr.y = \"set\";\nconsole.log(xs.join(\",\"), JSON.stringify(r));";
+// GH #86 review (SEMANTICS.md S115, S122): a refused view write is a check
+// Node never makes (Node stores whatever it is given), so each one ENDS the
+// program at its named fence — one program per case, on wasm and on c; the
+// line before the write prints, nothing after it.
+const VERR_PRE =
+  "// @dynamic\nconst xs: number[] = [1, 2, 3];\nconst v: any = xs;\nconst tup: [string, number] = [\"a\", 1];\nconst t: any = tup;\ntype R = { x: number; y?: string };\nconst rec: R = { x: 1 };\nconst r: any = rec;\nconsole.log(\"before\");\n";
+const AT = " [SC1090 at a write from dynamic code]";
+const VERR_ROWS: [string, string, string | RegExp][] = [
+  ["H-VERR-01 a value of the wrong primitive kind", "try { v[0] = \"s\"; } catch (e) { console.log(\"caught\"); }",
+    "Cannot store a value that is not a number into a 'number[]' element shared from typed code (it holds numbers only — SEMANTICS.md S115)" + AT],
+  ["H-VERR-02 a write past the end (a hole)", "try { v[7] = 1; } catch (e) { console.log(\"caught\"); }",
+    "Writing past the end of a 'number[]' shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)" + AT],
+  ["H-VERR-03 growing length", "try { v.length = 9; } catch (e) { console.log(\"caught\"); }",
+    "Growing the length of a 'number[]' shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)" + AT],
+  // wasm only: on c the native island's Proxy trap throws this one inside
+  // the engine, where it stays catchable (S122's c/llvm island residue)
+  ["H-VERR-04 a non-index member on an array view", "try { v.foo = 1; } catch (e) { console.log(\"caught\"); }",
+    "Cannot add property 'foo': a 'number[]' shared from typed code has a fixed shape (SEMANTICS.md S115) [SC1090]"],
+  ["H-VERR-05 a tuple's length is fixed", "try { t.push(2); } catch (e) { console.log(\"caught\"); }",
+    "a '[string, number]' shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)" + AT],
+  ["H-VERR-06 a tuple position's declared type", "try { t[1] = \"x\"; } catch (e) { console.log(\"caught\"); }",
+    "Cannot store a value that is not a number into a '[string, number]' position 1 shared from typed code (it holds numbers only — SEMANTICS.md S115)" + AT],
+  ["H-VERR-07 a record's shape is fixed", "try { r.z = 1; } catch (e) { console.log(\"caught\"); }",
+    /^Cannot add a property to a '\{ .* \}' shared from typed code: it has a fixed shape \(SEMANTICS\.md S115\) \[SC1090 at a write from dynamic code\]$/],
+  ["H-VERR-08 an island value into a nested typed slot that is not a view of it", "try { const g: number[][] = [[1]]; const gv: any = g; gv[0] = [2]; } catch (e) { console.log(\"caught\"); }",
+    "Cannot store object into a 'number[][]' element (a 'number[]' slot takes only a value shared from a typed 'number[]') (SEMANTICS.md S115) [SC1090]"],
+];
 
-test("H-VERR-01..08 each refused view write throws its named error, identically on wasm and c; the value is untouched", async () => {
-  const out = await bothRow("H-VERR", VERR_SRC);
-  const lines = out.split("\n");
-  // H-VERR-01 a value of the wrong primitive kind
-  expect(lines[0]).toBe("wrong kind TypeError Cannot store string into a 'number[]' element shared from typed code (it holds numbers only — SEMANTICS.md S115)");
-  // H-VERR-02 a write past the end (a hole)
-  expect(lines[1]).toBe("hole Error Writing past the end of a 'number[]' shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)");
-  // H-VERR-03 growing length
-  expect(lines[2]).toBe("grow length Error Growing the length of a 'number[]' shared from typed code would leave holes, which typed storage cannot hold (SEMANTICS.md S115)");
-  // H-VERR-04 a non-index member on an array view
-  expect(lines[3]).toBe("named member TypeError Cannot add property 'foo': a 'number[]' shared from typed code has a fixed shape (SEMANTICS.md S115)");
-  // H-VERR-05 a tuple's length is fixed
-  expect(lines[4]).toBe("tuple push Error a '[string, number]' shared from typed code is a tuple: its length is fixed (SEMANTICS.md S115)");
-  // H-VERR-06 a tuple position's declared type
-  expect(lines[5]).toBe("tuple slot TypeError Cannot store string into a '[string, number]' position 1 shared from typed code (it holds numbers only — SEMANTICS.md S115)");
-  // H-VERR-07 a record's shape is fixed
-  expect(lines[6]).toMatch(/^record add TypeError Cannot add property 'z': a '\{ .* \}' shared from typed code has a fixed shape \(SEMANTICS\.md S115\)$/);
-  // H-VERR-08 an island value into a nested typed slot that is not a view of it
-  expect(lines[7]).toBe("nested fresh TypeError Cannot store object into a 'number[][]' element (a 'number[]' slot takes only a value shared from a typed 'number[]') (SEMANTICS.md S115)");
-  // Shrinking works, and nothing a refused write touched changed.
-  expect(lines[8]).toBe("1 {\"x\":1,\"y\":\"set\"}");
+/** Both lanes end the program at the same fence line, after "before". */
+async function bothFence(id: string, src: string): Promise<string> {
+  const entry = join(scratch, `${id}-w.ts`);
+  await writeFile(entry, `${src}\n`);
+  const res = await compile(entry, { outPath: join(scratch, `${id}-w.wasm`), outDir: scratch, backend: "wasm", dynamic: true });
+  if (!res.ok) throw new Error(`${id} refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+  const w = await runWasmToTrap(res.binaryPath);
+  const c = await runCFull(`${id}-c`, src);
+  expect(String(w.stdout)).toBe("before\n");
+  if (id === "H-VERR-04") {
+    expect(c).toEqual({ stdout: "before\ncaught\n", stderr: "", exitCode: 0 });
+  } else {
+    expect(c.stdout).toBe("before\n");
+    expect(c.exitCode).toBe(1);
+    expect(c.stderr).toBe(String(w.stderr));
+  }
+  const line = String(w.stderr);
+  expect(line.startsWith("tsinter: unsupported: ")).toBe(true);
+  expect(line.endsWith("\n")).toBe(true);
+  return line.slice("tsinter: unsupported: ".length, -1);
+}
+
+for (const [id, body, want] of VERR_ROWS) {
+  test(`${id}: ends the program at its named fence, identically on wasm and c (GH #86 review, S122)`, async () => {
+    const msg = await bothFence(id.split(" ")[0]!, VERR_PRE + body);
+    if (typeof want === "string") expect(msg).toBe(want);
+    else expect(msg).toMatch(want);
+  });
+}
+
+test("H-VERR-09 shrinking a view works, and the writes that fit land", async () => {
+  const out = await bothRow("H-VERR-09", VERR_PRE + "v.length = 1;\nr.y = \"set\";\nconsole.log(xs.join(\",\"), JSON.stringify(r));");
+  expect(out).toBe("before\n1 {\"x\":1,\"y\":\"set\"}\n");
 });
 
 test("H-VWASM-01 callback walkers walk a view LIVE on every lane: writes through the third argument, straight to the typed array, and shrinking it answer Node's (S115 (c))", async () => {
@@ -438,9 +488,14 @@ test("H-S110c Array.prototype errors on an island array spell V8's texts on the 
   expect((await runC("H-S110c-c", "// @dynamic\nconst xs: any[] = [3, 1];\ntry { ([] as any[]).reduce((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { ([] as any[]).reduceRight((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.with(\"7\" as any, 1); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.toSorted(1 as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.sort({} as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\nconsole.log(xs.reduce((a: any, b: any) => a + b), xs.with(-1, 9).join(\",\"), xs.toSorted().join(\",\"));")).stdout).toBe(want);
 });
 
-test("H-S2b shrinking an island array's length truncates on wasm; growing it refuses by name (S110 (f))", async () => {
-  const r = await runRow("H-S2b", "// @dynamic\nconst a: any[] = [1, 2, 3];\na.length = 1;\nconsole.log(a.length, JSON.stringify(a));\ntry { a.length = 3; } catch (e) { console.log((e as Error).message); }");
-  expect(r.stdout).toBe("1 [1]\ngrowing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane\n");
+test("H-S2b shrinking an island array's length truncates on wasm; growing it refuses by name (S110 (f)) — the fence ends the program (GH #86, S122)", async () => {
+  const entry = join(scratch, "H-S2b.ts");
+  await writeFile(entry, "// @dynamic\nconst a: any[] = [1, 2, 3];\na.length = 1;\nconsole.log(a.length, JSON.stringify(a));\ntry { a.length = 3; } catch (e) { console.log((e as Error).message); }\n");
+  const res = await compile(entry, { outPath: join(scratch, "H-S2b.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
+  if (!res.ok) throw new Error(`H-S2b refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+  const r = await runWasmToTrap(res.binaryPath);
+  expect(String(r.stdout)).toBe("1 [1]\n");
+  expect(String(r.stderr)).toBe("tsinter: unsupported: growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane [SC1090]\n");
 });
 
 test("H-CORPUS-2788 the typed-views corpus program", async () => {

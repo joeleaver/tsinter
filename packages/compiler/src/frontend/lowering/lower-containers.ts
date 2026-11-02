@@ -6,7 +6,8 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
-import { bindOnce, droppableStatic, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { bindOnce, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
@@ -134,7 +135,7 @@ function lowerOptionalDefaultArg(
     // construction, with the declared-primitive result exit. Never a
     // static arrIntrinsic over a jsval (the validator ICE).
     {
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       if (receiver.type.kind === "jsval") {
         // The receiver's elements are ENGINE values whatever the checker
         // spelled (an evolving-`any` array tsc retyped by its pushes —
@@ -202,7 +203,7 @@ function lowerOptionalDefaultArg(
       return {
         kind: "arrIntrinsic",
         method: "toReversed",
-        receiver: L.lowerExpr(access.expression),
+        receiver: lowerMemberRecv(L, access),
         args: [],
         type: receiverIr,
         loc,
@@ -212,7 +213,7 @@ function lowerOptionalDefaultArg(
       if (call.arguments.length !== 2 || call.arguments.some(ts.isSpreadElement)) {
         L.noLowering(`.with with ${call.arguments.length} arguments`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const index = L.lowerExprExpecting(call.arguments[0]!, F64);
       const value = L.coerceInto(
         call.arguments[1]!,
@@ -232,7 +233,7 @@ function lowerOptionalDefaultArg(
       if (call.arguments.some(ts.isSpreadElement)) {
         L.unsupported("SC1090", call, "spread arguments to Array.toSpliced");
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const start = call.arguments[0]
         ? L.lowerExprExpecting(call.arguments[0], F64)
         : { kind: "numLit" as const, value: 0, type: F64, loc };
@@ -308,7 +309,7 @@ function lowerOptionalDefaultArg(
       );
     }
     if (name === "push" || name === "pop") {
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       // `a.push(...src)`: append src's elements in order (count
       // snapshotted first, so `a.push(...a)` duplicates like JS) and
       // return the new length.
@@ -359,7 +360,7 @@ function lowerOptionalDefaultArg(
             "loop and compare the narrowed values instead)",
         );
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       let needle = L.lowerExpr(call.arguments[0]!);
       // A derived CLASS VALUE against a base-classval element widens (the
       // same pointer — identity search is exact); the coercion path owns
@@ -397,7 +398,7 @@ function lowerOptionalDefaultArg(
       // because the two kinds map differently. The one ambiguous corner —
       // an array-of-arrays receiver given a bare inner array, where TS
       // types it as an element but JS would SPREAD it — is fenced.
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const shape: ("e" | "a")[] = [];
       const args: IrExpr[] = [];
       for (const argNode of call.arguments) {
@@ -450,7 +451,7 @@ function lowerOptionalDefaultArg(
       // are RETAINED into the copy: the same references, exactly JS's
       // shallow copy. Every element kind slices — the receiver's own type
       // is the result type.
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = call.arguments.map((a) => L.lowerExpr(a));
       for (let i = 0; i < args.length; i++) {
         if (args[i]!.type.kind !== "f64") L.badType(call.arguments[i]!, L.typeOf(call.arguments[i]!));
@@ -464,7 +465,7 @@ function lowerOptionalDefaultArg(
       // Node-exact relative/clamped indices, the removed elements back in
       // order (their ownership moves out of the receiver). Insertion
       // (3+ args) fenced by arity above.
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = call.arguments.map((a) => L.lowerExpr(a));
       for (let i = 0; i < args.length; i++) {
         if (args[i]!.type.kind !== "f64") L.badType(call.arguments[i]!, L.typeOf(call.arguments[i]!));
@@ -485,7 +486,7 @@ function lowerOptionalDefaultArg(
           "'.shift()' on union-element arrays (read [0] and splice(0, 1) with the narrowed value instead)",
         );
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       return { kind: "arrIntrinsic", method: "shift", receiver, args: [], type: L.withUndefinedArm(elem), loc };
     }
     if (name === "join") {
@@ -512,7 +513,7 @@ function lowerOptionalDefaultArg(
           "'.join()' on arrays of this element type (number, string, and boolean arrays join — unions of those with undefined/null arms too, the units printing empty like JS)",
         );
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       // Unit U (SEMANTICS.md S119): join(undefined) joins with ",".
       const sep = undefinedAsAbsent(L, L.lowerExpr(call.arguments[0]!), { kind: "strLit", value: ",", type: STRING, loc });
       return { kind: "arrIntrinsic", method: "join", receiver, args: [sep], type: STRING, loc };
@@ -729,7 +730,7 @@ function lowerOptionalDefaultArg(
     method: "map" | "filter" | "forEach",
     elem: IrType,): IrExpr {
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
     const { fnArg, arity } = hofCallbackArg(L, argNode, [elem], arrayOf(elem));
@@ -816,7 +817,7 @@ function lowerOptionalDefaultArg(
     if (receiverIr?.kind !== "record") return null;
     const shape = L.shapes.get(receiverIr.shapeId);
     if (!shape?.tuple) return null;
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     if (receiver.type.kind !== "record") return null;
     if (!pureReemittable(receiver)) {
       L.noLowering(
@@ -1137,7 +1138,7 @@ function lowerOptionalDefaultArg(
     method: "find" | "findIndex" | "findLast" | "findLastIndex" | "some" | "every",
     elem: IrType,): IrExpr {
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const arrT = arrayOf(elem);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
@@ -1397,7 +1398,7 @@ function lowerOptionalDefaultArg(
     access: ts.PropertyAccessExpression,
     elem: IrType,): IrExpr {
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const arrT = arrayOf(elem);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
@@ -1532,7 +1533,7 @@ function lowerOptionalDefaultArg(
     method: "reduce" | "reduceRight",
     elem: IrType,): IrExpr {
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const arrT = arrayOf(elem);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
@@ -1696,7 +1697,7 @@ function lowerOptionalDefaultArg(
     const copyFirst = method === "toSorted";
     if (L.undefSlots) return lowerWasmArraySortCall(L, call, access, elem, arrT, method);
     if (call.arguments.length === 0 && elem.kind === "string") {
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const cmp = defaultStringCmpHelper(L, loc);
       const fnT = funcOf([STRING, STRING], F64);
       const key = `${method}:${typeKey(STRING)}:2`;
@@ -1717,7 +1718,7 @@ function lowerOptionalDefaultArg(
           `${method}((a, b) => a - b) for numbers`,
       );
     }
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const argNode = call.arguments[0]!;
     const fnArg = adaptVariadicCallback(L, argNode, L.lowerExpr(argNode), [elem, elem]);
     // The comparator receives exactly (a, b); declaring a prefix is
@@ -2433,7 +2434,7 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     if (call.arguments.length > 1 || call.arguments.some(ts.isSpreadElement)) {
       L.noLowering(`.toSorted with ${call.arguments.length} arguments on Uint8Array`, call);
     }
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const undefinedArg = call.arguments[0]
       ? lowerStaticallyUndefinedArg(L, call.arguments[0])
       : null;
@@ -2818,7 +2819,7 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     access: ts.PropertyAccessExpression,
     elem: IrType,): IrExpr {
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const index = L.lowerExprExpecting(call.arguments[0]!, F64);
     const resultT = L.irTypeOf(call);
     if (resultT.kind !== "union") L.badType(call, L.typeOf(call)); // defensive: T | undefined always maps to a union
@@ -3051,7 +3052,11 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
       L.arrHofHelpers.set(key, helper);
       L.liftedFns.push(buildStrCharsFn(helper, loc));
     }
-    return { kind: "call", callee: helper, args: [src], type: arrayOf(STRING), loc };
+    // Unit U (S119 (a)): a source holding undefined is not iterable —
+    // Array.from and destructuring answer V8's generic text; `[...s]`
+    // checks first with its own spelling.
+    const guarded = src.kind === "call" && src.callee.startsWith("%undef.iter.") ? src : undefIterGuard(L, src, "undefined is not iterable (cannot read property Symbol(Symbol.iterator))", loc);
+    return { kind: "call", callee: helper, args: [guarded], type: arrayOf(STRING), loc };
   }
 
 /** The code-point split, from existing IR nodes — the string for-of
@@ -3204,7 +3209,7 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     if (receiverIr?.kind !== "map") return null;
     if (!L.isStdlibMember(access)) return null;
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     // The lib's `set` returns the Map (chaining typechecks); the lowered
     // set is a void statement, so a chained receiver has no value — fence
     // it instead of emitting a void receiver.
@@ -3578,7 +3583,7 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
     if (receiverIr?.kind !== "set") return null;
     if (!L.isStdlibMember(access)) return null;
     const loc = locOf(call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     // The lib's `add` returns the Set (chaining typechecks); the lowered
     // add is a void statement — fence chained receivers like Map's set.
     if (receiver.type.kind !== "set") {
@@ -5444,24 +5449,25 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     if (dynReceiver === undefined && !L.isStdlibMember(access)) return null;
     const name = access.name.text;
     const receiverKind = dynReceiver ? "string" : L.mapTypeOf(L.typeOf(access.expression))?.kind;
-    const lowerReceiver = (): IrExpr => (dynReceiver ? dynReceiver() : L.lowerExpr(access.expression));
+    const lowerReceiver = (): IrExpr => (dynReceiver ? dynReceiver() : lowerMemberRecv(L, access));
     const loc = locOf(call);
     if (receiverKind === "regex" && name === "test") {
       // RegExp.prototype.test — stateful on a global or sticky regex
       // (board #301: lastIndex is modelled on every lane).
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = call.arguments.map((a) => L.lowerExpr(a));
       return { kind: "regexIntrinsic", method: "test", receiver, args, type: BOOL, loc };
     }
     // `re.exec(s)`: RegExpBuiltinExec's honest `string[] | null` row
-    // ([whole, ...captures], nonparticipating captures "" — S064), reading
+    // ([whole, ...captures]; a nonparticipating capture is Node's
+    // undefined on the WasmGC lanes, "" on c/llvm — S064), reading
     // and writing lastIndex on a global or sticky regex (board #301). A
     // result bound to a local keeps its `.index`/`.input` in hidden
     // companions (lower-regex.ts execCompanionFor).
     if (receiverKind === "regex" && name === "exec") {
       if (call.arguments.length !== 1) return null; // exec takes exactly the subject
       const companion = L.execCompanionFor(call);
-      const re = L.lowerExpr(access.expression);
+      const re = lowerMemberRecv(L, access);
       const subject = L.lowerExprExpecting(call.arguments[0]!, STRING);
       const resultT: IrType = { kind: "union", unionId: L.unions.intern([arrayOf(STRING), { kind: "nullT" }]) };
       if (companion) {
@@ -5613,6 +5619,30 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     dynReceiver?: () => IrExpr,): IrExpr | null {
     if (L.chainBlocked(access, call)) return null;
     if (dynReceiver === undefined && access.name.text === "localeCompare") return lowerLocaleCompareCall(L, call, access);
+    if (dynReceiver === undefined && access.name.text === "at" && L.undefSlots && call.arguments.length === 1 &&
+        L.mapTypeOf(L.typeOf(access.expression))?.kind === "string" && L.isStdlibMember(access)) {
+      // `s.at(i)` on the WasmGC lanes (Unit U, S119): the relative index
+      // reads through charAt, out of range is `undefined`; NaN is charAt's
+      // own 0.
+      const loc = locOf(call);
+      const idx = L.lowerExpr(call.arguments[0]!);
+      if (idx.type.kind === "f64") {
+        return bindOnce(L, lowerMemberRecv(L, access), loc, (recv) =>
+          bindOnce(L, { kind: "libCall", fn: "math.trunc", args: [idx], type: F64, loc }, loc, (t) => {
+            const len: IrExpr = { kind: "strIntrinsic", method: "length", receiver: recv, args: [], type: F64, loc };
+            const k: IrExpr = {
+              kind: "ternary",
+              cond: { kind: "bin", op: "<", left: t, right: { kind: "numLit", value: 0, type: F64, loc }, type: BOOL, loc },
+              then: { kind: "bin", op: "+", left: len, right: t, type: F64, loc },
+              else_: t,
+              type: F64,
+              loc,
+            };
+            return { kind: "strIntrinsic", method: "charAt", receiver: recv, args: [k], undefOob: "at", type: STRING, loc };
+          }),
+        );
+      }
+    }
     const entry = own(STR_METHODS, access.name.text);
     if (!entry) return null;
     // A validated dyn receiver (`pkg.name.replace(...)` on a JSON.parse
@@ -5638,8 +5668,16 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
         call,
       );
     }
-    const receiver = dynReceiver ? dynReceiver() : L.lowerExpr(access.expression);
+    const receiver = dynReceiver ? dynReceiver() : lowerMemberRecv(L, access);
     const args = call.arguments.map((a) => L.lowerExpr(a));
+    if (entry.method === "repeat") {
+      // JS's ToNumber of the count (a JavaScript source can pass anything).
+      const a = args[0]!;
+      const aloc = locOf(call);
+      if (a.type.kind === "string") args[0] = { kind: "libCall", fn: "num.fromString", args: [undefinedAsText(L, a, aloc)], type: F64, loc: aloc };
+      else if (a.type.kind === "bool") args[0] = boolToNumber(L, a, aloc);
+      else if (a.type.kind === "dyn") args[0] = { kind: "libCall", fn: "dyn.toNumber", args: [a], type: F64, loc: aloc };
+    }
     // split's separator must BE a string here (a regex argument was
     // claimed by lowerRegexMethodCall before this path) — the lib's
     // `string | RegExp` union has no lowering as a VALUE.
@@ -5775,7 +5813,7 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
         "only the default collation is built in (tertiary strength, punctuation and case significant, no numeric or caseFirst ordering) — SEMANTICS.md S120",
       );
     }
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     let arg = L.lowerExpr(call.arguments[0]!);
     if (arg.type.kind !== "string") L.badType(call.arguments[0]!, L.typeOf(call.arguments[0]!));
     // Unit U (SEMANTICS.md S119): an argument holding its slot's undefined
@@ -6030,7 +6068,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       return {
         kind: "bytesIntrinsic",
         method: "toReversed",
-        receiver: L.lowerExpr(access.expression),
+        receiver: lowerMemberRecv(L, access),
         args: [],
         type: receiverIr,
         loc,
@@ -6043,7 +6081,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       return {
         kind: "bytesIntrinsic",
         method: "with",
-        receiver: L.lowerExpr(access.expression),
+        receiver: lowerMemberRecv(L, access),
         args: [
           L.lowerExprExpecting(call.arguments[0]!, F64),
           L.lowerExprExpecting(call.arguments[1]!, F64),
@@ -6073,7 +6111,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       return {
         kind: "bytesIntrinsic",
         method: "join",
-        receiver: L.lowerExpr(access.expression),
+        receiver: lowerMemberRecv(L, access),
         args: [separator],
         type: STRING,
         loc,
@@ -6083,7 +6121,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs > 2) {
         L.noLowering(`.${name} with ${nArgs} arguments on typed arrays`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = call.arguments.map((a) => L.lowerExprExpecting(a, F64));
       // subarray is a VIEW (TypedArray.prototype.subarray aliases), and
       // Buffer's slice() is subarray's deprecated Node alias — resolved by
@@ -6108,7 +6146,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs < 1 || nArgs > 3) {
         L.noLowering(`.fill with ${nArgs} arguments on typed arrays`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const v = L.lowerExprExpecting(call.arguments[0]!, F64);
       const idx = call.arguments.slice(1).map((a) => L.lowerExprExpecting(a, F64));
       return { kind: "bytesIntrinsic", method: "fillElem", receiver, args: [v, ...idx], type: receiverIr, loc };
@@ -6117,7 +6155,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs < 1 || nArgs > 2) {
         L.noLowering(`.set with ${nArgs} arguments on typed arrays`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const src = L.lowerExpr(call.arguments[0]!);
       if (!typeEquals(src.type, receiverIr)) {
         L.noLowering(
@@ -6150,7 +6188,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs > 3) L.noLowering(`.toString with ${nArgs} arguments on Buffers`, call);
       const encNode = call.arguments[0];
       const encName = encNode ? bufEncoding(L, "Buffer.toString", encNode) : "utf8";
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
       // The range form toString(enc, start[, end]) decodes the clamped
       // [start, end) byte window (Node's slice-then-decode). An omitted
@@ -6197,7 +6235,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs < required || nArgs > required + 1) {
         L.noLowering(`.${name} with ${nArgs} arguments`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const kind: IrExpr = { kind: "strLit", value: numKind, type: STRING, loc };
       const args = [kind, ...call.arguments.map((a) => L.lowerExprExpecting(a, F64))];
       if (nArgs === required) {
@@ -6215,7 +6253,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs !== required) {
         L.noLowering(`.${name} with ${nArgs} arguments`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const kind: IrExpr = { kind: "strLit", value: varKind, type: STRING, loc };
       const args = [kind, ...call.arguments.map((a) => L.lowerExprExpecting(a, F64))];
       return { kind: "bytesIntrinsic", method: write ? "writeNumVar" : "readNumVar", receiver, args, type: F64, loc };
@@ -6254,7 +6292,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs < 1 || nArgs > maxArgs) {
         L.noLowering(`.${name} with ${nArgs} arguments`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = [L.lowerExprExpecting(call.arguments[0]!, F64)];
       if (nArgs === 2) args.push(L.lowerExprExpecting(call.arguments[1]!, BOOL));
       return { kind: "bytesIntrinsic", method: dvGetter.method, receiver, args, type: F64, loc };
@@ -6271,7 +6309,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       if (nArgs < 2 || nArgs > maxArgs) {
         L.noLowering(`.${name} with ${nArgs} arguments`, call);
       }
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       const args = [
         L.lowerExprExpecting(call.arguments[0]!, F64),
         L.lowerExprExpecting(call.arguments[1]!, F64),
@@ -6416,12 +6454,12 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     if (nArgs !== 1) L.noLowering(`.equals with ${nArgs} arguments`, call);
     if (argIrKind(0)?.kind === "bytes") {
       const other = u8Arg(0);
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       return { kind: "bytesIntrinsic", method: "equals", receiver, args: [other], type: BOOL, loc };
     }
     // Not statically bytes (the invalid-input probes, untyped JS
     // helpers): Node's "otherBuffer" argument ladder runs at runtime.
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     return { kind: "libCall", fn: "bytes.equalsChk", args: [receiver, chkArg(0)], type: BOOL, loc };
   }
   if (name === "compare") {
@@ -6433,14 +6471,14 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     if (fast) {
       const target = u8Arg(0);
       const idx = call.arguments.slice(1).map((a) => L.lowerExprExpecting(a, F64));
-      const receiver = L.lowerExpr(access.expression);
+      const receiver = lowerMemberRecv(L, access);
       return { kind: "bytesIntrinsic", method: "compareBuf", receiver, args: [target, ...idx], type: F64, loc };
     }
     // An absent/ill-typed target or offset (`a.compare()`, string
     // offsets, explicit undefined): Node's target/targetStart/targetEnd/
     // sourceStart/sourceEnd ladder runs at runtime; absent slots pass
     // the undefined dyn (Node defaults apply there).
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     const slots: IrExpr[] = [];
     for (let i = 0; i < 5; i++) slots.push(i < nArgs ? chkArg(i) : dynUndefinedExpr(loc));
     return { kind: "libCall", fn: "bytes.compareChk", args: [receiver, ...slots], type: F64, loc };
@@ -6460,7 +6498,7 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     }
     const resultT = name === "includes" ? BOOL : F64;
     const vT = L.mapTypeOf(L.typeOf(args[0]!));
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     if (vT?.kind === "f64") {
       // A number needle wraps & 0xFF at runtime (Buffer semantics; the
       // encoding is irrelevant, like Node).
@@ -6503,7 +6541,7 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     const receiverT = L.mapTypeOf(L.typeOf(access.expression));
     if (receiverT?.kind !== "bytes") L.badType(access.expression, L.typeOf(access.expression));
     const vT = L.mapTypeOf(L.typeOf(args[0]!));
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     if (vT?.kind === "string") {
       const encName = encNode ? bufEncoding(L, ".fill", encNode) : "utf8";
       const s = L.lowerExprExpecting(args[0]!, STRING);
@@ -6522,12 +6560,12 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     if (nArgs < 1 || nArgs > 4) L.noLowering(`.copy with ${nArgs} arguments`, call);
     const target = u8Arg(0);
     const idx = call.arguments.slice(1).map((a) => L.lowerExprExpecting(a, F64));
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     return { kind: "bytesIntrinsic", method: "copy", receiver, args: [target, ...idx], type: F64, loc };
   }
   if (name === "swap16" || name === "swap32" || name === "swap64") {
     if (nArgs !== 0) L.noLowering(`.${name} with ${nArgs} arguments`, call);
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     return { kind: "bytesIntrinsic", method: name, receiver, args: [], type: BYTES_U8, loc };
   }
   if (name === "write") {
@@ -6548,7 +6586,7 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
       ? L.lowerExprExpecting(idxNodes[0], F64)
       : { kind: "numLit", value: 0, type: F64, loc };
     const writeArgs = [s, enc, offset, ...(idxNodes[1] ? [L.lowerExprExpecting(idxNodes[1], F64)] : [])];
-    const receiver = L.lowerExpr(access.expression);
+    const receiver = lowerMemberRecv(L, access);
     return { kind: "bytesIntrinsic", method: "writeStr", receiver, args: writeArgs, type: F64, loc };
   }
   return null;
@@ -6629,6 +6667,26 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
             const encName = encNode ? bufEncoding(L, "Buffer.from", encNode) : "utf8";
             const s = L.lowerExprExpecting(argNode, STRING);
             const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
+            if (L.undefSlots && mayHoldSlotUndef(L, s)) {
+              // Unit U (SEMANTICS.md S119): a string slot holding undefined
+              // is Node's type error, not a read of a null.
+              const tmp = L.declareHiddenLocal("%bufFromStr", STRING);
+              const ref: IrExpr = { kind: "varRef", localId: tmp.id, type: STRING, loc };
+              return {
+                kind: "seqExpr",
+                stmts: [{ kind: "varDecl", localId: tmp.id, init: s, loc }],
+                result: {
+                  kind: "ternary",
+                  cond: isUndefExpr(ref, false, loc),
+                  then: nodeThrowExpr(1, "ERR_INVALID_ARG_TYPE", "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined", BYTES_U8, loc),
+                  else_: { kind: "libCall", fn: "buffer.fromStr", args: [ref, enc], type: BYTES_U8, loc },
+                  type: BYTES_U8,
+                  loc,
+                },
+                type: BYTES_U8,
+                loc,
+              };
+            }
             return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
           }
           if (args.length === 1 && srcIr?.kind === "bytes" && srcIr.elem === "u8") {
@@ -7030,7 +7088,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
     shape: IrRecordShape,): IrExpr {
     const resultT = L.irTypeOf(call);
     if (resultT.kind !== "array") L.badType(call, L.typeOf(call)); // defensive
-    return objectIterOverIndexShape(L, call, member, argIr, shape, L.lowerExpr(call.arguments[0]!), resultT, locOf(call));
+    return objectIterOverIndexShape(L, call, member, argIr, shape, undefToObjectGuard(L, L.lowerExpr(call.arguments[0]!), locOf(call)), resultT, locOf(call));
   }
 
   /** The construction core, receiver/result pre-resolved — `node` anchors
@@ -7201,6 +7259,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
             elseUndef = [{ kind: "if", cond: L.requiredFieldFlag(argIr.shapeId, f.name, loc), then: [push(undefPushed)], else_: null, loc }];
           }
         }
+        if (guard === null) guard = plainFieldPresent(L, raw, loc);
         body.push(guard !== null ? { kind: "if", cond: guard, then: [push(pushed)], else_: elseUndef, loc } : push(pushed));
       }
 

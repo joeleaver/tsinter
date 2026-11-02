@@ -17,7 +17,8 @@
  * Required: wasm, c and llvm print exactly Node's output. The printing
  * steers clear of the registered divergences the rows are not about: a
  * capture that did not participate in an exec/match ROW prints through
- * `?? ""` (S064 — "" on this tier, undefined in Node; replacers get
+ * `?? ""` (S064 — "" on the c and llvm lanes, undefined in Node and on
+ * the WasmGC lanes; replacers get
  * Node's exact undefined and print it), and on a subject holding astral
  * characters slices print as lengths (the native lanes' strings cannot hold
  * a lone surrogate — S002's native arm).

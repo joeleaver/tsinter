@@ -118,6 +118,9 @@ async function buildHelpers(): Promise<Helpers> {
     namedTrap: () => {
       throw new Error("harness 1 does not build cfValue's cycle trap");
     },
+    fence: () => {
+      throw new Error("harness 1 does not build a runtime fence (GH #86)");
+    },
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {
@@ -1501,35 +1504,58 @@ describe("the dyn walker", () => {
     expect(inspect(function named(): number { return 3; })).toBe("[Function: named]");
   });
 
-  test("a promise inside a dyn tree fences (SEMANTICS.md S030)", async () => {
-    const source = [
-      'import { inspect } from "node:util";',
-      "async function mk(): Promise<any> { return JSON.parse('{\"v\":1}'); }",
-      "const p: any = mk();",
-      "try { console.log(inspect(p)); }",
-      'catch (e) { console.log("bare:", (e as Error).name, (e as Error).message); }',
-      // nested, so the throw unwinds through frames the render left open
-      `const holder: any = JSON.parse('{"before":1,"deep":{"x":2}}');`,
-      "holder.deep.p = p;",
-      "try { console.log(inspect(holder)); }",
-      'catch (e) { console.log("nested:", (e as Error).message); }',
-      // the engine recovers completely: buffer, frames, indentation
-      `console.log(inspect(JSON.parse('{"after":{"ok":[1,2,3]}}')));`,
-      `console.log(inspect(JSON.parse('{"z":"a string that is quite long so it needs the layout engine to break it up nicely"}')));`,
-      "",
-    ].join("\n");
-    const got = await runProgram("dyn-promise-fence", source);
-    const fence = "util.inspect of a promise value is not supported yet";
-    expect(got).toBe(
+  // GH #86 (SEMANTICS.md S122): the fence ENDS the program — its line on
+  // fd 2, then the trap; the catch around it never runs. (Before GH #86
+  // it was a catchable Error and this row also pinned the render engine
+  // recovering after it; nothing runs after a fence now.)
+  for (const [label, body, before] of [
+    ["bare", ["try { console.log(inspect(p)); }", 'catch (e) { console.log("bare:", (e as Error).name, (e as Error).message); }'], ""],
+    [
+      // nested, so the fence fires with render frames open
+      "nested",
       [
-        `bare: Error ${fence}`,
-        `nested: ${fence}`,
-        inspect({ after: { ok: [1, 2, 3] } }),
-        inspect({ z: "a string that is quite long so it needs the layout engine to break it up nicely" }),
+        `const holder: any = JSON.parse('{"before":1,"deep":{"x":2}}');`,
+        "holder.deep.p = p;",
+        `console.log(inspect(JSON.parse('{"after":{"ok":[1,2,3]}}')));`,
+        "try { console.log(inspect(holder)); }",
+        'catch (e) { console.log("nested:", (e as Error).message); }',
+      ],
+      inspect({ after: { ok: [1, 2, 3] } }) + "\n",
+    ],
+  ] as const) {
+    test(`a promise inside a dyn tree fences (SEMANTICS.md S030) — ${label}: the fence ends the program`, async () => {
+      const source = [
+        'import { inspect } from "node:util";',
+        "async function mk(): Promise<any> { return JSON.parse('{\"v\":1}'); }",
+        "const p: any = mk();",
+        ...body,
+        'console.log("after");',
         "",
-      ].join("\n"),
-    );
-  });
+      ].join("\n");
+      const entry = join(scratch, `dyn-promise-fence-${label}.ts`);
+      await writeFile(entry, source);
+      const res = await compile(entry, { outPath: join(scratch, `dyn-promise-fence-${label}.wasm`), outDir: scratch, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+      const chunks: Record<number, Buffer[]> = { 1: [], 2: [] };
+      let memory: WebAssembly.Memory | null = null;
+      const { instance } = await WebAssembly.instantiate(readFileSync(res.binaryPath), {
+        tsinter: {
+          write(fd: number, ptr: number, len: number): void {
+            if (memory === null) throw new Error("write before instantiation completed");
+            if (fd !== 1 && fd !== 2) throw new Error("unexpected write to fd " + String(fd));
+            chunks[fd]!.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+          },
+          now: () => 0,
+        },
+      });
+      memory = instance.exports["memory"] as WebAssembly.Memory;
+      expect(() => (instance.exports["_start"] as () => void)()).toThrow(WebAssembly.RuntimeError);
+      expect(Buffer.concat(chunks[1]!).toString("utf8")).toBe(before);
+      expect(Buffer.concat(chunks[2]!).toString("utf8")).toBe(
+        "tsinter: unsupported: util.inspect of a promise value is not supported yet [SC1090]\n",
+      );
+    });
+  }
 
   test("the recursion cap degrades like Node (SEMANTICS.md S029)", async () => {
     // Node CATCHES its own stack overflow mid-render, substitutes an

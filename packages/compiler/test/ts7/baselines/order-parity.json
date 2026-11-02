@@ -5807,6 +5807,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2845-in-dynamic-runtime-key.mjs": {
+   "order": [
+    "<repo>/tests/corpus/2845-in-dynamic-runtime-key.mjs"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

@@ -18,7 +18,7 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, toNumberCanon, undefRecvGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
+import { plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -3200,7 +3200,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // bool) that a value lowering of the `&&` would fence on.
       if (name === "Boolean") return boolCanon(L, L.lowerCondition(argNode));
       const arg = L.lowerExpr(argNode);
-      if (name === "String") return L.ensureString(arg, argNode);
+      if (name === "String") return undefinedAsText(L, L.ensureString(arg, argNode), loc);
       if (arg.type.kind === "f64") return toNumberCanon(L, arg);
       if (arg.type.kind === "bool") return boolToNumber(L, arg, loc);
       if (arg.type.kind === "string") {
@@ -3634,9 +3634,10 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
               "only string arguments lower (Node would ToString the value — convert it explicitly)",
             );
           }
-          return { kind: "libCall", fn: "str.decodeUriComponent", args: [d], type: STRING, loc };
+          return { kind: "libCall", fn: "str.decodeUriComponent", args: [L.undefSlots ? undefinedAsText(L, d, loc) : d], type: STRING, loc };
         }
-        const s = L.ensureString(L.lowerExpr(argNode), argNode);
+        const raw = L.ensureString(L.lowerExpr(argNode), argNode);
+        const s = L.undefSlots ? undefinedAsText(L, raw, loc) : raw;
         return {
           kind: "libCall",
           fn: name === "encodeURIComponent" ? "str.encodeUriComponent" : "str.encodeUri",
@@ -4247,7 +4248,35 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       }
       args.push(absent);
     }
-    return { kind: "callValue", callee, args, type: callee.type.ret, loc };
+    // Unit U (S119 (a)): a function-typed value holding undefined, called —
+    // Node's catchable `TypeError: <f> is not a function` (V8's spelling
+    // of a plain callee; anything else meets the named fence).
+    const spelled = calleeSpelling(expr.expression);
+    const checked = undefIterGuard(L, callee, spelled === null ? null : `${spelled} is not a function`, loc);
+    return { kind: "callValue", callee: checked, args, type: callee.type.ret, loc };
+  }
+
+  /** V8's spelling of a simple callee (`f`, `a.b`, `this.f`) in "<x> is not
+   * a function"; null otherwise. */
+  function calleeSpelling(e: ts.Expression): string | null {
+    let n = e;
+    while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n)) n = n.expression;
+    if (ts.isIdentifier(n)) return n.text;
+    if (n.kind === ts.SyntaxKind.ThisKeyword) return "this";
+    if (ts.isPropertyAccessExpression(n) && !n.questionDotToken && ts.isIdentifier(n.name)) {
+      const b = calleeSpelling(n.expression);
+      return b === null ? null : `${b}.${n.name.text}`;
+    }
+    // V8's CallPrinter: a string key prints as a member, a number or a name
+    // in brackets (`f[0]`, `f[i]`, `o["k"]` is `o.k`).
+    if (ts.isElementAccessExpression(n) && !n.questionDotToken) {
+      const b = calleeSpelling(n.expression);
+      if (b === null) return null;
+      const k = n.argumentExpression;
+      if (ts.isStringLiteral(k)) return `${b}.${k.text}`;
+      if (ts.isNumericLiteral(k) || ts.isIdentifier(k)) return `${b}[${k.text}]`;
+    }
+    return null;
   }
 
 /** The RUNTIME-ARITY spread call — `f(...args)`, the rest-forwarding idiom
@@ -4772,8 +4801,10 @@ const inliningPredicates = new Set<ts.Symbol>();
     // `(<A>{}).toString()` — assertion-wrapped literals and plain reads
     // have nothing to evaluate; pureObjectToStringReceiver widens
     // pureReceiverNode with the empty object literal.
-    if (pureObjectToStringReceiver(access.expression)) return constant;
-    const recv = L.lowerExpr(access.expression);
+    const lowered = L.lowerExpr(access.expression);
+    const mayUndef = mayHoldSlotUndef(L, lowered);
+    if (pureObjectToStringReceiver(access.expression) && !mayUndef) return constant;
+    const recv = undefRecvGuard(L, lowered, "toString", loc);
     const key = `objToStr:${typeKey(recv.type)}`;
     let helper = L.widthHelpers.get(key);
     if (!helper) {
@@ -4981,21 +5012,27 @@ const inliningPredicates = new Set<ts.Symbol>();
     const argNode = call.arguments[0]!;
     if (!ts.isStringLiteralLike(argNode)) return null;
     const key = argNode.text;
+    // Unit U (SEMANTICS.md S119): a primitive slot holding undefined has no
+    // members: Node's TypeError, ahead of the statically decided answer.
+    const probed = pureReceiverNode(recv) ? L.lowerExpr(recv) : null;
+    const checked = probed !== null ? undefRecvGuard(L, probed, name, loc) : null;
+    const done = (answer: IrExpr): IrExpr =>
+      checked === probed ? answer : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: checked!, loc }], result: answer, type: BOOL, loc };
     if (recvKind === "string") {
       if (/^(0|[1-9][0-9]*)$/.test(key) && Number(key) <= 2 ** 32 - 2) {
         // A canonical array index: an own property exactly when it is in
         // range — `index < s.length` (UTF-16 units, the box's indices).
-        const receiver = L.lowerExpr(recv);
+        const receiver = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
         if (receiver.type.kind !== "string") return null;
         const len: IrExpr = { kind: "strIntrinsic", method: "length", receiver, args: [], type: F64, loc };
         return { kind: "bin", op: "<", left: { kind: "numLit", value: Number(key), type: F64, loc }, right: len, type: BOOL, loc };
       }
       if (!pureReceiverNode(recv)) return null; // the constant elides the receiver
-      return { kind: "boolLit", value: key === "length", type: BOOL, loc };
+      return done({ kind: "boolLit", value: key === "length", type: BOOL, loc });
     }
     // Number/Boolean boxes own nothing: false for every key.
     if (!pureReceiverNode(recv)) return null;
-    return { kind: "boolLit", value: false, type: BOOL, loc };
+    return done({ kind: "boolLit", value: false, type: BOOL, loc });
   }
 
 /** Reconciles a direct call's recorded type with the checker's answer at
@@ -6629,6 +6666,11 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
    * never made it into the object). ONE
    * construction, interned per shape, shared by Object.keys and for-in —
    * for-in iterates exactly the keys Object.keys answers. */
+  function guardPlainField(L: Lowerer, read: IrExpr, stmt: IrStmt, loc: SrcLoc): IrStmt {
+    const cond = plainFieldPresent(L, read, loc);
+    return cond === null ? stmt : { kind: "if", cond, then: [stmt], else_: null, loc };
+  }
+
   export function recordKeysArrayCall(
     L: Lowerer,
     receiver: IrExpr,
@@ -6687,7 +6729,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
                 else_: null,
                 loc,
               }
-            : pushStmt,
+            : guardPlainField(L, { kind: "recordGet", obj: ref, shapeId: argIr.shapeId, field: f.name, type: f.type, loc }, pushStmt, loc),
         );
       }
       body.push({ kind: "return", value: outRef, loc });
@@ -6740,7 +6782,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
               shapeId,
               f.name,
             )
-          : { kind: "boolLit", value: true, type: BOOL, loc };
+          : plainFieldPresent(L, { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc }, loc) ?? { kind: "boolLit", value: true, type: BOOL, loc };
       body.push({
         kind: "if",
         cond: { kind: "strEq", negated: false, left: kRef, right: { kind: "strLit", value: f.name, type: STRING, loc }, type: BOOL, loc },
@@ -6785,9 +6827,15 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const sRef: IrExpr = { kind: "varRef", localId: "s.0", type: sT, loc };
     const body: IrStmt[] = [];
     for (const f of sShape.fields) {
-      const get: IrExpr = { kind: "recordGet", obj: sRef, shapeId: srcShapeId, field: f.name, type: f.type, loc };
+      const get: IrExpr = { kind: "recordGet", obj: sRef, shapeId: srcShapeId, field: f.name, spreadCopy: true, type: f.type, loc };
       const set: IrStmt = { kind: "recordSet", obj: tRef, shapeId: targetShapeId, field: f.name, value: get, loc };
       const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
+      // S119 (i): a missing key copies nothing.
+      const plainPresent = utag >= 0 ? null : plainFieldPresent(L, get, loc);
+      if (plainPresent !== null) {
+        body.push({ kind: "if", cond: plainPresent, then: [set], else_: null, loc });
+        continue;
+      }
       body.push(
         utag >= 0 && f.type.kind === "union"
           ? {
@@ -7196,7 +7244,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             });
           if (ok) {
             const loc = locOf(call);
-            const target = L.lowerExpr(call.arguments[0]!);
+            const target = undefToObjectGuard(L, L.lowerExpr(call.arguments[0]!), loc);
             const source = L.lowerExpr(call.arguments[1]!);
             if (target.type.kind === "record" && source.type.kind === "record") {
               const helper = recordAssignHelper(L, target.type.shapeId, source.type.shapeId, loc);
@@ -7387,7 +7435,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       const shape = L.shapes.get(probed.type.shapeId);
       if (!shape || shape.tuple || shape.indexValue || shapeHasAccessorSlots(shape)) return null;
       const loc = locOf(call);
-      const receiver = L.lowerExpr(recvNode);
+      const receiver = undefToObjectGuard(L, L.lowerExpr(recvNode), locOf(call));
       if (receiver.type.kind !== "record") return null; // probe/lower drift: keep the fence
       let key = L.lowerExpr(keyNode);
       // Number/boolean/dyn keys stringify — ToPropertyKey, the keyed-write
@@ -7451,7 +7499,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const loc = locOf(call);
     const resultT = L.irTypeOf(call);
     if (resultT.kind !== "array") L.badType(call, L.typeOf(call)); // defensive
-    const receiver = L.lowerExpr(argNode);
+    const receiver = undefToObjectGuard(L, L.lowerExpr(argNode), loc);
     if (member === "keys") {
       // The keys walk is shared with for-in (which iterates exactly the
       // keys Object.keys answers — one construction, one intern key).
@@ -7613,7 +7661,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
                 else_: elseUndef,
                 loc,
               }
-            : pushStmt,
+            : guardPlainField(L, raw, pushStmt, loc),
         );
       }
       body.push({ kind: "return", value: outRef, loc });

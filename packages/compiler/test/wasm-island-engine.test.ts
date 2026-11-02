@@ -346,7 +346,7 @@ describe("E1: __island_eval through the engine", () => {
     await expect(runWasm(path)).rejects.toThrow(/Maximum call stack size exceeded/);
   });
 
-  test("tier-only (S103 (g)): an engine rejection with an 'unhandledRejection' listener is a named error", async () => {
+  test("tier-only (S103 (g)): an engine rejection with an 'unhandledRejection' listener is a named fence that ends the program (GH #86, S122)", async () => {
     const r = await runTrap(
       "rejection-listener",
       [
@@ -356,7 +356,7 @@ describe("E1: __island_eval through the engine", () => {
     );
     expect(r.stdout).toBe("armed\n");
     expect(r.stderr).toBe(
-      "Uncaught Error: an island promise rejection with an 'unhandledRejection' listener registered is not supported yet (SEMANTICS.md S103)\n",
+      "tsinter: unsupported: an island promise rejection with an 'unhandledRejection' listener registered is not supported yet (SEMANTICS.md S103) [SC1090]\n",
     );
   });
 

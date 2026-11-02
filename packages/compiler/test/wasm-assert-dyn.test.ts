@@ -460,6 +460,13 @@ function makeHarness(): Harness {
       pushMessage(c);
       c.drop();
     },
+    // GH #86's fence (SEMANTICS.md S122) — no fd-write import here either:
+    // the message is built and dropped, then the trap that ends the run.
+    fence: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+      c.unreachable();
+    },
     excKind: () => excKindG,
     strCmpU16: () => strEqFn,
     strSlice: () => strSliceFn,
@@ -647,6 +654,12 @@ function makeHarness(): Harness {
     // emitter's own `namedTrap` (which DOES print) is exercised by the
     // corpus/end-to-end memo-row pins instead.
     namedTrap: (c) => {
+      c.unreachable();
+    },
+    // GH #86: the cfValue cycle / untyped-Map refusals are runtime fences
+    // now (SEMANTICS.md S122) — same bare-`unreachable` stand-in, for the
+    // same no-fd-write reason as namedTrap above.
+    fence: (c) => {
       c.unreachable();
     },
   };

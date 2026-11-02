@@ -400,12 +400,19 @@ describe("INC-29 U1 node:net — forced-host rows", () => {
     const { trace } = await run(src, { events: [{ at: 1, handle: 200, kind: CONNECT, payload: peer(4, 80, "10.0.0.1") }] });
     expect(trace.ops).toEqual(["connect 10.0.0.1:80/4", "nodelay 200 1", "nodelay 200 0", "close 200"]);
   });
-  test("N1-FH-15 the checked-dynamic handle's unmodelled members are named Errors, caught: a property read, an event name, destroy(err), a method — SINGLE-EDIT: an unmodelled property answering undefined", async () => {
-    const src = "'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst c = net.connect(80, '10.0.0.1');\nconst s = wrap(function (x) { return x; })(c);\nfor (const f of [() => s.remotePort, () => s.on('timeout', function () {}), () => s.destroy(new Error('x')), () => s.ref()]) {\n  try { f(); console.log('ok'); } catch (e) { console.log(e.name, e.message); }\n}\nc.destroy();\n";
-    const { out } = await run(src, {}, "cjs");
-    expect(out.stdout).toBe(
-      "Error reading the property 'remotePort' of a net handle is not supported yet\nError 'on' for the event 'timeout' on a net handle is not supported yet\nError destroy(err) on a net handle is not supported yet\nError 'ref' on a net handle is not supported yet\n",
-    );
+  test("N1-FH-15 the checked-dynamic handle's unmodelled members are named fences that end the program (GH #86, SEMANTICS.md S122 — a try/catch no longer sees them): a property read, an event name, destroy(err), a method — SINGLE-EDIT: an unmodelled property answering undefined", async () => {
+    const cases: [string, string][] = [
+      ["s.remotePort", "reading the property 'remotePort' of a net handle is not supported yet"],
+      ["s.on('timeout', function () {})", "'on' for the event 'timeout' on a net handle is not supported yet"],
+      ["s.destroy(new Error('x'))", "destroy(err) on a net handle is not supported yet"],
+      ["s.ref()", "'ref' on a net handle is not supported yet"],
+    ];
+    for (const [expr, text] of cases) {
+      const src = `'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst c = net.connect(80, '10.0.0.1');\nconst s = wrap(function (x) { return x; })(c);\nconsole.log('before');\ntry { ${expr}; console.log('ok'); } catch (e) { console.log(e.name, e.message); }\nc.destroy();\n`;
+      const { out } = await runToTrap(src, {}, "cjs");
+      expect(out.stdout).toBe("before\n");
+      expect(out.stderr).toBe(`tsinter: unsupported: ${text} [SC1090]\n`);
+    }
   });
   test("N1-FH-16 a record the module cannot read is the named trap: a source other than net, an unknown kind, a WRITE answer out of range — SINGLE-EDIT: the source check dropped", async () => {
     const src = 'import * as net from "node:net";\nconst c = net.connect(80, "10.0.0.1", () => c.write("x"));\n';
@@ -452,10 +459,14 @@ describe("INC-29 U1 node:net — forced-host rows", () => {
     const { out } = await run(src, {});
     expect(out.stdout).toBe("close c\nclose b\nclose a\n");
   });
-  test("N1-FH-18 S087 (h): close(cb) on a checked-dynamic server that is not listening is a named Error, where Node hands cb ERR_SERVER_NOT_RUNNING; close() with no callback is not fenced — SINGLE-EDIT: the not-listening fence dropped", async () => {
-    const src = "'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst srv = net.createServer();\nconst s = wrap(function (x) { return x; })(srv);\ntry { s.close(function (e) { console.log('cb', e && e.code); }); console.log('ok'); } catch (e) { console.log(e.name, e.message); }\ns.close();\nconsole.log('closed without cb');\n";
-    const { out, trace } = await run(src, {}, "cjs");
-    expect(out.stdout).toBe("Error close(cb) while not listening on a net handle is not supported yet\nclosed without cb\n");
+  test("N1-FH-18 S087 (h): close(cb) on a checked-dynamic server that is not listening is a named fence that ends the program (GH #86, SEMANTICS.md S122), where Node hands cb ERR_SERVER_NOT_RUNNING; close() with no callback is not fenced — SINGLE-EDIT: the not-listening fence dropped", async () => {
+    const head = "'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst srv = net.createServer();\nconst s = wrap(function (x) { return x; })(srv);\n";
+    const fenced = await runToTrap(head + "try { s.close(function (e) { console.log('cb', e && e.code); }); console.log('ok'); } catch (e) { console.log(e.name, e.message); }\n", {}, "cjs");
+    expect(fenced.out.stdout).toBe("");
+    expect(fenced.out.stderr).toBe("tsinter: unsupported: close(cb) while not listening on a net handle is not supported yet [SC1090]\n");
+    expect(fenced.trace.ops).toEqual([]);
+    const { out, trace } = await run(head + "s.close();\nconsole.log('closed without cb');\n", {}, "cjs");
+    expect(out.stdout).toBe("closed without cb\n");
     expect(trace.ops).toEqual([]);
   });
 });

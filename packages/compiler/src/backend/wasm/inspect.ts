@@ -221,6 +221,12 @@ export interface InspectDeps {
   /** Fill the exception cell with a fresh error of `className`. The dyn
    * walker's ONE throw is the promise fence (SEMANTICS.md S030). */
   throwError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   /** The exception cell's kind global — 0 when nothing is pending. Every
    * recursive step of the walker tests it, so a fence deep in a tree
    * unwinds instead of rendering the rest into a string nobody reads. */
@@ -3655,7 +3661,7 @@ export class InspectBuilder {
         // for a typed array held in a dynamic value — refused by name.
         dyn.isTyped(c, D, K);
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "inspecting a typed array held in a dynamic value is not supported yet"));
+        this.deps.fence(c, (x) => this.deps.lit(x, "inspecting a typed array held in a dynamic value is not supported yet"));
         c.refNull(this.deps.strType());
         c.return_();
         c.end();
@@ -3907,9 +3913,8 @@ export class InspectBuilder {
         // has no type for what comes out; fence loudly instead of a
         // silent-wrong shape (S030, the handle stance).
         c.call(this.reset());
-        this.deps.throwError(c, "%Error", "Error", (x) =>
-          this.deps.lit(x, "util.inspect of a promise value is not supported yet"),
-        );
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "util.inspect of a promise value is not supported yet"));
         c.refNull(strT);
         c.return_();
       });
@@ -4082,7 +4087,7 @@ export class InspectBuilder {
           c.localGet(O);
           c.refTest(dyn.objUrlT());
           c.ifVoid();
-          this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "inspecting a URL held in a dynamic value is not supported yet"));
+          this.deps.fence(c, (x) => this.deps.lit(x, "inspecting a URL held in a dynamic value is not supported yet"));
           c.refNull(this.deps.strType());
           c.return_();
           c.end();
@@ -4409,7 +4414,7 @@ export class InspectBuilder {
         c.i32Const(DK.HANDLE);
         c.i32Eq();
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `inspecting a ${this.deps.dyn().handleNoun()} is not supported yet`));
+        this.deps.fence(c, (x) => this.deps.lit(x, `inspecting a ${this.deps.dyn().handleNoun()} is not supported yet`));
         c.refNull(this.deps.strType());
         c.return_();
         c.end();
@@ -4483,9 +4488,8 @@ export class InspectBuilder {
     c.globalGet(this.hidden());
     c.ifVoid();
     c.call(this.reset());
-    this.deps.throwError(c, "%Error", "Error", (x) =>
-      this.deps.lit(x, `util.format %o of ${what} is not supported yet`),
-    );
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, `util.format %o of ${what} is not supported yet`));
     c.refNull(this.deps.strType());
     c.return_();
     c.end();
@@ -4738,10 +4742,7 @@ export class InspectBuilder {
       c.localGet(FCLOS);
       c.call(this.cfSeenCheck());
       c.ifVoid();
-      this.deps.namedTrap(
-        c,
-        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
-      );
+      this.deps.fence(c, (x) => this.deps.lit(x, "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)"));
       c.end();
       c.localGet(FCLOS);
       c.call(this.seenPush());
@@ -5036,10 +5037,7 @@ export class InspectBuilder {
       c.localGet(D);
       c.call(this.cfSeenCheck());
       c.ifVoid();
-      this.deps.namedTrap(
-        c,
-        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
-      );
+      this.deps.fence(c, (x) => this.deps.lit(x, "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)"));
       c.end();
       c.localGet(D);
       c.call(this.seenPush());
@@ -5120,10 +5118,7 @@ export class InspectBuilder {
       c.localGet(D);
       c.call(this.cfSeenCheck());
       c.ifVoid();
-      this.deps.namedTrap(
-        c,
-        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
-      );
+      this.deps.fence(c, (x) => this.deps.lit(x, "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)"));
       c.end();
       c.localGet(D);
       c.call(this.seenPush());
@@ -5139,7 +5134,7 @@ export class InspectBuilder {
         c.i32Const(OBJ_PROTO_MAP);
         c.i32GeU();
         c.ifVoid();
-        this.deps.namedTrap(c, "cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet");
+        this.deps.fence(c, (x) => this.deps.lit(x, "cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet"));
         c.end();
       }
       c.localGet(OP);

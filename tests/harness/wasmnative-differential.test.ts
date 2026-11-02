@@ -999,6 +999,7 @@ const CLAIM_FLOOR: string[] = [
   "2825-variadic-callback-object-args.js",
   "2826-locale-compare-collation.ts",
   "2827-locale-compare-sort.ts",
+  "2845-in-dynamic-runtime-key.mjs",
   "300-if-else.ts",
   "301-while.ts",
   "302-for.ts",

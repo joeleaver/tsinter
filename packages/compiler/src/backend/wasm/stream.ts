@@ -818,6 +818,12 @@ export const OP_AUTO_END = 10;
 export const OP_FIN = 11;
 
 export interface StreamDeps {
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   /** The %Readable hierarchy ROOT's own struct — every general helper's
    * receiver parameter, mirroring events.ts's `rootRef`/`rootStruct`. A
    * subclass struct is a wasm SUBTYPE (classes.ts's gate lift), so
@@ -4391,15 +4397,7 @@ export class StreamBuilder {
         c.i32Eqz();
         c.ifResult(this.deps.rootRef());
         // S050: already piping — loud named trap, not a silent overwrite.
-        this.deps.setUncaughtError(c, (cc) => {
-          this.deps.buildErrorLit(
-            cc,
-            "%Error",
-            "Error",
-            (ccc) => this.deps.lit(ccc, "multiple simultaneous pipe() destinations are not supported yet (SEMANTICS.md S050)"),
-            null,
-          );
-        });
+        this.deps.fence(c, (cc) => this.deps.lit(cc, "multiple simultaneous pipe() destinations are not supported yet (SEMANTICS.md S050)"));
         c.localGet(DST);
         c.else_();
         c.localGet(ROOT);
@@ -6223,15 +6221,7 @@ export class StreamBuilder {
         c.call(this.scheduleTick());
         c.end();
         c.else_();
-        this.deps.setUncaughtError(c, (cc) => {
-          this.deps.buildErrorLit(
-            cc,
-            "%Error",
-            "Error",
-            (ccc) => this.deps.lit(ccc, "pipeline() over a stream constructed with emitClose:false is not supported yet"),
-            null,
-          );
-        });
+        this.deps.fence(c, (cc) => this.deps.lit(cc, "pipeline() over a stream constructed with emitClose:false is not supported yet"));
         c.end();
         // The raw 'error' listener — errEntryAppend's own (root, clos,
         // thunk, once, prepend) ABI: no `name` (the bucket IS "error" by
@@ -6536,15 +6526,7 @@ export class StreamBuilder {
       c.localGet(ENTRY);
       c.structNew(cleanup.struct);
       c.else_();
-      this.deps.setUncaughtError(c, (cc) => {
-        this.deps.buildErrorLit(
-          cc,
-          "%Error",
-          "Error",
-          (ccc) => this.deps.lit(ccc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"),
-          null,
-        );
-      });
+      this.deps.fence(c, (cc) => this.deps.lit(cc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"));
       c.refNull(this.deps.voidClos().clos);
       c.end();
       this.mb.setBody(idx, [this.stateRef(), this.finEntryRef()], c.bytes());
@@ -6592,15 +6574,7 @@ export class StreamBuilder {
       c.end();
       c.localGet(P);
       c.else_();
-      this.deps.setUncaughtError(c, (cc) => {
-        this.deps.buildErrorLit(
-          cc,
-          "%Error",
-          "Error",
-          (ccc) => this.deps.lit(ccc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"),
-          null,
-        );
-      });
+      this.deps.fence(c, (cc) => this.deps.lit(cc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"));
       c.refNull(this.promType());
       c.end();
       this.mb.setBody(idx, [this.stateRef(), this.finEntryRef(), this.deps.promRef()], c.bytes());

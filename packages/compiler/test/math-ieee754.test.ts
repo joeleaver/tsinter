@@ -696,9 +696,18 @@ describe.for(LANES)("JS [%s]", (lane) => {
 /* ── LAZY: a module carries only what its members reach ────────────────── */
 
 test("LAZY: only the C functions a program's Math members reach are compiled into its module", async () => {
+  // A name-section entry is (index LEB)(length)(bytes): read each name by
+  // its own length byte — a greedy [A-Za-z_0-9]+ ran on into the NEXT
+  // entry's index byte whenever that index happened to be printable.
   const names = (m: Buffer): string[] => {
     const text = m.toString("latin1");
-    return [...new Set([...text.matchAll(/%w\.ieee754\.([A-Za-z_0-9]+)/g)].map((x) => x[1]!))].sort();
+    const prefix = "%w.ieee754.";
+    const out: string[] = [];
+    for (const x of text.matchAll(/%w\.ieee754\./g)) {
+      const len = text.charCodeAt(x.index! - 1);
+      out.push(text.slice(x.index! + prefix.length, x.index! + len));
+    }
+    return [...new Set(out)].sort();
   };
   const exact = await both("const x: number = JSON.parse('2');\nconsole.log(Math.sqrt(x), Math.sign(-x), Math.hypot(x, x), Math.clz32(x));\n");
   expect(exact.wasm).toBe(exact.node);

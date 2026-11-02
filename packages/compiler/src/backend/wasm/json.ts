@@ -118,6 +118,12 @@ export interface JsonDeps {
    * unwinds; json.parse is may-throw-seeded so its callers' pending
    * checks come free. */
   throwError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
+  /** GH #86: end the program at a runtime fence (a construct this build
+   * cannot run): `pushMessage` leaves its text; the helper prints
+   * `tsinter: unsupported: <text> [<code>]` (SC1090 by default; "" when
+   * the text already carries its code) and traps — nothing catches it.
+   * Code emitted after it is dead. */
+  fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
   /** Is a pending exception set? (the cell's kind global). */
   excKind: () => number;
   /** CLEAR the exception cell — the kind tag, the payload ref and the
@@ -5617,7 +5623,7 @@ export class JsonBuilder {
         // Unit I: a typed array held in a dynamic value (JSVAL-tagged).
         dyn.isTyped(c, 0, K);
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "JSON.stringify of a typed array held in a dynamic value is not supported yet"));
+        this.deps.fence(c, (x) => this.deps.lit(x, "JSON.stringify of a typed array held in a dynamic value is not supported yet"));
         c.i32Const(0);
         c.return_();
         c.end();
@@ -5627,7 +5633,7 @@ export class JsonBuilder {
         c.i32Const(DK.HANDLE);
         c.i32Eq();
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `JSON.stringify of a ${dyn.handleNoun()} is not supported yet`));
+        this.deps.fence(c, (x) => this.deps.lit(x, `JSON.stringify of a ${dyn.handleNoun()} is not supported yet`));
         c.i32Const(0);
         c.return_();
         c.end();

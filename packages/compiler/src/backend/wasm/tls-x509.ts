@@ -48,6 +48,13 @@ export const PEM_NONCANON = 5;
  * certificate inside the PEM block, which d2i_X509_AUX would read as
  * X509_CERT_AUX trust data — fenced by name. */
 export const PEM_TRAILING = 6;
+/** First-only mode (GH #86 review): the OpenSSL reason a certificate's
+ * OUTER header answers, Node's own error text (asn1ReasonFn). Clear of
+ * crypto.ts's own X509_* codes, which share the error global. */
+export const PEM_ASN1_HEADER = 17;
+export const PEM_ASN1_TOO_LONG = 18;
+export const PEM_ASN1_WRONG_TAG = 19;
+export const PEM_ASN1_FIELD_MISSING = 20;
 
 /* x509Info's fields. */
 export const XI_SAN = 0; // string, null = no subjectAltName extension
@@ -547,6 +554,10 @@ export class X509Builder {
         $.gput(g.err, $.i(code));
         $.ret($.nul(this.BA));
       };
+      const fail0 = (code: X): void => {
+        $.gput(g.err, code);
+        $.ret($.nul(this.BA));
+      };
       $.gput(g.err, $.i(PEM_OK));
       // BIO_gets(bp, linebuf, 255): up to 254 bytes, through a '\n'.
       const gets = (): void => {
@@ -667,13 +678,25 @@ export class X509Builder {
           f.c.localSet(I);
           f.c.localSet(K);
           $.if($.eq($.l(K), $.i(-2)), () => fail(PEM_NONCANON));
-          $.if($.andThen($.ge($.l(K), $.i(0)), $.ne($.add($.l(K), $.l(I)), $.get(this.BT, 2, $.l(DER)))), () => fail(PEM_TRAILING));
+          $.if($.andThen($.ge($.l(K), $.i(0)), $.ne($.add($.l(K), $.l(I)), $.get(this.BT, 2, $.l(DER)))), () => {
+            // the first value's own header speaks before its trailing bytes
+            $.put(I, $.call(this.asn1ReasonFn(), $.l(DER)));
+            $.if($.ne($.l(I), $.i(PEM_ASN1)), () => fail0($.l(I)));
+            fail(PEM_TRAILING);
+          });
         }
         // d2i_X509: the certificate's outer structure
+        const RAW = f.local(this.ref(this.BT));
+        $.put(RAW, $.l(DER));
         $.put(DER, $.call(this.certTlvFn(), $.l(DER)));
         $.if($.isNull($.l(DER)), () => {
           $.if($.eq($.g(g.err), $.i(PEM_NONCANON)), () => $.ret($.nul(this.BA)));
-          fail(PEM_ASN1);
+          if (first) {
+            $.gput(g.err, $.call(this.asn1ReasonFn(), $.l(RAW)));
+            $.ret($.nul(this.BA));
+          } else {
+            fail(PEM_ASN1);
+          }
         });
         $.put(OUT, $.call(this.baPushFn(), $.l(OUT), $.l(N), $.l(DER)));
         if (first) $.ret($.l(OUT));
@@ -681,6 +704,54 @@ export class X509Builder {
       });
       $.do($.l(OUT));
       // (unreachable, but the validator wants a value)
+    });
+  }
+
+  /** The reason d2i_X509 gives for a DER value, as far as its OUTER header
+   * decides it (ASN1_get_object, then the SEQUENCE template; measured
+   * against Node): a header that does not fit is "header too long", a
+   * length past the data "too long", another tag "wrong tag", an empty
+   * SEQUENCE "field missing". Anything deeper answers PEM_ASN1, the named
+   * fence: OpenSSL's reason there needs the whole template (S093 (d)). */
+  private asn1ReasonFn(): number {
+    return this.fn("asn1Reason", [this.ref(this.BT)], [I32], (f, $) => {
+      const D = 0;
+      const BUF = f.local(this.bRef);
+      const P = f.local(I32);
+      const END = f.local(I32);
+      const TAG = f.local(I32);
+      const L0 = f.local(I32);
+      const N = f.local(I32);
+      const LEN = f.local(I32);
+      const I = f.local(I32);
+      $.put(BUF, $.get(this.BT, 0, $.l(D)));
+      $.put(P, $.get(this.BT, 1, $.l(D)));
+      $.put(END, $.add($.l(P), $.get(this.BT, 2, $.l(D))));
+      $.if($.lt($.sub($.l(END), $.l(P)), $.i(2)), () => $.ret($.i(PEM_ASN1_HEADER)));
+      $.put(TAG, this.byte($, $.l(BUF), $.l(P)));
+      $.if($.eq($.and($.l(TAG), $.i(31)), $.i(31)), () => {
+        // a high tag number: its continuation bytes run off the end, or
+        // it is a tag this reader does not decode
+        $.put(I, $.add($.l(P), $.i(1)));
+        $.while($.lt($.l(I), $.l(END)), () => {
+          $.if($.lt(this.byte($, $.l(BUF), $.l(I)), $.i(128)), () => $.ret($.i(PEM_ASN1)));
+          $.put(I, $.add($.l(I), $.i(1)));
+        });
+        $.ret($.i(PEM_ASN1_HEADER));
+      });
+      $.put(L0, this.byte($, $.l(BUF), $.add($.l(P), $.i(1))));
+      $.put(P, $.add($.l(P), $.i(2)));
+      $.if($.lt($.l(L0), $.i(128)), () => $.put(LEN, $.l(L0)), () => {
+        $.put(N, $.and($.l(L0), $.i(127)));
+        $.if($.either($.eq($.l(N), $.i(0)), $.gt($.l(N), $.i(3))), () => $.ret($.i(PEM_ASN1)));
+        $.if($.gt($.add($.l(P), $.l(N)), $.l(END)), () => $.ret($.i(PEM_ASN1_HEADER)));
+        $.for(I, $.i(0), $.l(N), () => $.put(LEN, $.or($.shl($.l(LEN), $.i(8)), this.byte($, $.l(BUF), $.add($.l(P), $.l(I))))));
+        $.put(P, $.add($.l(P), $.l(N)));
+      });
+      $.if($.gt($.add($.l(P), $.l(LEN)), $.l(END)), () => $.ret($.i(PEM_ASN1_TOO_LONG)));
+      $.if($.ne($.l(TAG), $.i(0x30)), () => $.ret($.i(PEM_ASN1_WRONG_TAG)));
+      $.if($.not($.l(LEN)), () => $.ret($.i(PEM_ASN1_FIELD_MISSING)));
+      $.ret($.i(PEM_ASN1));
     });
   }
 

@@ -305,28 +305,28 @@ test("TH01 THENABLE: an object with its own then method returned from an async f
   // Node v24 adopts the thenable and prints "sync\nthenable number\nresolve number\n"; this tier refuses by name (full thenable adoption is not built).
   const { stdout, stderr } = await runRowTrap("TH01", "// @dynamic\nconst t: any = { then(r: any) { r(5); } };\nasync function g(): Promise<any> { return t; }\ng().then((v: any) => console.log(`thenable ${typeof v}`));\nPromise.resolve(t).then((v: any) => console.log(`resolve ${typeof v}`));\nconsole.log(\"sync\");", "ts");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: resolving a promise with a non-promise thenable is not supported yet [SC1090]\n");
 });
 
 test("TH02 THENABLE: plain JavaScript: an untyped object given a then method, returned from an async function", async () => {
   // Node v24 adopts the thenable and prints "sync\nthenable number\n"; this tier refuses by name (full thenable adoption is not built).
   const { stdout, stderr } = await runRowTrap("TH02", "'use strict';\nconst t = JSON.parse('{\"a\":1}');\nt.then = function (r) { r(5); };\nasync function g() { return t; }\ng().then((v) => console.log('thenable', typeof v));\nconsole.log('sync');", "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: resolving a promise with a non-promise thenable is not supported yet [SC1090]\n");
 });
 
 test("TH03 THENABLE: a FUNCTION given its own then method, through Promise.resolve and new Promise", async () => {
   // Node v24 adopts the thenable function and prints "sync\nfnres number\nfnnp number\n"; this tier refuses by name (full thenable adoption is not built).
   const { stdout, stderr } = await runRowTrap("TH03", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nconst f: any = id(function () {});\nf.then = (r: any) => r(6);\nPromise.resolve(f).then((v: any) => console.log(`fnres ${typeof v}`));\nnew Promise((r) => r(f)).then((v: any) => console.log(`fnnp ${typeof v}`));\nconsole.log('sync');", "ts");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: resolving a promise with a non-promise thenable is not supported yet [SC1090]\n");
 });
 
 test("TH04 THENABLE: a function expression given its own then method, returned from an async function", async () => {
   // Node v24 adopts the thenable function and prints "sync\nfn number\n"; this tier refuses by name (full thenable adoption is not built).
   const { stdout, stderr } = await runRowTrap("TH04", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst f: any = function () {};\nf.then = (r: any) => r(5);\nasync function g(): Promise<any> { return f; }\ng().then((v: any) => console.log(`fn ${typeof v}`));\nconsole.log(\"sync\");", "ts");
   expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: resolving a promise with a non-promise thenable is not supported yet [SC1090]\n");
 });
 
 // ============================================================
@@ -347,13 +347,13 @@ test("TY02 TYPED: a typed new Promise resolved with an any-held promise adopts i
   expect(exitCode).toBe(0);
 });
 
-test("TY03 TYPED: the adopted value is cast to the typed slot: a mismatch rejects with the boundary TypeError at adoption", async () => {
+test("TY03 TYPED: the adopted value is cast to the typed slot: a mismatch ends the program at adoption (GH #86 review, SEMANTICS.md S122)", async () => {
   // SEMANTICS.md S009: a typed slot validates a dyn value; Node has no slot type and fulfils with 7.
   // Node v24.18.1 prints "sync\no1\no2\ng 7\no3\no4\no5\n".
-  const { stdout, stderr, exitCode } = await runRow("TY03", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nasync function g(): Promise<string> { return x; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\no1\no2\no3\ncaught TypeError: expected string, got number\no4\no5\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  const { stdout, stderr } = await runRowTrap("TY03", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nasync function g(): Promise<string> { return x; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  // the check runs at adoption (after o1), before the rejection would have reached a handler
+  expect(stdout).toBe("sync\no1\n");
+  expect(stderr).toBe("tsinter: unsupported: expected string, got number [SC1100]\n");
 });
 
 test("TY04 TYPED: an any-held REJECTED promise returned from a typed async function rejects it with the reason", async () => {
@@ -430,13 +430,12 @@ test("TY13 TYPED: a PENDING any-held promise settled by a timer, adopted by a ty
   expect(exitCode).toBe(0);
 });
 
-test("TY14 TYPED: control: a typed NON-settler closure called with an any-held promise keeps the boundary TypeError", async () => {
+test("TY14 TYPED: control: a typed NON-settler closure called with an any-held promise keeps the boundary check, which ends the program (S122)", async () => {
   // SEMANTICS.md S009: an ordinary typed parameter validates a dyn value; only a promise's resolve function adopts.
   // Node v24.18.1 prints "f [object Promise]\nsync\nnp 1\no1\no2\no3\no4\no5\n".
-  const { stdout, stderr, exitCode } = await runRow("TY14", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nfunction f(v: number): void { console.log(`f ${v}`); }\ntry { f(x); } catch (e) { console.log(`caught ${String(e)}`); }\nnew Promise<number>((r) => r(1)).then((v) => console.log(`np ${v}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("caught TypeError: expected number, got object\nsync\nnp 1\no1\no2\no3\no4\no5\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  const { stdout, stderr } = await runRowTrap("TY14", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nfunction f(v: number): void { console.log(`f ${v}`); }\ntry { f(x); } catch (e) { console.log(`caught ${String(e)}`); }\nnew Promise<number>((r) => r(1)).then((v) => console.log(`np ${v}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: expected number, got object [SC1100]\n");
 });
 
 test("TY15 TYPED: a checked cast of an unknown-held promise returned from a typed async function adopts it before the cast (board #234)", async () => {
@@ -453,13 +452,13 @@ test("TY16 TYPED: a typed settler resolved with a checked cast of an unknown-hel
   expect(exitCode).toBe(0);
 });
 
-test("TY17 TYPED: the adopted value fails the checked cast: the dynCheck TypeError rejects at adoption", async () => {
+test("TY17 TYPED: the adopted value fails the checked cast: the dynCheck fence ends the program at adoption (S122)", async () => {
   // SEMANTICS.md S009: the checked cast validates; Node erases the cast and fulfils with 7.
   // Node v24.18.1 prints "sync\no1\no2\ng 7\no3\no4\no5\n".
-  const { stdout, stderr, exitCode } = await runRow("TY17", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nasync function g(): Promise<string> { return x as string; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\no1\no2\no3\ncaught TypeError: expected string at $, got number\no4\no5\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  const { stdout, stderr } = await runRowTrap("TY17", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nasync function g(): Promise<string> { return x as string; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  // the check runs at adoption (after o1), before the rejection would have reached a handler
+  expect(stdout).toBe("sync\no1\n");
+  expect(stderr).toBe("tsinter: unsupported: expected string at $, got number [SC1100]\n");
 });
 
 test("TY18 TYPED: control: a checked cast of an unknown-held number returns directly, no job", async () => {
@@ -469,13 +468,12 @@ test("TY18 TYPED: control: a checked cast of an unknown-held number returns dire
   expect(exitCode).toBe(0);
 });
 
-test("TY19 TYPED: NOT-LIFTED: a typed then handler's `: number` return of an any-held promise keeps the boundary TypeError (the handler is an ordinary typed function)", async () => {
+test("TY19 TYPED: NOT-LIFTED: a typed then handler's `: number` return of an any-held promise keeps the boundary check, which ends the program (the handler is an ordinary typed function; S122)", async () => {
   // SEMANTICS.md S083 (the #234 sentence): the cast is the handler's own return, inside an ordinary typed function, before any resolve function sees the value.
   // Node v24.18.1 prints "sync\nthen-h 8\n".
-  const { stdout, stderr, exitCode } = await runRow("TY19", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nconst x: any = id(n());\nPromise.resolve(1).then((): number => x).then((v) => console.log(`then-h ${v + 1}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\ncaught TypeError: expected number, got object\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  const { stdout, stderr } = await runRowTrap("TY19", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nconst x: any = id(n());\nPromise.resolve(1).then((): number => x).then((v) => console.log(`then-h ${v + 1}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\n");
+  expect(stderr).toBe("tsinter: unsupported: expected number, got object [SC1100]\n");
 });
 
 // ============================================================
@@ -506,5 +504,5 @@ test("SP04 SPINE: an imported module exporting a function named then: the namesp
   // Node v24 adopts the namespace thenable and prints "sync\nimported number\n"; this tier refuses by name (full thenable adoption is not built).
   const { stdout, stderr } = await runRowDirTrap("SP04", { "m.ts": "export function then(resolve: (v: number) => void): void { resolve(5); }", "main.ts": "// @dynamic\nasync function main(): Promise<void> {\n  const ns: any = await import(\"./m.ts\");\n  console.log(`imported ${typeof ns}`);\n}\nmain();\nconsole.log(\"sync\");" });
   expect(stdout).toBe("sync\n");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+  expect(stderr).toBe("tsinter: unsupported: resolving a promise with a non-promise thenable is not supported yet [SC1090]\n");
 });

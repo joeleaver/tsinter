@@ -112,6 +112,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "dyn.arrLen": { argTypes: [DYN], result: F64 },
   "dyn.arrAt": { argTypes: [DYN, F64], result: DYN },
   "dyn.hasKey": { argTypes: [DYN, STRING], result: BOOL },
+  "dyn.argStr": { argTypes: [DYN, STRING, STRING, F64], result: STRING },
   "dyn.toString": { argTypes: [DYN, STRING, STRING], result: STRING },
   "dyn.defineProps": { argTypes: [DYN, DYN], result: DYN },
   "dyn.typeof": { argTypes: [DYN], result: STRING },
@@ -1146,6 +1147,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "fs.readFdSync": { argTypes: [F64, STRING], result: STRING },
   "fs.readFdSyncBytes": { argTypes: [F64], result: BYTES_U8 },
   "process.isTTY": { argTypes: [F64], result: BOOL },
+  "undef.fieldAbsent": { argTypes: [BOOL], result: BOOL },
   // Like process.envGet: the result is the module's interned
   // `number | undefined` union — checked by arms in the libCall case.
   "process.columns": { argTypes: [F64], result: VOID },

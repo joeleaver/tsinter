@@ -1615,7 +1615,7 @@ void *scr_jsval_unview(ScrJsval *v, const ScrStr *key, const ScrStr *what) {
   JS_FreeValue(isl_ctx, r);
   static const char pre[] = "Cannot store ";
   static const char mid[] = " into ";
-  static const char post[] = " (SEMANTICS.md S115)";
+  static const char post[] = " (SEMANTICS.md S115) [SC1090]";
   size_t ml = (sizeof pre - 1) + tl + (sizeof mid - 1) + what->len + (sizeof post - 1);
   char *m = malloc(ml + 1);
   if (!m) {
@@ -1629,13 +1629,9 @@ void *scr_jsval_unview(ScrJsval *v, const ScrStr *key, const ScrStr *what) {
   memcpy(m + o, what->data, what->len), o += what->len;
   memcpy(m + o, post, sizeof post - 1), o += sizeof post - 1;
   if (ty) JS_FreeCString(isl_ctx, ty);
-  ScrStr *msg = scr_str_new(m, o);
-  ScrStr *code = scr_str_new("", 0);
-  free(m);
-  scr_throw_node_coded(1, code, msg);
-  scr_str_release(code);
-  scr_str_release(msg);
-  return NULL;
+  /* GH #86 review (SEMANTICS.md S115, S122): a check Node never makes —
+   * it ENDS the program at the fence line. */
+  scr_fence_fatal(m, o);
 }
 
 /* ── the inspect snapshot (unit H) ─────────────────────────────────────
@@ -9653,13 +9649,18 @@ void scr_jsval_cast_fail(ScrJsval *v, const ScrStr *target) {
   scr_throw_error_msg(SCR_ERR_TYPE, buf, (size_t)(n < 0 ? 0 : (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1));
 }
 
-static void isl_exit_fail(const char *want, ScrJsval *v) {
+/* GH #86 review (SEMANTICS.md S122): Node has no static/island boundary,
+ * so an exit's type check is this tier's own — a mismatch ENDS the
+ * program at the fence line. */
+static _Noreturn void isl_exit_fail(const char *want, ScrJsval *v) {
   ScrStr *got = scr_jsval_typeof(v);
-  char buf[128];
-  int n = snprintf(buf, sizeof buf, "expected %s, got %s", want,
+  char buf[160];
+  int n = snprintf(buf, sizeof buf, "expected %s, got %s [SC1100]", want,
                    got ? got->data : "unknown");
   if (got) scr_str_release(got);
-  scr_throw_error_msg(SCR_ERR_TYPE, buf, (size_t)n);
+  if (n < 0) n = 0;
+  if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+  scr_fence_fatal(buf, (size_t)n);
 }
 
 int scr_jsval_exit_f64(ScrJsval *v, double *out) {

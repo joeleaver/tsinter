@@ -127,7 +127,7 @@ const KNOWN: Record<string, string> = {
   "U2-REG-05": "S085 (b): a failed spawn's error carries name, message and code only",
   "U3-LATE-01": "S086 (k): a late 'data' listener's buffered chunks arrive at the next poll phase",
   "N1-REG-01": "S087 (a): a net error carries name, message and code only",
-  "N1-REG-02": "S087 (f): the checked-dynamic handle's unmodelled surface is fenced",
+  // N1-REG-02 (S087 (f)) runs one program per case since GH #86 (each fence now ends its program), which this extractor cannot read; the wasm lane pins it.
   "N1-REG-03": "S037: a Buffer crossing an untyped call slices as a copy",
   "N2-REG-01": "S088 (f): the checked-dynamic http handle's unmodelled members are fenced",
   "N2-REG-03": "S088 (g): a null the static type does not admit is fenced",
@@ -334,13 +334,16 @@ describe("the fetch fixtures on the wasm-native lane", () => {
     expectSame(r, true);
     expect(r.native.stderr.toString("utf8")).toBe("Unhandled promise rejection: TypeError: fetch failed\nRuntimeError: unreachable\n");
   }, 120_000);
-  test("wasm/fences.ts: the module's fences (S098 (d)), as on the wasm lane", async () => {
+  test("wasm/fences.ts: the module's first fence (S098 (d)) ends the run, as on the wasm lane (GH #86, SEMANTICS.md S122)", async () => {
     const { node, native } = await both(subst(readFileSync(join(fixtures, "wasm", "fences.ts"), "utf8")), false);
     expect(node.stdout.toString("utf8")).toBe("body ok false\njson ok {}\ntypeof: object\n");
-    expect(native.stdout.toString("utf8")).toBe(
-      "body: Error Response.body (a ReadableStream) is not supported yet\njson: Error JSON.stringify of a fetch value is not supported yet\ntypeof: object\n",
+    // the program's own catch never sees the fence: the fence line, then
+    // the runner's trap text (S117 (d)), exit 1
+    expect(native.stdout.toString("utf8")).toBe("");
+    expect(native.stderr.toString("utf8")).toBe(
+      "tsinter: unsupported: Response.body (a ReadableStream) is not supported yet [SC1090]\nRuntimeError: unreachable\n",
     );
-    expect(native.code).toBe(0);
+    expect(native.code).toBe(1);
   }, 120_000);
 });
 

@@ -101,6 +101,30 @@ async function runWasmToTrap(modulePath: string): Promise<{ stdout: Buffer; stde
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]) };
 }
 
+/** GH #86 (SEMANTICS.md S122): a runtime fence ENDS the program — the
+ * program's own try/catch never sees it. Builds `source`, runs it to the
+ * trap, and pins what it printed first and the one fence line. */
+async function expectFenceRow(name: string, source: string, dynamic: boolean, stdout: string, text: string): Promise<void> {
+  const res = dynamic ? await buildWasmDyn(name, source) : await buildWasm(name, source);
+  if (!res.ok) throw new Error(`${name} refused: ${res.diagnostics[0]?.message}`);
+  const r = await runWasmToTrap(res.binaryPath);
+  expect(r.stdout.toString("utf8")).toBe(stdout);
+  // a named fence carries its code: SC1090 unless `text` already names one
+  expect(r.stderr.toString("utf8")).toBe(`tsinter: unsupported: ${/ \[SC\d+[^\]]*\]$/.test(text) ? text : `${text} [SC1090]`}\n`);
+}
+
+/** Run a native binary to completion, never throwing on a nonzero exit:
+ * the fence rows compare both lanes' stdout, stderr and status. */
+async function runNative(path: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  const { execFile } = await import("node:child_process");
+  return await new Promise((resolve) => {
+    execFile(path, [], { encoding: "utf8" }, (err, stdout, stderr) => {
+      const code = err ? (err as { code?: unknown }).code : 0;
+      resolve({ stdout, stderr, code: typeof code === "number" ? code : 1 });
+    });
+  });
+}
+
 test("hello world compiles, validates, and runs byte-exactly", async () => {
   const res = await buildWasm("hello.ts", 'console.log("hello world");\n');
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
@@ -442,11 +466,11 @@ test("exception protocol: catch, finally paths, rethrow, TDZ", async () => {
   );
 });
 
-test("S009: a checked cast on a catch binding validates, it does not erase", async () => {
+test("S009: a checked cast on a catch binding validates, and a failure ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
   // No corpus program can pin this: Node erases `as`, so `(e as Error)`
-  // on a thrown string answers `undefined` there while every backend here
-  // throws the catchable TypeError. The passing half rides the corpus.
-  const res = await buildWasm(
+  // on a thrown string answers `undefined` there. The check is this
+  // tier's own, so a failure is a fence: the program's catch never runs.
+  await expectFenceRow(
     "caught-check.ts",
     [
       "function msgOf(v: string | number): string {",
@@ -465,118 +489,86 @@ test("S009: a checked cast on a catch binding validates, it does not erase", asy
       "}",
       "",
     ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    ["r1", "TypeError: caught value is not an instance of Error (checked cast)", ""].join("\n"),
+    false,
+    "r1\n",
+    "caught value is not an instance of Error (checked cast) [SC1100]",
   );
 });
 
-test("S009: `as` on an unknown value validates, and the failure names the path", async () => {
-  // Same inherited divergence one layer out: Node erases `u as number`
-  // and hands the string straight through, so NO corpus program can pin
-  // these texts. The contract they DO have is byte-parity with the C
-  // emitter's scr_dyn_check_fail — "expected <want> at <path>, got
-  // <kind>", where the path is the root `$` for a scalar target and the
-  // kind noun comes from scr_dyn_kind_name (null is "null", a unit is
-  // "undefined"). Verified against a C-lane build of this same program.
-  const res = await buildWasm(
-    "dyn-check-fail.ts",
-    [
-      "function asNum(u: unknown): number { return u as number; }",
-      "function asStr(u: unknown): string { return u as string; }",
-      "function asBool(u: unknown): boolean { return u as boolean; }",
-      "console.log(asNum(7), asStr(\"s\"), asBool(true));",
-      "const bad: string[] = [];",
-      'try { asNum("seven"); } catch (e) { if (e instanceof TypeError) bad.push(e.name + ": " + e.message); }',
-      "try { asStr(1); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
-      "try { asBool(undefined); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
-      "try { asNum(null); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
-      "for (const b of bad) console.log(b);",
-      "",
-    ].join("\n"),
-  );
+test("S009: `as` on an unknown value validates, and each failure ends the program naming the path (GH #86 review, S122)", async () => {
+  // Same inherited check one layer out: Node erases `u as number` and
+  // hands the string straight through, so NO corpus program can pin these
+  // texts. The contract they DO have is byte-parity with the C emitter's
+  // scr_dyn_check_fail — "expected <want> at <path>, got <kind>", where
+  // the path is the root `$` for a scalar target and the kind noun comes
+  // from scr_dyn_kind_name (null is "null", a unit is "undefined"). One
+  // program per failure: each one ends the program.
+  const pre = [
+    "function asNum(u: unknown): number { return u as number; }",
+    "function asStr(u: unknown): string { return u as string; }",
+    "function asBool(u: unknown): boolean { return u as boolean; }",
+    "console.log(asNum(7), asStr(\"s\"), asBool(true));",
+  ];
+  const cases: [string, string][] = [
+    ['try { asNum("seven"); } catch (e) { console.log("caught"); }', "expected number at $, got string"],
+    ["try { asStr(1); } catch (e) { console.log(\"caught\"); }", "expected string at $, got number"],
+    ["try { asNum(null); } catch (e) { console.log(\"caught\"); }", "expected number at $, got null"],
+  ];
+  for (const [i, [line, text]] of cases.entries()) {
+    await expectFenceRow(`dyn-check-fail-${i}.ts`, [...pre, line, ""].join("\n"), false, "7 s true\n", `${text} [SC1100]`);
+  }
+  // A dynamic undefined is no mismatch on the WasmGC lanes: the typed slot
+  // holds it (S119; GH #86 re-review).
+  const res = await buildWasm("dyn-check-undefined.ts", [...pre, "console.log(asBool(undefined), asNum(undefined), asStr(undefined));", ""].join("\n"));
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
   const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "7 s true",
-      "TypeError: expected number at $, got string",
-      "expected string at $, got number",
-      "expected boolean at $, got undefined",
-      "expected number at $, got null",
-      "",
-    ].join("\n"),
-  );
+  expect(stdout.toString("utf8")).toBe("7 s true\nundefined undefined undefined\n");
 });
 
-test("S009: a composite `as` names the PATH it failed at", async () => {
+test("S009: a composite `as` names the PATH it failed at — each failure ends the program (GH #86 review, S122)", async () => {
   // Same no-oracle situation as the scalar case, one layer down: Node
   // erases the cast entirely, so only the C emitter's texts can be the
   // contract. What is worth pinning here is the PATH grammar — `$` at the
   // root, `.key` per object step, `[i]` per array step — because it is
   // built from heap nodes threaded through the walkers, and a wrong
-  // parent link produces a plausible-looking but wrong path. Verified
-  // against a C-lane build of this same program.
-  const res = await buildWasm(
-    "dyn-check-path.ts",
-    [
-      "type Item = { name: string; price: number };",
-      "type Order = { id: string; items: Item[] };",
-      "function toU(o: unknown): unknown { return o; }",
-      "function asOrder(u: unknown): Order { return u as Order; }",
-      "function msg(build: () => void): void {",
-      "  try { build(); console.log('no throw'); }",
-      "  catch (e) { if (e instanceof TypeError) console.log(e.message); else console.log('other'); }",
-      "}",
-      "const good: Order = { id: 'o1', items: [{ name: 'a', price: 1 }] };",
-      "console.log(asOrder(toU(good)).items[0].price);",
-      "type BadA = { id: string; items: { name: string; price: string }[] };",
-      "msg(() => { asOrder(toU({ id: 'o2', items: [{ name: 'a', price: 'x' }] } as BadA)); });",
-      "type BadB = { id: string; items: { name: string }[] };",
-      "msg(() => { asOrder(toU({ id: 'o3', items: [{ name: 'a' }] } as BadB)); });",
-      "msg(() => { asOrder(toU('nope')); });",
-      "type BadC = { id: string; items: number };",
-      "msg(() => { asOrder(toU({ id: 'o4', items: 3 } as BadC)); });",
-      "type Pair = [string, number];",
-      "function asPair(u: unknown): Pair { return u as Pair; }",
-      "msg(() => { asPair(toU(['a', 1, 2] as [string, number, number])); });",
-      "msg(() => { asPair(toU(['a', 'b'] as [string, string])); });",
-      // Two bad fields at once: WHICH one the message names is the
-      // check walker's iteration order, and it must be the shape's
-      // CANONICAL (sorted) order — what the C and LLVM walkers use — not
-      // the declared spelling. Declared order here is z, a; canonical is
-      // a, z, so the answer is "$.a". Iterating declared order made this
-      // lane name a different field than the native ones.
-      "type Ord = { z: number; a: number };",
-      "function asOrd(u: unknown): Ord { return u as Ord; }",
-      "msg(() => { asOrd(toU({ z: 'bad', a: 'bad' })); });",
-      "",
-    ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "1",
-      "expected number at $.items[0].price, got string",
-      // A MISSING key reports exactly like a present one holding
-      // undefined — the walker passes a null `got` and kindName's null
-      // arm answers "undefined".
-      "expected number at $.items[0].price, got undefined",
-      "expected object at $, got string",
-      "expected array at $.items, got number",
-      // Arity failures carry their own message: the element type is not
-      // what went wrong.
-      "expected array of length 2 at $, got array",
-      "expected number at $[1], got string",
-      "expected number at $.a, got string",
-      "",
-    ].join("\n"),
-  );
+  // parent link produces a plausible-looking but wrong path. One program
+  // per failure (each ends the program).
+  const pre = [
+    "type Item = { name: string; price: number };",
+    "type Order = { id: string; items: Item[] };",
+    "function toU(o: unknown): unknown { return o; }",
+    "function asOrder(u: unknown): Order { return u as Order; }",
+    "function msg(build: () => void): void {",
+    "  try { build(); console.log('no throw'); }",
+    "  catch (e) { console.log('caught'); }",
+    "}",
+    "const good: Order = { id: 'o1', items: [{ name: 'a', price: 1 }] };",
+    "console.log(asOrder(toU(good)).items[0].price);",
+  ];
+  const cases: [string[], string][] = [
+    [["type BadA = { id: string; items: { name: string; price: string }[] };", "msg(() => { asOrder(toU({ id: 'o2', items: [{ name: 'a', price: 'x' }] } as BadA)); });"],
+      "expected number at $.items[0].price, got string"],
+    // (A MISSING key is no failure on the WasmGC lanes: the field reads as
+    // its undefined — S119 (i), wasm-review-repros' a2 rows.)
+    [["msg(() => { asOrder(toU('nope')); });"], "expected object at $, got string"],
+    [["type BadC = { id: string; items: number };", "msg(() => { asOrder(toU({ id: 'o4', items: 3 } as BadC)); });"],
+      "expected array at $.items, got number"],
+    // Arity failures carry their own message: the element type is not what
+    // went wrong.
+    [["type Pair = [string, number];", "function asPair(u: unknown): Pair { return u as Pair; }", "msg(() => { asPair(toU(['a', 1, 2] as [string, number, number])); });"],
+      "expected array of length 2 at $, got array"],
+    [["type Pair = [string, number];", "function asPair(u: unknown): Pair { return u as Pair; }", "msg(() => { asPair(toU(['a', 'b'] as [string, string])); });"],
+      "expected number at $[1], got string"],
+    // Two bad fields at once: WHICH one the message names is the check
+    // walker's iteration order, and it must be the shape's CANONICAL
+    // (sorted) order — what the C and LLVM walkers use — not the declared
+    // spelling. Declared order here is z, a; canonical is a, z.
+    [["type Ord = { z: number; a: number };", "function asOrd(u: unknown): Ord { return u as Ord; }", "msg(() => { asOrd(toU({ z: 'bad', a: 'bad' })); });"],
+      "expected number at $.a, got string"],
+  ];
+  for (const [i, [lines, text]] of cases.entries()) {
+    await expectFenceRow(`dyn-check-path-${i}.ts`, [...pre, ...lines, ""].join("\n"), false, "1\n", `${text} [SC1100]`);
+  }
 });
 
 test("toString:caught — String(e) over every exception-cell kind", async () => {
@@ -1927,15 +1919,15 @@ test("dyn keyed write: V8's refusal texts on every receiver that has no slot", a
       "try { JSON.parse('true')['q'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
       "try { JSON.parse('false')['q'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
       // The S016 lines. Node's answers, verified:
-      //   a['nope'] = 1     -> adds the property, no throw
       //   a['length'] = 1   -> TRUNCATES the array, no throw
       //   s['0'] = 'z'      -> "Cannot assign to read only property '0'
-      //                         of string 'abc'" (a DIFFERENT V8 message)
+      //                         of string 'abc'" — answered exactly since
+      //                         GH #86 review (Node throws there, so the
+      //                         error must be Node's)
       //   s['length'] = 9   -> the same read-only message for 'length'
-      // The out-of-range string index below is NOT a divergence — Node
-      // says "Cannot create property" there too, which is why it sits
-      // beside them.
-      "try { JSON.parse('[1]')['nope'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      // The out-of-range string index below says "Cannot create property"
+      // in Node too. a['nope'] = 1 (Node adds it) is S016's fence — its own
+      // row below, since it ends the program.
       "try { JSON.parse('[1,2,3]')['length'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
       "try { JSON.parse('\"abc\"')['0'] = 'z'; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
       "try { JSON.parse('\"abc\"')['length'] = 9; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
@@ -1954,14 +1946,22 @@ test("dyn keyed write: V8's refusal texts on every receiver that has no slot", a
       "Cannot create property 'x' on string 'abc'",
       "Cannot create property 'q' on boolean 'true'",
       "Cannot create property 'q' on boolean 'false'",
-      "Cannot create property 'nope' on array", // S016 — Node adds it
       // (truncates, as Node does — no line: unit H, S110 (f))
-      "Cannot create property '0' on string 'abc'", // S016 — Node: read only
-      "Cannot create property 'length' on string 'abc'", // S016 — same
-      "Cannot create property '9' on string 'abc'", // agrees with Node
+      "Cannot assign to read only property '0' of string 'abc'",
+      "Cannot assign to read only property 'length' of string 'abc'",
+      "Cannot create property '9' on string 'abc'",
       "6",
       "",
     ].join("\n"),
+  );
+  // S016's fence: an array's non-index member, which Node adds — the dyn
+  // tree has no slot for it, so it ends the program (GH #86 review, S122).
+  await expectFenceRow(
+    "dyn-keyset-nope.js",
+    "'use strict';\nconsole.log('before');\ntry { JSON.parse('[1]')['nope'] = 1; } catch (e) { console.log('caught'); }\n",
+    false,
+    "before\n",
+    "Cannot create property 'nope' on array (the checked-dynamic tree has no member slot for it — SEMANTICS.md S016) [SC1090]",
   );
 });
 
@@ -2004,8 +2004,8 @@ test("S016: dyn array index writes PAD where Node leaves holes", async () => {
       "const h = JSON.parse('[1]');",
       "h[3] = 9;",
       "console.log(j(Object.keys(h)));",
-      "console.log(String('1' in h) + ' ' + String('2' in h) + ' ' + String('3' in h));",
-      "console.log(String(Object.hasOwn(h, '1')) + ' ' + String(Object.hasOwn(h, '3')));",
+      // (the presence tests over a padded index fence since the GH #86
+      // review — the row below)
       // ... while length and the reads stay Node-exact.
       "console.log(s(h.length) + ' ' + s(h[1]) + ' ' + s(h[3]));",
       "",
@@ -2019,11 +2019,26 @@ test("S016: dyn array index writes PAD where Node leaves holes", async () => {
       "3 undefined 9",
       "1 3 ?",
       "0|1|2|3", // Node: 0|3
-      "true true true", // Node: false false true
-      "true true", // Node: false true
       "4 undefined 9", // Node agrees exactly
       "",
     ].join("\n"),
+  );
+});
+
+test("S016 (GH #86 review): `in` / Object.hasOwn over a padded index end the program at a named fence (Node: false); the written index answers", async () => {
+  await expectFenceRow(
+    "dyn-keyset-arr-in.js",
+    [
+      "'use strict';",
+      "const h = JSON.parse('[1]');",
+      "h[3] = 9;",
+      "console.log(String('3' in h) + ' ' + String(Object.hasOwn(h, '3')) + ' ' + String('0' in h));",
+      "try { console.log(String('1' in h)); } catch (e) { console.log('caught'); }",
+      "",
+    ].join("\n"),
+    false,
+    "true true true\n",
+    "'in' or Object.hasOwn over an array index that may be a hole (a write past an array's end leaves undefined where Node keeps a hole — SEMANTICS.md S119)",
   );
 });
 
@@ -2253,41 +2268,34 @@ test("dyn fn: the boxed CLOSURE is what identity compares, never the box", async
   );
 });
 
-test("dyn fn: JS ARITY through the thunk, and the adapter's result check", async () => {
+test("dyn fn: JS ARITY through the thunk, and the adapter's result check (each check a fence since GH #86 review, S122)", async () => {
   // The thunk is where a call's arguments meet the boxed signature's
   // declared parameters. Missing arguments are THE undefined immortal —
-  // a dyn parameter takes it (line 3: `typeof x` is "undefined"), a
-  // number parameter throws the path-annotated TypeError naming `$[i]`.
-  // Extra arguments are evaluated by the CALLER and then never read,
-  // which is why "eval extra" prints before the result. The last line is
-  // the adapter's half: a wrapper whose real return type is not the
-  // target's is caught at the ROOT path on the way out.
+  // a dyn parameter takes it (`typeof x` is "undefined"), a number
+  // parameter fails the path-annotated check naming `$[i]`. Extra
+  // arguments are evaluated by the CALLER and then never read, which is
+  // why "eval extra" prints before the result. The adapter's half: a
+  // wrapper whose real return type is not the target's fails at the ROOT
+  // path on the way out.
   //
-  // Node erases all of this (S009's stance). Its full output is
+  // Node erases all of this (S009's stance) and prints
   //   eval extra / 3 / undefined / number / s3
-  // — five lines to our six: NOTHING at all where the first check fires
-  // (that statement discards its result, so there is no console.log to
-  // reach), and "s3" where the last one does. The contract here is
-  // byte-parity with the C emitter, verified against a C-lane build of
-  // this same program.
+  // so each check is this tier's own and ends the program: the passing
+  // half runs as one program, each failing check as its own.
+  const pre = [
+    "function pick(a: number, b: number): number { return a + b; }",
+    "function takesDyn(x: unknown): string { return typeof x; }",
+    "function side(tag: string): number { console.log('eval ' + tag); return 1; }",
+  ];
   const res = await buildWasm(
     "dyn-fn-arity.ts",
     [
-      "function pick(a: number, b: number): number { return a + b; }",
-      "function takesDyn(x: unknown): string { return typeof x; }",
-      "function side(tag: string): number { console.log('eval ' + tag); return 1; }",
-      "const u: unknown = pick;",
-      "const one = u as (a: number) => unknown;",
-      "try { one(7); } catch (e) { console.log((e as Error).message); }",
+      ...pre,
       "const b: any = pick;",
       "console.log(`${b(1, 2, side('extra')) as number}`);",
       "const d: any = takesDyn;",
       "console.log(d() as string);",
       "console.log(d(5) as string);",
-      "function lies(a: number): string { return 's' + a; }",
-      "const lu: unknown = lies;",
-      "const lying = lu as (a: number) => number;",
-      "try { console.log(`${lying(3)}`); } catch (e) { console.log((e as Error).message); }",
       "",
     ].join("\n"),
   );
@@ -2296,14 +2304,34 @@ test("dyn fn: JS ARITY through the thunk, and the adapter's result check", async
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
     [
-      "expected number at $[1], got undefined", // Node: prints nothing here
       "eval extra", // the dropped argument still ran
       "3",
       "undefined", // a missing arg reaching a dyn parameter
       "number",
-      "expected number at $, got string", // Node: prints s3
       "",
     ].join("\n"),
+  );
+  // A missing argument reaches a number parameter as its undefined (S119;
+  // GH #86 re-review): `7 + undefined`, as Node.
+  const missing = await buildWasm(
+    "dyn-fn-arity-missing.ts",
+    [...pre, "const u: unknown = pick;", "const one = u as (a: number) => unknown;", "console.log(one(7));", ""].join("\n"),
+  );
+  if (!missing.ok) throw new Error(`refused: ${missing.diagnostics[0]?.message}`);
+  expect((await runWasm(missing.binaryPath)).stdout.toString("utf8")).toBe("NaN\n");
+  await expectFenceRow(
+    "dyn-fn-arity-result.ts",
+    [
+      ...pre,
+      "function lies(a: number): string { return 's' + a; }",
+      "const lu: unknown = lies;",
+      "const lying = lu as (a: number) => number;",
+      "try { console.log(`${lying(3)}`); } catch (e) { console.log('caught'); }",
+      "",
+    ].join("\n"),
+    false,
+    "",
+    "expected number at $, got string [SC1100]",
   );
 });
 
@@ -2658,10 +2686,10 @@ test("dyn invoke: the callback family binds `length` ONCE, like the spec", async
 });
 
 test("S023: the dyn invoke ladder — Node's refusals, and the fences that are ours", async () => {
-  // The four rungs, in order. Everything here but the three
-  // "not supported yet" lines is Node's own answer, byte for byte;
-  // those three are S023, and they are plain Errors rather than
-  // TypeErrors precisely so a handler testing for one is not misled.
+  // The four rungs, in order. Everything here is Node's own answer, byte
+  // for byte; the S023 fence (indexOf with a non-string needle) ends the
+  // program since GH #86 (SEMANTICS.md S122), so it runs as its own
+  // program at the end of this test.
   // The callable-callback gate is the one place this lane leaves the C
   // runtime behind: V8 names the operand's TYPE ("number 5",
   // `string "abc"`) where the C runtime renders its ToString image.
@@ -2683,7 +2711,6 @@ test("S023: the dyn invoke ladder — Node's refusals, and the fences that are o
       "out.push(msg(() => { num.push(1); }));",
       "out.push(msg(() => { obj.push(1); }));",
       "out.push(msg(() => { str.at(0); }));",
-      "out.push(msg(() => { str.indexOf(1); }));",
       "out.push(msg(() => { arr.slice('x'); }));",
       "out.push('str.slice ' + String(str.slice(1)) + ' indexOf ' + String(str.indexOf('b')) +",
       "  ' lastIndexOf ' + String(str.lastIndexOf('c')) + ' includes ' + String(str.includes('bc')));",
@@ -2711,10 +2738,8 @@ test("S023: the dyn invoke ladder — Node's refusals, and the fences that are o
       "TypeError: obj.push is not a function",
       // Rung two, S023: `.at` is REAL now (increment 21 stage B, gate
       // 2 — 1113's own measured need, shared here for free since
-      // dyn.invoke() is the SAME ladder jsval ≡ dyn routes through);
-      // `.indexOf` with a non-string needle stays the S023 fence.
+      // dyn.invoke() is the SAME ladder jsval ≡ dyn routes through).
       "(no throw)",
-      "Error: 'String.prototype.indexOf' on a dynamic value is not supported yet",
       // A string index runs ToNumber now, as in Node (unit H, S110 (f)):
       // 'x' is NaN, so slice(0) answers without a throw.
       "(no throw)",
@@ -2735,6 +2760,14 @@ test("S023: the dyn invoke ladder — Node's refusals, and the fences that are o
       "TypeError: The comparison function must be either a function or undefined: [object Array]",
       "",
     ].join("\n"),
+  );
+  // `.indexOf` with a non-string needle stays the S023 fence.
+  await expectFenceRow(
+    "dyn-invoke-ladder-fence.ts",
+    "const str: any = JSON.parse('\"abc\"');\nconsole.log('before');\ntry { str.indexOf(1); } catch (e) { console.log('caught'); }\n",
+    false,
+    "before\n",
+    "'String.prototype.indexOf' on a dynamic value is not supported yet",
   );
 });
 
@@ -2921,7 +2954,6 @@ test("S023: apply's argsArray — the array-like fence and the primitive's own T
       "  try { return 'ok ' + String(h()); } catch (e) { return (e as Error).name + ': ' + (e as Error).message; }",
       "}",
       "const out: string[] = [];",
-      "out.push('arraylike ' + show(() => { return g.apply(null, al); }));",
       "out.push('string ' + show(() => { return g.apply(null, 'ab'); }));",
       "out.push('number ' + show(() => { return g.apply(null, 5); }));",
       "out.push('array ' + show(() => { return g.apply(null, JSON.parse('[\"p\",\"q\"]')); }));",
@@ -2934,15 +2966,30 @@ test("S023: apply's argsArray — the array-like fence and the primitive's own T
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
     [
-      // S023 — Node answers "ok x/y" here, which is exactly why this is a
-      // fence and not the message below.
-      "arraylike Error: 'Function.prototype.apply' with an array-like argsArray on a dynamic value is not supported yet",
       "string TypeError: CreateListFromArrayLike called on non-object",
       "number TypeError: CreateListFromArrayLike called on non-object",
       "array ok p/q",
       "nullish ok undefined/undefined",
       "",
     ].join("\n"),
+  );
+  // S023 — Node answers "ok x/y" for an array-like argsArray, which is
+  // exactly why this is a fence and not the message above; it ends the
+  // program (GH #86, SEMANTICS.md S122).
+  await expectFenceRow(
+    "dyn-invoke-apply-like-fence.ts",
+    [
+      "function f(a: unknown, b: unknown): string { return String(a) + '/' + String(b); }",
+      "function box(v: unknown): unknown { return v; }",
+      "const g: any = box(f);",
+      "function mk(): unknown { return JSON.parse('{\"length\":2,\"0\":\"x\",\"1\":\"y\"}'); }",
+      "const al: any = mk();",
+      "try { console.log('ok ' + String(g.apply(null, al))); } catch (e) { console.log('caught'); }",
+      "",
+    ].join("\n"),
+    false,
+    "",
+    "'Function.prototype.apply' with an array-like argsArray on a dynamic value is not supported yet",
   );
 });
 
@@ -4408,7 +4455,7 @@ test("classes: dispatch lands on an UNOVERRIDDEN ancestor's implementation", asy
   );
 });
 
-test("errors: a caught binding tells USER subclasses apart, and `as` still checks", async () => {
+test("errors: a caught binding tells USER subclasses apart, and `as` still checks (a failure ends the program — GH #86 review, S122)", async () => {
   // What the class-id compare this replaced could never do. An
   // Error-typed catch binding can hold anything error-rooted, so the
   // handler's `instanceof` chain has to discriminate a two-deep user
@@ -4443,7 +4490,8 @@ test("errors: a caught binding tells USER subclasses apart, and `as` still check
       "}",
       "for (let i = 0; i < 4; i = i + 1) console.log(classify(i));",
       // S009 against a USER subclass: the payload is a RangeError, so the
-      // interval guard fails and the catchable TypeError names AppError.
+      // interval guard fails and the fence names AppError (the outer catch
+      // never runs).
       "try {",
       "  try {",
       '    throw new RangeError("r");',
@@ -4458,17 +4506,9 @@ test("errors: a caught binding tells USER subclasses apart, and `as` still check
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "db 500 DbError",
-      "app 400",
-      "type bad type",
-      "err plain",
-      "TypeError: caught value is not an instance of AppError (checked cast)",
-      "",
-    ].join("\n"),
-  );
+  const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["db 500 DbError", "app 400", "type bad type", "err plain", ""].join("\n"));
+  expect(stderr.toString("utf8")).toBe("tsinter: unsupported: caught value is not an instance of AppError (checked cast) [SC1100]\n");
 });
 
 test("async: a plain user class FULFILS a promise (only rejections are gated)", async () => {
@@ -4715,13 +4755,12 @@ test("S032 retired by unit U (S119): a dynamic-keyed record read with no undefin
   expect(stdout.toString("utf8")).toBe("true undefined\n");
 });
 
-test("S033: a dynamic-keyed write naming no declared field on a signature-free record throws", async () => {
+test("S033: a dynamic-keyed write naming no declared field on a signature-free record ends the program (GH #86 review, S122)", async () => {
   // The "mockable module" pattern (corpus 2470): every declared field
   // shares one common type, so the frontend accepts the computed-key
   // write, but the record itself is a monomorphic struct with a FIXED
-  // field set. Node adds the property; this tier throws a catchable
-  // TypeError and stores nothing. No corpus program can pin the throwing
-  // side (Node's silent-success text differs by construction).
+  // field set. Node adds the property; this tier ends the program at the
+  // named fence (the catch never runs). No corpus program can pin it.
   const res = await buildWasm(
     "fixed-shape-write.ts",
     [
@@ -4748,20 +4787,18 @@ test("S033: a dynamic-keyed write naming no declared field on a signature-free r
     ].join("\n"),
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    ["mocked", "caught: Cannot add property 'nope' to a fixed-shape object", "done", ""].join("\n"),
-  );
+  const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("mocked\n");
+  expect(stderr.toString("utf8")).toBe("tsinter: unsupported: Cannot add property 'nope' to a fixed-shape object [SC1090]\n");
 });
 
-test("S009 amendment: a dynamic-keyed write validates a declared field's type on a hybrid record", async () => {
+test("S009 amendment: a dynamic-keyed write validates a declared field's type on a hybrid record (a failure ends the program — GH #86 review, S122)", async () => {
   // The SAME trust-but-verify mechanism `e as C` uses (S009), reached from
   // a second site: `r[k] = v` where the runtime key `k` names a DECLARED
   // field whose static type is narrower than the index signature's value
   // type `v` arrives as. Node stores whatever `v` is; here the write
-  // validates through the identical dynCheck machinery and throws,
-  // leaving the field untouched. No corpus program can pin the throwing
-  // side for the usual byte-exact reason.
+  // validates through the identical dynCheck machinery and a mismatch
+  // ends the program at its fence (the catch never runs).
   const res = await buildWasm(
     "hybrid-declared-write-check.ts",
     [
@@ -4784,8 +4821,9 @@ test("S009 amendment: a dynamic-keyed write validates a declared field's type on
     ].join("\n"),
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("caught: expected number at $.known, got string 1\n");
+  const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("");
+  expect(stderr.toString("utf8")).toBe("tsinter: unsupported: expected number at $.known, got string [SC1100]\n");
 });
 
 test("bytes: construction forms, length/byteLength, and the element coercion matrix", async () => {
@@ -7775,7 +7813,7 @@ test("dyn↔bytes crossing: Object.hasOwn/keys/values/entries see numeric indice
   );
 });
 
-test("dyn↔bytes crossing: keyed write through `unknown` — in-range numeric writes THROUGH to the shared storage, OOB numeric is a SILENT no-op (matches Node: typed arrays are fixed-length, unlike arrays which grow), a non-numeric key throws (S016's array precedent — no property table on this payload either)", async () => {
+test("dyn↔bytes crossing: keyed write through `unknown` — in-range numeric writes THROUGH to the shared storage, OOB numeric is a SILENT no-op (matches Node: typed arrays are fixed-length, unlike arrays which grow), a non-numeric key ends the program at S016's fence (GH #86 review, S122: Node adds the property; no property table on this payload either)", async () => {
   const res = await buildWasm(
     "dyn-bytes-keyset.js",
     [
@@ -7792,9 +7830,10 @@ test("dyn↔bytes crossing: keyed write through `unknown` — in-range numeric w
     ].join("\n"),
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    ["55", "3 undefined", "Cannot create property 'nope' on Uint8Array", ""].join("\n"),
+  const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["55", "3 undefined", ""].join("\n"));
+  expect(stderr.toString("utf8")).toBe(
+    "tsinter: unsupported: Cannot create property 'nope' on Uint8Array (the checked-dynamic tree has no member slot for it — SEMANTICS.md S016) [SC1090]\n",
   );
 });
 
@@ -8363,7 +8402,7 @@ test("increment 21 stage A: jsOp:getProp through undefined throws Node's own cat
   expect(stdout.toString("utf8")).toBe("caught: TypeError: Cannot read properties of undefined (reading 'x')\n");
 });
 
-test("increment 21 stage A: jsExit strict primitives — happy path reads the exact tag, a wrong-kind exit throws \"expected <want>, got <typeof>\" (scriptc-only synthetic diagnostic, ported verbatim from scr_island.c's isl_exit_fail — no Node oracle exists for this text since Node has no static/island boundary at all; verified against the reference C backend's OWN output on the identical source, matching SEMANTICS.md S009's convention for texts with no Node analog)", async () => {
+test("increment 21 stage A: jsExit strict primitives — happy path reads the exact tag, a wrong-kind exit ends the program at the fence \"expected <want>, got <typeof>\" (GH #86 review, S122; scriptc-only synthetic diagnostic, ported verbatim from scr_island.c's isl_exit_fail — no Node oracle exists for this text since Node has no static/island boundary at all; verified against the reference C backend's OWN output on the identical source, matching SEMANTICS.md S009's convention for texts with no Node analog)", async () => {
   const source = [
     "function mint(): any {",
     '  return { n: "not-a-number" };',
@@ -8380,7 +8419,7 @@ test("increment 21 stage A: jsExit strict primitives — happy path reads the ex
   ].join("\n");
   const wasm = await buildWasmDyn("jsexit-scalar-fail.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(wasm.binaryPath);
+  const { stdout, stderr } = await runWasmToTrap(wasm.binaryPath);
   const c = await compile(join(scratch, "jsexit-scalar-fail.ts"), {
     outPath: join(scratch, "jsexit-scalar-fail.c.out"),
     outDir: scratch,
@@ -8388,14 +8427,13 @@ test("increment 21 stage A: jsExit strict primitives — happy path reads the ex
     backend: "c",
   });
   if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const cOut = await promisify(execFile)(c.binaryPath);
-  expect(stdout.toString("utf8")).toBe(cOut.stdout);
-  expect(stdout.toString("utf8")).toBe("caught: TypeError: expected number, got string\ndone\n");
+  const cOut = await runNative(c.binaryPath);
+  expect(cOut).toEqual({ stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), code: 1 });
+  expect(stdout.toString("utf8")).toBe("");
+  expect(stderr.toString("utf8")).toBe("tsinter: unsupported: expected number, got string [SC1100]\n");
 });
 
-test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit form, Array.isArray-gated, elements BY REFERENCE (the dyn ARR payload's own vector handed over directly, no copy: module.ts's STRUCTURAL type interning already makes array<jsval>'s wasm struct index identical to dyn's own ARR-payload vector struct, whether or not vecKeyFor's jsval arm exists — that arm's real effect is sharing ONE helper-function family between array<jsval> and array<dyn>, a cache-dedup, not a type-compatibility requirement); a non-array exit throws \"expected an array, got <typeof>\", verified against the reference C backend the same way as the scalar case above", async () => {
+test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit form, Array.isArray-gated, elements BY REFERENCE (the dyn ARR payload's own vector handed over directly, no copy: module.ts's STRUCTURAL type interning already makes array<jsval>'s wasm struct index identical to dyn's own ARR-payload vector struct, whether or not vecKeyFor's jsval arm exists — that arm's real effect is sharing ONE helper-function family between array<jsval> and array<dyn>, a cache-dedup, not a type-compatibility requirement); a non-array exit ends the program at its fence (GH #86 review, S122), verified against the reference C backend the same way as the scalar case above", async () => {
   const source = [
     "function mintArr(): any {",
     "  return [1, 2, 3];",
@@ -8420,7 +8458,7 @@ test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit 
   ].join("\n");
   const wasm = await buildWasmDyn("jsexit-array.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(wasm.binaryPath);
+  const { stdout, stderr } = await runWasm(wasm.binaryPath);
   const c = await compile(join(scratch, "jsexit-array.ts"), {
     outPath: join(scratch, "jsexit-array.c.out"),
     outDir: scratch,
@@ -8428,19 +8466,15 @@ test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit 
     backend: "c",
   });
   if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const cOut = await promisify(execFile)(c.binaryPath);
-  expect(stdout.toString("utf8")).toBe(cOut.stdout);
+  const cOut = await runNative(c.binaryPath);
   // Unit H (SEMANTICS.md S014's unit-H amendment): an `any[]` parameter IS
   // the island array, so no exit runs at the call — a non-array argument
-  // binds as it is. The lie surfaces one step later instead: `p.length` is
-  // checker-typed `number`, and the validated exit of the engine's
-  // `undefined` there throws (S110 (d)) where Node
-  // prints "undefined undefined undefined undefined". Same on both lanes.
-  expect(stdout.toString("utf8")).toBe(
-    ["1 2 3 3", "caught: TypeError: expected number, got undefined", "done", ""].join("\n"),
-  );
+  // binds as it is, and `p.length` is the engine's `undefined`. The wasm
+  // lane's number slot holds it, as Node's binding does (S119, S110 (d));
+  // the c lane has no such slot and ends the program at the exit's check.
+  expect(cOut).toEqual({ stdout: "1 2 3 3\n", stderr: "tsinter: unsupported: expected number, got undefined [SC1100]\n", code: 1 });
+  expect(stdout.toString("utf8")).toBe("1 2 3 3\nundefined undefined undefined undefined\ndone\n");
+  expect(stderr.toString("utf8")).toBe("");
 });
 
 test("increment 21 stage A: insp.jsval — console.log of a composite holding jsval elements (`any[]`, the sanctioned corpus form) renders through the SAME dyn walker plain unknown values use, byte-exact against Node's util.inspect-flavored console.log", async () => {
@@ -8479,44 +8513,25 @@ test("increment 21 stage A: getProp's Number.prototype PLACEHOLDER six — expor
   expect(stdout.toString("utf8")).toBe("function function function function function\n"); // Node-verified
 });
 
-test("increment 21 stage A gate fix F1: unmodeled prototype-member getProp reads fence LOUDLY (a plain, catchable Error — S023's own text family, never a TypeError, never silent undefined) — per-kind fence text over NUM/BOOL/STR/ARR, plus Object.prototype's own members on a NUM receiver outside its placeholder six (round-1's own gap: `typeof n.hasOwnProperty` silently answered undefined, Node answers a function)", async () => {
-  const res = await buildWasmDyn(
-    "getprop-fence-per-kind.ts",
-    [
-      "const n: any = 5;",
-      "try { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`caught-num: ${e}`); }",
-      "const b: any = true;",
-      "try { console.log(typeof b.toString); } catch (e) { console.log(`caught-bool: ${e}`); }",
-      'const s: any = "hi";',
-      "try { console.log(typeof s.charAt); } catch (e) { console.log(`caught-str: ${e}`); }",
-      "const arr: any = [1, 2, 3];",
-      "try { console.log(typeof arr.push); } catch (e) { console.log(`caught-arr: ${e}`); }",
-      'console.log("done");',
-      "",
-    ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
+test("increment 21 stage A gate fix F1: unmodeled prototype-member getProp reads fence LOUDLY (S023's own text family, never a TypeError, never silent undefined; since GH #86 the fence ends the program — SEMANTICS.md S122) — per-kind fence text over NUM/BOOL/STR/ARR, plus Object.prototype's own members on a NUM receiver outside its placeholder six (round-1's own gap: `typeof n.hasOwnProperty` silently answered undefined, Node answers a function)", async () => {
   // No Node oracle for these texts (an unmodeled-member fence is a
   // scriptc-only synthetic diagnostic — the construct itself compiles
   // and runs fine in Node, since Node HAS these methods; this tier
   // simply does not implement the method BODIES yet, S023's own
-  // "TODO marker, not a stance" framing). The plain-Error mechanism and
-  // text FAMILY are what's pinned, matching S023 exactly.
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "caught-num: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet",
-      "caught-bool: Error: 'Boolean.prototype.toString' on an island value is not supported yet",
-      "caught-str: Error: 'String.prototype.charAt' on an island value is not supported yet",
-      "caught-arr: Error: 'Array.prototype.push' on an island value is not supported yet",
-      "done",
-      "",
-    ].join("\n"),
-  );
+  // "TODO marker, not a stance" framing). One program per kind.
+  const cases: [string, string, string][] = [
+    ["num", "const n: any = 5;\ntry { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`caught: ${e}`); }", "'Object.prototype.hasOwnProperty' on an island value is not supported yet"],
+    ["bool", "const b: any = true;\ntry { console.log(typeof b.toString); } catch (e) { console.log(`caught: ${e}`); }", "'Boolean.prototype.toString' on an island value is not supported yet"],
+    ["str", 'const s: any = "hi";\ntry { console.log(typeof s.charAt); } catch (e) { console.log(`caught: ${e}`); }', "'String.prototype.charAt' on an island value is not supported yet"],
+    ["arr", "const arr: any = [1, 2, 3];\ntry { console.log(typeof arr.push); } catch (e) { console.log(`caught: ${e}`); }", "'Array.prototype.push' on an island value is not supported yet"],
+  ];
+  for (const [id, src, text] of cases) {
+    await expectFenceRow(`getprop-fence-per-kind-${id}.ts`, `console.log("before");\n${src}\nconsole.log("done");\n`, true, "before\n", text);
+  }
 });
 
-test("increment 21 stage A gate fix F1: OWN property shadows the prototype fence on an OBJ receiver (Node-measured: `({toString: 5}).toString` is `5`, not a function — an own field of the SAME NAME as a fenced prototype member must win, never fence); a genuinely absent Object.prototype-named member on an empty object still fences", async () => {
-  const res = await buildWasmDyn(
+test("increment 21 stage A gate fix F1: OWN property shadows the prototype fence on an OBJ receiver (Node-measured: `({toString: 5}).toString` is `5`, not a function — an own field of the SAME NAME as a fenced prototype member must win, never fence); a genuinely absent Object.prototype-named member on an empty object still fences (ending the program — GH #86, SEMANTICS.md S122)", async () => {
+  await expectFenceRow(
     "getprop-own-shadow.ts",
     [
       "const o: any = { toString: 5 };",
@@ -8525,13 +8540,9 @@ test("increment 21 stage A gate fix F1: OWN property shadows the prototype fence
       "try { console.log(typeof empty.hasOwnProperty); } catch (e) { console.log(`caught: ${e}`); }",
       "",
     ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    ["number 5", "caught: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet", ""].join(
-      "\n",
-    ),
+    true,
+    "number 5\n",
+    "'Object.prototype.hasOwnProperty' on an island value is not supported yet",
   );
 });
 
@@ -8579,7 +8590,7 @@ test("increment 21 stage A gate fix F3: island-array NON-INDEX keyed writes thro
   ].join("\n");
   const wasm = await buildWasmDyn("setidx-nonindex-fence.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(wasm.binaryPath);
+  const { stdout, stderr } = await runWasmToTrap(wasm.binaryPath);
   const c = await compile(join(scratch, "setidx-nonindex-fence.ts"), {
     outPath: join(scratch, "setidx-nonindex-fence.c.out"),
     outDir: scratch,
@@ -8594,13 +8605,11 @@ test("increment 21 stage A gate fix F3: island-array NON-INDEX keyed writes thro
   // property write, no throw) — the wasm lane diverges from BOTH,
   // pinned explicitly so nothing later assumes they agree.
   expect(cOut.stdout).toBe("no-throw\nno-throw2\n3\n");
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "caught: TypeError: Cannot create property '-1' on array",
-      "caught2: TypeError: Cannot create property 'foo' on array",
-      "3",
-      "",
-    ].join("\n"),
+  // GH #86 review (S016, S122): the wasm lane's limitation is a fence
+  // that ends the program at the first such write.
+  expect(stdout.toString("utf8")).toBe("");
+  expect(stderr.toString("utf8")).toBe(
+    "tsinter: unsupported: Cannot create property '-1' on array (the checked-dynamic tree has no member slot for it — SEMANTICS.md S016) [SC1090]\n",
   );
 });
 
@@ -8655,74 +8664,49 @@ test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a
 });
 
 test("increment 21 stage A gate round 2 fix D1: Function.prototype members on a FUNC-kind jsval receiver fence as 'Function.prototype.<name>', not 'Object.prototype.<name>' — reachable through F2's OWN placeholders (a placeholder IS a real FUNC-kind jsval): `const f: any = v.toString; typeof f.call` used to silently answer undefined (no table had 'call' at all); apply/bind/call/toString are the closed Function.prototype own-member set (Node-measured, caller/arguments excluded as throwing accessors)", async () => {
-  const res = await buildWasmDyn(
-    "getprop-fence-func.ts",
-    [
-      "const v: any = 5;",
-      "const f: unknown = v.toString;", // a FUNC-kind jsval placeholder, round-tripped through unknown only to hold it — read back below via a fresh jsval read
-      "const g: any = v.toString;",
-      "try { console.log(typeof g.call); } catch (e) { console.log(`caught-call: ${e}`); }",
-      "try { console.log(typeof g.apply); } catch (e) { console.log(`caught-apply: ${e}`); }",
-      "try { console.log(typeof g.bind); } catch (e) { console.log(`caught-bind: ${e}`); }",
-      "try { console.log(typeof g.hasOwnProperty); } catch (e) { console.log(`caught-hasown: ${e}`); }",
-      "console.log(typeof f);",
-      "",
-    ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
   // No Node oracle for the fence texts themselves (Node HAS these
   // methods; this tier fences the unmodeled BODY, S023's own framing).
   // 'call'/'apply'/'bind' attribute Function.prototype; 'hasOwnProperty'
   // (present on Function.prototype's OWN chain via Object.prototype, not
-  // Function.prototype itself) still correctly attributes Object.
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "caught-call: Error: 'Function.prototype.call' on an island value is not supported yet",
-      "caught-apply: Error: 'Function.prototype.apply' on an island value is not supported yet",
-      "caught-bind: Error: 'Function.prototype.bind' on an island value is not supported yet",
-      "caught-hasown: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet",
-      "function",
-      "",
-    ].join("\n"),
-  );
+  // Function.prototype itself) still correctly attributes Object. Each
+  // fence ends its program (GH #86, SEMANTICS.md S122): one per member.
+  const cases: [string, string][] = [
+    ["call", "'Function.prototype.call' on an island value is not supported yet"],
+    ["apply", "'Function.prototype.apply' on an island value is not supported yet"],
+    ["bind", "'Function.prototype.bind' on an island value is not supported yet"],
+    ["hasOwnProperty", "'Object.prototype.hasOwnProperty' on an island value is not supported yet"],
+  ];
+  for (const [member, text] of cases) {
+    await expectFenceRow(
+      `getprop-fence-func-${member}.ts`,
+      ["const v: any = 5;", "const f: unknown = v.toString;", "const g: any = v.toString;", "console.log(typeof f);", `try { console.log(typeof g.${member}); } catch (e) { console.log('caught'); }`, ""].join("\n"),
+      true,
+      "function\n",
+      text,
+    );
+  }
 });
 
 test("increment 21 stage A gate round 2 fix D2: the four annex-B accessor-definer names (__defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__) are function-valued on EVERY kind's prototype chain (Node-measured, reviewer's g4 probe) and must fence like any other Object.prototype member, not silently answer undefined", async () => {
-  const res = await buildWasmDyn(
-    "getprop-fence-annexb.ts",
-    [
-      "const n: any = 5;",
-      "try { console.log(typeof n.__defineGetter__); } catch (e) { console.log(`caught-num: ${e}`); }",
-      "const arr: any = [1, 2];",
-      "try { console.log(typeof arr.__lookupSetter__); } catch (e) { console.log(`caught-arr: ${e}`); }",
-      "const o: any = {};",
-      "try { console.log(typeof o.__defineSetter__); } catch (e) { console.log(`caught-obj: ${e}`); }",
-      "",
-    ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "caught-num: Error: 'Object.prototype.__defineGetter__' on an island value is not supported yet",
-      "caught-arr: Error: 'Object.prototype.__lookupSetter__' on an island value is not supported yet",
-      "caught-obj: Error: 'Object.prototype.__defineSetter__' on an island value is not supported yet",
-      "",
-    ].join("\n"),
-  );
+  // One program per receiver kind: the fence ends it (GH #86, S122).
+  const cases: [string, string, string][] = [
+    ["num", "const n: any = 5;\ntry { console.log(typeof n.__defineGetter__); } catch (e) { console.log(`caught: ${e}`); }", "'Object.prototype.__defineGetter__' on an island value is not supported yet"],
+    ["arr", "const arr: any = [1, 2];\ntry { console.log(typeof arr.__lookupSetter__); } catch (e) { console.log(`caught: ${e}`); }", "'Object.prototype.__lookupSetter__' on an island value is not supported yet"],
+    ["obj", "const o: any = {};\ntry { console.log(typeof o.__defineSetter__); } catch (e) { console.log(`caught: ${e}`); }", "'Object.prototype.__defineSetter__' on an island value is not supported yet"],
+  ];
+  for (const [id, src, text] of cases) {
+    await expectFenceRow(`getprop-fence-annexb-${id}.ts`, `${src}\n`, true, "", text);
+  }
 });
 
 test("increment 21 stage A gate round 2 fix D3: the NUM arm's fence attribution — a name Number.prototype does NOT itself carry (hasOwnProperty, only on Object.prototype) fences as 'Object.prototype.hasOwnProperty' on a NUM receiver, not 'Number.prototype.hasOwnProperty' (round 2's own catch: every sibling arm already spelled the generic-table name correctly, only NUM's copy-pasted the kind's own constructor name by mistake)", async () => {
-  const res = await buildWasmDyn(
+  await expectFenceRow(
     "getprop-fence-num-attribution.ts",
-    ["const n: any = 5;", "try { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`${e}`); }", ""].join(
-      "\n",
-    ),
+    ["const n: any = 5;", "try { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`${e}`); }", ""].join("\n"),
+    true,
+    "",
+    "'Object.prototype.hasOwnProperty' on an island value is not supported yet",
   );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet\n");
 });
 
 test("increment 21 stage A gate round 2 fix D7: jsMarshal(dyn) aliasing — a dyn-typed value marshaled into an island (`any`) slot TWICE from the SAME `unknown` local, then both round-tripped back to `unknown` (dynFromJsval, identity), are === to each other — the S014 island amendment's dyn-operand identity arm, mirrored for the marshal-IN direction the way the existing dynFromJsval-identity test covers marshal-OUT. Also asserts the reference C backend's OWN value (round 3 note 1): the native lane deep-COPIES at this same boundary (S014's DEFAULT rule, not the wasm-only exception), so C answers `false` where wasm/Node answer `true` — pinned explicitly so a later 'fix' can never silently align wasm to C's copy instead of Node's identity", async () => {
@@ -8757,38 +8741,22 @@ test("increment 21 stage A gate round 2 fix D7: jsMarshal(dyn) aliasing — a dy
   expect(cOut.stdout).toBe("false\n");
 });
 
-test("increment 21 stage A gate round 3 fix R1/R2: '__proto__' (every kind, an Object.prototype ACCESSOR — never function-valued, so it cannot live in the function-shaped tables) and 'caller'/'arguments' (FUNC only, Function.prototype's own THROWING accessors) fence loudly instead of silently answering undefined; both are catchable and the program survives, matching the reviewer's h1 shape", async () => {
-  const res = await buildWasmDyn(
-    "getprop-fence-accessors.ts",
-    [
-      "function mintObj(): any { return { a: 1 }; }",
-      "const o: any = mintObj();",
-      "try { console.log(typeof o.__proto__); } catch (e) { console.log(`1: ${e}`); }",
-      "try { console.log(`${o.__proto__}`); } catch (e) { console.log(`2: ${e}`); }",
-      "const v: any = 5;",
-      "const f: any = v.toString;",
-      "try { console.log(typeof f.caller); } catch (e) { console.log(`3: ${e}`); }",
-      "try { console.log(typeof f.arguments); } catch (e) { console.log(`4: ${e}`); }",
-      'console.log("done");',
-      "",
-    ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
+test("increment 21 stage A gate round 3 fix R1/R2: '__proto__' (every kind, an Object.prototype ACCESSOR — never function-valued, so it cannot live in the function-shaped tables) and 'caller'/'arguments' (FUNC only, Function.prototype's own THROWING accessors) fence loudly instead of silently answering undefined; since GH #86 each fence ends the program (SEMANTICS.md S122), so each runs as its own program", async () => {
   // No Node oracle for the fence texts (Node answers the real prototype
   // object for __proto__, and throws ITS OWN strict-mode TypeError for
   // caller/arguments — this tier fences all three loudly instead of
   // modeling either, S023's own "TODO marker" framing).
-  expect(stdout.toString("utf8")).toBe(
-    [
-      "1: Error: 'Object.prototype.__proto__' on an island value is not supported yet",
-      "2: Error: 'Object.prototype.__proto__' on an island value is not supported yet",
-      "3: Error: 'Function.prototype.caller' on an island value is not supported yet",
-      "4: Error: 'Function.prototype.arguments' on an island value is not supported yet",
-      "done",
-      "",
-    ].join("\n"),
-  );
+  const objHead = "function mintObj(): any { return { a: 1 }; }\nconst o: any = mintObj();\n";
+  const fnHead = "const v: any = 5;\nconst f: any = v.toString;\n";
+  const cases: [string, string, string][] = [
+    ["proto-typeof", objHead + "try { console.log(typeof o.__proto__); } catch (e) { console.log(`1: ${e}`); }", "'Object.prototype.__proto__' on an island value is not supported yet"],
+    ["proto-template", objHead + "try { console.log(`${o.__proto__}`); } catch (e) { console.log(`2: ${e}`); }", "'Object.prototype.__proto__' on an island value is not supported yet"],
+    ["caller", fnHead + "try { console.log(typeof f.caller); } catch (e) { console.log(`3: ${e}`); }", "'Function.prototype.caller' on an island value is not supported yet"],
+    ["arguments", fnHead + "try { console.log(typeof f.arguments); } catch (e) { console.log(`4: ${e}`); }", "'Function.prototype.arguments' on an island value is not supported yet"],
+  ];
+  for (const [id, src, text] of cases) {
+    await expectFenceRow(`getprop-fence-accessors-${id}.ts`, `${src}\nconsole.log("done");\n`, true, "", text);
+  }
 });
 
 test("increment 21 stage A gate round 3 fix R3: a LITERAL \"__proto__\" key in an island object literal refuses at COMPILE TIME (jsOp:objLit-proto-key) — a wasm-ALONE divergence otherwise: real JS treats `{__proto__: v}` as the prototype-setter special form (non-object v is a silent no-op, no own property is ever created, `typeof o.__proto__` reads the real prototype object, \"object\"), where this tier's objPut would silently store it as an ordinary own entry (\"number\") — Node-measured AND confirmed against the reference C backend, both answering \"object\" where the pre-fix wasm lane answered \"number\" (the reviewer's h6/h6b shape)", async () => {
@@ -8974,28 +8942,18 @@ test("increment 21 stage B N2 gate, RETIRED by INC-25 P4's merge (CP1 ack R12): 
 test("split() capture splice — R4's own four-shape minimum, verbatim, ELEMENT level", async () => {
   // ELEMENT level, not join(): a join collapses a genuinely-empty
   // participating capture and a nonparticipating undefined slot to the
-  // SAME "" either way, so a join-level assertion can't discriminate
-  // "correctly produced '' per S064" from "wrongly produced an empty
-  // match" — the design's own pin language ("a nonparticipating slot
-  // (S064's \"\" rendering)") means exactly this element-level
-  // discrimination (lead ruling, this pass's own CP). JSON.stringify
-  // shows the divergence directly: Node's OWN JSON.stringify of a
-  // nonparticipating slot is `null` (from an actual `undefined`
-  // element) — measured live this session — while this tier's `string
-  // []` cannot hold undefined at all, so it renders "" per S064
-  // instead (registered, not a bug). The assertions below are this
-  // TIER's own expected S064-aware output, not Node's raw JSON (which
-  // would never match by construction) — every `null` in the live-
-  // measured Node JSON becomes "" here, nothing else changes.
+  // SAME "" either way. JSON.stringify shows the difference directly:
+  // Node's JSON of a nonparticipating slot is `null` (an actual
+  // `undefined` element), and since Unit U this tier's string slots hold
+  // undefined too (SEMANTICS.md S064 is c/llvm-only now), so the
+  // expectations below are Node's own JSON, measured.
   //
-  // (a) a nonparticipating slot — index 1 is S064's own divergence
-  //     (Node: null; here: ""). (b) a nested group (both levels
-  //     spliced, no S064 exposure — no index is ever nonparticipating).
-  //     (c) a no-match subject (no splice at all, no S064 exposure).
-  //     (d) one zero-length-advance interaction (js_regexp_Symbol_
-  //     split's own `e === p` check — a zero-length match landing
-  //     exactly at the current segment's own start is treated as no-
-  //     match, not a splice point; no S064 exposure).
+  // (a) a nonparticipating slot (Node: null). (b) a nested group (both
+  //     levels spliced, no index is ever nonparticipating). (c) a
+  //     no-match subject (no splice at all). (d) one zero-length-advance
+  //     interaction (js_regexp_Symbol_split's own `e === p` check — a
+  //     zero-length match landing exactly at the current segment's own
+  //     start is treated as no-match, not a splice point).
   const res = await buildWasm(
     "split-splice-r4.ts",
     [
@@ -9008,7 +8966,7 @@ test("split() capture splice — R4's own four-shape minimum, verbatim, ELEMENT 
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
-    ['["a","",""]', '["a","1","1","b"]', '["abc"]', '["a",""]', ""].join("\n"),
+    ['["a",null,""]', '["a","1","1","b"]', '["abc"]', '["a",""]', ""].join("\n"),
   );
 });
 
@@ -9024,8 +8982,9 @@ test("split() stale-capture-reuse regression: two alternatives, different captur
   // inside the loop. No R4 shape above happens to toggle a group's own
   // participation across segments (each pattern there has either one
   // group, always-together nested groups, or none) — this pin is that
-  // exact toggling shape, element-level, S064-aware (Node: null for
-  // whichever alternative's group didn't participate that segment).
+  // exact toggling shape, element-level (Node: null for whichever
+  // alternative's group didn't participate that segment — and this tier's
+  // undefined, Unit U).
   const res = await buildWasm(
     "split-stale-capture.ts",
     ['console.log(JSON.stringify("1a2b3".split(/(\\d)|([a-z])/)));'].join("\n"),
@@ -9033,7 +8992,7 @@ test("split() stale-capture-reuse regression: two alternatives, different captur
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
-    '["","1","","","","a","","2","","","","b","","3","",""]\n',
+    '["","1",null,"",null,"a","","2",null,"",null,"b","","3",null,""]\n',
   );
 });
 
@@ -9207,24 +9166,19 @@ test("empty-match advance at the subject's own end, without /u: splits the surro
  * matchAllInto}. Pin shapes (a)-(e) per the brief's own §1, plus the two
  * required TypeError pins (F2). */
 
-test("match()/exec() nonparticipating capture — S064's own honest-slice rule, ELEMENT level: two DIFFERENT Node shapes collapse to the SAME tier answer", async () => {
-  // The design's own ready witness, measured live this session:
-  // "b".match(/(a*)*/) leaves capture[1] genuinely UNSET (`1 in m` is
-  // true, `m[1]` is the VALUE undefined, unquoted — JSON.stringify
-  // shows ["",null]), while /(a*)+/.exec("b") leaves it PARTICIPATING-
-  // EMPTY (`e[1]` is the string ""). Node tells these apart; this tier's
-  // `string[]` cannot hold `undefined` at all, so S064 renders BOTH as
-  // "" — the two calls answer IDENTICALLY here where Node's own answers
-  // differ. Asserted at raw stdout (element) level, not JSON.stringify
-  // (which would print "null" for the first on Node but this tier can
-  // never produce — the whole point is what THIS tier answers).
+test("match()/exec() nonparticipating capture, ELEMENT level: an UNSET capture is undefined, a participating-empty one is \"\" — Node's distinction (Unit U; S064 is c/llvm-only now)", async () => {
+  // "b".match(/(a*)*/) leaves capture[1] genuinely UNSET (`m[1]` is the
+  // VALUE undefined, unquoted), while /(a*)+/.exec("b") leaves it
+  // PARTICIPATING-EMPTY (`e[1]` is the string ""). Node tells these apart
+  // and so does this tier now (string slots hold undefined). Node also
+  // prints the result's index/input/groups — S116 (c), not pinned here.
   const res = await buildWasm(
     "match-honest-slice.ts",
     ['console.log("b".match(/(a*)*/));', 'console.log(/(a*)+/.exec("b"));'].join("\n"),
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(["[ '', '' ]", "[ '', '' ]", ""].join("\n"));
+  expect(stdout.toString("utf8")).toBe(["[ '', undefined ]", "[ '', '' ]", ""].join("\n"));
 });
 
 test("match() null arm — no match answers null, never []", async () => {
