@@ -2,7 +2,7 @@
  * its boundary fences), island-expression detection, the island method-call
  * surface (Math and number/string methods under --dynamic), and the npm
  * package boundary fences for node_modules-declared symbols. */
-import { boolToNumber, toNumberCanon } from "./lower-exprs.js";
+import { boolToNumber, toNumberCanon, undefCallSpreadGuard } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
@@ -738,7 +738,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
       ts.isSpreadElement(call.arguments[0]!)
     ) {
       const spread = call.arguments[0]! as ts.SpreadElement;
-      const src = L.lowerExpr(spread.expression);
+      const src = undefCallSpreadGuard(L, L.lowerExpr(spread.expression), spread.expression, locOf(spread));
       if (src.type.kind !== "array" || src.type.elem.kind !== "f64") {
         L.unsupported(
           "SC1090",

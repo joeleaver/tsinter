@@ -23,7 +23,7 @@ import * as ts from "../ts7/adapter.js";
 import type { FnCtx, Lowerer } from "./lowerer.js";
 import { BOOL, F64, IrExpr, IrFunction, IrLocal, IrStmt, IrType, REGEX, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, typeEquals } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
-import { isMatchSliceType, lowerGroupsProjection, namedCaptureGroupsOfPattern } from "./lower-exprs.js";
+import { bindOnce, isMatchSliceType, isUndefExpr, lowerGroupsProjection, mayHoldSlotUndef, namedCaptureGroupsOfPattern, undefinedAsText } from "./lower-exprs.js";
 import { foldRegexLiteral } from "../../backend/wasm/regex-fold.js";
 import { typeKey } from "../types.js";
 import { bodyReadsArguments } from "./lower-calls.js";
@@ -585,8 +585,10 @@ export function lowerReplaceCall(L: Lowerer, call: ts.CallExpression, access: ts
     if (L.mapTypeOf(repT)?.kind !== "string") return null;
     const loc = locOf(call);
     const receiver = lowerReceiver();
-    const pat = L.lowerExpr(patNode);
-    const rep = L.lowerExpr(repNode);
+    // GH #104 (SEMANTICS.md S119): a pattern or replacement holding
+    // undefined is the text "undefined" (ToString).
+    const pat = undefinedAsText(L, L.lowerExpr(patNode), loc);
+    const rep = undefinedAsText(L, L.lowerExpr(repNode), loc);
     return { kind: "regexIntrinsic", method: isAll ? "strReplaceAll" : "strReplace", receiver, args: [pat, rep], type: STRING, loc };
   }
   return lowerFunctionReplace(L, call, isRegex, isAll, lowerReceiver);
@@ -688,6 +690,17 @@ function lowerFunctionReplace(L: Lowerer, call: ts.CallExpression, isRegex: bool
   }
   const key = `fnReplace:${isRegex ? "re" : "str"}:${isAll}:${typeKey(fnT)}:${shape?.count ?? "?"}:${shape?.groups.map((g) => `${g.name}=${g.index}`).join(",") ?? ""}`;
   const name = helperName(L, key, (fname) => buildReplaceHelper(L, fname, fnNode, fnT, isRegex, isAll, shape, roleOf, loc));
+  // GH #104 (SEMANTICS.md S119): a replacer slot holding undefined is not
+  // callable, so Node replaces with its ToString, "undefined".
+  if (fn.kind !== "closure" && mayHoldSlotUndef(L, fn)) {
+    return bindOnce(L, receiver, loc, (r) => bindOnce(L, pat, loc, (p) => bindOnce(L, fn, loc, (f) => {
+      const text: IrExpr = { kind: "strLit", value: "undefined", type: STRING, loc };
+      const asText: IrExpr = isRegex
+        ? { kind: "regexIntrinsic", method: isAll ? "replaceAll" : "replace", receiver: r, args: [p, text], type: STRING, loc }
+        : { kind: "regexIntrinsic", method: isAll ? "strReplaceAll" : "strReplace", receiver: r, args: [p, text], type: STRING, loc };
+      return { kind: "ternary", cond: isUndefExpr(f, false, loc), then: asText, else_: { kind: "call", callee: name, args: [r, p, f], type: STRING, loc }, type: STRING, loc };
+    })));
+  }
   return { kind: "call", callee: name, args: [receiver, pat, fn], type: STRING, loc };
 }
 
@@ -815,7 +828,8 @@ function buildReplaceHelper(
         throw new Error("unreachable: replacer role");
     }
   });
-  loop.push(decl(r, L.coerceInto(blame, { kind: "callValue", callee: F, args, type: fnT.ret, loc }, STRING)));
+  // GH #104 (SEMANTICS.md S119): ToString of the replacer's result — undefined is the text "undefined".
+  loop.push(decl(r, undefinedAsText(L, L.coerceInto(blame, { kind: "callValue", callee: F, args, type: fnT.ret, loc }, STRING), loc)));
   loop.push(push(parts, at(row, width, STRING))); // the gap before the match
   loop.push(push(parts, r));
   loop.push(assign(i, bin("+", i, num(1, loc), loc)));

@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { conditionalSpreadOf, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, undefinedAsText } from "./lower-exprs.js";
+import { bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -862,6 +862,27 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     };
   }
 
+  /** GH #105: Node validates a builtin's arguments inside the call, after
+   * every argument evaluated. `build` makes the call from `args`; where a
+   * `dyn.argStr` check would run ahead of a later argument with effects,
+   * each argument evaluates first into a hidden local (a checked one as its
+   * unchecked value), in order, and the checks then run over those reads. */
+  export function deferArgChecks(L: Lowerer, args: IrExpr[], loc: SrcLoc, build: (args: IrExpr[]) => IrExpr): IrExpr {
+    const isCheck = (e: IrExpr): e is IrExpr & { kind: "libCall" } => e.kind === "libCall" && e.fn === "dyn.argStr";
+    const first = args.findIndex(isCheck);
+    if (first < 0 || args.slice(first + 1).every((a) => isCheck(a) ? droppableStatic(a.args[0]!) : droppableStatic(a))) return build(args);
+    const stmts: IrStmt[] = [];
+    const bind = (e: IrExpr): IrExpr => {
+      if (droppableStatic(e)) return e;
+      const t = L.declareHiddenLocal("%arg", e.type);
+      stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+      return { kind: "varRef", localId: t.id, type: e.type, loc };
+    };
+    const out = args.map((a) => (isCheck(a) ? { ...a, args: [bind(a.args[0]!), ...a.args.slice(1)] } : bind(a)));
+    const result = build(out);
+    return { kind: "seqExpr", stmts, result, type: result.type, loc };
+  }
+
   /** fs.existsSync on the WasmGC lanes: Node's validation failure is
    * swallowed, so anything that is not a path answers false — a slot
    * holding undefined and a dynamic non-string included. Null where the
@@ -1236,7 +1257,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const mode: IrExpr | null = modeNode ? L.lowerExprExpecting(modeNode, F64) : null;
       if (!recursive) {
         return mode
-          ? { kind: "libCall", fn: "fs.mkdirModeSync", args: [path, mode], type: VOID, loc }
+          ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fs.mkdirModeSync", args, type: VOID, loc }))
           : { kind: "libCall", fn: "fs.mkdirSync", args: [path], type: VOID, loc };
       }
       if (!ts.isExpressionStatement(expr.parent)) {
@@ -1247,7 +1268,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         );
       }
       return mode
-        ? { kind: "libCall", fn: "fs.mkdirRecursiveModeSync", args: [path, mode], type: VOID, loc }
+        ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fs.mkdirRecursiveModeSync", args, type: VOID, loc }))
         : { kind: "libCall", fn: "fs.mkdirRecursiveSync", args: [path], type: VOID, loc };
     }
     // fs.promises.mkdir(p, options): the mkdirSync matrix behind settled
@@ -1284,11 +1305,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const type: IrType = { kind: "promise", inner: VOID };
       if (!recursive) {
         return mode
-          ? { kind: "libCall", fn: "fsp.mkdirMode", args: [path, mode], type, loc }
+          ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fsp.mkdirMode", args, type, loc }))
           : { kind: "libCall", fn: "fsp.mkdir", args: [path], type, loc };
       }
       return mode
-        ? { kind: "libCall", fn: "fsp.mkdirRecursiveMode", args: [path, mode], type, loc }
+        ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fsp.mkdirRecursiveMode", args, type, loc }))
         : { kind: "libCall", fn: "fsp.mkdirRecursive", args: [path], type, loc };
     }
     // rmSync(p, options): literal { recursive?, force? } booleans — the
@@ -1320,13 +1341,13 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // the both-omitted case).
       const num = (node: ts.Expression | undefined, dflt: number): IrExpr =>
         node ? L.lowerExprExpecting(node, F64) : { kind: "numLit", value: dflt, type: F64, loc };
-      return {
+      return deferArgChecks(L, [path, recursive, force, num(opts.exprs["maxRetries"], 0), num(opts.exprs["retryDelay"], 100)], loc, (args) => ({
         kind: "libCall",
         fn: "fs.rmRetrySync",
-        args: [path, recursive, force, num(opts.exprs["maxRetries"], 0), num(opts.exprs["retryDelay"], 100)],
+        args,
         type: VOID,
         loc,
-      };
+      }));
     }
     // accessSync(p, mode?): an omitted mode is Node's F_OK (0). The mode
     // is an ordinary number — fs.constants.* reads bake to literals.
@@ -1338,7 +1359,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const mode: IrExpr = expr.arguments[1]
         ? L.lowerExprExpecting(expr.arguments[1], F64)
         : { kind: "numLit", value: 0, type: F64, loc };
-      return { kind: "libCall", fn: "fs.accessSync", args: [path, mode], type: VOID, loc };
+      return deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fs.accessSync", args, type: VOID, loc }));
     }
     if (bi.module === "fs" && bi.member === "writeFileSync" && expr.arguments.length === 2) {
       const dataIr = L.mapTypeOf(L.typeOf(expr.arguments[1]!));
@@ -1352,7 +1373,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         }
         const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
         const data = L.lowerExprExpecting(expr.arguments[1]!, BYTES_U8);
-        return { kind: "libCall", fn: "fs.writeFileSyncBytes", args: [path, data], type: VOID, loc };
+        return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileSyncBytes", args, type: VOID, loc }));
       }
     }
     // writeFileSync(p, data, options): the lowered options are a literal
@@ -1375,7 +1396,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         ) {
           const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
           const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
-          return { kind: "libCall", fn: "fs.writeFileSync", args: [path, data], type: VOID, loc };
+          return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileSync", args, type: VOID, loc }));
         }
       }
       let modeNode: ts.Expression | null = null;
@@ -1418,10 +1439,10 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
       if (modeNode === null) {
         // encoding-only options change nothing: the plain write.
-        return { kind: "libCall", fn: "fs.writeFileSync", args: [path, data], type: VOID, loc };
+        return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileSync", args, type: VOID, loc }));
       }
       const mode = L.lowerExprExpecting(modeNode, F64);
-      return { kind: "libCall", fn: "fs.writeFileModeSync", args: [path, data, mode], type: VOID, loc };
+      return deferArgChecks(L, [path, data, mode], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileModeSync", args, type: VOID, loc }));
     }
     // zlib takes Buffers; a string argument (the lib admits it) gets the
     // wrap-it-first hint instead of a generic type mismatch.
@@ -1464,8 +1485,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         isPathModule(bi.module) && L.mapTypeOf(L.typeOf(a))?.kind !== "string"
           ? checkedStrParam(L, a, bi.member === "resolve" ? `paths[${i}]` : "path", "of type string", false)
           : L.lowerExprExpecting(a, STRING));
-      const packed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(STRING), loc };
-      return { kind: "libCall", fn: fn.fn, args: [packed], type: fn.result, loc };
+      return deferArgChecks(L, elems, loc, (elems) => ({ kind: "libCall", fn: fn.fn, args: [{ kind: "arrayLit", elems, type: arrayOf(STRING), loc }], type: fn.result, loc }));
     }
     if (bi.module === "fs" && bi.member === "readFileSync" &&
         expr.arguments.length >= 1 && expr.arguments.length <= 2 &&
@@ -1557,7 +1577,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const dflt = fn.defaults![i - required]!;
       args.push({ kind: "strLit", value: dflt, type: STRING, loc });
     }
-    return { kind: "libCall", fn: fn.fn, args, type: fn.result, loc };
+    return deferArgChecks(L, args, loc, (args) => ({ kind: "libCall", fn: fn.fn, args, type: fn.result, loc }));
   }
 
 /** Reflect.apply(target, thisArg, argsList) where the TARGET is a builtin
@@ -3612,7 +3632,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       );
     }
     if (member === "parse") {
-      const text = L.lowerExprExpecting(call.arguments[0]!, STRING);
+      const text = undefinedAsText(L, L.lowerExprExpecting(call.arguments[0]!, STRING), loc); // GH #104: ToString (S119)
       return { kind: "libCall", fn: "json.parse", args: [text], type: DYN, loc };
     }
     if (member === "stringify") {
@@ -3675,14 +3695,38 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
             `(only number, string, boolean, records, arrays, unions of those, and 'unknown' stringify)`,
         );
       }
-      const node: IrExpr = { kind: "jsonStringify", value, type: STRING, loc };
-      if (indent !== "") {
-        // The compile-time-resolved indent rides as an extra property (the
-        // node shape in ir/nodes.ts is unchanged); the backend re-indents
-        // the compact serializer output with Node's gap algorithm.
-        (node as { indent?: string }).indent = indent;
+      // GH #102 (SEMANTICS.md S119): on the WasmGC lanes a string slot
+      // holds undefined, so a dyn root the stringify drops (undefined, a
+      // function) answers the undefined VALUE, as in Node, not its text.
+      if (value.type.kind === "dyn" && L.undefSlots) {
+        return bindOnce(L, value, loc, (read) => ({
+          kind: "ternary",
+          cond: {
+            kind: "logical",
+            op: "||",
+            left: { kind: "dynTest", test: "undefined", value: read, type: BOOL, loc },
+            right: { kind: "dynTest", test: "function", value: read, type: BOOL, loc },
+            type: BOOL,
+            loc,
+          },
+          then: { kind: "slotUndef", type: STRING, loc },
+          else_: indent !== "" ? Object.assign({ kind: "jsonStringify", value: read, type: STRING, loc } as IrExpr, { indent }) : { kind: "jsonStringify", value: read, type: STRING, loc },
+          type: STRING,
+          loc,
+        }));
       }
-      return node;
+      // GH #101/#102 (SEMANTICS.md S119): a root holding its slot's
+      // undefined stringifies to the undefined VALUE, not "null".
+      return undefElse(L, value, loc, slotUndefOf(loc), (read) => {
+        const node: IrExpr = { kind: "jsonStringify", value: read, type: STRING, loc };
+        if (indent !== "") {
+          // The compile-time-resolved indent rides as an extra property (the
+          // node shape in ir/nodes.ts is unchanged); the backend re-indents
+          // the compact serializer output with Node's gap algorithm.
+          (node as { indent?: string }).indent = indent;
+        }
+        return node;
+      });
     }
     return null; // unknown members are tsc errors before lowering
   }
@@ -3982,7 +4026,18 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const baseNode = args[1];
     if (!baseNode) return noBase(input);
     const baseT = L.mapTypeOf(L.typeOf(baseNode));
-    if (baseT?.kind === "string") return withBase(input, L.lowerExpr(baseNode));
+    if (baseT?.kind === "string") {
+      const base = L.lowerExpr(baseNode);
+      // GH #104 (SEMANTICS.md S119): a base holding undefined is an absent
+      // base — both arguments evaluate first, in order.
+      if (mayHoldSlotUndef(L, base)) {
+        return bindOnce(L, input, loc, (inRead) => bindOnce(L, base, loc, (bRead) => {
+          const yes = noBase(inRead);
+          return { kind: "ternary", cond: isUndefExpr(bRead, false, loc), then: yes, else_: withBase(inRead, bRead), type: yes.type, loc };
+        }));
+      }
+      return withBase(input, base);
+    }
     if (baseT?.kind === "url") {
       return withBase(input, { kind: "libCall", fn: "url.href", args: [L.lowerExpr(baseNode)], type: STRING, loc });
     }
@@ -5898,16 +5953,20 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         if (data.type.kind === "dyn" && isJsSourceFile(call.getSourceFile())) {
           data = { kind: "dynCheck", value: data, type: STRING, loc };
         }
+        // GH #104 (SEMANTICS.md S119): a chunk holding undefined is Node's
+        // type error, thrown at the call.
+        const chunkChecked = (build: (read: IrExpr) => IrExpr): IrExpr =>
+          undefElse(L, data, loc, () => nodeThrowExpr(1, "ERR_INVALID_ARG_TYPE", 'The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined', BOOL, loc), build);
         // The Buffer overload writes raw bytes through the same promptly
         // submitted streams.
         if (data.type.kind === "bytes" && data.type.elem === "u8") {
-          return {
+          return chunkChecked((read) => ({
             kind: "libCall",
             fn: stream === "stdout" ? "process.stdoutWriteBytes" : "process.stderrWriteBytes",
-            args: [data],
+            args: [read],
             type: BOOL,
             loc,
-          };
+          }));
         }
         if (data.type.kind !== "string") {
           L.noLowering(
@@ -5916,13 +5975,13 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
             "strings and Buffer/Uint8Array values write; narrow unions first",
           );
         }
-        return {
+        return chunkChecked((read) => ({
           kind: "libCall",
           fn: stream === "stdout" ? "process.stdoutWrite" : "process.stderrWrite",
-          args: [data],
+          args: [read],
           type: BOOL,
           loc,
-        };
+        }));
       }
     }
     const member = L.stdlibGlobalMember(access, "process");
@@ -6602,7 +6661,8 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         call.arguments.length === 0 ? "pass the string (a zero-argument encode is an empty Uint8Array)" : undefined,
       );
     }
-    const s = L.lowerExprExpecting(call.arguments[0]!, STRING);
+    // GH #104 (SEMANTICS.md S119): an input holding undefined is the default "".
+    const s = undefinedAsAbsent(L, L.lowerExprExpecting(call.arguments[0]!, STRING), { kind: "strLit", value: "", type: STRING, loc });
     const enc: IrExpr = { kind: "strLit", value: "utf8", type: STRING, loc };
     return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
   }
@@ -6653,8 +6713,11 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       }
       const subs = call.arguments.slice(1).map((a): IrExpr => {
         const v = L.lowerExpr(a);
-        if (v.type.kind === "string") return v;
-        if (v.type.kind === "f64" || v.type.kind === "bool" || v.type.kind === "record") {
+        // GH #104 (SEMANTICS.md S119): a substitution holding undefined
+        // is the text "undefined".
+        if (v.type.kind === "string") return undefinedAsText(L, v, loc);
+        if (v.type.kind === "record") return ensureString(L, v, a);
+        if (v.type.kind === "f64" || v.type.kind === "bool") {
           return { kind: "toString", operand: v, type: STRING, loc };
         }
         L.noLowering(
@@ -6684,7 +6747,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         if (packed.type.kind !== "bytes") L.badType(spread.expression, L.typeOf(spread.expression));
         return { kind: "libCall", fn: "string.fromCharCode", args: [packed], type: STRING, loc };
       }
-      const packed = L.lowerExprExpecting(spread.expression, arrayOf(F64));
+      const packed = undefCallSpreadGuard(L, L.lowerExprExpecting(spread.expression, arrayOf(F64)), spread.expression, locOf(spread));
       return { kind: "libCall", fn: "string.fromCharCode", args: [packed], type: STRING, loc };
     }
     const elems = call.arguments.map((a) => L.lowerExprExpecting(a, F64));

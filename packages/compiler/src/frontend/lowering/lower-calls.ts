@@ -18,7 +18,7 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
+import { checkAfterArgs, undefFenceGuard, isUndefExpr, slotUndefOf, undefElse, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -460,7 +460,9 @@ export interface GenericInstance {
       const elems = sources.slice(restAt).map((a, i) => {
         if (isIr(a)) return L.coerceInto(blame, a.ir, restType.elem);
         if (ts.isSpreadElement(a)) {
-          let src = L.lowerExpr(a.expression);
+          // GH #104 (SEMANTICS.md S119): V8's call-spread TypeError over a
+          // slot holding undefined.
+          let src = undefCallSpreadGuard(L, L.lowerExpr(a.expression), a.expression, locOf(a));
           // A same-element Set spread drains first (setIntrinsic toArray).
           if (src.type.kind === "set" && typeEquals(src.type.elem, restType.elem)) {
             src = { kind: "setIntrinsic", method: "toArray", receiver: src, args: [], type: arrayOf(src.type.elem), loc: locOf(a) };
@@ -2262,11 +2264,11 @@ export function islandPrimitiveExit(L: Lowerer, call: ts.CallExpression, result:
     // call arguments ride the interned per-arity dyn thunk.
     return callArgs.length > 1
       ? makeTimerArgsThunk(L, callArgs[0]!, callArgs.slice(1), what, loc)
-      : adaptZeroArgTimerCallback(L, L.lowerExpr(callArgs[0]!), callArgs[0]!, loc);
+      : adaptZeroArgTimerCallback(L, undefFnParamGuard(L, L.lowerExpr(callArgs[0]!), "callback", loc), callArgs[0]!, loc);
   }
 
-  function makeTimerArgsThunk(L: Lowerer, cbNode: ts.Expression, argNodes: readonly ts.Expression[], what: string, loc: SrcLoc): IrExpr {
-    const cbLowered = L.lowerExpr(cbNode);
+  function makeTimerArgsThunk(L: Lowerer, cbNode: ts.Expression, argNodes: readonly ts.Expression[], what: string, loc: SrcLoc, cbPre?: IrExpr): IrExpr {
+    const cbLowered = cbPre ?? L.lowerExpr(cbNode);
     let boxedCb: IrExpr;
     if (cbLowered.type.kind === "dyn") {
       boxedCb = cbLowered;
@@ -2326,7 +2328,33 @@ export function islandPrimitiveExit(L: Lowerer, call: ts.CallExpression, result:
         loc,
       });
     }
+    // GH #104 (SEMANTICS.md S119): a callback slot holding undefined is
+    // Node's ERR_INVALID_ARG_TYPE, after every argument evaluated.
+    if (cbLowered.type.kind === "func") {
+      return checkAfterArgs(L, cbLowered, args, loc,
+        (r) => ({ kind: "dynFrom", value: undefFnParamGuard(L, r, "callback", loc), type: DYN, loc }),
+        (cb, rest) => ({ kind: "call", callee: name, args: [cb, ...rest], type: toT, loc }));
+    }
     return { kind: "call", callee: name, args: [boxedCb, ...args], type: toT, loc };
+  }
+
+  /** `setTimeout(cb, ms, ...args)` / setInterval's: JS evaluates the
+   * callback, then the delay, then the trailing arguments — the callback
+   * and delay bind first (when they have effects), the thunk's arguments
+   * evaluate after them. */
+  function timerWithArgs(L: Lowerer, expr: ts.CallExpression, what: string, loc: SrcLoc, build: (cb: IrExpr, ms: IrExpr) => IrExpr): IrExpr {
+    const stmts: IrStmt[] = [];
+    const bind = (e: IrExpr): IrExpr => {
+      if (droppableStatic(e)) return e;
+      const t = L.declareHiddenLocal("%targ", e.type);
+      stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+      return { kind: "varRef", localId: t.id, type: e.type, loc };
+    };
+    const raw = bind(L.lowerExpr(expr.arguments[0]!));
+    const ms = bind(L.lowerExpr(expr.arguments[1]!));
+    const cb = makeTimerArgsThunk(L, expr.arguments[0]!, expr.arguments.slice(2), what, loc, raw);
+    const result = build(cb, ms);
+    return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: result.type, loc };
   }
 
 /** The timer surface's member names — the ambient globals AND the
@@ -2372,22 +2400,28 @@ export function islandPrimitiveExit(L: Lowerer, call: ts.CallExpression, result:
       if (expr.arguments.length === 0) {
         L.noLowering("setTimeout with 0 arguments", expr, "the supported form is setTimeout(callback, ms?, ...args)");
       }
-      const cb = expr.arguments.length > 2
-        ? makeTimerArgsThunk(L, expr.arguments[0]!, expr.arguments.slice(2), "setTimeout", loc)
-        : adaptZeroArgTimerCallback(L, L.lowerExpr(expr.arguments[0]!), expr.arguments[0]!, loc);
-      const ms: IrExpr = expr.arguments.length >= 2
-        ? L.lowerExpr(expr.arguments[1]!)
-        : { kind: "numLit", value: 1, type: F64, loc };
+      const resultT = L.mapTypeOf(L.typeOf(expr));
       // The use position decides the shape: a Timeout handle (mapped to
       // f64) when the call is USED (assigned, `.unref()`d, cleared) — the
       // clearable-handle timer; plain void in statement position (the
       // historic fire-and-forget setTimeout, no clear surface). Both ride
       // the same heap; only the handle form can be unref'd/cleared.
-      const resultT = L.mapTypeOf(L.typeOf(expr));
-      if (resultT?.kind === "f64" && !ts.isExpressionStatement(expr.parent)) {
-        return { kind: "libCall", fn: "timers.setTimeoutHandle", args: [cb, ms], type: F64, loc };
+      const handle = resultT?.kind === "f64" && !ts.isExpressionStatement(expr.parent);
+      const build = (cb: IrExpr, ms: IrExpr): IrExpr => handle
+        ? { kind: "libCall", fn: "timers.setTimeoutHandle", args: [cb, ms], type: F64, loc }
+        : { kind: "libCall", fn: "timers.setTimeout", args: [cb, ms], type: VOID, loc };
+      if (expr.arguments.length > 2) {
+        return timerWithArgs(L, expr, "setTimeout", loc, build);
       }
-      return { kind: "libCall", fn: "timers.setTimeout", args: [cb, ms], type: VOID, loc };
+      // GH #104 (SEMANTICS.md S119): a callback slot holding undefined is
+      // Node's ERR_INVALID_ARG_TYPE, after the delay evaluated.
+      const raw = L.lowerExpr(expr.arguments[0]!);
+      const ms: IrExpr = expr.arguments.length >= 2
+        ? L.lowerExpr(expr.arguments[1]!)
+        : { kind: "numLit", value: 1, type: F64, loc };
+      return checkAfterArgs(L, raw, [ms], loc,
+        (r) => adaptZeroArgTimerCallback(L, undefFnParamGuard(L, r, "callback", loc), expr.arguments[0]!, loc),
+        (cb, [m]) => build(cb, m!));
     }
     // clearTimeout(handle): shares the interval clear (the handle ids
     // share one space). A `Timeout | null` handle narrows first, like
@@ -2420,13 +2454,17 @@ export function islandPrimitiveExit(L: Lowerer, call: ts.CallExpression, result:
       if (expr.arguments.length === 0) {
         L.noLowering("setInterval with 0 arguments", expr, "the supported form is setInterval(callback, ms?, ...args)");
       }
-      const cb = expr.arguments.length > 2
-        ? makeTimerArgsThunk(L, expr.arguments[0]!, expr.arguments.slice(2), "setInterval", loc)
-        : adaptZeroArgTimerCallback(L, L.lowerExpr(expr.arguments[0]!), expr.arguments[0]!, loc);
+      if (expr.arguments.length > 2) {
+        return timerWithArgs(L, expr, "setInterval", loc, (cb, ms) => ({ kind: "libCall", fn: "timers.setInterval", args: [cb, ms], type: F64, loc }));
+      }
+      // GH #104 (SEMANTICS.md S119): setTimeout's callback check.
+      const raw = L.lowerExpr(expr.arguments[0]!);
       const ms: IrExpr = expr.arguments.length >= 2
         ? L.lowerExpr(expr.arguments[1]!)
         : { kind: "numLit", value: 1, type: F64, loc };
-      return { kind: "libCall", fn: "timers.setInterval", args: [cb, ms], type: F64, loc };
+      return checkAfterArgs(L, raw, [ms], loc,
+        (r) => adaptZeroArgTimerCallback(L, undefFnParamGuard(L, r, "callback", loc), expr.arguments[0]!, loc),
+        (cb, [m]) => ({ kind: "libCall", fn: "timers.setInterval", args: [cb, m!], type: F64, loc }));
     }
     if (member === "clearInterval") {
       const noop = tolerantClearNoop(L, expr, loc);
@@ -2453,7 +2491,7 @@ export function islandPrimitiveExit(L: Lowerer, call: ts.CallExpression, result:
       }
       const cb = expr.arguments.length > 1
         ? makeTimerArgsThunk(L, expr.arguments[0]!, expr.arguments.slice(1), "setImmediate", loc)
-        : adaptZeroArgTimerCallback(L, L.lowerExpr(expr.arguments[0]!), expr.arguments[0]!, loc);
+        : adaptZeroArgTimerCallback(L, undefFnParamGuard(L, L.lowerExpr(expr.arguments[0]!), "callback", loc), expr.arguments[0]!, loc);
       return { kind: "libCall", fn: "timers.setImmediate", args: [cb], type: F64, loc };
     }
     if (member === "clearImmediate") {
@@ -3057,7 +3095,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           loc,
         };
       }
-      const adapted = adaptZeroArgTimerCallback(L, cb, raw, loc);
+      const adapted = adaptZeroArgTimerCallback(L, undefFnParamGuard(L, cb, "callback", loc), raw, loc);
       if (adapted.type.kind !== "func") {
         L.noLowering(
           `queueMicrotask with a '${L.fmt(cb.type)}' argument`,
@@ -3571,7 +3609,9 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           const x = L.lowerExprExpecting(expr.arguments[0]!, F64);
           return { kind: "libCall", fn: "num.isNaN", args: [x], type: BOOL, loc };
         }
-        const s = L.lowerExprExpecting(expr.arguments[0]!, STRING);
+        // GH #104 (SEMANTICS.md S119): ToString of a slot holding
+        // undefined is the text "undefined" (NaN).
+        const s = undefinedAsText(L, L.lowerExprExpecting(expr.arguments[0]!, STRING), loc);
         const radix: IrExpr = expr.arguments[1]
           ? L.lowerExprExpecting(expr.arguments[1], F64)
           : { kind: "numLit", value: 0, type: F64, loc };
@@ -3593,7 +3633,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         const name = expr.expression.text;
         const probed = probeLower(L, expr.arguments[0]!);
         if (name === "parseFloat" && probed?.type.kind === "string") {
-          return { kind: "libCall", fn: "num.parseFloat", args: [probed], type: F64, loc };
+          return { kind: "libCall", fn: "num.parseFloat", args: [undefinedAsText(L, probed, loc)], type: F64, loc };
         }
         if (name === "isFinite" && probed?.type.kind === "f64") {
           return { kind: "libCall", fn: "number.isFinite", args: [probed], type: BOOL, loc };
@@ -4664,6 +4704,9 @@ const DYN_STRING_ONLY_METHODS = new Set([
       );
     }
     if (arg.type.kind === "caught") return null;
+    // GH #101 (SEMANTICS.md S119): an array slot holding undefined is no
+    // array — the test is on the value, evaluated once.
+    if (arg.type.kind === "array" && mayHoldSlotUndef(L, arg)) return isUndefExpr(arg, true, loc);
     if (arg.kind === "varRef" || arg.kind === "recordGet" || arg.kind === "fieldGet") {
       return { kind: "boolLit", value: arg.type.kind === "array", type: BOOL, loc };
     }
@@ -5737,6 +5780,11 @@ const inliningPredicates = new Set<ts.Symbol>();
     }
   }
 
+/** GH #104 (SEMANTICS.md S119): a then/finally handler slot holding
+ * undefined, which Node treats as an absent handler (the value passes
+ * through) — this tier decides the handler statically, so it stops by name. */
+const PROMISE_HANDLER_UNDEF = "a promise handler holding undefined (Node treats it as absent and passes the settlement through — SEMANTICS.md S119)";
+
 export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (call.questionDotToken || access.questionDotToken) return null;
@@ -5855,7 +5903,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       // contextual type spelled (a module-namespace type has no mapping —
       // the handle is the value's only story, isIslandExpr's local rule).
       if (inner.kind === "jsval") markJsvalHandlerParams(L, call.arguments[0]!);
-      let cb = L.lowerExpr(call.arguments[0]!);
+      let cb = undefFenceGuard(L, L.lowerExpr(call.arguments[0]!), PROMISE_HANDLER_UNDEF, loc);
       // A TYPED handler on a DYN-settling promise (the tracePromise
       // result's `.then((value) => ...)` — the checker's generic
       // instantiation typed the parameter, but the settled value is a
@@ -6045,7 +6093,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     }
 
     if (member === "finally") {
-      const cb = L.lowerExpr(call.arguments[0]!);
+      const cb = undefFenceGuard(L, L.lowerExpr(call.arguments[0]!), PROMISE_HANDLER_UNDEF, loc);
       if (cb.type.kind !== "func" || cb.type.params.length !== 0 || cb.type.ret.kind !== "void") {
         L.unsupported(
           "SC1090",
@@ -6605,7 +6653,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       if (call.arguments.length !== 1) {
         L.noLowering(`Symbol.for with ${call.arguments.length} arguments`, call);
       }
-      const key = L.lowerExprExpecting(call.arguments[0]!, STRING);
+      // GH #104 (SEMANTICS.md S119): ToString of a key holding undefined.
+      const key = undefinedAsText(L, L.lowerExprExpecting(call.arguments[0]!, STRING), loc);
       return { kind: "libCall", fn: "sym.for", args: [key], type: SYMBOL_T, loc };
     }
     if (member === "keyFor") {

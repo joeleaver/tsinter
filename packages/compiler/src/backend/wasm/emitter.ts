@@ -494,6 +494,11 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean, v
       visit((o as { receiver?: unknown }).receiver, true);
       return;
     }
+    // An undefined test of a string reads its value (the null test).
+    if (o.kind === "isUndef" && (o as { operand?: { type?: { kind?: unknown } } }).operand?.type?.kind === "string") {
+      visit((o as { operand?: unknown }).operand, true);
+      return;
+    }
     // Strings unit S3: a window reader takes its receiver (a regex
     // method its subject) as a VALUE — reading a view in place.
     // ...and an array push moves its elements (the emitter's push case).
@@ -32399,7 +32404,11 @@ class Assembler {
         return;
 
       case "isUndef":
-        this.walkExpr(e.operand);
+        // A string's undefined is its null VALUE: tested on the value, so a
+        // rope or slice view is not flattened for the test (GH #104 — a
+        // tokenizer's subject binding keeps its window shadow).
+        if (e.operand.type.kind === "string") this.walkValue(e.operand);
+        else this.walkExpr(e.operand);
         this.emitIsUndefOnStack(e.operand.type);
         return;
 

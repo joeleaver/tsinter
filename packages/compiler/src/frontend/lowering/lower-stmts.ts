@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, droppableStatic, emptyArrayOf, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -938,6 +938,22 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // `throw err` where err arrived as a dyn argument. instanceof
       // narrowing over the payload stays false (the checked-dynamic tree's %error encoding
       // is not a hierarchy object — SEMANTICS.md).
+      // GH #104 (SEMANTICS.md S119): a plain slot holding undefined throws
+      // undefined itself — the dynamic undefined, which a catch binding
+      // reads back as Node's.
+      if (value.type.kind !== "dyn" && value.type.kind !== "union" && mayHoldSlotUndef(L, value)) {
+        const loc = locOf(stmt);
+        const t = L.declareHiddenLocal("%thrown", value.type);
+        const read: IrExpr = { kind: "varRef", localId: t.id, type: value.type, loc };
+        return {
+          kind: "block",
+          body: [
+            { kind: "varDecl", localId: t.id, init: value, loc },
+            { kind: "if", cond: { kind: "isUndef", operand: read, type: BOOL, loc }, then: [{ kind: "throw", value: dynUndefinedExpr(loc), loc }], else_: [{ kind: "throw", value: read, loc }], loc },
+          ],
+          loc,
+        };
+      }
       return { kind: "throw", value, loc: locOf(stmt) };
     }
     if (ts.isTryStatement(stmt)) return L.lowerTry(stmt);
@@ -4285,12 +4301,31 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
         loc,
       };
     }
-    const obj = L.lowerExpr(target.expression);
-    if (obj.type.kind === "record") {
-      const shape = L.shapes.get(obj.type.shapeId);
+    const obj0 = L.lowerExpr(target.expression);
+    if (obj0.type.kind === "record") {
+      const shape = L.shapes.get(obj0.type.shapeId);
       if (shape?.indexValue && shape.fields.length === 0 && !shape.tuple) {
-        return { kind: "recordKeyDelete", obj, shapeId: obj.type.shapeId, key: undefinedAsText(L, lowerKey(), locOf(expr)), loc };
+        const key = undefinedAsText(L, lowerKey(), locOf(expr));
+        // GH #101 (SEMANTICS.md S119): ToObject of a receiver holding
+        // undefined throws Node's TypeError — after the key evaluated.
+        if (mayHoldSlotUndef(L, obj0) && !droppableStatic(key)) {
+          const o = L.declareHiddenLocal("%delobj", obj0.type);
+          const k = L.declareHiddenLocal("%delkey", STRING);
+          const oRef: IrExpr = { kind: "varRef", localId: o.id, type: obj0.type, loc };
+          return {
+            kind: "block",
+            body: [
+              { kind: "varDecl", localId: o.id, init: obj0, loc },
+              { kind: "varDecl", localId: k.id, init: key, loc },
+              { kind: "recordKeyDelete", obj: undefToObjectGuard(L, oRef, loc), shapeId: obj0.type.shapeId, key: { kind: "varRef", localId: k.id, type: STRING, loc }, loc },
+            ],
+            loc,
+          };
+        }
+        return { kind: "recordKeyDelete", obj: undefToObjectGuard(L, obj0, loc), shapeId: obj0.type.shapeId, key, loc };
       }
+      const obj = undefToObjectGuard(L, obj0, loc);
+      if (obj.type.kind !== "record") throw new Error("lowerer bug: delete receiver");
       // `delete r.f` of a declared OPTIONAL field (undefined-armed slot) is
       // the undefined-arm write: a monomorphic shape cannot remove its
       // slot, and absence IS the undefined arm (divergences 37/56), so the
@@ -4329,7 +4364,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     L.unsupported(
       "SC1090",
       expr,
-      `'delete' on '${L.fmt(obj.type)}' receivers (process.env keys and pure Record<string, T> keys delete)`,
+      `'delete' on '${L.fmt(obj0.type)}' receivers (process.env keys and pure Record<string, T> keys delete)`,
     );
   }
 
@@ -7910,7 +7945,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           const recv = L.declareHiddenLocal("%inrec", receiver.type);
           const shapeId = receiver.type.shapeId;
           const recvRef = (): IrExpr => ({ kind: "varRef", localId: recv.id, type: receiver.type, loc });
-          const keys = objectIterOverIndexShape(L, stmt.expression, "keys", receiver.type, rShape, recvRef(), keysT, loc);
+          // GH #101 (SEMANTICS.md S119): for-in over a slot holding
+          // undefined visits nothing.
+          const keys = undefElse(L, recvRef(), loc, emptyArrayOf(loc), (read) => objectIterOverIndexShape(L, stmt.expression, "keys", read.type as IrType & { kind: "record" }, rShape, read, keysT, loc));
           const guard = (kRef: IrExpr): IrExpr => ({
             kind: "arrIntrinsic",
             method: "includes",
@@ -7929,9 +7966,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         // Fixed and hybrid shapes cannot lose keys mid-walk (no delete;
         // an undefined-arm write agrees with the snapshot under Node's
         // missing-key behavior), so the snapshot alone is exact.
-        const keys = rShape.indexValue
-          ? objectIterOverIndexShape(L, stmt.expression, "keys", receiver.type, rShape, receiver, keysT, loc)
-          : recordKeysArrayCall(L, receiver, receiver.type, rShape, loc);
+        const keys = undefElse(L, receiver, loc, emptyArrayOf(loc), (read) =>
+          rShape.indexValue
+            ? objectIterOverIndexShape(L, stmt.expression, "keys", read.type as IrType & { kind: "record" }, rShape, read, keysT, loc)
+            : recordKeysArrayCall(L, read, read.type as IrType & { kind: "record" }, rShape, loc),
+        );
         return lowerForInOverKeys(L, stmt, keys, labels);
       }
       L.unsupported(
@@ -8040,7 +8079,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     const loc = locOf(stmt);
     // Unit U (SEMANTICS.md S119 (b)): for-in skips holes — fenced once the
     // program made a hole.
-    const arrExpr = holeFencedArray(L, L.lowerExpr(stmt.expression), "for-in", loc);
+    // GH #101: an array slot holding undefined visits nothing.
+    const arrExpr = undefElse(L, L.lowerExpr(stmt.expression), loc, emptyArrayOf(loc), (read) => holeFencedArray(L, read, "for-in", loc));
     if (arrExpr.type.kind !== "array") L.badType(stmt.expression, L.typeOf(stmt.expression));
     L.scopes.push(new Map());
     try {

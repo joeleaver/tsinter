@@ -6,7 +6,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
-import { bindOnce, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
@@ -317,7 +317,9 @@ function lowerOptionalDefaultArg(
         ? call.arguments[0]!
         : null;
       if (name === "push" && spreadArg && ts.isSpreadElement(spreadArg)) {
-        let src = L.lowerExpr(spreadArg.expression);
+        // GH #104 (SEMANTICS.md S119): V8's call-spread TypeError over a
+        // slot holding undefined.
+        let src = undefCallSpreadGuard(L, L.lowerExpr(spreadArg.expression), spreadArg.expression, locOf(spreadArg));
         // `a.push(...someSet)`: a same-element Set drains first
         // (setIntrinsic toArray — insertion order), then appends.
         if (src.type.kind === "set" && typeEquals(src.type.elem, elem)) {
@@ -419,7 +421,9 @@ function lowerOptionalDefaultArg(
           const arg = L.lowerExpr(argNode);
           if (arg.type.kind !== "array") L.badType(argNode, L.typeOf(argNode));
           shape.push("a");
-          args.push(arg);
+          // GH #104 (SEMANTICS.md S119): an array slot holding undefined is
+          // no array to IsArray — it appends as one undefined element.
+          args.push(undefinedAsAbsent(L, arg, { kind: "arrayLit", elems: [{ kind: "slotUndef", type: elem, loc }], type: arg.type, loc }));
           continue;
         }
         // A handle-element receiver given an argument whose CHECKER type
@@ -660,7 +664,7 @@ function lowerOptionalDefaultArg(
    * loop passes exactly what it declares (JS passes everything; a callback
    * only sees the parameters it names). Returns the lowered callback and
    * its declared arity. */
-  function hofCallbackArg(L: Lowerer, argNode: ts.Expression, lead: IrType[], arrT: IrType):
+  function hofCallbackArg(L: Lowerer, argNode: ts.Expression, lead: IrType[], arrT: IrType, guard = true):
     { fnArg: IrExpr & { type: IrType & { kind: "func" } }; arity: number } {
     // A DYN-receiver HOF's callback (`parsed.flatMap((value) => ...)`):
     // the contextual signature types the unannotated param `any` (the
@@ -699,6 +703,9 @@ function lowerOptionalDefaultArg(
       for (const n of overridden) L.chainNarrowedType.delete(n);
     }
     const full = [...lead, F64, arrT];
+    // GH #104 (SEMANTICS.md S119): a function slot holding undefined is
+    // V8's IsCallable failure, before any element is visited.
+    if (guard) fnArg = undefFnArgGuard(L, fnArg, locOf(argNode));
     // A VARIADIC JS callback: Node passes it every argument — element,
     // index, array (the accumulator first for reduce).
     fnArg = adaptVariadicCallback(L, argNode, fnArg, full);
@@ -1540,12 +1547,18 @@ function lowerOptionalDefaultArg(
     const hasInit = call.arguments.length === 2;
     const accT = hasInit ? L.irTypeOf(call) : elem;
     if (accT.kind === "void" || accT.kind === "func") L.badType(call, L.typeOf(call));
-    const { fnArg, arity } = hofCallbackArg(L, argNode, [accT, elem], arrT);
+    // The callable check runs after the initial value evaluated (V8's
+    // reduce reads both arguments first).
+    const { fnArg, arity } = hofCallbackArg(L, argNode, [accT, elem], arrT, false);
     if (!typeEquals(fnArg.type.ret, accT)) L.badType(argNode, L.typeOf(argNode));
     const helper = reduceHelper(L, method, elem, accT, arity, hasInit, loc);
-    const args: IrExpr[] = [receiver, fnArg];
-    if (hasInit) args.push(L.lowerExprExpecting(call.arguments[1]!, accT));
-    return { kind: "call", callee: helper, args, type: accT, loc };
+    const init = hasInit ? L.lowerExprExpecting(call.arguments[1]!, accT) : null;
+    const build = (f: IrExpr, z: IrExpr | null): IrExpr => ({ kind: "call", callee: helper, args: z === null ? [receiver, f] : [receiver, f, z], type: accT, loc });
+    if (!mayHoldSlotUndef(L, fnArg)) return build(fnArg, init);
+    if (init === null || droppableStatic(init)) return build(undefFnArgGuard(L, fnArg, loc), init);
+    // The receiver evaluates before both arguments (JS order).
+    return bindOnce(L, receiver, loc, (rv) => bindOnce(L, fnArg, loc, (f) => bindOnce(L, init, loc, (z) =>
+      ({ kind: "call", callee: helper, args: [rv, undefFnArgGuard(L, f, loc), z], type: accT, loc }))));
   }
 
 /** The reduce/reduceRight loops, from existing IR nodes:
@@ -3440,7 +3453,8 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
       L.mapHofHelpers.set(key, helper);
       L.liftedFns.push(L.buildMapForEachFn(helper, mapT, arity, fnRet, loc));
     }
-    return { kind: "call", callee: helper, args: [receiver, fnArg], type: VOID, loc };
+    // GH #104 (SEMANTICS.md S119): V8's IsCallable check.
+    return { kind: "call", callee: helper, args: [receiver, undefFnArgGuard(L, fnArg, loc)], type: VOID, loc };
   }
 
 /** The loop body of the Map.forEach desugar, from existing IR nodes:
@@ -3646,7 +3660,7 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
       L.setHofHelpers.set(key, helper);
       L.liftedFns.push(L.buildSetForEachFn(helper, setT, arity, fnRet, loc));
     }
-    return { kind: "call", callee: helper, args: [receiver, fnArg], type: VOID, loc };
+    return { kind: "call", callee: helper, args: [receiver, undefFnArgGuard(L, fnArg, loc)], type: VOID, loc }; // GH #104: IsCallable
   }
 
 /** The loop body of the Set.forEach desugar — buildMapForEachFn with
@@ -5354,7 +5368,9 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       L.mapHofHelpers.set(key, helper);
       L.liftedFns.push(buildMapSeedFn(mapT, helper, seed.type, elem, kT, vT, loc));
     }
-    return { kind: "call", callee: helper, args: [seed], type: mapT, loc };
+    // GH #104 (SEMANTICS.md S119): a seed slot holding undefined is no
+    // seed — `new Map(u)` is empty.
+    return { kind: "call", callee: helper, args: [undefinedAsAbsent(L, seed, { kind: "arrayLit", elems: [], type: seed.type, loc })], type: mapT, loc };
   }
 
 /** The seeding loop, from existing IR nodes:
@@ -5455,8 +5471,11 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       // RegExp.prototype.test — stateful on a global or sticky regex
       // (board #301: lastIndex is modelled on every lane).
       const receiver = lowerMemberRecv(L, access);
+      // GH #104 (SEMANTICS.md S119): the subject's ToString — a slot
+      // holding undefined is searched as the text "undefined".
       const args = call.arguments.map((a) => L.lowerExpr(a));
-      return { kind: "regexIntrinsic", method: "test", receiver, args, type: BOOL, loc };
+      if (args.length !== 1) return { kind: "regexIntrinsic", method: "test", receiver, args, type: BOOL, loc };
+      return undefTextSubject(L, receiver, args[0]!, loc, (r, s) => ({ kind: "regexIntrinsic", method: "test", receiver: r, args: [s], type: BOOL, loc }));
     }
     // `re.exec(s)`: RegExpBuiltinExec's honest `string[] | null` row
     // ([whole, ...captures]; a nonparticipating capture is Node's
@@ -5471,9 +5490,9 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       const subject = L.lowerExprExpecting(call.arguments[0]!, STRING);
       const resultT: IrType = { kind: "union", unionId: L.unions.intern([arrayOf(STRING), { kind: "nullT" }]) };
       if (companion) {
-        return { kind: "regexIntrinsic", method: "execInto", receiver: re, args: [companion.subject(subject), companion.pos()], type: resultT, loc };
+        return undefTextSubject(L, re, subject, loc, (r, s) => ({ kind: "regexIntrinsic", method: "execInto", receiver: r, args: [companion.subject(s), companion.pos()], type: resultT, loc }));
       }
-      return { kind: "regexIntrinsic", method: "exec", receiver: re, args: [subject], type: resultT, loc };
+      return undefTextSubject(L, re, subject, loc, (r, s) => ({ kind: "regexIntrinsic", method: "exec", receiver: r, args: [s], type: resultT, loc }));
     }
     // `s.match(re)` for non-g/y regexes: Node's exec-shaped result reduced
     // to the honest slice — the `string[] | null` union holding
@@ -5588,7 +5607,9 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
         L.unsupported("SC1120", call, "'.split()' with this many arguments");
       }
       const receiver = lowerReceiver();
-      const args = call.arguments.map((a) => L.lowerExpr(a));
+      // GH #104 (SEMANTICS.md S119): a replacement holding undefined is
+      // the text "undefined" (ToString).
+      const args = call.arguments.map((a, i) => (i === 1 ? undefinedAsText(L, L.lowerExpr(a), loc) : L.lowerExpr(a)));
       if (name !== "split" && args[1]?.type.kind !== "string") {
         L.unsupported(
           "SC1120",
@@ -6837,7 +6858,11 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
           const encName = args[1] ? bufEncoding(L, "Buffer.byteLength", args[1]) : "utf8";
           const s = L.lowerExprExpecting(args[0]!, STRING);
           const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
-          return { kind: "libCall", fn: "buffer.byteLenStr", args: [s, enc], type: F64, loc };
+          // GH #104 (SEMANTICS.md S119): a string slot holding undefined is
+          // Node's type error.
+          return undefElse(L, s, loc,
+            () => nodeThrowExpr(1, "ERR_INVALID_ARG_TYPE", 'The "string" argument must be of type string or an instance of Buffer or ArrayBuffer. Received undefined', F64, loc),
+            (read) => ({ kind: "libCall", fn: "buffer.byteLenStr", args: [read, enc], type: F64, loc }));
         }
         if (srcIr?.kind === "bytes" && args.length === 1) {
           const receiver = L.lowerExpr(args[0]!);

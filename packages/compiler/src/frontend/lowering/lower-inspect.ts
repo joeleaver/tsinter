@@ -41,7 +41,7 @@ import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
-import { plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable } from "./lower-exprs.js";
+import { plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable, undefElse } from "./lower-exprs.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -1231,8 +1231,15 @@ function convertSpecArg(L: Lowerer, spec: number, node: ts.Expression, value: Ir
     );
   }
   value = jsvalAsDyn(value);
+  // GH #102/#104 (SEMANTICS.md S119): a plain slot holding undefined is
+  // `undefined` to every specifier — NaN to the numeric ones.
+  const uk = value.type.kind;
+  if ((uk === "f64" || uk === "string" || uk === "bool" || uk === "record" || uk === "array" || uk === "object") && mayHoldSlotUndef(L, value)) {
+    const text = spec === 100 || spec === 105 || spec === 102 ? "NaN" : "undefined";
+    return undefElse(L, value, loc, () => str(text, loc), (read) => convertSpecArg(L, spec, node, read, loc));
+  }
   const t = value.type;
-  const textOf = (): IrExpr => (t.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc });
+  const textOf =(): IrExpr => (t.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc });
   switch (spec) {
     case 115: // %s
       return formatSArg(L, node, value, 0, loc);

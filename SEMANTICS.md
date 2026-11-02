@@ -722,7 +722,25 @@ String (`hasOwnProperty`, `valueOf`, `slice` as a VALUE rather than a
 call, ...). The PRESENCE operator answers the same way for the same
 reason — `"toString" in u` is `true` in Node and `false` here, as is
 `"slice" in u` on a dyn array — because there is no chain to walk, only
-the own-entry table the read consults. (GH #86 review, wasm and
+the own-entry table the read consults. The presence operator is LOUD
+where that matters (the lead's ruling, GH #103 review): `k in o` over a
+record (an absent optional field of that name included), an
+index-signature map, `process.env` or a dynamic object, where `k` names an
+Object.prototype member (`constructor`, `toString`, `valueOf`,
+`hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`,
+`toLocaleString`, `__proto__`, `__defineGetter__`, `__defineSetter__`,
+`__lookupGetter__`, `__lookupSetter__`) that the object does not own, ends
+the program at a named fence (S122, SC1090: "'in' with a key naming an
+Object.prototype member the object does not own …") instead of answering
+false — a literal key decided at compile time, a run-time key by one check
+on the not-own path only. So the counting idiom `if (k in counts)
+counts[k]++` stays exact for every ordinary word and stops by name on
+`"constructor"`, where Node would read the inherited function. An own key
+of that name answers true as before; `Object.hasOwn` is own-only and
+unaffected; a dynamic object with no prototype (`Object.create(null)`)
+fences too, where Node answers false (the over-approximation is loud).
+The other reads above (`u["toString"]`, `"slice" in` a dynamic array's
+Array.prototype names) keep this entry's answer. (GH #86 review, wasm and
 wasm-native: a function's OWN `prototype` — which Node's ordinary functions
 have and arrows and methods lack — is recorded on the boxed function when
 the box is built from a known function; a box that lost it ends
@@ -8823,15 +8841,44 @@ Cannot convert undefined or null to object`; `"k" in r` throws `Cannot use
 on such a slot throw Node's `Cannot read properties of undefined`, whatever
 produced it (`!`, `as`, a return, a binding).
 
-**Known divergences, filed for the next unit.** These are NOT yet exact or
-loud, and each is registered here until its issue closes: conversions and
-the remaining observers of a record or array slot holding `undefined`
-(`${rs[0]}`, `String(r)`, for-in, `Array.isArray`, GH #101); a top-level
-`JSON.stringify(u)` and `new Error(u)` of a string slot holding it (GH #102);
-`in` over a dynamic `null` (GH #103); bare traps at builtins that take such a
-slot, among them `parseInt(u)`, `re.test(u)` and `c instanceof C` (GH #104);
-and the evaluation order of the arguments behind a `dyn.argStr` parameter
-check (GH #105).
+Since GH #101-#105 the remaining observers answer as Node does too. A
+record, array or class-instance slot holding `undefined` converts to the
+text `undefined` (templates, `String`, concatenation, `+=`, `%s`), is no
+array to `Array.isArray` and no instance to `instanceof`, and for-in over
+it visits nothing. `JSON.stringify` of a slot holding it — any kind — is
+the `undefined` VALUE, not `"null"`, as is a dynamic root the stringify
+drops (`undefined`, a function); `util.format`'s `%d`/`%i`/`%f` print `NaN`
+for it and `%j`/`%o`/`%O` print `undefined`. `new Error(u)` (and every
+builtin error, and `super(u)` in a subclass) has the message `""`. Where
+Node ToStrings an argument it is the text `"undefined"`: `parseInt`,
+`parseFloat`, `JSON.parse` (Node's SyntaxError), `re.test` / `re.exec`,
+`replace` / `replaceAll` patterns and replacements and a replacer
+function's result, computed keys (`({ [u]: 1 })`), a run-time key of `in`,
+`Symbol.for`, `String.raw` substitutions and `new URL`'s input; where it is
+an absent argument it is absent: `new RegExp(u)` is `/(?:)/`, its flags
+none, `new Set(u)` / `new Map(u)` empty, `new URL(s, u)` base-less,
+`TextEncoder.encode(u)` empty. `[1].concat(a)` appends it as one element.
+Throwing a slot holding it throws `undefined`. A call spread of an array
+slot holding it (`f(...a)`, `Math.max(...a)`, `xs.push(...a)`,
+`String.fromCharCode(...a)`) throws V8's `TypeError: a is not iterable
+(cannot read property undefined)` (a source V8's printer does not render
+meets S119 (a)'s fence). `delete r.k` on one throws `Cannot convert
+undefined or null to object`; `Buffer.byteLength(u)` and
+`process.stdout.write(u)` throw Node's `ERR_INVALID_ARG_TYPE`. A
+function-typed slot holding it, handed to a builtin that calls it back,
+throws V8's `undefined is not a function` (`map`, `filter`, `forEach`,
+`find`, `findIndex`, `some`, `every`, `flatMap`, `reduce` — after its
+initial value evaluated — and Map/Set `forEach`), or Node's
+`ERR_INVALID_ARG_TYPE` for `callback` (`setTimeout`, `setInterval`,
+`setImmediate`, `queueMicrotask`, `process.nextTick`, after every argument
+evaluated) or `listener` (an emitter's `on`/`once`/`off` and friends); as
+a replacer it is not callable, so `replace` inserts `"undefined"`. A
+dynamic value holding a primitive (`null` from `JSON.parse`, a number, a
+string, a boolean, `undefined`) on the right of `"k" in d` throws Node's
+`TypeError: Cannot use 'in' operator to search for 'k' in <String(d)>`
+(GH #103). And a builtin whose string parameters are checked at the
+dynamic boundary (`dyn.argStr`: `path.*`, the sync `fs` calls) evaluates
+every argument before the first check runs, as Node does (GH #105).
 
 What else parts from Node, each loudly:
 
@@ -8933,17 +8980,25 @@ Node, and fences in a program that also lacks a key and observes one.
 holding `undefined`, a dynamic non-string; a dynamic Buffer, typed array or
 URL stays S122's fence), without Node's DEP0187 process warning on stderr.
 
-(f) **`util.format`'s `%j`, `%o`, `%O`** with a string-typed argument
-holding `undefined` render the string `"undefined"` (`%s` and `%d` are
-exact).
+(f) *Retired by GH #102:* `util.format`'s `%j`, `%o` and `%O` over a slot
+holding `undefined` print `undefined`, as Node does.
+
+(k) **A then/finally handler holding `undefined`.** `p.then(hs[0])` where
+the function-typed slot holds `undefined`: Node treats the handler as
+absent and passes the settlement through; the handler's shape is decided
+statically here, so the registration ends the program at a named fence
+(S122, SC1090: "a promise handler holding undefined …").
 
 **Rationale:** the ruling — the real-app trial's most common blocker. The
 cost of the representation is measured on three microbenchmarks in the
 unit's report; a later unit proves presence statically to drop the tests.
 **Tested by:** `packages/compiler/test/wasm-undefined-slots.test.ts` (each
 row against Node spawned at test time, on the wasm lane and — the native
-rows — on the wasm-native lane; (b) and (c) pinned by their fence text); the
-wasm and wasm-native censuses (every corpus program unchanged).
+rows — on the wasm-native lane; (b) and (c) pinned by their fence text);
+`packages/compiler/test/wasm-undef-observers.test.ts` (GH #101-#105's
+observers and their neighbours, every row on both lanes; (k) pinned by its
+fence text); the wasm and wasm-native censuses (every corpus program
+unchanged).
 
 ## S120 — `localeCompare` collates by ICU's root collation whatever the host's locale; the c and llvm lanes collate ASCII only and stop by name on anything else *(wasm and wasm-native; (b) the c and llvm lanes, retiring with them at N4; (c) wasm and wasm-native)*
 

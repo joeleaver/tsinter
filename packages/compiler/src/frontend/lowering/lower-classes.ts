@@ -11,7 +11,7 @@ import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
-import { pureReemittable } from "./lower-exprs.js";
+import { pureReemittable, undefinedAsAbsent } from "./lower-exprs.js";
 import { lowerSearchParamsNew, lowerUrlBaseArgs } from "./lower-builtins.js";
 import { requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { STREAM_API_MEMBERS, STREAM_PROP_MEMBERS, UNDERSCORE_METHODS, lowerStreamNew, lowerStreamSuperCall, streamCtorShape } from "./lower-stream.js";
@@ -4660,7 +4660,9 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
     }
     if (args.length === 0) return { kind: "strLit", value: "", type: STRING, loc };
     const value = L.lowerExpr(args[0]!);
-    if (value.type.kind === "string") return value;
+    // GH #102 (SEMANTICS.md S119): a message slot holding undefined is an
+    // absent message — `new Error(u).message` is "".
+    if (value.type.kind === "string") return undefinedAsAbsent(L, value, { kind: "strLit", value: "", type: STRING, loc });
     if (value.kind === "unitLit" && value.unit === "undefined") {
       return { kind: "strLit", value: "", type: STRING, loc };
     }
@@ -4996,7 +4998,9 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
               "string arguments are the lowered form (a RegExp copy or ToString coercion has no lowering)",
             );
           }
-          return v;
+          // GH #104 (SEMANTICS.md S119): a slot holding undefined is an
+          // absent pattern or flags argument — `new RegExp(u)` is /(?:)/.
+          return undefinedAsAbsent(L, v, { kind: "strLit", value: "", type: STRING, loc });
         };
         const pattern = strArg(args[0], "pattern");
         const flags = strArg(args[1], "flags argument");
@@ -5284,6 +5288,9 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
                 seed = { kind: "jsExit", value: seed, type: arrayOf(mapped.elem), fresh: true, loc: seed.loc };
               }
               if (typeEquals(seed.type, arrayOf(mapped.elem))) {
+                // GH #104 (SEMANTICS.md S119): a seed slot holding
+                // undefined is no seed — `new Set(u)` is empty.
+                seed = undefinedAsAbsent(L, seed, { kind: "arrayLit", elems: [], type: seed.type, loc });
                 return { kind: "setNew", seed, type: mapped, loc };
               }
               // Any other lowered kind falls through to the named fence

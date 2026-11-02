@@ -42,6 +42,7 @@ import { dynFallbackType, jsFuncNameOf, newFnCtx } from "./lowerer.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { arrayOf, BOOL, canBoxFuncIntoDyn, canConvertToDyn, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, isUnitType, STRING, SrcLoc, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
+import { undefFnParamGuard } from "./lower-exprs.js";
 import { streamForcedTuple, streamSidesOf } from "./lower-stream.js";
 
 /** True when the class descends from (or is) the runtime emitter. */
@@ -458,7 +459,9 @@ function lowerListenerArg(
       }
     }
   }
-  const cb = L.lowerExpr(node);
+  // GH #104 (SEMANTICS.md S119): a listener slot holding undefined is
+  // Node's ERR_INVALID_ARG_TYPE for "listener".
+  const cb = undefFnParamGuard(L, L.lowerExpr(node), "listener", locOf(node));
   if (cb.type.kind !== "func") {
     L.noLowering(`'${member}' with a non-function listener`, node);
   }

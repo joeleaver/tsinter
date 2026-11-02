@@ -3047,6 +3047,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
  * conversions, fresh allocations). */
 export function mayHoldSlotUndef(L: Lowerer, e: IrExpr): boolean {
   if (!L.undefSlots) return false;
+  if (definedReads.has(e)) return false;
   const k = e.type.kind;
   if (isUnitType(e.type) || k === "void" || k === "dyn" || k === "jsval" || k === "caught") return false;
   switch (e.kind) {
@@ -3083,6 +3084,60 @@ export function bindOnce(L: Lowerer, e: IrExpr, loc: SrcLoc, f: (read: IrExpr) =
   const read: IrExpr = { kind: "varRef", localId: t.id, type: e.type, loc };
   const result = f(read);
   return { kind: "seqExpr", stmts: [{ kind: "varDecl", localId: t.id, init: e, loc }], result, type: result.type, loc };
+}
+
+/** GH #101: reads undefElse hands its continuation — known to hold a
+ * value, so nothing under them re-tests for undefined. */
+const definedReads = new WeakSet<IrExpr>();
+
+/** GH #101 (SEMANTICS.md S119): an observer of `e` that answers otherwise
+ * where `e` holds its slot's undefined — `onUndef` there (its result type
+ * is `f`'s), `f(read)` elsewhere, `e` evaluated once. `f` sees a read
+ * known to hold a value, so its own lowering adds no second test. With no
+ * undefined possible this is `f(e)`. */
+export function undefElse(L: Lowerer, e: IrExpr, loc: SrcLoc, onUndef: (t: IrType) => IrExpr, f: (read: IrExpr) => IrExpr): IrExpr {
+  if (!mayHoldSlotUndef(L, e)) return f(e);
+  return bindOnce(L, e, loc, (read) => {
+    const known: IrExpr = { ...read };
+    definedReads.add(known);
+    const body = f(known);
+    return { kind: "ternary", cond: isUndefExpr(read, false, loc), then: onUndef(body.type), else_: body, type: body.type, loc };
+  });
+}
+
+/** undefElse's undefined answer for an observer whose result is a value
+ * of its own (`slotUndef` of the result type). */
+export function slotUndefOf(loc: SrcLoc): (t: IrType) => IrExpr {
+  return (t) => ({ kind: "slotUndef", type: t, loc });
+}
+
+/** undefElse's undefined answer for an observer that walks nothing: a
+ * fresh empty array of the result type. */
+export function emptyArrayOf(loc: SrcLoc): (t: IrType) => IrExpr {
+  return (t) => ({ kind: "arrayLit", elems: [], type: t, loc });
+}
+
+/** GH #104: `build(subject)` for a regex subject that may hold its slot's
+ * undefined, searched as the text "undefined". A BINDING read keeps its
+ * own shape (a ToString around it would flatten a rope or slice view at
+ * every call — the tokenizer loops' linear scaling): the binding's value
+ * slot is tested and the operation built once per answer. */
+export function undefTextSubject(L: Lowerer, recv: IrExpr, s: IrExpr, loc: SrcLoc, build: (recv: IrExpr, s: IrExpr) => IrExpr): IrExpr {
+  if (s.type.kind !== "string" || !mayHoldSlotUndef(L, s)) return build(recv, s);
+  // JS order: the receiver evaluates, then the subject, then the test —
+  // a receiver that reassigns the subject's binding is seen (review o1/o3).
+  const stmts: IrStmt[] = [];
+  const bind = (e: IrExpr): IrExpr => {
+    const t = L.declareHiddenLocal("%rsubj", e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const r = droppableStatic(recv) ? recv : bind(recv);
+  const sr = pureReemittable(s) ? s : bind(s);
+  const yes = build(r, { kind: "strLit", value: "undefined", type: STRING, loc });
+  const no = build(r, sr);
+  const result: IrExpr = { kind: "ternary", cond: isUndefExpr(sr, false, loc), then: yes, else_: no, type: no.type, loc };
+  return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: result.type, loc };
 }
 
 /** Unit U: a string value whose undefined reads as the text "undefined"
@@ -3388,6 +3443,219 @@ export function undefIterGuard(L: Lowerer, src: IrExpr, spelling: string | null 
     });
   }
   return { kind: "call", callee: name, args: [src], type: t, loc };
+}
+
+/** Object.prototype's own member names — what `k in o` finds through the
+ * prototype chain of every ordinary object (SEMANTICS.md S015). */
+export const OBJECT_PROTO_NAMES: ReadonlySet<string> = new Set([
+  "constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__", "__lookupSetter__",
+  "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "__proto__", "toLocaleString",
+]);
+
+/** The S015 fence's text: Node answers true through the prototype chain. */
+export const PROTO_IN_FENCE =
+  "'in' with a key naming an Object.prototype member the object does not own (Node answers true through the prototype chain, which this tier does not model — SEMANTICS.md S015)";
+
+/** Lead ruling (GH #103 review, SEMANTICS.md S015): `k in o` on the
+ * not-own path — false, or the named fence when `k` names an
+ * Object.prototype member. An interned `%in.protomiss(k)` helper; the
+ * caller reaches it only after the own lookup said no. */
+export function protoMissCall(L: Lowerer, key: IrExpr, loc: SrcLoc, inlineWindow = true): IrExpr {
+  const hkey = "in:protomiss";
+  let name = L.retagHelpers.get(hkey);
+  if (!name) {
+    name = `%in.protomiss.${L.retagHelpers.size}`;
+    L.retagHelpers.set(hkey, name);
+    const k: IrExpr = { kind: "varRef", localId: "k.0", type: STRING, loc };
+    const n: IrExpr = { kind: "varRef", localId: "n.0", type: F64, loc };
+    const num = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
+    const ret = (v: boolean): IrStmt => ({ kind: "return", value: { kind: "boolLit", value: v, type: BOOL, loc }, loc });
+    const fence: IrStmt = { kind: "runtimeFence", code: "SC1090", message: PROTO_IN_FENCE, loc };
+    // The miss path is hot (every `in` that answers false): a key whose
+    // length no name has returns after one length read and a few number
+    // compares; the names' texts are compared only at a matching length.
+    const byLen = new Map<number, string[]>();
+    for (const nm of OBJECT_PROTO_NAMES) byLen.set(nm.length, [...(byLen.get(nm.length) ?? []), nm]);
+    const body: IrStmt[] = [
+      { kind: "varDecl", localId: "n.0", init: { kind: "strIntrinsic", method: "length", receiver: k, args: [], type: F64, loc }, loc },
+    ];
+    for (const [len, names] of [...byLen].sort((a, b) => a[0] - b[0])) {
+      const cond = names
+        .map((nm): IrExpr => ({ kind: "strEq", negated: false, left: k, right: { kind: "strLit", value: nm, type: STRING, loc }, type: BOOL, loc }))
+        .reduce((l, r) => ({ kind: "logical", op: "||", left: l, right: r, type: BOOL, loc }));
+      body.push({
+        kind: "if",
+        cond: { kind: "bin", op: "===", left: n, right: num(len), type: BOOL, loc },
+        then: [{ kind: "if", cond, then: [fence], else_: null, loc }, ret(false)],
+        else_: null,
+        loc,
+      });
+    }
+    body.push(ret(false));
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "k.0", name: "k", type: STRING }],
+      returnType: BOOL,
+      locals: [
+        { id: "k.0", name: "k", type: STRING, mutable: false },
+        { id: "n.0", name: "n", type: F64, mutable: false },
+      ],
+      body,
+      loc,
+    });
+  }
+  if (!inlineWindow) return { kind: "call", callee: name, args: [key], type: BOOL, loc };
+  // The length window inline (7..20 units: no name is shorter or longer),
+  // so most misses never make the call.
+  const len: IrExpr = { kind: "strIntrinsic", method: "length", receiver: key, args: [], type: F64, loc };
+  const inWindow: IrExpr = {
+    kind: "logical",
+    op: "&&",
+    left: { kind: "bin", op: ">=", left: len, right: { kind: "numLit", value: 7, type: F64, loc }, type: BOOL, loc },
+    right: { kind: "bin", op: "<=", left: len, right: { kind: "numLit", value: 20, type: F64, loc }, type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  return { kind: "logical", op: "&&", left: inWindow, right: { kind: "call", callee: name, args: [key], type: BOOL, loc }, type: BOOL, loc };
+}
+
+/** A literal key naming an Object.prototype member, not own: the fence
+ * where the answer is reached, after `first` evaluates (an interned
+ * `%in.protofence()` — a fence is a statement, not an expression). */
+function protoInFenceExpr(L: Lowerer, first: IrExpr | null, loc: SrcLoc): IrExpr {
+  const hkey = "in:protofence";
+  let name = L.retagHelpers.get(hkey);
+  if (!name) {
+    name = `%in.protofence.${L.retagHelpers.size}`;
+    L.retagHelpers.set(hkey, name);
+    L.liftedFns.push({
+      name,
+      params: [],
+      returnType: BOOL,
+      locals: [],
+      body: [
+        { kind: "runtimeFence", code: "SC1090", message: PROTO_IN_FENCE, loc },
+        { kind: "return", value: { kind: "boolLit", value: false, type: BOOL, loc }, loc },
+      ],
+      loc,
+    });
+  }
+  const call: IrExpr = { kind: "call", callee: name, args: [], type: BOOL, loc };
+  if (first === null || droppableStatic(first)) return call;
+  return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: first, loc }], result: call, type: BOOL, loc };
+}
+
+/** GH #103: the receiver of `"k" in d` over a dynamic value — Node's
+ * `TypeError: Cannot use 'in' operator to search for 'k' in <String(d)>`
+ * where it holds a primitive (undefined, null, a boolean, number or
+ * string), through an interned per-key check helper. */
+export function dynInRecvGuard(L: Lowerer, recv: IrExpr, key: string, loc: SrcLoc): IrExpr {
+  const hkey = `dynin:${key}`;
+  let name = L.retagHelpers.get(hkey);
+  if (!name) {
+    name = `%dyn.inrecv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(hkey, name);
+    const d: IrExpr = { kind: "varRef", localId: "d.0", type: DYN, loc };
+    const test = (t: "nullish" | "string" | "number" | "boolean"): IrExpr => ({ kind: "dynTest", test: t, value: d, type: BOOL, loc });
+    const cond = (["string", "number", "boolean"] as const).reduce<IrExpr>((l, t) => ({ kind: "logical", op: "||", left: l, right: test(t), type: BOOL, loc }), test("nullish"));
+    const message: IrExpr = {
+      kind: "strConcat",
+      left: { kind: "strLit", value: `Cannot use 'in' operator to search for '${key}' in `, type: STRING, loc },
+      right: { kind: "toString", operand: d, type: STRING, loc },
+      type: STRING,
+      loc,
+    };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "d.0", name: "d", type: DYN }],
+      returnType: DYN,
+      locals: [{ id: "d.0", name: "d", type: DYN, mutable: false }],
+      body: [
+        {
+          kind: "if",
+          cond,
+          then: [{ kind: "throw", value: { kind: "libCall", fn: "error.new", args: [message], type: { kind: "object", className: "%TypeError" }, loc }, loc }],
+          else_: null,
+          loc,
+        },
+        { kind: "return", value: d, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [recv], type: DYN, loc };
+}
+
+/** GH #104 (SEMANTICS.md S119): a function-typed argument Node validates
+ * (`setTimeout(f)`, `emitter.on("e", f)`) that may hold its slot's
+ * undefined: Node's `ERR_INVALID_ARG_TYPE` for the parameter `param`. */
+export function undefFnParamGuard(L: Lowerer, fn: IrExpr, param: string, loc: SrcLoc): IrExpr {
+  if (fn.type.kind !== "func" || fn.kind === "closure") return fn;
+  return undefElse(L, fn, loc, (t) => nodeThrowExpr(1, "ERR_INVALID_ARG_TYPE", `The "${param}" argument must be of type function. Received undefined`, t, loc), (read) => read);
+}
+
+/** GH #104 (SEMANTICS.md S119): `e`, or — where it holds its slot's
+ * undefined and Node would answer — the named fence `message` (S122),
+ * through an interned check helper. */
+export function undefFenceGuard(L: Lowerer, e: IrExpr, message: string, loc: SrcLoc): IrExpr {
+  if (e.kind === "closure" || !mayHoldSlotUndef(L, e)) return e;
+  const t = e.type;
+  const key = `undeffence:${typeKey(t)}:${message}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%undef.fence.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body: [
+        { kind: "if", cond: isUndefExpr(x, false, loc), then: [{ kind: "runtimeFence", code: "SC1090", message, loc }], else_: null, loc },
+        { kind: "return", value: x, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [e], type: t, loc };
+}
+
+/** GH #105-style ordering for a check on the FIRST of several arguments:
+ * `build(check(first), later)` where every argument evaluates before the
+ * check runs — later arguments with effects bind to hidden locals first. */
+export function checkAfterArgs(L: Lowerer, first: IrExpr, later: IrExpr[], loc: SrcLoc, check: (e: IrExpr) => IrExpr, build: (first: IrExpr, later: IrExpr[]) => IrExpr): IrExpr {
+  if (!mayHoldSlotUndef(L, first) || later.every(droppableStatic)) return build(check(first), later);
+  const stmts: IrStmt[] = [];
+  const bind = (e: IrExpr): IrExpr => {
+    if (droppableStatic(e)) return e;
+    const t = L.declareHiddenLocal("%arg", e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const f = bind(first);
+  const rest = later.map(bind);
+  const result = build(check(f), rest);
+  return { kind: "seqExpr", stmts, result, type: result.type, loc };
+}
+
+/** GH #104 (SEMANTICS.md S119): a function-typed argument a builtin calls
+ * back (`a.map(f)`, `a.forEach(f)`) that may hold its slot's undefined:
+ * V8's `TypeError: undefined is not a function`. */
+export function undefFnArgGuard(L: Lowerer, fn: IrExpr, loc: SrcLoc): IrExpr {
+  if (fn.type.kind !== "func" || fn.kind === "closure") return fn;
+  return undefThrowGuard(L, fn, "undefined is not a function", loc);
+}
+
+/** GH #104 (SEMANTICS.md S119 (a)): a CALL's spread argument (`f(...xs)`,
+ * `Math.max(...xs)`, `a.push(...xs)`) that may hold its slot's undefined:
+ * V8's call-spread TypeError, `<xs> is not iterable (cannot read property
+ * undefined)`, with the source as V8's CallPrinter renders it; a source it
+ * does not render meets the named fence. */
+export function undefCallSpreadGuard(L: Lowerer, src: IrExpr, spreadOf: ts.Expression, loc: SrcLoc): IrExpr {
+  if (!mayHoldSlotUndef(L, src)) return src;
+  const spelled = v8SpreadSpelling(spreadOf.getText());
+  return undefIterGuard(L, src, spelled === "" ? null : `${spelled} is not iterable (cannot read property undefined)`, loc);
 }
 
 /** Unit U (SEMANTICS.md S119 (a)): the receiver of an index read `x[i]`
@@ -5150,7 +5418,9 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
               `'${L.fmt(k.type)}'-typed computed property keys (string, number, boolean, and unknown keys stringify)`,
             );
           }
-          key = k;
+          // GH #104 (SEMANTICS.md S119): a key slot holding undefined is
+          // the key "undefined".
+          key = undefinedAsText(L, k, locOf(name));
         }
       } else if (ts.isIdentifier(name) || ts.isStringLiteral(name)) {
         key = { kind: "strLit", value: name.text, type: STRING, loc: locOf(name) };
@@ -5835,6 +6105,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
               `'${L.fmt(k.type)}'-typed computed property keys (string, number, boolean, and unknown keys stringify)`,
             );
           }
+          k = undefinedAsText(L, k, locOf(prop.name));
           const value = L.intoIndexValueSlot(L.lowerExpr(prop.initializer), shape.indexValue, prop.initializer);
           contributors.push({ kind: "keyedField", key: k, value });
           continue;
@@ -7789,6 +8060,17 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
   }
 
 export function ensureString(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
+    const k = e.type.kind;
+    // GH #101 (SEMANTICS.md S119): a record, array or class-instance slot
+    // holding undefined converts to the text "undefined" (the string,
+    // number and boolean slots' own ToString already answers it).
+    if (k === "record" || k === "array" || k === "object") {
+      return undefElse(L, e, e.loc, (t) => ({ kind: "strLit", value: "undefined", type: t, loc: e.loc }), (read) => ensureStringOf(L, read, node));
+    }
+    return ensureStringOf(L, e, node);
+  }
+
+function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
     if (e.type.kind === "string") return e;
     if (e.type.kind === "dyn") {
       // String(u) / `${u}`: a runtime dispatch over the dyn kind — Node's
@@ -9732,6 +10014,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           }
         }
         if (left.type.kind === "regex" && left.kind === "varRef" && ts.isIdentifier(expr.left)) {
+          if (mayHoldSlotUndef(L, left)) return isUndefExpr(left, true, loc);
           return { kind: "boolLit", value: true, type: BOOL, loc };
         }
       }
@@ -9768,6 +10051,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         if (L.inHierarchy(targetInfo) && L.inHierarchy(lhsInfo)) {
           const classValue = L.lowerExpr(expr.right);
           if (classValue.type.kind !== "classval") L.badType(expr.right, L.typeOf(expr.right));
+          // GH #101: a slot holding undefined is no instance (the class
+          // value is a pure read, so evaluating it on one arm only is
+          // unobservable).
+          if (mayHoldSlotUndef(L, left) && pureReemittable(classValue)) {
+            return undefElse(L, left, loc, () => ({ kind: "boolLit", value: false, type: BOOL, loc }), (read) => ({ kind: "instanceOfValue", value: read, classValue, type: BOOL, loc }));
+          }
           return { kind: "instanceOfValue", value: left, classValue, type: BOOL, loc };
         }
         // A standalone side: the answer is static (the target slot can
@@ -9777,6 +10066,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         const value =
           left.type.className === targetInfo.def.name ||
           L.isSubclassOf(left.type.className, targetInfo.def.name);
+        if (value && mayHoldSlotUndef(L, left) && (ts.isIdentifier(expr.right) || expr.right.kind === ts.SyntaxKind.ThisKeyword)) {
+          return isUndefExpr(left, true, loc);
+        }
         if (left.kind === "varRef" && (ts.isIdentifier(expr.right) || expr.right.kind === ts.SyntaxKind.ThisKeyword)) {
           return { kind: "boolLit", value, type: BOOL, loc };
         }
@@ -9859,12 +10151,21 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     }
     const lhsInfo = L.classes.get(left.type.className);
     if (!lhsInfo) throw new Error(`lowerer bug: unknown class ${left.type.className}`);
-    if (L.inHierarchy(lhsInfo) && L.inHierarchy(target)) {
-      return { kind: "instanceOf", value: left, className: target.def.name, type: BOOL, loc };
-    }
     const value =
       left.type.className === target.def.name ||
       L.isSubclassOf(left.type.className, target.def.name);
+    // GH #101 (SEMANTICS.md S119): a class slot holding undefined is no
+    // instance — tested on the value, evaluated once (the read handed on
+    // is a pure one, so the static answer folds over it).
+    if (mayHoldSlotUndef(L, left)) {
+      const hier = L.inHierarchy(lhsInfo) && L.inHierarchy(target);
+      return undefElse(L, left, loc, () => ({ kind: "boolLit", value: false, type: BOOL, loc }), (read) =>
+        hier ? { kind: "instanceOf", value: read, className: target.def.name, type: BOOL, loc } : { kind: "boolLit", value, type: BOOL, loc },
+      );
+    }
+    if (L.inHierarchy(lhsInfo) && L.inHierarchy(target)) {
+      return { kind: "instanceOf", value: left, className: target.def.name, type: BOOL, loc };
+    }
     if (left.kind === "varRef") {
       return { kind: "boolLit", value, type: BOOL, loc };
     }
@@ -10103,10 +10404,19 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         if (probed?.type.kind === "dyn") {
           let k = L.lowerExpr(expr.left); // JS order: the key evaluates first
           if (k.type.kind === "f64" || k.type.kind === "string" || k.type.kind === "dyn") {
-            k = L.ensureString(k, expr.left);
+            k = undefinedAsText(L, L.ensureString(k, expr.left), loc);
             const recvD = L.lowerExpr(expr.right);
             if (recvD.type.kind === "dyn") {
-              return { kind: "libCall", fn: "dyn.hasKey", args: [recvD, k], type: BOOL, loc };
+              // S015 (lead ruling): the not-own path asks whether the key
+              // names an Object.prototype member (the named fence).
+              return bindOnce(L, k, loc, (kr) => bindOnce(L, recvD, loc, (dr) => ({
+                kind: "logical",
+                op: "||",
+                left: { kind: "libCall", fn: "dyn.hasKey", args: [dr, kr], type: BOOL, loc },
+                right: protoMissCall(L, kr, loc),
+                type: BOOL,
+                loc,
+              })));
             }
           }
         }
@@ -10134,7 +10444,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         type: envType,
         loc,
       };
-      return { kind: "unionIsTag", unionId: envType.unionId, tag: undefTag, negated: true, value: read, type: BOOL, loc };
+      const present: IrExpr = { kind: "unionIsTag", unionId: envType.unionId, tag: undefTag, negated: true, value: read, type: BOOL, loc };
+      // S015 (lead ruling): an Object.prototype name process.env does not own.
+      return OBJECT_PROTO_NAMES.has(key) ? { kind: "logical", op: "||", left: present, right: protoInFenceExpr(L, null, loc), type: BOOL, loc } : present;
     }
     const recv = L.lowerExpr(expr.right);
     // Error-rooted receivers (builtin or user subclass — the isErrnoException
@@ -10178,10 +10490,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       }
     }
     // A dyn receiver (`"portless" in pkg` after the `typeof pkg ===
-    // "object"` guard): own-member presence on the checked-dynamic tree — tsc admits `in`
-    // only on object-typed operands, so unit receivers are unreachable.
+    // "object"` guard): own-member presence on the checked-dynamic tree.
+    // GH #103: an `any` can hold a primitive (null from JSON.parse), where
+    // Node throws its TypeError — `in` never boxes its right operand.
     if (recv.type.kind === "dyn") {
-      return { kind: "dynHasKey", key, value: recv, type: BOOL, loc };
+      const has: IrExpr = { kind: "dynHasKey", key, value: dynInRecvGuard(L, recv, key, loc), type: BOOL, loc };
+      // S015 (lead ruling): a key naming an Object.prototype member that is
+      // not own stops by name rather than answering false.
+      if (!OBJECT_PROTO_NAMES.has(key)) return has;
+      return { kind: "logical", op: "||", left: has, right: protoInFenceExpr(L, null, loc), type: BOOL, loc };
     }
     // `"k" in u` over a UNION whose arms are FIXED record shapes: every
     // arm answers membership STATICALLY (a declared non-optional field is
@@ -10225,6 +10542,11 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           loc,
         });
         const trues = answers.filter((a) => a.has);
+        // S015 (lead ruling): arms that do not own an Object.prototype name.
+        if (OBJECT_PROTO_NAMES.has(key) && trues.length < answers.length) {
+          if (trues.length === 0) return protoInFenceExpr(L, recv, loc);
+          L.unsupported("SC1090", expr, "'in' with a key naming an Object.prototype member over a union only some of whose arms own it (SEMANTICS.md S015)");
+        }
         if (trues.length === answers.length || trues.length === 0) {
           // Constant either way — but JS still EVALUATES the operand (it
           // may throw: an ambient-const read is a ReferenceError). Pure
@@ -10281,11 +10603,14 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         // The read goes through the guard itself, so a computed receiver
         // (`"k" in get()`) is evaluated exactly once.
         const read: IrExpr = { kind: "recordGet", obj: inGuard, shapeId: recv.type.shapeId, field: key, type: field.type, loc };
-        return L.markPresence(
+        const present = L.markPresence(
           { kind: "unionIsTag", unionId: field.type.unionId, tag: L.armTag(field.type.unionId, UNDEFINED_T), negated: true, value: read, type: BOOL, loc },
           recv.type.shapeId,
           key,
         );
+        // S015 (lead ruling): an absent optional field named like an
+        // Object.prototype member — Node finds the inherited one.
+        return OBJECT_PROTO_NAMES.has(key) ? { kind: "logical", op: "||", left: present, right: protoInFenceExpr(L, null, loc), type: BOOL, loc } : present;
       }
       // A declared non-optional field always exists on every value of the
       // shape — statically true, but folding may only drop a
@@ -10308,6 +10633,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     if (shape.indexValue) {
       L.unsupported("SC1090", expr, "'in' over index-signature keys (read the key and test '!== undefined' instead)");
     }
+    // S015 (lead ruling): a key naming an Object.prototype member the
+    // shape does not own — Node answers true; decided here, at the fence.
+    if (OBJECT_PROTO_NAMES.has(key)) return protoInFenceExpr(L, inGuard, loc);
     if (recv.kind === "varRef" || recv.kind === "recordGet" || recv.kind === "fieldGet" || pureRecvNode) {
       return guardedIn({ kind: "boolLit", value: false, type: BOOL, loc });
     }
@@ -10327,7 +10655,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     if (recvT?.kind !== "record") return null;
     const shape = L.shapes.get(recvT.shapeId);
     if (!shape?.indexValue || shape.tuple) return null;
-    const keyIr = L.lowerExprExpecting(expr.left, STRING);
+    // GH #104 (SEMANTICS.md S119): a key holding undefined is the key
+    // "undefined"; a receiver holding undefined throws Node's TypeError,
+    // its text naming the key — tested at the call, through a cold helper,
+    // so the presence helper itself never throws (a throwing helper costs
+    // every call site its pending-exception check).
+    const keyIr = undefinedAsText(L, L.lowerExprExpecting(expr.left, STRING), loc);
     const recv = L.lowerExprExpecting(expr.right, recvT);
     const hkey = `haskey:${recvT.shapeId}`;
     let helper = L.widthHelpers.get(hkey);
@@ -10391,7 +10724,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           ],
           loc,
         },
-        ret({ kind: "boolLit", value: false, type: BOOL, loc }),
+        // S015 (lead ruling): not own — the Object.prototype names fence.
+        ret(protoMissCall(L, k, loc, false)),
       );
       L.liftedFns.push({
         name: helper,
@@ -10410,8 +10744,40 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         loc,
       });
     }
-    return { kind: "call", callee: helper, args: [keyIr, recv], type: BOOL, loc };
+    const hasKey = helper;
+    if (!mayHoldSlotUndef(L, recv)) return { kind: "call", callee: hasKey, args: [keyIr, recv], type: BOOL, loc };
+    return bindOnce(L, keyIr, loc, (k) => bindOnce(L, recv, loc, (r) => ({
+      kind: "ternary",
+      cond: isUndefExpr(r, false, loc),
+      then: { kind: "call", callee: inUndefRecvThrower(L, loc), args: [k], type: BOOL, loc },
+      else_: { kind: "call", callee: hasKey, args: [k, r], type: BOOL, loc },
+      type: BOOL,
+      loc,
+    })));
   }
+
+/** `%in.undefrecv(k)`: Node's `Cannot use 'in' operator to search for
+ * '<k>' in undefined` — the cold arm of a run-time-key `in`. */
+function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
+  const hkey = "in:undefrecv";
+  let name = L.retagHelpers.get(hkey);
+  if (!name) {
+    name = `%in.undefrecv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(hkey, name);
+    const k: IrExpr = { kind: "varRef", localId: "k.0", type: STRING, loc };
+    const lit = (value: string): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
+    const cat = (left: IrExpr, right: IrExpr): IrExpr => ({ kind: "strConcat", left, right, type: STRING, loc });
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "k.0", name: "k", type: STRING }],
+      returnType: BOOL,
+      locals: [{ id: "k.0", name: "k", type: STRING, mutable: false }],
+      body: [{ kind: "throw", value: { kind: "libCall", fn: "error.new", args: [cat(cat(lit("Cannot use 'in' operator to search for '"), k), lit("' in undefined"))], type: { kind: "object", className: "%TypeError" }, loc }, loc }],
+      loc,
+    });
+  }
+  return name;
+}
 
 /** A regex literal `/ab+c/gi` → regexLit (interned per (pattern, flags)
    * by the backend). The TS parser has already syntax-checked the literal;
