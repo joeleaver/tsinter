@@ -58,6 +58,7 @@ import * as nodeWin32 from "node:path/win32";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { LEGACY_LANES } from "../../../tests/harness/legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const runtimeTestDir = join(import.meta.dirname, "../../runtime/test");
@@ -352,8 +353,12 @@ int main(int argc, char **argv) {
 `;
 }
 
+// The C driver links the legacy C runtime (scr_path.c): built and compared only
+// when SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts); otherwise the
+// oracle is two-way, Node against the emitted module.
 let cDriverBin: string;
 beforeAll(async () => {
+  if (!LEGACY_LANES) return;
   const cPath = join(scratch, "oracle_driver.c");
   await writeFile(cPath, cDriverSource());
   cDriverBin = join(scratch, "oracle_driver");
@@ -554,8 +559,8 @@ async function threeWay(
 
   // column 2: the C driver, one pass over the whole file (no batching —
   // it never uses check()'s capped MISMATCH path, so nothing throttles it).
-  const cAnswers = await runCDriver(casesFilePath);
-  expect(cAnswers.length, `C driver: exactly one output line per input line (${familyName})`).toBe(rows.length);
+  const cAnswers = LEGACY_LANES ? await runCDriver(casesFilePath) : null;
+  if (cAnswers !== null) expect(cAnswers.length, `C driver: exactly one output line per input line (${familyName})`).toBe(rows.length);
 
   const tallies = new Map<string, Tally>();
   const mismatches: string[] = [];
@@ -581,7 +586,7 @@ async function threeWay(
     for (let k = 0; k < batch.length; k++) {
       const row = batch[k]!;
       const expected = nodeAnswer(ns, row.op, row.args);
-      const c = cAnswers[start + k]!;
+      const c = cAnswers === null ? expected : cAnswers[start + k]!;
       const m = moduleAnswers[k]!;
       const ok = c === expected && m === expected;
       bump(row.rawOp, ok);

@@ -31,6 +31,7 @@ import {
   resolveLibraryFences,
   type SurfaceManifest,
 } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const manifestPath = join(repoRoot, "packages/compiler/surface-manifest.json");
@@ -171,7 +172,12 @@ describe("surface manifest sampling harness", () => {
     const file = probeFile(probe);
     if (entry!.status === "static") {
       const outDir = join(file, "..", "out");
-      const result = await compile(file, { outPath: join(outDir, "bin"), outDir });
+      // The flagless default build is a legacy lane (legacy-lanes.ts): off it,
+      // the probe builds --backend wasm, and "static" means the FRONTEND
+      // lowered it — a wasm tier refusal (SC3xxx, backend coverage) still
+      // counts, any other diagnostic does not.
+      const result = await compile(file, { outPath: join(outDir, LEGACY_LANES ? "bin" : "bin.wasm"), outDir, ...(LEGACY_LANES ? {} : { backend: "wasm" as const }) });
+      if (!result.ok && !LEGACY_LANES && result.diagnostics.every((d) => d.code.startsWith("SC3"))) return;
       if (!result.ok) {
         expect.unreachable(
           `${probe.id} is listed static but did not compile:\n` +

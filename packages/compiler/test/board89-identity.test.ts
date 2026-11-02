@@ -29,6 +29,7 @@ import { compile } from "../src/index.js";
 import { validateModule } from "../src/ir/validate.js";
 import { F64, type IrModule } from "../src/ir/nodes.js";
 import { runWasm } from "./wasm-host.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -67,7 +68,7 @@ async function buildWasm(name: string, source: string): Promise<string> {
  * exactly — the standard shape for a pure-identity cell with no sanitize
  * requirement. */
 async function expectAllLanes(name: string, source: string, expected: string): Promise<void> {
-  for (const backend of ["llvm", "c"] as const) {
+  for (const backend of modernLanes(["llvm", "c"] as const)) {
     const bin = await buildNative(`${name}-${backend}.ts`, source, backend, false);
     const { stdout } = await execFileAsync(bin);
     expect(stdout, `${name} (${backend})`).toBe(expected);
@@ -326,7 +327,7 @@ console.log("acc", acc);
 const P4_EXPECTED =
   "drop1 identity: true\ndrop2 identity: true\ndrop3 identity: true\ndropMixed identity: true\nacc 13509\n";
 
-describe("board #89 P4: 85-D4 trampoline, multi-refcounted-param drops (1/2/3/mixed tails)", () => {
+describe.skipIf(!LEGACY_LANES)("board #89 P4: 85-D4 trampoline, multi-refcounted-param drops (1/2/3/mixed tails)", () => {
   for (const backend of ["llvm", "c"] as const) {
     test(`${backend}: identity + correct release across all four tail shapes`, async () => {
       const bin = await buildNative(`p4-multidrop-${backend}.ts`, P4_SOURCE, backend, false);
@@ -437,7 +438,7 @@ console.log("done", acc);
 `;
 const P6_EXPECTED = "done 16540\n";
 
-describe("board #89 P6: LEAK axis, sanitized (ASan), computed values, 4 mechanisms x 100 iterations", () => {
+describe.skipIf(!LEGACY_LANES)("board #89 P6: LEAK axis, sanitized (ASan), computed values, 4 mechanisms x 100 iterations", () => {
   for (const backend of ["llvm", "c"] as const) {
     test(`${backend}, sanitized: no leak across param-coercion/stranded/D4-single/D4-double`, async () => {
       const bin = await buildNative(`p6-leak-${backend}.ts`, P6_SOURCE, backend, true);
@@ -645,7 +646,7 @@ test("board #89 P10: immortal-original — wrapper's true original is a top-leve
   await expectAllLanes("p10-immortal", P10_SOURCE, P10_EXPECTED);
 });
 
-describe("board #89 P10b: immortal-original, sanitized — trueOrig retain/release on an immortal is a harmless no-op", () => {
+describe.skipIf(!LEGACY_LANES)("board #89 P10b: immortal-original, sanitized — trueOrig retain/release on an immortal is a harmless no-op", () => {
   for (const backend of ["llvm", "c"] as const) {
     test(`${backend}, sanitized: no leak, no crash`, async () => {
       const bin = await buildNative(`p10b-immortal-san-${backend}.ts`, P10_SOURCE, backend, true);

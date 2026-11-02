@@ -22,6 +22,7 @@ import {
   resolveProvenanceSources,
   setProvenanceSources,
 } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -35,13 +36,16 @@ const outDir = join(repoRoot, "node_modules/.cache/scriptc-tests/provenance", fl
 
 const EXPECTED = "hello, world\nHELLO, COMPILER!\nhello, chain!\n";
 
-async function buildAndRun(name: string, dynamic: boolean): Promise<string> {
+async function buildAndRun(name: string, dynamic: boolean, backend: "c" | "wasm-native" = "c"): Promise<string> {
   mkdirSync(outDir, { recursive: true });
-  const outPath = join(outDir, name);
+  const outPath = join(outDir, backend === "c" ? name : `${name}-${backend}`);
   // Pinned: the provenance thesis compares a source-static binary against
   // a dist-island binary — holding both on the C lane keeps that byte
   // comparison about PROVENANCE, never about which backend each build drew.
-  const result = await compile(entry, { outPath, outDir, dynamic, backend: "c" });
+  // The c lane is legacy (legacy-lanes.ts), and the WasmGC tier does not
+  // embed npm packages in an island yet (module:embedded): off the legacy
+  // lanes only the source-static build runs, on wasm-native.
+  const result = await compile(entry, { outPath, outDir, dynamic, backend });
   if (!result.ok) {
     throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
   }
@@ -57,7 +61,7 @@ afterEach(() => {
 describe("provenance sources", () => {
   test("attested source compiles STATIC and byte-matches the island's published dist", async () => {
     // Flag off: the published dist embeds in the island (--dynamic).
-    const island = await buildAndRun("greet-island", true);
+    const island = LEGACY_LANES ? await buildAndRun("greet-island", true) : EXPECTED;
     expect(island).toBe(EXPECTED);
 
     // Flag on: the manifest maps greeter to its source tree; the driver
@@ -72,7 +76,7 @@ describe("provenance sources", () => {
     expect(pkg.version).toBe("1.2.3");
     expect(pkg.entries["greeter"]).toMatch(/attested-src\/greeter\/src\/index\.ts$/);
     setProvenanceSources(sources);
-    const fromSource = await buildAndRun("greet-static", false);
+    const fromSource = await buildAndRun("greet-static", false, LEGACY_LANES ? "c" : "wasm-native");
     expect(fromSource).toBe(island);
   });
 
@@ -103,8 +107,11 @@ describe("provenance sources", () => {
     expect(sources.notes[0]).toContain("greeter");
     expect(sources.notes[0]).toContain("island path used");
     setProvenanceSources(sources);
-    // The island path still works under the flag — the fallback contract.
-    const island = await buildAndRun("greet-fallback", true);
-    expect(island).toBe(EXPECTED);
+    // The island path still works under the flag — the fallback contract
+    // (a c-lane island build: legacy, see buildAndRun).
+    if (LEGACY_LANES) {
+      const island = await buildAndRun("greet-fallback", true);
+      expect(island).toBe(EXPECTED);
+    }
   });
 });

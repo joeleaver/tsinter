@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile, compileLibrary } from "../src/index.js";
 import { runtimeSrcDir } from "../src/backend/cc.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const vendorDir = join(runtimeSrcDir(), "..", "vendor", "zlib-chromium");
@@ -76,7 +77,8 @@ describe("the vendored zlib's own symbol prefix", () => {
     expect(ours).toEqual(want);
   });
 
-  for (const backend of ["c", "llvm"] as const) {
+  // c and llvm (and library mode) are legacy, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts)
+  for (const backend of modernLanes(["c", "llvm"] as const)) {
     test(`ZP-02 ${backend}: an executable carries no plain or Cr_z_ zlib name`, async () => {
       const dir = await mkdtemp(join(scratch, `${backend}-`));
       const entry = join(dir, "main.ts");
@@ -87,7 +89,7 @@ describe("the vendored zlib's own symbol prefix", () => {
     }, 300000);
   }
 
-  test("ZP-03 a library archive carries no plain or Cr_z_ zlib name", async () => {
+  test.skipIf(!LEGACY_LANES)("ZP-03 a library archive carries no plain or Cr_z_ zlib name", async () => {
     const dir = await mkdtemp(join(scratch, "lib-"));
     const entry = join(dir, "lib.ts");
     await writeFile(entry, PROGRAM.split("\n").slice(0, 4).join("\n") + "\n");

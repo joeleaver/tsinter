@@ -15,6 +15,7 @@ import { osTableHostNum } from "./wasm-os-tables-host.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
 import { emitWasmModule, parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
 import { arrayOf, REGEX, RUNTIME_ERROR_CLASSES, STRING, VOID, type IrClassDef, type IrExpr, type IrGlobal, type IrModule, type IrStmt, type SrcLoc } from "../src/ir/nodes.js";
+import { LEGACY_LANES } from "../../../tests/harness/legacy-lanes.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -8420,15 +8421,17 @@ test("increment 21 stage A: jsExit strict primitives — happy path reads the ex
   const wasm = await buildWasmDyn("jsexit-scalar-fail.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
   const { stdout, stderr } = await runWasmToTrap(wasm.binaryPath);
-  const c = await compile(join(scratch, "jsexit-scalar-fail.ts"), {
-    outPath: join(scratch, "jsexit-scalar-fail.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const cOut = await runNative(c.binaryPath);
-  expect(cOut).toEqual({ stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), code: 1 });
+  if (LEGACY_LANES) {
+    const c = await compile(join(scratch, "jsexit-scalar-fail.ts"), {
+      outPath: join(scratch, "jsexit-scalar-fail.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+    const cOut = await runNative(c.binaryPath);
+    expect(cOut).toEqual({ stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), code: 1 });
+  }
   expect(stdout.toString("utf8")).toBe("");
   expect(stderr.toString("utf8")).toBe("tsinter: unsupported: expected number, got string [SC1100]\n");
 });
@@ -8459,20 +8462,22 @@ test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit 
   const wasm = await buildWasmDyn("jsexit-array.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
   const { stdout, stderr } = await runWasm(wasm.binaryPath);
-  const c = await compile(join(scratch, "jsexit-array.ts"), {
-    outPath: join(scratch, "jsexit-array.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const cOut = await runNative(c.binaryPath);
-  // Unit H (SEMANTICS.md S014's unit-H amendment): an `any[]` parameter IS
-  // the island array, so no exit runs at the call — a non-array argument
-  // binds as it is, and `p.length` is the engine's `undefined`. The wasm
-  // lane's number slot holds it, as Node's binding does (S119, S110 (d));
-  // the c lane has no such slot and ends the program at the exit's check.
-  expect(cOut).toEqual({ stdout: "1 2 3 3\n", stderr: "tsinter: unsupported: expected number, got undefined [SC1100]\n", code: 1 });
+  if (LEGACY_LANES) {
+    const c = await compile(join(scratch, "jsexit-array.ts"), {
+      outPath: join(scratch, "jsexit-array.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+    const cOut = await runNative(c.binaryPath);
+    // Unit H (SEMANTICS.md S014's unit-H amendment): an `any[]` parameter IS
+    // the island array, so no exit runs at the call — a non-array argument
+    // binds as it is, and `p.length` is the engine's `undefined`. The wasm
+    // lane's number slot holds it, as Node's binding does (S119, S110 (d));
+    // the c lane has no such slot and ends the program at the exit's check.
+    expect(cOut).toEqual({ stdout: "1 2 3 3\n", stderr: "tsinter: unsupported: expected number, got undefined [SC1100]\n", code: 1 });
+  }
   expect(stdout.toString("utf8")).toBe("1 2 3 3\nundefined undefined undefined undefined\ndone\n");
   expect(stderr.toString("utf8")).toBe("");
 });
@@ -8591,20 +8596,22 @@ test("increment 21 stage A gate fix F3: island-array NON-INDEX keyed writes thro
   const wasm = await buildWasmDyn("setidx-nonindex-fence.ts", source);
   if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
   const { stdout, stderr } = await runWasmToTrap(wasm.binaryPath);
-  const c = await compile(join(scratch, "setidx-nonindex-fence.ts"), {
-    outPath: join(scratch, "setidx-nonindex-fence.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const cOut = await promisify(execFile)(c.binaryPath);
-  // The native island is a REAL engine array (matches Node: ordinary
-  // property write, no throw) — the wasm lane diverges from BOTH,
-  // pinned explicitly so nothing later assumes they agree.
-  expect(cOut.stdout).toBe("no-throw\nno-throw2\n3\n");
+  if (LEGACY_LANES) {
+    const c = await compile(join(scratch, "setidx-nonindex-fence.ts"), {
+      outPath: join(scratch, "setidx-nonindex-fence.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const cOut = await promisify(execFile)(c.binaryPath);
+    // The native island is a REAL engine array (matches Node: ordinary
+    // property write, no throw) — the wasm lane diverges from BOTH,
+    // pinned explicitly so nothing later assumes they agree.
+    expect(cOut.stdout).toBe("no-throw\nno-throw2\n3\n");
+  }
   // GH #86 review (S016, S122): the wasm lane's limitation is a fence
   // that ends the program at the first such write.
   expect(stdout.toString("utf8")).toBe("");
@@ -8626,20 +8633,22 @@ test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a
   if (!wasmWrite.ok) throw new Error(`refused: ${wasmWrite.diagnostics[0]?.message}`);
   const rWrite = await runWasm(wasmWrite.binaryPath);
   expect(rWrite.stdout.toString("utf8")).toBe("99 2\n"); // Node-verified
-  const cWrite = await compile(join(scratch, "arrexit-alias-write.ts"), {
-    outPath: join(scratch, "arrexit-alias-write.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!cWrite.ok) throw new Error(`c reference refused: ${cWrite.diagnostics[0]?.message}`);
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
-  const cWriteOut = await promisify(execFile)(cWrite.binaryPath);
-  // Unit H closed the per-lane split (SEMANTICS.md S014/S044's unit-H
-  // amendments): an `any[]` parameter IS the island array on every lane,
-  // so C shares the array too — Node's answer on both.
-  expect(cWriteOut.stdout).toBe("99 2\n");
+  if (LEGACY_LANES) {
+    const cWrite = await compile(join(scratch, "arrexit-alias-write.ts"), {
+      outPath: join(scratch, "arrexit-alias-write.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!cWrite.ok) throw new Error(`c reference refused: ${cWrite.diagnostics[0]?.message}`);
+    const cWriteOut = await promisify(execFile)(cWrite.binaryPath);
+    // Unit H closed the per-lane split (SEMANTICS.md S014/S044's unit-H
+    // amendments): an `any[]` parameter IS the island array on every lane,
+    // so C shares the array too — Node's answer on both.
+    expect(cWriteOut.stdout).toBe("99 2\n");
+  }
 
   const growSource = [
     "function mintArr(): any { return [1, 2, 3]; }",
@@ -8652,15 +8661,17 @@ test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a
   if (!wasmGrow.ok) throw new Error(`refused: ${wasmGrow.diagnostics[0]?.message}`);
   const rGrow = await runWasm(wasmGrow.binaryPath);
   expect(rGrow.stdout.toString("utf8")).toBe("4 4\n"); // Node-verified
-  const cGrow = await compile(join(scratch, "arrexit-alias-grow.ts"), {
-    outPath: join(scratch, "arrexit-alias-grow.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!cGrow.ok) throw new Error(`c reference refused: ${cGrow.diagnostics[0]?.message}`);
-  const cGrowOut = await promisify(execFile)(cGrow.binaryPath);
-  expect(cGrowOut.stdout).toBe("4 4\n"); // unit H: C shares the array too (Node-exact)
+  if (LEGACY_LANES) {
+    const cGrow = await compile(join(scratch, "arrexit-alias-grow.ts"), {
+      outPath: join(scratch, "arrexit-alias-grow.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!cGrow.ok) throw new Error(`c reference refused: ${cGrow.diagnostics[0]?.message}`);
+    const cGrowOut = await promisify(execFile)(cGrow.binaryPath);
+    expect(cGrowOut.stdout).toBe("4 4\n"); // unit H: C shares the array too (Node-exact)
+  }
 });
 
 test("increment 21 stage A gate round 2 fix D1: Function.prototype members on a FUNC-kind jsval receiver fence as 'Function.prototype.<name>', not 'Object.prototype.<name>' — reachable through F2's OWN placeholders (a placeholder IS a real FUNC-kind jsval): `const f: any = v.toString; typeof f.call` used to silently answer undefined (no table had 'call' at all); apply/bind/call/toString are the closed Function.prototype own-member set (Node-measured, caller/arguments excluded as throwing accessors)", async () => {
@@ -8724,21 +8735,23 @@ test("increment 21 stage A gate round 2 fix D7: jsMarshal(dyn) aliasing — a dy
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe("true\n"); // Node-verified
 
-  const c = await compile(join(scratch, "jsmarshal-dyn-identity.ts"), {
-    outPath: join(scratch, "jsmarshal-dyn-identity.c.out"),
-    outDir: scratch,
-    dynamic: true,
-    backend: "c",
-  });
-  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const cOut = await promisify(execFile)(c.binaryPath);
-  // The per-lane split: C copies at the jsMarshal(dyn) boundary (S014's
-  // default rule), so its two "marshaled" values are DIFFERENT objects
-  // and the round-trip identity check answers false — unlike wasm, which
-  // aliases and matches Node's true.
-  expect(cOut.stdout).toBe("false\n");
+  if (LEGACY_LANES) {
+    const c = await compile(join(scratch, "jsmarshal-dyn-identity.ts"), {
+      outPath: join(scratch, "jsmarshal-dyn-identity.c.out"),
+      outDir: scratch,
+      dynamic: true,
+      backend: "c",
+    });
+    if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const cOut = await promisify(execFile)(c.binaryPath);
+    // The per-lane split: C copies at the jsMarshal(dyn) boundary (S014's
+    // default rule), so its two "marshaled" values are DIFFERENT objects
+    // and the round-trip identity check answers false — unlike wasm, which
+    // aliases and matches Node's true.
+    expect(cOut.stdout).toBe("false\n");
+  }
 });
 
 test("increment 21 stage A gate round 3 fix R1/R2: '__proto__' (every kind, an Object.prototype ACCESSOR — never function-valued, so it cannot live in the function-shaped tables) and 'caller'/'arguments' (FUNC only, Function.prototype's own THROWING accessors) fence loudly instead of silently answering undefined; since GH #86 each fence ends the program (SEMANTICS.md S122), so each runs as its own program", async () => {

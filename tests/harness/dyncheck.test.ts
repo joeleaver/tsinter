@@ -23,11 +23,25 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
+
+/** The c lane is legacy (legacy-lanes.ts): by default these programs build
+ * wasm-native, whose runner follows a fence or an uncaught throw with its
+ * trap text `RuntimeError: unreachable` (SEMANTICS.md S117 (d), S122) — set
+ * aside before any stderr expectation. `cOnly` rows pin what only the c lane
+ * does — its fence texts for native handles, the c island's fences, an
+ * http-handle dynCheck the wasm tier refuses (dynCheck:httpReq) — and skip.
+ * SCRIPTC_LEGACY_LANES=1 runs everything on the c lane, as before. */
+const lane = LEGACY_LANES ? "c" : "wasm-native";
+const cOnly = test.skipIf(!LEGACY_LANES);
+function stripTrapText(s: string): string {
+  return lane === "wasm-native" ? s.replace(/RuntimeError: unreachable\n$/, "") : s;
+}
 
 interface RunResult {
   stdout: string;
@@ -43,6 +57,7 @@ async function compileAndRun(name: string, source: string, ext: "ts" | "cjs" = "
     .update(source)
     .update(sanitize ? "san" : "plain")
     .update(dynamic ? "dyn" : "")
+    .update(lane === "c" ? "" : lane)
     .digest("hex")
     .slice(0, 16);
   const outDir = join(cacheDir, `dyncheck-${key}`);
@@ -51,8 +66,9 @@ async function compileAndRun(name: string, source: string, ext: "ts" | "cjs" = "
   writeFileSync(file, source);
   // Pinned: the exact TypeError text and path rendering of failed checked
   // casts are C-reference pins; lane identity stays fixed so a diff means
-  // the dyn boundary changed, never that the default backend moved.
-  const result = await compile(file, { outPath: join(outDir, name), outDir, sanitize, backend: "c", dynamic });
+  // the dyn boundary changed, never that the default backend moved. Off the
+  // legacy lanes the same programs build wasm-native (`lane` above).
+  const result = await compile(file, { outPath: join(outDir, name), outDir, sanitize, backend: lane, dynamic });
   if (!result.ok) {
     throw new Error(
       "dyncheck program failed to compile:\n" +
@@ -61,11 +77,11 @@ async function compileAndRun(name: string, source: string, ext: "ts" | "cjs" = "
   }
   try {
     const { stdout, stderr } = await execFileAsync(result.binaryPath, [], { encoding: "utf8" });
-    return { stdout, stderr, exitCode: 0 };
+    return { stdout, stderr: stripTrapText(stderr), exitCode: 0 };
   } catch (err) {
     const e = err as { code?: unknown; stdout?: string; stderr?: string };
     if (typeof e.code !== "number") throw err;
-    return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", exitCode: e.code };
+    return { stdout: e.stdout ?? "", stderr: stripTrapText(e.stderr ?? ""), exitCode: e.code };
   }
 }
 
@@ -83,7 +99,7 @@ console.log("unreachable", c.host);
     expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got string");
   });
 
-  test("missing field throws as undefined", async () => {
+  cOnly("missing field throws as undefined", async () => {
     const r = await compileAndRun(
       "missing-field",
       `type Config = { host: string; port: number };
@@ -404,7 +420,7 @@ console.log("unreachable");
     expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got string");
   });
 
-  test("a MISSING argument is undefined and fails a required param's check", async () => {
+  cOnly("a MISSING argument is undefined and fails a required param's check", async () => {
     // JS arity: the thunk fills undefined; a number param can't hold it.
     const r = await compileAndRun(
       "dynfn-missing-arg",
@@ -653,7 +669,7 @@ server.listen(0, '127.0.0.1', wrap(function() {
 }));
 `;
 
-  test("a real-but-unmodeled member on a dyn handle throws the loud ladder", async () => {
+  cOnly("a real-but-unmodeled member on a dyn handle throws the loud ladder", async () => {
     // writeContinue stays unmodeled (cork/uncork/flushHeaders graduated
     // to real dispatches — the ladder's exemplar moves with the surface).
     const r = await compileAndRun(
@@ -671,7 +687,7 @@ server.listen(0, '127.0.0.1', wrap(function() {
     );
   });
 
-  test("an expando write on a dyn handle throws the loud ladder (identity would break)", async () => {
+  cOnly("an expando write on a dyn handle throws the loud ladder (identity would break)", async () => {
     const r = await compileAndRun(
       "handle-expando-write",
       serverPreamble +
@@ -685,7 +701,7 @@ server.listen(0, '127.0.0.1', wrap(function() {
     expect(r.stderr).toContain("setting 'custom' on a dynamic IncomingMessage is not supported yet");
   });
 
-  test("an unmodeled event registration on a dyn handle throws the loud ladder", async () => {
+  cOnly("an unmodeled event registration on a dyn handle throws the loud ladder", async () => {
     const r = await compileAndRun(
       "handle-unmodeled-event",
       serverPreamble +
@@ -701,7 +717,7 @@ server.listen(0, '127.0.0.1', wrap(function() {
     );
   });
 
-  test("a handle-targeted dynCheck failure names the class", async () => {
+  cOnly("a handle-targeted dynCheck failure names the class", async () => {
     const r = await compileAndRun(
       "handle-wrong-target",
       `import type { IncomingMessage } from "node:http";
@@ -856,7 +872,7 @@ console.log(keys(eng).length, keys(eng).join(","));
     expect(r.stdout).toBe("2 a,b\n");
   });
 
-  test("deepStrictEqual over island-held values: identity passes, structure fences", async () => {
+  cOnly("deepStrictEqual over island-held values: identity passes, structure fences", async () => {
     const r = await compileAndRun(
       "jsval-deepeq",
       `import assert from "node:assert";
@@ -880,7 +896,7 @@ console.log("unreachable");
     );
   });
 
-  test("util.inspect (console.log) of an island-held unknown renders plain data and fences other engine shapes with the engine typeof", async () => {
+  cOnly("util.inspect (console.log) of an island-held unknown renders plain data and fences other engine shapes with the engine typeof", async () => {
     // Unit H: plain engine data (dense Arrays, plain objects of enumerable
     // data members) renders through a read-only dyn snapshot — Node's own
     // output (SEMANTICS.md S110 (e)).
@@ -963,7 +979,7 @@ console.log(\`\${eng.a} \${eng.fresh}\`);
     expect(r.stdout).toBe("2 x\n");
   });
 
-  test("'in' over an island-held unknown fences (never a silent false)", async () => {
+  cOnly("'in' over an island-held unknown fences (never a silent false)", async () => {
     const r = await compileAndRun(
       "jsval-in",
       `/** @returns {any} */
@@ -980,7 +996,7 @@ console.log(has(eng));
     expect(r.stderr).toContain("'in' on an island value held in 'unknown' is not supported yet");
   });
 
-  test("a wrapped island value RC-balances through catch-and-continue unwinds", async () => {
+  cOnly("a wrapped island value RC-balances through catch-and-continue unwinds", async () => {
     // The engine clone's DataCloneError (a function member) is catchable;
     // the wrapped cell must release cleanly through the unwind (the SAN
     // lane's RC audit is the check).

@@ -15,17 +15,24 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
 import { analyze, compile, renderAll } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 /* Every compile below deliberately carries NO backend pin: this suite is
  * the user-adoption path, so it must see exactly what a flagless
  * `scriptc build` produces — the LLVM backend where the tier claims the
  * program, the transparent C fallback where it refuses. A failure here
- * that a `backend: "c"` pin would hide is a release-default bug. */
+ * that a `backend: "c"` pin would hide is a release-default bug.
+ *
+ * Except: that flagless default is a legacy lane (legacy-lanes.ts), so by
+ * default the programs that compile AND RUN build wasm-native (`runLane`);
+ * the ones that must fail stay flagless — they fail in the frontend, before
+ * any backend. SCRIPTC_LEGACY_LANES=1 restores the flagless builds. */
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
 const fixture = (name: string) => join(repoRoot, "tests/fixtures/strictness", name);
 const nodeTypesDir = join(repoRoot, "tests/fixtures/node-types");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
+const runLane = LEGACY_LANES ? {} : { backend: "wasm-native" as const };
 
 function outDirFor(name: string): string {
   return mkdtempSync(join(tmpdir(), `scriptc-config-${name}-`));
@@ -37,6 +44,7 @@ test("indexed-loose: the project's own (less strict) knobs are adopted — compi
     outPath: join(outDir, "main"),
     outDir,
     sanitize,
+    ...runLane,
   });
   expect(result.ok, !result.ok ? JSON.stringify(result.diagnostics, null, 2) : "").toBe(true);
   if (!result.ok) return;
@@ -64,6 +72,7 @@ test("node-types: the supported process surface lowers statically under @types/n
     outPath: join(outDir, "argv-env"),
     outDir,
     sanitize,
+    ...runLane,
   });
   expect(result.ok, !result.ok ? JSON.stringify(result.diagnostics, null, 2) : "").toBe(true);
   if (!result.ok) return;
@@ -75,7 +84,9 @@ test("node-types: the supported process surface lowers statically under @types/n
   expect(stdout).toBe("2\nalpha\nbeta\nhi from env\nwritten without newline <- flushed in order\n");
 });
 
-test("node-types: captured NodeJS.WritableStream values write through the procStream scalar", async () => {
+// Legacy: the WasmGC tier refuses the procStream scalar (type:procStream), so
+// this one runs only on the flagless default (legacy-lanes.ts).
+test.skipIf(!LEGACY_LANES)("node-types: captured NodeJS.WritableStream values write through the procStream scalar", async () => {
   const outDir = outDirFor("node-stream-capture");
   const result = await compile(join(nodeTypesDir, "stream-capture.ts"), {
     outPath: join(outDir, "stream-capture"),
@@ -95,6 +106,7 @@ test("node-types: path and os lower statically under @types/node's shapes", asyn
     outPath: join(outDir, "path-os"),
     outDir,
     sanitize,
+    ...runLane,
   });
   expect(result.ok, !result.ok ? JSON.stringify(result.diagnostics, null, 2) : "").toBe(true);
   if (!result.ok) return;
@@ -188,6 +200,7 @@ test("no-types-node: a bare project outside the repo compiles on the fallback de
     outPath: join(outDir, "main"),
     outDir,
     sanitize,
+    ...runLane,
   });
   expect(result.ok, !result.ok ? JSON.stringify(result.diagnostics, null, 2) : "").toBe(true);
   if (!result.ok) return;
@@ -205,6 +218,7 @@ test("dot-parent: bare '.' and '..' imports build and run (the TS project dialec
     outPath: join(outDir, "main"),
     outDir,
     sanitize,
+    ...runLane,
   });
   expect(result.ok, !result.ok ? JSON.stringify(result.diagnostics, null, 2) : "").toBe(true);
   if (!result.ok) return;

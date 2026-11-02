@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
+import { LEGACY_LANES, LEGACY_ONLY } from "./tests/harness/legacy-lanes.js";
 
 // Compiled-binary + oracle caches for the test lanes (see cc.ts's cache block
 // and tests/harness/README.md). Workers inherit SCRIPTC_CACHE_DIR from here;
@@ -30,6 +31,11 @@ export default defineConfig({
       "packages/*/src/**/*.test.ts",
       "packages/*/test/**/*.test.ts",
     ],
+    // The legacy C/LLVM lanes are not tested by default: their legacy-only
+    // files are excluded here and their cases in mixed files skip.
+    // SCRIPTC_LEGACY_LANES=1 brings both back. The list, with a reason per
+    // file, is tests/harness/legacy-lanes.ts.
+    exclude: [...configDefaults.exclude, ...(LEGACY_LANES ? [] : Object.keys(LEGACY_ONLY))],
     // Differential tests spawn clang + binaries; give them room. 300s is a
     // hang detector, not a performance bound: under a merge gate sharing
     // the box with lane compiles, a legitimately compile-heavy corpus

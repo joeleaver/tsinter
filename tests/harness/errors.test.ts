@@ -18,11 +18,22 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
+
+/** The c lane is legacy (legacy-lanes.ts): by default these programs build
+ * wasm-native, whose runner follows a fence or an uncaught throw with its
+ * trap text `RuntimeError: unreachable` (SEMANTICS.md S117 (d), S122) — set
+ * aside before any stderr expectation. Every row holds on both lanes.
+ * SCRIPTC_LEGACY_LANES=1 runs everything on the c lane, as before. */
+const lane = LEGACY_LANES ? "c" : "wasm-native";
+function stripTrapText(s: string): string {
+  return lane === "wasm-native" ? s.replace(/RuntimeError: unreachable\n$/, "") : s;
+}
 
 interface RunResult {
   stdout: string;
@@ -45,6 +56,7 @@ async function compileAndRun(
     .update(source)
     .update(JSON.stringify(extraFiles))
     .update(sanitize ? "san" : "plain")
+    .update(lane === "c" ? "" : lane)
     .digest("hex")
     .slice(0, 16);
   // Multi-module programs live OUTSIDE node_modules: the cache dir sits
@@ -67,8 +79,9 @@ async function compileAndRun(
   const dynamic = /^\/\/ @dynamic\s*$/.test(source.split("\n", 1)[0] ?? "");
   // Pinned: the uncaught-STDERR line shape (SEMANTICS.md divergence 11) is
   // pinned against the C reference; the LLVM lane's uncaught epilogue is
-  // llvm-differential's parity job, not this suite's.
-  const result = await compile(file, { outPath: join(outDir, name), outDir, sanitize, backend: "c", dynamic });
+  // llvm-differential's parity job, not this suite's. Off the legacy lanes
+  // the same programs build wasm-native (`lane` above).
+  const result = await compile(file, { outPath: join(outDir, name), outDir, sanitize, backend: lane, dynamic });
   if (!result.ok) {
     throw new Error(
       "errors program failed to compile:\n" +
@@ -77,11 +90,11 @@ async function compileAndRun(
   }
   try {
     const { stdout, stderr } = await execFileAsync(result.binaryPath, [], { encoding: "utf8" });
-    return { stdout, stderr: stripAsanFiberWarning(stderr), exitCode: 0 };
+    return { stdout, stderr: stripTrapText(stripAsanFiberWarning(stderr)), exitCode: 0 };
   } catch (err) {
     const e = err as { code?: unknown; stdout?: string; stderr?: string };
     if (typeof e.code !== "number") throw err;
-    return { stdout: e.stdout ?? "", stderr: stripAsanFiberWarning(e.stderr ?? ""), exitCode: e.code };
+    return { stdout: e.stdout ?? "", stderr: stripTrapText(stripAsanFiberWarning(e.stderr ?? "")), exitCode: e.code };
   }
 }
 

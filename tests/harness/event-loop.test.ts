@@ -14,6 +14,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { modernLanes } from "./legacy-lanes.js";
 import { eventLoopCases, type StdinScript } from "./event-loop-cases.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
@@ -51,8 +52,8 @@ function runWithStdin(cmd: string, args: string[], script: StdinScript): Promise
 
 /** The lanes each case runs on: the c lane (the reference these fixtures
  * were written against) and the wasm-native lane. */
-const BACKENDS = ["c", "wasm-native"] as const;
-type Backend = (typeof BACKENDS)[number];
+const BACKENDS = modernLanes(["c", "wasm-native"] as const);
+type Backend = "c" | "wasm-native";
 
 /** Cases the wasm-native lane does not yet match, pinned as failing (a
  * fix makes the case pass and this test fail until the entry goes): the

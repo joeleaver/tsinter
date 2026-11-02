@@ -21,6 +21,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -61,12 +62,13 @@ const PROGRAMS: [string, string, (stdout: string) => void][] = [
   ],
 ];
 
-const LANES = ["wasm", "c", "llvm"] as const;
+// c and llvm are legacy lanes, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts).
+const LANES = modernLanes(["wasm", "c", "llvm"] as const);
 /** SCRIPTC_SAN=1 (the sanitized lane) builds the c and llvm binaries with
  * ASan + the RC audit, so the table doubles as a leak/overflow check of
  * the codec and its driver. */
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
-type Lane = (typeof LANES)[number];
+type Lane = "wasm" | "c" | "llvm";
 
 async function runLane(file: string, lane: Lane): Promise<string> {
   const dir = await mkdtemp(join(scratch, `${lane}-`));

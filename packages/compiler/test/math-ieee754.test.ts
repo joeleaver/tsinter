@@ -52,6 +52,7 @@ import { IEEE754_CC } from "../src/backend/wasm/ieee754-src.js";
 import { CCompiler, CSubsetError, parseC } from "../src/backend/wasm/csubset.js";
 import { ModuleBuilder } from "../src/backend/wasm/module.js";
 import { runWasm } from "./wasm-host.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -212,7 +213,8 @@ function program(call: string, arity: number, inputs: number[]): string {
 }
 
 type Lane = "wasm" | "c" | "llvm";
-const LANES: Lane[] = ["wasm", "c", "llvm"];
+// c and llvm are legacy lanes, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts).
+const LANES: Lane[] = modernLanes<Lane>(["wasm", "c", "llvm"]);
 const execFileAsync = promisify(execFile);
 
 let serial = 0;
@@ -570,7 +572,7 @@ describe.for(LANES)("DYNAMIC [%s]", (lane) => {
  * lane's engine (phase 2) runs the SAME override (scr_island_math.h) over the
  * same ieee754.cc compiled into engine.wasm, its pow bound to the module's
  * own %w.jsPow. */
-describe.for(["c", "llvm", "wasm"] as const)("ENGINE [%s]", (lane) => {
+describe.for(modernLanes(["c", "llvm", "wasm"] as const))("ENGINE [%s]", (lane) => {
   test("ENGINE: Math evaluated by the embedded engine answers Node's bits", async () => {
     const next = xorshift(0x2468ace013579bdfn);
     const xs: number[] = [...EDGES, ...nanInputs()];
@@ -621,7 +623,7 @@ describe.for(["c", "llvm", "wasm"] as const)("ENGINE [%s]", (lane) => {
 
 /* ── LINK: the ieee754 object joins a native link exactly when used ─────── */
 
-test("LINK: a native binary carries V8's ieee754 code exactly when it calls a transcendental (or embeds the engine)", async () => {
+test.skipIf(!LEGACY_LANES)("LINK: a native binary carries V8's ieee754 code exactly when it calls a transcendental (or embeds the engine)", async () => {
   const syms = async (bin: string): Promise<string[]> => {
     const r = await execFileAsync("nm", [bin], { encoding: "utf8", maxBuffer: 64 << 20 });
     return [...new Set([...r.stdout.matchAll(/\bscr_ieee754_[a-z0-9]+\b/g)].map((m) => m[0]))].sort();

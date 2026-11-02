@@ -17,11 +17,26 @@ non-harness suite and the wasm census; anything else also needs the full run.
 (`pnpm test:sandbox` is upstream's Vercel Sandbox gate; its credentials are not
 available on this fork.)
 
+**The legacy C and LLVM lanes are not tested by default.** The C and LLVM
+backends, their C runtime (`packages/runtime/src/scr_*`), and everything that
+only they build — `--backend c|llvm`, the flagless default build, library
+mode, FFI — are transitional and are deleted at milestone N4. Until then they
+may break without blocking anything, so no gate (the full run included)
+covers them: the suite tests the WasmGC lanes (wasm, wasm-native) and the
+frontend. `vitest.config.ts` excludes the legacy-only test files, and mixed
+files skip their c/llvm cases (frontend checks that used to ride the c lane
+build wasm-native or wasm instead). The one list, with a reason per file, is
+[`tests/harness/legacy-lanes.ts`](./tests/harness/legacy-lanes.ts).
+`SCRIPTC_LEGACY_LANES=1` brings every legacy file and case back, e.g.
+`SCRIPTC_LEGACY_LANES=1 pnpm exec vitest run tests/harness/differential.test.ts`.
+A new test that builds a c or llvm binary goes on that list (or gates its
+legacy cases with `LEGACY_LANES` / `modernLanes`) in the same commit.
+
 `SCRIPTC_TEST_WORKERS` caps the vitest worker pool so concurrent agents don't
 contend for cores; full local suites also queue behind an advisory lock per
 lane.
 
-Corpus programs are differential tests against Node: every program runs under Node and as a compiled native binary, and stdout, stderr, and exit codes must match byte-for-byte. A new feature lands with corpus programs that pin its behavior both ways. The wasm lane (`tests/harness/wasm-differential.test.ts`) attempts every corpus program under `--backend wasm` and histograms refusals into the work queue; out-of-tier programs must refuse loudly with a named diagnostic, never miscompile. Adding a corpus program may require re-recording `packages/compiler/test/ts7/baselines/order-parity.json` (always for `.js`/`.mjs`/`.cjs` and `*/main.ts` entries), and the full plain lane is what proves it.
+Corpus programs are differential tests against Node: every program runs under Node and as a compiled program on each tested lane (wasm, wasm-native; the legacy c and llvm lanes only under `SCRIPTC_LEGACY_LANES=1`), and stdout, stderr, and exit codes must match byte-for-byte. A new feature lands with corpus programs that pin its behavior both ways. The wasm lane (`tests/harness/wasm-differential.test.ts`) attempts every corpus program under `--backend wasm` and histograms refusals into the work queue; out-of-tier programs must refuse loudly with a named diagnostic, never miscompile. Adding a corpus program may require re-recording `packages/compiler/test/ts7/baselines/order-parity.json` (always for `.js`/`.mjs`/`.cjs` and `*/main.ts` entries), and the full plain lane is what proves it.
 
 ## Semantics register
 

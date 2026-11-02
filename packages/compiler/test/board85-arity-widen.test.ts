@@ -48,6 +48,11 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
+
+/** The refusal and IR-disposition rows (groups 2 and 3) are the frontend's:
+ * they build llvm as written, wasm off the legacy lanes (legacy-lanes.ts). */
+const frontendLane = LEGACY_LANES ? "llvm" : "wasm";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,7 +132,7 @@ console.log("identity", w === real);
 const RELABEL_EXPECTED = "real hello 42\nidentity true\n";
 
 describe("board #85: pure relabel path — all-scalar trailing drops (int/SSE register classes), identity preserved", () => {
-  for (const backend of ["llvm", "c"] as const) {
+  for (const backend of modernLanes(["llvm", "c"] as const)) {
     for (const sanitize of [false, true]) {
       test(`${backend}, ${sanitize ? "sanitized (ASan)" : "plain"}: identity preserved, extra scalar trailing args ignored safely`, async () => {
         const bin = await buildNative(`relabel-${backend}-${sanitize}.ts`, RELABEL_SOURCE, backend, sanitize);
@@ -164,7 +169,7 @@ w("hello", computed);
 `;
 const TRAMPOLINE_STRING_EXPECTED = "real hello\n";
 
-describe("board #85: absorbing trampoline path — refcounted trailing drops, audit-clean, identity lost (board #89, matches base)", () => {
+describe.skipIf(!LEGACY_LANES)("board #85: absorbing trampoline path — refcounted trailing drops, audit-clean, identity lost (board #89, matches base)", () => {
   for (const backend of ["llvm", "c"] as const) {
     test(`${backend}, sanitized (ASan): union/optional trailing param (2253's own Callback shape) — no leak`, async () => {
       const bin = await buildNative(`trampoline-union-${backend}.ts`, TRAMPOLINE_UNION_SOURCE, backend, true);
@@ -179,7 +184,7 @@ describe("board #85: absorbing trampoline path — refcounted trailing drops, au
   }
 });
 
-test("board #85: 2253-union-coercions.ts itself, sanitized (ASan) — no leak (the shape that surfaced 85-D4)", async () => {
+test.skipIf(!LEGACY_LANES)("board #85: 2253-union-coercions.ts itself, sanitized (ASan) — no leak (the shape that surfaced 85-D4)", async () => {
   const repoRoot = join(import.meta.dirname, "../../..");
   const source = await readFile(join(repoRoot, "tests/corpus/2253-union-coercions.ts"), "utf8");
   const bin = await buildNative("2253-sanitized.ts", source, "llvm", true);
@@ -203,7 +208,7 @@ console.log(narrowed.inner.calc(99), narrowed.inner.calc === outer.inner.calc);
 const RECORD_WIDTH_EXPECTED = "7 true\n6 true\n";
 
 describe("board #85: 2557's own record-width-lift shapes (top-level + nested)", () => {
-  for (const backend of ["llvm", "c"] as const) {
+  for (const backend of modernLanes(["llvm", "c"] as const)) {
     test(`${backend}: identity survives record-field width lift, both depths`, async () => {
       const bin = await buildNative(`recwidth-${backend}.ts`, RECORD_WIDTH_SOURCE, backend, false);
       const { stdout } = await execFileAsync(bin);
@@ -230,7 +235,7 @@ console.log(seen, cb === cb);
 `;
 const CALLBACK_ARITY_DROP_EXPECTED = "ran;ran; true\n";
 
-test("board #85: 2253's own cb/Callback shape (coerceToExpected direct path) calls correctly", async () => {
+test.skipIf(!LEGACY_LANES)("board #85: 2253's own cb/Callback shape (coerceToExpected direct path) calls correctly", async () => {
   const bin = await buildNative("cb-aritydrop.ts", CALLBACK_ARITY_DROP_SOURCE, "llvm", false);
   const { stdout } = await execFileAsync(bin);
   expect(stdout).toBe(CALLBACK_ARITY_DROP_EXPECTED);
@@ -272,7 +277,7 @@ const CHAIN_EXPECTED =
   "plainA===plainA true\nplainA===plainB false\n";
 
 describe("board #85 F1: chained (depth-2/3) arity-drop identity, every loop arm", () => {
-  for (const backend of ["llvm", "c"] as const) {
+  for (const backend of modernLanes(["llvm", "c"] as const)) {
     test(`${backend}: depth-3 chain identity + no-match-with-bases (regression pin, was already correct)`, async () => {
       const bin = await buildNative(`chain-${backend}.ts`, CHAIN_SOURCE, backend, false);
       const { stdout } = await execFileAsync(bin);
@@ -319,7 +324,7 @@ h("x", 1, 2);
 `,
     );
     const outPath = join(scratch, "rest-src");
-    const res = await compile(entry, { outPath, outDir: scratch, backend: "llvm" });
+    const res = await compile(entry, { outPath, outDir: scratch, backend: frontendLane });
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.diagnostics[0]?.code).toBe("SC1090");
   });
@@ -336,7 +341,7 @@ h("x", 1, 2, 3);
 `,
     );
     const outPath = join(scratch, "rest-dst");
-    const res = await compile(entry, { outPath, outDir: scratch, backend: "llvm" });
+    const res = await compile(entry, { outPath, outDir: scratch, backend: frontendLane });
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.diagnostics[0]?.code).toBe("SC2009");
   });
@@ -348,7 +353,7 @@ async function emittedIrText(name: string, source: string): Promise<string> {
   const entry = join(scratch, name);
   await writeFile(entry, source);
   const outPath = join(scratch, name.replace(/\.ts$/, ""));
-  const res = await compile(entry, { outPath, outDir: scratch, backend: "llvm", emitIr: true });
+  const res = await compile(entry, { outPath: frontendLane === "wasm" ? `${outPath}.wasm` : outPath, outDir: scratch, backend: frontendLane, emitIr: true });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   if (!res.irPath) throw new Error("compile ok but no irPath (emitIr not honored)");
   return readFile(res.irPath, "utf8");
@@ -395,7 +400,7 @@ console.log(String(make()));
     const entry = join(scratch, "2470-retrace.js");
     await writeFile(entry, source);
     const outPath = join(scratch, "2470-retrace");
-    const res = await compile(entry, { outPath, outDir: scratch, backend: "llvm", emitIr: true });
+    const res = await compile(entry, { outPath: frontendLane === "wasm" ? `${outPath}.wasm` : outPath, outDir: scratch, backend: frontendLane, emitIr: true });
     if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
     if (!res.irPath) throw new Error("compile ok but no irPath");
     const ir = await readFile(res.irPath, "utf8");
@@ -488,7 +493,7 @@ const ADDENDUM_SHAPES: { name: string; source: string; expected: string }[] = [
 
 describe("board #85 85-D3/D4 addendum: rev-85's F1-blast-radius shapes (ported, provenance cited)", () => {
   for (const shape of ADDENDUM_SHAPES) {
-    for (const backend of ["llvm", "c"] as const) {
+    for (const backend of modernLanes(["llvm", "c"] as const)) {
       test(`${backend}: ${shape.name}`, async () => {
         const bin = await buildNative(`${shape.name}-${backend}.ts`, shape.source, backend, false);
         const { stdout } = await execFileAsync(bin);

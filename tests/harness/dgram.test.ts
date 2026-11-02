@@ -15,6 +15,7 @@ import { existsSync, globSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { modernLanes } from "./legacy-lanes.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const fixturesRoot = join(repoRoot, "tests/fixtures/dgram");
@@ -82,8 +83,8 @@ function runLane(cmd: string, args: string[], driver: string | null): Promise<Pr
  * wasm-native lane (native-runner phase N1: node:dgram in the wasm module
  * over the runner's host). A program the wasm tier does not build refuses
  * there by name and is not run on that lane. */
-const BACKENDS = ["c", "wasm-native"] as const;
-type Backend = (typeof BACKENDS)[number];
+const BACKENDS = modernLanes(["c", "wasm-native"] as const);
+type Backend = "c" | "wasm-native";
 
 /** Programs the wasm-native lane does not yet match, pinned as failing (a
  * fix makes the program pass and this test fail until the entry goes). */

@@ -30,6 +30,7 @@ import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
 import { runWasm } from "../../packages/compiler/test/wasm-host.js";
+import { modernLanes } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -37,7 +38,9 @@ const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 
 type Lane = "c" | "llvm" | "wasm";
-const lanes: Lane[] = sanitize ? ["c", "llvm"] : ["c", "llvm", "wasm"];
+// c and llvm are legacy lanes, off unless SCRIPTC_LEGACY_LANES=1
+// (legacy-lanes.ts); a sanitized run without them has no lane left and skips.
+const lanes: Lane[] = modernLanes<Lane>(sanitize ? ["c", "llvm"] : ["c", "llvm", "wasm"]);
 
 interface Out { stdout: string; stderr: string; exitCode: number }
 
@@ -282,7 +285,7 @@ const RESIDUE: { name: string; js: string; node: (s: string) => string }[] = [
 const marked = (group: Row[]): string =>
   group.map((r) => `console.log(${JSON.stringify(`--- ${r.name}`)}); try { ${r.js}\n} catch (e) { console.log('THREW', e && e.message); }`).join("\n");
 
-describe(`island util.inspect = Node's (${lanes.join(", ")}${sanitize ? ", sanitized" : ""})`, () => {
+describe.skipIf(lanes.length === 0)(`island util.inspect = Node's (${lanes.join(", ")}${sanitize ? ", sanitized" : ""})`, () => {
   rows.forEach((group, gi) => {
     test(`group ${gi}: ${group.map((r) => r.name).join(", ")}`, async () => {
       const js = marked(group);

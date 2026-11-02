@@ -15,6 +15,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { modernLanes } from "./legacy-lanes.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const fixtureDir = join(repoRoot, "tests/fixtures/console-io");
@@ -28,8 +29,8 @@ interface ClosedChild {
   signal: NodeJS.Signals | null;
 }
 
-const BACKENDS = ["c", "wasm-native"] as const;
-type Backend = (typeof BACKENDS)[number];
+const BACKENDS = modernLanes(["c", "wasm-native"] as const);
+type Backend = "c" | "wasm-native";
 
 async function build(name: string, backend: Backend): Promise<{ binary: string; sourceFile: string }> {
   const sourceFile = join(fixtureDir, `${name}.ts`);

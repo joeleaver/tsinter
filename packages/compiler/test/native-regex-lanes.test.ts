@@ -38,6 +38,7 @@ import { compileRegex } from "../src/backend/wasm/regex-buildtime.js";
 import { patternPool } from "./regex-pattern-pool.js";
 import { regexLanesProgram, renderRow } from "./regex-lanes-program.js";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 const SAN = process.env["SCRIPTC_SAN"] === "1";
 
@@ -117,7 +118,8 @@ describe("one regex table, every lane", () => {
 
     const node = execFileSync(process.execPath, [entry], { maxBuffer: 1 << 30 }).toString();
     const outs: Record<string, string> = {};
-    for (const lane of ["wasm", "c", "llvm"] as const) {
+    // c and llvm are legacy lanes, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts)
+    for (const lane of modernLanes(["wasm", "c", "llvm"] as const)) {
       const outPath = join(dir, lane === "wasm" ? "regex-lanes.wasm" : `regex-lanes-${lane}`);
       const res = await compile(entry, { outPath, outDir: join(dir, `out-${lane}`), backend: lane, sanitize: lane !== "wasm" && SAN });
       if (!res.ok) throw new Error(`${lane}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
@@ -129,7 +131,7 @@ describe("one regex table, every lane", () => {
     writeFileSync(fEntry, regexLanesProgram(fencedRows.map((f) => f.row).join("\n"), SUBJECTS));
     const fNode = execFileSync(process.execPath, [fEntry], { maxBuffer: 1 << 30 }).toString();
     const fOuts: Record<string, string> = {};
-    for (const lane of ["c", "llvm"] as const) {
+    for (const lane of modernLanes(["c", "llvm"] as const)) {
       const res = await compile(fEntry, { outPath: join(dir, `regex-fenced-${lane}`), outDir: join(dir, `fout-${lane}`), backend: lane, sanitize: SAN });
       if (!res.ok) throw new Error(`${lane} (fenced): ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
       fOuts[lane] = execFileSync(res.binaryPath, { maxBuffer: 1 << 30 }).toString();
@@ -157,8 +159,10 @@ describe("one regex table, every lane", () => {
       for (let i = 0; i < Math.max(x.length, y.length); i++) if (x[i] !== y[i]) return `line ${i}:\n  ${x[i]}\n  ${y[i]}`;
       return "differ";
     };
-    expect(sameAs(outs["wasm"]!, outs["c"]!)).toBe(null);
-    expect(sameAs(outs["wasm"]!, outs["llvm"]!)).toBe(null);
+    if (LEGACY_LANES) {
+      expect(sameAs(outs["wasm"]!, outs["c"]!)).toBe(null);
+      expect(sameAs(outs["wasm"]!, outs["llvm"]!)).toBe(null);
+    }
 
     // and Node's, on every unfenced row
     const lane = byRow(outs["wasm"]!);
@@ -173,20 +177,22 @@ describe("one regex table, every lane", () => {
     // the fenced rows: c = llvm, each the named Error (S122's c/llvm
     // residue) where Node builds the regex; the wasm lane's program ends
     // at the fence with its stderr line (GH #86)
-    expect(sameAs(fOuts["c"]!, fOuts["llvm"]!)).toBe(null);
-    const fLane = byRow(fOuts["c"]!);
-    const fWant = byRow(fNode);
     const fences = new Map<string, number>();
-    for (let i = 0; i < fencedRows.length; i++) {
-      const got = fLane.get(i) ?? [];
-      const exp = fWant.get(i) ?? [];
-      const key = fencedRows[i]!.key;
-      const fence = got.length === 1 ? / Error "new RegExp\(\): '([^']+)' is not supported yet" libCall:regex\.new:(\S+)$/.exec(got[0]!) : null;
-      if (fence === null || fence[1] !== key || fence[2] !== key || exp.length === 0 || exp[0]!.includes(" Error ")) {
-        diffs.push(`fenced row ${i} (${key}) ${fencedRows[i]!.row}\n  node ${exp.join("\n       ")}\n  c    ${got.join("\n       ")}`);
-        continue;
+    if (LEGACY_LANES) {
+      expect(sameAs(fOuts["c"]!, fOuts["llvm"]!)).toBe(null);
+      const fLane = byRow(fOuts["c"]!);
+      const fWant = byRow(fNode);
+      for (let i = 0; i < fencedRows.length; i++) {
+        const got = fLane.get(i) ?? [];
+        const exp = fWant.get(i) ?? [];
+        const key = fencedRows[i]!.key;
+        const fence = got.length === 1 ? / Error "new RegExp\(\): '([^']+)' is not supported yet" libCall:regex\.new:(\S+)$/.exec(got[0]!) : null;
+        if (fence === null || fence[1] !== key || fence[2] !== key || exp.length === 0 || exp[0]!.includes(" Error ")) {
+          diffs.push(`fenced row ${i} (${key}) ${fencedRows[i]!.row}\n  node ${exp.join("\n       ")}\n  c    ${got.join("\n       ")}`);
+          continue;
+        }
+        fences.set(key, (fences.get(key) ?? 0) + 1);
       }
-      fences.set(key, (fences.get(key) ?? 0) + 1);
     }
     for (const [key, err] of Object.entries(wasmFenceErr)) {
       expect(err).toBe(`tsinter: unsupported: new RegExp(): '${key}' is not supported yet [libCall:regex.new:${key}]\n`);

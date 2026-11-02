@@ -26,6 +26,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
 import { runWasm } from "../../packages/compiler/test/wasm-host.js";
+import { modernLanes } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -154,8 +155,8 @@ async function runWasmUnder(path: string, tz: string): Promise<string> {
 
 beforeAll(async () => {
   work = mkdtempSync(join(tmpdir(), "tsinter-tz-matrix-"));
-  await build("static", STATIC_SRC, false, ["c", "llvm", "wasm"]);
-  await build("engine", ENGINE_SRC, true, ["c", "llvm", "wasm"]);
+  await build("static", STATIC_SRC, false, modernLanes(["c", "llvm", "wasm"] as const));
+  await build("engine", ENGINE_SRC, true, modernLanes(["c", "llvm", "wasm"] as const));
 }, 600_000);
 
 afterAll(() => {

@@ -23,12 +23,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { LEGACY_LANES, modernLanes } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
-const platformTest = process.env["SCRIPTC_PORTABLE_ONLY"] === "1" ? test.skip : test;
+// Every row but the build-time refusal pins the c lane's binary or emitted C:
+// a legacy lane, off unless SCRIPTC_LEGACY_LANES=1 (legacy-lanes.ts).
+const cTest = LEGACY_LANES ? test : test.skip;
+const platformTest = process.env["SCRIPTC_PORTABLE_ONLY"] === "1" ? test.skip : cTest;
 
 interface BuildResult {
   binaryPath: string;
@@ -65,7 +69,7 @@ async function build(
 }
 
 describe("regex (scriptc-only behavior)", () => {
-  test("assert.throws's shape form aborts by name on a global/sticky regex VALUE (board #301)", async () => {
+  cTest("assert.throws's shape form aborts by name on a global/sticky regex VALUE (board #301)", async () => {
     // lastIndex is modelled (SEMANTICS.md S003's regex amendment), but
     // Node runs a shape key's regex a SECOND time when it reports a failed
     // comparison — one verdict cannot reproduce that, so a value-path g/y
@@ -102,8 +106,9 @@ console.log("unreachable");
     mkdirSync(dir, { recursive: true });
     const file = join(dir, "main.ts");
     writeFileSync(file, `console.log("before");\nconsole.log(/${"(a)".repeat(300)}/.test("a"));\n`);
-    for (const backend of ["c", "llvm"] as const) {
-      const result = await compile(file, { outPath: join(dir, `p-${backend}`), outDir: dir, sanitize, backend });
+    // The wasm tier itself, and the c and llvm lanes when SCRIPTC_LEGACY_LANES=1.
+    for (const backend of modernLanes(["wasm", "c", "llvm"] as const)) {
+      const result = await compile(file, { outPath: join(dir, backend === "wasm" ? "p.wasm" : `p-${backend}`), outDir: dir, sanitize: backend !== "wasm" && sanitize, backend });
       expect(result.ok).toBe(false);
       if (result.ok) continue;
       expect(result.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);

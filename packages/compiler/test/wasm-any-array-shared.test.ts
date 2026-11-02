@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
+import { LEGACY_LANES, modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 let scratch = "";
 beforeAll(async () => {
@@ -37,7 +38,8 @@ async function refuseRow(id: string, src: string): Promise<string> {
   const entry = join(scratch, `${id}.ts`);
   await writeFile(entry, `${src}\n`);
   const lanes: string[] = [];
-  for (const backend of ["wasm", "c"] as const) {
+  // c is a legacy lane, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts)
+  for (const backend of modernLanes(["wasm", "c"] as const)) {
     const res = await compile(entry, {
       outPath: join(scratch, `${id}.${backend}.out`),
       outDir: scratch,
@@ -47,7 +49,7 @@ async function refuseRow(id: string, src: string): Promise<string> {
     if (res.ok) throw new Error(`${id} compiled on ${backend} but was expected to refuse`);
     lanes.push(res.diagnostics.map((d) => `${d.code}:${d.message}`).join("\n"));
   }
-  expect(lanes[1]).toBe(lanes[0]);
+  for (const other of lanes.slice(1)) expect(other).toBe(lanes[0]);
   return lanes[0]!;
 }
 
@@ -136,10 +138,12 @@ async function runCFull(id: string, src: string): Promise<{ stdout: string; stde
  * island's Proxy views): the wasm stdout, after checking c agrees. */
 async function bothRow(id: string, src: string): Promise<string> {
   const w = await runRow(`${id}-w`, src);
-  const c = await runC(`${id}-c`, src);
-  expect(c.stdout).toBe(w.stdout);
   expect(w.exitCode).toBe(0);
-  expect(c.exitCode).toBe(0);
+  if (LEGACY_LANES) {
+    const c = await runC(`${id}-c`, src);
+    expect(c.stdout).toBe(w.stdout);
+    expect(c.exitCode).toBe(0);
+  }
   return w.stdout;
 }
 
@@ -234,14 +238,16 @@ async function bothFence(id: string, src: string): Promise<string> {
   const res = await compile(entry, { outPath: join(scratch, `${id}-w.wasm`), outDir: scratch, backend: "wasm", dynamic: true });
   if (!res.ok) throw new Error(`${id} refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
   const w = await runWasmToTrap(res.binaryPath);
-  const c = await runCFull(`${id}-c`, src);
   expect(String(w.stdout)).toBe("before\n");
-  if (id === "H-VERR-04") {
-    expect(c).toEqual({ stdout: "before\ncaught\n", stderr: "", exitCode: 0 });
-  } else {
-    expect(c.stdout).toBe("before\n");
-    expect(c.exitCode).toBe(1);
-    expect(c.stderr).toBe(String(w.stderr));
+  if (LEGACY_LANES) {
+    const c = await runCFull(`${id}-c`, src);
+    if (id === "H-VERR-04") {
+      expect(c).toEqual({ stdout: "before\ncaught\n", stderr: "", exitCode: 0 });
+    } else {
+      expect(c.stdout).toBe("before\n");
+      expect(c.exitCode).toBe(1);
+      expect(c.stderr).toBe(String(w.stderr));
+    }
   }
   const line = String(w.stderr);
   expect(line.startsWith("tsinter: unsupported: ")).toBe(true);
@@ -478,14 +484,16 @@ test("H-S2 a write past an island array's length (Node leaves holes) refuses by 
   const { runWasmToTrap } = await import("./wasm-host.js");
   const t = await runWasmToTrap(res.binaryPath);
   expect(String(t.stderr)).toContain("writing an island array at index 4 past its length (the holes Node leaves) is not supported yet on the wasm lane");
-  const c = await runC("H-S2c", "// @dynamic\nconst xs: any[] = [1, 2];\nxs[4] = 5;\nconsole.log(xs.length);");
-  expect(c.stdout).toBe("5\n");
+  if (LEGACY_LANES) {
+    const c = await runC("H-S2c", "// @dynamic\nconst xs: any[] = [1, 2];\nxs[4] = 5;\nconsole.log(xs.length);");
+    expect(c.stdout).toBe("5\n");
+  }
 });
 
 test("H-S110c Array.prototype errors on an island array spell V8's texts on the native lanes too", async () => {
   const want = "TypeError Reduce of empty array with no initial value\nTypeError Reduce of empty array with no initial value\nRangeError Invalid index : 7\nTypeError The comparison function must be either a function or undefined: 1\nTypeError The comparison function must be either a function or undefined: #<Object>\n4 3,9 1,3\n";
   expect((await runRow("H-S110c-w", "// @dynamic\nconst xs: any[] = [3, 1];\ntry { ([] as any[]).reduce((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { ([] as any[]).reduceRight((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.with(\"7\" as any, 1); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.toSorted(1 as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.sort({} as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\nconsole.log(xs.reduce((a: any, b: any) => a + b), xs.with(-1, 9).join(\",\"), xs.toSorted().join(\",\"));")).stdout).toBe(want);
-  expect((await runC("H-S110c-c", "// @dynamic\nconst xs: any[] = [3, 1];\ntry { ([] as any[]).reduce((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { ([] as any[]).reduceRight((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.with(\"7\" as any, 1); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.toSorted(1 as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.sort({} as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\nconsole.log(xs.reduce((a: any, b: any) => a + b), xs.with(-1, 9).join(\",\"), xs.toSorted().join(\",\"));")).stdout).toBe(want);
+  if (LEGACY_LANES) expect((await runC("H-S110c-c", "// @dynamic\nconst xs: any[] = [3, 1];\ntry { ([] as any[]).reduce((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { ([] as any[]).reduceRight((a: any) => a); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.with(\"7\" as any, 1); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.toSorted(1 as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\ntry { xs.sort({} as any); } catch (e) { console.log((e as Error).name, (e as Error).message); }\nconsole.log(xs.reduce((a: any, b: any) => a + b), xs.with(-1, 9).join(\",\"), xs.toSorted().join(\",\"));")).stdout).toBe(want);
 });
 
 test("H-S2b shrinking an island array's length truncates on wasm; growing it refuses by name (S110 (f)) — the fence ends the program (GH #86, S122)", async () => {

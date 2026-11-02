@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { modernLanes } from "../../../tests/harness/legacy-lanes.js";
 
 const SAN = process.env["SCRIPTC_SAN"] === "1";
 
@@ -194,7 +195,9 @@ describe("board #301: stateful regex methods, every lane = Node", () => {
     if (process.env["REGEX_STATE_DUMP"]) writeFileSync(process.env["REGEX_STATE_DUMP"], genProgram(rows, seed));
     const node = execFileSync(process.execPath, [entry], { maxBuffer: 1 << 30 }).toString();
     const outs: Record<string, string> = {};
-    for (const lane of ["wasm", "c", "llvm"] as const) {
+    // c and llvm are legacy lanes, off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts)
+    const lanes = modernLanes(["wasm", "c", "llvm"] as const);
+    for (const lane of lanes) {
       const outPath = join(dir, lane === "wasm" ? "regex-state.wasm" : `regex-state-${lane}`);
       const res = await compile(entry, { outPath, outDir: join(dir, `out-${lane}`), backend: lane, sanitize: lane !== "wasm" && SAN });
       if (!res.ok) throw new Error(`${lane}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
@@ -211,8 +214,6 @@ describe("board #301: stateful regex methods, every lane = Node", () => {
     const lines = node.split("\n").length;
     console.log(`regex state fuzz: ${rows} rows, seed ${seed}, ${lines} output lines`);
     expect(lines).toBeGreaterThan(rows);
-    expect(firstDiff(node, outs["wasm"]!)).toBe(null);
-    expect(firstDiff(node, outs["c"]!)).toBe(null);
-    expect(firstDiff(node, outs["llvm"]!)).toBe(null);
+    for (const lane of lanes) expect(firstDiff(node, outs[lane]!), lane).toBe(null);
   }, 1_800_000);
 });

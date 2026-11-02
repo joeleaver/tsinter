@@ -24,6 +24,7 @@ import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
 import { runWasm } from "../../packages/compiler/test/wasm-host.js";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -93,7 +94,11 @@ async function islandEval(lane: Lane, name: string, js: string): Promise<string>
   return r.stdout.trimEnd();
 }
 
-const lanes: Lane[] = sanitize ? ["native"] : ["native", "wasm"];
+// "native" is the flagless default build, a legacy lane: off unless
+// SCRIPTC_LEGACY_LANES=1 (legacy-lanes.ts). A sanitized run without it has
+// no lane left (the wasm lane is never sanitized) and skips.
+const lanes: Lane[] = (sanitize ? (["native"] as Lane[]) : (["native", "wasm"] as Lane[])).filter((l) => LEGACY_LANES || l !== "native");
+if (lanes.length === 0) test.skip("island web globals: no lane (the wasm lane is never sanitized; the native lane is legacy)", () => {});
 
 for (const lane of lanes)
 describe(`island web globals (scriptc-only, ${lane}${sanitize ? ", sanitized" : ""})`, () => {

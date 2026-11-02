@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { analyze, compile } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -30,6 +31,10 @@ const fixturesRoot = join(repoRoot, "tests/fixtures");
 const pilotRoot = join(fixturesRoot, "npm-static");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
+/** The c lane (and the flagless default) is legacy (legacy-lanes.ts): by
+ * default the pilots build wasm-native. SCRIPTC_LEGACY_LANES=1 restores the
+ * c-pinned builds and the flagless workspace build. */
+const lane = LEGACY_LANES ? "c" : "wasm-native";
 
 interface RunResult {
   stdout: Buffer;
@@ -65,6 +70,7 @@ async function buildStatic(entry: string, npmStatic: string[] | "auto"): Promise
   const key = hash
     .update(npmStatic === "auto" ? "auto" : npmStatic.join(","))
     .update(sanitize ? "san" : "plain")
+    .update(lane === "c" ? "" : lane)
     .digest("hex")
     .slice(0, 16);
   const outDir = join(cacheDir, `npm-static-${key}`);
@@ -76,8 +82,8 @@ async function buildStatic(entry: string, npmStatic: string[] | "auto"): Promise
     npmStatic,
     // Pinned: the suite pins --npm-static's FRONTEND frontier (coverage
     // numbers, fence sites); the backend lane is held fixed so those pins
-    // move only when the frontend moves.
-    backend: "c",
+    // move only when the frontend moves. Off the legacy lanes: wasm-native.
+    backend: lane,
   });
   if (!result.ok) {
     throw new Error(
@@ -322,9 +328,9 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     // Flavor-split like every fixed-name build dir: the other flavor's
     // concurrent suite runs this same test (with a different sanitize
     // flag, even) and must not share the dir.
-    const outDir = join(cacheDir, `npm-static-workspace-${sanitize ? "san" : "plain"}`);
+    const outDir = join(cacheDir, `npm-static-workspace-${sanitize ? "san" : "plain"}${LEGACY_LANES ? "" : "-wn"}`);
     mkdirSync(outDir, { recursive: true });
-    const result = await compile(entry, { outPath: join(outDir, "program"), outDir, sanitize, npmStatic: ["wslinked"] });
+    const result = await compile(entry, { outPath: join(outDir, "program"), outDir, sanitize, npmStatic: ["wslinked"], ...(LEGACY_LANES ? {} : { backend: "wasm-native" as const }) });
     if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
     const [nodeRes, nativeRes] = await Promise.all([
       runBinary("node", [entry]),

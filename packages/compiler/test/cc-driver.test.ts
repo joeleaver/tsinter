@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compileC, resolveCc } from "../src/backend/cc.js";
+import { LEGACY_LANES } from "../../../tests/harness/legacy-lanes.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -109,7 +110,8 @@ async function withCcEnv(cc: string | undefined, target: string | undefined, bod
 
 const HOST_CLANG_C = '#include <stdio.h>\nint main(void) { printf("clang says hi\\n"); return 0; }\n';
 
-test("host-native clang static build compiles the runtime and runs", async () => {
+// compileC builds the legacy C runtime: off unless SCRIPTC_LEGACY_LANES=1 (tests/harness/legacy-lanes.ts)
+test.skipIf(!LEGACY_LANES)("host-native clang static build compiles the runtime and runs", async () => {
   const dir = await mkdtemp(join(tmpdir(), "scr-host-clang-"));
   const cPath = join(dir, "program.c");
   await writeFile(cPath, HOST_CLANG_C);
@@ -125,7 +127,7 @@ test("host-native clang static build compiles the runtime and runs", async () =>
 
 const HELLO_C = '#include <stdio.h>\nint main(void) { printf("zigcc says hi\\n"); return 0; }\n';
 
-describe.skipIf(!zigOnPath())("zig cc builds (zig on PATH)", () => {
+describe.skipIf(!LEGACY_LANES || !zigOnPath())("zig cc builds (zig on PATH)", () => {
   test("host-native zigcc build compiles the runtime and runs", async () => {
     const dir = await mkdtemp(join(tmpdir(), "scr-zigcc-"));
     const cPath = join(dir, "program.c");

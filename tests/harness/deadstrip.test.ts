@@ -14,12 +14,35 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { compile } from "@tsinter/compiler";
+import { LEGACY_LANES } from "./legacy-lanes.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 
-test("unreached bodies leave no trace in the emitted C", async () => {
+const REACHED = ["used", "double", "evenSteps", "oddSteps", "usedMethod", "tag"];
+const UNREACHED = ["unusedForIn", "unusedAsync", "unusedComptime", "unusedGeneric", "unusedMethod"];
+
+// Dead-stripping is reachability's (the frontend's): the lowered IR the
+// WasmGC lanes build from carries no unreached body either.
+test("unreached bodies leave no trace in the lowered IR", async () => {
+  const outDir = join(cacheDir, "deadstrip-ir");
+  const result = await compile(join(repoRoot, "tests/corpus/420-dead-strip-modules/main.ts"), {
+    outPath: join(outDir, "program.wasm"),
+    outDir,
+    backend: "wasm",
+    emitIr: true,
+  });
+  if (!result.ok) {
+    throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+  }
+  const ir = readFileSync(result.irPath!, "utf8");
+  for (const reached of REACHED) expect(ir, `expected reached '${reached}' in the IR`).toContain(reached);
+  for (const gone of UNREACHED) expect(ir, `unreached '${gone}' must leave no trace in the IR`).not.toContain(gone);
+});
+
+// The emitted C is a legacy lane's artifact (legacy-lanes.ts).
+test.skipIf(!LEGACY_LANES)("unreached bodies leave no trace in the emitted C", async () => {
   const outDir = join(cacheDir, `deadstrip-c${sanitize ? "-san" : ""}`);
   const result = await compile(join(repoRoot, "tests/corpus/420-dead-strip-modules/main.ts"), {
     outPath: join(outDir, "program"),
