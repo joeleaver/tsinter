@@ -13,6 +13,14 @@
  * a silent class mismatch would silently drop or gain those rows in a way
  * nothing else here would notice.
  *
+ * A ROOT RUN STILL CHECKS THE NON-ROOT CLASS (GH #125): when this process is
+ * root and the committed file is non-root, the generator runs as an
+ * unprivileged uid (`nobody`), so the rows are regenerated under the
+ * committed class and every assertion below still applies. Only when no
+ * unprivileged uid can run it do the tests that need a fresh run skip, with
+ * the reason named. A root-class file read by a non-root run still fails the
+ * assertion, as before.
+ *
  * fs.ts's OWN hand-written module table (its exported `OP_TABLE`/`CODES`)
  * is CHECKED AGAINST these SAME rows below — NOT a chain (rev-26's 3B
  * read P-3's own warning: "the module's table checked against the
@@ -63,27 +71,57 @@ interface FsErrnoRowsFile {
   mkdirRecursiveReturn: { firstCreated: string; secondCreated: string | null };
 }
 
-function runGenerator(): FsErrnoRowsFile {
-  const out = execFileSync(process.execPath, [GEN_PATH], { encoding: "utf8" });
+function runGenerator(as?: { uid: number; gid: number }): FsErrnoRowsFile {
+  const out = execFileSync(process.execPath, [GEN_PATH], { encoding: "utf8", ...as });
   return JSON.parse(out) as FsErrnoRowsFile;
+}
+
+/** `nobody`'s uid and gid from /etc/passwd, or null. */
+function unprivilegedUser(): { uid: number; gid: number } | null {
+  try {
+    const line = readFileSync("/etc/passwd", "utf8").split("\n").find((l) => l.startsWith("nobody:"));
+    const [, , uid, gid] = line?.split(":") ?? [];
+    return uid !== undefined && gid !== undefined && Number(uid) > 0 ? { uid: Number(uid), gid: Number(gid) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The fresh run, and why there is none (a root run with no uid to drop to). */
+function freshRun(committed: FsErrnoRowsFile): { fresh: FsErrnoRowsFile | null; why: string } {
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  if (!isRoot || committed.header.uidClass === "root") return { fresh: runGenerator(), why: "" };
+  const user = unprivilegedUser();
+  if (user === null) return { fresh: null, why: "environment: running as root and no 'nobody' user to regenerate the non-root rows as" };
+  try {
+    return { fresh: runGenerator(user), why: "" };
+  } catch (e) {
+    return { fresh: null, why: `environment: running as root and the generator failed as uid ${user.uid}: ${(e as Error).message.split("\n")[0]}` };
+  }
 }
 
 describe("fs-errno-rows: the generator matches the committed file", () => {
   const committed = JSON.parse(readFileSync(COMMITTED_PATH, "utf8")) as FsErrnoRowsFile;
-  const fresh = runGenerator();
+  const run = freshRun(committed);
+  const freshOr = (skip: (condition: boolean, note: string) => void): FsErrnoRowsFile => {
+    skip(run.fresh === null, run.why);
+    return run.fresh!;
+  };
 
   test("the committed file parses and is non-empty", () => {
     expect(Array.isArray(committed.rows)).toBe(true);
     expect(committed.rows.length).toBeGreaterThan(0);
   });
 
-  test("ROOT POLICY: the current run's uid class matches the committed file's (L-3 — an assertion, not a skip)", () => {
+  test("ROOT POLICY: the current run's uid class matches the committed file's (L-3 — an assertion, not a skip)", ({ skip }) => {
+    const fresh = freshOr(skip);
     expect(fresh.header.uidClass, `committed file was generated under uid class "${committed.header.uidClass}"; this run is "${fresh.header.uidClass}" — EACCES rows differ by class, so the committed file must be regenerated under the SAME class before this diff means anything`).toBe(
       committed.header.uidClass,
     );
   });
 
-  test("every row in the committed file reproduces byte-for-byte (message included) from a fresh run", () => {
+  test("every row in the committed file reproduces byte-for-byte (message included) from a fresh run", ({ skip }) => {
+    const fresh = freshOr(skip);
     // Rows are compared as a SET keyed on (op,key,code) — order is not
     // load-bearing (the generator's own internal ordering is incidental),
     // but every (op,key,code) triple in the committed file must have an
@@ -112,7 +150,8 @@ describe("fs-errno-rows: the generator matches the committed file", () => {
   // exactly like the sync rows, PLUS asserts every entry's own
   // `matchesSync` is true, so a generator that silently recorded a
   // mismatch cannot hide behind a passing diff).
-  test("the fsp REJECTION AXIS reproduces byte-for-byte and every rejection matches its sync sibling (B-2)", () => {
+  test("the fsp REJECTION AXIS reproduces byte-for-byte and every rejection matches its sync sibling (B-2)", ({ skip }) => {
+    const fresh = freshOr(skip);
     const keyOf = (r: FsRejectionRow): string => `${r.op}:${r.fspKey}:${r.code}`;
     const committedByKey = new Map(committed.rejectionRows.map((r) => [keyOf(r), r]));
     const freshByKey = new Map(fresh.rejectionRows.map((r) => [keyOf(r), r]));
@@ -150,7 +189,8 @@ describe("fs-errno-rows: the generator matches the committed file", () => {
     expect(counts).toEqual(EXPECTED_COUNTS);
   });
 
-  test("mkdirSync recursive's fenced return value reproduces (K-3/S073's second sentence)", () => {
+  test("mkdirSync recursive's fenced return value reproduces (K-3/S073's second sentence)", ({ skip }) => {
+    const fresh = freshOr(skip);
     expect(fresh.mkdirRecursiveReturn.secondCreated).toBeNull();
     expect(committed.mkdirRecursiveReturn.secondCreated).toBeNull();
     // The FIRST-created path's SHAPE (placeholder + the literal suffix
@@ -159,7 +199,8 @@ describe("fs-errno-rows: the generator matches the committed file", () => {
     expect(committed.mkdirRecursiveReturn.firstCreated.endsWith("/rec")).toBe(true);
   });
 
-  test("row-shape sanity: existsSync (op 19) is EXCLUDED entirely, never an empty row (L-2/A-9)", () => {
+  test("row-shape sanity: existsSync (op 19) is EXCLUDED entirely, never an empty row (L-2/A-9)", ({ skip }) => {
+    const fresh = freshOr(skip);
     expect(committed.rows.some((r) => r.key === "existsSync")).toBe(false);
     expect(fresh.rows.some((r) => r.key === "existsSync")).toBe(false);
   });

@@ -39,6 +39,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import ts5 from "typescript";
 import { compile } from "@tsinter/compiler";
 import { startFetchServers } from "../fixtures/fetch/servers.mjs";
+import { HAS_IPV6, LOCALHOST_DUAL, NO_IPV6, NO_LOCALHOST_DUAL } from "./env-caps.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const source = join(import.meta.dirname, "wasm-differential.test.ts");
@@ -147,6 +148,13 @@ const UNPINNED: Record<string, string> = {
   // settles, and sees the output
   "U3-ORD-01": "S117 (f): the first poll phase can precede the child's first output",
 };
+/* Rows whose Node answer depends on the machine's network stack (GH #125):
+ * each skips, with its reason, only where the probe shows the capability is
+ * absent (tests/harness/env-caps.ts). */
+const NEEDS: Record<string, readonly [boolean, string]> = {
+  // a connect through 'localhost' that tries two addresses
+  "N1-ERR-03": [LOCALHOST_DUAL, NO_LOCALHOST_DUAL],
+};
 const TIMED: Record<string, string> = {
   "U3-TWO-02": "S086 (l): close-together children's exit and end follow the reads",
   // Node itself prints either order: whether the last read reaches end of
@@ -217,7 +225,9 @@ describe(`the wasm lane's host rows on the wasm-native lane (${rows.length} rows
     }
   });
 
-  test.concurrent.for(rows.map((r, i) => [`${r.id} (#${i})`, r] as const))("%s", async ([, row]) => {
+  test.concurrent.for(rows.map((r, i) => [`${r.id} (#${i})`, r] as const))("%s", async ([, row], { skip }) => {
+    const need = NEEDS[row.id];
+    if (need !== undefined) skip(!need[0], need[1]);
     await slot(async () => {
       const dir = mkdtempSync(join(tmpdir(), "wn-row-"));
       try {
@@ -260,7 +270,7 @@ describe(`the wasm lane's host rows on the wasm-native lane (${rows.length} rows
 
   test("KNOWN is exact: no listed row equals Node now, and every entry names a row", () => {
     const stale = Object.keys(KNOWN).filter((id) => equalNode.has(id) || !seen.has(id));
-    const missing = [...Object.keys(KNOWN), ...Object.keys(TIMED), ...Object.keys(UNPINNED)].filter((id) => !rows.some((r) => r.id === id));
+    const missing = [...Object.keys(KNOWN), ...Object.keys(TIMED), ...Object.keys(UNPINNED), ...Object.keys(NEEDS)].filter((id) => !rows.some((r) => r.id === id));
     expect({ stale, missing }).toEqual({ stale: [], missing: [] });
   });
 });
@@ -1320,7 +1330,7 @@ main();
     }
   }, 600_000);
 
-  test("notes: a redirect to a URL with credentials is refused as Node refuses it (request mode cors), an invalid punycode label is an Invalid URL, an IPv6 host prints as the WHATWG serializer prints it", async () => {
+  test("notes: a redirect to a URL with credentials is refused as Node refuses it (request mode cors), an invalid punycode label is an Invalid URL", async () => {
     const P = `http://127.0.0.1:${plainPort}`;
     const { node, native } = await both(
       probe([
@@ -1331,13 +1341,25 @@ main();
         ["puny-bad", "http://xn--abc.example/"],
         ["puny-c1", "http://xn--a.example/"],
         ["puny-ascii", "http://xn--abc-.example/"],
-        ["v6-mapped", `http://[::ffff:127.0.0.1]:${plainPort}/v6`],
-        ["v6-zeros", "http://[0:0:0:0:0:0:0:1]:1/"],
       ]),
     );
     const out = node.stdout.toString("utf8");
     expect(out).toContain('cred-same ERR fetch failed Error undefined cross origin not allowed for request mode "cors"');
     expect(out).toContain("puny-bad ERR Failed to parse URL from http://xn--abc.example/ TypeError ERR_INVALID_URL Invalid URL");
+    expect(native.stdout.toString("utf8")).toBe(out);
+  }, 120_000);
+
+  // Split from the row above (GH #125) so that row still runs on a machine
+  // without IPv6, where Node itself cannot reach an IPv6 host.
+  test("notes (IPv6): an IPv6 host prints as the WHATWG serializer prints it", async ({ skip }) => {
+    skip(!HAS_IPV6, NO_IPV6);
+    const { node, native } = await both(
+      probe([
+        ["v6-mapped", `http://[::ffff:127.0.0.1]:${plainPort}/v6`],
+        ["v6-zeros", "http://[0:0:0:0:0:0:0:1]:1/"],
+      ]),
+    );
+    const out = node.stdout.toString("utf8");
     expect(out).toContain("v6-mapped OK 200 http://[::ffff:7f00:1]:");
     expect(native.stdout.toString("utf8")).toBe(out);
   }, 120_000);
