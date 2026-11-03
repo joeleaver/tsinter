@@ -1,0 +1,7 @@
+cycle-tla-window/a.ts:1:1 - error SC1016: circular imports (cycle-tla-window/a.ts → cycle-tla-window/b.ts → cycle-tla-window/a.ts; an async cycle (its evaluation awaits the top-level await at cycle-tla-window/a.ts:5) whose top-level code at cycle-tla-window/b.ts:5 can run user code during the cycle's init window — an async cycle is admitted only when its module bodies are declaration-only) are not supported yet
+
+  1 | import { bump } from "./b.ts";
+    | ^
+  2 | export async function total(): Promise<number> {
+
+  hint: ES-module cycles compile with Node's evaluation order and TDZ errors; the named shape is the part that does not — break the named edge, or move the named top-level code into a function body

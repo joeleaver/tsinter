@@ -1,0 +1,8 @@
+cycle-namespace/a.ts:2:18 - error SC1016: a namespace ('Units') in a module of an import cycle whose top-level code runs during the cycle's evaluation, or in a module that cycle can reach before it ran (Node reads the namespace as undefined until its body ran, which is not modeled) is not supported yet
+
+  1 | import { show } from "./b.ts";
+  2 | export namespace Units {
+    |                  ^~~~~
+  3 |   export const scale = 3;
+
+  hint: ES-module cycles compile with Node's evaluation order and TDZ errors; the named shape is the part that does not — break the named edge, or move the named top-level code into a function body

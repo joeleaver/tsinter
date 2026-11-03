@@ -42,7 +42,9 @@
  *    that path (no snapshot pins it). */
 
 import { builtinModules } from "node:module";
-import { dirname, resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, extname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import * as ts from "./ts7/adapter.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
 import {
@@ -142,7 +144,7 @@ function jsoncSyntaxError(text: string): string | null {
 function adoptProjectConfig7(
   host: ts.Ts7Host,
   entryPath: string,
-): { configFile: string | null; options: ts.Ts7CompilerOptions; diags: ScrDiagnostic[] } {
+): { configFile: string | null; options: ts.Ts7CompilerOptions; diags: ScrDiagnostic[]; syntheticDefaults?: boolean } {
   const configFile = ts.findConfigFile(dirname(entryPath), ts.sys.fileExists) ?? null;
   if (!configFile) {
     return { configFile, options: { ...BASE_OPTIONS, ...FORCED_OPTIONS }, diags: [] };
@@ -164,8 +166,47 @@ function adoptProjectConfig7(
     diags.push(strictNullChecksFloorDiag(configFile));
     adopted["strictNullChecks"] = true;
   }
-  return { configFile, options: { ...BASE_OPTIONS, ...adopted, ...FORCED_OPTIONS }, diags };
+  return { configFile, options: { ...BASE_OPTIONS, ...adopted, ...FORCED_OPTIONS }, diags, syntheticDefaults: syntheticDefaultsOf7(parsed.options) };
 }
+
+/** Whether the PROJECT's own compiler options let a default import bind a
+ * module with no default export (`import path from "node:path"` — TS1259
+ * without it), computed as TypeScript 5's tsc computes the effective
+ * flag: explicit `allowSyntheticDefaultImports` wins; else
+ * `esModuleInterop` (explicit, or implied by `module` node16/node18/
+ * node20/nodenext/preserve); else `module: system`; else a `bundler`
+ * module resolution (explicit, or implied by `module: preserve`). The
+ * scriptc world forces its own module options, so the project's raw
+ * module/moduleResolution must be read here, before forcing. */
+function syntheticDefaultsOf7(raw: Record<string, unknown>): boolean {
+  const synth = raw["allowSyntheticDefaultImports"];
+  if (typeof synth === "boolean") return synth;
+  // (tsgo answers the enum values; a spelled name is read as tsconfig
+  // spells it.)
+  const asEnum = (v: unknown, e: Record<string, string | number>): number | undefined => {
+    if (typeof v === "number") return v;
+    if (typeof v !== "string") return undefined;
+    const key = Object.keys(e).find((k) => k.toLowerCase() === v.toLowerCase());
+    return key !== undefined && typeof e[key] === "number" ? (e[key] as number) : undefined;
+  };
+  const mod = asEnum(raw["module"], ts.ModuleKind as unknown as Record<string, string | number>);
+  const nodeLike =
+    mod === ts.ModuleKind.Node16 ||
+    mod === ts.ModuleKind.Node18 ||
+    mod === ts.ModuleKind.Node20 ||
+    mod === ts.ModuleKind.NodeNext ||
+    mod === ts.ModuleKind.Preserve;
+  const interop = raw["esModuleInterop"];
+  if (typeof interop === "boolean" ? interop : nodeLike) return true;
+  if (mod === ts.ModuleKind.System) return true;
+  const res = asEnum(raw["moduleResolution"], ts.ModuleResolutionKind as unknown as Record<string, string | number>);
+  if (res === ts.ModuleResolutionKind.Bundler) return true;
+  return res === undefined && mod === ts.ModuleKind.Preserve;
+}
+
+/** The project's effective synthetic-default flag per loaded program
+ * (syntheticDefaultsOf7) — preflight's default-import-of-a-builtin rule. */
+const syntheticDefaultsByProgram = new WeakMap<object, boolean>();
 
 /** The target project's @types/node, resolved with the OWN resolver's
  * type-directive lookup anchored at the ENTRY (typeRoots-free — exactly the
@@ -244,6 +285,7 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   if (paths !== null) options = { ...options, paths };
   const coreRoots = [entryPath, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
   const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
+  if (config.syntheticDefaults !== undefined) syntheticDefaultsByProgram.set(program, config.syntheticDefaults);
   const entry = program.getSourceFile(entryPath);
   if (!entry) {
     program.dispose();
@@ -1078,6 +1120,10 @@ function backEdgeUseOffence7(
 export function makeCycleAdmission(
   program: ts.Program,
   edgesOf: (sf: ts.SourceFile) => readonly CycleEdge[],
+  /** Keep the DECLARATION-ONLY bar for every cluster (the --dynamic
+   * import() subgraph: a cycle evaluating on an import()'s microtask is
+   * modeled only when nothing can observe its partial initialization). */
+  declarationOnly = false,
 ): (importer: ts.SourceFile, e: CycleEdge) => string | null {
   // Tarjan over the same edges the order walk uses (self-edges skipped —
   // Node's self-reference rule makes those benign before admission is
@@ -1125,6 +1171,24 @@ export function makeCycleAdmission(
   // reason the cluster's cycles stay fenced, or null when its every
   // member passes the inert-top-level bar.
   const sccVerdict = new Map<ts.SourceFile[], string | null>();
+  // The first top-level await the static ES-module graph below `roots`
+  // reaches (the roots themselves included): a module that awaits, or
+  // imports one that does, evaluates asynchronously.
+  const awaitReach = (roots: readonly ts.SourceFile[]): ts.Node | null => {
+    const seen = new Set<ts.SourceFile>(roots);
+    const work = [...roots];
+    while (work.length > 0) {
+      const sf = work.pop()!;
+      const found = topLevelAwaitOf7(sf);
+      if (found !== null) return found;
+      for (const e of edgesOf(sf)) {
+        if (e.stmt === undefined || isCjsJsFile7(e.dep) || seen.has(e.dep)) continue;
+        seen.add(e.dep);
+        work.push(e.dep);
+      }
+    }
+    return null;
+  };
   return (importer: ts.SourceFile, e: CycleEdge): string | null => {
     if (e.stmt === undefined) return "the cycle closes through a require() edge";
     // Cheap per-edge admission: nothing readable binds through the edge.
@@ -1152,22 +1216,138 @@ export function makeCycleAdmission(
           reason = `${m.fileName} is a CommonJS module — admission covers ES-module cycles only`;
           break;
         }
-        const off = nonInertTopLevel7(program, m);
-        if (off !== null) {
-          reason = `top-level code at ${lineOf(off)} can run user code during the cycle's init window — only declaration-only module bodies are admitted`;
-          break;
+      }
+      // An ES-module cycle is admitted whatever its top levels run: the
+      // guarded %init calls reproduce Node's evaluation order, imported
+      // bindings are live (they read the exporter's own storage), and the
+      // module-TDZ analysis' cycle mode (module-tdz.ts) guards every read
+      // that can run before its binding initialized — Node's exact TDZ
+      // ReferenceError, or a named fence for the var-like bindings Node
+      // reads as undefined (SEMANTICS.md S124). The one residual is
+      // TOP-LEVEL AWAIT: an async cycle's evaluation order is modeled only
+      // for declaration-only clusters, so a cycle with an awaiting member
+      // keeps the declaration-only bar.
+      if (reason === null) {
+        // A member that awaits at top level, or imports (transitively)
+        // a module that does: Node evaluates it asynchronously.
+        const tla = awaitReach(comp);
+        if (declarationOnly) {
+          for (const m of comp) {
+            const off = nonInertTopLevel7(program, m);
+            if (off !== null) {
+              reason = `top-level code at ${lineOf(off)} can run user code during the cycle's init window — a cycle evaluated by import() is admitted only when its module bodies are declaration-only`;
+              break;
+            }
+          }
+          if (reason === null) reason = "%TLA%";
+        } else if (tla !== null) {
+          // (Name another offender than the await's own statement when
+          // there is one.)
+          const offs = comp.map((m) => nonInertTopLevel7(program, m)).filter((n): n is ts.Node => n !== null);
+          const off = offs.find((n) => !(n.pos <= tla.pos && tla.end <= n.end && n.getSourceFile() === tla.getSourceFile())) ?? offs[0];
+          reason =
+            off !== undefined
+              ? `an async cycle (its evaluation awaits the top-level await at ${lineOf(tla)}) whose top-level code at ${lineOf(off)} can run user code during the cycle's init window — an async cycle is admitted only when its module bodies are declaration-only`
+              : "%TLA%";
         }
       }
       sccVerdict.set(comp, reason);
     }
     const clusterReason = sccVerdict.get(comp)!;
-    if (clusterReason !== null) return clusterReason;
+    if (clusterReason === null) return null;
+    if (clusterReason !== "%TLA%") return clusterReason;
     const use = backEdgeUseOffence7(program, importer, e.stmt);
     if (use !== null) {
-      return `the cycle-crossing binding '${use.name}' is read at ${lineOf(use.node)}, outside any function body — a read during the init window observes the partially-initialized module (Node's TDZ ReferenceError / stale var), which is not modeled`;
+      return `the cycle-crossing binding '${use.name}' is read at ${lineOf(use.node)}, outside any function body, in a cycle ${declarationOnly ? "evaluated by import()" : "with top-level await"} — such a cycle is admitted only when its cycle-crossing bindings are read inside function bodies`;
     }
     return null;
   };
+}
+
+/** The first top-level `await` / `for await` of a module (outside every
+ * function-like boundary), or null — the lowering's asyncInitFiles test. */
+function topLevelAwaitOf7(sf: ts.SourceFile): ts.Node | null {
+  let found: ts.Node | null = null;
+  ts.walkPreorder(sf, (node) => {
+    if (node !== sf && ts.isFunctionLike(node)) return "skip";
+    if (ts.isAwaitExpression(node) || (ts.isForOfStatement(node) && node.awaitModifier !== undefined)) {
+      found = node;
+      return "stop";
+    }
+    return undefined;
+  });
+  return found;
+}
+
+/* ── import attributes (Node's validateAttributes) ────────────────────────
+ * Node validates every static import request's attributes when it loads
+ * the target (internal/modules/esm/assert.js): a key other than `type` is
+ * ERR_IMPORT_ATTRIBUTE_UNSUPPORTED; a JSON module demands `type: "json"`
+ * (ERR_IMPORT_ATTRIBUTE_MISSING without it); a JavaScript module (and a
+ * builtin) takes no `type` (ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE for
+ * `json`, ERR_IMPORT_ATTRIBUTE_UNSUPPORTED for any other value); a
+ * TypeScript module's format is not in Node's table, so its attributes are
+ * not checked. All are TypeErrors of the load phase — the startup crash
+ * channel's resolution walk reports the first. */
+
+/** The module format Node's attribute table keys, for a resolved target
+ * file or a builtin: "json", "javascript" (module, commonjs, builtin), or
+ * null (a TypeScript module — not in the table). */
+function attributeFormatOf7(target: string | null): "json" | "javascript" | null {
+  if (target === null) return "javascript"; // a builtin
+  if (target.endsWith(".json")) return "json";
+  if (/\.(js|mjs|cjs|jsx)$/.test(target)) return "javascript";
+  return null;
+}
+
+/** Node's attribute-validation TypeError message for one import request,
+ * or null when Node accepts it. `url` is the target's URL (`file:///…`, or
+ * `node:<name>` for a builtin). */
+function importAttributeError7(
+  attrs: ts.ImportAttributes | undefined,
+  format: "json" | "javascript" | null,
+  url: string,
+): string | null {
+  const pairs: [string, string][] = [];
+  for (const a of attrs?.attributes ?? []) {
+    const value = ts.isStringLiteralLike(a.value) ? a.value.text : a.value.getText();
+    pairs.push([a.name.text, value]);
+  }
+  for (const [k, v] of pairs) {
+    if (k !== "type") return `Import attribute "${k}" with value "${v}" is not supported in ${url}`;
+  }
+  if (format === null) return null;
+  const type = pairs.find(([k]) => k === "type")?.[1];
+  const invalid = (t: string): string =>
+    t !== "json" ? `Import attribute "type" with value "${t}" is not supported in ${url}` : `Module "${url}" is not of type "${t}"`;
+  if (format === "javascript") return type === undefined ? null : invalid(type);
+  if (type === "json") return null;
+  return type === undefined ? `Module "${url}" needs an import attribute of "type: json"` : invalid(type);
+}
+
+/** For a relative specifier no program module answers: a description of
+ * the file it names when that file is not a module Node can load (an
+ * asset a bundler imports — `./x.css`, `./logo.svg?url` — which Node
+ * refuses with ERR_UNKNOWN_FILE_EXTENSION), "jsx" when it resolves to a
+ * JSX module (the checker's own error names that, for every import form:
+ * '--jsx' is not set), null otherwise. */
+function nonModuleImportTarget7(fromFile: string, spec: string): string | null {
+  const bare = spec.replace(/[?#].*$/, "");
+  const path = resolve(dirname(resolve(fromFile)), bare);
+  const ext = extname(path);
+  const isFile = (p: string): boolean => {
+    try {
+      return existsSync(p) && statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (ext !== "" && !/^\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|json|node)$/.test(ext) && isFile(path)) {
+    return `the '${spec}' import (a '${ext}' file is not a JavaScript module — a bundler loads it; Node refuses it with ERR_UNKNOWN_FILE_EXTENSION)`;
+  }
+  const answer = resolveRelativeModule(fromFile, bare);
+  if (answer !== null && /\.(tsx|jsx)$/.test(answer)) return "jsx";
+  return null;
 }
 
 /** Resolves an import specifier from `from` to a source file of the
@@ -1658,6 +1838,30 @@ function preflight7(load: LoadResult): {
     edges.set(sf, deps);
     refusals.set(sf, []);
     depPositions.set(sf, []);
+    /** Node's load-phase refusal of an import request's ATTRIBUTES (the
+     * attribute section above), recorded as a startup-crash candidate
+     * like a resolution refusal. The edge otherwise stays as written —
+     * the program still compiles whole (buildMain), and Node refuses it
+     * before any module evaluates. `target` is the resolved file, or null
+     * for a builtin. (The `assert { … }` spelling is the checker's own
+     * error: Node 24 no longer parses it.) */
+    const attributeRefusal = (
+      stmt: ts.ImportDeclaration | ts.ExportDeclaration,
+      spec: string,
+      target: string | null,
+    ): void => {
+      const attrs = stmt.attributes;
+      const format = attributeFormatOf7(target);
+      if (attrs === undefined && format !== "json") return;
+      const url = target === null ? `node:${spec.replace(/^node:/, "")}` : pathToFileURL(target).href;
+      const message = importAttributeError7(attrs, format, url);
+      if (message === null) return;
+      refusals.get(sf)!.push({
+        crash: { message, className: "%TypeError", loc: locOf7(stmt) },
+        fallback: unsupportedDiag("SC1010", locOf7(stmt), `the '${spec}' import (Node refuses its import attributes: ${message})`),
+        pos: stmt.getStart(sf),
+      });
+    };
     for (const stmt of sf.statements) {
       if (ts.isImportEqualsDeclaration(stmt)) {
         // The ENTITY form (`import a = A`, `import x = N.y`) is namespace
@@ -1668,14 +1872,35 @@ function preflight7(load: LoadResult): {
         // only nested/namespace-internal sites can reach the lowering's
         // fence); `import type x = require(...)` is pure type surface and
         // lowers to nothing.
+        // Node runs neither CommonJS-only TypeScript form as written: type
+        // stripping refuses the syntax (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX),
+        // and --experimental-transform-types turns it into `require(…)` /
+        // `module.exports = …`, a ReferenceError in a file Node loads as
+        // an ES module. These are tsc-CommonJS-emit programs.
         if (ts.isExternalModuleReference(stmt.moduleReference) && !stmt.isTypeOnly) {
-          diags.push(unsupportedDiag("SC1013", locOf7(stmt), "import = require(...) assignments"));
+          diags.push(
+            unsupportedDiag(
+              "SC1013",
+              locOf7(stmt),
+              isNodeEsmFile7(sf)
+                ? "import = require(...) assignments (Node's type stripping refuses them, and in a file Node loads as an ES module `require` does not exist — they run only under tsc's CommonJS emit)"
+                : "import = require(...) assignments (TypeScript modules Node loads as CommonJS are not compiled yet)",
+            ),
+          );
         }
         continue;
       }
       if (ts.isExportAssignment(stmt)) {
         if (stmt.isExportEquals) {
-          diags.push(unsupportedDiag("SC1012", locOf7(stmt), "export = assignments"));
+          diags.push(
+            unsupportedDiag(
+              "SC1012",
+              locOf7(stmt),
+              isNodeEsmFile7(sf)
+                ? "export = assignments (Node's type stripping refuses them, and in a file Node loads as an ES module `module` does not exist — they run only under tsc's CommonJS emit)"
+                : "export = assignments (TypeScript modules Node loads as CommonJS are not compiled yet)",
+            ),
+          );
         }
         continue;
       }
@@ -1683,6 +1908,10 @@ function preflight7(load: LoadResult): {
         if (stmt.isTypeOnly || erasedTypeOnlyReexport(stmt)) continue;
         if (!stmt.moduleSpecifier) continue;
         const fromSpec = ts.isStringLiteral(stmt.moduleSpecifier) ? stmt.moduleSpecifier.text : "";
+        // A program module a bare specifier names — an opted-in
+        // --npm-static package's entry, or a PROJECT import (#alias /
+        // self-name) — re-exports exactly like a relative one (below).
+        let programReDep: ts.SourceFile | null = null;
         if (!isRelativeSpecifier(fromSpec)) {
           // NAMED re-exports from a SUPPORTED builtin pass (`export { ok }
           // from "node:assert"` — a universal re-export facade facade): the
@@ -1697,6 +1926,7 @@ function preflight7(load: LoadResult): {
             stmt.exportClause !== undefined &&
             ts.isNamedExports(stmt.exportClause)
           ) {
+            attributeRefusal(stmt, fromSpec, null);
             continue;
           }
           // NAMED re-exports from an INSTALLED npm package (`export
@@ -1719,13 +1949,43 @@ function preflight7(load: LoadResult): {
               continue;
             }
           }
-          if (stmt.exportClause !== undefined && ts.isNamedExports(stmt.exportClause) && reNpm !== null) {
+          if (reNpm !== null && isNpmStaticPackage(reNpm.packageName)) {
+            programReDep = npmStaticProgramDep(program, reNpm.packageName, reNpm.typesFile);
+            if (programReDep === null) continue; // offender recorded — the fallback loop reloads
+          } else if (reNpm !== null) {
+            // A package the build does not compile: its code runs in the
+            // embedded engine. Named re-exports bind through
+            // collectNpmImports; a STAR re-export has no member list the
+            // engine could bind, so collectNpmImports names it (and a
+            // static build names the engine requirement, as for any
+            // import of the package).
+            continue;
+          } else if (canonicalBuiltinModule(fromSpec) === null) {
+            const proj = resolveProjectImport(sf.fileName, fromSpec);
+            const projSf = proj !== null ? (program.getSourceFile(proj) ?? null) : null;
+            if (projSf !== null && !projSf.isDeclarationFile) {
+              programReDep = projSf;
+            } else {
+              diags.push(
+                unsupportedDiag(
+                  "SC1010",
+                  locOf7(stmt),
+                  ambientDeclared(fromSpec)
+                    ? `the '${fromSpec}' module (it exists only as an ambient 'declare module' type surface — there is no runtime module to import)`
+                    : fromSpec.startsWith("#")
+                      ? `the '${fromSpec}' import (no program source answers it through the package.json imports field)`
+                      : `the '${fromSpec}' package (nothing installed resolves it)`,
+                ),
+              );
+              continue;
+            }
+          } else {
+            diags.push(unsupportedDiag("SC1014", locOf7(stmt), "star and namespace re-exports of builtin modules"));
             continue;
           }
-          diags.push(unsupportedDiag("SC1014", locOf7(stmt), "re-exports from packages or builtin modules"));
-          continue;
         }
-        const reDep = resolveImport7(program, sf, fromSpec);
+        const reDep = programReDep ?? resolveImport7(program, sf, fromSpec);
+        if (reDep !== null) attributeRefusal(stmt, fromSpec, reDep.fileName);
         // `export * as ns from "./m"` re-exports the module NAMESPACE
         // object under a name: importers' `x.ns.member` reads resolve
         // statically through the same alias machinery as `import * as ns`
@@ -1898,6 +2158,30 @@ function preflight7(load: LoadResult): {
       const clause = stmt.importClause;
       const dep = isRelative ? resolveImport7(program, sf, spec) : (npmStaticDep ?? projDep);
       const isJson = dep !== null && dep.fileName.endsWith(".json");
+      if (dep !== null) attributeRefusal(stmt, spec, dep.fileName);
+      else if (!isRelative && canonicalBuiltinModule(spec) !== null) attributeRefusal(stmt, spec, null);
+      // A relative specifier no program module answers, naming a file Node
+      // cannot load as a module: a bundler's asset import (`./x.css`,
+      // `./logo.svg?url`) or a JSX module. Named for what it is, whatever
+      // the import form.
+      if (isRelative && dep === null) {
+        const what = nonModuleImportTarget7(sf.fileName, spec);
+        if (what !== null) {
+          if (what !== "jsx") diags.push(unsupportedDiag("SC1010", locOf7(stmt), what));
+          continue;
+        }
+        // No file answers it at all: Node's resolution refuses the program
+        // (ERR_MODULE_NOT_FOUND) before any module evaluates — the startup
+        // crash channel, like a bare specifier nothing installed resolves.
+        if (!/[?#]/.test(spec) && resolveRelativeModule(sf.fileName, spec) === null) {
+          refuse(
+            `Cannot find module '${resolve(dirname(resolve(sf.fileName)), spec)}' imported from ${sf.fileName}`,
+            "%Error",
+            `the '${spec}' import (no file answers it — Node refuses the program with ERR_MODULE_NOT_FOUND)`,
+          );
+          continue;
+        }
+      }
       // SELF-imports: the bindings alias this module's OWN declarations,
       // so a TOP-LEVEL read lexically above the aliased declaration is
       // Node's TDZ ReferenceError at runtime (exactly what tsc's TS2448
@@ -1926,22 +2210,26 @@ function preflight7(load: LoadResult): {
           esModuleInterop?: boolean;
           allowSyntheticDefaultImports?: boolean;
         };
-        const interopOn = opts.esModuleInterop === true || opts.allowSyntheticDefaultImports === true;
+        const interopOn =
+          syntheticDefaultsByProgram.get(program) ?? (opts.esModuleInterop === true || opts.allowSyntheticDefaultImports === true);
         const defaultOk =
           builtinDefaultImportModule(spec) !== null ||
           ((isJsSourceFileName(sf.fileName) || interopOn) && canonicalBuiltinModule(spec) !== null);
         if (clause.name && !isJson && dep === null && !defaultOk) {
-          diags.push(unsupportedDiag("SC1012", locOf7(clause.name)));
-        }
-        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings) && isJson) {
           diags.push(
-            unsupportedDiag(
-              "SC1012",
-              locOf7(clause.namedBindings),
-              "named imports from JSON modules",
-            ),
+            canonicalBuiltinModule(spec) !== null && !isRelative
+              ? unsupportedDiag(
+                  "SC1012",
+                  locOf7(clause.name),
+                  `a default import of the builtin '${spec}' in a project whose compiler options give modules no synthetic default (tsc reports TS1259 there; esModuleInterop, allowSyntheticDefaultImports, a bundler module resolution and module node16/nodenext/preserve all allow it)`,
+                  `import * as ${clause.name.text} from "${spec}", or enable esModuleInterop in the project's tsconfig`,
+                )
+              : unsupportedDiag("SC1012", locOf7(clause.name)),
           );
         }
+        // Named imports from a JSON module: a JSON module has only a
+        // default export, so Node's link phase refuses the program with a
+        // SyntaxError (cjsNamedImportLinkCheck reports it in V8's order).
         if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
           // `import * as ns from "./m"` of a RESOLVED user module lowers:
           // ns.member accesses resolve statically through the checker to
@@ -2323,7 +2611,9 @@ function cjsNamedImportLinkCheck(
     return dep !== null && isCjsJsFile7(dep) ? dep : null;
   };
   const visible = (dep: ts.SourceFile, name: string): boolean =>
-    // `default` is the module.exports binding itself — always provided.
+    // `default` is the module.exports binding itself — always provided; a
+    // JSON module provides nothing else.
+    dep.fileName.endsWith(".json") ? name === "default" :
     // (cjs-lexer.ts lexes SOURCE TEXT — only strings cross into the
     // typescript5 island; the SourceFile is just the memo/resolve handle.)
     name === "default" || cjsLexerVisibleNames(dep, (d) => d.text, resolveCjsDep, lexMemo).has(name);
@@ -2355,6 +2645,12 @@ function cjsNamedImportLinkCheck(
     );
     return true;
   };
+  // The link-checked targets: CommonJS modules (their lexer-built facade)
+  // and JSON modules (a default export only).
+  const linkDepOf = (sf: ts.SourceFile, spec: string): ts.SourceFile | null => {
+    const dep = resolveEdge(sf, spec);
+    return dep !== null && (isCjsJsFile7(dep) || dep.fileName.endsWith(".json")) ? dep : null;
+  };
   const firstInvisibleOf = (sf: ts.SourceFile): BadCjsImport | null => {
     const entries: { local: string; exportName: string; nameNode: ts.Node; spec: string; dep: ts.SourceFile }[] = [];
     for (const stmt of sf.statements) {
@@ -2363,7 +2659,7 @@ function cjsNamedImportLinkCheck(
       if (!clause || clause.phaseModifier === ts.SyntaxKind.TypeKeyword) continue;
       if (!clause.namedBindings || !ts.isNamedImports(clause.namedBindings)) continue;
       const spec = stmt.moduleSpecifier.text;
-      const dep = cjsDepOf(sf, spec);
+      const dep = linkDepOf(sf, spec);
       if (dep === null) continue;
       for (const e of clause.namedBindings.elements) {
         if (e.isTypeOnly) continue;
@@ -2383,7 +2679,7 @@ function cjsNamedImportLinkCheck(
       if (stmt.moduleSpecifier === undefined || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
       if (!stmt.exportClause || !ts.isNamedExports(stmt.exportClause)) continue;
       const spec = stmt.moduleSpecifier.text;
-      const dep = cjsDepOf(sf, spec);
+      const dep = linkDepOf(sf, spec);
       if (dep === null) continue;
       for (const e of stmt.exportClause.elements) {
         if (e.isTypeOnly) continue;

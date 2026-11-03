@@ -70,14 +70,22 @@ import type { Lowerer } from "./lowerer.js";
 import type { FileParts } from "./lower-modules.js";
 import { BOOL, STRING, VOID } from "../../ir/nodes.js";
 import type { IrExpr, IrFunction, IrGlobal, IrStmt, SrcLoc } from "../../ir/nodes.js";
-import { makeInertPredicates, nonInertTopLevel, orderedImportsOf } from "../program.js";
+import { locOf, makeInertPredicates, nonInertTopLevel, orderedImportsOf, resolveImport } from "../program.js";
 import { boundIdentifiersOf } from "./lowerer.js";
+import { nsSymbolRuntimeKind } from "./lower-namespaces.js";
+import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 
 export interface Occurrence {
   start: number;
   end: number;
   b: TdzBinding;
+  /** The innermost enclosing unit, or the SourceFile for a top-level
+   * access (cycle mode only — see needsCheck). */
   unit: ts.Node;
+  /** The name the access spells: V8's TDZ message names the binding as
+   * the ACCESS SITE sees it (an importer's local alias, a namespace
+   * member's export name), not the exporter's declaration name. */
+  name: string;
 }
 
 export interface TdzBinding {
@@ -92,6 +100,18 @@ export interface TdzBinding {
   /** Cycle mode: every access inside any function-like unit is guarded. */
   everywhere: boolean;
   isClass: boolean;
+  /** Cycle mode: the files of the binding's import-cycle cluster. A
+   * TOP-LEVEL read in another member that evaluates first (the declaring
+   * module is still mid-evaluation then) is guarded too. */
+  cluster: ReadonlySet<string> | null;
+  /** Non-null for a VAR-LIKE binding of a hot cycle cluster (`var`, an
+   * enum): Node reads `undefined` before its declaration ran, which no
+   * typed slot represents — the guard is a run-time fence carrying this
+   * message instead of the TDZ ReferenceError (SEMANTICS.md S124). */
+  fence: string | null;
+  /** The flag is another mechanism's own state (a JSON module's run-once
+   * loaded flag): never dropped as unused. */
+  sharedFlag?: true;
 }
 
 const isStaticMember = (n: ts.Node): boolean =>
@@ -134,6 +154,43 @@ export class ModuleTdz {
   readonly occByFile = new Map<string, Occurrence[]>();
   /** The analyzed source files (occurrence collection, the coverage check). */
   readonly files: ts.SourceFile[] = [];
+  /** Evaluation position of each file (Node's depth-first postorder — the
+   * module order): a top-level read of another cluster member's binding
+   * can see it uninitialized only when that member evaluates LATER (it is
+   * an ancestor still mid-evaluation). */
+  readonly orderOf = new Map<string, number>();
+  /** Cycle-mode flag-only bindings on a module's DEFAULT ALIAS symbol
+   * (`export default someIdentifier`): Node's `default` is its own binding,
+   * initialized when the export statement runs, while importers' reads
+   * resolve through the alias to the target's storage. */
+  readonly defaultAliases = new Set<ts.Symbol>();
+
+  /** The binding an identifier's symbol is guarded as: a flagged default
+   * alias on its import hops wins over the alias-resolved declaration. */
+  bindingOfSymbol(checker: ts.TypeChecker, program: ts.Program, sym: ts.Symbol | undefined): TdzBinding | undefined {
+    if (sym === undefined) return undefined;
+    if (sym.flags & ts.SymbolFlags.Alias) {
+      if (this.defaultAliases.size > 0) {
+        const hop = defaultAliasHop(checker, program, sym, this.defaultAliases);
+        if (hop !== null) return this.bySymbol.get(hop);
+      }
+      sym = checker.getAliasedSymbol(sym);
+    }
+    return this.bySymbol.get(sym);
+  }
+
+  /** The access-site name for a guarded IR access at `loc` (the recorded
+   * source occurrence it lowered from), else the declaration name. */
+  nameAt(b: TdzBinding, loc: SrcLoc): string {
+    const occs = this.occByFile.get(loc.file);
+    if (occs !== undefined) {
+      for (const o of occs) {
+        if (o.start > loc.end) break;
+        if (o.b === b && o.start >= loc.start && o.start <= loc.end) return o.name;
+      }
+    }
+    return b.name;
+  }
 
   /** The innermost unit strictly enclosing `node` (not `node` itself). */
   ownerUnit(node: ts.Node): ts.Node | null {
@@ -177,8 +234,9 @@ export class ModuleTdz {
       else hi = mid;
     }
     if (lo >= occs.length || occs[lo]!.start >= end) return null;
-    const owner = this.ownerUnit(node);
-    if (owner === null) return null;
+    // A top-level node's scope is its SourceFile (cycle mode records
+    // top-level occurrences under it — needsCheck).
+    const owner = this.ownerUnit(node) ?? sf;
     const want = new Map<TdzBinding, { count: number; first: Occurrence }>();
     for (let i = lo; i < occs.length && occs[i]!.start < end; i++) {
       const o = occs[i]!;
@@ -200,15 +258,15 @@ export class ModuleTdz {
       const r = v as Record<string, unknown>;
       const kind = r["kind"];
       let b: TdzBinding | undefined;
-      if (kind === "libCall" && r["fn"] === "global.tdzCheck") {
-        const flag = (r["args"] as { localId?: string }[])[0];
-        b = flag?.localId !== undefined ? this.byFlagId.get(flag.localId) : undefined;
+      const checked = checkedFlagOf(r);
+      if (checked !== null) {
+        b = this.byFlagId.get(checked);
       } else if (kind === "varRef" || kind === "assign" || kind === "assignExpr" || kind === "incDec" || kind === "forOf") {
         b = this.byGlobalId.get(r["localId"] as string);
       }
       if (b !== undefined && want.has(b)) {
         const loc = r["loc"] as SrcLoc | undefined;
-        if (loc !== undefined && loc.file === sf.fileName && loc.start >= start && loc.start < end && this.unitAt(loc.file, loc.start) === owner) {
+        if (loc !== undefined && loc.file === sf.fileName && loc.start >= start && loc.start < end && (this.unitAt(loc.file, loc.start) ?? sf) === owner) {
           have.set(b, (have.get(b) ?? 0) + 1);
         }
       }
@@ -218,7 +276,7 @@ export class ModuleTdz {
     const out: IrStmt[] = [];
     for (const [b, w] of want) {
       if ((have.get(b) ?? 0) >= w.count) continue;
-      out.push(this.checkStmt(b, { file: sf.fileName, start: w.first.start, end: w.first.end }));
+      out.push(this.checkStmt(b, { file: sf.fileName, start: w.first.start, end: w.first.end }, w.first.name));
     }
     return out.length > 0 ? out : null;
   }
@@ -245,29 +303,64 @@ export class ModuleTdz {
       return false; // the class's inner binding
     }
     const u = this.unitAt(file, start);
-    if (u === null) return false;
+    if (u === null) {
+      // Cycle mode: a TOP-LEVEL read in another member of the cluster that
+      // evaluates before the declaring module (an ancestor, still
+      // mid-evaluation) — Node's TDZ for a cross-module read.
+      if (b.cluster === null || file === b.sf.fileName || !b.cluster.has(file)) return false;
+      return (this.orderOf.get(b.sf.fileName) ?? -1) > (this.orderOf.get(file) ?? -1);
+    }
     if (b.everywhere) return true;
     if (file !== b.sf.fileName) return false;
     const at = this.addedAt.get(u);
     return at !== undefined && at <= b.declIndex;
   }
 
-  checkExpr(b: TdzBinding, loc: SrcLoc): IrExpr {
+  checkExpr(b: TdzBinding, loc: SrcLoc, name: string = b.name): IrExpr {
     return {
       kind: "libCall",
       fn: "global.tdzCheck",
       args: [
         { kind: "varRef", localId: b.flag.id, type: BOOL, loc },
-        { kind: "strLit", value: b.name, type: STRING, loc },
+        { kind: "strLit", value: name, type: STRING, loc },
       ],
       type: VOID,
       loc,
     };
   }
 
-  checkStmt(b: TdzBinding, loc: SrcLoc): IrStmt {
-    return { kind: "exprStmt", expr: this.checkExpr(b, loc), loc };
+  checkStmt(b: TdzBinding, loc: SrcLoc, name: string = b.name): IrStmt {
+    if (b.fence !== null) {
+      // A var-like binding (SEMANTICS.md S124): Node reads `undefined`
+      // here, which the typed slot cannot hold — the read ends the
+      // program by name instead (S122's run-time fence). Checks sit in
+      // straight-line positions (seqExpr), so the test lives in a helper
+      // (fenceHelpers, emitted by insertModuleTdzChecks).
+      // One helper per access SITE (the fence names its line).
+      const callee = `${FENCE_HELPER}${b.flag.id}.${name}.${this.orderOf.get(loc.file) ?? "x"}_${loc.start}`;
+      if (!this.fenceHelpers.has(callee)) {
+        this.fenceHelpers.set(callee, {
+          name: callee,
+          params: [],
+          returnType: VOID,
+          locals: [],
+          body: [{
+            kind: "if",
+            cond: { kind: "unary", op: "!", operand: { kind: "varRef", localId: b.flag.id, type: BOOL, loc }, type: BOOL, loc },
+            then: [{ kind: "runtimeFence", code: "SC1016", message: b.fence.replace("%NAME%", name), loc }],
+            else_: null,
+            loc,
+          }],
+          loc,
+        });
+      }
+      return { kind: "exprStmt", expr: { kind: "call", callee, args: [], type: VOID, loc }, loc };
+    }
+    return { kind: "exprStmt", expr: this.checkExpr(b, loc, name), loc };
   }
+
+  /** The var-like bindings' fence helpers checkStmt minted, by name. */
+  readonly fenceHelpers = new Map<string, IrFunction>();
 
   flagSet(b: TdzBinding, loc: SrcLoc): IrStmt {
     return { kind: "assign", localId: b.flag.id, value: { kind: "boolLit", value: true, type: BOOL, loc }, loc };
@@ -277,14 +370,70 @@ export class ModuleTdz {
    * guarded — `typeof x` folds statically typed operands away during
    * lowering, so its guard is placed at the expression, not the read. */
   guardedRef(L: Lowerer, ident: ts.Identifier): TdzBinding | null {
-    let sym = L.checker.getSymbolAtLocation(ident);
-    if (sym === undefined) return null;
-    if (sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
-    const b = this.bySymbol.get(sym);
+    const b = this.bindingOfSymbol(L.checker, L.program, L.checker.getSymbolAtLocation(ident));
     if (b === undefined) return null;
     const sf = ident.getSourceFile();
     return this.needsCheck(b, sf.fileName, ident.getStart(sf)) ? b : null;
   }
+}
+
+/** The init flag a guard node tests: a `global.tdzCheck` libCall, or a
+ * var-like binding's fence (`if (!flag) runtimeFence`). Null otherwise. */
+export function checkedFlagOf(r: Record<string, unknown>): string | null {
+  if (r["kind"] === "libCall" && r["fn"] === "global.tdzCheck") {
+    const flag = (r["args"] as { localId?: string }[])[0];
+    return flag?.localId ?? null;
+  }
+  if (r["kind"] === "call" && typeof r["callee"] === "string" && r["callee"].startsWith(FENCE_HELPER)) {
+    const rest = r["callee"].slice(FENCE_HELPER.length);
+    // `<flag id>.<access name>.<site>`: flag ids end in `%tdz`, `%tdzc.<C>`,
+    // `%tdzf.<N>` — the name and the site are the last two dot-free
+    // segments.
+    const noSite = rest.slice(0, rest.lastIndexOf("."));
+    return noSite.slice(0, noSite.lastIndexOf("."));
+  }
+  return null;
+}
+
+/** Name prefix of the var-like bindings' fence helpers (ModuleTdz.checkStmt). */
+const FENCE_HELPER = "%tdzfence.";
+
+/** The first DEFAULT-export hop of an import alias chain (default import
+ * clauses, `{ default as x }` specifiers, `export { default } from`
+ * re-exports) that lands on a symbol in `targets`, or null — the walk
+ * Lowerer.defaultSnapshotSymbolOf makes for snapshot storage. */
+function defaultAliasHop(
+  checker: ts.TypeChecker,
+  program: ts.Program,
+  alias: ts.Symbol,
+  targets: ReadonlySet<ts.Symbol>,
+): ts.Symbol | null {
+  let sym: ts.Symbol | undefined = alias;
+  for (let hop = 0; sym !== undefined && hop < 32; hop++) {
+    if (hop > 0 && targets.has(sym)) return sym;
+    const d = checker
+      .declarationsOf(sym)
+      .find((x) => ts.isImportClause(x) || ts.isImportSpecifier(x) || ts.isExportSpecifier(x));
+    let spec: ts.Expression | undefined;
+    let name: string | undefined;
+    if (d && ts.isImportClause(d) && ts.isImportDeclaration(d.parent)) {
+      spec = d.parent.moduleSpecifier;
+      name = "default";
+    } else if (d && ts.isImportSpecifier(d)) {
+      const idecl: ts.Node = d.parent.parent.parent;
+      if (ts.isImportDeclaration(idecl)) spec = idecl.moduleSpecifier;
+      name = (d.propertyName ?? d.name).text;
+    } else if (d && ts.isExportSpecifier(d)) {
+      const edecl: ts.Node = d.parent.parent;
+      if (ts.isExportDeclaration(edecl)) spec = edecl.moduleSpecifier;
+      name = (d.propertyName ?? d.name).text;
+    }
+    if (d === undefined || spec === undefined || !ts.isStringLiteral(spec) || name !== "default") return null;
+    const dep = resolveImport(program, d.getSourceFile(), spec.text);
+    if (!dep) return null;
+    sym = checker.getSymbolAtLocation(dep)?.getExports().get(ts.InternalSymbolName.Default as ts.__String);
+  }
+  return null;
 }
 
 /** The builtins that only SCHEDULE their callback — never call it before
@@ -386,45 +535,123 @@ function importSccs(program: ts.Program, files: readonly ts.SourceFile[]): Map<t
 export function analyzeModuleTdz(L: Lowerer, parts: readonly FileParts[]): ModuleTdz {
   const tdz = new ModuleTdz();
   const files = parts.map((p) => p.sf);
+  files.forEach((sf, i) => tdz.orderOf.set(sf.fileName, i));
   const sccs = importSccs(L.program, files);
-  const clusterHot = new Map<ts.SourceFile[], boolean>();
-  const unitRefMemo = new Map<ts.SourceFile[], Set<ts.Symbol>>();
+  const clusterInfo = new Map<ts.SourceFile[], ClusterRefs | null>();
   const syncInert = makeSyncInert(L);
+  const refuseNamespaces = (m: ts.SourceFile): void => {
+    // A namespace's members flatten into module globals bound as its body
+    // runs; before that Node reads the namespace object as undefined (a
+    // TypeError at the member read, or an undefined member mid-body). Not
+    // modeled: a module that hot cycle code can reach before it ran
+    // refuses its runtime namespace at the declaration.
+    for (const st of m.statements) {
+      if (!ts.isModuleDeclaration(st) || !ts.isIdentifier(st.name) || isAmbient(st)) continue;
+      const sym = L.checker.getSymbolAtLocation(st.name);
+      if (sym === undefined || nsSymbolRuntimeKind(L, sym) !== "instantiated") continue;
+      L.pushDiag(
+        unsupportedDiag(
+          "SC1016",
+          locOf(st.name),
+          `a namespace ('${st.name.text}') in a module of an import cycle whose top-level code runs during the cycle's evaluation, or in a module that cycle can reach before it ran (Node reads the namespace as undefined until its body ran, which is not modeled)`,
+        ),
+      );
+    }
+  };
+  // 1. Every cluster's verdict. HOT: some member's top level can run user
+  // code during the cluster's init window, or reads a binding of a member
+  // that is still mid-evaluation then. A cold cluster keeps the per-file
+  // analysis (nothing can observe a partial initialization).
+  const hotWindows: { lo: number; hi: number; refs: ClusterRefs }[] = [];
+  for (const sf of files) {
+    const comp = sccs.get(sf);
+    if (comp === undefined || comp.length < 2 || clusterInfo.has(comp)) continue;
+    const refs = clusterRefs(L, comp, tdz.orderOf);
+    const hot = refs.backTopRead || comp.some((m) => nonInertTopLevel(L.program, m) !== null);
+    clusterInfo.set(comp, hot ? refs : null);
+    if (!hot) continue;
+    for (const m of comp) refuseNamespaces(m);
+    const orders = comp.map((m) => tdz.orderOf.get(m.fileName) ?? -1);
+    hotWindows.push({ lo: Math.min(...orders), hi: Math.max(...orders), refs });
+  }
+  // 2. The modules a hot cluster's code can reach before they ran: Node
+  // evaluates them inside the cluster's window (between its first member
+  // starting and its last finishing — a member's not-yet-evaluated
+  // imports, transitively), so cycle code calling into one can meet its
+  // bindings uninitialized. Each is analyzed in cycle mode too, its own
+  // code units' references and the cluster's flagged.
+  const windowScope = (sf: ts.SourceFile): ClusterRefs | null => {
+    const at = tdz.orderOf.get(sf.fileName) ?? -1;
+    const ws = hotWindows.filter((w) => w.lo < at && at < w.hi);
+    if (ws.length === 0) return null;
+    const own = clusterRefs(L, [sf], tdz.orderOf);
+    const refs = new Set<ts.Symbol>(own.refs);
+    for (const w of ws) for (const r of w.refs.refs) refs.add(r);
+    return { files: new Set([sf.fileName]), refs, backTopRead: false };
+  };
+  const scopeOf = new Map<ts.SourceFile, ClusterRefs | null>();
   for (const sf of files) {
     if (sf.isDeclarationFile) continue;
     const comp = sccs.get(sf);
-    let everywhere = false;
-    if (comp !== undefined && comp.length > 1) {
-      if (!clusterHot.has(comp)) clusterHot.set(comp, comp.some((m) => nonInertTopLevel(L.program, m) !== null));
-      everywhere = clusterHot.get(comp)!;
+    let cluster: ClusterRefs | null = comp !== undefined && comp.length > 1 ? clusterInfo.get(comp)! : null;
+    if (cluster === null) {
+      cluster = windowScope(sf);
+      if (cluster !== null) refuseNamespaces(sf);
     }
+    scopeOf.set(sf, cluster);
     tdz.files.push(sf);
-    analyzeFile(L, tdz, sf, everywhere ? clusterUnitRefs(L, comp!, unitRefMemo) : null, syncInert);
+    analyzeFile(L, tdz, sf, cluster, syncInert);
+  }
+  // A JSON module imported into a hot cluster: before its first request
+  // evaluated it, Node reads its default binding as undefined — a code
+  // unit of the cluster reading it then fences (S124), testing the
+  // module's own run-once loaded flag.
+  for (const [sym, { flag, importer }] of L.jsonLoadedFlagOf) {
+    const cluster = scopeOf.get(importer);
+    if (cluster === undefined || cluster === null || tdz.bySymbol.has(sym)) continue;
+    const decl = L.checker.declarationsOf(sym)[0];
+    if (decl === undefined) continue;
+    const b: TdzBinding = {
+      name: "default",
+      sf: decl.getSourceFile(),
+      declIndex: 0,
+      declNode: decl,
+      flag,
+      everywhere: true,
+      isClass: false,
+      cluster: cluster.files,
+      fence: "a read of '%NAME%' (a JSON module's default, imported into an import cycle) before the JSON module evaluated — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124)",
+      sharedFlag: true,
+    };
+    tdz.bySymbol.set(sym, b);
+    tdz.byFlagId.set(flag.id, b);
   }
   if (tdz.bySymbol.size > 0) collectOccurrences(L, tdz);
   return tdz;
 }
 
 /** Every source access of a flagged binding inside a unit where it is
- * guarded (ModuleTdz.occByFile). Type positions are not accesses; an
- * `extends` expression is. */
+ * guarded (ModuleTdz.occByFile) — plus, in cycle mode, the TOP-LEVEL
+ * reads of another cluster member's bindings (needsCheck decides which).
+ * Type positions are not accesses; an `extends` expression is. */
 function collectOccurrences(L: Lowerer, tdz: ModuleTdz): void {
   const names = new Set<string>();
   let anyCycle = false;
+  const cycleFiles = new Set<string>();
   for (const b of tdz.bySymbol.values()) {
     names.add(b.name);
     if (b.everywhere) anyCycle = true;
+    if (b.cluster !== null) for (const f of b.cluster) cycleFiles.add(f);
   }
   for (const sf of tdz.files) {
     const out: Occurrence[] = [];
+    const topLevel = cycleFiles.has(sf.fileName);
     const record = (n: ts.Node, sym: ts.Symbol | undefined, unit: ts.Node): void => {
-      if (sym === undefined) return;
-      if (sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
-      const b = tdz.bySymbol.get(sym);
+      const b = tdz.bindingOfSymbol(L.checker, L.program, sym);
       if (b === undefined) return;
       const start = n.getStart(sf);
       if (!tdz.needsCheck(b, sf.fileName, start)) return;
-      out.push({ start, end: n.end, b, unit });
+      out.push({ start, end: n.end, b, unit, name: ts.isIdentifier(n) ? n.text : b.name });
     };
     // Iterative (each entry carries its innermost enclosing unit): a
     // thousands-deep expression must not overflow the JS stack. `out` is
@@ -435,14 +662,17 @@ function collectOccurrences(L: Lowerer, tdz: ModuleTdz): void {
       if (ts.isTypeNode(n) && !(ts.isExpressionWithTypeArguments(n) && n.parent !== undefined && ts.isHeritageClause(n.parent) && n.parent.token === ts.SyntaxKind.ExtendsKeyword)) {
         continue;
       }
+      // Module plumbing binds; it never reads.
+      if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isImportEqualsDeclaration(n)) continue;
       const unit = isUnit(n) ? n : outer;
-      if (unit !== undefined) {
+      const scope = unit ?? (topLevel ? sf : undefined);
+      if (scope !== undefined) {
         if (ts.isIdentifier(n)) {
           // Name pre-filter: a cycle-mode binding may be imported under
           // another name, so every identifier resolves then.
-          if (anyCycle || names.has(n.text)) record(n, L.checker.getSymbolAtLocation(n), unit);
+          if (anyCycle || names.has(n.text)) record(n, L.checker.getSymbolAtLocation(n), scope);
         } else if (ts.isShorthandPropertyAssignment(n)) {
-          if (anyCycle || (ts.isIdentifier(n.name) && names.has(n.name.text))) record(n.name, L.checker.getShorthandAssignmentValueSymbol(n), unit);
+          if (anyCycle || (ts.isIdentifier(n.name) && names.has(n.name.text))) record(n.name, L.checker.getShorthandAssignmentValueSymbol(n), scope);
           if (n.objectAssignmentInitializer !== undefined) work.push([n.objectAssignmentInitializer, unit]);
           continue;
         }
@@ -484,14 +714,16 @@ export function assertTdzCoverage(tdz: ModuleTdz, functions: IrFunction[]): void
       let arr = locs.get(loc.file);
       if (arr === undefined) locs.set(loc.file, (arr = []));
       arr.push(loc.start);
-      if (r["kind"] === "runtimeFence") {
+      // (A var-like binding's own guard fence — SC1016 — is a CHECK, not
+      // a fenced statement.)
+      if (r["kind"] === "runtimeFence" && r["code"] !== "SC1016") {
         let f = fences.get(loc.file);
         if (f === undefined) fences.set(loc.file, (f = []));
         f.push(loc);
       }
-      if (r["kind"] === "libCall" && r["fn"] === "global.tdzCheck") {
-        const flag = (r["args"] as { localId?: string }[])[0];
-        const b = flag?.localId !== undefined ? tdz.byFlagId.get(flag.localId) : undefined;
+      const checked = checkedFlagOf(r);
+      if (checked !== null) {
+        const b = tdz.byFlagId.get(checked);
         if (b !== undefined) {
           let c = checks.get(loc.file);
           if (c === undefined) checks.set(loc.file, (c = []));
@@ -532,31 +764,61 @@ export function assertTdzCoverage(tdz: ModuleTdz, functions: IrFunction[]): void
   }
 }
 
-/** Every symbol an identifier inside some function-like unit of the
- * cluster's files resolves to — cycle mode flags exactly the bindings
- * some unit (in any member) could read. */
-function clusterUnitRefs(
-  L: Lowerer,
-  comp: ts.SourceFile[],
-  memo: Map<ts.SourceFile[], Set<ts.Symbol>>,
-): Set<ts.Symbol> {
-  const hit = memo.get(comp);
-  if (hit !== undefined) return hit;
+/** A hot cluster's reference facts (cycle mode). */
+interface ClusterRefs {
+  files: ReadonlySet<string>;
+  /** Every symbol an identifier inside some function-like unit of the
+   * cluster's files resolves to, plus every top-level reference one member
+   * makes to another member's binding — cycle mode flags exactly the
+   * bindings some code in the cluster could read early. */
+  refs: Set<ts.Symbol>;
+  /** Some member's top level reads a binding (not a hoisted function) of a
+   * member that evaluates after it — still mid-evaluation at the read. */
+  backTopRead: boolean;
+}
+
+function clusterRefs(L: Lowerer, comp: ts.SourceFile[], orderOf: ReadonlyMap<string, number>): ClusterRefs {
+  const files = new Set(comp.map((m) => m.fileName));
   const refs = new Set<ts.Symbol>();
+  let backTopRead = false;
+  const resolve = (sym: ts.Symbol | undefined): ts.Symbol | undefined =>
+    sym !== undefined && sym.flags & ts.SymbolFlags.Alias ? L.checker.getAliasedSymbol(sym) : sym;
   for (const m of comp) {
+    const mOrder = orderOf.get(m.fileName) ?? -1;
+    const topRef = (sym: ts.Symbol | undefined, viaAlias: ts.Symbol | undefined): void => {
+      if (sym === undefined) return;
+      const decls = L.checker.declarationsOf(sym);
+      const home = decls[0]?.getSourceFile();
+      if (home === undefined || home === m || !files.has(home.fileName)) return;
+      refs.add(sym);
+      if (viaAlias !== undefined) refs.add(viaAlias);
+      if (decls.every((d) => ts.isFunctionDeclaration(d))) return; // hoisted: initialized at link
+      if ((orderOf.get(home.fileName) ?? -1) > mOrder) backTopRead = true;
+    };
     // Iterative: a thousands-deep expression must not overflow the JS stack.
     const work: [ts.Node, boolean][] = [[m, false]];
     while (work.length > 0) {
       const [n, inUnit] = work.pop()!;
-      if (inUnit && ts.isIdentifier(n)) {
-        let sym = L.checker.getSymbolAtLocation(n);
-        if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
-        if (sym !== undefined) refs.add(sym);
+      if (!inUnit && (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isImportEqualsDeclaration(n))) continue;
+      if (ts.isTypeNode(n) && !(ts.isExpressionWithTypeArguments(n) && n.parent !== undefined && ts.isHeritageClause(n.parent))) continue;
+      if (ts.isIdentifier(n)) {
+        const raw = L.checker.getSymbolAtLocation(n);
+        const sym = resolve(raw);
+        if (inUnit) {
+          if (sym !== undefined) refs.add(sym);
+          if (raw !== undefined && raw !== sym) refs.add(raw);
+        } else {
+          topRef(sym, raw !== sym ? raw : undefined);
+        }
         continue;
       }
-      if (inUnit && ts.isShorthandPropertyAssignment(n)) {
+      if (ts.isShorthandPropertyAssignment(n)) {
         const sym = L.checker.getShorthandAssignmentValueSymbol(n);
-        if (sym !== undefined) refs.add(sym);
+        if (inUnit) {
+          if (sym !== undefined) refs.add(resolve(sym)!);
+        } else {
+          topRef(resolve(sym), undefined);
+        }
       }
       const inner = inUnit || isUnit(n);
       ts.forEachChild(n, (c) => {
@@ -565,19 +827,23 @@ function clusterUnitRefs(
       });
     }
   }
-  memo.set(comp, refs);
-  return refs;
+  return { files, refs, backTopRead };
 }
 
-/** `cycleRefs` non-null: cycle mode — flag every binding some unit of the
- * cluster references (the symbols given), guarded at every unit access. */
+/** `cluster` non-null: cycle mode — flag every binding some code of the
+ * hot cluster references (ClusterRefs.refs), guarded at every unit access
+ * and at the top-level reads needsCheck names. Cycle mode also flags the
+ * bindings no per-file analysis needs: the module's `default` (its own
+ * binding, initialized when the export statement runs) and the var-like
+ * bindings (`var`, enums), whose early reads fence (S124). */
 function analyzeFile(
   L: Lowerer,
   tdz: ModuleTdz,
   sf: ts.SourceFile,
-  cycleRefs: Set<ts.Symbol> | null,
+  cluster: ClusterRefs | null,
   syncInert: (e: ts.Expression) => boolean,
 ): void {
+  const cycleRefs = cluster?.refs ?? null;
   const everywhere = cycleRefs !== null;
   const checker = L.checker;
   const resolve = (ident: ts.Node): ts.Symbol | undefined => {
@@ -587,7 +853,20 @@ function analyzeFile(
   };
 
   // 1. The file's lexical bindings, its units, and the reference maps.
-  const candidates = new Map<ts.Symbol, { name: string; index: number; declNode: ts.Node; global: IrGlobal | null; isClass: boolean }>();
+  const candidates = new Map<ts.Symbol, {
+    name: string;
+    index: number;
+    declNode: ts.Node;
+    global: IrGlobal | null;
+    isClass: boolean;
+    /** Cycle mode: flagged whatever the reference set says. */
+    always?: boolean;
+    fence?: string;
+    /** A flag with no storage of its own (the default ALIAS, an enum). */
+    flagOnly?: boolean;
+  }>();
+  const fenceText = (what: string): string =>
+    `a read of '%NAME%' (${what}, read by code of an import cycle) before its module ran — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124)`;
   const valueUnits = new Map<ts.Symbol, ts.Node>(); // top-level `const f = () => ...`
   const deferredUnits = new Set<ts.Node>();
   const topClasses = new Map<ts.Symbol, ts.ClassLikeDeclaration>();
@@ -605,8 +884,25 @@ function analyzeFile(
     if (isAmbient(stmt)) return;
     if (ts.isVariableStatement(stmt)) {
       const list = stmt.declarationList;
-      if ((list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0) return; // var: no TDZ
       if ((list.flags & ts.NodeFlags.Using) !== 0) return;
+      if ((list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0) {
+        // var: no TDZ — but in cycle mode an early read is Node's
+        // `undefined`, fenced by name (S124).
+        if (!everywhere) return;
+        list.declarations.forEach((decl, d) => {
+          for (const nameNode of boundIdentifiersOf(decl.name)) {
+            const sym = checker.getSymbolAtLocation(nameNode);
+            if (sym === undefined) continue;
+            const global = L.globalsBySymbol.get(sym) ?? null;
+            // An undefined-armed (or dynamic) slot holds `undefined` from
+            // instantiation on (buildMain's var hoisting): Node's early
+            // read is representable, so nothing to fence.
+            if (global !== null && (L.varGlobalEntryInits.get(sf) ?? []).includes(global)) continue;
+            candidates.set(sym, { name: nameNode.text, index: stepOf[stmtIndex]! + d, declNode: decl, global, isClass: false, fence: fenceText("a var binding") });
+          }
+        });
+        return;
+      }
       list.declarations.forEach((decl, d) => {
         const index = stepOf[stmtIndex]! + d;
         for (const nameNode of boundIdentifiersOf(decl.name)) {
@@ -635,6 +931,27 @@ function analyzeFile(
           }
         }
       });
+    } else if (everywhere && ts.isEnumDeclaration(stmt)) {
+      const sym = checker.getSymbolAtLocation(stmt.name);
+      if (sym === undefined) return;
+      candidates.set(sym, { name: stmt.name.text, index: stepOf[stmtIndex]!, declNode: stmt, global: null, isClass: false, flagOnly: true, fence: fenceText("an enum") });
+    } else if (everywhere && ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      // The module's `default` binding: storage of its own (an expression
+      // or a mutable target's snapshot), or — `export default ident` of an
+      // immutable target — alias plumbing to the target's storage, which
+      // gets a flag of its own keyed by the default ALIAS symbol.
+      const sym = checker.getSymbolAtLocation(sf)?.getExports().get(ts.InternalSymbolName.Default as ts.__String);
+      if (sym === undefined) return;
+      const global = L.globalsBySymbol.get(sym) ?? null;
+      if (global === null && !(sym.flags & ts.SymbolFlags.Alias)) return;
+      candidates.set(sym, { name: "default", index: stepOf[stmtIndex]!, declNode: stmt, global, isClass: false, always: true, flagOnly: global === null });
+      if (global === null) tdz.defaultAliases.add(sym);
+    } else if (everywhere && ts.isClassDeclaration(stmt) && stmt.name === undefined) {
+      // `export default class { ... }`: the binding is the module's default.
+      const sym = checker.getSymbolAtLocation(sf)?.getExports().get(ts.InternalSymbolName.Default as ts.__String);
+      if (sym === undefined) return;
+      topClasses.set(sym, stmt);
+      candidates.set(sym, { name: "default", index: stepOf[stmtIndex]!, declNode: stmt, global: null, isClass: true, always: true });
     } else if (ts.isClassDeclaration(stmt) && stmt.name !== undefined) {
       const sym = checker.getSymbolAtLocation(stmt.name);
       if (sym === undefined) return;
@@ -821,10 +1138,12 @@ function analyzeFile(
   const tag = (L.fileTag.get(sf) ?? "").replace(/^%/, "") || "e.";
   for (const [sym, c] of candidates) {
     const ref = refIndex.get(sym);
-    if (cycleRefs !== null ? !cycleRefs.has(sym) : ref === undefined || ref > c.index) continue;
+    if (cycleRefs !== null ? !cycleRefs.has(sym) && c.always !== true : ref === undefined || ref > c.index) continue;
     let flagId: string;
     if (c.isClass) {
       flagId = `%g.${tag}%tdzc.${c.name}`;
+    } else if (c.flagOnly === true) {
+      flagId = `%g.${tag}%tdzf.${c.name}`;
     } else {
       if (c.global === null) continue; // alias plumbing / no storage
       flagId = `${c.global.id}%tdz`;
@@ -839,6 +1158,8 @@ function analyzeFile(
       flag,
       everywhere,
       isClass: c.isClass,
+      cluster: cluster?.files ?? null,
+      fence: c.fence ?? null,
     };
     tdz.bySymbol.set(sym, b);
     if (c.global !== null) tdz.byGlobalId.set(c.global.id, b);
@@ -880,17 +1201,34 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
       if (kind === "varRef") {
         const b = guarded(node["localId"] as string, loc);
         if (b === null) return node;
-        return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!)], result: node, type: node["type"], loc });
+        return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!, tdz.nameAt(b, loc!))], result: node, type: node["type"], loc });
       }
       walkChildren(node);
       if (kind === "incDec") {
         const b = guarded(node["localId"] as string, loc);
         if (b === null) return node;
-        return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!)], result: node, type: node["type"], loc });
+        return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!, tdz.nameAt(b, loc!))], result: node, type: node["type"], loc });
       }
       if (kind === "assign" || kind === "assignExpr") {
         const b = guarded(node["localId"] as string, loc);
         if (b === null) return node;
+        if (b.fence !== null) {
+          // A var-like binding's early WRITE is Node's too: it lands, and
+          // a later read sees it (a declaration with an initializer
+          // overwrites it later, as in Node; one without stores nothing).
+          // So the write marks the binding as holding a value.
+          const value = node["value"] as IrExpr;
+          const tmpId = `%tdzv.${temps++}`;
+          fn.locals.push({ id: tmpId, name: "%tdzv", type: value.type, mutable: false });
+          node["value"] = mark({
+            kind: "seqExpr",
+            stmts: [{ kind: "varDecl", localId: tmpId, init: value, loc }, tdz.flagSet(b, loc!)],
+            result: { kind: "varRef", localId: tmpId, type: value.type, loc },
+            type: value.type,
+            loc,
+          });
+          return node;
+        }
         // Node's PutValue order: the RHS evaluates, THEN the binding's
         // state is tested.
         const value = node["value"] as IrExpr;
@@ -898,7 +1236,7 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
         fn.locals.push({ id: tmpId, name: "%tdzv", type: value.type, mutable: false });
         node["value"] = mark({
           kind: "seqExpr",
-          stmts: [{ kind: "varDecl", localId: tmpId, init: value, loc }, tdz.checkStmt(b, loc!)],
+          stmts: [{ kind: "varDecl", localId: tmpId, init: value, loc }, tdz.checkStmt(b, loc!, tdz.nameAt(b, loc!))],
           result: { kind: "varRef", localId: tmpId, type: value.type, loc },
           type: value.type,
           loc,
@@ -907,7 +1245,7 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
       }
       if (kind === "forOf") {
         const b = guarded(node["localId"] as string, loc);
-        if (b === null) return node;
+        if (b === null || b.fence !== null) return node;
         // Each iteration's binding write: next() ran, then PutValue tests.
         node["body"] = [tdz.checkStmt(b, loc!), ...(node["body"] as IrStmt[])];
         return node;
@@ -936,6 +1274,7 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
     };
     fn.body = fn.body.map((s) => rewrite(s as unknown as Record<string, unknown>) as unknown as IrStmt);
   }
+  for (const h of tdz.fenceHelpers.values()) functions.push(h);
   if (process.env["SCRIPTC_TDZ_ASSERT"] === "1") assertTdzCoverage(tdz, functions);
   dropUnusedFlags(tdz, functions, globals);
 }
@@ -946,7 +1285,7 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
  * to an unguarded build wherever nothing is guarded. */
 function dropUnusedFlags(tdz: ModuleTdz, functions: IrFunction[], globals: IrGlobal[]): void {
   const allFlags = new Set<string>();
-  for (const b of tdz.bySymbol.values()) allFlags.add(b.flag.id);
+  for (const b of tdz.bySymbol.values()) if (b.sharedFlag !== true) allFlags.add(b.flag.id);
   const used = new Set<string>();
   const seen = new WeakSet<object>();
   const scanUse = (v: unknown): void => {
@@ -957,10 +1296,8 @@ function dropUnusedFlags(tdz: ModuleTdz, functions: IrFunction[], globals: IrGlo
       return;
     }
     const r = v as Record<string, unknown>;
-    if (r["kind"] === "libCall" && r["fn"] === "global.tdzCheck") {
-      const flag = (r["args"] as IrExpr[])[0];
-      if (flag !== undefined && flag.kind === "varRef") used.add(flag.localId);
-    }
+    const checked = checkedFlagOf(r);
+    if (checked !== null) used.add(checked);
     for (const k of Object.keys(r)) if (k !== "type" && k !== "loc") scanUse(r[k]);
   };
   for (const fn of functions) scanUse(fn.body);

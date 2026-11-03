@@ -5759,6 +5759,30 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2787-any-array-shared.ts": {
+   "order": [
+    "<repo>/tests/corpus/2787-any-array-shared.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2788-typed-views.ts": {
+   "order": [
+    "<repo>/tests/corpus/2788-typed-views.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2795-regex-lastindex-state.ts": {
+   "order": [
+    "<repo>/tests/corpus/2795-regex-lastindex-state.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2796-regex-replace-callbacks.ts": {
+   "order": [
+    "<repo>/tests/corpus/2796-regex-replace-callbacks.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/2820-switch-case-tdz.ts": {
    "order": [
     "<repo>/tests/corpus/2820-switch-case-tdz.ts"
@@ -5810,6 +5834,136 @@
   "<repo>/tests/corpus/2845-in-dynamic-runtime-key.mjs": {
    "order": [
     "<repo>/tests/corpus/2845-in-dynamic-runtime-key.mjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2900-cycle-tdz-reads/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2900-cycle-tdz-reads/b.ts",
+    "<repo>/tests/corpus/2900-cycle-tdz-reads/a.ts",
+    "<repo>/tests/corpus/2900-cycle-tdz-reads/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2901-cycle-entry-hoisted/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2901-cycle-entry-hoisted/parser.ts",
+    "<repo>/tests/corpus/2901-cycle-entry-hoisted/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2902-cycle-tdz-uncaught/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2902-cycle-tdz-uncaught/b.ts",
+    "<repo>/tests/corpus/2902-cycle-tdz-uncaught/a.ts",
+    "<repo>/tests/corpus/2902-cycle-tdz-uncaught/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2903-cycle-default-forms/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2903-cycle-default-forms/defaults.ts",
+    "<repo>/tests/corpus/2903-cycle-default-forms/shapes.ts",
+    "<repo>/tests/corpus/2903-cycle-default-forms/label.ts",
+    "<repo>/tests/corpus/2903-cycle-default-forms/readers.ts",
+    "<repo>/tests/corpus/2903-cycle-default-forms/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2904-cycle-barrel/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2904-cycle-barrel/util/debug.ts",
+    "<repo>/tests/corpus/2904-cycle-barrel/util/format.ts",
+    "<repo>/tests/corpus/2904-cycle-barrel/util/levels.ts",
+    "<repo>/tests/corpus/2904-cycle-barrel/util/index.ts",
+    "<repo>/tests/corpus/2904-cycle-barrel/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2905-cycle-class-extends/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2905-cycle-class-extends/base.ts",
+    "<repo>/tests/corpus/2905-cycle-class-extends/nodes.ts",
+    "<repo>/tests/corpus/2905-cycle-class-extends/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2906-cycle-extends-tdz/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2906-cycle-extends-tdz/leaf.ts",
+    "<repo>/tests/corpus/2906-cycle-extends-tdz/base.ts",
+    "<repo>/tests/corpus/2906-cycle-extends-tdz/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2907-cycle-window-call/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2907-cycle-window-call/b.ts",
+    "<repo>/tests/corpus/2907-cycle-window-call/a.ts",
+    "<repo>/tests/corpus/2907-cycle-window-call/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2908-json-import-shared/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2908-json-import-shared/tweak.ts",
+    "<repo>/tests/corpus/2908-json-import-shared/report.ts",
+    "<repo>/tests/corpus/2908-json-import-shared/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2909-reexport-project-imports/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2909-reexport-project-imports/models/index.ts",
+    "<repo>/tests/corpus/2909-reexport-project-imports/util.ts",
+    "<repo>/tests/corpus/2909-reexport-project-imports/barrel.ts",
+    "<repo>/tests/corpus/2909-reexport-project-imports/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2910-builtin-default-interop/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2910-builtin-default-interop/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2911-json-named-import-crash/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2911-json-named-import-crash/dep.ts",
+    "<repo>/tests/corpus/2911-json-named-import-crash/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2912-json-attribute-missing-crash/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2912-json-attribute-missing-crash/other.ts",
+    "<repo>/tests/corpus/2912-json-attribute-missing-crash/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2913-cycle-reaches-pending-module/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2913-cycle-reaches-pending-module/probe.ts",
+    "<repo>/tests/corpus/2913-cycle-reaches-pending-module/b.ts",
+    "<repo>/tests/corpus/2913-cycle-reaches-pending-module/util.ts",
+    "<repo>/tests/corpus/2913-cycle-reaches-pending-module/a.ts",
+    "<repo>/tests/corpus/2913-cycle-reaches-pending-module/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2914-cycle-var-early-write/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2914-cycle-var-early-write/b.ts",
+    "<repo>/tests/corpus/2914-cycle-var-early-write/a.ts",
+    "<repo>/tests/corpus/2914-cycle-var-early-write/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2915-cjs-default-reexport/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2915-cjs-default-reexport/lib.cjs",
+    "<repo>/tests/corpus/2915-cjs-default-reexport/facade.ts",
+    "<repo>/tests/corpus/2915-cjs-default-reexport/main.ts"
    ],
    "diags": []
   },
@@ -6881,7 +7035,7 @@
       "end": 0
      },
      "milestone": "later",
-     "hint": "cycles of ES modules with declaration-only top levels whose cycle-crossing bindings are only used inside function bodies compile as-is; move the named top-level read or call into a function body (or break the named edge) so nothing runs during the cycle's init window"
+     "hint": "ES-module cycles compile with Node's evaluation order and TDZ errors; the named shape is the part that does not — break the named edge, or move the named top-level code into a function body"
     }
    ]
   },
@@ -6932,63 +7086,31 @@
    ],
    "diags": []
   },
-  "<repo>/tests/diagnostics/cycle-tdz-read/main.ts": {
+  "<repo>/tests/diagnostics/cycle-namespace/main.ts": {
    "order": [
-    "<repo>/tests/diagnostics/cycle-tdz-read/b.ts",
-    "<repo>/tests/diagnostics/cycle-tdz-read/a.ts",
-    "<repo>/tests/diagnostics/cycle-tdz-read/main.ts"
+    "<repo>/tests/diagnostics/cycle-namespace/b.ts",
+    "<repo>/tests/diagnostics/cycle-namespace/a.ts",
+    "<repo>/tests/diagnostics/cycle-namespace/main.ts"
    ],
-   "diags": [
-    {
-     "code": "SC1016",
-     "message": "circular imports (<repo>/tests/diagnostics/cycle-tdz-read/a.ts → <repo>/tests/diagnostics/cycle-tdz-read/b.ts → <repo>/tests/diagnostics/cycle-tdz-read/a.ts; the cycle-crossing binding 'a' is read at <repo>/tests/diagnostics/cycle-tdz-read/b.ts:2, outside any function body — a read during the init window observes the partially-initialized module (Node's TDZ ReferenceError / stale var), which is not modeled) are not supported yet",
-     "loc": {
-      "file": "<repo>/tests/diagnostics/cycle-tdz-read/a.ts",
-      "start": 0,
-      "end": 0
-     },
-     "milestone": "later",
-     "hint": "cycles of ES modules with declaration-only top levels whose cycle-crossing bindings are only used inside function bodies compile as-is; move the named top-level read or call into a function body (or break the named edge) so nothing runs during the cycle's init window"
-    }
-   ]
+   "diags": []
   },
-  "<repo>/tests/diagnostics/cycle-window-call/main.ts": {
+  "<repo>/tests/diagnostics/cycle-tla-window/main.ts": {
    "order": [
-    "<repo>/tests/diagnostics/cycle-window-call/b.ts",
-    "<repo>/tests/diagnostics/cycle-window-call/a.ts",
-    "<repo>/tests/diagnostics/cycle-window-call/main.ts"
+    "<repo>/tests/diagnostics/cycle-tla-window/b.ts",
+    "<repo>/tests/diagnostics/cycle-tla-window/a.ts",
+    "<repo>/tests/diagnostics/cycle-tla-window/main.ts"
    ],
    "diags": [
     {
      "code": "SC1016",
-     "message": "circular imports (<repo>/tests/diagnostics/cycle-window-call/a.ts → <repo>/tests/diagnostics/cycle-window-call/b.ts → <repo>/tests/diagnostics/cycle-window-call/a.ts; top-level code at <repo>/tests/diagnostics/cycle-window-call/a.ts:5 can run user code during the cycle's init window — only declaration-only module bodies are admitted) are not supported yet",
+     "message": "circular imports (<repo>/tests/diagnostics/cycle-tla-window/a.ts → <repo>/tests/diagnostics/cycle-tla-window/b.ts → <repo>/tests/diagnostics/cycle-tla-window/a.ts; an async cycle (its evaluation awaits the top-level await at <repo>/tests/diagnostics/cycle-tla-window/a.ts:5) whose top-level code at <repo>/tests/diagnostics/cycle-tla-window/b.ts:5 can run user code during the cycle's init window — an async cycle is admitted only when its module bodies are declaration-only) are not supported yet",
      "loc": {
-      "file": "<repo>/tests/diagnostics/cycle-window-call/a.ts",
+      "file": "<repo>/tests/diagnostics/cycle-tla-window/a.ts",
       "start": 0,
       "end": 0
      },
      "milestone": "later",
-     "hint": "cycles of ES modules with declaration-only top levels whose cycle-crossing bindings are only used inside function bodies compile as-is; move the named top-level read or call into a function body (or break the named edge) so nothing runs during the cycle's init window"
-    }
-   ]
-  },
-  "<repo>/tests/diagnostics/cycle/main.ts": {
-   "order": [
-    "<repo>/tests/diagnostics/cycle/b.ts",
-    "<repo>/tests/diagnostics/cycle/a.ts",
-    "<repo>/tests/diagnostics/cycle/main.ts"
-   ],
-   "diags": [
-    {
-     "code": "SC1016",
-     "message": "circular imports (<repo>/tests/diagnostics/cycle/a.ts → <repo>/tests/diagnostics/cycle/b.ts → <repo>/tests/diagnostics/cycle/a.ts; the cycle-crossing binding 'a' is read at <repo>/tests/diagnostics/cycle/b.ts:2, outside any function body — a read during the init window observes the partially-initialized module (Node's TDZ ReferenceError / stale var), which is not modeled) are not supported yet",
-     "loc": {
-      "file": "<repo>/tests/diagnostics/cycle/a.ts",
-      "start": 0,
-      "end": 0
-     },
-     "milestone": "later",
-     "hint": "cycles of ES modules with declaration-only top levels whose cycle-crossing bindings are only used inside function bodies compile as-is; move the named top-level read or call into a function body (or break the named edge) so nothing runs during the cycle's init window"
+     "hint": "ES-module cycles compile with Node's evaluation order and TDZ errors; the named shape is the part that does not — break the named edge, or move the named top-level code into a function body"
     }
    ]
   },
@@ -7026,7 +7148,7 @@
     },
     {
      "code": "SC1012",
-     "message": "export = assignments are not supported yet",
+     "message": "export = assignments (Node's type stripping refuses them, and in a file Node loads as an ES module `module` does not exist — they run only under tsc's CommonJS emit) are not supported yet",
      "loc": {
       "file": "<repo>/tests/diagnostics/default-export.ts",
       "start": 439,
@@ -7291,7 +7413,7 @@
     },
     {
      "code": "SC1013",
-     "message": "import = require(...) assignments are not supported yet",
+     "message": "import = require(...) assignments (Node's type stripping refuses them, and in a file Node loads as an ES module `require` does not exist — they run only under tsc's CommonJS emit) are not supported yet",
      "loc": {
       "file": "<repo>/tests/diagnostics/import-equals-require.ts",
       "start": 178,
@@ -7310,14 +7432,14 @@
    "diags": [
     {
      "code": "SC1012",
-     "message": "default exports/imports are not supported yet",
+     "message": "a default import of the builtin 'node:os' in a project whose compiler options give modules no synthetic default (tsc reports TS1259 there; esModuleInterop, allowSyntheticDefaultImports, a bundler module resolution and module node16/nodenext/preserve all allow it) is not supported yet",
      "loc": {
       "file": "<repo>/tests/diagnostics/import-forms/main.ts",
       "start": 517,
       "end": 519
      },
      "milestone": "later",
-     "hint": "use named exports: export function f() {} / import { f } from \"./m\""
+     "hint": "import * as os from \"node:os\", or enable esModuleInterop in the project's tsconfig"
     },
     {
      "code": "SC1013",
@@ -7341,7 +7463,7 @@
     },
     {
      "code": "SC1014",
-     "message": "re-exports from packages or builtin modules are not supported yet",
+     "message": "star and namespace re-exports of builtin modules are not supported yet",
      "loc": {
       "file": "<repo>/tests/diagnostics/import-forms/main.ts",
       "start": 759,
@@ -7349,6 +7471,17 @@
      },
      "milestone": "later",
      "hint": "export declarations directly: export function f() {}"
+    },
+    {
+     "code": "SC1010",
+     "message": "the './cfg.json' import (Node refuses its import attributes: Module \"file://<repo>/tests/diagnostics/import-forms/cfg.json\" needs an import attribute of \"type: json\") is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/import-forms/main.ts",
+      "start": 536,
+      "end": 570
+     },
+     "milestone": "M4",
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     }
    ]
   },
@@ -7457,24 +7590,6 @@
     "<repo>/tests/diagnostics/json-module-comment/main.ts"
    ],
    "diags": []
-  },
-  "<repo>/tests/diagnostics/json-modules/main.ts": {
-   "order": [
-    "<repo>/tests/diagnostics/json-modules/main.ts"
-   ],
-   "diags": [
-    {
-     "code": "SC1012",
-     "message": "named imports from JSON modules are not supported yet",
-     "loc": {
-      "file": "<repo>/tests/diagnostics/json-modules/main.ts",
-      "start": 135,
-      "end": 146
-     },
-     "milestone": "later",
-     "hint": "use named exports: export function f() {} / import { f } from \"./m\""
-    }
-   ]
   },
   "<repo>/tests/diagnostics/json-shape/main.ts": {
    "order": [
@@ -7935,6 +8050,12 @@
   "<repo>/tests/diagnostics/var-fences.ts": {
    "order": [
     "<repo>/tests/diagnostics/var-fences.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/void-ternary-value.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/void-ternary-value.ts"
    ],
    "diags": []
   },
@@ -8465,12 +8586,6 @@
   "<repo>/tests/fixtures/node-types/stream-capture.ts": {
    "order": [
     "<repo>/tests/fixtures/node-types/stream-capture.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/diagnostics/void-ternary-value.ts": {
-   "order": [
-    "<repo>/tests/diagnostics/void-ternary-value.ts"
    ],
    "diags": []
   }

@@ -1110,7 +1110,18 @@ export class Lowerer {
    * assignments with no observable evaluation order of their own —
    * prepended by lowerFileInit so the bindings are live before any
    * top-level statement runs. */
-  readonly jsonInitActions = new Map<ts.SourceFile, IrStmt[]>();
+  /** JSON default imports: the import STATEMENT → its JSON module's
+   * evaluation (a call of the module's run-once loader), placed in the
+   * importer's %init header at the statement's request position — Node
+   * evaluates a JSON module like any dependency, once, and every importer
+   * shares the one object. */
+  readonly jsonInitActions = new Map<ts.Statement, IrStmt[]>();
+  /** JSON module (its symbol) → its loader function name. */
+  readonly jsonLoaderOf = new Map<ts.Symbol, string>();
+  /** JSON module (its symbol) → its run-once loaded flag and the file
+   * that imports it first (module-tdz's cycle mode guards reads before the
+   * module evaluated). */
+  readonly jsonLoadedFlagOf = new Map<ts.Symbol, { flag: IrGlobal; importer: ts.SourceFile }>();
   /** The embedded npm runtime graph (collectNpmImports), attached to the
    * emitted module. Null without npm imports or without --dynamic. */
   npmEmbedded: IrModule["embedded"] | null = null;
@@ -1447,6 +1458,11 @@ export class Lowerer {
           // the import declaration's resolved CJS module.
           const dep = this.cjsDefaultImportDepOf(recvDecl);
           if (dep) symbol = this.cjsModuleExportSymbol(dep, ident.text);
+        } else if (recvDecl && (ts.isImportSpecifier(recvDecl) || ts.isExportSpecifier(recvDecl))) {
+          // The same binding reached through a named (re-)export of the
+          // module's default (`export { default as pc } from "pkg"`).
+          const dep = this.cjsDefaultDepOfSpecifier(recvDecl);
+          if (dep) symbol = this.cjsModuleExportSymbol(dep, ident.text);
         }
       }
     }
@@ -1682,6 +1698,32 @@ export class Lowerer {
     return dep;
   }
 
+  /** The CommonJS module whose `default` (its module.exports) an import
+   * or re-export SPECIFIER binds, following the named hops through
+   * facades: `import { pc } from "./facade"` over the facade's
+   * `export { default as pc } from "picocolors"` answers picocolors'
+   * entry, exactly as a default import of it would. Null otherwise. */
+  private cjsDefaultDepOfSpecifier(spec0: ts.ImportSpecifier | ts.ExportSpecifier): ts.SourceFile | null {
+    let d: ts.ImportSpecifier | ts.ExportSpecifier = spec0;
+    for (let hop = 0; hop < 32; hop++) {
+      const stmt: ts.Node = ts.isImportSpecifier(d) ? d.parent.parent.parent : d.parent.parent;
+      const specNode = ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt) ? stmt.moduleSpecifier : undefined;
+      if (specNode === undefined || !ts.isStringLiteral(specNode)) return null;
+      const from = stmt.getSourceFile();
+      const dep = isRelativeSpecifier(specNode.text)
+        ? resolveImport(this.program, from, specNode.text)
+        : npmStaticDepSf7(this.program, from, specNode.text);
+      if (!dep) return null;
+      const name = (d.propertyName ?? d.name).text;
+      if (name === "default") return isJsSourceFile(dep) && !isNodeEsmFile(dep) ? dep : null;
+      const next = this.checker.getSymbolAtLocation(dep)?.getExports().get(name as ts.__String);
+      const nd = next ? this.checker.declarationsOf(next).find((x) => ts.isExportSpecifier(x)) : undefined;
+      if (nd === undefined || !ts.isExportSpecifier(nd)) return null;
+      d = nd;
+    }
+    return null;
+  }
+
   /** True when `expr` is an identifier bound by a top-level
    * `const x = require("./local")` of a RELATIVE module — the CommonJS
    * namespace binding — or of a bare specifier naming an opted-in
@@ -1701,6 +1743,8 @@ export class Lowerer {
     if (ts.isImportClause(decl)) {
       if (decl.name === undefined || this.cjsDefaultImportDepOf(decl) === null) return false;
       if (sym) this.fenceCjsInteropDefault(expr, sym);
+    } else if (ts.isImportSpecifier(decl) || ts.isExportSpecifier(decl)) {
+      if (this.cjsDefaultDepOfSpecifier(decl) === null) return false;
     } else {
       if (!ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name) || !decl.initializer) {
         return false;

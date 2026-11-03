@@ -10,7 +10,7 @@ import { isNpmStaticPackage } from "../npm-static.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsJsFile, isJsSourceFile, isRequireStatement, locOf, makeCycleAdmission, orderedImportsOf, resolveImport, resolveNpmImport } from "../program.js";
 import type { CycleEdge } from "../program.js";
-import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
+import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
@@ -138,7 +138,7 @@ export interface FileParts {
           ? [{ dep, stmt: stmt as ts.ImportDeclaration | ts.ExportDeclaration }]
           : [],
       );
-    const cycleAdmissionReason = makeCycleAdmission(program, staticEdgesOf);
+    const cycleAdmissionReason = makeCycleAdmission(program, staticEdgesOf, true);
     const visit = (sf: ts.SourceFile): void => {
       if (state.get(sf) !== undefined) return;
       state.set(sf, "visiting");
@@ -174,6 +174,39 @@ export interface FileParts {
     if (added.length > 0) order.splice(order.length - 1, 0, ...added);
   }
 
+/** Every program class declaration in module order, except that a class
+   * whose `extends` names another program class declared LATER (an import
+   * cycle evaluates the subclass's module first) moves after its base —
+   * a shape collects against its base's. Outside cycles bases already come
+   * first (a base's module evaluates before its importers), so the order
+   * is unchanged there. */
+  function baseFirstClassOrder(L: Lowerer, parts: FileParts[]): ts.ClassDeclaration[] {
+    const all = parts.flatMap((fp) => fp.classDecls);
+    const known = new Set(all);
+    const state = new Map<ts.ClassDeclaration, "visiting" | "done">();
+    const out: ts.ClassDeclaration[] = [];
+    const visit = (decl: ts.ClassDeclaration): void => {
+      if (state.has(decl)) return;
+      state.set(decl, "visiting");
+      for (const h of decl.heritageClauses ?? []) {
+        if (h.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+        for (const t of h.types) {
+          const e = t.expression;
+          if (!ts.isIdentifier(e) && !ts.isPropertyAccessExpression(e)) continue;
+          let sym = L.checker.getSymbolAtLocation(ts.isPropertyAccessExpression(e) ? e.name : e);
+          if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
+          for (const d of sym !== undefined ? L.checker.declarationsOf(sym) : []) {
+            if (ts.isClassDeclaration(d) && known.has(d)) visit(d);
+          }
+        }
+      }
+      state.set(decl, "done");
+      out.push(decl);
+    };
+    for (const decl of all) visit(decl);
+    return out;
+  }
+
 /** Collect pass over the WHOLE program: signatures, class shapes, and
    * file-scope globals visible everywhere → hoisting, mutual recursion, and
    * cross-module references fall out for free. Runs in both passes —
@@ -182,7 +215,7 @@ export interface FileParts {
   export function collectProgram(L: Lowerer, parts: FileParts[]): void {
     L.collecting = true;
     try {
-      for (const fp of parts) for (const decl of fp.classDecls) L.collectClassShape(decl);
+      for (const decl of baseFirstClassOrder(L, parts)) L.collectClassShape(decl);
       for (const fp of parts) for (const decl of fp.fnDecls) L.collectSignature(decl);
     } finally {
       L.collecting = false;
@@ -224,6 +257,24 @@ export interface FileParts {
     const builder = L.dynamic ? new NpmGraphBuilder() : null;
     for (const fp of parts) {
       for (const stmt of fp.sf.statements) {
+        // STAR re-exports (`export * from "pkg"`, `export * as ns from
+        // "pkg"`) of a package the build does not compile (preflight let
+        // them through): a static build names the engine requirement, as
+        // for any import of the package; under the engine there is no
+        // member list to bind by name, which is named instead.
+        if (
+          ts.isExportDeclaration(stmt) && !stmt.isTypeOnly &&
+          (stmt.exportClause === undefined || ts.isNamespaceExport(stmt.exportClause)) &&
+          stmt.moduleSpecifier !== undefined && ts.isStringLiteral(stmt.moduleSpecifier) &&
+          !isRelativeSpecifier(stmt.moduleSpecifier.text) && !stmt.moduleSpecifier.text.startsWith("#")
+        ) {
+          const npm = resolveNpmImport(fp.sf.fileName, stmt.moduleSpecifier.text);
+          if (npm !== null && !isNpmStaticPackage(npm.packageName)) {
+            if (!builder) L.pushDiag(requiresDynamicImportDiag(npm.packageName, locOf(stmt)));
+            else L.pushDiag(unsupportedDiag("SC1014", locOf(stmt), "star re-exports of a package the embedded engine runs (re-export its members by name)"));
+          }
+          continue;
+        }
         // NAMED re-exports from npm packages (`export { isUrl } from
         // "url-or-path"` — preflight admitted them): import-plus-export
         // plumbing — the island load registers at this statement's
@@ -509,6 +560,25 @@ export interface FileParts {
       for (const stmt of fp.sf.statements) {
         if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
         const clause = stmt.importClause;
+        if (clause !== undefined && clause.phaseModifier !== ts.SyntaxKind.TypeKeyword && clause.namedBindings !== undefined && ts.isNamedImports(clause.namedBindings)) {
+          // NAMED imports from a JSON module: Node refuses the program at
+          // link time (a JSON module exports only `default` — preflight's
+          // link check compiles the program to that SyntaxError), so no
+          // read of these bindings ever runs. They get typed storage that
+          // is never written, only so the rest of the program lowers.
+          for (const el of clause.namedBindings.elements) {
+            if (el.isTypeOnly) continue;
+            const sym = L.checker.getSymbolAtLocation(el.name);
+            if (!sym || !(sym.flags & ts.SymbolFlags.Alias)) continue;
+            const t = L.checker.getAliasedSymbol(sym);
+            if (!L.checker.declarationsOf(t)[0]?.getSourceFile().fileName.endsWith(".json") || L.globalsBySymbol.has(t)) continue;
+            const mapped = L.mapTypeOf(L.typeOf(el.name));
+            if (!mapped) continue;
+            const g: IrGlobal = { id: `%g.json.${L.globalsList.length}.${el.name.text}`, name: el.name.text, type: mapped, mutable: false };
+            L.globalsBySymbol.set(t, g);
+            L.globalsList.push(g);
+          }
+        }
         if (!clause?.name || clause.phaseModifier === ts.SyntaxKind.TypeKeyword) continue;
         const nameSym = L.checker.getSymbolAtLocation(clause.name);
         if (!nameSym || !(nameSym.flags & ts.SymbolFlags.Alias)) continue;
@@ -536,21 +606,51 @@ export interface FileParts {
             ));
             throw new PoisonError();
           }
-          const value = L.comptimeValueToIr(parsed, mapped, "$", clause.name);
-          let g = L.globalsBySymbol.get(target);
-          if (!g) {
-            g = {
-              id: `%g.json.${L.globalsList.length}`,
-              name: clause.name.text,
-              type: mapped,
-              mutable: false,
-            };
-            L.globalsBySymbol.set(target, g);
-            L.globalsList.push(g);
+          let loader = L.jsonLoaderOf.get(target);
+          if (loader === undefined) {
+            const value = L.comptimeValueToIr(parsed, mapped, "$", clause.name);
+            const n = L.globalsList.length;
+            let g = L.globalsBySymbol.get(target);
+            if (!g) {
+              g = {
+                id: `%g.json.${n}`,
+                name: clause.name.text,
+                type: mapped,
+                mutable: false,
+              };
+              L.globalsBySymbol.set(target, g);
+              L.globalsList.push(g);
+            }
+            // Run-once, like a module's %init: the first request evaluates
+            // the module; later ones (other importers) share its object.
+            const loaded: IrGlobal = { id: `%g.json.${n}%loaded`, name: "%loaded", type: BOOL, mutable: true };
+            L.globalsList.push(loaded);
+            loader = `%json.load.${n}`;
+            const loc = locOf(stmt);
+            L.liftedFns.push({
+              name: loader,
+              params: [],
+              returnType: VOID,
+              locals: [],
+              body: [
+                {
+                  kind: "if",
+                  cond: { kind: "varRef", localId: loaded.id, type: BOOL, loc },
+                  then: [{ kind: "return", value: null, loc }],
+                  else_: null,
+                  loc,
+                },
+                { kind: "assign", localId: loaded.id, value: { kind: "boolLit", value: true, type: BOOL, loc }, loc },
+                { kind: "assign", localId: g.id, value, loc },
+              ],
+              loc,
+            });
+            L.jsonLoaderOf.set(target, loader);
+            L.jsonLoadedFlagOf.set(target, { flag: loaded, importer: fp.sf });
           }
-          const actions = L.jsonInitActions.get(fp.sf) ?? [];
-          L.jsonInitActions.set(fp.sf, actions);
-          actions.push({ kind: "assign", localId: g.id, value, loc: locOf(stmt) });
+          L.jsonInitActions.set(stmt, [
+            { kind: "exprStmt", expr: { kind: "call", callee: loader, args: [], type: VOID, loc: locOf(stmt) }, loc: locOf(stmt) },
+          ]);
         } catch (e) {
           if (!(e instanceof PoisonError)) throw e;
           // diagnostic already recorded; uses of the binding poison too
@@ -1764,7 +1864,10 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
       }
       for (const { stmt, dep } of orderedImportsOf(L.program, sf)) {
         const npm = L.npmInitActions.get(sf)?.get(stmt);
-        if (npm !== undefined && npm.length > 0) {
+        const json = L.jsonInitActions.get(stmt);
+        if (json !== undefined) {
+          header.push(...json);
+        } else if (npm !== undefined && npm.length > 0) {
           header.push(...npm);
         } else if (dep !== null && dep !== sf) {
           // dep === sf is the self-import (the package self-name resolving
@@ -1868,18 +1971,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
           loc,
         });
       }
-      // Module-scope `var` hoisting: undefined-armed var globals hold the
-      // interned undefined from module entry (before any body statement —
-      // a function called above the declaration reads `undefined`, exactly
-      // Node); checked-dynamic var globals hold the dyn undefined the same
-      // way. After the guard: a cache-hit revisit must not reset them.
-      for (const g of L.varGlobalEntryInits.get(sf) ?? []) {
-        const wrapped = g.type.kind === "dyn" ? dynUndefinedExpr(loc0) : L.unassignedSlotInit(g.type, loc0);
-        if (wrapped) {
-          header.push({ kind: "assign", localId: g.id, value: wrapped, loc: loc0 });
-        }
-      }
-      const prelude = L.jsonInitActions.get(sf) ?? [];
+      const prelude: IrStmt[] = [];
       // Class STATIC readonly fields, static BLOCKS, and class DECORATORS
       // run at their class statement's source position (splitFiles hoisted
       // the declarations out of `stmts`, so the statements merge back in
@@ -1910,10 +2002,23 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
       // once the class definition completed — after its own statics (the
       // stable sort keeps a flag behind its class's entry).
       for (const st of L.moduleTdz === null ? [] : sf.statements) {
-        if (!ts.isClassDeclaration(st) || st.name === undefined) continue;
-        const sym = L.checker.getSymbolAtLocation(st.name);
+        if (!ts.isClassDeclaration(st)) continue;
+        // (`export default class {}` binds the module's default symbol.)
+        const sym = st.name !== undefined ? L.checker.getSymbolAtLocation(st.name) : defaultExportSymbolOf(L, sf) ?? undefined;
         const b = sym !== undefined ? L.moduleTdz!.bySymbol.get(sym) : undefined;
         if (b !== undefined) statics.push({ pos: st.getStart(), info: null, tdzFlag: L.moduleTdz!.flagSet(b, locOf(st)) });
+        // Cycle mode: the HERITAGE expression is a top-level read the class
+        // definition evaluates first (`class Leaf extends Base` with Base's
+        // module still mid-evaluation is Node's TDZ) — the declaration is
+        // hoisted out of the statement list, so its guard lands here, ahead
+        // of the class's own statics.
+        for (const h of st.heritageClauses ?? []) {
+          if (h.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+          for (const o of L.moduleTdz!.occByFile.get(sf.fileName) ?? []) {
+            if (o.unit !== sf || o.start < h.getStart() || o.start >= h.end) continue;
+            statics.push({ pos: st.getStart() - 0.5, info: null, tdzFlag: L.moduleTdz!.checkStmt(o.b, { file: sf.fileName, start: o.start, end: o.end }, o.name) });
+          }
+        }
       }
       statics.sort((a, b) => a.pos - b.pos);
       const body = [...header, ...prelude];
@@ -1934,6 +2039,17 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // inits while it lowered: they land immediately before it — JS's
         // order for the supported whole-initializer positions.
         body.push(...L.pendingClassExprInits.splice(0), ...stmtIr);
+        // Module-TDZ cycle mode (module-tdz.ts): an enum and the module's
+        // `default` initialize once their statement ran.
+        if (L.moduleTdz !== null && L.moduleTdz.bySymbol.size > 0) {
+          const sym = ts.isEnumDeclaration(stmt)
+            ? L.checker.getSymbolAtLocation(stmt.name)
+            : ts.isExportAssignment(stmt) && !stmt.isExportEquals
+              ? defaultExportSymbolOf(L, sf) ?? undefined
+              : undefined;
+          const b = sym !== undefined ? L.moduleTdz.bySymbol.get(sym) : undefined;
+          if (b !== undefined) body.push(L.moduleTdz.flagSet(b, locOf(stmt)));
+        }
       }
       while (at < statics.length) {
         const ev = statics[at]!;
@@ -1979,9 +2095,22 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             loc,
           }
         : null;
+    // Module-scope `var` hoisting: undefined-armed var globals hold the
+    // interned undefined from INSTANTIATION — before any module evaluates
+    // (checked-dynamic var globals hold the dyn undefined the same way).
+    // Assigning them at their own module's entry instead would erase a
+    // write that code of an import cycle made before the module ran (Node
+    // keeps it: a `var` with no initializer stores nothing when it runs).
+    const varInits: IrStmt[] = [];
+    for (const gs of L.varGlobalEntryInits.values()) {
+      for (const g of gs) {
+        const wrapped = g.type.kind === "dyn" ? dynUndefinedExpr(loc) : L.unassignedSlotInit(g.type, loc);
+        if (wrapped) varInits.push({ kind: "assign", localId: g.id, value: wrapped, loc });
+      }
+    }
     const body: IrStmt[] =
       initCall !== null
-        ? [{
+        ? [...varInits, {
             kind: "exprStmt",
             expr: isAsync
               ? { kind: "awaitExpr", value: initCall, type: VOID, loc }

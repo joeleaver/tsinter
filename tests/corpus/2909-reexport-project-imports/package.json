@@ -1,0 +1,9 @@
+{
+  "name": "reexport-project-imports",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#models": "./models/index.ts",
+    "#util": "./util.ts"
+  }
+}

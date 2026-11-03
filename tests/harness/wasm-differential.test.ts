@@ -3684,6 +3684,27 @@ const TIER_FLOOR: string[] = [
   // GH #91: `k in obj` with a runtime key on a dynamic value (dyn.hasKey)
   // — a new program, passing from its first run.
   "2845-in-dynamic-runtime-key.mjs",
+  // TS module forms (round-3 survey): ES-module cycles with Node's order,
+  // live bindings and TDZ errors (SEMANTICS.md S124), JSON imports under
+  // Node's attribute rules, project-import re-exports, builtin default
+  // imports under the project's effective interop flag — new programs
+  // passing from their first run.
+  "2900-cycle-tdz-reads/main.ts",
+  "2901-cycle-entry-hoisted/main.ts",
+  "2902-cycle-tdz-uncaught/main.ts",
+  "2903-cycle-default-forms/main.ts",
+  "2904-cycle-barrel/main.ts",
+  "2905-cycle-class-extends/main.ts",
+  "2906-cycle-extends-tdz/main.ts",
+  "2907-cycle-window-call/main.ts",
+  "2908-json-import-shared/main.ts",
+  "2909-reexport-project-imports/main.ts",
+  "2910-builtin-default-interop/main.ts",
+  "2911-json-named-import-crash/main.ts",
+  "2912-json-attribute-missing-crash/main.ts",
+  "2913-cycle-reaches-pending-module/main.ts",
+  "2914-cycle-var-early-write/main.ts",
+  "2915-cjs-default-reexport/main.ts",
 ];
 
 interface RunResult {
@@ -10284,4 +10305,267 @@ describe("#227 fetch rows", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 60000);
+});
+
+/* ── Module forms rows (the round-3 survey's TS module unit): the shapes
+ * the corpus cannot hold — a program whose OUTCOME is a named fence or a
+ * compile refusal, and matrices of tsconfigs/attributes. Expected outputs
+ * come from Node itself, run in-test on the same files; only the fence and
+ * refusal texts are pinned. ── */
+
+describe("module forms rows", () => {
+  /** Writes `files` (paths may hold subdirectories) to a fresh directory. */
+  function writeTree(files: Record<string, string>): string {
+    const dir = mkdtempSync(join(tmpdir(), "modforms-"));
+    for (const [n, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, n)), { recursive: true });
+      writeFileSync(join(dir, n), body);
+    }
+    return dir;
+  }
+  async function buildIn(dir: string): Promise<Awaited<ReturnType<typeof compile>>> {
+    return compile(join(dir, "main.ts"), { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+  }
+  async function nodeIn(dir: string, files: Record<string, string>): Promise<RunResult> {
+    const transform = Object.values(files).some((t) => /\benum\s+[A-Za-z_$]/.test(t))
+      ? ["--experimental-transform-types", "--disable-warning=ExperimentalWarning"]
+      : [];
+    const pending = execFileAsync("node", [...transform, join(dir, "main.ts")], { encoding: "buffer", cwd: dir });
+    pending.child.stdin?.end();
+    try {
+      const { stdout, stderr } = await pending;
+      return { stdout, stderr, exitCode: 0 };
+    } catch (e) {
+      const err = e as { stdout: Buffer; stderr: Buffer; code: number };
+      return { stdout: err.stdout, stderr: err.stderr, exitCode: err.code };
+    }
+  }
+  /** Compiles and runs `files` on the wasm lane; Node runs them too. The
+   * wasm run must match Node's stdout and exit status; when Node failed,
+   * the wasm stderr must carry Node's error message (Node's own line is
+   * `<Class> [<code>]: <message>`; the lane prints `Uncaught <Class>:
+   * <message>`). */
+  async function sameAsNode(files: Record<string, string>): Promise<{ stdout: string; exitCode: number }> {
+    const dir = writeTree(files);
+    try {
+      const res = await buildIn(dir);
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const wasm = await runWasm(res.binaryPath);
+      const node = await nodeIn(dir, files);
+      expect({ stdout: wasm.stdout.toString("utf8"), exitCode: wasm.exitCode }).toEqual({ stdout: node.stdout.toString("utf8"), exitCode: node.exitCode });
+      if (node.exitCode !== 0) {
+        const line = node.stderr.toString("utf8").split("\n").find((l) => /^\w*Error( \[\w+\])?: /.test(l));
+        const message = (line ?? "").replace(/^\w*Error( \[\w+\])?: /, "").split(dir).join("<D>");
+        expect(message).not.toBe("");
+        expect(wasm.stderr.toString("utf8").split(dir).join("<D>")).toContain(message);
+      }
+      return { stdout: node.stdout.toString("utf8"), exitCode: node.exitCode };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  async function refusals(files: Record<string, string>): Promise<string[]> {
+    const dir = writeTree(files);
+    try {
+      const res = await buildIn(dir);
+      return res.ok ? [] : res.diagnostics.map((d) => `${d.code} ${d.message.split(dir).join("<D>")}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const builtinDefaults = 'import path from "node:path";\nimport os from "os";\nconsole.log(path.basename("/a/b.txt"), typeof os.EOL);\n';
+  test("MF-01 a TypeScript default import of a builtin follows the project's EFFECTIVE synthetic-default flag, as tsc computes it", async () => {
+    for (const options of [
+      { module: "preserve" },
+      { module: "nodenext" },
+      { module: "node16" },
+      { module: "esnext", moduleResolution: "bundler" },
+      { module: "commonjs", esModuleInterop: true },
+      { module: "commonjs", allowSyntheticDefaultImports: true },
+      { module: "system" },
+    ]) {
+      const tsconfig = JSON.stringify({ compilerOptions: { strict: true, ...options } });
+      expect({ options, out: await sameAsNode({ "main.ts": builtinDefaults, "tsconfig.json": tsconfig }) }).toEqual({ options, out: { stdout: "b.txt string\n", exitCode: 0 } });
+    }
+    for (const options of [
+      { module: "commonjs" },
+      { module: "nodenext", esModuleInterop: false },
+      { module: "esnext" },
+      { module: "nodenext", allowSyntheticDefaultImports: false },
+    ]) {
+      const tsconfig = JSON.stringify({ compilerOptions: { strict: true, ...options } });
+      // (An explicit `false` is also tsgo's own config error — TS 7 removed
+      // the option's false value — so only the SC1012s are counted.)
+      const diags = (await refusals({ "main.ts": builtinDefaults, "tsconfig.json": tsconfig })).filter((d) => d.startsWith("SC1012"));
+      expect({ options, n: diags.length, all: diags.every((d) => d.startsWith("SC1012 a default import of the builtin") && d.includes("TS1259")) }).toEqual({ options, n: 2, all: true });
+    }
+    // No tsconfig: tsc's defaults (module commonjs, no interop) — refused.
+    expect((await refusals({ "main.ts": builtinDefaults })).length).toBe(2);
+  }, 120000);
+
+  const cfg = '{ "version": "1.2.3", "list": [1, 2] }\n';
+  test("MF-02 JSON imports follow Node's import-attribute rules: the program compiles to Node's own load-phase TypeError or link-phase SyntaxError, before any module evaluates", async () => {
+    const cases: Record<string, string>[] = [
+      { "main.ts": 'import c from "./cfg.json";\nconsole.log(c.version);\n' },
+      { "main.ts": 'import c from "./cfg.json" with { type: "text" };\nconsole.log(c.version);\n' },
+      { "main.ts": 'import c from "./cfg.json" with { type: "json", mode: "x" };\nconsole.log(c.version);\n' },
+      { "main.ts": 'import "./side.ts";\nimport c from "./x.js" with { type: "json" };\nconsole.log(c);\n', "x.js": "export default 1;\n", "side.ts": 'console.log("side");\n' },
+      { "main.ts": 'import c from "./c.cjs" with { type: "json" };\nconsole.log(c);\n', "c.cjs": "module.exports = 2;\n" },
+      { "main.ts": 'import * as fs from "node:fs" with { type: "json" };\nconsole.log(typeof fs);\n' },
+      { "main.ts": 'import c from "./x.js" with { type: "javascript" };\nconsole.log(c);\n', "x.js": "export default 1;\n" },
+      { "main.ts": 'import c from "./cfg.json" with { type: "json" };\nimport { get } from "./other.ts";\nconsole.log(c.version, get());\n', "other.ts": 'import c2 from "./cfg.json";\nexport function get(): string { return c2.version; }\n' },
+      { "main.ts": 'import "./side.ts";\nimport { list, version } from "./cfg.json" with { type: "json" };\nconsole.log(version, list);\n', "side.ts": 'console.log("side");\n' },
+      { "main.ts": 'export { default as d } from "./cfg.json";\nconsole.log(1);\n' },
+      { "main.ts": 'import "./cfg.json";\nconsole.log(2);\n' },
+    ];
+    const outcomes: number[] = [];
+    for (const files of cases) outcomes.push((await sameAsNode({ "cfg.json": cfg, ...files })).exitCode);
+    // Every case is one of Node's refusals: nothing runs.
+    expect(outcomes).toEqual(cases.map(() => 1));
+  }, 180000);
+
+  test("MF-03 accepted JSON imports: a TypeScript target ignores attributes, a side-effect import with the attribute loads, and every importer shares the one module object", async () => {
+    expect(await sameAsNode({ "cfg.json": cfg, "x.ts": "export default 7;\n", "main.ts": 'import x from "./x.ts" with { type: "json" };\nimport "./cfg.json" with { type: "json" };\nconsole.log(x);\n' })).toEqual({ stdout: "7\n", exitCode: 0 });
+    expect(
+      await sameAsNode({
+        "cfg.json": cfg,
+        "a.ts": 'import c from "./cfg.json" with { type: "json" };\nc.version = "mutated";\nc.list.push(3);\nexport {};\n',
+        "b.ts": 'import c from "./cfg.json" with { type: "json" };\nconsole.log("b sees", c.version, c.list.length);\nexport {};\n',
+        "main.ts": 'import "./a.ts";\nimport "./b.ts";\nimport c from "./cfg.json" with { type: "json" };\nconsole.log(c.version, c.list.length);\n',
+      }),
+    ).toEqual({ stdout: "b sees mutated 3\nmutated 3\n", exitCode: 0 });
+  }, 120000);
+
+  // SEMANTICS.md S124: a var-like binding of a hot cycle read before its
+  // module ran. Node v24.18.1 prints "b undefined" for the var (and throws
+  // a TypeError reading 'A' of undefined for the enum).
+  const fenceA = 'import { peek } from "./b.ts";\nconsole.log("a start");\nexport var v = 7;\nexport enum E { A = 1 }\nconsole.log(peek());\n';
+  test("MF-04 S124: in a cycle, a `var` or enum read before its module ran ends the program by name (Node reads undefined); read after, both are Node's values", async () => {
+    for (const [read, name, what] of [
+      ["`${v}`", "v", "a var binding"],
+      ["`${E.A}`", "E", "an enum"],
+    ] as const) {
+      const dir = writeTree({
+        "main.ts": 'import { v } from "./a.ts";\nconsole.log("main", v);\n',
+        "a.ts": fenceA,
+        "b.ts": `import { v, E } from "./a.ts";\nexport function peek(): string { return \`\${v} \${E.A}\`; }\nconsole.log("b", ${read});\n`,
+      });
+      try {
+        const res = await buildIn(dir);
+        if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
+        const r = await runWasm(res.binaryPath);
+        expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8").split(dir).join("<D>"), exitCode: r.exitCode }).toEqual({
+          stdout: "",
+          stderr: `tsinter: unsupported: a read of '${name}' (${what}, read by code of an import cycle) before its module ran — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124) [SC1016 at <D>/b.ts:3]\n`,
+          exitCode: 1,
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    expect(
+      await sameAsNode({
+        "main.ts": 'import { v } from "./a.ts";\nconsole.log("main", v);\n',
+        "a.ts": fenceA,
+        "b.ts": 'import { v, E } from "./a.ts";\nexport function peek(): string { return `${v} ${E.A}`; }\nconsole.log("b loaded");\n',
+      }),
+    ).toEqual({ stdout: "b loaded\na start\n7 1\nmain 7\n", exitCode: 0 });
+  }, 120000);
+
+  test("MF-05 imports Node cannot load as modules refuse by name: a bundler asset (any import form, query suffix included); a JSX module is the checker's own error", async () => {
+    const base = { "s.css": ".a{}\n", "logo.svg": "<svg/>\n", "App.tsx": "export default function App() { return 1; }\n" };
+    const diags = await refusals({ ...base, "main.ts": 'import css from "./s.css";\nimport "./s.css";\nimport logo from "./logo.svg?url";\nconsole.log(css, logo);\n' });
+    const assetDiag = (spec: string, ext: string): string =>
+      `SC1010 the '${spec}' import (a '${ext}' file is not a JavaScript module — a bundler loads it; Node refuses it with ERR_UNKNOWN_FILE_EXTENSION) is not supported yet`;
+    expect(diags).toContain(assetDiag("./s.css", ".css"));
+    expect(diags.filter((d) => d === assetDiag("./s.css", ".css")).length).toBe(2);
+    expect(diags).toContain(assetDiag("./logo.svg?url", ".svg"));
+    // A JSX module: the checker's own error names it (for every import
+    // form), and nothing else piles on — no default-import refusal.
+    const jsx = await refusals({ ...base, "main.ts": 'import App from "./App";\nconsole.log(App());\n' });
+    expect(jsx).toEqual(["SC0001 Module './App' was resolved to '<D>/App.tsx', but '--jsx' is not set."]);
+  }, 120000);
+
+  test("MF-06 a star re-export of an installed package the build does not compile names the engine requirement in a static build; `export =` and `import = require` name why Node does not run them", async () => {
+    const pkg = {
+      "node_modules/starpkg/package.json": JSON.stringify({ name: "starpkg", version: "1.0.0", type: "module", main: "index.js", types: "index.d.ts" }),
+      "node_modules/starpkg/index.js": "export const one = 1;\n",
+      "node_modules/starpkg/index.d.ts": "export declare const one: number;\n",
+      "package.json": JSON.stringify({ name: "app", type: "module" }),
+    };
+    expect(await refusals({ ...pkg, "facade.ts": 'export * from "starpkg";\n', "main.ts": 'import { one } from "./facade.ts";\nconsole.log(one);\n' })).toContain(
+      "SC2013 importing 'starpkg' requires the embedded dynamic engine, which this build does not include — the package's implementation runs there",
+    );
+    const cjsForms = await refusals({ "main.ts": 'import os = require("node:os");\nexport const n = 1;\nconsole.log(typeof os);\n' });
+    expect(cjsForms.some((d) => d.startsWith("SC1013 import = require(...) assignments (Node's type stripping refuses them"))).toBe(true);
+  }, 120000);
+
+  test("MF-07 a cycle that evaluates asynchronously — a member awaits at top level, or imports a module that does — keeps the declaration-only bar, named", async () => {
+    const diags = await refusals({
+      "main.ts": 'import { total } from "./a.ts";\nconsole.log(total());\n',
+      "a.ts": 'import "./slow.ts";\nimport { bump } from "./b.ts";\nexport function total(): number {\n  return bump(1);\n}\n',
+      "b.ts": 'import { total } from "./a.ts";\nexport function bump(n: number): number {\n  return n + 1;\n}\nconsole.log(typeof total, bump(2));\n',
+      "slow.ts": "await Promise.resolve();\nexport {};\n",
+    });
+    expect(diags.length).toBe(1);
+    expect(diags[0]).toContain("an async cycle (its evaluation awaits the top-level await at <D>/slow.ts:1) whose top-level code at <D>/b.ts:5 can run user code");
+  }, 120000);
+
+  test("MF-09 S124: a JSON module's default read by a function of a cycle before the JSON module's first request evaluated it fences by name; read after, it is Node's object", async () => {
+    const files = {
+      "cfg.json": cfg,
+      "main.ts": 'import { show } from "./a.ts";\nshow();\n',
+      "a.ts": 'import "./b.ts";\nimport c from "./cfg.json" with { type: "json" };\nexport function show(): void {\n  console.log("show", c.version);\n}\n',
+    };
+    const dir = writeTree({ ...files, "b.ts": 'import { show } from "./a.ts";\nconsole.log("b");\nshow();\n' });
+    try {
+      const res = await buildIn(dir);
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
+      const r = await runWasm(res.binaryPath);
+      // Node v24.18.1 prints "b", then throws TypeError: Cannot read
+      // properties of undefined (reading 'version').
+      expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8").split(dir).join("<D>"), exitCode: r.exitCode }).toEqual({
+        stdout: "b\n",
+        stderr: "tsinter: unsupported: a read of 'c' (a JSON module's default, imported into an import cycle) before the JSON module evaluated — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124) [SC1016 at <D>/a.ts:4]\n",
+        exitCode: 1,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(await sameAsNode({ ...files, "b.ts": 'import { show } from "./a.ts";\nconsole.log("b");\nexport function later(): void {\n  show();\n}\n' })).toEqual({ stdout: "b\nshow 1.2.3\n", exitCode: 0 });
+  }, 120000);
+
+  test("MF-10 S124: a module OUTSIDE the cycle that cycle code reaches before it ran is guarded too — its const is Node's TDZ, and its `var` (Node: NaN from undefined * 2) fences by name", async () => {
+    const files = {
+      "main.ts": 'import { fn } from "./a.ts";\nconsole.log("main", fn());\n',
+      "a.ts": 'import "./b.ts";\nimport { read } from "./util.ts";\nexport function fn(): string { return read(); }\n',
+      "b.ts": 'import { fn } from "./a.ts";\nconsole.log("b", fn());\n',
+    };
+    expect(await sameAsNode({ ...files, "util.ts": 'const K = "five";\nexport function read(): string { return K; }\n' })).toEqual({ stdout: "", exitCode: 1 });
+    const dir = writeTree({ ...files, "util.ts": "var K = 5;\nexport function read(): string { return String(K * 2); }\n" });
+    try {
+      const res = await buildIn(dir);
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
+      const r = await runWasm(res.binaryPath);
+      // Node v24.18.1 prints "b NaN" then "main 10".
+      expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8").split(dir).join("<D>"), exitCode: r.exitCode }).toEqual({
+        stdout: "",
+        stderr: "tsinter: unsupported: a read of 'K' (a var binding, read by code of an import cycle) before its module ran — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124) [SC1016 at <D>/util.ts:2]\n",
+        exitCode: 1,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  test("MF-08 a relative import no file answers (in JavaScript, where the checker does not stop it) compiles to Node's ERR_MODULE_NOT_FOUND startup crash, before any module evaluates", async () => {
+    expect(
+      await sameAsNode({
+        "main.ts": 'import "./side.ts";\nimport { twice } from "./lib.mjs";\nconsole.log(twice(2));\n',
+        "side.ts": 'console.log("side");\nexport {};\n',
+        "lib.mjs": 'import { helper } from "./missing.js";\nexport function twice(n) { return helper(n) * 2; }\n',
+      }),
+    ).toEqual({ stdout: "", exitCode: 1 });
+  }, 120000);
 });

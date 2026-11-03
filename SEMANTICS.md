@@ -9225,3 +9225,100 @@ of its shape, so the merged order would need a reshape at the literal.
 Registered so the divergence is honest until that is built; it has no test
 that pins it as desired. **Tested by:** nothing pins this order; the review
 rows avoid it.
+
+## S124 — Code of an import cycle that reads a `var` binding, an enum or a JSON module's default before its module ran ends the program by name, where Node reads `undefined` *(every lane)*
+
+ES-module import cycles compile whatever their top levels run: the
+guarded `%init` calls reproduce Node's evaluation order (depth-first
+postorder, a module already evaluating is a cache hit), imported bindings
+are live, and every read that can run before its binding initialized is
+guarded — a `let`/`const`/`class` binding or a module's `default` throws
+Node's own catchable `ReferenceError: Cannot access '<name>' before
+initialization`, named as the reading module spells it (an import alias,
+a namespace member's export name). The guarded modules are the cycle's
+own and every module its code can reach before that module ran (Node
+evaluates those inside the cycle's window: a member's not-yet-evaluated
+imports, transitively). A `var` binding, and an enum (Node's transform
+declares it with `var`), have no TDZ: before its declaration ran, Node
+reads `undefined` — the value itself, or a TypeError reading a member of
+it (`E.A`). A `var` whose type holds `undefined` (`var v: T | undefined`)
+holds it here too, from before any module runs, so its early read is
+Node's; for any other `var`, and an enum, no typed slot holds that
+`undefined` (an enum's members fold to constants and its object never
+exists here), so such an early read is
+a run-time fence (S122): `tsinter: unsupported: a read of '<name>' (a var
+binding | an enum, read by code of an import cycle) before its module ran
+… [SC1016 at <file>:<line>]`, exit 1. A JSON module is the same case: it
+evaluates at its first import request, and a function of the cycle that
+reads its default before that request ran reads `undefined` in Node — the
+read fences the same way (`a JSON module's default, imported into an
+import cycle`). A write is not fenced: as in Node it lands, and a later
+read — even one before the declaration ran — sees it; the declaration
+statement overwrites it only when it has an initializer (a `var` with none
+stores nothing, so the written value survives, Node's behavior). Reads
+after the module ran are Node's values.
+
+**Rationale:** the cycles real projects ship (barrel `index.ts` files that
+re-export modules importing the barrel, class hierarchies split across
+files, registries filled at load) are refused whole otherwise; the
+var-like early read is the one residual with no typed representation, and
+it is rare in TypeScript (`export var` is uncommon; an enum read while its
+module is still mid-evaluation is an ordering bug Node reports as a
+TypeError). A runtime namespace in such a cycle refuses at compile time
+instead (SC1016, its members flatten into module globals bound as its body
+runs), and so do cycles with a top-level `await` and cycles evaluated by
+`import()`, which keep the declaration-only admission. **Tested by:** the
+corpus cycle programs 2900–2907 (Node-exact, including uncaught TDZ
+errors); the wasm-differential "module forms" rows pin the fence text and
+exit status for a `var` and an enum read early, and that the same
+programs read late run as Node.
+
+<!-- S125 is reserved for the GH #109 branch. -->
+
+## S126 — A relative import or require resolves the way TypeScript's bundler resolution does, where Node accepts only the exact file *(every lane)*
+
+Node's ESM resolver takes a relative specifier as a URL: the file must
+exist under exactly that name (`ERR_MODULE_NOT_FOUND` otherwise), and a
+directory is `ERR_UNSUPPORTED_DIR_IMPORT`. Its CommonJS `require` tries
+`.js`, `.json` and `.node` and a directory's `package.json` `main` /
+`index.js`, never `.ts`. Here every relative specifier — `import`,
+`export … from`, `require()`, an `import()` of a program module — resolves
+with TypeScript 5's bundler candidates (resolve.ts `loadAsFile` /
+`loadAsDirectory`), so these compile and run where Node refuses the
+program at startup:
+
+- an EXTENSIONLESS specifier (`./util`): `.ts`, `.tsx`, `.d.ts`, `.js`,
+  `.jsx` are tried in that order;
+- a `.js` / `.jsx` specifier naming a TypeScript source (`./util.js` →
+  `util.ts`; `.mjs` → `.mts`, `.cjs` → `.cts`) — and when both `util.js`
+  and `util.ts` exist, the `.ts` wins where Node loads the `.js`;
+- a DIRECTORY (`./lib`): its `package.json` `types` / `typings` / `main`,
+  then `index` with the same extensions.
+
+Inside an opted-in `--npm-static` package, relative edges resolve to the
+shipped JavaScript only, with Node's CommonJS candidates. A relative
+specifier that no candidate answers at all is Node's own startup crash
+(`ERR_MODULE_NOT_FOUND`, the startup-crash channel), and a file that is not
+a module (`./x.css`) refuses by name. **Rationale:** real TypeScript
+projects are written for tsc and bundlers, which accept these spellings;
+the survey's TypeScript repos depend on them throughout (lead ruling, GH
+module-forms review: keep accepting them, register the divergence).
+**Tested by:** the corpus's multi-module programs use exact `.ts`
+specifiers where Node is the oracle; the order-parity baselines pin the
+resolved module order for every corpus and diagnostics entry.
+
+## S127 — A JSON document read through `createRequire`'s `require` is a fresh object at every call, not Node's one cached module shared with its `import` *(every lane)*
+
+Node 24 caches a JSON module once: a second `require` of the same file,
+and an `import … with { type: "json" }` of it, answer the same object, so a
+mutation through one is seen through the others. Here an `import` of a
+JSON module is one shared, typed object (it evaluates once, at its first
+request), but `createRequire(import.meta.url)("./x.json")` parses the
+document's text into a fresh checked-dynamic value at each call: two
+requires, or a require and an import, are distinct objects, and a
+mutation through one is not seen through the other. Reads are Node's.
+**Rationale:** the typed import and the dynamic require value have
+different representations; sharing them needs one object both can view,
+which is not built. The pattern this serves (reading a version or a config
+once) does not mutate. **Tested by:** corpus 2631/2637 (createRequire
+reads); nothing pins the identity.

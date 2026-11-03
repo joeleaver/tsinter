@@ -173,17 +173,19 @@ export const UNSUPPORTED: Record<string, UnsupportedEntry> = {
     hint: "export declarations directly: export function f() {}",
   },
   SC1015: { feature: "dynamic import()", milestone: "M4" },
-  // Benign cycles are ADMITTED (Node runs them as cache hits): cycles of
-  // ES modules whose top levels are declaration-only and whose
-  // cycle-crossing bindings are used only inside function bodies (mutual
-  // recursion, cross-module class references), plus closing edges that
-  // bind nothing readable. SC1016 remains for exactly the cycles where
-  // Node's partial initialization is observable — the message names the
-  // offending binding or top-level statement.
+  // ES-module cycles are ADMITTED whatever their top levels run: Node's
+  // evaluation order, live bindings, and the TDZ ReferenceError of a read
+  // before its module ran (module-tdz.ts's cycle mode; a var-like binding's
+  // early read is a named run-time fence, SEMANTICS.md S124). SC1016
+  // remains for the shapes that is not modeled, each named at its site:
+  // cycles through CommonJS modules or require() edges, a runtime
+  // namespace in a cycle that runs code while it evaluates, and the
+  // async (top-level await) and import()-evaluated cycles, which keep the
+  // declaration-only bar.
   SC1016: {
     feature: "circular imports",
     milestone: "later",
-    hint: "cycles of ES modules with declaration-only top levels whose cycle-crossing bindings are only used inside function bodies compile as-is; move the named top-level read or call into a function body (or break the named edge) so nothing runs during the cycle's init window",
+    hint: "ES-module cycles compile with Node's evaluation order and TDZ errors; the named shape is the part that does not — break the named edge, or move the named top-level code into a function body",
   },
   // Class DECLARATIONS shipped; SC1020's remaining use is class expressions.
   SC1020: { feature: "class expressions", milestone: "later" },

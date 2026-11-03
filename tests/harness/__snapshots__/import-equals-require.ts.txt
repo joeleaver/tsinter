@@ -5,7 +5,7 @@ import-equals-require.ts:4:1 - error SC0001: Import assignment cannot be used wh
     | ^~~~~~~~~~~~~~~~~~~~~~~~~~
   5 | console.log(fs.readFileSync("/dev/null", "utf8"));
 
-import-equals-require.ts:4:1 - error SC1013: import = require(...) assignments are not supported yet
+import-equals-require.ts:4:1 - error SC1013: import = require(...) assignments (Node's type stripping refuses them, and in a file Node loads as an ES module `require` does not exist — they run only under tsc's CommonJS emit) are not supported yet
 
   3 | // alias plumbing and compiles).
   4 | import fs = require("fs");

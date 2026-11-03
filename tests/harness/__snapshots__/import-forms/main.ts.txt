@@ -1,11 +1,20 @@
-import-forms/main.ts:9:8 - error SC1012: default exports/imports are not supported yet
+import-forms/main.ts:9:8 - error SC1012: a default import of the builtin 'node:os' in a project whose compiler options give modules no synthetic default (tsc reports TS1259 there; esModuleInterop, allowSyntheticDefaultImports, a bundler module resolution and module node16/nodenext/preserve all allow it) is not supported yet
 
    8 | import * as helpers from "./helpers.ts";
    9 | import os from "node:os";
      |        ^~
   10 | import * as cfg from "./cfg.json";
 
-  hint: use named exports: export function f() {} / import { f } from "./m"
+  hint: import * as os from "node:os", or enable esModuleInterop in the project's tsconfig
+
+import-forms/main.ts:10:1 - error SC1010: the './cfg.json' import (Node refuses its import attributes: Module "file://import-forms/cfg.json" needs an import attribute of "type: json") is not supported yet
+
+   9 | import os from "node:os";
+  10 | import * as cfg from "./cfg.json";
+     | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  11 | import * as legacy from "./legacy.cjs";
+
+  hint: relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported
 
 import-forms/main.ts:10:8 - error SC1013: namespace imports of JSON modules are not supported yet
 
@@ -21,7 +30,7 @@ import-forms/main.ts:11:8 - error SC1013: namespace imports of CommonJS modules 
      |        ^~~~~~~~~~~
   12 | 
 
-import-forms/main.ts:15:1 - error SC1014: re-exports from packages or builtin modules are not supported yet
+import-forms/main.ts:15:1 - error SC1014: star and namespace re-exports of builtin modules are not supported yet
 
   14 | // the STAR form still has no lowering — no namespace object to rebuild.
   15 | export * from "node:child_process";

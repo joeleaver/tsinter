@@ -1,0 +1,5 @@
+{
+  "name": "svc",
+  "retries": 3,
+  "tags": ["a", "b"]
+}
