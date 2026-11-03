@@ -170,6 +170,8 @@ interface DynSite extends Site {
   /** An out-crossing into a sequence expression's own temporary: the
    * sequence node, outside which the copy is never read. */
   scope?: unknown;
+  /** The crossing's own IR node (the dynamic copy, for an in-crossing). */
+  node: IrExpr;
 }
 
 /** Does a function body hold a dynamic crossing of a composite or a
@@ -221,9 +223,9 @@ const isComposite = (t: IrType | undefined): boolean =>
  * argument and hands back a copy of a composite result (its call thunk).
  * JavaScript shares the object at every one of them. They are judged here
  * as one more kind of copy, with the width copies' write, identity and
- * ordering machinery. The dynamic side is ONE type, so a write to any
- * dynamic value counts as a write to every dynamic copy, unless the copy's
- * own binding is only read. What can write a dynamic value: the keyed
+ * ordering machinery. On the dynamic side a write counts when its receiver
+ * may be the copy (or the value a copy was taken from: dynAliasClasses),
+ * unless the copy's own binding is only read. What can write a dynamic value: the keyed
  * write, Object.assign/defineProperty onto one, the mutating array methods
  * through dynamic dispatch, island property writes and method calls, and
  * every write the program's own functions make (a boxed program function
@@ -786,7 +788,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const { refs, fns } = refsOf(v.type);
         if (refs.length === 0 && fns.length === 0) return;
         dynSites.push({
-          dir: "in", callee: "%dyn.from", arg: v, t: v.type, loc, where: curFn, top: curTop,
+          dir: "in", callee: "%dyn.from", arg: v, t: v.type, loc, where: curFn, top: curTop, node: r as unknown as IrExpr,
           dest: destOf(parent, pkey, r), consumed: stack.length > 0 && dynUseAt(stack.length - 1, true) === "ro",
         });
         return;
@@ -796,7 +798,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const { refs, fns } = refsOf(t);
         if (refs.length === 0 && fns.length === 0) return;
         dynSites.push({
-          dir: "out", callee: "%dyn.check", arg: r["value"] as IrExpr, t, loc, where: curFn, top: curTop,
+          dir: "out", callee: "%dyn.check", arg: r["value"] as IrExpr, t, loc, where: curFn, top: curTop, node: r as unknown as IrExpr,
           dest: destOf(parent, pkey, r), consumed: consumedAt(stack.length - 1, t), atReturn: atReturn(stack.length - 1),
           scope: parent?.["kind"] === "varDecl" && pkey === "init" && stack.length >= 2 && stack[stack.length - 2]![0]["kind"] === "seqExpr" &&
             stack[stack.length - 2]![1] === "stmts" ? stack[stack.length - 2]![0] : undefined,
@@ -1448,6 +1450,366 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   }
   judgeDynSites();
 
+  /** Which dynamic values may be the same object: a unification
+   * (Steensgaard-style, flow- and field-insensitive) over the program's
+   * dynamic values. Bindings, parameters, results, the dynamic fields of
+   * typed values, and every value built fresh are nodes; an assignment, an
+   * argument, a return, a capture, a store into a dynamic container (a
+   * keyed write, a push) or a read out of one (a member, an element) puts
+   * both sides in one class. Everything the analysis does not follow — a
+   * dynamic call, a runtime function that is not a known reader or writer,
+   * a throw, the parameters and results of functions used as values, any
+   * expression kind not modelled here — meets in one UNKNOWN class. A copy
+   * is a fresh node of its own; a crossing never joins the two sides (that
+   * is what a copy is), except through the dynamic fields of the typed
+   * value, which are shared. */
+  function dynAliasClasses(): { same: (a: IrExpr, fa: string, b: IrExpr, fb: string) => boolean } {
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let r = x;
+      while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+      let c = x;
+      while (c !== r) {
+        const n = parent.get(c)!;
+        parent.set(c, r);
+        c = n;
+      }
+      return r;
+    };
+    const union = (a: string, b: string): void => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent.set(ra, rb);
+    };
+    const UNKNOWN = "\0unknown";
+    let fresh = 0;
+    const nodeOf = new Map<unknown, string>();
+    const isDyn = (e: IrExpr | undefined): boolean => e !== undefined && isDynType(e.type);
+    /** The nodes of the dynamic fields a typed value of type `t` carries. */
+    const dynFields = (t: IrType, out: string[] = [], seen = new Set<string>()): string[] => {
+      const k = tkey(t);
+      if (seen.has(k)) return out;
+      seen.add(k);
+      if (t.kind === "record") {
+        const sh = L.shapes.get(t.shapeId);
+        for (const f of sh?.fields ?? []) {
+          if (isDynType(f.type)) out.push(`r:${t.shapeId}:${f.name}`);
+          else dynFields(f.type, out, seen);
+        }
+        if (sh?.indexValue) {
+          if (isDynType(sh.indexValue)) out.push(`r:${t.shapeId}:*`);
+          else dynFields(sh.indexValue, out, seen);
+        }
+      } else if (t.kind === "object") {
+        for (let c = L.classes.get(t.className); c; c = c.base ?? undefined) {
+          for (const [n, ft] of c.fields) {
+            if (isDynType(ft)) out.push(`o:${rootOf(t.className)}:${n}`);
+            else dynFields(ft, out, seen);
+          }
+        }
+      } else if (t.kind === "union") {
+        for (const a of L.unions.get(t.unionId)?.arms ?? []) dynFields(a, out, seen);
+      } else if (t.kind === "array" || t.kind === "map" || t.kind === "set" || t.kind === "promise") {
+        const inner = t.kind === "array" ? t.elem : t.kind === "map" ? t.value : t.kind === "set" ? t.elem : t.inner;
+        if (isDynType(inner)) out.push(`c:${k}`);
+        else dynFields(inner, out, seen);
+      }
+      return out;
+    };
+    const fieldNode = (e: Record<string, unknown>): string | null => {
+      const k = e["kind"];
+      if (k === "recordGet" || k === "recordSet") return `r:${e["shapeId"] as string}:${e["field"] as string}`;
+      if (k === "recordKeyGet" || k === "recordKeySet") return `r:${e["shapeId"] as string}:*`;
+      if (k === "fieldGet" || k === "fieldSet") return `o:${rootOf(e["className"] as string)}:${e["field"] as string}`;
+      return null;
+    };
+    const paramKey = (callee: string, i: number): string | null => {
+      const f = byName.get(callee);
+      const p = f?.params[i];
+      return p ? bkey(callee, p.localId) : null;
+    };
+    /** The node of a dynamic expression (evaluating it for its effects). */
+    const node = (e: IrExpr, fn: string): string => {
+      const memo = nodeOf.get(e);
+      if (memo !== undefined) return memo;
+      const r = e as unknown as Record<string, unknown>;
+      let n: string;
+      switch (e.kind) {
+        case "varRef":
+          n = bkey(fn, e.localId);
+          break;
+        case "dynKeyGet":
+          walk(e.key, fn, null);
+          n = node(e.value, fn);
+          break;
+        case "dynDestrCheck":
+          n = node(e.value, fn);
+          break;
+        case "ternary":
+          walk(e.cond, fn, null);
+          n = node(e.then, fn);
+          union(n, node(e.else_, fn));
+          break;
+        case "logical":
+        case "nullish":
+        case "orDefault": {
+          const l = r["left"] as IrExpr;
+          const rt = r["right"] as IrExpr;
+          n = isDyn(l) ? node(l, fn) : `\0f${fresh++}`;
+          if (!isDyn(l)) walk(l, fn, null);
+          if (isDyn(rt)) union(n, node(rt, fn));
+          else walk(rt, fn, null);
+          break;
+        }
+        case "seqExpr":
+          walk(e.stmts, fn, null);
+          n = node(e.result, fn);
+          break;
+        case "dynFrom": {
+          // A copy: a node of its own, sharing only the typed value's
+          // dynamic fields.
+          n = `\0f${fresh++}`;
+          walk(e.value, fn, null);
+          for (const f of dynFields(e.value.type)) union(n, f);
+          break;
+        }
+        case "dynArrLit":
+          n = `\0f${fresh++}`;
+          for (const x of e.elems) {
+            if (isDyn(x)) union(n, node(x, fn));
+            else walk(x, fn, null);
+          }
+          break;
+        case "dynObjLit":
+          n = `\0f${fresh++}`;
+          for (const f of e.fields ?? []) {
+            walk(f.key, fn, null);
+            if (isDyn(f.value)) union(n, node(f.value, fn));
+            else walk(f.value, fn, null);
+          }
+          break;
+        case "call": {
+          if (PASS_THROUGH.test(e.callee) && e.args[0] && isDyn(e.args[0])) {
+            n = node(e.args[0], fn);
+            for (const a of e.args.slice(1)) walk(a, fn, null);
+            break;
+          }
+          walk(r, fn, null, true);
+          n = byName.has(e.callee) ? `\0ret:${e.callee}` : UNKNOWN;
+          break;
+        }
+        case "libCall":
+          if (DYN_FRESH_LIB.test(e.fn)) {
+            walk(e.args, fn, null);
+            n = `\0f${fresh++}`;
+          } else if (DYN_READER.test(e.fn) || PURE_LIB.test(e.fn)) {
+            // A reader answers its argument or a part of it.
+            n = `\0f${fresh++}`;
+            for (const a of e.args) {
+              if (isDyn(a)) union(n, node(a, fn));
+              else walk(a, fn, null);
+            }
+          } else {
+            walk(r, fn, null, true);
+            n = UNKNOWN;
+          }
+          break;
+        case "dynInvoke":
+          walk(r, fn, null, true);
+          n = node(e.recv, fn);
+          break;
+        case "recordGet":
+        case "recordKeyGet":
+        case "fieldGet": {
+          walk(r, fn, null, true);
+          n = fieldNode(r) ?? UNKNOWN;
+          break;
+        }
+        default:
+          walk(r, fn, null, true);
+          n = UNKNOWN;
+      }
+      nodeOf.set(e, n);
+      return n;
+    };
+    /** Walks `x` for its flows; `into` names the node a dynamic value found
+     * here flows to (null: it escapes, unless its parent is modelled).
+     * `children`: walk only the children of the kinded node `x`. */
+    function walk(x: unknown, fn: string, into: string | null, children = false): void {
+      if (x === null || typeof x !== "object") return;
+      if (Array.isArray(x)) {
+        for (const y of x) walk(y, fn, into);
+        return;
+      }
+      const r = x as Record<string, unknown>;
+      const k = r["kind"];
+      if (typeof k !== "string") {
+        for (const key of Object.keys(r)) if (key !== "type" && key !== "loc" && key !== "name") walk(r[key], fn, into);
+        return;
+      }
+      const e = r as unknown as IrExpr;
+      if (!children && r["type"] !== undefined && isDynType(r["type"] as IrType)) {
+        const n = node(e, fn);
+        union(n, into ?? UNKNOWN);
+        return;
+      }
+      const sub = (key: string, to: string | null): void => walk(r[key], fn, to);
+      switch (k) {
+        case "varDecl":
+          sub("init", bkey(fn, r["localId"] as string));
+          return;
+        case "assign":
+        case "assignExpr":
+          sub("value", bkey(fn, r["localId"] as string));
+          return;
+        case "return":
+          sub("value", `\0ret:${fn}`);
+          return;
+        case "exprStmt": {
+          const ex = r["expr"] as IrExpr;
+          if (isDynType(ex.type)) node(ex, fn);
+          else walk(ex, fn, null);
+          return;
+        }
+        case "call": {
+          const callee = r["callee"] as string;
+          const args = r["args"] as IrExpr[];
+          args.forEach((a, i) => walk(a, fn, byName.has(callee) ? paramKey(callee, i) : null));
+          return;
+        }
+        case "closure": {
+          const g = byName.get(r["fnName"] as string);
+          ((r["captures"] as string[] | undefined) ?? []).forEach((c, i) => {
+            const gc = g?.captures?.[i];
+            if (gc) union(bkey(fn, c), bkey(g!.name, gc.localId));
+            else union(bkey(fn, c), UNKNOWN);
+          });
+          return;
+        }
+        case "recordLit": {
+          const shapeId = (r["type"] as IrType & { shapeId?: string }).shapeId;
+          for (const f of (r["fields"] as { name: string; value: IrExpr }[]) ?? []) {
+            walk(f.value, fn, shapeId !== undefined ? `r:${shapeId}:${f.name}` : null);
+          }
+          return;
+        }
+        case "recordSet":
+        case "recordKeySet":
+        case "fieldSet": {
+          const fnode = fieldNode(r);
+          for (const key of Object.keys(r)) {
+            if (key === "type" || key === "loc") continue;
+            walk(r[key], fn, key === "value" ? fnode : null);
+          }
+          return;
+        }
+        case "dynCheck":
+          // A copy out: the typed value shares only its dynamic fields.
+          {
+            const v = r["value"] as IrExpr;
+            const n = node(v, fn);
+            for (const f of dynFields(r["type"] as IrType)) union(n, f);
+          }
+          return;
+        case "dynTest":
+        case "dynHasKey":
+        case "jsonStringify":
+        case "dynScalarEq":
+        case "dynIterN":
+          // Readers.
+          for (const key of Object.keys(r)) {
+            if (key === "type" || key === "loc") continue;
+            const v = r[key];
+            if (v && typeof v === "object" && !Array.isArray(v) && isDynType((v as IrExpr).type)) node(v as IrExpr, fn);
+            else walk(v, fn, null);
+          }
+          return;
+        case "intrinsic":
+          if (/^console\./.test(r["name"] as string)) {
+            for (const a of r["args"] as IrExpr[]) {
+              if (isDynType(a.type)) node(a, fn);
+              else walk(a, fn, null);
+            }
+            return;
+          }
+          break;
+        case "libCall": {
+          const lf = r["fn"] as string;
+          const args = r["args"] as IrExpr[];
+          if (DYN_WRITER.test(lf) && args[0] && isDynType(args[0].type)) {
+            // A store into the first argument.
+            const t = node(args[0], fn);
+            for (const a of args.slice(1)) {
+              if (isDynType(a.type)) union(t, node(a, fn));
+              else walk(a, fn, null);
+            }
+            return;
+          }
+          if (DYN_READER.test(lf) || PURE_LIB.test(lf)) {
+            for (const a of args) {
+              if (isDynType(a.type)) node(a, fn);
+              else walk(a, fn, null);
+            }
+            return;
+          }
+          break;
+        }
+        case "dynInvoke": {
+          const m = r["method"] as string;
+          const recv = node(r["recv"] as IrExpr, fn);
+          const args = r["args"] as IrExpr[];
+          if (DYN_MUTATING.has(m) || DYN_IDENTITY.has(m) || m === "join" || m === "slice" || m === "at" || m === "concat") {
+            // Elements stored into (or read out of) the receiver.
+            for (const a of args) {
+              if (isDynType(a.type)) union(recv, node(a, fn));
+              else walk(a, fn, null);
+            }
+            return;
+          }
+          if (/^(forEach|map|filter|some|every|find|findIndex)$/.test(m)) {
+            // The callback's parameters receive the elements (and the
+            // receiver itself); its result joins the receiver's class.
+            for (const a of args) {
+              const g = a.kind === "dynFrom" && a.value.kind === "closure" ? byName.get(a.value.fnName) : undefined;
+              if (g) {
+                walk((a as IrExpr & { kind: "dynFrom" }).value, fn, null);
+                for (const p of g.params) if (isDynType(p.type)) union(recv, bkey(g.name, p.localId));
+                union(recv, `\0ret:${g.name}`);
+              } else if (isDynType(a.type)) union(node(a, fn), UNKNOWN), union(recv, UNKNOWN);
+              else walk(a, fn, null);
+            }
+            return;
+          }
+          union(recv, UNKNOWN);
+          for (const a of args) walk(a, fn, null);
+          return;
+        }
+        default:
+          break;
+      }
+      for (const key of Object.keys(r)) {
+        if (key === "type" || key === "loc") continue;
+        walk(r[key], fn, null);
+      }
+    }
+    for (const f of functions) {
+      // A function used as a value is called by code this walk does not
+      // follow: its dynamic parameters and its result meet UNKNOWN.
+      if (valueFns.has(f.name)) {
+        for (const p of f.params) if (isDynType(p.type)) union(bkey(f.name, p.localId), UNKNOWN);
+        union(`\0ret:${f.name}`, UNKNOWN);
+      }
+      walk(f.body, f.name, null);
+    }
+    return {
+      same: (a, fa, b, fb) => {
+        const na = node(a, fa);
+        const nb = node(b, fb);
+        return find(na) === find(nb);
+      },
+    };
+  }
+
   /** S125 (c): every dynamic crossing the program could observe refuses
    * by name. */
   function judgeDynSites(): void {
@@ -1549,14 +1911,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       while (v && v.kind === "dynKeyGet") v = unwrap(v.value);
       return v?.kind === "varRef" ? bkey(fn, v.localId) : null;
     };
+    const alias = dynAliasClasses();
     /** Is a dynamic value written where a copy taken at `site` could still
      * be held (`during`: only in these functions)? The width copies'
      * ordering rule: an earlier top-level statement of the same module
      * initializer has already run. A write to the own members of a
      * fresh-rooted binding counts only for a copy taken OUT of that
-     * binding's value (`outOf`). */
-    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null): boolean =>
+     * binding's value (`outOf`). With `value` (the copy, or the value a
+     * copy was taken from), only a write whose receiver may be that value
+     * counts (dynAliasClasses). */
+    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null, value: { e: IrExpr; fn: string } | null = null): boolean =>
       dynWrites.some((w) => {
+        if (value !== null && w.recv !== null && !alias.same(w.recv, w.fn, value.e, value.fn)) return false;
         if (freshRooted(w.recv, w.fn) && !(outOf !== null && rootKey(w.recv, w.fn) === outOf)) return false;
         if (during === null) return !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top);
         if (during instanceof Set) return during.has(w.fn);
@@ -1776,7 +2142,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // lost to it, and a write to it (or to anything inside it) is
           // lost to the copy.
           const destRO = dynDestReadOnly(s);
-          if (!destRO && dynWritten(s, null)) why = DYN_WRITE_TO;
+          if (!destRO && dynWritten(s, null, null, { e: s.node, fn: s.where })) why = DYN_WRITE_TO;
           else if (anyWritten(sole ? refs.filter((r) => tkey(r) !== tkey(s.t)) : refs, s)) why = ORIG_WRITTEN;
           else if (!destRO && dynIdentity) why = DYN_SAME;
         }
@@ -1788,7 +2154,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // lives in (and what that can call) runs, unless it suspends.
           const window = copyWindow(s);
           if (typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
-          else if (dynWritten(s, window, rootKey(s.arg, s.where))) why = DYN_WRITE_FROM;
+          else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) why = DYN_WRITE_FROM;
           else if (anyIdentity(refs)) why = COPY_IDENTITY;
         }
       }

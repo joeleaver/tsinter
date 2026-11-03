@@ -9429,17 +9429,24 @@ where JavaScript shares the object, and …") when the program could tell:
 - a write through the copy, or a write to the original (or anything a
   deep copy copied from it) while the copy is still held;
 - an identity test on the copy's type, or between dynamic values;
-- for a dynamic side, any write to a dynamic value counts (they are one
-  type), except a write to the own members of a binding that holds a
-  value built fresh (`JSON.parse`, a dynamic literal) — that object is no
-  copy — and except where the copy's binding is read at once (tested,
-  printed, a scalar read off it). Writes are the keyed write,
-  `Object.assign`/`defineProperty` onto a dynamic value, the mutating array
-  methods through dynamic dispatch, and every write the program's own
-  functions make. Without `--dynamic` a dynamic call reaches only boxed
-  program functions (whose writes are noted where they are) and runtime
-  methods that read their arguments; with it, handing a dynamic value to a
-  dynamic call counts as a write.
+- on a dynamic side, a write counts when its receiver may be the copy
+  (an in-crossing) or the value a copy was taken from (an out-crossing).
+  "May be" is a unification over the program's dynamic values: bindings,
+  parameters, results and the dynamic fields of typed values join one
+  class through assignment, argument passing, returns, captures, stores
+  into a dynamic container and reads out of one; whatever the analysis
+  does not follow (a dynamic call, a runtime function that is not a known
+  reader or writer, a throw, the parameters and results of functions used
+  as values, any other expression) meets in one shared unknown class. A
+  write to the own members of a binding that holds a value built fresh
+  (`JSON.parse`, a dynamic literal) and never hands it anywhere changes no
+  copy, unless the copy was checked out of that very value. Writes are the
+  keyed write, `Object.assign`/`defineProperty` onto a dynamic value, the
+  mutating array methods through dynamic dispatch, and every write the
+  program's own functions make. Without `--dynamic` a dynamic call reaches
+  only boxed program functions (whose writes are noted where they are) and
+  runtime methods that read their arguments; with it, handing a dynamic
+  value to a dynamic call counts as a write.
 
 Not observable, so they run: a crossing of a value nothing else holds
 (a literal all the way down, `JSON.parse(text) as T`, a binding used only

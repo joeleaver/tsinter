@@ -270,6 +270,16 @@ out.push("c");
 console.log(out);`,
   },
   {
+    // A write to a dynamic value the copy can never be.
+    id: "ok-unrelated-dyn-write",
+    src: `const r = { n: 1 };
+const u: unknown = r;
+const other: any = JSON.parse('{"m":1}');
+const alias = other;
+alias.m = 2;
+console.log(u, other, r.n);`,
+  },
+  {
     id: "ok-parse-member-cast",
     src: `const doc: any = JSON.parse('{"items":[1,2],"name":"n"}');
 const items = doc.items as number[];
