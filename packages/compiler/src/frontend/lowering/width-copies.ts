@@ -1775,8 +1775,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
                 walk((a as IrExpr & { kind: "dynFrom" }).value, fn, null);
                 for (const p of g.params) if (isDynType(p.type)) union(recv, bkey(g.name, p.localId));
                 union(recv, `\0ret:${g.name}`);
-              } else if (isDynType(a.type)) union(node(a, fn), UNKNOWN), union(recv, UNKNOWN);
-              else walk(a, fn, null);
+              } else if (isDynType(a.type)) {
+                union(node(a, fn), UNKNOWN);
+                union(recv, UNKNOWN);
+              } else walk(a, fn, null);
             }
             return;
           }
