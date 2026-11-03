@@ -1,7 +1,9 @@
 # Cloud environment probe (Claude Code on the web)
 
 First trial of running tsinter's heavy testing in a cloud session instead of the
-shared laptop. Probed on 2026-11-03 at main `d844ab9`; branch `cloud/lint-probe`.
+shared laptop. Probed on 2026-11-03 at main `d844ab9`. The test runs below are on that base plus the lint fix. `main` moved to
+`a3e7b78` during the probe, so the branch `cloud/lint-probe` is rebased onto it, and lint, build, `tsc --noEmit`
+and the non-harness suite were re-run on the rebased tree (section 3).
 Everything below was run in the session; times are wall-clock.
 
 ## Verdict
@@ -11,9 +13,9 @@ Everything below was run in the session; times are wall-clock.
 | wasm census (`wasm-differential.test.ts`) | **yes** | `scripts/cloud-setup.sh` (Node 24.18.1 + pnpm). 1132/1135 claimed, same as the laptop. 10m46s with 4 workers. 4 row failures come from the container (no IPv6). Two child-process ordering rows (U3-ORD-01, U3-BIG-01) also fail **on main**, while Node orders them correctly here, so they are a real divergence that this slower box exposes. See below |
 | non-harness suite (`vitest run packages`) | **yes** | clang 21 on PATH (some package tests call `clang`). 3 failures, all `fs-errno-rows` because the container runs as root. They pass as `nobody`. ~12 min |
 | wasm-native tests | **yes** | clang 21.1.8 from the LLVM GitHub release (apt.llvm.org is blocked), `/usr/bin/time`, and run in a bare environment (`cleanenv`). Differential: 1132/1135 claimed, **1136/1136 passed** (12m19s). Host rows: 245/252. 5 failures come from the environment and pass once it is fixed, and 2 TLS-hint rows still fail in a bare environment (see below) |
-| full run (`SCRIPTC_NO_CACHE=1 npx vitest run`) | RESULT_FULL_VERDICT | everything above |
+| full run (`SCRIPTC_NO_CACHE=1 npx vitest run`) | **yes** | everything above. **33.5 min** on 4 cores (laptop ≈30). 7930 passed, 14 failed. Every failure is one of the rows classified in this doc |
 | survey re-runs | **yes, with two changes** | `SURVEY_MEMMAX=0` (no systemd) and `@types/node` pre-seeded into `$SURVEY_CACHE/node-types` (`SURVEY=1 scripts/cloud-setup.sh`) |
-| **pushing results** | **blocked in this session** | `git push` to `joeleaver/tsinter` got HTTP 403 for every branch (see "Git push") |
+| **pushing results** | **blocked in this session** | `git push` and the GitHub connector both got HTTP 403 for joeleaver/tsinter (see "Git push"). Fix: install the Claude GitHub App on the repo with Contents write, then reconnect GitHub in claude.ai |
 
 The constraints that shape all of this:
 
@@ -40,7 +42,7 @@ The constraints that shape all of this:
 | RAM | 15.7 GiB, no swap |
 | Disk | 30 GB available for the session (`/` reports 252 GB, but the per-session allowance is what counts) |
 | OS | Ubuntu 24.04.5 LTS, kernel 6.18 (Firecracker VM) |
-| Long processes | Detached `nohup setsid` jobs ran unattended: census, wasm-native and host rows back to back (31 min), then the full run (RESULT_LONGEST). Between turns, while idle, the VM rebooted once (see above) |
+| Long processes | Detached `nohup setsid` jobs ran unattended: census, wasm-native and host rows back to back (31 min), then the full run (33.5 min), 65 min in all with no intervention. Between turns, while idle, the VM rebooted once (see above) |
 
 ## 2. Toolchain
 
@@ -90,6 +92,19 @@ All 3 failures are in `packages/compiler/test/fs-errno-rows.test.ts`, and the ca
 container runs as root, and the test asserts the uid class the committed rows were generated under
 (`committed file was generated under uid class "non-root"; this run is "root"`). Run as `nobody`
 (`runuser -u nobody -- … vitest run packages/compiler/test/fs-errno-rows.test.ts`), the file passes 16/16.
+
+**On the rebased branch** (`a3e7b78` + lint fix; the conflict in `lower-calls.ts` was only the import line, which
+keeps main's new `afterArgs, evaluateArgsFirst` and drops `slotUndefOf, undefElse`): main has the same 56 lint
+errors, and after the fix lint reports **0**, the build passes (67 s), and `tsc --noEmit` passes for the compiler
+and the cli. The non-harness suite under `env -i`:
+
+```
+ Test Files  1 failed | 143 passed (144)
+      Tests  3 failed | 4593 passed | 24 skipped (4620)
+   Duration  730.86s
+```
+
+The 3 failures are the same root-only `fs-errno-rows` tests.
 
 ### wasm census
 
@@ -177,7 +192,28 @@ as cloud noise.
 
 ### Full run
 
-RESULT_FULL
+`SCRIPTC_NO_CACHE=1 SCRIPTC_TEST_WORKERS=4 npx vitest run` from the repo root (4 is all the cores here, so this is
+the default run), detached, with clang 21.1.8 and `time` installed but without `cleanenv`:
+
+```
+ Test Files  3 failed | 167 passed (170)
+      Tests  14 failed | 7930 passed | 29 skipped (7973)
+   Duration  2008.74s
+```
+
+| file | failures | which |
+|---|---|---|
+| wasm-differential | 6 | N1-ERR-02, N1-ERR-03, N1-REG-01, U4-R-03 (no IPv6); U3-BIG-01 (the ordering gap above; U3-ORD-01 passed this time); **U1-RES-01** |
+| wasmnative-host-rows | 5 | N1-ERR-03 and the IPv6 notes row (no IPv6); proxy-optin (`NO_PROXY`); U4-R-10 and SECURITY 2-3 (the unresolved CA hint) |
+| fs-errno-rows | 3 | root |
+
+U1-RES-01 is new in this run. Its `trapped` case (a `spawnSync` timeout on a shell that traps the signal and keeps
+writing) gave `status=4 signal=null` where Node gives `status=null signal=SIGPIPE`. It is the same case that
+failed host row U1-RUN-06 once. Both rows passed in the other runs, so this case is a timing flake here: whether
+the shell dies of SIGPIPE or exits first depends on the race.
+
+Every failure is classified. None points to the lint change: the ones that are not environmental (U3-ORD-01,
+U3-BIG-01) fail the same way on untouched `main`.
 
 ## 4. Survey
 
@@ -213,7 +249,10 @@ RESULT_FULL
 your organization. An org admin can install the Claude GitHub App …". Pushing to the session's own assigned branch
 was refused the same way, so the block is not about the branch name. Reads worked: `git ls-remote`, and reading
 issue #115 through the GitHub connector. Before cloud sessions can hand results back, the owner needs to install
-the Claude GitHub App on joeleaver/tsinter or reconnect GitHub in claude.ai settings. RESULT_PUSH
+the Claude GitHub App on joeleaver/tsinter or reconnect GitHub in claude.ai settings. The GitHub connector was refused as well: `create_branch` for `cloud/lint-probe` returned
+`403 Resource not accessible by integration`. **Nothing can be written to GitHub from this session**, by git or
+by API. The branch is committed in the session's checkout, ready to push once access is fixed. The files were also
+handed to the user as attachments, along with a `git am` patch series against `a3e7b78`.
 
 ## 6. Setup script
 
