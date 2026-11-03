@@ -254,6 +254,11 @@ the Claude GitHub App on joeleaver/tsinter or reconnect GitHub in claude.ai sett
 by API. The branch is committed in the session's checkout, ready to push once access is fixed. The files were also
 handed to the user as attachments, along with a `git am` patch series against `a3e7b78`.
 
+**Resolved later in the session:** after the owner connected the Claude GitHub App to the repo (with Contents
+write) and reconnected GitHub in claude.ai, `git push -u origin cloud/lint-probe` succeeded with no other change. The
+container did not need a restart. A future cloud session that finds `git push` refused with "Claude doesn't have
+GitHub access … for your organization" needs the same fix.
+
 ## 6. Setup script
 
 `scripts/cloud-setup.sh` reproduces the working toolchain from a fresh clone: Node 24.18.1 (checksum-verified),
