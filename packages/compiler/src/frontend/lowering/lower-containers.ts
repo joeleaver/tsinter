@@ -881,9 +881,11 @@ function lowerOptionalDefaultArg(
     const { fnArg, arity } = hofCallbackArg(L, argNode, [snapshotElem], arrayOf(snapshotElem));
     const fnRet = fnArg.type.ret;
     if (fnRet.kind === "void" || fnRet.kind === "func") L.badType(call, L.typeOf(call));
-    if (arity >= 3) {
-      // The third parameter is the tuple itself in Node; here it would be
-      // a fresh array a write could tell from the tuple.
+    // The third parameter is the tuple itself in Node; here it is a fresh
+    // array of the positions, built just before each call. GH #122: that
+    // is exact when the callback can only read it while it still equals
+    // the tuple (tupleArrayParamReadOnly); otherwise refused by name.
+    if (arity >= 3 && !tupleArrayParamReadOnly(L, argNode)) {
       L.noLowering(
         `${L.checker.typeToString(L.typeOf(access.expression))}.map with a callback that takes the array`,
         argNode,
@@ -904,13 +906,17 @@ function lowerOptionalDefaultArg(
       { kind: "varDecl", localId: tmpF.id, init: fnArg, loc },
       { kind: "varDecl", localId: tmpOut.id, init: { kind: "arrayLit", elems: [], type: outT, loc }, loc },
     ];
-    byIndex.forEach((f, k) => {
+    const position = (f: (typeof byIndex)[number]): IrExpr => {
       const read: IrExpr = { kind: "recordGet", obj: tRef, shapeId: receiverIr.shapeId, field: f.name, type: f.type, loc };
-      const value = typeEquals(f.type, snapshotElem) ? read : L.coerceInto(access.expression, read, snapshotElem);
+      return typeEquals(f.type, snapshotElem) ? read : L.coerceInto(access.expression, read, snapshotElem);
+    };
+    byIndex.forEach((f, k) => {
+      const value = position(f);
+      const live: IrExpr = { kind: "arrayLit", elems: byIndex.map(position), type: arrayOf(snapshotElem), loc };
       const called: IrExpr = {
         kind: "callValue",
         callee: { kind: "varRef", localId: tmpF.id, type: fnArg.type, loc },
-        args: ([value, { kind: "numLit", value: k, type: F64, loc }] as IrExpr[]).slice(0, arity),
+        args: ([value, { kind: "numLit", value: k, type: F64, loc }, live] as IrExpr[]).slice(0, arity),
         type: fnRet,
         loc,
       };
@@ -922,6 +928,102 @@ function lowerOptionalDefaultArg(
     });
     return { kind: "seqExpr", stmts, result: { kind: "varRef", localId: tmpOut.id, type: outT, loc }, type: outT, loc };
   }
+
+/** GH #122: a tuple map callback `(v, i, arr) => ...` receives a fresh
+ * array of the tuple's positions in place of the tuple. That is exact while
+ * the callback can only READ `arr`, and only while the reads still equal
+ * the tuple:
+ *   - `arr.length` anywhere (a tuple's length is fixed);
+ *   - `arr[e]` (not a write target) only when nothing in the callback can
+ *     write the tuple: no calls, `new`, tagged templates, await/yield,
+ *     delete, `this`, nested functions, and every other identifier the
+ *     body reads is a primitive (so no object, the tuple included, is in
+ *     reach, and no conversion runs program code).
+ * Any other use of `arr` (passing it, storing it, comparing it, writing
+ * through it, a closure over it) keeps the refusal. */
+function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
+  if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return false;
+  if (fn.parameters.length !== 3) return false;
+  const p = fn.parameters[2]!;
+  if (!ts.isIdentifier(p.name) || p.initializer || p.dotDotDotToken) return false;
+  const sym = L.checker.getSymbolAtLocation(p.name);
+  if (!sym) return false;
+  const isArr = (n: ts.Node): boolean => ts.isIdentifier(n) && n !== p.name && L.checker.getSymbolAtLocation(n) === sym;
+  const K = ts.SyntaxKind;
+  const ASSIGN_OPS = new Set<ts.SyntaxKind>([
+    K.EqualsToken, K.PlusEqualsToken, K.MinusEqualsToken, K.AsteriskEqualsToken, K.AsteriskAsteriskEqualsToken,
+    K.SlashEqualsToken, K.PercentEqualsToken, K.LessThanLessThanEqualsToken, K.GreaterThanGreaterThanEqualsToken,
+    K.GreaterThanGreaterThanGreaterThanEqualsToken, K.AmpersandEqualsToken, K.BarEqualsToken, K.CaretEqualsToken,
+    K.AmpersandAmpersandEqualsToken, K.BarBarEqualsToken, K.QuestionQuestionEqualsToken,
+  ]);
+  /** A write position: an assignment's left side (through a destructuring
+   * pattern's literals), an increment, a delete operand, a for-in/of head. */
+  const writeTarget = (n: ts.Node): boolean => {
+    let top: ts.Node = n;
+    for (;;) {
+      const q = top.parent;
+      if (ts.isParenthesizedExpression(q) || ts.isNonNullExpression(q) || ts.isArrayLiteralExpression(q) ||
+        ts.isObjectLiteralExpression(q) || ts.isPropertyAssignment(q) || ts.isShorthandPropertyAssignment(q) ||
+        ts.isSpreadElement(q) || ts.isSpreadAssignment(q)) {
+        top = q;
+        continue;
+      }
+      break;
+    }
+    const q = top.parent;
+    if (ts.isBinaryExpression(q) && q.left === top && ASSIGN_OPS.has(q.operatorToken.kind)) return true;
+    if ((ts.isPrefixUnaryExpression(q) || ts.isPostfixUnaryExpression(q)) &&
+      (q.operator === K.PlusPlusToken || q.operator === K.MinusMinusToken)) return true;
+    if (ts.isDeleteExpression(q)) return true;
+    if ((ts.isForOfStatement(q) || ts.isForInStatement(q)) && q.initializer === top) return true;
+    return false;
+  };
+  let elementReads = false;
+  let ok = true;
+  const primitive = (n: ts.Node): boolean => {
+    const t = L.checker.getTypeAtLocation(n);
+    const flags = ts.TypeFlags.NumberLike | ts.TypeFlags.StringLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void;
+    if (t.isUnionType()) return t.getTypes().every((m) => (m.flags & flags) !== 0);
+    return (t.flags & flags) !== 0;
+  };
+  let effectful = false;
+  const visit = (n: ts.Node, nested: boolean): void => {
+    if (!ok) return;
+    if (n !== fn && ts.isFunctionLike(n)) {
+      effectful = true;
+      ts.forEachChild(n, (c) => visit(c, true));
+      return;
+    }
+    if (ts.isCallExpression(n) || ts.isNewExpression(n) || ts.isTaggedTemplateExpression(n) || ts.isAwaitExpression(n) ||
+      ts.isYieldExpression(n) || ts.isDeleteExpression(n) || n.kind === ts.SyntaxKind.ThisKeyword) {
+      effectful = true;
+    }
+    if (isArr(n)) {
+      const q = n.parent;
+      if (ts.isPropertyAccessExpression(q) && q.expression === n && q.name.text === "length" && !writeTarget(q)) return;
+      if (ts.isElementAccessExpression(q) && q.expression === n && !writeTarget(q) && !nested) {
+        elementReads = true;
+        visit(q.argumentExpression, nested);
+        return;
+      }
+      ok = false;
+      return;
+    }
+    if (ts.isIdentifier(n) && n !== p.name) {
+      const q = n.parent;
+      const nameOnly = (ts.isPropertyAccessExpression(q) && q.name === n) || (ts.isPropertyAssignment(q) && q.name === n) ||
+        ts.isParameter(q) || (ts.isVariableDeclaration(q) && q.name === n) || ts.isLabeledStatement(q) ||
+        ts.isBreakStatement(q) || ts.isContinueStatement(q);
+      if (!nameOnly && !primitive(n)) effectful = true;
+    }
+    ts.forEachChild(n, (c) => visit(c, nested));
+  };
+  for (const prm of fn.parameters.slice(0, 2)) {
+    if (prm.initializer) visit(prm.initializer, false);
+  }
+  visit(fn.body, false);
+  return ok && (!elementReads || !effectful);
+}
 
 /** The OOB-SAFE indexed read for --npm-static package files: `xs[i]`
    * answers the interned `elem | undefined` union — the element when `i`

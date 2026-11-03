@@ -7931,25 +7931,58 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             // earlier source is seen; a static source converts (copies)
             // into the dyn world only after the last argument with an
             // effect. A spread flattens where it stands (Node iterates it
-            // there), so a spread with a write after an earlier source
-            // has no order to keep here — refused by name.
+            // there): GH #122 — a spread before the last argument with an
+            // effect takes its spine where it stands (a static array's
+            // shallow slice, a dyn iterable drained into a fresh dyn
+            // array), so a later argument's push/pop/element store is not
+            // seen while a write INTO an element still is (the elements
+            // keep their identity and convert after the last argument).
+            // Any other spread kind there keeps the refusal.
             const srcNodes = sources.map((a) => (ts.isSpreadElement(a) ? a.expression : a));
+            const lowered = srcNodes.map((n) => L.lowerExpr(n));
+            let lastEffect = -1;
+            for (let i = lowered.length - 1; i >= 0; i--) {
+              if (!droppableStatic(lowered[i]!)) {
+                lastEffect = i;
+                break;
+              }
+            }
+            for (let i = 0; i < lastEffect; i++) {
+              if (!ts.isSpreadElement(sources[i]!)) continue;
+              const v = lowered[i]!;
+              const sloc = locOf(sources[i]!);
+              if (v.type.kind === "array") {
+                lowered[i] = { kind: "arrIntrinsic", method: "slice", receiver: v, args: [], type: v.type, loc: sloc };
+              } else if (v.type.kind === "dyn") {
+                const snap = L.declareHiddenLocal("%oaspread", DYN);
+                const sRef: IrExpr = { kind: "varRef", localId: snap.id, type: DYN, loc: sloc };
+                lowered[i] = {
+                  kind: "seqExpr",
+                  stmts: [
+                    { kind: "varDecl", localId: snap.id, init: { kind: "dynArrLit", elems: [], type: DYN, loc: sloc }, loc: sloc },
+                    { kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.packPushSpreadIter", args: [sRef, v], type: VOID, loc: sloc }, loc: sloc },
+                  ],
+                  result: sRef,
+                  type: DYN,
+                  loc: sloc,
+                };
+              } else if (v.type.kind !== "string") {
+                L.noLowering(
+                  "Object.assign with spread sources and a later argument that may write",
+                  call,
+                  "Node evaluates every argument before it copies — compute the sources into consts first",
+                );
+              }
+            }
             // Only a STATIC source copies when it enters the pack; a dyn or
             // island source rides by reference, as Node's does.
             const bound = evaluateArgsFirst(
               L,
-              srcNodes.map((n) => L.lowerExpr(n)),
+              lowered,
               loc,
               false,
               (t) => !(t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "void" || t.kind === "dyn" || t.kind === "jsval" || isUnitType(t)),
             );
-            if (bound.stmts.length > 0 && spreadCount > 0) {
-              L.noLowering(
-                "Object.assign with spread sources and a later argument that may write",
-                call,
-                "Node evaluates every argument before it copies — compute the sources into consts first",
-              );
-            }
             stmts.push(...bound.stmts);
             let ok = true;
             for (let i = 0; i < sources.length; i++) {

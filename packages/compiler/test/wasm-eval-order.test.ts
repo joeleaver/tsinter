@@ -125,6 +125,14 @@ const ROWS: { id: string; src: string }[] = [
   { id: "c22-contexts", src: "const a = [1];\nfunction* g() { console.log(a, yield 1, a.push(2)); console.log(a, a.pop(), yield 2); }\nconst it = g();\nit.next(); it.next(7); it.next(8);\nconst f = () => console.log(a, a.push(3));\nf();\nclass C { static { console.log(a, a.push(4)); } m = [0]; constructor() { console.log(this.m, this.m.push(1)); } }\nnew C();\nconst flag = a.length > 0;\nif (flag) console.log(a, a.pop()); else console.log(a, a.push(9));\nconst s = flag ? `${a}` + String(a.push(5)) : \"\";\nconsole.log(s, a + String(a.pop()));\nasync function k() { const b = [1]; for (let i = 0; i < 2; i++) console.log(b, await Promise.resolve(i), b.push(i)); }\nk().then(() => console.log(\"done\"));\nlabel: for (const v of [1, 2, 3] as const) { if (v === 2) continue label; console.log(v, a, a.push(v)); }" },
   { id: "l7-object-assign", src: "const cfg: Record<string, number> = { a: 1 };\nconst s1: Record<string, number> = { b: 2 };\nfunction m(): Record<string, number> { s1[\"b\"] = 5; return { c: 3 }; }\nconsole.log(Object.assign(cfg, s1, m()), cfg);\nconst o = { a: 1, b: 2 };\nfunction bump() { o.a = 9; return { c: 3 }; }\nconsole.log(Object.assign({}, o, bump()));\nconst parts = [{ x: 1 }, { y: 2 }];\nconst core = { z: 3 };\nconsole.log(Object.assign({}, ...parts, core));" },
   { id: "l8-assign-map-assert", src: "import assert from \"node:assert\";\nconst o = { a: 1, b: 2 };\nfunction bump() { o.a = 9; return { c: 3 }; }\nconsole.log(Object.assign({}, o, bump()));\nconst xs = [3, 1, 2];\nconst m = new Map([[\"k\", xs], [\"j\", (xs.pop(), xs)]]);\nconsole.log(m.get(\"k\"));\nassert.deepStrictEqual(xs, (xs.push(4), xs));\nconsole.log(\"ok\", xs);\nconst strs = [\"b\", \"a\"];\nconsole.log(strs.join(String(strs.sort())), strs);\nconsole.log(`${xs.length}${xs.push(1)}${xs.length}`);" },
+  /* ── GH #122: narrowed refusals ─────────────────────────────────────── */
+  // A spread before a later argument with an effect takes its spine where
+  // it stands (Node iterates it there); writes INTO its elements are still
+  // seen, since Object.assign copies after every argument.
+  { id: "n1-assign-spread-sources", src: "const base = { a: 1 };\nconst items = [\"x\", \"y\"];\nconsole.log(Object.assign({}, base, ...items.map((k) => ({ [k]: 1 }))));\nconst parts = [{ x: 1 }, { y: 2 }];\nfunction mk(n: number) { return { n }; }\nconsole.log(Object.assign({}, ...parts, mk(1)));\nconsole.log(Object.assign({}, ...parts, (parts.push({ x: 2 }), { z: 3 })));\nconsole.log(parts.length);\nconst ps = [{ x: 1, y: 0 }, { x: 2, y: 2 }];\nfunction poke() { ps[0]!.x = 5; ps.pop(); return { z: 3 }; }\nconsole.log(Object.assign({}, ...ps, poke()), ps);\nconst qs = [{ x: 1 }];\nfunction grow() { qs.push({ x: 9 }); qs[0] = { x: 7 }; return { w: 1 }; }\nconsole.log(Object.assign({}, base, ...qs, grow(), ...qs));\nconst u: unknown = JSON.parse('[{\"d\":1},{\"e\":2}]');\nif (Array.isArray(u)) {\n  console.log(Object.assign({}, ...u, (u.push({ f: 3 }), { g: 4 })), u.length);\n  console.log(Object.assign({}, base, ...u, mk(2)));\n}\nconsole.log(Object.assign({}, ...\"ab\", mk(3)));" },
+  // The tuple map's array parameter, read only: its length, or its
+  // elements where nothing in the callback can write the tuple.
+  { id: "n2-tuple-map-array-param", src: "const t: [number, number] = [1, 2];\nconsole.log(t.map((v, i, arr) => v + arr.length));\nconsole.log(t.map((v, i, arr) => arr[1 - i]! * 10 + v));\nconst u: [string, string, string] = [\"a\", \"b\", \"c\"];\nconsole.log(u.map((v, i, arr) => `${v}/${arr.length}/${arr[(i + 1) % arr.length]}`));\nconsole.log(u.map(function (v, i, arr) { const n = arr.length; let s = 0; for (let k = 0; k < n; k++) s += k; return String(v) + s; }));\nconst w: [number, number, number] = [5, 6, 7];\nconsole.log(w.map((v, i, arr) => { const f = () => arr.length; return f() + v; }));\nconsole.log(w.map((v, _i, arr) => arr.length > 2 ? v : -v));\nconsole.log(t.map((v, i, arr) => { t[1] = 4; return v + arr.length; }), t);" },
 ];
 
 /** Rows where Node answers and this tier stops by name at run time: the
@@ -144,8 +152,17 @@ const FENCES: { id: string; src: string; stdout: string; stderr: RegExp }[] = [
 /** Forms that stay compile refusals, each by name. */
 const REFUSALS: { id: string; src: string; message: RegExp }[] = [
   { id: "json-replacer", src: "const o = { a: 1 };\nconsole.log(JSON.stringify(o, (k, v) => v));", message: /'JSON\.stringify with replacer\/space parameters'/ },
-  { id: "tuple-map-array-param", src: "const t: [number, number] = [1, 2];\nconsole.log(t.map((v, i, arr) => arr.length));", message: /\[number, number\]\.map with a callback that takes the array/ },
-  { id: "assign-spread-then-write", src: "const parts = [{ x: 1 }];\nconst core = { z: 3 };\nconsole.log(Object.assign({}, ...parts, (parts.push({ x: 2 }), core)));", message: /'Object\.assign with spread sources and a later argument that may write'/ },
+  // GH #122: the tuple map's array parameter is a fresh array of the
+  // positions — refused wherever the callback could tell it from the
+  // tuple (Node: [ 10, 18 ], [ 51, 52 ], [ 50, 2 ] [ 3, 2 ]).
+  { id: "tuple-map-array-param-write-by-name", src: "const t: [number, number] = [1, 2];\nconsole.log(t.map((v, i, arr) => { t[1] = 9; return arr[1]! + v; }));", message: /\[number, number\]\.map with a callback that takes the array/ },
+  { id: "tuple-map-array-param-call", src: "const t: [number, number] = [1, 2];\nfunction poke(): number { t[0] = 50; return 0; }\nconsole.log(t.map((v, i, arr) => arr[poke()]! + v));", message: /\[number, number\]\.map with a callback that takes the array/ },
+  { id: "tuple-map-array-param-write-through", src: "const t: [number, number] = [1, 2];\nconsole.log(t.map((v, i, arr) => { arr[0] = 3; return v; }), t);", message: /\[number, number\]\.map with a callback that takes the array/ },
+  { id: "tuple-map-array-param-escape", src: "const t: [number, number] = [1, 2];\nconst keep: number[][] = [];\nconsole.log(t.map((v, i, arr) => { keep.push(arr); return v; }));", message: /\[number, number\]\.map with a callback that takes the array/ },
+  // A spread with no spine snapshot (a Set) before a later argument that
+  // may write it (Node: { '0': 'c', '1': 'b', n: 1 } — the added "zz" is
+  // not seen).
+  { id: "assign-set-spread-then-write", src: "const s = new Set([\"ab\", \"c\"]);\nfunction mk(n: number) { s.add(\"zz\"); return { n }; }\nconsole.log(Object.assign({}, ...s, mk(1)));", message: /'Object\.assign with spread sources and a later argument that may write'/ },
 ];
 
 describe("GH #117/#119: runtime stops by name", () => {
