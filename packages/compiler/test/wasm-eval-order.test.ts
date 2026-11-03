@@ -159,6 +159,11 @@ const REFUSALS: { id: string; src: string; message: RegExp }[] = [
   { id: "tuple-map-array-param-call", src: "const t: [number, number] = [1, 2];\nfunction poke(): number { t[0] = 50; return 0; }\nconsole.log(t.map((v, i, arr) => arr[poke()]! + v));", message: /\[number, number\]\.map with a callback that takes the array/ },
   { id: "tuple-map-array-param-write-through", src: "const t: [number, number] = [1, 2];\nconsole.log(t.map((v, i, arr) => { arr[0] = 3; return v; }), t);", message: /\[number, number\]\.map with a callback that takes the array/ },
   { id: "tuple-map-array-param-escape", src: "const t: [number, number] = [1, 2];\nconst keep: number[][] = [];\nconsole.log(t.map((v, i, arr) => { keep.push(arr); return v; }));", message: /\[number, number\]\.map with a callback that takes the array/ },
+  // Object elements can reach the tuple: a field holding it, a getter, a
+  // setter (review of #122).
+  { id: "tuple-map-array-param-write-through-elem", src: "class Box { self: [Box, Box] | null = null; constructor(public n: number) {} }\nconst b0 = new Box(10), b1 = new Box(20);\nconst t: [Box, Box] = [b0, b1];\nb0.self = t;\nconsole.log(t.map((v, i, arr) => { if (i === 0) { arr[0]!.self![1] = arr[0]!; return arr[1]!.n; } return -1; }), t[1].n);", message: /\[Box, Box\]\.map with a callback that takes the array/ },
+  { id: "tuple-map-array-param-getter-elem", src: "class C { constructor(public n: number) {} get g(): number { t[1] = t[0]; return 1; } }\nconst t: [C, C] = [new C(10), new C(20)];\nconsole.log(t.map((v, i, arr) => i === 0 ? arr[0]!.g + arr[1]!.n : -1), t[1].n);", message: /\[C, C\]\.map with a callback that takes the array/ },
+  { id: "tuple-map-array-param-setter-elem", src: "class C { constructor(public n: number) {} set s(x: number) { t[1] = t[0]; } }\nconst t: [C, C] = [new C(10), new C(20)];\nconsole.log(t.map((v, i, arr) => { if (i === 0) arr[0]!.s = 1; return arr[1]!.n; }), t[1].n);", message: /\[C, C\]\.map with a callback that takes the array/ },
   // A spread with no spine snapshot (a Set) before a later argument that
   // may write it (Node: { '0': 'c', '1': 'b', n: 1 } — the added "zz" is
   // not seen).

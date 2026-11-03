@@ -937,8 +937,10 @@ function lowerOptionalDefaultArg(
  *   - `arr[e]` (not a write target) only when nothing in the callback can
  *     write the tuple: no calls, `new`, tagged templates, await/yield,
  *     delete, `this`, nested functions, and every other identifier the
- *     body reads is a primitive (so no object, the tuple included, is in
- *     reach, and no conversion runs program code).
+ *     body reads is a primitive, every element read is a primitive, and
+ *     no member is read or written on anything else (so no object — the
+ *     tuple, an element holding it, a getter or setter — is in reach, and
+ *     no conversion runs program code).
  * Any other use of `arr` (passing it, storing it, comparing it, writing
  * through it, a closure over it) keeps the refusal. */
 function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
@@ -982,7 +984,7 @@ function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
   let ok = true;
   const primitive = (n: ts.Node): boolean => {
     const t = L.checker.getTypeAtLocation(n);
-    const flags = ts.TypeFlags.NumberLike | ts.TypeFlags.StringLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void;
+    const flags = ts.TypeFlags.NumberLike | ts.TypeFlags.StringLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.BigIntLike | ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void;
     if (t.isUnionType()) return t.getTypes().every((m) => (m.flags & flags) !== 0);
     return (t.flags & flags) !== 0;
   };
@@ -1003,11 +1005,19 @@ function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
       if (ts.isPropertyAccessExpression(q) && q.expression === n && q.name.text === "length" && !writeTarget(q)) return;
       if (ts.isElementAccessExpression(q) && q.expression === n && !writeTarget(q) && !nested) {
         elementReads = true;
+        // An element that is an object can reach the tuple (a field
+        // holding it, a getter or setter): only primitive elements read.
+        if (!primitive(q)) effectful = true;
         visit(q.argumentExpression, nested);
         return;
       }
       ok = false;
       return;
+    }
+    // A member access or write on anything but a primitive may run a
+    // getter or setter, or write an object that reaches the tuple.
+    if ((ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) && !isArr(n.expression) && !primitive(n.expression)) {
+      effectful = true;
     }
     if (ts.isIdentifier(n) && n !== p.name) {
       const q = n.parent;
