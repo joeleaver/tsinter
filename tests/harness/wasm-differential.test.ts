@@ -77,6 +77,7 @@ import ts5 from "typescript";
 import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 import { makeHostFacts, type HostFactSnapshot } from "./host-facts.js";
+import { HAS_IPV6, LOCALHOST_DUAL, NO_IPV6, NO_LOCALHOST_DUAL } from "./env-caps.js";
 // #227: the `fetch` import's host half over Node's own fetch, shared with
 // packages/compiler/test/wasm-host.ts.
 import { makeFetchHost } from "../../packages/compiler/test/wasm-fetch-host.js";
@@ -8455,7 +8456,8 @@ describe("INC-29 U1 node:net rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("N1-ERR-02 EADDRINUSE with no host (the '::' bind: listen EADDRINUSE: address already in use :::<port>) and with an IP host (its lookup tick first), in Node's order", async () => {
+  test("N1-ERR-02 EADDRINUSE with no host (the '::' bind: listen EADDRINUSE: address already in use :::<port>) and with an IP host (its lookup tick first), in Node's order", async ({ skip }) => {
+    skip(!HAS_IPV6, NO_IPV6);
     const r = await runN1Source("// EADDRINUSE: a second server on the first one's port, with no host (the\n// '::' bind) and with an IP host; the errors' texts and codes, in order.\nimport * as net from \"node:net\";\n\nconst a = net.createServer();\na.listen(0, () => {\n  const port = a.address().port;\n  const b = net.createServer();\n  b.on(\"error\", (e) => {\n    console.log(\"b error\", e.message === \"listen EADDRINUSE: address already in use :::\" + port, (e as NodeJS.ErrnoException).code);\n    const c = net.createServer();\n    c.on(\"error\", (e2) => {\n      console.log(\"c error\", e2.message === \"listen EADDRINUSE: address already in use 127.0.0.1:\" + port, (e2 as NodeJS.ErrnoException).code);\n      a.close(() => console.log(\"a closed\"));\n    });\n    c.on(\"listening\", () => console.log(\"c listening (never)\"));\n    c.listen(port, \"127.0.0.1\");\n    console.log(\"c listen called\");\n  });\n  b.listen(port);\n  console.log(\"b listen called\");\n  process.nextTick(() => console.log(\"tick after b listen\"));\n});\n", "ts");
     expect(r.stdout.toString("utf8")).toBe("b listen called\nb error true EADDRINUSE\nc listen called\ntick after b listen\nc error true EADDRINUSE\na closed\n");
     expect(r.stderr.toString("utf8")).toBe("");
@@ -8503,7 +8505,8 @@ describe("INC-29 U1 node:net rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("N1-ERR-03 a refused connect through 'localhost' (both addresses tried in turn): the AggregateError's name, empty message and code", async () => {
+  test("N1-ERR-03 a refused connect through 'localhost' (both addresses tried in turn): the AggregateError's name, empty message and code", async ({ skip }) => {
+    skip(!LOCALHOST_DUAL, NO_LOCALHOST_DUAL);
     const r = await runN1Source("// A refused connect through 'localhost' (both of its addresses are tried,\n// one after the other): the aggregate error's name, message and code.\nimport * as net from \"node:net\";\n\nconst probe = net.createServer();\nprobe.listen(0, \"127.0.0.1\", () => {\n  const port = probe.address().port;\n  probe.close(() => {\n    const c = net.connect(port);\n    c.on(\"error\", (e) => {\n      console.log(\"error\", e.name, JSON.stringify(e.message), (e as NodeJS.ErrnoException).code);\n    });\n    c.on(\"close\", () => console.log(\"close\"));\n  });\n});\n", "ts");
     expect(r.stdout.toString("utf8")).toBe("error AggregateError \"\" ECONNREFUSED\nclose\n");
     expect(r.stderr.toString("utf8")).toBe("");
@@ -8754,7 +8757,8 @@ describe("INC-29 U1 node:net rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("N1-REG-01 S087 (a): a refused connect's error has no errno, syscall, address or port, and the AggregateError of a 'localhost' connect has no errors array (Node: -111 connect 127.0.0.1 <port>, and an array of two)", async () => {
+  test("N1-REG-01 S087 (a): a refused connect's error has no errno, syscall, address or port, and the AggregateError of a 'localhost' connect has no errors array (Node: -111 connect 127.0.0.1 <port>, and an array of two)", async ({ skip }) => {
+    skip(!LOCALHOST_DUAL, NO_LOCALHOST_DUAL);
     const r = await runN1Source("// S087 (a): a connect error carries name, message and code only; the\n// AggregateError has no errors array. Node's answers are in the row.\nimport * as net from \"node:net\";\nconst srv = net.createServer();\nsrv.listen(0, \"127.0.0.1\", () => {\n  const port = srv.address().port;\n  srv.close(() => {\n    const c = net.connect(port, \"127.0.0.1\");\n    c.on(\"error\", (e: any) => {\n      console.log(e.name, e.code);\n      console.log(\"errno\", e.errno, \"syscall\", e.syscall, \"address\", e.address, \"port\", e.port === undefined);\n      const d = net.connect(port, \"localhost\");\n      d.on(\"error\", (a: any) => {\n        console.log(a.name, a.code, \"errors\", a.errors === undefined);\n      });\n    });\n  });\n});\n", "ts");
     // Node v24.18.1 prints "errno -111 syscall connect address 127.0.0.1 port false" and "... errors false".
     expect(r.stdout.toString("utf8")).toBe("Error ECONNREFUSED\nerrno undefined syscall undefined address undefined port true\nAggregateError ECONNREFUSED errors true\n");
@@ -9160,7 +9164,8 @@ describe("INC-29 U4 review rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("U4-R-03 finding 2: an IPv6 literal host is not a domain to Node's domainToASCII, so checkServerIdentity takes the DNS path and fails with Node's altnames text", async () => {
+  test("U4-R-03 finding 2: an IPv6 literal host is not a domain to Node's domainToASCII, so checkServerIdentity takes the DNS path and fails with Node's altnames text", async ({ skip }) => {
+    skip(!HAS_IPV6, NO_IPV6);
     const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\nconst server = tls.createServer({ key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") }, (s) => { s.end(); });\nserver.listen(0, \"::1\", () => {\n  const port = server.address().port;\n  const c = tls.connect({ host: \"::1\", port, ca }, () => {\n    console.log(\"secureConnect\", c.authorized, c.authorizationError);\n    c.end();\n  });\n  c.on(\"error\", (e) => console.log(\"error\", (e as NodeJS.ErrnoException).code, e.message));\n  c.on(\"close\", () => server.close(() => console.log(\"closed\")));\n});\n", {}, "ts");
     expect(r.stdout.toString("utf8")).toBe("error ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Host: ::1. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1\nclosed\n");
     expect(r.stderr.toString("utf8")).toBe("");
