@@ -23882,6 +23882,14 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (e.fn === "dyn.iterLive") {
+          // GH #119: the for-of source — a dyn array itself, read live.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.iterLive());
+          this.emitPendingCheck();
+          return;
+        }
         if (e.fn === "dyn.arrLen") {
           // The pack's length and element reads: an ARR by construction
           // (the defensive arms in C cover nothing this lowering reaches).

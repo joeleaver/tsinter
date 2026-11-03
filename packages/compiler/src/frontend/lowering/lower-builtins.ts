@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -6719,7 +6719,11 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         );
       }
       const tmplNode = call.arguments[0]!;
-      const tmpl = L.lowerExpr(tmplNode);
+      // GH #117 sweep: the template and every substitution evaluate before
+      // any substitution stringifies.
+      const subNodes = call.arguments.slice(1);
+      const bound = evaluateArgsFirst(L, [tmplNode, ...subNodes].map((a) => L.lowerExpr(a)), loc);
+      const tmpl = bound.values[0]!;
       const rawT = arrayOf(STRING);
       let raw: IrExpr | null = null;
       if (tmpl.type.kind === "record") {
@@ -6736,8 +6740,8 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
           "the template must carry a string[] `raw` member: String.raw({ raw: [...] }, ...subs)",
         );
       }
-      const subs = call.arguments.slice(1).map((a): IrExpr => {
-        const v = L.lowerExpr(a);
+      const subs = subNodes.map((a, i): IrExpr => {
+        const v = bound.values[i + 1]!;
         // GH #104 (SEMANTICS.md S119): a substitution holding undefined
         // is the text "undefined".
         if (v.type.kind === "string") return undefinedAsText(L, v, loc);
@@ -6752,7 +6756,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         );
       });
       const packedSubs: IrExpr = { kind: "arrayLit", elems: subs, type: rawT, loc };
-      return { kind: "libCall", fn: "string.raw", args: [raw, packedSubs], type: STRING, loc };
+      return afterArgs(bound.stmts, { kind: "libCall", fn: "string.raw", args: [raw, packedSubs], type: STRING, loc }, loc);
     }
     const spread = call.arguments.find(ts.isSpreadElement);
     if (spread) {

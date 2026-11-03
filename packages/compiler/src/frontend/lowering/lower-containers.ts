@@ -7,7 +7,7 @@ import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { lowerArrayFromIterable } from "./lower-stdlib-members.js";
-import { bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
@@ -830,7 +830,7 @@ function lowerOptionalDefaultArg(
     if (!shape?.tuple) return null;
     const receiver = lowerMemberRecv(L, access);
     if (receiver.type.kind !== "record") return null;
-    if (!pureReemittable(receiver)) {
+    if (name === "slice" && !pureReemittable(receiver)) {
       L.noLowering(
         `${L.checker.typeToString(L.typeOf(access.expression))}.${name}`,
         call,
@@ -850,31 +850,28 @@ function lowerOptionalDefaultArg(
     }
     if (elemT === null || byIndex.length === 0) return null; // empty/union-position tuples keep the fence
     const snapshotElem = elemT;
-    const snapshot: IrExpr = {
-      kind: "arrayLit",
-      elems: byIndex.map((f) => {
-        const read: IrExpr = {
-          kind: "recordGet",
-          obj: receiver,
-          shapeId: receiverIr.shapeId,
-          field: f.name,
-          type: f.type,
-          loc,
-        };
-        return typeEquals(f.type, snapshotElem) ? read : L.coerceInto(access.expression, read, snapshotElem);
-      }),
-      type: arrayOf(snapshotElem),
-      loc,
-    };
     if (name === "slice") {
       if (call.arguments.length > 2) {
         L.noLowering(`.slice with ${call.arguments.length} arguments`, call);
       }
-      const args = call.arguments.map((a) => L.lowerExpr(a));
-      for (let i = 0; i < args.length; i++) {
-        if (args[i]!.type.kind !== "f64") L.badType(call.arguments[i]!, L.typeOf(call.arguments[i]!));
+      const rawArgs = call.arguments.map((a) => L.lowerExpr(a));
+      for (let i = 0; i < rawArgs.length; i++) {
+        if (rawArgs[i]!.type.kind !== "f64") L.badType(call.arguments[i]!, L.typeOf(call.arguments[i]!));
       }
-      return { kind: "arrIntrinsic", method: "slice", receiver: snapshot, args, type: arrayOf(snapshotElem), loc };
+      // The positions are read when slice runs — after its arguments,
+      // which may write the tuple (GH #119 sweep).
+      const bound = evaluateArgsFirst(L, [receiver, ...rawArgs], loc);
+      const recv = bound.values[0]!;
+      const snapshot: IrExpr = {
+        kind: "arrayLit",
+        elems: byIndex.map((f) => {
+          const read: IrExpr = { kind: "recordGet", obj: recv, shapeId: receiverIr.shapeId, field: f.name, type: f.type, loc };
+          return typeEquals(f.type, snapshotElem) ? read : L.coerceInto(access.expression, read, snapshotElem);
+        }),
+        type: arrayOf(snapshotElem),
+        loc,
+      };
+      return afterArgs(bound.stmts, { kind: "arrIntrinsic", method: "slice", receiver: snapshot, args: bound.values.slice(1), type: arrayOf(snapshotElem), loc }, loc);
     }
     // map
     if (call.arguments.length !== 1) {
@@ -884,8 +881,46 @@ function lowerOptionalDefaultArg(
     const { fnArg, arity } = hofCallbackArg(L, argNode, [snapshotElem], arrayOf(snapshotElem));
     const fnRet = fnArg.type.ret;
     if (fnRet.kind === "void" || fnRet.kind === "func") L.badType(call, L.typeOf(call));
-    const helper = arrayHofHelper(L, "map", snapshotElem, fnRet, arity, loc);
-    return { kind: "call", callee: helper, args: [snapshot, fnArg], type: arrayOf(fnRet), loc };
+    if (arity >= 3) {
+      // The third parameter is the tuple itself in Node; here it would be
+      // a fresh array a write could tell from the tuple.
+      L.noLowering(
+        `${L.checker.typeToString(L.typeOf(access.expression))}.map with a callback that takes the array`,
+        argNode,
+        "declare (value, index) only and read the tuple by name",
+      );
+    }
+    // GH #119: Node's map reads position i just before calling back for
+    // it, so a callback that writes a later position sees its write. The
+    // positions are fixed, so the walk unrolls: receiver and callback
+    // evaluate once, then one read-and-call per position, in order.
+    const tmpT = L.declareHiddenLocal("%tuple", receiver.type);
+    const tmpF = L.declareHiddenLocal("%tuplemapf", fnArg.type);
+    const outT = arrayOf(fnRet);
+    const tmpOut = L.declareHiddenLocal("%tuplemap", outT);
+    const tRef: IrExpr = { kind: "varRef", localId: tmpT.id, type: receiver.type, loc };
+    const stmts: IrStmt[] = [
+      { kind: "varDecl", localId: tmpT.id, init: receiver, loc },
+      { kind: "varDecl", localId: tmpF.id, init: fnArg, loc },
+      { kind: "varDecl", localId: tmpOut.id, init: { kind: "arrayLit", elems: [], type: outT, loc }, loc },
+    ];
+    byIndex.forEach((f, k) => {
+      const read: IrExpr = { kind: "recordGet", obj: tRef, shapeId: receiverIr.shapeId, field: f.name, type: f.type, loc };
+      const value = typeEquals(f.type, snapshotElem) ? read : L.coerceInto(access.expression, read, snapshotElem);
+      const called: IrExpr = {
+        kind: "callValue",
+        callee: { kind: "varRef", localId: tmpF.id, type: fnArg.type, loc },
+        args: ([value, { kind: "numLit", value: k, type: F64, loc }] as IrExpr[]).slice(0, arity),
+        type: fnRet,
+        loc,
+      };
+      stmts.push({
+        kind: "exprStmt",
+        expr: { kind: "arrIntrinsic", method: "push", receiver: { kind: "varRef", localId: tmpOut.id, type: outT, loc }, args: [called], type: F64, loc },
+        loc,
+      });
+    });
+    return { kind: "seqExpr", stmts, result: { kind: "varRef", localId: tmpOut.id, type: outT, loc }, type: outT, loc };
   }
 
 /** The OOB-SAFE indexed read for --npm-static package files: `xs[i]`
@@ -1098,10 +1133,22 @@ function lowerOptionalDefaultArg(
       const outT = arrayOf(fnRet);
       locals.push({ id: "out.0", name: "out", type: outT, mutable: false });
       returnType = outT;
+      // An index the callback removed is a HOLE in Node's result (its
+      // length is the walk's): this tier stores the hole as the element's
+      // undefined and raises the module's holes flag, so every observer
+      // that tells a hole from undefined keeps its fence (SEMANTICS.md
+      // S119). Without undefined slots the hole has no representation —
+      // a named stop.
+      const absent: IrStmt[] = L.undefSlots
+        ? [
+            { kind: "exprStmt", expr: { kind: "arrayLit", elems: [], holes: true, type: outT, loc }, loc },
+            push(outT, { kind: "slotUndef", type: fnRet, loc }),
+          ]
+        : [{ kind: "runtimeFence", code: "SC1090", message: "Array.prototype.map over an array its callback shrank (Node leaves a hole in the result)", loc }];
       body = [
         { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: outT, loc }, loc },
         readLen,
-        forLoop([push(outT, callF(getElem))]),
+        forLoop([presentAt(arrT, loc, ref("i.0", F64), [push(outT, callF(getElem))], absent)]),
         { kind: "return", value: ref("out.0", outT), loc },
       ];
     } else if (method === "filter") {
@@ -1114,20 +1161,22 @@ function lowerOptionalDefaultArg(
         { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: arrT, loc }, loc },
         readLen,
         forLoop([
-          { kind: "varDecl", localId: "v.0", init: getElem, loc },
-          {
-            kind: "if",
-            cond: callF(ref("v.0", elem)),
-            then: [push(arrT, ref("v.0", elem))],
-            else_: null,
-            loc,
-          },
+          presentAt(arrT, loc, ref("i.0", F64), [
+            { kind: "varDecl", localId: "v.0", init: getElem, loc },
+            {
+              kind: "if",
+              cond: callF(ref("v.0", elem)),
+              then: [push(arrT, ref("v.0", elem))],
+              else_: null,
+              loc,
+            },
+          ]),
         ]),
         { kind: "return", value: ref("out.0", arrT), loc },
       ];
     } else {
       returnType = VOID;
-      body = [readLen, forLoop([{ kind: "exprStmt", expr: callF(getElem), loc }])];
+      body = [readLen, forLoop([presentAt(arrT, loc, ref("i.0", F64), [{ kind: "exprStmt", expr: callF(getElem), loc }])])];
     }
     return { name, params, returnType, locals, body, loc };
   }
@@ -1370,13 +1419,15 @@ function lowerOptionalDefaultArg(
     const body: IrStmt[] = [
       readLenStmt(arrT, loc),
       countedForLoop(loc, [
-        {
-          kind: "if",
-          cond: method === "some" ? callF : { kind: "unary", op: "!", operand: callF, type: BOOL, loc },
-          then: [{ kind: "return", value: bool(method === "some"), loc }],
-          else_: null,
-          loc,
-        },
+        presentAt(arrT, loc, ref("i.0", F64), [
+          {
+            kind: "if",
+            cond: method === "some" ? callF : { kind: "unary", op: "!", operand: callF, type: BOOL, loc },
+            then: [{ kind: "return", value: bool(method === "some"), loc }],
+            else_: null,
+            loc,
+          },
+        ]),
       ]),
       { kind: "return", value: bool(method !== "some"), loc },
     ];
@@ -1488,7 +1539,7 @@ function lowerOptionalDefaultArg(
     const body: IrStmt[] = [
       { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: fnRet, loc }, loc },
       readLenStmt(arrT, loc),
-      countedForLoop(loc, [
+      countedForLoop(loc, [presentAt(arrT, loc, ref("i.0", F64), [
         {
           kind: "varDecl",
           localId: "r.0",
@@ -1508,7 +1559,7 @@ function lowerOptionalDefaultArg(
           loc,
         },
         innerLoop,
-      ]),
+      ])]),
       { kind: "return", value: ref("out.0", fnRet), loc },
     ];
     L.liftedFns.push({
@@ -1661,18 +1712,20 @@ function lowerOptionalDefaultArg(
         loc,
       },
       body: [
-        {
-          kind: "assign",
-          localId: "acc.0",
-          value: {
-            kind: "callValue",
-            callee: ref("f.0", fnT),
-            args: [ref("acc.0", accT), at(i), i, ref("a.0", arrT)].slice(0, arity),
-            type: accT,
+        presentAt(arrT, loc, i, [
+          {
+            kind: "assign",
+            localId: "acc.0",
+            value: {
+              kind: "callValue",
+              callee: ref("f.0", fnT),
+              args: [ref("acc.0", accT), at(i), i, ref("a.0", arrT)].slice(0, arity),
+              type: accT,
+              loc,
+            },
             loc,
           },
-          loc,
-        },
+        ]),
       ],
       loc,
     };
@@ -2764,6 +2817,19 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
       type: elem,
       loc,
     };
+  }
+
+/** The callback HOFs' per-index HasProperty test (forEach, map, filter,
+   * some, every, flatMap, reduce, reduceRight — not the find family, which
+   * reads every index): Node fixes the walk's length at entry but calls
+   * the callback only for an index the array still has, so a callback
+   * that shrinks its array (pop, shift, splice) is not called for the
+   * indices it removed. A dense array has index i exactly while
+   * i < its current length (holes are the hole fence's business — S119).
+   * `absent` runs instead for a missing index. */
+  function presentAt(arrT: IrType, loc: SrcLoc, i: IrExpr, body: IrStmt[], absent: IrStmt[] | null = null): IrStmt {
+    const len: IrExpr = { kind: "arrIntrinsic", method: "length", receiver: { kind: "varRef", localId: "a.0", type: arrT, loc }, args: [], type: F64, loc };
+    return { kind: "if", cond: { kind: "bin", op: "<", left: i, right: len, type: BOOL, loc }, then: body, else_: absent, loc };
   }
 
 /** `for (i = 0; i < n; i++) { ...body }` over the conventional locals. */
@@ -8034,12 +8100,21 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       });
       return name;
     };
-    let acc = L.lowerExprExpecting(call.arguments[0]!, targetIr);
+    // GH #117 sweep: every argument evaluates before any source copies (a
+    // later argument that writes an earlier source is seen, as in Node).
+    const bound = evaluateArgsFirst(
+      L,
+      [
+        L.lowerExprExpecting(call.arguments[0]!, targetIr),
+        ...plans.map((p, i) => L.lowerExprExpecting(call.arguments[i + 1]!, { kind: "record", shapeId: p.fromId })),
+      ],
+      loc,
+    );
+    let acc = bound.values[0]!;
     for (let i = 0; i < plans.length; i++) {
-      const src = L.lowerExprExpecting(call.arguments[i + 1]!, { kind: "record", shapeId: plans[i]!.fromId });
-      acc = { kind: "call", callee: helperFor(plans[i]!), args: [acc, src], type: targetIr, loc };
+      acc = { kind: "call", callee: helperFor(plans[i]!), args: [acc, bound.values[i + 1]!], type: targetIr, loc };
     }
-    return acc;
+    return afterArgs(bound.stmts, acc, loc);
   }
 
 /** One contributor of a pure-index-record MERGE literal: a full spread of

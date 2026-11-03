@@ -6603,7 +6603,41 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     return null;
   }
 
+  /** GH #119: for-of over a TUPLE reads each position live. The tuple
+   * branch below hands the generic array for-of an empty placeholder
+   * iterable (it carries the element type the loop variable binds at)
+   * registered here; the finished `forOf` over it becomes a counted loop
+   * over the positions whose body opens by reading position i of the
+   * tuple, evaluated once at loop entry — ArrayIterator's own walk (a
+   * tuple's length is fixed in this tier: push/pop/splice on one refuse
+   * by name). */
+  const liveTuples = new WeakMap<IrExpr, { tuple: IrExpr; n: number; readAt: (t: IrExpr, i: IrExpr) => IrExpr }>();
+
   function lowerForOfImpl(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
+    const s = lowerForOfImpl0(L, stmt);
+    if (s.kind !== "forOf") return s;
+    const live = liveTuples.get(s.iterable);
+    if (live === undefined) return s;
+    const loc = s.loc;
+    if (live.n === 0) return { kind: "block", body: [{ kind: "exprStmt", expr: live.tuple, loc }, s], loc };
+    const tup = L.declareHiddenLocal("%tuple", live.tuple.type);
+    const i = L.declareHiddenLocal("%tupleidx", F64);
+    i.mutable = true;
+    const iRef: IrExpr = { kind: "varRef", localId: i.id, type: F64, loc };
+    const tRef: IrExpr = { kind: "varRef", localId: tup.id, type: live.tuple.type, loc };
+    const loop: IrStmt = {
+      kind: "for",
+      init: { kind: "varDecl", localId: i.id, init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+      cond: { kind: "bin", op: "<", left: iRef, right: { kind: "numLit", value: live.n, type: F64, loc }, type: BOOL, loc },
+      update: { kind: "assign", localId: i.id, value: { kind: "bin", op: "+", left: iRef, right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc }, loc },
+      body: [{ kind: "varDecl", localId: s.localId, init: live.readAt(tRef, iRef), loc }, ...s.body],
+      ...(s.labels && { labels: s.labels }),
+      loc,
+    };
+    return { kind: "block", body: [{ kind: "varDecl", localId: tup.id, init: live.tuple, loc }, loop], loc };
+  }
+
+  function lowerForOfImpl0(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
     // Labels consume HERE (nested statements must never see them). The
     // plain array/string paths carry them; the container/matchAll/stdin
     // desugars drop them — a labeled jump naming those loops fences at the
@@ -6852,36 +6886,36 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         if (elemT !== null) {
           const loc = locOf(stmt.expression);
           const shapeId = iterable.type.shapeId;
-          const snapshotElem = elemT;
-          // Step 2B: an impure receiver (the `for (const k of ["a", "b"]
-          // as const)` literal, a call) evaluates once into a hidden
-          // local at loop entry, and the positions read from that.
-          let pre: IrStmt | null = null;
-          let tupleRead: IrExpr = iterable;
-          if (!pureReemittable(iterable)) {
-            const tmp = L.declareHiddenLocal("%tuple", iterable.type);
-            pre = { kind: "varDecl", localId: tmp.id, init: iterable, loc };
-            tupleRead = { kind: "varRef", localId: tmp.id, type: iterable.type, loc };
-          }
-          const snapshot: IrExpr = {
-            kind: "arrayLit",
-            elems: byIndex.map((f) => {
-              const read: IrExpr = {
-                kind: "recordGet",
-                obj: tupleRead,
-                shapeId,
-                field: f.name,
-                type: f.type,
-                loc,
-              };
-              return typeEquals(f.type, snapshotElem)
-                ? read
-                : L.coerceInto(stmt.expression, read, snapshotElem);
-            }),
-            type: arrayOf(snapshotElem),
-            loc,
+          const liveElem = elemT;
+          // GH #119: the receiver evaluates ONCE at loop entry (a call, the
+          // `["a", "b"] as const` literal, a binding the body may
+          // reassign), and each pass reads its position LIVE — a body
+          // that writes a later position sees the write, as Node's
+          // ArrayIterator does (lowerForOfImpl builds the loop).
+          const readPos = (t: IrExpr, f: (typeof byIndex)[number]): IrExpr => {
+            const read: IrExpr = { kind: "recordGet", obj: t, shapeId, field: f.name, type: f.type, loc };
+            return typeEquals(f.type, liveElem) ? read : L.coerceInto(stmt.expression, read, liveElem);
           };
-          iterable = pre === null ? snapshot : { kind: "seqExpr", stmts: [pre], result: snapshot, type: snapshot.type, loc };
+          const placeholder: IrExpr = { kind: "arrayLit", elems: [], type: arrayOf(liveElem), loc };
+          liveTuples.set(placeholder, {
+            tuple: iterable,
+            n: byIndex.length,
+            readAt: (t, i) => {
+              let acc = readPos(t, byIndex[byIndex.length - 1]!);
+              for (let k = byIndex.length - 2; k >= 0; k--) {
+                acc = {
+                  kind: "ternary",
+                  cond: { kind: "bin", op: "===", left: i, right: { kind: "numLit", value: k, type: F64, loc }, type: BOOL, loc },
+                  then: readPos(t, byIndex[k]!),
+                  else_: acc,
+                  type: liveElem,
+                  loc,
+                };
+              }
+              return acc;
+            },
+          });
+          iterable = placeholder;
         } else {
           L.noLowering("for-of over tuples", stmt.expression,
             "tuples with union-typed or unrepresentable positions are fixed-shape — read t[0], t[1], ... directly (plain-position tuples purely iterate)");
@@ -7499,17 +7533,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * (break/return out of a partial iteration calling it.return()) is NOT
    * run — a divergence only a custom island iterator with a return()
    * method can observe. */
-  /** For-of over a CHECKED-DYNAMIC iterable: the source packs ONCE
-   * through the spread walk (dyn.iterPack — dyn arrays element-by-
-   * element, strings by code point, bytes by byte; a WRAPPED engine
-   * value drains through the ENGINE's own iterator protocol via the
-   * iter_drain arm; every other kind throws V8's not-iterable
-   * TypeError, the identifier spelling when the head has one), then a
-   * hidden index loop binds each element as a dyn value. The pack is an
-   * eager SNAPSHOT (the matchAll stance): body mutations of a dyn-array
-   * source don't extend the iteration where JS's live array iterator
-   * would — documented divergence; engine sources drain through their
-   * own protocol, so generators/Maps/Sets step exactly once like Node. */
+  /** For-of over a CHECKED-DYNAMIC iterable: a dyn ARRAY is walked
+   * itself (dyn.iterLive, GH #119) — the hidden index loop re-reads its
+   * length every step and each element live, Node's ArrayIterator walk,
+   * so body pushes extend the loop and pops end it early. Every other
+   * source packs ONCE through the spread walk (dyn.iterPack — strings by
+   * code point, bytes by byte; a WRAPPED engine value drains through the
+   * ENGINE's own iterator protocol via the iter_drain arm, so
+   * generators/Maps/Sets step exactly once like Node; every other kind
+   * throws V8's not-iterable TypeError, the identifier spelling when the
+   * head has one), and the loop binds each element as a dyn value. */
   function lowerForOfDyn(L: Lowerer, stmt: ts.ForOfStatement, iterable: IrExpr, labels?: string[]): IrStmt {
     const loc = locOf(stmt);
     const head = stmt.expression;
@@ -7618,7 +7651,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             localId: pack.id,
             init: {
               kind: "libCall",
-              fn: "dyn.iterPack",
+              fn: "dyn.iterLive",
               args: [iterable, { kind: "strLit", value: spell, type: STRING, loc }],
               type: DYN,
               loc,

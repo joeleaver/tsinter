@@ -8936,7 +8936,9 @@ holes the same way (Step 2B; before it, a compile refusal); an n that is not
 a valid array length throws V8's `RangeError: Invalid array length`, and an
 n above 2^24 (16777216) stops the program by name ("new Array(n) with n above
 16777216", SC1090, S122): every hole is allocated here, where V8 keeps a large
-array sparse. Since the GH #86 review the same holds for `in`/`Object.hasOwn` over an
+array sparse. A `map` whose callback removed elements of its own array
+(`pop`, `shift`, `splice`) leaves a hole in the result at every index it
+then skipped, as Node does (GH #119) — made the same way. Since the GH #86 review the same holds for `in`/`Object.hasOwn` over an
 index of a typed array after it crossed into a dynamic value (`[1, , 3]`
 passed to an untyped JavaScript function): the element's `undefined` there
 may be a hole, so the answer fences once the program has made one.

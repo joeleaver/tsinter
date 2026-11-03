@@ -1829,6 +1829,10 @@ export type IrLibFn =
    * not iterable (cannot read property Symbol(Symbol.iterator))"). In the
    * may-throw seed set. */
   | "dyn.iterPack"
+  /** GH #119: the for-of-over-dyn source — a dyn ARRAY itself (the loop
+   * reads it live by index), any other kind dyn.iterPack's drain. Same
+   * arguments, refusals and may-throw status as dyn.iterPack. */
+  | "dyn.iterLive"
   /** The for-of-over-dyn pack accessors — the emitted index loop drives
    * them over a dyn.iterPack result (ARR by construction). arrLen: the
    * ARR length as f64 (0 for non-ARR kinds; arg borrowed). arrAt: the
@@ -7340,6 +7344,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.keySet",
   // the destructuring pack throws V8's TypeError on non-iterable dyn kinds
   "dyn.iterPack",
+  "dyn.iterLive",
   "dyn.toString",
   "dyn.defineProps",
   "process.chdir",

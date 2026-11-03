@@ -2554,6 +2554,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             // non-object receivers (may-throw seed set).
             return finish(`scr_dyn_key_set(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "dyn.iterPack":
+          case "dyn.iterLive": // legacy lane: the snapshot
             // Destructuring/for-of pack over a dyn source: both borrowed,
             // fresh array +1; throws V8's not-iterable TypeError on
             // non-iterable dyn kinds and drains wrapped engine values

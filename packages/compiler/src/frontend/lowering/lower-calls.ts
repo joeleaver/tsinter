@@ -19,7 +19,7 @@ import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
-import { checkAfterArgs, undefFenceGuard, isUndefExpr, slotUndefOf, undefElse, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, slotUndefOf, undefElse, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -3141,8 +3141,11 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // Each argument's VALUE first (the jsval fence, function boxing);
       // its printed text second — the two steps a runtime format string
       // splits (board #237).
-      const values: RuntimeFormatArg[] = expr.arguments.map((a) => {
-        const lowered = L.lowerExpr(a);
+      // GH #117: every argument evaluates before any formats.
+      const raw = expr.arguments.map((a) => L.lowerExpr(a));
+      const first = expr.arguments.some(ts.isSpreadElement) ? { stmts: [], values: raw } : evaluateArgsFirst(L, raw, loc);
+      const values: RuntimeFormatArg[] = expr.arguments.map((a, i) => {
+        const lowered = first.values[i]!;
         if (lowered.type.kind === "jsval") {
           // An island value prints through the checked-dynamic renderer
           // (the jsval→dyn crossing wraps BY REFERENCE; nothing is
@@ -3186,13 +3189,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (values.length > 1 && !expr.arguments.some(ts.isSpreadElement)) {
         const formatted = lowerRuntimeFormat(L, values, "console", loc, surface);
         if (formatted !== null) {
-          return {
+          return afterArgs(first.stmts, {
             kind: "intrinsic",
             name: stdoutMember ? "console.log" : "console.error",
             args: [formatted],
             type: VOID,
             loc,
-          };
+          }, loc);
         }
       }
       const args = values.map(({ node: a, value: lowered }) => {
@@ -3225,13 +3228,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // render fence honestly with the reason.
         return lowerConsoleInspectArg(L, a, lowered, surface, loc);
       });
-      return {
+      return afterArgs(first.stmts, {
         kind: "intrinsic",
         name: stdoutMember ? "console.log" : "console.error",
         args,
         type: VOID,
         loc,
-      };
+      }, loc);
     }
 
     // The timer globals — setTimeout/clearTimeout, setInterval/
@@ -7922,12 +7925,37 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             // value — the two runtime variants, picked here by position.
             const sources = call.arguments.slice(1);
             const spreadCount = sources.filter((a) => ts.isSpreadElement(a)).length;
+            // GH #117 sweep: Node evaluates every argument before it
+            // copies any source, so a later argument that writes an
+            // earlier source is seen; a static source converts (copies)
+            // into the dyn world only after the last argument with an
+            // effect. A spread flattens where it stands (Node iterates it
+            // there), so a spread with a write after an earlier source
+            // has no order to keep here — refused by name.
+            const srcNodes = sources.map((a) => (ts.isSpreadElement(a) ? a.expression : a));
+            // Only a STATIC source copies when it enters the pack; a dyn or
+            // island source rides by reference, as Node's does.
+            const bound = evaluateArgsFirst(
+              L,
+              srcNodes.map((n) => L.lowerExpr(n)),
+              loc,
+              false,
+              (t) => !(t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "void" || t.kind === "dyn" || t.kind === "jsval" || isUnitType(t)),
+            );
+            if (bound.stmts.length > 0 && spreadCount > 0) {
+              L.noLowering(
+                "Object.assign with spread sources and a later argument that may write",
+                call,
+                "Node evaluates every argument before it copies — compute the sources into consts first",
+              );
+            }
+            stmts.push(...bound.stmts);
             let ok = true;
             for (let i = 0; i < sources.length; i++) {
               const argNode = sources[i]!;
               const spread = ts.isSpreadElement(argNode);
-              const srcNode = spread ? argNode.expression : argNode;
-              const src = assignSourceDyn(L, L.lowerExpr(srcNode), srcNode);
+              const srcNode = srcNodes[i]!;
+              const src = assignSourceDyn(L, bound.values[i]!, srcNode);
               if (src.type.kind !== "dyn") {
                 ok = false;
                 break;

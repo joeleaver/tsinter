@@ -536,19 +536,22 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         const pieces: IrExpr[] = [];
         const headRaw = templateRawTextOf(t.head);
         if (headRaw !== "") pieces.push({ kind: "strLit", value: headRaw, type: STRING, loc });
-        for (const span of t.templateSpans) {
-          pieces.push(
-            L.caughtToString(span.expression) ??
-              L.ensureString(L.lowerExpr(span.expression), span.expression),
-          );
+        // GH #117 sweep: the tag receives every substitution VALUE before
+        // it stringifies any (`String.raw\`${a}-${a.reverse()}\`` joins the
+        // reversed array twice) — unlike an untagged template, whose
+        // ToString runs per substitution.
+        const subs = t.templateSpans.map((span) => L.caughtToString(span.expression) ?? L.lowerExpr(span.expression));
+        const bound = evaluateArgsFirst(L, subs, loc);
+        t.templateSpans.forEach((span, i) => {
+          pieces.push(L.ensureString(bound.values[i]!, span.expression));
           const raw = templateRawTextOf(span.literal);
           if (raw !== "") {
             pieces.push({ kind: "strLit", value: raw, type: STRING, loc: locOf(span.literal) });
           }
-        }
+        });
         if (pieces.length === 0) return { kind: "strLit", value: "", type: STRING, loc };
-        if (pieces.length === 1) return undefinedAsText(L, pieces[0]!, loc);
-        return pieces.reduce((acc, p) => ({ kind: "strConcat", left: acc, right: p, type: STRING, loc }));
+        if (pieces.length === 1) return afterArgs(bound.stmts, undefinedAsText(L, pieces[0]!, loc), loc);
+        return afterArgs(bound.stmts, pieces.reduce((acc, p) => ({ kind: "strConcat", left: acc, right: p, type: STRING, loc })), loc);
       }
       return lowerTaggedTemplate(L, expr);
     }
@@ -3170,6 +3173,66 @@ export function bindOnce(L: Lowerer, e: IrExpr, loc: SrcLoc, f: (read: IrExpr) =
   const read: IrExpr = { kind: "varRef", localId: t.id, type: e.type, loc };
   const result = f(read);
   return { kind: "seqExpr", stmts: [{ kind: "varDecl", localId: t.id, init: e, loc }], result, type: result.type, loc };
+}
+
+/** GH #117: operations that take a LIST of values and only then turn them
+ * into text. Node evaluates every argument of a console method or
+ * util.format before it formats any (formatWithOptions runs over the
+ * finished list), so `console.log(a, a.reverse())` prints the reversed
+ * array twice; `a + f()` evaluates both operands before ToPrimitive of
+ * either; String.raw receives its substitution values before it
+ * stringifies them. This tier converts a value where it stands in the
+ * list, which is the same thing only when nothing after it can write.
+ * So: when a value whose TEXT depends on the heap (anything but a number,
+ * string, boolean or unit — an array, record, Map, class instance, dyn
+ * value...) precedes the last value that may have an effect, every
+ * non-literal value up to that one is evaluated into a hidden local
+ * first, in source order, and the conversion reads the locals. A
+ * unit-typed value keeps only its effect (no local holds a bare unit) and
+ * converts as its literal. Pure reads and literals cost nothing:
+ * `console.log(a, b)` and `console.log(a, i)` are unchanged. `force`
+ * binds whenever some value may have an effect (util.format's `%c`
+ * consumes an argument it never converts, but Node still evaluates it).
+ * `deferred` replaces the heap test for an operation whose conversion
+ * copies only some kinds (Object.assign's dyn pack copies a static
+ * source, never a dyn one). The returned statements run, in order, before the operation
+ * (afterArgs). */
+export function evaluateArgsFirst(L: Lowerer, values: IrExpr[], loc: SrcLoc, force = false, deferred?: (t: IrType) => boolean): { stmts: IrStmt[]; values: IrExpr[] } {
+  let last = -1;
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (!droppableStatic(values[i]!)) {
+      last = i;
+      break;
+    }
+  }
+  const textOfHeap = (t: IrType): boolean =>
+    !(t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "void" || isUnitType(t));
+  // A fresh literal of literals (`{ k: 1 }`, `[10, 20]`) is out of every
+  // later argument's reach: converting it early is unobservable.
+  const constLit = (v: IrExpr): boolean =>
+    v.kind === "numLit" || v.kind === "strLit" || v.kind === "boolLit" || v.kind === "unitLit" ||
+    (v.kind === "arrayLit" && v.elems.every(constLit)) ||
+    (v.kind === "recordLit" && v.fields.every((f) => constLit(f.value)));
+  const needed = last >= 0 && (force || values.slice(0, last).some((v) => !constLit(v) && (deferred ?? textOfHeap)(v.type)));
+  if (!needed) return { stmts: [], values };
+  const stmts: IrStmt[] = [];
+  const out = values.map((v, i): IrExpr => {
+    if (i > last) return v;
+    if (v.kind === "numLit" || v.kind === "strLit" || v.kind === "boolLit" || v.kind === "unitLit") return v;
+    if (isUnitType(v.type)) {
+      stmts.push({ kind: "exprStmt", expr: v, loc });
+      return { kind: "unitLit", unit: v.type.kind === "nullT" ? "null" : "undefined", type: v.type, loc };
+    }
+    const t = L.declareHiddenLocal("%argfirst", v.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: v, loc });
+    return { kind: "varRef", localId: t.id, type: v.type, loc };
+  });
+  return { stmts, values: out };
+}
+
+/** `result` after `stmts` (evaluateArgsFirst's bound values). */
+export function afterArgs(stmts: IrStmt[], result: IrExpr, loc: SrcLoc): IrExpr {
+  return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: result.type, loc };
 }
 
 /** GH #101: reads undefElse hands its continuation — known to hold a
@@ -9166,12 +9229,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       case ts.SyntaxKind.PlusToken:
         if (bothNum) return { kind: "bin", op: "+", left, right, type: F64, loc };
         if (left.type.kind === "string" || right.type.kind === "string") {
-          return undefPlusGuard(L, left, right, loc, (l, r) => ({
+          // GH #117 sweep: both operands evaluate before either converts
+          // (`a + String(a.reverse())` joins the reversed array twice).
+          const ops = evaluateArgsFirst(L, [left, right], loc);
+          return afterArgs(ops.stmts, undefPlusGuard(L, ops.values[0]!, ops.values[1]!, loc, (l, r) => ({
             kind: "strConcat",
             left: L.ensureString(l, expr.left),
             right: L.ensureString(r, expr.right),
             type: STRING, loc,
-          }));
+          })), loc);
         }
         L.unsupported("SC1043", expr);
         break;

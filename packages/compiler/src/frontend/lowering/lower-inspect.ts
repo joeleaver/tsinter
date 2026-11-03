@@ -41,7 +41,7 @@ import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
-import { plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable, undefElse } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable, undefElse } from "./lower-exprs.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -1491,17 +1491,26 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
   if (argNodes.length === 0) return str("", loc);
   const first = argNodes[0]!;
   const firstIsLiteral = ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first);
+  // GH #117: every argument evaluates, in order, before any formats — a
+  // `%c` argument included (consumed and never printed, but evaluated).
+  const bound = evaluateArgsFirst(
+    L,
+    argNodes.map((n) => L.lowerExpr(n)),
+    loc,
+    firstIsLiteral && (first as ts.StringLiteralLike).text.includes("%c"),
+  );
+  const valueOf = new Map(argNodes.map((n, i) => [n, bound.values[i]!] as const));
 
   /** The rest-args tail: ` ` + (strings verbatim, everything else
    * inspected at the default depth). */
-  const restArg = (node: ts.Expression): IrExpr => formatSArg(L, node, L.lowerExpr(node), 2, loc);
+  const restArg = (node: ts.Expression): IrExpr => formatSArg(L, node, valueOf.get(node)!, 2, loc);
 
   if (!firstIsLiteral) {
-    const lowered = argNodes.map((n) => ({ node: n, value: L.lowerExpr(n) }));
+    const lowered = argNodes.map((n) => ({ node: n, value: valueOf.get(n)! }));
     if (lowered.length > 1) {
       // A runtime format string (board #237): Node's scan runs at run time.
       const runtime = lowerRuntimeFormat(L, lowered, "format", loc);
-      if (runtime !== null) return runtime;
+      if (runtime !== null) return afterArgs(bound.stmts, runtime, loc);
     }
     // No substitutions possible: every argument joins with spaces.
     const parts: IrExpr[] = [];
@@ -1509,7 +1518,7 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
       if (i > 0) parts.push(str(" ", loc));
       parts.push(formatSArg(L, lowered[i]!.node, lowered[i]!.value, 2, loc));
     }
-    return concatAll(parts, loc);
+    return afterArgs(bound.stmts, concatAll(parts, loc), loc);
   }
 
   const fmt = (first as ts.StringLiteralLike).text;
@@ -1535,7 +1544,7 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
           case 102: { // f
             const node = args[++a]!;
             if (lastPos !== i - 1) parts.push(str(fmt.slice(lastPos, i - 1), loc));
-            parts.push(convertSpecArg(L, nextChar, node, L.lowerExpr(node), loc));
+            parts.push(convertSpecArg(L, nextChar, node, valueOf.get(node)!, loc));
             lastPos = i + 1;
             continue;
           }
@@ -1570,7 +1579,7 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
     parts.push(str(" ", loc));
     parts.push(restArg(args[a]!));
   }
-  return concatAll(parts, loc);
+  return afterArgs(bound.stmts, concatAll(parts, loc), loc);
 }
 
 /* ── runtime format strings (board #237) ─────────────────────────────── */

@@ -7757,6 +7757,34 @@ export class DynBuilder {
     });
   }
 
+  /** %w.dyn.iterLive(d, msg) → the for-of source (GH #119): a dyn ARRAY
+   * is answered ITSELF, so the loop's index walk reads each element live
+   * and re-reads the length every step — ArrayIterator's walk, which sees
+   * elements the body pushes and stops early when it pops. Every other
+   * kind drains through iterPack (strings are immutable; an engine
+   * value steps through its own iterator protocol there). */
+  iterLive(): number {
+    return this.cached("iterLive", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const S = 2;
+      c.localGet(0);
+      c.localSet(S);
+      this.emitIterSrc(c, S);
+      c.localGet(S);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(S);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.iterPack());
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
+  }
+
   /** %w.dyn.spreadPush(vec, src, what, iterPath) — one spread source
    * FLATTENED onto an argument vector (INC-27 U5): the call-side
    * `f(...xs)` and Object.assign's source pack both build through it.

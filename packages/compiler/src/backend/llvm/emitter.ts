@@ -534,6 +534,7 @@ const LIB_FN_SYMS: Record<string, string> = {
   "json.parse": "scr_json_parse",
   "dyn.keySet": "scr_dyn_key_set",
   "dyn.iterPack": "scr_dyn_iter_pack",
+  "dyn.iterLive": "scr_dyn_iter_pack", // legacy lane: the snapshot
   "dyn.arrLen": "scr_dyn_arr_len",
   "dyn.arrAt": "scr_dyn_arr_at",
   "dyn.hasKey": "scr_dyn_has_key",
