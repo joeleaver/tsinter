@@ -1849,6 +1849,19 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "unionWrap":
         case "upcast":
           return deepFresh(e.value, fn, depth + 1);
+        case "ternary":
+          return deepFresh(e.then, fn, depth + 1) && deepFresh(e.else_, fn, depth + 1);
+        case "logical":
+        case "nullish":
+        case "orDefault": {
+          const r = e as unknown as { left: IrExpr; right: IrExpr };
+          return deepFresh(r.left, fn, depth + 1) && deepFresh(r.right, fn, depth + 1);
+        }
+        case "strIntrinsic":
+        case "regexIntrinsic":
+          // String and regex methods build what they return (`s.split("")`,
+          // a match array of strings).
+          return true;
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
           return !!b && !b.captured && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
