@@ -8931,8 +8931,12 @@ holes …", code SC1090 — S122 since GH #86; it was a catchable `Error`) once 
 past an end, or an elision) and the array holds an element's `undefined`. An array whose holes were all filled
 (the out-of-order fill) is exact everywhere; in a program that made a hole,
 an array holding an EXPLICIT `undefined` fences too (the over-approximation
-the missing per-element hole mark costs). `new Array(n)` stays a compile
-refusal. Since the GH #86 review the same holds for `in`/`Object.hasOwn` over an
+the missing per-element hole mark costs). `new Array(n)` with n > 0 makes n
+holes the same way (Step 2B; before it, a compile refusal); an n that is not
+a valid array length throws V8's `RangeError: Invalid array length`, and an
+n above 2^24 (16777216) stops the program by name ("new Array(n) with n above
+16777216", SC1090, S122): every hole is allocated here, where V8 keeps a large
+array sparse. Since the GH #86 review the same holds for `in`/`Object.hasOwn` over an
 index of a typed array after it crossed into a dynamic value (`[1, , 3]`
 passed to an untyped JavaScript function): the element's `undefined` there
 may be a hole, so the answer fences once the program has made one.

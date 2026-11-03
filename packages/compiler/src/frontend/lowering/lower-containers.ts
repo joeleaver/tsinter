@@ -6,6 +6,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
+import { lowerArrayFromIterable } from "./lower-stdlib-members.js";
 import { bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
@@ -279,7 +280,7 @@ function lowerOptionalDefaultArg(
     // included — Node returns the unchanged length); reduce/reduceRight
     // lower both declared forms (with and without an initial value).
     const arity = {
-      push: [0, Number.MAX_SAFE_INTEGER], pop: [0, 0], indexOf: [1, 1], includes: [1, 1], join: [1, 1],
+      push: [0, Number.MAX_SAFE_INTEGER], pop: [0, 0], indexOf: [1, 1], includes: [1, 1], join: [0, 1],
       concat: [0, Number.MAX_SAFE_INTEGER],
       slice: [0, 2], shift: [0, 0], splice: [1, 2], at: [1, 1],
       map: [1, 1], filter: [1, 1], forEach: [1, 1], find: [1, 1], findIndex: [1, 1], some: [1, 1],
@@ -519,7 +520,10 @@ function lowerOptionalDefaultArg(
       }
       const receiver = lowerMemberRecv(L, access);
       // Unit U (SEMANTICS.md S119): join(undefined) joins with ",".
-      const sep = undefinedAsAbsent(L, L.lowerExpr(call.arguments[0]!), { kind: "strLit", value: ",", type: STRING, loc });
+      // join() (Step 2B): an omitted separator is ","
+      const sep = call.arguments.length === 0
+        ? { kind: "strLit" as const, value: ",", type: STRING, loc }
+        : undefinedAsAbsent(L, L.lowerExpr(call.arguments[0]!), { kind: "strLit", value: ",", type: STRING, loc });
       return { kind: "arrIntrinsic", method: "join", receiver, args: [sep], type: STRING, loc };
     }
     // Unit U (SEMANTICS.md S119): the callbacks that SKIP holes in Node
@@ -2963,6 +2967,11 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     if (call.questionDotToken || access.questionDotToken) return null;
     if (!L.isStdlibGlobal(access.expression, "Array")) return null;
     if (access.name.text !== "from") return null;
+    // Step 2B: iterable sources, with or without a mapper (lower-stdlib-members.ts).
+    if (call.arguments.length >= 1 && !ts.isObjectLiteralExpression(call.arguments[0]!)) {
+      const fromIter = lowerArrayFromIterable(L, call);
+      if (fromIter) return fromIter;
+    }
     const loc = locOf(call);
     const args = call.arguments;
     // MAPPER-LESS `Array.from({ length: n })` (usually with an explicit
@@ -3290,8 +3299,25 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
     mapT: IrType & { kind: "map" },
     method: "keys" | "values" | "entries",): IrExpr {
     const loc = locOf(call);
+    // Step 2B: the sole argument of `new Set(...)` and of a mapper-less
+    // `Array.from(...)` drains on the spot too — no user code runs between
+    // the call and the drain there either.
+    let outer: ts.Node = call.parent;
+    while (ts.isParenthesizedExpression(outer)) outer = outer.parent;
+    const soleArg = (args: ts.NodeArray<ts.Expression> | undefined): boolean => {
+      if (args?.length !== 1) return false;
+      let a: ts.Expression = args[0]!;
+      while (ts.isParenthesizedExpression(a)) a = a.expression;
+      return a === call;
+    };
+    const immediateDrain =
+      (ts.isNewExpression(outer) && ts.isIdentifier(outer.expression) && outer.expression.text === "Set" &&
+        L.isStdlibSymbol(L.resolveValueSymbol(outer.expression) ?? undefined) && soleArg(outer.arguments)) ||
+      (ts.isCallExpression(outer) && ts.isPropertyAccessExpression(outer.expression) &&
+        outer.expression.name.text === "from" && L.isStdlibGlobal(outer.expression.expression, "Array") &&
+        soleArg(outer.arguments));
     const inArraySpread =
-      ts.isSpreadElement(call.parent) && ts.isArrayLiteralExpression(call.parent.parent);
+      (ts.isSpreadElement(call.parent) && ts.isArrayLiteralExpression(call.parent.parent)) || immediateDrain;
     if (!inArraySpread) {
       L.noLowering(
         `.${method}() outside an immediate array spread`,

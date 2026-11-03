@@ -6,7 +6,9 @@ Run with python3 -I from this directory: python3 -I collate.py npm|repo"""
 import gzip, json, os, re, sys, collections
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+RESULTS = os.environ.get("SURVEY_RESULTS", os.path.join(HERE, "results"))  # a re-run writes beside the committed tables
 CACHE = os.environ.get("SURVEY_CACHE", os.path.expanduser("~/.cache/tsinter-dl/survey"))
+RAW = os.environ.get("SURVEY_RAW", os.path.join(CACHE, "raw"))
 RANK = {"D": 3, "B": 2, "F": 1, "U": 0, "G": 0}
 INST = re.compile(r"\s*\(instantiating '[^']*'\)")
 BUILTIN_REASON = re.compile(r"^(SC\d+): the '([^']+)' module is not supported yet")
@@ -45,7 +47,7 @@ def jsonl(path):
 
 def collate(stratum, meta):
     pid = meta["id"]
-    d = os.path.join(CACHE, "raw", stratum)
+    d = os.path.join(RAW, stratum)
     planf = os.path.join(d, pid + ".plan.json")
     plan = json.load(open(planf)) if os.path.exists(planf) else {"entries": []}
     rows = jsonl(os.path.join(d, pid + ".jsonl"))
@@ -121,7 +123,7 @@ def collate(stratum, meta):
                 sites[key] = (k, s.get("t", -1), s.get("s", ""))
     gate_entries, gate_crashes = 0, 0
     if stratum == "repo":
-        for r in jsonl(os.path.join(CACHE, "raw", "repogate", pid + ".jsonl")):
+        for r in jsonl(os.path.join(RAW, "repogate", pid + ".jsonl")):
             if r.get("crash") or r.get("processCrash") or r.get("timeout") or r.get("budget"):
                 gate_crashes += 1
                 continue
@@ -156,8 +158,8 @@ def collate(stratum, meta):
 
 def main():
     stratum = sys.argv[1]
-    os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
-    out = os.path.join(HERE, "results", stratum + ".jsonl.gz")
+    os.makedirs(os.path.join(RESULTS), exist_ok=True)
+    out = os.path.join(RESULTS, stratum + ".jsonl.gz")
     n = 0
     with gzip.GzipFile(out, "wb", mtime=0) as gz:
         if stratum == "npm":

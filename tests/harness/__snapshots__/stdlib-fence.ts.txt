@@ -107,7 +107,7 @@ stdlib-fence.ts:26:7 - error SC2020: 'ArrayBuffer' is part of the standard libra
   25 | const px = new Proxy({ a: 1 }, {});
   26 | const buf = new ArrayBuffer(8);
      |       ^~~
-  27 | const st = new Set(new Set([1, 2])); // array seeds lower; Set/iterable seeds stay fenced
+  27 | const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
 
   hint: no free-standing ArrayBuffer value exists — typed arrays own their storage (new Uint8Array(n) allocates; new Uint8Array(new ArrayBuffer(n)) erases the buffer into the view)
 
@@ -116,15 +116,24 @@ stdlib-fence.ts:26:13 - error SC2020: 'new ArrayBuffer' is part of the standard 
   25 | const px = new Proxy({ a: 1 }, {});
   26 | const buf = new ArrayBuffer(8);
      |             ^~~~~~~~~~~~~~~~~~
-  27 | const st = new Set(new Set([1, 2])); // array seeds lower; Set/iterable seeds stay fenced
+  27 | const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
 
   hint: no free-standing ArrayBuffer value exists — typed arrays own their storage: allocate the view directly (new Uint8Array(n)), or erase a fresh buffer into one (new Uint8Array(new ArrayBuffer(n)), new DataView(new ArrayBuffer(n), ...))
+
+stdlib-fence.ts:27:7 - error SC2009: values of type 'Set<[number, number]>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — '[number, number]' is outside that domain
+
+  26 | const buf = new ArrayBuffer(8);
+  27 | const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
+     |       ^~
+  28 | // (new Error / TypeError / RangeError / SyntaxError now LOWER — the error
+
+  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
 stdlib-fence.ts:27:12 - error SC2020: 'new Set(values)' is part of the standard library types but has no scriptc lowering yet
 
   26 | const buf = new ArrayBuffer(8);
-  27 | const st = new Set(new Set([1, 2])); // array seeds lower; Set/iterable seeds stay fenced
-     |            ^~~~~~~~~~~~~~~~~~~~~~~~
+  27 | const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
+     |            ^~~~~~~~~~~~~~~~~~~~~~~~~~
   28 | // (new Error / TypeError / RangeError / SyntaxError now LOWER — the error
 
   hint: construct the Set empty and add() each value — only an array of already-legal elements (string or number) seeds a Set
@@ -188,15 +197,15 @@ stdlib-fence.ts:41:14 - error SC2020: 'string.normalize' is part of the standard
   40 | const arrAt = [1, 2].at(0);
   41 | const norm = "abc".normalize();
      |              ^~~~~~~~~~~~~~~
-  42 | const limited = "a,b,c".split(",", 2); // the string-separator split lowers; the limit form stays fenced
+  42 | const limited = [1, 2].lastIndexOf(2); // split with a limit lowers now (Step 2B); array lastIndexOf stays fenced
 
   hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
 
-stdlib-fence.ts:42:17 - error SC2020: '.split with 2 arguments on strings' is part of the standard library types but has no scriptc lowering yet
+stdlib-fence.ts:42:17 - error SC2020: 'number[].lastIndexOf' is part of the standard library types but has no scriptc lowering yet
 
   41 | const norm = "abc".normalize();
-  42 | const limited = "a,b,c".split(",", 2); // the string-separator split lowers; the limit form stays fenced
-     |                 ^~~~~~~~~~~~~~~~~~~~~
+  42 | const limited = [1, 2].lastIndexOf(2); // split with a limit lowers now (Step 2B); array lastIndexOf stays fenced
+     |                 ^~~~~~~~~~~~~~~~~~
   43 | const fixed = (1.5).toFixed(); // digit-free toFixed lowers now (the static ties-up integer)
 
   hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
@@ -215,22 +224,13 @@ stdlib-fence.ts:49:15 - error SC2020: '.indexOf with 2 arguments' is part of the
   48 | const nums = [1, 2, 3];
   49 | const found = nums.indexOf(2, 1);
      |               ^~~~~~~~~~~~~~~~~~
-  50 | const joined = nums.join();
+  50 | const joined = nums.join(); // join() lowers now (Step 2B)
 
   hint: the fromIndex parameter has no lowering — slice first, or loop
 
-stdlib-fence.ts:50:16 - error SC2020: '.join with 0 arguments' is part of the standard library types but has no scriptc lowering yet
-
-  49 | const found = nums.indexOf(2, 1);
-  50 | const joined = nums.join();
-     |                ^~~~~~~~~~~
-  51 | nums.forEach((x) => console.log(x), { unused: true }); // thisArg stays fenced
-
-  hint: pass the separator explicitly: join(",")
-
 stdlib-fence.ts:51:1 - error SC2020: '.forEach with 2 arguments' is part of the standard library types but has no scriptc lowering yet
 
-  50 | const joined = nums.join();
+  50 | const joined = nums.join(); // join() lowers now (Step 2B)
   51 | nums.forEach((x) => console.log(x), { unused: true }); // thisArg stays fenced
      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   52 | const pos = "abc".includes("b", 1); // the position form lowers now (indexOf's clamp)

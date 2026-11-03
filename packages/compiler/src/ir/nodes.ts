@@ -2106,6 +2106,10 @@ export type IrLibFn =
    * with exact binary-value rounding and THROWS RangeError outside 0..100.
    * Successful results +1. */
   | "num.toExponential"
+  /** Number.prototype.toString(radix) of a finite nonzero number for an
+   * integral radix in [2, 36] (the frontend handles the rest): V8's
+   * DoubleToRadixStringView, digit for digit. */
+  | "num.toRadix"
   | "num.toFixed0"
   | "num.toFixed"
   /** Object.is over two numbers — the spec's SameValue on doubles: NaN

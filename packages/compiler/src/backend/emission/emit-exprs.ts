@@ -6296,6 +6296,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "dyn.argStr":
           case "stream.hostDefaultHwm":
           case "url.pathToFileURLHost":
+          case "num.toRadix":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
           default: {
             const _exhaustive: never = fn;

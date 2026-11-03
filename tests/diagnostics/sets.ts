@@ -2,10 +2,10 @@
 // messages. Elements are Map's KEY types (string or number — SameValueZero
 // hashing is honest for exactly those); everything else is fenced.
 
-// Array seeds lower (`new Set(["a", "b"])` is a corpus program now); a
-// non-array seed — another Set, any iterable — typechecks against the lib
-// but keeps the fence: never silently an empty set.
-const seeded = new Set(new Set(["a", "b"]));
+// Array, Set, string and tuple seeds lower (Step 2B); a seed whose values
+// are not legal elements — a Map's [key, value] entries — typechecks
+// against the lib but keeps the fence: never silently an empty set.
+const seeded = new Set(new Map([["a", 1]]));
 
 // Elements must be string or number — the new-site diagnostic names the
 // element type.

@@ -1,8 +1,8 @@
 scriptc coverage tests/coverage-fixtures/dynamic-mix.ts
 
   statements analyzed   9
-  compile statically    3  (33%)
-  compile dynamically   5  (55%) (island sites — the embedded engine runs them)
+  compile statically    4  (44%)
+  compile dynamically   4  (44%) (island sites — the embedded engine runs them)
 
   blockers:
       ×1  loose equality (== and !=)  SC1040

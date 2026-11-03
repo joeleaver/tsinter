@@ -24692,6 +24692,16 @@ class Assembler {
           code.call(this.toExponentialHelper());
           return;
         }
+        if (e.fn === "num.toRadix") {
+          // The dyn toString arm's own transcription of V8's
+          // DoubleToRadixStringView; its preconditions (x finite and
+          // nonzero, radix integral in [2, 36]) are the frontend's.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.i32TruncF64S();
+          code.call(this.toRadixHelper());
+          return;
+        }
         // ── end INC-25 P4 ────────────────────────────────────────────
         // ── INC-25 pass P5 (design-number-v6.txt §5.4/§7.6, CP1
         // §1/§5-§12; CP2 not yet reached). The "string.*" family's three

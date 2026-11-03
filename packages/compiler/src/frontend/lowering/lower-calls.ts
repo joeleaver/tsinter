@@ -18,6 +18,7 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
+import { lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { checkAfterArgs, undefFenceGuard, isUndefExpr, slotUndefOf, undefElse, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -3435,6 +3436,20 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (arg.type.kind === "string") {
         return { kind: "libCall", fn: "num.fromString", args: [arg], type: F64, loc };
       }
+      // Step 2B: a checked-dynamic value (`unknown`), and a union of
+      // primitive and unit arms (`string | undefined`), take the dyn
+      // tree's own ToNumber — undefined NaN, null 0, booleans 1/0, strings
+      // the StringNumericLiteral grammar, a symbol V8's TypeError.
+      if (arg.type.kind === "dyn") {
+        return { kind: "libCall", fn: "dyn.toNumber", args: [arg], type: F64, loc };
+      }
+      if (arg.type.kind === "union") {
+        const arms = L.unions.get(arg.type.unionId)?.arms ?? [];
+        const primitive = arms.every((a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || a.kind === "undefinedT" || a.kind === "nullT");
+        if (primitive && arms.length > 0 && L.dynConvertible(arg.type)) {
+          return { kind: "libCall", fn: "dyn.toNumber", args: [{ kind: "dynFrom", value: arg, type: DYN, loc }], type: F64, loc };
+        }
+      }
       L.noLowering(
         `Number of ${L.fmt(arg.type)} values`,
         argNode,
@@ -4178,6 +4193,12 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         L.lowerDateCall(expr, expr.expression) ??
         L.lowerTextCodecCall(expr, expr.expression) ??
         L.lowerStringStaticCall(expr, expr.expression) ??
+        // Step 2B: string and array members with no intrinsic of their
+        // own, desugared onto existing ones (lower-stdlib-members.ts).
+        lowerStringFromCodePoint(L, expr, expr.expression) ??
+        lowerStringMemberExtra(L, expr, expr.expression) ??
+        lowerArrayMemberExtra(L, expr, expr.expression) ??
+        lowerArrayFill(L, expr, expr.expression) ??
         L.lowerStringLastIndexOfCall(expr, expr.expression) ??
         L.lowerPromiseMethodCall(expr, expr.expression) ??
         // Homogeneous promise-tuple literals claim BEFORE the static path
@@ -5159,6 +5180,13 @@ const inliningPredicates = new Set<ts.Symbol>();
       if (operand.type.kind === "string") return operand; // identity
       if (operand.type.kind !== "f64" && operand.type.kind !== "bool") return null;
       return { kind: "toString", operand, type: STRING, loc };
+    }
+    // `n.toString(radix)` — Step 2B (lower-stdlib-members.ts).
+    if (L.undefSlots && name === "toString" && recvKind === "f64" && call.arguments.length === 1 &&
+        !ts.isSpreadElement(call.arguments[0]!)) {
+      const operand = undefRecvGuard(L, L.lowerExpr(recv), name, loc);
+      if (operand.type.kind !== "f64") return null;
+      return lowerNumberToStringRadix(L, operand, call.arguments[0]!, loc);
     }
     if ((name === "toExponential" || name === "toFixed") && recvKind === "f64" &&
         call.arguments.length === 0) {
@@ -8030,7 +8058,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       }
       if (probed?.type.kind !== "record") return null;
       const shape = L.shapes.get(probed.type.shapeId);
-      if (!shape || shape.tuple || shape.indexValue || shapeHasAccessorSlots(shape)) return null;
+      if (!shape || shape.tuple || (!shape.indexValue && shapeHasAccessorSlots(shape))) return null;
       const loc = locOf(call);
       const receiver = undefToObjectGuard(L, L.lowerExpr(recvNode), locOf(call));
       if (receiver.type.kind !== "record") return null; // probe/lower drift: keep the fence
@@ -8041,7 +8069,10 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
       }
       if (key.type.kind !== "string") return null;
-      const helper = recordHasOwnHelper(L, receiver.type.shapeId, loc);
+      key = undefinedAsText(L, key, locOf(keyNode)); // GH #104: ToPropertyKey of undefined is "undefined"
+      // Index-signature shapes (Step 2B): own membership is the declared
+      // names plus the overflow keys (lower-stdlib-members.ts).
+      const helper = shape.indexValue ? recordHasOwnIndexHelper(L, receiver.type.shapeId, loc) : recordHasOwnHelper(L, receiver.type.shapeId, loc);
       return { kind: "call", callee: helper, args: [receiver, key], type: BOOL, loc };
     }
     if (member !== "keys" && member !== "values" && member !== "entries") return null;

@@ -5,6 +5,7 @@ Run from this directory with python3 -I report.py npm|repo [--unmatched]"""
 import collections, gzip, json, os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+RESULTS = os.environ.get("SURVEY_RESULTS", os.path.join(HERE, "results"))
 sys.path.insert(0, HERE)
 from families import TITLES, classify  # noqa: E402
 
@@ -17,7 +18,7 @@ ENV = {"tsc:missing-dep", "tsc:knock-on", "tsc:ambient"}  # mostly the survey en
 
 
 def load(stratum):
-    with gzip.open(os.path.join(HERE, "results", stratum + ".jsonl.gz"), "rt") as fh:
+    with gzip.open(os.path.join(RESULTS, stratum + ".jsonl.gz"), "rt") as fh:
         return [json.loads(l) for l in fh]
 
 
@@ -290,7 +291,7 @@ def main():
     w("## Lists\n")
     w("Clean: " + ", ".join(sorted(p["name"] for p in pkgs if p["verdict"] == "clean")) + "\n")
     text = "\n".join(out)
-    open(os.path.join(HERE, "results", f"tables-{stratum}.md"), "w").write(text)
+    open(os.path.join(RESULTS, f"tables-{stratum}.md"), "w").write(text)
     print(text)
     if "--unmatched" in sys.argv:
         c = collections.Counter()

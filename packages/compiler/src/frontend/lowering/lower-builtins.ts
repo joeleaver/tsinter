@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText } from "./lower-exprs.js";
+import { bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -6470,6 +6470,31 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       return { kind: "libCall", fn, args: [arg], type: BOOL, loc };
     }
     if (member === "parseFloat" || member === "parseInt") {
+      // Number.parseInt / Number.parseFloat ARE the global functions
+      // (`Number.parseInt === parseInt`, ES2015 20.1.2.12/13): the same
+      // static lowerings — num.parseInt with the omitted radix completed
+      // to 0 (the spec's undefined: base 10 with the 0x escape), and
+      // num.parseFloat over a string argument. Other argument types keep
+      // the island path below (or its fence).
+      if (!call.arguments.some((a) => ts.isSpreadElement(a))) {
+        if (member === "parseInt" && (call.arguments.length === 1 || call.arguments.length === 2)) {
+          // GH #104 (SEMANTICS.md S119): ToString of a slot holding
+          // undefined is the text "undefined" (NaN).
+          const s = undefinedAsText(L, L.lowerExprExpecting(call.arguments[0]!, STRING), loc);
+          const radix: IrExpr = call.arguments[1]
+            ? L.lowerExprExpecting(call.arguments[1], F64)
+            : { kind: "numLit", value: 0, type: F64, loc };
+          if (s.type.kind === "string" && radix.type.kind === "f64") {
+            return { kind: "libCall", fn: "num.parseInt", args: [s, radix], type: F64, loc };
+          }
+        }
+        if (member === "parseFloat" && call.arguments.length === 1) {
+          const probed = probeLower(L, call.arguments[0]!);
+          if (probed?.type.kind === "string") {
+            return { kind: "libCall", fn: "num.parseFloat", args: [undefinedAsText(L, probed, loc)], type: F64, loc };
+          }
+        }
+      }
       const want = member === "parseFloat" ? 1 : 2;
       if (call.arguments.length !== want) {
         L.noLowering(

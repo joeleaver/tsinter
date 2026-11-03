@@ -50,7 +50,7 @@ const { analyze, compile } = await import(DIST);
 const ts = createRequire(join(REPO, "packages/compiler/package.json"))("typescript5");
 const CACHE = process.env.SURVEY_CACHE ?? join(process.env.HOME, ".cache/tsinter-dl/survey");
 const [stratum, id] = process.argv.slice(2);
-const dir = join(CACHE, "raw", stratum);
+const dir = join(process.env.SURVEY_RAW ?? join(CACHE, "raw"), stratum);
 const plan = JSON.parse(readFileSync(join(dir, `${id}.plan.json`), "utf8"));
 const out = join(dir, `${id}.jsonl`);
 const done = new Set(existsSync(out) ? readFileSync(out, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).entry) : []);

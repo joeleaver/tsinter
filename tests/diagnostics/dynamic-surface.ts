@@ -6,7 +6,7 @@
 // variants, parseInt, isNaN, and the global parseFloat/isFinite over
 // exactly-typed arguments, and string-pattern replace/replaceAll —
 // board #301 — compile statically now and no longer appear
-// here.)
+// here; so do Number.parseInt/parseFloat and n.toString(radix), Step 2B.)
 const price = (19.99).toPrecision(4);
 const ch = "hello".at(0);
-const n = Number.parseFloat("3.14");
+// (Number.parseFloat("3.14") stood here; it lowers statically since Step 2B.)

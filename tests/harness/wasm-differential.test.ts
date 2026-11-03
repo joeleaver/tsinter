@@ -3705,6 +3705,8 @@ const TIER_FLOOR: string[] = [
   "2913-cycle-reaches-pending-module/main.ts",
   "2914-cycle-var-early-write/main.ts",
   "2915-cjs-default-reexport/main.ts",
+  "2920-stdlib-strings-numbers.ts",
+  "2921-stdlib-arrays-iterables.ts",
   "2940-cjs-export-value-copy/main.ts",
   "2941-cjs-export-value-copy-require/main.cjs",
   "2942-cjs-export-value-copy-mjs/main.mjs",

@@ -12,6 +12,7 @@ import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExports
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable, undefinedAsAbsent } from "./lower-exprs.js";
+import { lowerNewArrayLength, lowerSetFromIterable } from "./lower-stdlib-members.js";
 import { lowerSearchParamsNew, lowerUrlBaseArgs } from "./lower-builtins.js";
 import { requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { STREAM_API_MEMBERS, STREAM_PROP_MEMBERS, UNDERSCORE_METHODS, lowerStreamNew, lowerStreamSuperCall, streamCtorShape } from "./lower-stream.js";
@@ -5149,6 +5150,18 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
           L.noLowering("new Array with spread arguments", expr, "write the array literal: [...xs]");
         }
         if (args.length === 1 && L.mapTypeOf(L.typeOf(args[0]!))?.kind === "f64") {
+          // Step 2B: on the WasmGC lanes the holes are the element's
+          // undefined, the gap representation (lower-stdlib-members.ts).
+          let lenT = L.mapTypeOf(L.typeOf(expr));
+          if (lenT?.kind !== "array") {
+            const ctx = L.checker.getContextualType(expr);
+            const ctxMapped = ctx ? L.mapTypeOf(ctx) : null;
+            if (ctxMapped?.kind === "array") lenT = ctxMapped;
+          }
+          if (lenT?.kind === "array") {
+            const holes = lowerNewArrayLength(L, args[0]!, lenT, loc);
+            if (holes) return holes;
+          }
           L.noLowering(
             "new Array(count)",
             expr,
@@ -5334,6 +5347,11 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
             const seed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(first.type), loc };
             return { kind: "setNew", seed, type: setT, loc };
           }
+        }
+        // Step 2B: any other iterable seed [...x] reads (lower-stdlib-members.ts).
+        if (mapped?.kind === "set" && (expr.arguments?.length ?? 0) === 1) {
+          const fromIter = lowerSetFromIterable(L, expr.arguments![0]!, mapped, loc);
+          if (fromIter) return fromIter;
         }
         if ((expr.arguments?.length ?? 0) > 0) {
           L.noLowering(

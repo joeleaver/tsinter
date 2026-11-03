@@ -29,7 +29,13 @@ function targets() {
 
 function spawnWorker(t) {
   return new Promise((done) => {
-    const ch = spawn(process.execPath, ["--max-old-space-size=6144", join(HERE, "worker.mjs"), stratum, t.id], { cwd: HERE, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    // Each worker runs in its own memory cap (a transient systemd scope; the
+    // box is shared): a worker the cap kills is a runaway, recorded as a
+    // timeout below. SURVEY_MEMMAX=0 runs uncapped.
+    const memMax = process.env.SURVEY_MEMMAX ?? "14G";
+    const argv = [process.execPath, "--max-old-space-size=6144", join(HERE, "worker.mjs"), stratum, t.id];
+    const capped = memMax !== "0" ? ["systemd-run", "--user", "--scope", "-q", "-p", `MemoryMax=${memMax}`, "-p", "MemorySwapMax=0", ...argv] : argv;
+    const ch = spawn(capped[0], capped.slice(1), { cwd: HERE, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let current = null, kind = "primary", stderr = "", timer, buf = "", timedOut = false;
     const kill = () => { try { process.kill(-ch.pid, "SIGKILL"); } catch {} };
     const arm = () => {
@@ -69,7 +75,10 @@ async function runTarget(t) {
     const r = await spawnWorker(t);
     if (r.code === 0 && !r.timedOut) break;
     const entry = r.current ?? "<startup>";
-    appendJsonl(out, r.timedOut ? { entry, kind: t.kinds.get(entry), timeout: true } : { entry, kind: t.kinds.get(entry), processCrash: { code: r.code, signal: r.signal, stderr: r.stderr } });
+    // A SIGKILL this driver did not send is the memory cap's: a runaway,
+    // recorded as a timeout (the scope reports it as signal or as exit 137).
+    const capKilled = !r.timedOut && (r.signal === "SIGKILL" || r.code === 137);
+    appendJsonl(out, r.timedOut || capKilled ? { entry, kind: t.kinds.get(entry), timeout: true, ...(capKilled ? { memCap: true } : {}) } : { entry, kind: t.kinds.get(entry), processCrash: { code: r.code, signal: r.signal, stderr: r.stderr } });
     if (entry === "<startup>") break;
     if (Date.now() - started > TARGET_BUDGET) {
       const have = new Set(readJsonl(out).map((x) => x.entry));

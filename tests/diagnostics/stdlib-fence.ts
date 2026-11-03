@@ -24,7 +24,7 @@ const d = new Date();
 const wm = new WeakMap();
 const px = new Proxy({ a: 1 }, {});
 const buf = new ArrayBuffer(8);
-const st = new Set(new Set([1, 2])); // array seeds lower; Set/iterable seeds stay fenced
+const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
 // (new Error / TypeError / RangeError / SyntaxError now LOWER — the error
 // battery lives in the corpus; what stays fenced is the rest of the family
 // and the unlowered members of lowered error objects.)
@@ -39,7 +39,7 @@ const clamped = Math.min(1, ...[2, 3]);
 const entries = [1, 2].entries();
 const arrAt = [1, 2].at(0);
 const norm = "abc".normalize();
-const limited = "a,b,c".split(",", 2); // the string-separator split lowers; the limit form stays fenced
+const limited = [1, 2].lastIndexOf(2); // split with a limit lowers now (Step 2B); array lastIndexOf stays fenced
 const fixed = (1.5).toFixed(); // digit-free toFixed lowers now (the static ties-up integer)
 const localized = (1234.5).toLocaleString();
 
@@ -47,7 +47,7 @@ const localized = (1234.5).toLocaleString();
 // no fenced form remains to pin.)
 const nums = [1, 2, 3];
 const found = nums.indexOf(2, 1);
-const joined = nums.join();
+const joined = nums.join(); // join() lowers now (Step 2B)
 nums.forEach((x) => console.log(x), { unused: true }); // thisArg stays fenced
 const pos = "abc".includes("b", 1); // the position form lowers now (indexOf's clamp)
 const rev = JSON.parse("1", (_k, v) => v);

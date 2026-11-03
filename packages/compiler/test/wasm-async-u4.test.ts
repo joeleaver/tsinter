@@ -807,9 +807,11 @@ test("HO02 HOLES: Array.from number-or-undefined holes", async () => {
   expect(exitCode).toBe(0);
 });
 
-test("HO03 HOLES: B-i: new Array(n) of numbers", async () => {
-  const { diagnostics, survey } = await refuseRow("HO03", "const a: number[] = new Array<number>(3);\nconsole.log(a.length, a[0], String(a[1]));", "ts");
-  expect(diagnostics).toEqual(["SC2020:'new Array(count)' is part of the standard library types but has no scriptc lowering yet"]);
+test("HO03 HOLES: new Array(n) of numbers holds holes read as undefined (Step 2B, S119)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("HO03", "const a: number[] = new Array<number>(3);\nconsole.log(a.length, a[0], String(a[1]));", "ts");
+  expect(stdout).toBe("3 undefined undefined\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("HO04 HOLES: B-i: Array.from of numbers", async () => {
@@ -827,9 +829,11 @@ test("HO06 HOLES: B-i: Array.from of a union without undefined", async () => {
   expect(diagnostics).toEqual(["SC1090:typeof expressions on statically-typed values are not supported yet", "SC2020:'Array.from with this argument shape' is part of the standard library types but has no scriptc lowering yet"]);
 });
 
-test("HO07 HOLES: B-i: new Array(n) of a union with undefined", async () => {
-  const { diagnostics, survey } = await refuseRow("HO07", "const a = new Array<string | undefined>(2);\nconsole.log(a.length, a[0] === undefined);", "ts");
-  expect(diagnostics).toEqual(["SC2020:'new Array(count)' is part of the standard library types but has no scriptc lowering yet"]);
+test("HO07 HOLES: new Array(n) of a union with undefined (Step 2B, S119)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("HO07", "const a = new Array<string | undefined>(2);\nconsole.log(a.length, a[0] === undefined);", "ts");
+  expect(stdout).toBe("2 true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ============================================================

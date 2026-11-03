@@ -578,9 +578,9 @@ test("row57 B-i [plain]: join over (record|record)[] with an explicit separator"
   ]);
 });
 
-test("row58 B-i [plain]: join with ZERO arguments (the arity fence — number[]; the ONLY row asserting this fence)", async () => {
-  const diags = await runRowRefuse("row58", "const a: number[] = [1, -0, NaN]; console.log(a.join());", false);
-  expect(diags).toEqual(["SC2020:'.join with 0 arguments' is part of the standard library types but has no scriptc lowering yet"]);
+test("row58 [plain]: join with ZERO arguments joins with \",\" (Step 2B; the arity fence it pinned is gone)", async () => {
+  const out = await runRow("row58", "const a: number[] = [1, -0, NaN]; console.log(a.join());");
+  expect(out).toBe("1,0,NaN\n");
 });
 
 test("row59 B-i [plain]: an array of Date (element does not compile) — the EXACT two-diagnostic set, an explicit separator so the arity fence never fires here (row58 alone owns it)", async () => {

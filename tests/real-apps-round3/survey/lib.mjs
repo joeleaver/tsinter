@@ -16,7 +16,7 @@ export const TARBALLS = join(ROOT, "tarballs");
 export const PACKUMENTS = join(ROOT, "packuments");
 export const TREES = join(ROOT, "npm");
 export const REPOS = join(ROOT, "repos");
-export const RAW = join(ROOT, "raw");
+export const RAW = process.env.SURVEY_RAW ?? join(ROOT, "raw"); // SURVEY_RAW: a re-run beside the committed one
 for (const d of [DATA, ROOT, TARBALLS, PACKUMENTS, TREES, REPOS, RAW]) mkdirSync(d, { recursive: true });
 
 // npm's own bundled semver (ships with node, not a surveyed package).

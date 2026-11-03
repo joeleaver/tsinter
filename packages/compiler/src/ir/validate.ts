@@ -274,6 +274,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "str.encodeUri": { argTypes: [STRING], result: STRING },
   "regexp.escape": { argTypes: [STRING], result: STRING },
   "num.toExponential": { argTypes: [F64], result: STRING },
+  "num.toRadix": { argTypes: [F64, F64], result: STRING },
   "num.toFixed0": { argTypes: [F64], result: STRING },
   "num.toFixed": { argTypes: [F64, F64], result: STRING },
   "num.sameValue": { argTypes: [F64, F64], result: BOOL },

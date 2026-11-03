@@ -1,7 +1,16 @@
+sets.ts:8:7 - error SC2009: values of type 'Set<[string, number]>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — '[string, number]' is outside that domain
+
+  7 | // against the lib but keeps the fence: never silently an empty set.
+  8 | const seeded = new Set(new Map([["a", 1]]));
+    |       ^~~~~~
+  9 | 
+
+  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
+
 sets.ts:8:16 - error SC2020: 'new Set(values)' is part of the standard library types but has no scriptc lowering yet
 
-  7 | // but keeps the fence: never silently an empty set.
-  8 | const seeded = new Set(new Set(["a", "b"]));
+  7 | // against the lib but keeps the fence: never silently an empty set.
+  8 | const seeded = new Set(new Map([["a", 1]]));
     |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
   9 | 
 

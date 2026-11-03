@@ -6522,8 +6522,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * for the test; anything else meets the backend's named fence. */
   export function lowerForOf(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
     if (!L.undefSlots || stmt.awaitModifier) return lowerForOfImpl(L, stmt);
-    const k = L.mapTypeOf(L.typeOf(stmt.expression))?.kind;
-    if (k !== "array") return lowerForOfImpl(L, stmt); // strings: the desugar checks (notIterableCheck)
+    const mapped = L.mapTypeOf(L.typeOf(stmt.expression));
+    const k = mapped?.kind;
+    // Arrays, and (Step 2B) tuples, whose positions the loop walks.
+    const tuple = mapped?.kind === "record" && L.shapes.get(mapped.shapeId)?.tuple === true;
+    if (k !== "array" && !tuple) return lowerForOfImpl(L, stmt); // strings: the desugar checks (notIterableCheck)
     const pureSyntax = (n: ts.Expression): boolean => {
       while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n)) n = n.expression;
       if (ts.isIdentifier(n) || n.kind === ts.SyntaxKind.ThisKeyword) return true;
@@ -6536,7 +6539,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     const spelling = iterableSpelling(stmt.expression);
     if (!pureSyntax(stmt.expression) || spelling === null) return lowerForOfImpl(L, stmt);
     const probe = L.lowerExpr(stmt.expression);
-    if (!mayHoldSlotUndef(L, probe) || probe.type.kind !== "array") return lowerForOfImpl(L, stmt);
+    if (!mayHoldSlotUndef(L, probe) || (probe.type.kind !== "array" && probe.type.kind !== "record")) return lowerForOfImpl(L, stmt);
     const check = notIterableCheck(probe, stmt.expression, locOf(stmt.expression));
     const loop = lowerForOfImpl(L, stmt);
     return { kind: "block", body: [check, loop], loc: locOf(stmt) };
@@ -6846,16 +6849,26 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             elemT = { kind: "union", unionId: L.unions.intern(arms) };
           }
         }
-        if (elemT !== null && pureReemittable(iterable)) {
+        if (elemT !== null) {
           const loc = locOf(stmt.expression);
           const shapeId = iterable.type.shapeId;
           const snapshotElem = elemT;
-          iterable = {
+          // Step 2B: an impure receiver (the `for (const k of ["a", "b"]
+          // as const)` literal, a call) evaluates once into a hidden
+          // local at loop entry, and the positions read from that.
+          let pre: IrStmt | null = null;
+          let tupleRead: IrExpr = iterable;
+          if (!pureReemittable(iterable)) {
+            const tmp = L.declareHiddenLocal("%tuple", iterable.type);
+            pre = { kind: "varDecl", localId: tmp.id, init: iterable, loc };
+            tupleRead = { kind: "varRef", localId: tmp.id, type: iterable.type, loc };
+          }
+          const snapshot: IrExpr = {
             kind: "arrayLit",
             elems: byIndex.map((f) => {
               const read: IrExpr = {
                 kind: "recordGet",
-                obj: iterable,
+                obj: tupleRead,
                 shapeId,
                 field: f.name,
                 type: f.type,
@@ -6868,6 +6881,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             type: arrayOf(snapshotElem),
             loc,
           };
+          iterable = pre === null ? snapshot : { kind: "seqExpr", stmts: [pre], result: snapshot, type: snapshot.type, loc };
         } else {
           L.noLowering("for-of over tuples", stmt.expression,
             "tuples with union-typed or unrepresentable positions are fixed-shape — read t[0], t[1], ... directly (plain-position tuples purely iterate)");

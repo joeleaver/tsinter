@@ -214,15 +214,14 @@ describe("board #149: Buffer.fill/fillNum/fillStr/compareBuf — every row measu
   });
 });
 
-// board #141 — number.toString(radix): B1 does NOT build a static arm
+// board #141 — number.toString(radix): Step 2B built the static arm (the
+// rows below were the pinned refusal; history kept). B1 did NOT build it
 // (P6-J5): the deliverable is (i) a pinned refusal row (SC2012's code AND
 // hint text, all four forms) under a static build, and its acceptance
 // under --dynamic; (ii) Node's oracle, committed as a hashed probe
 // (inc26-work/inc26/rev27/probes/b1/141-toradix.out, re-verified
 // byte-identical against a fresh `node v24.18.1` run this session — the
 // spec the later cross-lane unit is held to). The board stays OPEN.
-const RADIX_HINT =
-  "build with --dynamic to run this call in the embedded engine (adds ~620KB to the binary); static builds never include it";
 const RADIX_FORMS: { label: string; lines: string[] }[] = [
   { label: "literal-receiver", lines: ["console.log((255).toString(16));"] },
   { label: "number-local", lines: ["const n = 255;", "console.log(n.toString(16));"] },
@@ -233,17 +232,12 @@ const RADIX_FORMS: { label: string; lines: string[] }[] = [
   },
 ];
 
-describe("board #141: number.toString(radix) refuses SC2012 under a static build (all four forms, identical code+hint), and all four compile under --dynamic", () => {
+describe("board #141: number.toString(radix) compiles under a static build (Step 2B) and under --dynamic, all four forms", () => {
   for (const form of RADIX_FORMS) {
-    test(`${form.label} — static: SC2012 with the generic dynamic-engine hint (never surfaces.ts's OWN radix hint, which is dead for this construct — R-4) — SINGLE-EDIT: none, the four-form uniformity row`, async () => {
-      const res = await build(form.lines, { dynamic: false });
-      expect(res.ok, `expected a refusal for ${form.label}, got OK`).toBe(false);
-      if (res.ok) return;
-      expect(res.diagnostics[0]?.code).toBe("SC2012");
-      expect(res.diagnostics[0]?.message).toBe(
-        "'.toString()' on numbers runs in the embedded dynamic engine, which this build does not include",
-      );
-      expect(res.diagnostics[0]?.hint).toBe(RADIX_HINT);
+    test(`${form.label} — static: compiles and prints Node's text (Step 2B lowered it; the full edge matrix is wasm-stdlib-members.test.ts) — SINGLE-EDIT: none, the four-form uniformity row`, async () => {
+      const path = await buildOk(form.lines, { dynamic: false });
+      const { stdout } = await runWasm(path);
+      expect(stdout).toBe(form.label === "charCodeAt-result" ? "41\n" : "ff\n");
     });
     test(`${form.label} — --dynamic: compiles clean (no static arm needed; the island engine serves it) — SINGLE-EDIT: none, the four-form uniformity row`, async () => {
       const path = await buildOk(form.lines, { dynamic: true });
