@@ -9467,7 +9467,10 @@ record copy keeps only the type's fields, in the type's order) is S009's,
 not (c)'s. **Rationale:** a stopgap until unit U1 makes the dynamic
 crossings share (docs/design/dynamic-values.md); until then a silent
 divergence becomes a named refusal. Known cost: the corpus loses no
-program; see the commit for the npm survey count. **Tested by:**
+program. In a 73-package sample of the round-3 npm survey (stratum A),
+26 packages carry a refused crossing and 13 refuse because of it alone
+(among them react-dom, whose hooks share one object through three
+dynamic slots, express and lodash). **Tested by:**
 `packages/compiler/test/wasm-dyn-copies.test.ts` (#120's two forms and
 each refused shape on wasm and wasm-native, and the unobservable shapes
 diffed against Node).
