@@ -138,11 +138,6 @@ const kCloseEmitted = 1 << 16;
 const kClosed = 1 << 17;
 const kMultiAwaitDrain = 1 << 18;
 
-/* Writable bits net.ts keeps on a socket that http.ts reads. */
-const wEnding = 1 << 0;
-const wEnded = 1 << 1;
-const wFinished = 1 << 2;
-
 
 /* ── $inc: IncomingMessage ─────────────────────────────────────────── */
 const I_RS = 0;
@@ -201,7 +196,7 @@ const I_RAWVEC = 50; // eqref: the typed surface's cached rawHeaders string[]
 const O_OD = 0; // array of $od (outputData)
 const O_OD_N = 1;
 const O_OUTSIZE = 2;
-const O_WRITABLE = 3;
+// O_WRITABLE = 3: not read in this file.
 const O_DESTROYED = 4;
 const O_LAST = 5;
 const O_CHUNKED = 6;
@@ -213,8 +208,8 @@ const O_SENDDATE = 11;
 const O_RMCONN = 12;
 const O_RMCLEN = 13;
 const O_RMTE = 14;
-const O_STRICTCL = 15;
-const O_BYTESWRITTEN = 16; // f64
+// O_STRICTCL = 15: not read in this file.
+// O_BYTESWRITTEN = 16: not read in this file. (f64)
 const O_CONTLEN = 17; // f64
 const O_HASCONTLEN = 18; // i32: _contentLength !== null
 const O_HASBODY = 19;
@@ -234,7 +229,7 @@ const O_HDRS_N = 32;
 const O_KATIMEOUT = 33; // f64
 const O_ERRORED = 34; // err
 const O_HWM = 35;
-const O_REJECTNONSTD = 36;
+// O_REJECTNONSTD = 36: not read in this file.
 const O_MAXREQPERSOCK = 37; // f64
 const O_LFINISH = 38;
 const O_LFINISH_N = 39;
@@ -250,7 +245,7 @@ const O_LUNPIPE = 48;
 const O_LUNPIPE_N = 49;
 const O_LTIMEOUT = 50;
 const O_LTIMEOUT_N = 51;
-const O_KIND = 52; // 1 ServerResponse, 2 ClientRequest
+// O_KIND = 52: not read in this file. (1 ServerResponse, 2 ClientRequest)
 const O_FIELDS = 53;
 
 /* $res: ServerResponse */
@@ -282,8 +277,8 @@ const C_ERROR = 67; // err (kError)
 const C_PORT = 68; // f64: the options' port (for getName)
 const C_LRESPONSE = 69;
 const C_LRESPONSE_N = 70;
-const C_RTMO = 71; // eqref: the socket 'timeout' listener emitRequestTimeout
-const C_RSPTMO = 72; // eqref: the socket 'timeout' listener responseOnTimeout
+// C_RTMO = 71: not read in this file. (eqref: the socket 'timeout' listener emitRequestTimeout)
+// C_RSPTMO = 72: not read in this file. (eqref: the socket 'timeout' listener responseOnTimeout)
 const C_TLSO = 73; // INC-29 U4 (TLS modules): the https request's $tlso, null for http
 
 /* ── $hsrv: an http.Server's own state (net.Server's V_HTTP) ──────── */
@@ -303,9 +298,9 @@ const H_MAXREQPERSOCK = 12; // f64
 const H_HALFOPEN = 13; // httpAllowHalfOpen
 const H_CONNS = 14; // array of $parser (kConnections), null = none yet
 const H_CONNS_N = 15;
-const H_REJECTNONSTD = 16;
-const H_SRV = 17; // the net.Server
-const H_SEQ = 18; // i32: the next parser order (std::set's pointer order: SEMANTICS.md S088 (b))
+// H_REJECTNONSTD = 16: not read in this file.
+// H_SRV = 17: not read in this file. (the net.Server)
+// H_SEQ = 18: not read in this file. (i32: the next parser order (std::set's pointer order: SEMANTICS.md S088 (b)))
 
 /* ── $conn: the per-connection `state` of connectionListenerInternal ─ */
 const K_SRV = 0;
@@ -320,7 +315,7 @@ const K_OUT_N = 8;
 const K_IN = 9; // array of $inc
 const K_IN_N = 10;
 const K_OUTDATA = 11;
-const K_REQCOUNT = 12;
+// K_REQCOUNT = 12: not read in this file.
 const K_KASET = 13;
 const K_ONERROR = 14; // socketOnError's closure (one per socket here)
 const K_ONTIMEOUT = 15;
@@ -401,7 +396,7 @@ const A_KABUFFER = 11; // f64 agentKeepAliveTimeoutBuffer
 const A_REQUESTS = 12; // array of $amap
 const A_REQUESTS_N = 13;
 const A_SOCKETS = 14;
-const A_SOCKETS_N = 15;
+// A_SOCKETS_N = 15: not read in this file.
 const A_FREE = 16;
 const A_FREE_N = 17;
 const A_OPTPORT = 18; // f64 this.options.port (when A_HASOPTPORT)

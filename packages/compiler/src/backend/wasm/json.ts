@@ -2962,6 +2962,9 @@ export class JsonBuilder {
    * (ties away from zero) + READ. */
   toFixed(): number {
     return this.cached("toFixed", [F64, F64], [this.deps.strRef()], (idx) => {
+      // Kept for its side effect: the first i32Global("nd") call adds the module global,
+      // and dropping it could renumber the globals that follow.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const ND = this.i32Global("nd");
       const DP = this.i32Global("dp");
       const strRef = this.deps.strRef();

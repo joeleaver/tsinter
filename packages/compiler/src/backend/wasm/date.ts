@@ -931,8 +931,7 @@ export class DateBuilder {
         NEWPOS = 10,
         VAL = 11,
         EFFYEAR = 12,
-        DAYS = 13,
-        CH = 14;
+        DAYS = 13;
       const T = 15; // f64
       const locals: ValType[] = [
         I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, F64,

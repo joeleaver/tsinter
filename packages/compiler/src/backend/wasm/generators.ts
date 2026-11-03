@@ -61,6 +61,10 @@
  * as a refusal this builder should grow a null path for. */
 import type { IrType } from "../../ir/nodes.js";
 import { typeKey } from "../../ir/nodes.js";
+// Deliberate boundary crossing (see the header above): the arm list is shared with the
+// frontend by construction, never re-derived. Moving computeGenResultArms out of
+// frontend/ is a separate change.
+// eslint-disable-next-line no-restricted-imports
 import { computeGenResultArms, type GenResultArms } from "../../frontend/types.js";
 import { I32, ModuleBuilder, type ValType } from "./module.js";
 
