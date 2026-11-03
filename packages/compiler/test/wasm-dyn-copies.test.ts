@@ -213,7 +213,124 @@ console.log(out);`,
     refused: "fn",
   },
 
+  // A constructor's dynamic parameter (reached through `new`, not a direct call).
+  {
+    id: "in-constructor-param-write",
+    src: `class A { constructor(x: any) { x.n = 2; } }
+const o = { n: 1 };
+new A(o);
+console.log(o);`,
+    refused: "in",
+  },
+  // The plugin pattern: a method reached through a virtual call.
+  {
+    id: "in-virtual-method-write",
+    src: `abstract class Plugin { abstract apply(ctx: any): void; }
+class Tag extends Plugin { apply(ctx: any) { ctx.tags.push("t"); } }
+class Log extends Plugin { apply(ctx: any) { ctx.log = 1; } }
+const ctx = { tags: [] as string[], log: 0 };
+const ps: Plugin[] = [new Tag(), new Log()];
+for (const p of ps) p.apply(ctx);
+console.log(ctx);`,
+    refused: "in",
+  },
+  // An async function's result reaches its caller through the promise.
+  {
+    id: "in-async-result-then",
+    src: `const o = { n: 1 };
+async function f(): Promise<any> { return o; }
+f().then((v) => { v.n = 2; console.log(o.n); });`,
+    refused: "in",
+  },
+  {
+    id: "in-async-result-await",
+    src: `const a = [1];
+async function f(): Promise<any> { const d: any = a; return d; }
+async function main() {
+  const v = await f();
+  v.push(2);
+  console.log(a);
+}
+main();`,
+    refused: "in",
+  },
+  // A generator's yield reaches its caller through the iterator.
+  {
+    id: "in-generator-yield-for-of",
+    src: `const a = [1];
+const d: any = a;
+function* g(): Generator<any> { yield d; }
+for (const v of g()) v.push(2);
+console.log(a);`,
+    refused: "in",
+  },
+  {
+    id: "in-generator-yield-next",
+    src: `const a = [1];
+function* g(): Generator<any> { const d: any = a; yield d; }
+const it = g();
+const r = it.next();
+r.value.push(2);
+console.log(a);`,
+    refused: "in",
+  },
   // ── unobservable: exact ────────────────────────────────────────────
+  // A function's own local value, built and returned into `any`: it dies at the return.
+  {
+    id: "ok-return-own-record",
+    src: `function parseArgs(argv: string[]): any {
+  const flags: string[] = [];
+  for (const a of argv) if (a.startsWith("--")) flags.push(a.slice(2));
+  return { flags };
+}
+const opts = parseArgs(["--x", "y", "--z"]);
+const env: any = JSON.parse("{}");
+env.mode = "dev";
+console.log(opts.flags.length, env.mode);`,
+  },
+  {
+    id: "ok-return-own-captured-by-loop",
+    src: `function summary(xs: number[]): any {
+  const ret = { total: 0, big: 0 };
+  xs.forEach((x) => { ret.total += 1; if (x > 5) ret.big += 1; });
+  return ret;
+}
+const s = summary([1, 7, 9]);
+const out: any = JSON.parse("{}");
+out.s = s;
+console.log(JSON.stringify(out));`,
+  },
+  // The copy is last read before the original is written.
+  {
+    id: "ok-logged-then-mutated",
+    src: `function main() {
+  const names = ["x", "y"];
+  const payload: unknown = { names };
+  console.log(JSON.stringify(payload));
+  names.push("z");
+  console.log(names.length);
+}
+main();`,
+  },
+  {
+    // A library result nothing else holds.
+    id: "ok-library-result",
+    src: `const keys: unknown = Object.keys({ a: 1, b: 2 }).map((k) => k + "!");
+const words: unknown = "x y".split(" ");
+const other: any = JSON.parse("[]");
+other.push(1);
+console.log(keys, words, other);`,
+  },
+  {
+    // An identity test between dynamic values the copy can never be.
+    id: "ok-unrelated-identity",
+    src: `const r = { n: 1 };
+const list: any = JSON.parse("[]");
+list.push(r);
+const x: any = JSON.parse("{}");
+const y: any = x;
+console.log(x === y, list, r.n);`,
+  },
   {
     id: "ok-fresh-into-any",
     src: `const a: any = { n: 1 };

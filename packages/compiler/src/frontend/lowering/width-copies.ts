@@ -302,6 +302,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   };
   /** The program compares dynamic values by identity somewhere. */
   let dynIdentity = false;
+  /** The dynamic operands of those comparisons (null: a comparison whose
+   * operands are not followed — a Map/Set keyed by dynamic values). */
+  const dynIdentityOps: ({ e: IrExpr; fn: string } | null)[] = [];
   /** The functions handed to each function-value adapter (`%fn.adapt.N`). */
   const adapterArgs = new Map<string, { e: IrExpr; fn: string }[]>();
   /** Can a dynamic call reach code this pass does not read? Without
@@ -317,6 +320,17 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * the receiver of a write or a key/element search (with the values the
    * write stores), an out-crossing, or anything else. */
   const ownUses = new Map<string, { use: "ro" | "recv" | "exit" | "other"; stored?: IrExpr[] }[]>();
+  /** Where each dynamic binding is used (its function and top-level statement). */
+  const useTops = new Map<string, { fn: string; top: number }[]>();
+  /** Per typed reference-holding binding: each use as ownership sees it —
+   * a scalar read, a write in place (with the values it stores), a loop or
+   * print or key listing that hands no reference on, a crossing, or
+   * anything else. */
+  const typedOwnUses = new Map<string, { ok: boolean; stored?: IrExpr[] }[]>();
+  /** Every closure: where it is made, what it captures, and whether it is
+   * handed straight to an array callback loop (which runs it before
+   * returning and keeps no hold of it). */
+  const closureCaptures: { fnName: string; fn: string; captures: string[]; transient: boolean }[] = [];
   /** The reference-holding types a value of type `t` is or contains (a
    * deep copy copies every one of them), and the function types inside
    * it (boxed with a copying thunk). */
@@ -532,6 +546,37 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         return "other";
     }
   };
+  /** The use a typed binding's reference makes, for ownership (its kinded
+   * parent sits at stack index `i`). */
+  const typedOwnUseAt = (i: number, t: IrType): { ok: boolean; stored?: IrExpr[] } => {
+    i = forwardFrom(i);
+    // A member of a literal that crosses right there is the crossing.
+    for (let j = i; j >= 0; j--) {
+      const [a, k] = stack[j]!;
+      if ((a["kind"] === "recordLit" && k === "fields") || (a["kind"] === "arrayLit" && k === "elems")) continue;
+      if (j < i && a["kind"] === "dynFrom") return { ok: true };
+      break;
+    }
+    const [anc, key] = stack[i]!;
+    const ak = anc["kind"] as string;
+    const elemFree = t.kind !== "array" || !hasRef(t.elem);
+    if ((ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr")) {
+      return { ok: !hasRef(anc["type"] as IrType) };
+    }
+    if ((ak === "recordSet" || ak === "fieldSet" || ak === "recordKeySet") && key === "obj") return { ok: true, stored: [anc["value"] as IrExpr] };
+    if ((ak === "fieldIncDec" && key === "obj") || ak === "toBool" || ak === "isUndef") return { ok: true };
+    if (ak === "arraySet" && key === "arr") return { ok: true, stored: [anc["value"] as IrExpr] };
+    if (ak === "arrIntrinsic" && key === "receiver") {
+      const m = anc["method"] as string;
+      if (MUTATING_ARR.has(m)) return { ok: true, stored: anc["args"] as IrExpr[] };
+      return { ok: elemFree };
+    }
+    if (ak === "call" && key === "args" && HOF_HELPER.test(anc["callee"] as string)) return { ok: elemFree };
+    if (ak === "forOf" && key === "iterable") return { ok: elemFree };
+    if (ak === "dynFrom") return { ok: true };
+    const u = useOf(anc, key);
+    return { ok: u === "print" || u === "keys" };
+  };
   /** The use a dynamic binding's reference `ref` makes, for ownership
    * (its kinded parent sits at stack index `i`). */
   const ownUseAt = (i: number, ref: unknown): { use: "ro" | "recv" | "exit" | "other"; stored?: IrExpr[] } => {
@@ -654,6 +699,21 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       let o = ownUses.get(key);
       if (!o) ownUses.set(key, (o = []));
       o.push(ownUseAt(stack.length - 1, r));
+      let ut = useTops.get(key);
+      if (!ut) useTops.set(key, (ut = []));
+      ut.push({ fn: curFn, top: curTop });
+    }
+    if (k === "varRef" && parent && t !== undefined && !isDynType(t) && hasRef(t)) {
+      const key = bkey(curFn, r["localId"] as string);
+      let o = typedOwnUses.get(key);
+      if (!o) typedOwnUses.set(key, (o = []));
+      o.push(typedOwnUseAt(stack.length - 1, t));
+    }
+    if (k === "closure") {
+      closureCaptures.push({
+        fnName: r["fnName"] as string, fn: curFn, captures: (r["captures"] as string[] | undefined) ?? [],
+        transient: parent !== null && parent["kind"] === "call" && pkey === "args" && HOF_HELPER.test(parent["callee"] as string),
+      });
     }
     noteDynNode(r, parent, pkey);
     let kids: readonly string[] = Object.hasOwn(TRANSPARENT, k) ? TRANSPARENT[k]! : [];
@@ -790,6 +850,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         dynSites.push({
           dir: "in", callee: "%dyn.from", arg: v, t: v.type, loc, where: curFn, top: curTop, node: r as unknown as IrExpr,
           dest: destOf(parent, pkey, r), consumed: stack.length > 0 && dynUseAt(stack.length - 1, true) === "ro",
+          atReturn: stack.length > 0 && atReturn(stack.length - 1),
         });
         return;
       }
@@ -814,7 +875,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "dynInvoke": {
         const m = r["method"] as string;
         if (DYN_MUTATING.has(m)) noteDynWrite(r["recv"] as IrExpr);
-        if (DYN_IDENTITY.has(m)) dynIdentity = true;
+        if (DYN_IDENTITY.has(m)) {
+          dynIdentity = true;
+          dynIdentityOps.push({ e: r["recv"] as IrExpr, fn: curFn });
+          for (const a of r["args"] as IrExpr[]) if (isDynType(a.type)) dynIdentityOps.push({ e: a, fn: curFn });
+        }
         if (opaqueCalls && (r["args"] as IrExpr[]).some(passesDyn)) noteDynWrite(null);
         return;
       }
@@ -822,12 +887,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         if (opaqueCalls && (r["args"] as IrExpr[]).some(passesDyn)) noteDynWrite(null);
         return;
       case "dynScalarEq":
-        if (isDynType((r["left"] as IrExpr).type) && isDynType((r["right"] as IrExpr).type)) dynIdentity = true;
+        if (isDynType((r["left"] as IrExpr).type) && isDynType((r["right"] as IrExpr).type)) {
+          dynIdentity = true;
+          dynIdentityOps.push({ e: r["left"] as IrExpr, fn: curFn }, { e: r["right"] as IrExpr, fn: curFn });
+        }
         return;
       case "mapIntrinsic":
       case "setIntrinsic": {
         const rt = (r["receiver"] as IrExpr).type;
-        if ((rt.kind === "map" && isDynType(rt.key)) || (rt.kind === "set" && isDynType(rt.elem))) dynIdentity = true;
+        if ((rt.kind === "map" && isDynType(rt.key)) || (rt.kind === "set" && isDynType(rt.elem))) {
+          dynIdentity = true;
+          dynIdentityOps.push(null);
+        }
         return;
       }
       case "jsOp": {
@@ -838,7 +909,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // and marshaled scalars hand nothing).
         if (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter") noteDynWrite(null);
         else if (JS_WRITING_OPS.has(op) && args.slice(1).some(passesJs)) noteDynWrite(null);
-        if (op === "eq" || op === "neq") dynIdentity = true;
+        if (op === "eq" || op === "neq") {
+          dynIdentity = true;
+          dynIdentityOps.push(null);
+        }
         return;
       }
       case "jsMarshal":
@@ -1020,14 +1094,17 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * (which runs once), in a top-level statement before the copy's, has
    * already happened; everything else (a write in any other function, a
    * closure, a later statement) counts. */
-  const isWritten = (t: IrType, fields: string[] | undefined, site: Site | null, during: Set<string> | null = null): boolean => {
+  const isWritten = (t: IrType, fields: string[] | undefined, site: Site | null, during: Set<string> | null = null, deadAfter: { fn: string; top: number } | null = null): boolean => {
     if (reachW.has(tkey(t))) return true;
     // A TRANSIENT copy (handed to a parameter that never lets it go) dies
     // when the call returns: only a write in a function the call can run
-    // (`during`) can meet it.
+    // (`during`) can meet it. A copy whose binding is last read in
+    // top-level statement `deadAfter.top` of its function cannot see a
+    // write that function makes in a later statement.
     const counts = (key: string): boolean =>
       (written.get(key) ?? []).some((w) =>
-        during !== null ? during.has(w.fn) : !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top));
+        !(deadAfter !== null && w.fn === deadAfter.fn && w.top > deadAfter.top) &&
+        (during !== null ? during.has(w.fn) : !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top)));
     const fs = fields ?? fieldNames(t);
     if (t.kind === "object") {
       const root = rootOf(t.className);
@@ -1516,6 +1593,20 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       }
       return out;
     };
+    const dynFieldsMemo = new Map<string, string[]>();
+    const dynFieldsOf = (t: IrType): string[] => {
+      let m = dynFieldsMemo.get(tkey(t));
+      if (!m) dynFieldsMemo.set(tkey(t), (m = dynFields(t)));
+      return m;
+    };
+    /** Typed expressions whose dynamic fields this walk follows: built
+     * here (literals, constructors, checked out of a dynamic value), read
+     * out of a value it follows, or handed on. */
+    const TYPED_PRODUCERS = new Set([
+      "varRef", "recordLit", "arrayLit", "recordGet", "fieldGet", "arrayGet", "recordKeyGet", "unionWrap", "unionNarrow",
+      "upcast", "downcast", "ternary", "logical", "nullish", "orDefault", "seqExpr", "dynCheck", "call", "new",
+      "virtualCall", "callValue", "closure", "arrIntrinsic",
+    ]);
     const fieldNode = (e: Record<string, unknown>): string | null => {
       const k = e["kind"];
       if (k === "recordGet" || k === "recordSet") return `r:${e["shapeId"] as string}:${e["field"] as string}`;
@@ -1652,6 +1743,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const n = node(e, fn);
         union(n, into ?? UNKNOWN);
         return;
+      }
+      // A typed value made where this walk cannot see its dynamic fields
+      // filled (a runtime result, an awaited or iterated value, a generator
+      // step): those fields meet UNKNOWN.
+      if (!children && r["type"] !== undefined && r["loc"] !== undefined && !TYPED_PRODUCERS.has(k)) {
+        for (const f of dynFieldsOf(r["type"] as IrType)) union(f, UNKNOWN);
+      }
+      // A binding something other than a declaration or an assignment
+      // fills (a loop variable, a catch binding, a pattern): its values are
+      // not followed.
+      if (typeof r["localId"] === "string" && k !== "varRef" && k !== "varDecl" && k !== "assign" && k !== "assignExpr" && k !== "incDec") {
+        union(bkey(fn, r["localId"] as string), UNKNOWN);
       }
       const sub = (key: string, to: string | null): void => walk(r[key], fn, to);
       switch (k) {
@@ -1794,10 +1897,30 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         walk(r[key], fn, null);
       }
     }
+    // The functions every call of which this walk sees as a direct `call`
+    // (whose arguments it joins to the parameters, and whose returns to the
+    // call's value). Every other function — used as a value, a constructor
+    // (`new`), a method (virtual calls, `super`), an async function or a
+    // generator (their results reach the caller through a promise or an
+    // iterator) — is called by code the walk does not follow.
+    const direct = new Set<string>();
+    {
+      const scan = (n: unknown): void => {
+        if (n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) return n.forEach(scan);
+        const r = n as Record<string, unknown>;
+        if (r["kind"] === "call") direct.add(r["callee"] as string);
+        for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
+      };
+      for (const f of functions) scan(f.body);
+    }
+    const indirect = (f: IrFunction): boolean =>
+      valueFns.has(f.name) || !direct.has(f.name) || !!f.async || !!f.generator || f.name.endsWith(".constructor") ||
+      classPrefixes.some((pre) => f.name.startsWith(pre));
     for (const f of functions) {
-      // A function used as a value is called by code this walk does not
-      // follow: its dynamic parameters and its result meet UNKNOWN.
-      if (valueFns.has(f.name)) {
+      // A function called by code this walk does not follow: its dynamic
+      // parameters and its result meet UNKNOWN.
+      if (indirect(f)) {
         for (const p of f.params) if (isDynType(p.type)) union(bkey(f.name, p.localId), UNKNOWN);
         union(`\0ret:${f.name}`, UNKNOWN);
       }
@@ -1867,9 +1990,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           return !!b && !b.captured && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
         }
         case "libCall":
-          // The data-in, data-out library families build what they return
-          // (`s.split(" ")`, a regex match).
-          return /^(math|num|number|string|str|path|sym|os|text|strdec|regex|regexp)\./.test(e.fn);
+          // The runtime builds the composites it returns (`s.split(" ")`, a
+          // directory listing, a regex match); none is a program value.
+          // (process.argv and the like answer one shared value.)
+          return !/^(dyn|process|global|emitter|stdin)\./.test(e.fn);
         default:
           // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
           return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
@@ -1935,8 +2059,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
      * binding's value (`outOf`). With `value` (the copy, or the value a
      * copy was taken from), only a write whose receiver may be that value
      * counts (dynAliasClasses). */
-    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null, value: { e: IrExpr; fn: string } | null = null): boolean =>
+    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null, value: { e: IrExpr; fn: string } | null = null, dead: { fn: string; top: number } | null = null): boolean =>
       dynWrites.some((w) => {
+        if (dead !== null && w.fn === dead.fn && w.top > dead.top) return false;
         if (value !== null && w.recv !== null && !alias.same(w.recv, w.fn, value.e, value.fn)) return false;
         if (freshRooted(w.recv, w.fn) && !(outOf !== null && rootKey(w.recv, w.fn) === outOf)) return false;
         if (during === null) return !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top);
@@ -2011,8 +2136,52 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       scan(node);
       return { fns, suspends };
     };
-    const anyWritten = (types: IrType[], site: Site | null, during: Set<string> | null = null): boolean =>
-      types.some((t) => isWritten(t, undefined, site, during));
+    const anyWritten = (types: IrType[], site: Site | null, during: Set<string> | null = null, dead: { fn: string; top: number } | null = null): boolean =>
+      types.some((t) => isWritten(t, undefined, site, during, dead));
+    /** For a copy landing in a local dynamic binding nothing captures: the
+     * last top-level statement of its function that reads it (later
+     * statements of that function cannot observe it). */
+    const lastUse = (s: DynSite): { fn: string; top: number } | null => {
+      if (s.dest === null || s.dest.param || s.dest.key.startsWith("g\0")) return null;
+      const b = bindings.get(s.dest.key);
+      if (!b || b.captured || b.assigns.length !== 1) return null;
+      // Every use reads it at once, so the copy goes nowhere else.
+      if (!(dynUses.get(s.dest.key) ?? []).every((u) => u === "ro")) return null;
+      const tops = useTops.get(s.dest.key) ?? [];
+      if (tops.some((u) => u.fn !== s.where)) return null;
+      return { fn: s.where, top: Math.max(s.top, ...tops.map((u) => u.top)) };
+    };
+    /** A typed value built from locals of the function that nothing else
+     * can reach once it returns: literals of such values, and local
+     * bindings initialized fresh, used only by reads of scalars, writes in
+     * place storing such values, loops handing on no reference, printing,
+     * and crossings — and captured only by callbacks an array loop runs
+     * before returning. */
+    const ownedTyped = (e: IrExpr | undefined, fn: string, depth = 0): boolean => {
+      e = unwrap(e);
+      if (!e || depth > 6) return false;
+      if (!hasRef(e.type) || deepFresh(e, fn)) return true;
+      if (e.kind === "recordLit") return e.fields.every((f) => ownedTyped(f.value, fn, depth + 1));
+      if (e.kind === "arrayLit") return e.elems.every((x) => x !== null && typeof x === "object" && "kind" in x && ownedTyped(x as IrExpr, fn, depth + 1));
+      if (e.kind !== "varRef") return false;
+      const key = bkey(fn, e.localId);
+      if (key.startsWith("g\0")) return false;
+      const b = bindings.get(key);
+      if (!b || b.assigns.length === 0 || !b.assigns.every((a) => ownedTyped(a, fn, depth + 1))) return false;
+      const keys = [key];
+      if (b.captured) {
+        for (const c of closureCaptures) {
+          const i = c.fn === fn ? c.captures.indexOf(e.localId) : -1;
+          if (i < 0) continue;
+          const g = byName.get(c.fnName);
+          const gc = g?.captures?.[i];
+          if (!c.transient || !gc) return false;
+          keys.push(bkey(c.fnName, gc.localId));
+        }
+      }
+      return keys.every((k) => (typedOwnUses.get(k) ?? []).every((u) =>
+        u.ok && (u.stored ?? []).every((x) => !hasRef(x.type) || ownedTyped(x, k.split("\0")[0]!, depth + 1))));
+    };
     const anyIdentity = (types: IrType[]): boolean => types.some((t) => identity.has(tkey(t)));
     /** The uses of a dynamic binding a crossing lands in, when they are
      * all known and all read at once. */
@@ -2151,15 +2320,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const x = unwrap(s.arg);
         const src = x?.kind === "varRef" ? bindings.get(bkey(s.where, x.localId)) : undefined;
         const sole = x !== undefined && (fresh(x) || (src !== undefined && !src.captured && src.assigns.length === 1 && fresh(src.assigns[0]) && src.uses.every((u) => u === "read" || u === "copy" || u === "keys" || u === "print")));
-        const unique = deepFresh(x, s.where);
+        // Nothing else holds the value: fresh all the way down, or (at a
+        // return) built from locals of the function that die with it.
+        const unique = deepFresh(x, s.where) || (s.atReturn === true && ownedTyped(x, s.where));
         if (refs.length > 0 && !unique && !s.consumed) {
           // The original is still held: a write on the dynamic side is
           // lost to it, and a write to it (or to anything inside it) is
           // lost to the copy.
           const destRO = dynDestReadOnly(s);
-          if (!destRO && dynWritten(s, null, null, { e: s.node, fn: s.where })) why = DYN_WRITE_TO;
-          else if (anyWritten(sole ? refs.filter((r) => tkey(r) !== tkey(s.t)) : refs, s)) why = ORIG_WRITTEN;
-          else if (!destRO && dynIdentity) why = DYN_SAME;
+          const dead = lastUse(s);
+          if (!destRO && dynWritten(s, null, null, { e: s.node, fn: s.where }, dead)) why = DYN_WRITE_TO;
+          else if (anyWritten(sole ? refs.filter((r) => tkey(r) !== tkey(s.t)) : refs, s, null, dead)) why = ORIG_WRITTEN;
+          else if (!destRO && dynIdentityOps.some((o) => o === null || alias.same(o.e, o.fn, s.node, s.where))) why = DYN_SAME;
         }
       } else {
         feature = `a dynamic ('unknown', 'any' or 'object') value checked into '${L.fmt(s.t)}'`;

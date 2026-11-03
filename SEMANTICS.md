@@ -9428,7 +9428,8 @@ judged with (b)'s machinery and refuses (SC1090, "… it would be a COPY
 where JavaScript shares the object, and …") when the program could tell:
 - a write through the copy, or a write to the original (or anything a
   deep copy copied from it) while the copy is still held;
-- an identity test on the copy's type, or between dynamic values;
+- an identity test on the copy's type, or between dynamic values one of
+  which may be the copy;
 - on a dynamic side, a write counts when its receiver may be the copy
   (an in-crossing) or the value a copy was taken from (an out-crossing).
   "May be" is a unification over the program's dynamic values: bindings,
@@ -9436,8 +9437,11 @@ where JavaScript shares the object, and …") when the program could tell:
   class through assignment, argument passing, returns, captures, stores
   into a dynamic container and reads out of one; whatever the analysis
   does not follow (a dynamic call, a runtime function that is not a known
-  reader or writer, a throw, the parameters and results of functions used
-  as values, any other expression) meets in one shared unknown class. A
+  reader or writer, a throw, the parameters and results of every function
+  not reached only by direct calls — functions used as values,
+  constructors, methods, async functions and generators — the dynamic
+  fields of a typed value the runtime made, any other expression) meets in
+  one shared unknown class. A
   write to the own members of a binding that holds a value built fresh
   (`JSON.parse`, a dynamic literal) and never hands it anywhere changes no
   copy, unless the copy was checked out of that very value. Writes are the
@@ -9456,8 +9460,12 @@ crossing with no write and no identity test after it on either side; an
 out-crossing into a sequence temporary or a local whose every use is a
 read, while no code that can run in between writes a dynamic value; a
 `return` that checks a local dynamic value the function built and owns
-(the evolving-array idiom `const acc = []; … return acc`); and a callback
-parameter that only reads its copy while the call cannot reach a write.
+(the evolving-array idiom `const acc = []; … return acc`); a `return`
+that converts a value the function built from its own locals, which die
+with the call (`return { flags }` into `any`); a copy whose local binding
+is last read before the function writes the original; library results
+(`readdirSync`, `split`, a match); and a callback parameter that only
+reads its copy while the call cannot reach a write.
 An `Error` crosses through the identity cache (S021), an `any[]` crosses
 by reference, and a variadic callback's adapter is vetted by GH #22: none
 of them is judged here. A `Promise` crosses by reference too; its
