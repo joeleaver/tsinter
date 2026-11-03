@@ -1,0 +1,44 @@
+
+describe("realprobe", () => {
+  test("realprobe", async () => {
+    // PROBE_SPEC: JSON {entry, dynamic, npmStatic?, cwd, outDir, cases:[{name,args,stdin?}]}
+    const spec = JSON.parse(readFileSync(process.env["PROBE_SPEC"]!, "utf8"));
+    mkdirSync(spec.outDir, { recursive: true });
+    const t0 = Date.now();
+    const res = await compile(spec.entry, {
+      outPath: join(spec.outDir, "program.wasm"),
+      outDir: spec.outDir,
+      backend: "wasm",
+      dynamic: spec.dynamic === true,
+      ...(spec.npmStatic !== undefined ? { npmStatic: spec.npmStatic } : {}),
+    });
+    writeFileSync(join(spec.outDir, "build.time"), String((Date.now() - t0) / 1000));
+    if (!res.ok) {
+      writeFileSync(join(spec.outDir, "build.log"), res.diagnostics.map((d: any) => `${d.code} ${JSON.stringify(d.loc ?? d.file ?? "")} ${d.message}`).join("\n") + "\n");
+      console.log("REFUSED", res.diagnostics.length);
+      return;
+    }
+    writeFileSync(join(spec.outDir, "build.log"), "ok\n");
+    const prevCwd = process.cwd();
+    process.chdir(spec.cwd);
+    try {
+      for (const c of spec.cases) {
+        (globalThis as any).__probeArgv = c.args;
+        const t1 = Date.now();
+        let r: RunResult;
+        try {
+          r = await runWasm(res.binaryPath, c.stdin !== undefined ? { stdin: readFileSync(c.stdin) } : undefined);
+        } catch (e) {
+          r = { stdout: Buffer.from(""), stderr: Buffer.from(`HOST THREW: ${(e as Error)?.stack ?? e}\n`), exitCode: 999 };
+        }
+        const p = join(spec.outDir, c.name);
+        writeFileSync(p + ".out", r.stdout);
+        writeFileSync(p + ".err", r.stderr);
+        writeFileSync(p + ".exit", String(r.exitCode) + "\n");
+        writeFileSync(p + ".time", String((Date.now() - t1) / 1000) + "\n");
+      }
+    } finally {
+      process.chdir(prevCwd);
+    }
+  }, 3_600_000);
+});

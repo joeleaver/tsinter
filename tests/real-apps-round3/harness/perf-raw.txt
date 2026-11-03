@@ -1,0 +1,72 @@
+rep0 startup (`bogus`, exit 2) | node-orig cpu=0.232 rc=2 maxrss_children=95812KB
+rep0 startup (`bogus`, exit 2) | node-patched cpu=0.215 rc=2 maxrss_children=95812KB
+rep0 startup (`bogus`, exit 2) | wn cpu=0.003 rc=2 maxrss_children=95812KB
+rep0 startup (`bogus`, exit 2) | outputs identical: True
+rep0 play 1 300 | node-orig cpu=0.400 rc=0 maxrss_children=102044KB
+rep0 play 1 300 | node-patched cpu=0.371 rc=0 maxrss_children=102424KB
+rep0 play 1 300 | wn cpu=0.172 rc=0 maxrss_children=102424KB
+rep0 play 1 300 | outputs identical: True
+rep0 fuzztext 1 1500 | node-orig cpu=0.563 rc=0 maxrss_children=102424KB
+rep0 fuzztext 1 1500 | node-patched cpu=0.545 rc=0 maxrss_children=102424KB
+rep0 fuzztext 1 1500 | wn cpu=0.302 rc=0 maxrss_children=102424KB
+rep0 fuzztext 1 1500 | outputs identical: True
+rep0 perft 5 (4.87M nodes) | node-orig cpu=4.966 rc=0 maxrss_children=112820KB
+rep0 perft 5 (4.87M nodes) | node-patched cpu=4.059 rc=0 maxrss_children=112820KB
+rep0 perft 5 (4.87M nodes) | wn cpu=11.845 rc=0 maxrss_children=112820KB
+rep0 perft 5 (4.87M nodes) | outputs identical: True
+rep0 perft 4 kiwipete | node-orig cpu=3.936 rc=0 maxrss_children=113316KB
+rep0 perft 4 kiwipete | node-patched cpu=2.573 rc=0 maxrss_children=113316KB
+rep0 perft 4 kiwipete | wn cpu=9.050 rc=0 maxrss_children=113316KB
+rep0 perft 4 kiwipete | outputs identical: True
+rep0 fuzz 1 60 (verbose moves, SAN, undo) | node-orig cpu=4.934 rc=0 maxrss_children=133880KB
+rep0 fuzz 1 60 (verbose moves, SAN, undo) | node-patched cpu=3.904 rc=0 maxrss_children=133880KB
+rep0 fuzz 1 60 (verbose moves, SAN, undo) | wn cpu=11.075 rc=0 maxrss_children=133880KB
+rep0 fuzz 1 60 (verbose moves, SAN, undo) | outputs identical: True
+rep1 startup (`bogus`, exit 2) | node-orig cpu=0.233 rc=2 maxrss_children=133880KB
+rep1 startup (`bogus`, exit 2) | node-patched cpu=0.250 rc=2 maxrss_children=133880KB
+rep1 startup (`bogus`, exit 2) | wn cpu=0.002 rc=2 maxrss_children=133880KB
+rep1 startup (`bogus`, exit 2) | outputs identical: True
+rep1 play 1 300 | node-orig cpu=0.490 rc=0 maxrss_children=133880KB
+rep1 play 1 300 | node-patched cpu=0.386 rc=0 maxrss_children=133880KB
+rep1 play 1 300 | wn cpu=0.155 rc=0 maxrss_children=133880KB
+rep1 play 1 300 | outputs identical: True
+rep1 fuzztext 1 1500 | node-orig cpu=0.522 rc=0 maxrss_children=133880KB
+rep1 fuzztext 1 1500 | node-patched cpu=0.559 rc=0 maxrss_children=133880KB
+rep1 fuzztext 1 1500 | wn cpu=0.235 rc=0 maxrss_children=133880KB
+rep1 fuzztext 1 1500 | outputs identical: True
+rep1 perft 5 (4.87M nodes) | node-orig cpu=5.067 rc=0 maxrss_children=133880KB
+rep1 perft 5 (4.87M nodes) | node-patched cpu=3.389 rc=0 maxrss_children=133880KB
+rep1 perft 5 (4.87M nodes) | wn cpu=11.205 rc=0 maxrss_children=133880KB
+rep1 perft 5 (4.87M nodes) | outputs identical: True
+rep1 perft 4 kiwipete | node-orig cpu=4.722 rc=0 maxrss_children=133880KB
+rep1 perft 4 kiwipete | node-patched cpu=3.036 rc=0 maxrss_children=133880KB
+rep1 perft 4 kiwipete | wn cpu=9.522 rc=0 maxrss_children=133880KB
+rep1 perft 4 kiwipete | outputs identical: True
+rep1 fuzz 1 60 (verbose moves, SAN, undo) | node-orig cpu=5.757 rc=0 maxrss_children=134480KB
+rep1 fuzz 1 60 (verbose moves, SAN, undo) | node-patched cpu=3.573 rc=0 maxrss_children=134480KB
+rep1 fuzz 1 60 (verbose moves, SAN, undo) | wn cpu=12.192 rc=0 maxrss_children=134480KB
+rep1 fuzz 1 60 (verbose moves, SAN, undo) | outputs identical: True
+rep2 startup (`bogus`, exit 2) | node-orig cpu=0.243 rc=2 maxrss_children=134480KB
+rep2 startup (`bogus`, exit 2) | node-patched cpu=0.215 rc=2 maxrss_children=134480KB
+rep2 startup (`bogus`, exit 2) | wn cpu=0.003 rc=2 maxrss_children=134480KB
+rep2 startup (`bogus`, exit 2) | outputs identical: True
+rep2 play 1 300 | node-orig cpu=0.452 rc=0 maxrss_children=134480KB
+rep2 play 1 300 | node-patched cpu=0.324 rc=0 maxrss_children=134480KB
+rep2 play 1 300 | wn cpu=0.121 rc=0 maxrss_children=134480KB
+rep2 play 1 300 | outputs identical: True
+rep2 fuzztext 1 1500 | node-orig cpu=0.461 rc=0 maxrss_children=134480KB
+rep2 fuzztext 1 1500 | node-patched cpu=0.465 rc=0 maxrss_children=134480KB
+rep2 fuzztext 1 1500 | wn cpu=0.334 rc=0 maxrss_children=134480KB
+rep2 fuzztext 1 1500 | outputs identical: True
+rep2 perft 5 (4.87M nodes) | node-orig cpu=4.536 rc=0 maxrss_children=134480KB
+rep2 perft 5 (4.87M nodes) | node-patched cpu=3.313 rc=0 maxrss_children=134480KB
+rep2 perft 5 (4.87M nodes) | wn cpu=11.294 rc=0 maxrss_children=134480KB
+rep2 perft 5 (4.87M nodes) | outputs identical: True
+rep2 perft 4 kiwipete | node-orig cpu=4.143 rc=0 maxrss_children=134480KB
+rep2 perft 4 kiwipete | node-patched cpu=3.095 rc=0 maxrss_children=134480KB
+rep2 perft 4 kiwipete | wn cpu=10.350 rc=0 maxrss_children=134480KB
+rep2 perft 4 kiwipete | outputs identical: True
+rep2 fuzz 1 60 (verbose moves, SAN, undo) | node-orig cpu=5.387 rc=0 maxrss_children=134480KB
+rep2 fuzz 1 60 (verbose moves, SAN, undo) | node-patched cpu=3.714 rc=0 maxrss_children=134480KB
+rep2 fuzz 1 60 (verbose moves, SAN, undo) | wn cpu=10.521 rc=0 maxrss_children=134480KB
+rep2 fuzz 1 60 (verbose moves, SAN, undo) | outputs identical: True

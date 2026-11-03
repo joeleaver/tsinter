@@ -1,0 +1,124 @@
+## chess: 55 root sites (64 reached, cascades included)
+    32 driver:dyn:receiver e.g. D SC1090 main.ts:15 console.log(chess.ascii()); -- method calls like 'chess.ascii' is not supported yet
+    11 bigint             e.g. D SC2009 src/chess.ts:58 const rand = xoroshiro128(0xa187eb39cdcaed8f31c4b365b102e01en) -- values of type '() => bigint' cannot be compiled: the function shape is supported, but its return type 'bigint
+     4 es5:proto          e.g. F SC1090 src/pgn.js:67 C.prototype = parent.prototype; -- assignment to non-variables are not supported yet
+     4 write:untyped      e.g. F SC1090 src/pgn.js:77 self.expected = expected; -- assignment to non-variables are not supported yet
+     1 types:shape        e.g. D SC2001 src/chess.ts:30 const MASK64 = 0xffffffffffffffffn -- values of type '18446744073709551615n' cannot be compiled yet (supported: number, string, boolean, arrays, Map
+     1 tsgo:panic         e.g. D SC0004 src/chess.ts:579 if ((tokens[0].match(regex) || []).length > 1) { -- the TypeScript checker crashed answering a query here (an upstream typescript-go bug): panic: interface conver
+     1 fn:call-bind       e.g. F SC1090 src/pgn.js:72 var self = Error.call(this, message); -- Function.prototype.call on a compiled function value (compiled calls are direct — no runtime 'this' or argumen
+     1 builtin:value      e.g. F SC1090 src/pgn.js:84 peg$subclass(peg$SyntaxError, Error); -- the builtin 'Error' used as a value (it has no runtime object here — comparisons with another builtin, truthin
+## toml: 15 root sites (15 reached, cascades included)
+    12 tsc:ambient        e.g. D SC0001 src/extract.ts:326 case 1: return Temporal.ZonedDateTime.from(str) -- Cannot find name 'Temporal'.
+     3 tsc:knock-on       e.g. D SC0001 src/stringify.ts:38 if (globalThis.Temporal) { -- Element implicitly has an 'any' type because type 'typeof globalThis' has no index signature.
+## papa: 84 root sites (88 reached, cascades included)
+    20 stdlib:js          e.g. F SC2020 node_modules/papaparse/papaparse.js:51 var code = moduleFactory.toString(); -- '() => { parse: (_input: any, _config: any) => any; unparse: (_input: any, _config: any) => string; RECORD_SEP
+    19 es5:proto          e.g. F SC1090 node_modules/papaparse/papaparse.js:52 return Papa.BLOB_URL || (Papa.BLOB_URL = URL.createObjectURL(new Blob(["var glob -- constructing values other than classes declared in the program is not supported yet
+    13 dyn:receiver       e.g. F SC1090 node_modules/papaparse/papaparse.js:1824 delete workers[workerId]; -- 'delete' on 'unknown' receivers (process.env keys and pure Record<string, T> keys delete) are not supported ye
+     6 write:untyped      e.g. F SC1090 node_modules/papaparse/papaparse.js:1768 workers[w.id] = w; -- indexing records with non-string or non-number keys are not supported yet
+     6 fn:call-bind       e.g. F SC1090 node_modules/papaparse/papaparse.js:430 replaceConfig.call(this, config); -- Function.prototype.call on a compiled function value (compiled calls are direct — no runtime 'this' or argumen
+     4 global:sniff       e.g. F SC1090 node_modules/papaparse/papaparse.js:11 if (typeof define === 'function' && define.amd) -- the reference to 'define' (a binding form with no lowering) is not supported yet
+     4 op:any             e.g. F SC1043 node_modules/papaparse/papaparse.js:1236 if (field === '__parsed_extra') -- comparing non-number, non-string values are not supported yet
+     3 binding:blocked    e.g. F SC1090 node_modules/papaparse/papaparse.js:149 if (_input === Papa.NODE_STREAM_INPUT && typeof PAPA_BROWSER_CONTEXT === 'undefi -- the reference to 'PAPA_BROWSER_CONTEXT' (a binding form with no lowering) is not supported yet
+     3 date               e.g. F SC1090 node_modules/papaparse/papaparse.js:294 if (_config.escapeFormulae instanceof RegExp) { -- 'instanceof' right-hand sides other than classes declared in the program is not supported yet
+     3 driver:binding:blocked e.g. F SC1090 main.mjs:9 console.log(Papa.unparse([{ a: 1, b: "x,y" }, { a: 2, b: 'q"uote' }, { a: 3, b:  -- the reference to 'unparse' (a binding form with no lowering) is not supported yet
+     2 types:shape        e.g. F SC2011 node_modules/papaparse/papaparse.js:390 || (typeof _quotes === 'function' && _quotes(str, col)) -- values of type 'never' have no static representation but run in the embedded dynamic engine, which this build 
+     1 builtin:value      e.g. F SC1090 node_modules/papaparse/papaparse.js:370 if (str.constructor === Date) -- the builtin 'Date' used as a value (it has no runtime object here — comparisons with another builtin, truthine
+## polka: 6 root sites (7 reached, cascades included)
+     2 driver:dyn:receiver e.g. F SC1090 main.mjs:41 app.handler({ method, url, headers: {} }, res); -- method calls like 'app.handler' is not supported yet
+     1 driver:class:dyn   e.g. F SC1090 main.mjs:35 this.headers[k.toLowerCase()] = v; -- references to 'this' in object literal methods are not supported yet
+     1 generic:fn         e.g. F SC1090 node_modules/polka/index.js:38 add(method, pattern, ...fns) { -- overriding the inherited generic method 'add' with a non-generic method (generic methods dispatch statically a
+     1 op:any             e.g. F SC2011 node_modules/matchit/lib/matchit.js:110 if (x !== void 0 && y.type | 2 === OTYPE) { -- the '|' operator on 'any'-typed values runs in the embedded dynamic engine, which this build does not include 
+     1 fn:call-bind       e.g. F SC1090 node_modules/matchit/lib/matchit.js:29 var fn = isMatch.bind(isMatch, segs); -- Function.prototype.bind on a compiled function value (compiled calls are direct — no runtime 'this' or argumen
+## expr: 111 root sites (111 reached, cascades included)
+    65 es5:proto          e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:26 Instruction.prototype.toString = function () { -- assignment to non-variables are not supported yet
+    17 op:any             e.g. F SC1043 node_modules/expr-eval/dist/bundle.js:218 while (argCount-- > 0) { -- comparing non-number, non-string values are not supported yet
+     7 stdlib:js          e.g. F SC2020 node_modules/expr-eval/dist/bundle.js:245 Object.defineProperty(f, 'name', { -- 'Object.defineProperty' is part of the standard library types but has no scriptc lowering yet
+     5 dyn:receiver       e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:77 } else if (type === IVAR && values.hasOwnProperty(item.value)) { -- method calls like 'values.hasOwnProperty' is not supported yet
+     3 var:hoist          e.g. F SC1030 node_modules/expr-eval/dist/bundle.js:1508 x = GAMMA_P[0]; -- the reference to 'GAMMA_P' above its 'var' declaration (a read there would be 'undefined', which the binding's
+     3 builtin:value      e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:1676 sin: Math.sin, -- Math methods as values (call 'sin' directly) are not supported yet
+     2 fn:call-bind       e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:1584 function max(array) { -- 'arguments' in functions with declared parameters (use a rest parameter: (...args)) are not supported yet
+     2 binding:blocked    e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:1739 min: min, -- the reference to 'min' (a binding form with no lowering) is not supported yet
+     2 write:untyped      e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:1783 Parser.parse = function (expr) { -- assignment to non-variables are not supported yet
+     2 driver:dyn:receiver e.g. F SC1090 main.mjs:31 const ex = Parser.parse("2 * x + y"); -- method calls like 'Parser.parse' is not supported yet
+     1 cjs:shape          e.g. F SC1090 node_modules/expr-eval/dist/bundle.js:2 typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports)  -- the reference to 'exports' (a binding form with no lowering) is not supported yet
+     1 driver:es5:proto   e.g. F SC1090 main.mjs:4 const p = new Parser(); -- constructing values other than classes declared in the program is not supported yet
+     1 driver:destructure e.g. F SC1031 main.mjs:24 for (const [e, v] of cases) { -- array destructuring of non-array values (the source is union-typed) are not supported yet
+## marked: 56 root sites (64 reached, cascades included)
+    15 write:untyped      e.g. D SC1090 src/marked.ts:74 marked.options = -- assignment to non-variables are not supported yet
+    14 types:shape        e.g. D SC2009 src/defaults.ts:21 export let _defaults: MarkedOptions<any, any> = _getDefaults(); -- values of type 'MarkedOptions<any, any>' cannot be compiled: the record shape is supported, but its member 'ex
+     5 generic:fn         e.g. D SC2005 src/marked.ts:154 export const parser = _Parser.parse; -- values of type '<ParserOutput = string, RendererOutput = string>(tokens: Token[], options?: MarkedOptions<Pars
+     5 binding:blocked    e.g. F SC1090 bin/main.js:37 const helpText = await readFile(resolve(__dirname, '../man/marked.1.md'), 'utf8' -- the reference to 'readFile' (a binding form with no lowering) is not supported yet
+     4 stdlib:js          e.g. D SC2012 src/rules.ts:22 source = source.replace(name, valSource); -- '.replace()' on strings runs in the embedded dynamic engine, which this build does not include
+     4 builtin:value      e.g. F SC1090 bin/main.js:169 return resolve(file.replace(/^~/, homedir)); -- the builtin 'os.homedir' used as a value (it has no runtime object here — comparisons with another builtin, tr
+     3 dyn:receiver       e.g. F SC1090 bin/main.js:45 manProcess.on('error', () => { -- method calls like 'manProcess.on('error', () => {
+        console.log(helpText);
+      })
+        .on' is not 
+     2 fn:value           e.g. D SC2007 src/marked.ts:152 export const parseInline = marked.parseInline; -- values of type 'overloadedParse' cannot be compiled: the type declares multiple call signatures (overloads), a
+     2 cjs:require        e.g. F SC1090 bin/main.js:53 const pkg = require('../package.json'); -- require() with bindings outside the module's top level (move it to the top of the file) is not supported yet
+     1 driver:write:untyped e.g. F SC1090 bin/marked.js:15 process.title = 'marked'; -- assignment to non-variables are not supported yet
+     1 driver:builtin:value e.g. F SC1090 bin/marked.js:16 main(process); -- the builtin 'process' used as a value (it has no runtime object here — comparisons with another builtin, truth
+## markedlib: 92 root sites (105 reached, cascades included)
+    57 obj:computed       e.g. F SC1101 node_modules/marked/lib/marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedanti -- holding 'RegExp' values in a runtime-keyed (computed-key) object literal is not supported yet
+    19 write:untyped      e.g. F SC1090 node_modules/marked/lib/marked.esm.js:81 Please report this to https://github.com/markedjs/marked.`,e){let s="<p>An error -- assignment to non-variables are not supported yet
+     6 types:shape        e.g. F SC1090 node_modules/marked/lib/marked.esm.js:18 `)}function $e(a,e,t,n){if(!e.includes("<"))return!1;for(let s=0;s<e.length;s++) -- 'unknown'-typed class fields are not supported yet
+     4 dyn:receiver       e.g. F SC1090 node_modules/marked/lib/marked.esm.js:80 `}strong({tokens:e}){return`<strong>${this.parser.parseInline(e)}</strong>`}em({ -- spread arguments into a dynamic rest parameter is not supported yet
+     2 driver:dyn:receiver e.g. D SC1090 main.ts:9 for (const t of marked.lexer(text)) console.log(t.type, JSON.stringify(t.raw.sli -- method calls like 'marked.lexer' is not supported yet
+     1 fn:call-bind       e.g. D SC1090 node_modules/marked/lib/marked.esm.js:80 `}strong({tokens:e}){return`<strong>${this.parser.parseInline(e)}</strong>`}em({ -- bound method references (call 'setOptions' directly) are not supported yet
+     1 destructure        e.g. F SC1090 node_modules/marked/lib/marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedanti -- assignment to non-variables as an expression (only `x = e` over a variable yields a value; write property/dest
+     1 fn:value           e.g. F SC1101 node_modules/marked/lib/marked.esm.js:13 function v(){return{async:!1,breaks:!1,extensions:null,gfm:!0,hooks:null,pedanti -- passing '(unknown) => RegExp' function values into 'unknown' slots (a parameter or result type has no dynamic 
+     1 op:any             e.g. F SC1090 node_modules/marked/lib/marked.esm.js:80 `}strong({tokens:e}){return`<strong>${this.parser.parseInline(e)}</strong>`}em({ -- logical operators on union-typed values outside conditions (narrow first: check a discriminant field, or compa
+## diff: 28 root sites (38 reached, cascades included)
+     8 generic:class      e.g. D SC1090 src/diff/character.ts:4 class CharacterDiff extends Diff<string, string> {} -- extending the generic class 'Diff' without a compiled concrete instantiation (the type arguments must map — se
+     7 types:shape        e.g. D SC2011 src/diff/base.ts:58 options: DiffCallbackNonabortable<ValueT> | AllDiffOptions & Partial<CallbackOpt -- values of type 'DiffCallbackNonabortable<ValueT> | (DiffArraysOptions<unknown> & DiffCharsOptions & DiffWordsO
+     5 dyn:receiver       e.g. D SC1090 src/diff/character.ts:45 return characterDiff.diff(oldStr, newStr, options); -- method calls like 'characterDiff.diff' is not supported yet
+     2 stdlib:js          e.g. D SC2020 src/patch/parse.ts:418 data = diffstr[i].substring(3).trim().split('\t', 2), -- '.split with 2 arguments on strings' is part of the standard library types but has no scriptc lowering yet
+     2 other              e.g. D SC1090 src/patch/parse.ts:524 return list as StructuredPatch[]; -- a '{ hunks: { lines: string[]; newLines: number; newStart: number; oldLines: number; oldStart: number }[] | un
+     1 fn:value           e.g. D SC1090 src/patch/apply.ts:156 function applyHunk( -- functions with optional or defaulted parameters as values, except where the target type spells the completed s
+     1 write:untyped      e.g. D SC1090 src/patch/create.ts:211 optionsObj.context = 4; -- assignment to non-variables are not supported yet
+     1 driver:stdlib:js   e.g. D SC2020 main.ts:68 if (op === 0) ls.splice(at, 0, mkLine()); -- '.splice with 3 arguments' is part of the standard library types but has no scriptc lowering yet
+     1 driver:generic:fn  e.g. D SC1090 main.ts:82 const arr = diffArrays(a.split(""), b.split("")).length; -- calls selecting an overload signature of a generic function (only the implementation signature monomorphizes) 
+## semver: 214 root sites (288 reached, cascades included)
+    60 binding:blocked    e.g. F SC1090 lib/classes/range.js:8 options = parseOptions(options) -- the reference to 'parseOptions' (a binding form with no lowering) is not supported yet
+    40 cjs:shape          e.g. F SC1090 lib/internal/debug.js:11 module.exports = debug -- 'module.exports =' with a non-literal value (export a class/function/const identifier, a scalar literal, or a 
+    33 dyn:receiver       e.g. F SC1090 lib/classes/range.js:118 range = range.replace(hr, hyphenReplace(this.options.includePrerelease)) -- method calls like 'range.replace' is not supported yet
+    19 driver:binding:blocked e.g. F SC1090 main.cjs:14 const p = semver.parse(v); -- the reference to 'parse' (a binding form with no lowering) is not supported yet
+    15 op:any             e.g. F SC1043 lib/classes/range.js:78 this.formatted += '||' -- comparing non-number, non-string values are not supported yet
+    12 module:cycle       e.g. D SC1013 lib/classes/range.js:223 const parseOptions = require('../internal/parse-options') -- require() below code that can reach its binding 'parseOptions' (Node initializes the binding AT the require an
+    12 types:shape        e.g. F SC2011 lib/classes/range.js:42 .map(r => this.parseRange(r.trim())) -- values of type '(r: any) => any' have no static representation but run in the embedded dynamic engine, which t
+     8 write:untyped      e.g. F SC1090 lib/classes/comparator.js:28 this.value = '' -- fields assigned outside the constructor's top level ('this.value' would be undefined until the first assignmen
+     5 destructure        e.g. F SC1090 lib/internal/re.js:12 const re = exports.re = [] -- assignment to non-variables as an expression (only `x = e` over a variable yields a value; write property/dest
+     4 stdlib:js          e.g. F SC2020 lib/internal/lrucache.js:31 const firstKey = this.map.keys().next().value -- 'MapIterator<any>.next' is part of the standard library types but has no scriptc lowering yet
+     2 fn:value           e.g. F SC1090 lib/functions/parse.js:4 const parse = (version, options, throwErrors = false) => { -- functions with optional or defaulted parameters as values, except where the target type spells the completed s
+     1 error:shape        e.g. F SC1090 lib/classes/range.js:10 if (range instanceof Range) { -- 'instanceof m32.Range' on 'unknown' values (only the Error classes answer — test 'instanceof Error' and read '
+     1 driver:op:any      e.g. F SC2011 main.cjs:48 let s = seed >>> 0; -- the '>>>' operator on 'any'-typed values runs in the embedded dynamic engine, which this build does not includ
+     1 driver:dyn:receiver e.g. F SC1090 main.cjs:76 const line = `#${i} ${r} :: ${sat.length} max=${mx} min=${mn} ${a} ${b} cmp=${se -- string conversions of unions with object arms (narrow first: check a discriminant field, or compare with '!== 
+     1 driver:write:untyped e.g. F SC1090 main.cjs:98 else { console.error("usage: table|fuzz|resolve"); process.exitCode = 2; } -- assignment to non-variables are not supported yet
+
+## census (apps, root sites) — driver sites excluded
+  7 apps   55 sites  write:untyped      writes through untyped or nested receivers: o.a.b = v, o[k] = v, o.n++  {'markedlib': 19, 'marked': 15, 'semver': 8, 'papa': 6, 'chess': 4, 'expr': 2, 'diff': 1}
+  6 apps   63 sites  dyn:receiver       method calls, member reads, for-in, switch, spread on any/unknown rece  {'semver': 33, 'papa': 13, 'expr': 5, 'diff': 5, 'markedlib': 4, 'marked': 3}
+  6 apps   42 sites  types:shape        types with no static representation: unions with fields, intersections  {'marked': 14, 'semver': 12, 'diff': 7, 'markedlib': 6, 'papa': 2, 'chess': 1}
+  5 apps   38 sites  op:any             operators on any-typed values (|, >>>, ===, +=, comparisons), loose eq  {'expr': 17, 'semver': 15, 'papa': 4, 'polka': 1, 'markedlib': 1}
+  5 apps   37 sites  stdlib:js          ECMAScript stdlib member with no lowering (reverse, splice/3, substr,   {'papa': 20, 'expr': 7, 'marked': 4, 'semver': 4, 'diff': 2}
+  5 apps   11 sites  fn:call-bind       Function.prototype.call/apply/bind and `arguments` on compiled functio  {'papa': 6, 'expr': 2, 'chess': 1, 'polka': 1, 'markedlib': 1}
+  4 apps   70 sites  binding:blocked    reference to a binding whose declaration was refused or has no lowerin  {'semver': 60, 'marked': 5, 'papa': 3, 'expr': 2}
+  4 apps    9 sites  builtin:value      builtin globals, Math or string methods as values (#84)  {'marked': 4, 'expr': 3, 'chess': 1, 'papa': 1}
+  4 apps    6 sites  fn:value           functions as values: optional/defaulted params, overloads, generics ke  {'marked': 2, 'semver': 2, 'markedlib': 1, 'diff': 1}
+  3 apps   88 sites  es5:proto          ES5 constructors and prototype wiring: X.prototype.m = fn, new on a fu  {'expr': 65, 'papa': 19, 'chess': 4}
+  2 apps   41 sites  cjs:shape          CommonJS shapes: module.exports = <non-literal>, exports aliasing, mem  {'semver': 40, 'expr': 1}
+  2 apps    6 sites  generic:fn         generic methods and arrows in forms with no monomorphized home  {'marked': 5, 'polka': 1}
+  2 apps    6 sites  destructure        destructuring beyond typed record sources: absent fields, optional pat  {'semver': 5, 'markedlib': 1}
+  1 apps   57 sites  obj:computed       runtime-keyed (computed-key) object literals holding methods, spreads,  {'markedlib': 57}
+  1 apps   12 sites  tsc:ambient        name not found: usually an ambient .d.ts the tsconfig includes, which   {'toml': 12}
+  1 apps   12 sites  module:cycle       import cycles (SC1016) and require() below code that reaches its bindi  {'semver': 12}
+  1 apps   11 sites  bigint             bigint  {'chess': 11}
+  1 apps    8 sites  generic:class      generic class hierarchies  {'diff': 8}
+  1 apps    4 sites  global:sniff       reads or typeof of undeclared globals (UMD define/module/self/window,   {'papa': 4}
+  1 apps    3 sites  tsc:knock-on       type errors downstream of an unresolved import or lost ambient types (  {'toml': 3}
+  1 apps    3 sites  date               Date values  {'papa': 3}
+  1 apps    3 sites  var:hoist          `var` read inside a hoisted function declared above it (generated pars  {'expr': 3}
+  1 apps    2 sites  cjs:require        require() off top level, computed, or as a value; createRequire; impor  {'marked': 2}
+  1 apps    2 sites  other              uncategorized  {'diff': 2}
+  1 apps    1 sites  tsgo:panic         typescript-go checker panic (SC0004)  {'chess': 1}
+  1 apps    1 sites  error:shape        Error specifics: constructor options (cause), overriding Error methods  {'semver': 1}
