@@ -123,7 +123,7 @@ export function collectNamespaceStmt(L: Lowerer, decl: ts.ModuleDeclaration, fp:
   if (body === undefined || !ts.isModuleBlock(body)) return; // bodyless non-ambient: tsc-rejected
   L.nsBlocks.set(body, "flattened");
   for (const s of body.statements) {
-    if (ts.isFunctionDeclaration(s)) fp.fnDecls.push(s);
+    if (ts.isFunctionDeclaration(s)) { if (L.checker.liveFunctionDeclarationFor(s) === null) fp.fnDecls.push(s); }
     else if (ts.isClassDeclaration(s)) fp.classDecls.push(s);
     else if (ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) continue;
     else if (ts.isModuleDeclaration(s)) collectNamespaceStmt(L, s, fp);

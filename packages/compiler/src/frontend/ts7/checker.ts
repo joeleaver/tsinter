@@ -44,7 +44,7 @@ import type {
   TypeReference,
 } from "typescript/unstable/sync";
 import { walkPreorder } from "./ast.js";
-import { SignatureKind, TypeFlags } from "./enums.js";
+import { SignatureKind, SyntaxKind, TypeFlags } from "./enums.js";
 
 /** Array-overload chunk size: large enough that per-request overhead
  * vanishes, small enough to keep any single JSON-RPC payload modest. */
@@ -104,6 +104,32 @@ function collectNodes(sf: SourceFile): Node[] {
     return undefined;
   });
   return nodes;
+}
+
+function isBodiedFunctionDeclaration(n: Node): boolean {
+  return n.kind === SyntaxKind.FunctionDeclaration && (n as unknown as { body?: Node }).body !== undefined;
+}
+
+/** The statement list a function declaration is declared in, as a scope:
+ * its parent, or a switch's case block for a declaration in a clause (one
+ * scope for every clause). Declarations of one symbol in DIFFERENT scopes
+ * (two script files' globals) are never duplicates of each other. */
+function declScopeOf(n: Node): Node | undefined {
+  const p = n.parent;
+  if (p !== undefined && (p.kind === SyntaxKind.CaseClause || p.kind === SyntaxKind.DefaultClause)) return p.parent;
+  return p;
+}
+
+/** GH #111: the declarations of `decls` that are DEAD — a bodied function
+ * declaration followed by another of the same symbol in the same scope. */
+function deadDuplicates(decls: readonly Node[]): Set<Node> {
+  const dead = new Set<Node>();
+  const bodied = decls.filter(isBodiedFunctionDeclaration);
+  if (bodied.length < 2) return dead;
+  for (const d of bodied) {
+    if (bodied.some((o) => o !== d && declScopeOf(o) === declScopeOf(d) && o.pos > d.pos)) dead.add(d);
+  }
+  return dead;
 }
 
 export class CheckerFacade {
@@ -173,24 +199,70 @@ export class CheckerFacade {
       decls = symbol.declarations
         .map((h) => h.resolve(project))
         .filter((n): n is Node => n !== undefined);
+      // GH #111: a scope that declares the same function more than once
+      // (JS allows it outside ES modules and strict blocks) instantiates
+      // every declaration at scope entry, in order — the LAST one is the
+      // binding's value and the earlier ones are never observable. Only
+      // the live declaration is reported, so every consumer (signatures,
+      // bodies, parameters) reads the function Node runs. Overload
+      // signatures have no body and are untouched.
+      const dead = deadDuplicates(decls);
+      if (dead.size > 0) decls = decls.filter((d) => !dead.has(d));
       this.declsOf.set(symbol, decls);
     }
     return decls;
   }
 
-  /** 5.9.3's symbol.valueDeclaration. */
+  /** 5.9.3's symbol.valueDeclaration (a dead duplicate function
+   * declaration answers the live one — see declarationsOf). */
   valueDeclarationOf(symbol: Ts7Symbol): Node | undefined {
     if (this.valueDeclOf.has(symbol)) return this.valueDeclOf.get(symbol);
-    const decl = symbol.valueDeclaration?.resolve(this.requireProject());
+    let decl = symbol.valueDeclaration?.resolve(this.requireProject());
+    if (decl !== undefined && isBodiedFunctionDeclaration(decl)) {
+      const decls = this.declarationsOf(symbol);
+      if (!decls.includes(decl)) {
+        const scope = declScopeOf(decl);
+        decl = decls.find((d) => isBodiedFunctionDeclaration(d) && declScopeOf(d) === scope) ?? decl;
+      }
+    }
     this.valueDeclOf.set(symbol, decl);
     return decl;
   }
 
+  /** The live declaration when `decl` is a DEAD duplicate function
+   * declaration (an earlier same-scope declaration of a function the
+   * scope declares again — see declarationsOf), else null. */
+  liveFunctionDeclarationFor(decl: Node): Node | null {
+    if (!isBodiedFunctionDeclaration(decl)) return null;
+    const name = (decl as unknown as { name?: Node }).name;
+    const symbol = name === undefined ? undefined : this.getSymbolAtLocation(name);
+    if (symbol === undefined) return null;
+    const decls = this.declarationsOf(symbol);
+    if (decls.includes(decl)) return null;
+    const scope = declScopeOf(decl);
+    return decls.find((d) => isBodiedFunctionDeclaration(d) && declScopeOf(d) === scope) ?? null;
+  }
+
+  /** Every bodied declaration of `decl`'s function symbol, dead
+   * duplicates included, in source order (GH #111's signature check). */
+  allFunctionDeclarationsOf(decl: Node): Node[] {
+    const name = (decl as unknown as { name?: Node }).name;
+    const symbol = name === undefined ? undefined : this.getSymbolAtLocation(name);
+    if (symbol === undefined) return [decl];
+    const project = this.requireProject();
+    const scope = declScopeOf(decl);
+    return symbol.declarations
+      .map((h) => h.resolve(project))
+      .filter((n): n is Node => n !== undefined && isBodiedFunctionDeclaration(n) && declScopeOf(n) === scope);
+  }
+
   /** 5.9.3's signature.getDeclaration() (undefined for synthesized
-   * signatures — same contract as sig.declaration there). */
+   * signatures — same contract as sig.declaration there). A dead
+   * duplicate function declaration answers the live one. */
   signatureDeclaration(signature: Signature): Node | undefined {
     if (this.sigDeclOf.has(signature)) return this.sigDeclOf.get(signature);
-    const decl = signature.declaration?.resolve(this.requireProject());
+    let decl = signature.declaration?.resolve(this.requireProject());
+    if (decl !== undefined) decl = this.liveFunctionDeclarationFor(decl) ?? decl;
     this.sigDeclOf.set(signature, decl);
     return decl;
   }
@@ -201,6 +273,20 @@ export class CheckerFacade {
     let sigs = this.callSigsOf.get(type);
     if (sigs === undefined) {
       sigs = this.raw.getSignaturesOfType(type, SignatureKind.Call);
+      // GH #111: a function declared more than once in one scope types as
+      // one signature per declaration (an "overload set"); only the live
+      // (last) declaration's is the function's.
+      if (sigs.length > 1) {
+        const project = this.requireProject();
+        const raw = sigs.map((s) => s.declaration?.resolve(project));
+        if (raw.every((d) => d !== undefined && isBodiedFunctionDeclaration(d))) {
+          const live = raw.map((d) => this.liveFunctionDeclarationFor(d!) ?? d!);
+          if (live.every((d) => d === live[0])) {
+            const keep = sigs.filter((_, i) => raw[i] === live[0]);
+            if (keep.length === 1) sigs = keep;
+          }
+        }
+      }
       this.callSigsOf.set(type, sigs);
     }
     return sigs;

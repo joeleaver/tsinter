@@ -5967,6 +5967,65 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2940-cjs-export-value-copy/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2940-cjs-export-value-copy/lib.cjs",
+    "<repo>/tests/corpus/2940-cjs-export-value-copy/facade.ts",
+    "<repo>/tests/corpus/2940-cjs-export-value-copy/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2941-cjs-export-value-copy-require/main.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2941-cjs-export-value-copy-require/lib.cjs",
+    "<repo>/tests/corpus/2941-cjs-export-value-copy-require/main.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2942-cjs-export-value-copy-mjs/main.mjs": {
+   "order": [
+    "<repo>/tests/corpus/2942-cjs-export-value-copy-mjs/lib.cjs",
+    "<repo>/tests/corpus/2942-cjs-export-value-copy-mjs/main.mjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2943-fn-decl-duplicates.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2943-fn-decl-duplicates.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2944-fn-decl-duplicates-strict.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2944-fn-decl-duplicates-strict.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2945-fn-decl-duplicates.mjs": {
+   "order": [
+    "<repo>/tests/corpus/2945-fn-decl-duplicates.mjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2946-fn-decl-duplicates-ts.ts": {
+   "order": [
+    "<repo>/tests/corpus/2946-fn-decl-duplicates-ts.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2947-cjs-export-duplicate-fn/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2947-cjs-export-duplicate-fn/lib.cjs",
+    "<repo>/tests/corpus/2947-cjs-export-duplicate-fn/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2948-fn-decl-binding-review.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2948-fn-decl-binding-review.cjs"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

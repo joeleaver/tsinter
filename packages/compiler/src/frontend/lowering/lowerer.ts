@@ -1102,6 +1102,8 @@ export class Lowerer {
    * property exports — different object, same declaration — so globalOf
    * falls back through the shared node (collectGlobals registers both). */
   readonly globalsByDeclNode = new Map<ts.Node, IrGlobal>();
+  /** GH #111: files whose parse-time duplicate-declaration errors were reported (splitFiles may run per pass). */
+  readonly syntaxErrorChecked = new Set<ts.SourceFile>();
   readonly globalsList: IrGlobal[] = [];
   /** The module-scope TDZ analysis (module-tdz.ts), computed once per
    * pass after collection; null until run() reaches it. */
@@ -1506,6 +1508,17 @@ export class Lowerer {
         this.flushDeferred(snap);
         return snap;
       }
+      // CJS MEMBER-EXPORT storage (GH #110): `exports.x = <entity name>`
+      // binds an ALIAS in the checker, so getAliasedSymbol would chase a
+      // named import of `x` through to the live local (`let level`) or to
+      // a property symbol with no storage (`exports.x = obj.x`). Node's
+      // named import reads the export table's VALUE, copied when the
+      // statement ran — the export's own storage (collectGlobals).
+      const member = this.cjsMemberSnapshotSymbolOf(symbol);
+      if (member) {
+        this.flushDeferred(member);
+        return member;
+      }
       symbol = this.checker.getAliasedSymbol(symbol);
     }
     // CommonJS export plumbing: a binding that resolved to a PROPERTY of a
@@ -1556,6 +1569,54 @@ export class Lowerer {
       const dep = resolveImport(this.program, d.getSourceFile(), spec.text);
       if (!dep) return null;
       sym = defaultExportSymbolOf(this, dep) ?? undefined;
+    }
+    return null;
+  }
+
+  /** The CJS member-export storage symbol a NAMED import/re-export alias
+   * chain lands on, or null: the walk follows `{ x }` / `{ x as y }`
+   * import specifiers and `export { x } from` re-export hops, and at a
+   * JS module stops at that module's export-table member `x` when
+   * collectGlobals registered storage for it (`exports.x = <expr>` /
+   * `module.exports.x = <expr>` — a snapshot of the value at the
+   * statement). Exports with no storage (class plumbing, table
+   * shorthands) answer null and resolve as before. */
+  private cjsMemberSnapshotSymbolOf(alias: ts.Symbol): ts.Symbol | null {
+    let sym: ts.Symbol | undefined = alias;
+    for (let hop = 0; sym !== undefined && hop < 32; hop++) {
+      const decls = this.checker.declarationsOf(sym);
+      // `const { x } = require("./m.cjs")` — the checker's require alias.
+      const be = decls.find(ts.isBindingElement);
+      if (be && hop === 0) {
+        const pat = be.parent;
+        const vd = pat.parent;
+        const key = be.propertyName ?? be.name;
+        if (key === undefined) return null;
+        if (!ts.isObjectBindingPattern(pat) || !ts.isVariableDeclaration(vd) || !vd.initializer || !ts.isIdentifier(key) || be.dotDotDotToken) return null;
+        const rspec = requireSpecOf(vd.initializer);
+        if (rspec === null || !isRelativeSpecifier(rspec)) return null;
+        const dep = resolveImport(this.program, vd.getSourceFile(), rspec);
+        const exp = dep && isJsSourceFile(dep) ? this.cjsModuleExportSymbol(dep, key.text) : undefined;
+        return exp && this.globalsBySymbol.has(exp) ? exp : null;
+      }
+      const d = decls.find((x) => ts.isImportSpecifier(x) || ts.isExportSpecifier(x));
+      if (d === undefined) return null;
+      let spec: ts.Expression | undefined;
+      if (ts.isImportSpecifier(d)) {
+        const idecl: ts.Node = d.parent.parent.parent;
+        if (ts.isImportDeclaration(idecl)) spec = idecl.moduleSpecifier;
+      } else {
+        const edecl: ts.Node = d.parent.parent;
+        if (ts.isExportDeclaration(edecl)) spec = edecl.moduleSpecifier;
+      }
+      const name = (d.propertyName ?? d.name).text;
+      if (spec === undefined || !ts.isStringLiteral(spec) || name === "default") return null;
+      const dep = resolveImport(this.program, d.getSourceFile(), spec.text);
+      if (!dep) return null;
+      const exp = this.cjsModuleExportSymbol(dep, name);
+      if (!exp) return null;
+      if (isJsSourceFile(dep) && this.globalsBySymbol.has(exp)) return exp;
+      sym = exp; // another re-export hop, or the walk ends at the next turn
     }
     return null;
   }

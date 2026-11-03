@@ -18,7 +18,8 @@
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
@@ -33,14 +34,44 @@ const sanitize = process.env["SCRIPTC_SAN"] === "1";
 /** The c lane is legacy (legacy-lanes.ts): by default these programs build
  * wasm-native, whose runner follows a fence or an uncaught throw with its
  * trap text `RuntimeError: unreachable` (SEMANTICS.md S117 (d), S122) — set
- * aside before any stderr expectation. `cOnly` rows pin what only the c lane
- * does — its fence texts for native handles, the c island's fences, an
- * http-handle dynCheck the wasm tier refuses (dynCheck:httpReq) — and skip.
- * SCRIPTC_LEGACY_LANES=1 runs everything on the c lane, as before. */
+ * aside before any stderr expectation. Rows where the lanes part (GH #113:
+ * the c lane's native-handle fence texts, the c island's fences, its
+ * checked-cast failures where the value is undefined) pin each lane's own
+ * outcome; where wasm-native answers as Node does, the row runs Node too and
+ * compares (`expectAsNode`). SCRIPTC_LEGACY_LANES=1 runs everything on the c
+ * lane, as before. */
 const lane = LEGACY_LANES ? "c" : "wasm-native";
-const cOnly = test.skipIf(!LEGACY_LANES);
 function stripTrapText(s: string): string {
   return lane === "wasm-native" ? s.replace(/RuntimeError: unreachable\n$/, "") : s;
+}
+
+/** Runs the same inline program under Node (the harness oracle's flags),
+ * from a temporary directory (Node strips no types under node_modules). */
+async function nodeRun(name: string, source: string, ext: "ts" | "cjs"): Promise<RunResult> {
+  const dir = mkdtempSync(join(tmpdir(), "dyncheck-node-"));
+  const file = join(dir, `${name}.${ext}`);
+  writeFileSync(file, source);
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      "node",
+      ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file],
+      { encoding: "utf8" },
+    );
+    return { stdout, stderr, exitCode: 0 };
+  } catch (err) {
+    const e = err as { code?: unknown; stdout?: string; stderr?: string };
+    if (typeof e.code !== "number") throw err;
+    return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", exitCode: e.code };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** GH #113: a row whose wasm-native outcome is Node's — stdout, stderr and
+ * exit status compared with Node's own run of the same program. */
+async function expectAsNode(r: RunResult, name: string, source: string, ext: "ts" | "cjs" = "ts"): Promise<void> {
+  const n = await nodeRun(name, source, ext);
+  expect(r).toEqual(n);
 }
 
 interface RunResult {
@@ -99,16 +130,19 @@ console.log("unreachable", c.host);
     expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got string");
   });
 
-  cOnly("missing field throws as undefined", async () => {
-    const r = await compileAndRun(
-      "missing-field",
-      `type Config = { host: string; port: number };
+  test("missing field: the c lane throws as undefined; wasm-native reads undefined as Node does (S119)", async () => {
+    const src = `type Config = { host: string; port: number };
 const c = JSON.parse('{"host":"h"}') as Config;
 console.log("unreachable", c.port);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got undefined");
+`;
+    const r = await compileAndRun("missing-field", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got undefined");
+      return;
+    }
+    expect(r.stdout).toBe("unreachable undefined\n");
+    await expectAsNode(r, "missing-field", src);
   });
 
   test("optional field: a PRESENT wrong-typed key throws with the arms named", async () => {
@@ -420,19 +454,24 @@ console.log("unreachable");
     expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got string");
   });
 
-  cOnly("a MISSING argument is undefined and fails a required param's check", async () => {
-    // JS arity: the thunk fills undefined; a number param can't hold it.
-    const r = await compileAndRun(
-      "dynfn-missing-arg",
-      `function twice(x: number): number { return x * 2; }
+  test("a MISSING argument is undefined: the c lane fails the required param's check; wasm-native passes undefined as Node does (S119)", async () => {
+    // JS arity: the thunk fills undefined. The c lane's number param can't
+    // hold it; wasm-native's can (undefined in typed slots), and `x * 2`
+    // is NaN — Node's run.
+    const src = `function twice(x: number): number { return x * 2; }
 const u: unknown = twice;
 const zero = u as () => unknown;
-zero();
+console.log(zero());
 console.log("unreachable");
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got undefined");
+`;
+    const r = await compileAndRun("dynfn-missing-arg", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected number at $[0], got undefined");
+      return;
+    }
+    expect(r.stdout).toBe("NaN\nunreachable\n");
+    await expectAsNode(r, "dynfn-missing-arg", src);
   });
 
   test("an adapter validates the RESULT into the target's return type", async () => {
@@ -669,7 +708,7 @@ server.listen(0, '127.0.0.1', wrap(function() {
 }));
 `;
 
-  cOnly("a real-but-unmodeled member on a dyn handle throws the loud ladder", async () => {
+  test("a real-but-unmodeled member on a dyn handle throws the loud ladder (where Node keeps serving)", async () => {
     // writeContinue stays unmodeled (cork/uncork/flushHeaders graduated
     // to real dispatches — the ladder's exemplar moves with the surface).
     const r = await compileAndRun(
@@ -682,12 +721,15 @@ server.listen(0, '127.0.0.1', wrap(function() {
       "cjs",
     );
     expect(r.exitCode).toBe(1);
+    // GH #113: each lane names the fence its own way (S088 (f) on wasm).
     expect(r.stderr).toContain(
-      "'ServerResponse.prototype.writeContinue' on a dynamic value is not supported yet",
+      LEGACY_LANES
+        ? "'ServerResponse.prototype.writeContinue' on a dynamic value is not supported yet"
+        : "tsinter: unsupported: 'writeContinue' on an http handle is not supported yet [SC1090]",
     );
   });
 
-  cOnly("an expando write on a dyn handle throws the loud ladder (identity would break)", async () => {
+  test("an expando write on a dyn handle throws the loud ladder (identity would break)", async () => {
     const r = await compileAndRun(
       "handle-expando-write",
       serverPreamble +
@@ -698,10 +740,14 @@ server.listen(0, '127.0.0.1', wrap(function() {
       "cjs",
     );
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("setting 'custom' on a dynamic IncomingMessage is not supported yet");
+    expect(r.stderr).toContain(
+      LEGACY_LANES
+        ? "setting 'custom' on a dynamic IncomingMessage is not supported yet"
+        : "tsinter: unsupported: setting the property 'custom' of an http handle (to this value) is not supported yet [SC1090]",
+    );
   });
 
-  cOnly("an unmodeled event registration on a dyn handle throws the loud ladder", async () => {
+  test("an unmodeled event registration on a dyn handle throws the loud ladder", async () => {
     const r = await compileAndRun(
       "handle-unmodeled-event",
       serverPreamble +
@@ -713,19 +759,23 @@ server.listen(0, '127.0.0.1', wrap(function() {
     );
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain(
-      "listening for 'nonsense' on a dynamic IncomingMessage is not supported yet",
+      LEGACY_LANES
+        ? "listening for 'nonsense' on a dynamic IncomingMessage is not supported yet"
+        : "tsinter: unsupported: 'on' for the event 'nonsense' on an http handle is not supported yet [SC1090]",
     );
   });
 
-  cOnly("a handle-targeted dynCheck failure names the class", async () => {
-    const r = await compileAndRun(
-      "handle-wrong-target",
-      `import type { IncomingMessage } from "node:http";
+  test("a handle-targeted dynCheck failure names the class (c); the wasm tier refuses the cast by name", async () => {
+    const src = `import type { IncomingMessage } from "node:http";
 const u: unknown = "not a request";
 const req = u as IncomingMessage;
 console.log("unreachable", req.url);
-`,
-    );
+`;
+    if (!LEGACY_LANES) {
+      await expect(compileAndRun("handle-wrong-target", src)).rejects.toThrow(/SC3001: .*\(dynCheck:httpReq\)/);
+      return;
+    }
+    const r = await compileAndRun("handle-wrong-target", src);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("tsinter: unsupported: expected IncomingMessage at $, got string");
   });
@@ -872,10 +922,8 @@ console.log(keys(eng).length, keys(eng).join(","));
     expect(r.stdout).toBe("2 a,b\n");
   });
 
-  cOnly("deepStrictEqual over island-held values: identity passes, structure fences", async () => {
-    const r = await compileAndRun(
-      "jsval-deepeq",
-      `import assert from "node:assert";
+  test("deepStrictEqual over island-held values: identity passes; structure fences on the c lane, compares as Node on wasm-native", async () => {
+    const src = `import assert from "node:assert";
 const eng: any = { a: 1 };
 const other: any = { a: 1 };
 const u1: unknown = eng;
@@ -883,12 +931,15 @@ const u2: unknown = eng;
 assert.deepStrictEqual(u1, u2); // the same engine value: honest true
 console.log("identity ok");
 const u3: unknown = other;
-assert.deepStrictEqual(u1, u3); // distinct values: the structural walk fences
+assert.deepStrictEqual(u1, u3); // distinct values: the structural walk
 console.log("unreachable");
-`,
-      "ts",
-      true,
-    );
+`;
+    const r = await compileAndRun("jsval-deepeq", src, "ts", true);
+    if (!LEGACY_LANES) {
+      expect(r.stdout).toBe("identity ok\nunreachable\n");
+      await expectAsNode(r, "jsval-deepeq", src);
+      return;
+    }
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain("identity ok");
     expect(r.stderr).toContain(
@@ -896,7 +947,7 @@ console.log("unreachable");
     );
   });
 
-  cOnly("util.inspect (console.log) of an island-held unknown renders plain data and fences other engine shapes with the engine typeof", async () => {
+  test("util.inspect (console.log) of an island-held unknown renders plain data; other engine shapes fence on the c lane and render as Node on wasm-native", async () => {
     // Unit H: plain engine data (dense Arrays, plain objects of enumerable
     // data members) renders through a read-only dyn snapshot — Node's own
     // output (SEMANTICS.md S110 (e)).
@@ -909,17 +960,20 @@ console.log("unreachable");
     );
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("{ a: 1, list: [ 1, 2, 3 ] }\n");
-    // An accessor member is not plain data (Node prints [Getter]): the
-    // loud fence, naming the engine typeof.
-    const g = await compileAndRun(
-      "jsval-inspect-getter",
-      `const eng: any = { get a() { return 1; } };
+    if (!LEGACY_LANES) await expectAsNode(r, "jsval-inspect", wrapPreamble + "console.log(u);\n");
+    // An accessor member is not plain data (Node prints [Getter]): the c
+    // lane's loud fence, naming the engine typeof; wasm-native's own value
+    // renders as Node's.
+    const getterSrc = `const eng: any = { get a() { return 1; } };
 const u: unknown = eng;
 console.log(u);
-`,
-      "ts",
-      true,
-    );
+`;
+    const g = await compileAndRun("jsval-inspect-getter", getterSrc, "ts", true);
+    if (!LEGACY_LANES) {
+      expect(g.stdout).toBe("{ a: [Getter] }\n");
+      await expectAsNode(g, "jsval-inspect-getter", getterSrc);
+      return;
+    }
     expect(g.exitCode).toBe(1);
     expect(g.stderr).toContain(
       "util.inspect of a composite 'any' value (typeof 'object') is not supported yet",
@@ -979,27 +1033,30 @@ console.log(\`\${eng.a} \${eng.fresh}\`);
     expect(r.stdout).toBe("2 x\n");
   });
 
-  cOnly("'in' over an island-held unknown fences (never a silent false)", async () => {
-    const r = await compileAndRun(
-      "jsval-in",
-      `/** @returns {any} */
+  test("'in' over an island-held unknown fences on the c lane (never a silent false); wasm-native answers as Node", async () => {
+    const src = `/** @returns {any} */
 function mint() { return { a: 1 }; }
 const eng = mint();
 /** @param {object} bag */
 function has(bag) { return "a" in bag; }
 console.log(has(eng));
-`,
-      "cjs",
-      true,
-    );
+`;
+    const r = await compileAndRun("jsval-in", src, "cjs", true);
+    if (!LEGACY_LANES) {
+      expect(r.stdout).toBe("true\n");
+      await expectAsNode(r, "jsval-in", src, "cjs");
+      return;
+    }
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("'in' on an island value held in 'unknown' is not supported yet");
   });
 
-  cOnly("a wrapped island value RC-balances through catch-and-continue unwinds", async () => {
+  test("a wrapped island value RC-balances through catch-and-continue unwinds (c); wasm-native fences the clone by name", async () => {
     // The engine clone's DataCloneError (a function member) is catchable;
     // the wrapped cell must release cleanly through the unwind (the SAN
-    // lane's RC audit is the check).
+    // lane's RC audit is the check). GH #113: on wasm-native a function
+    // value reaching structuredClone under --dynamic carries no source
+    // text, so the clone is S122's fence (Node: "done 100").
     // The crossing rides a real dyn PARAM slot — a local initialized from
     // an island value stays island-world by the runtime-world dispatch.
     const r = await compileAndRun(
@@ -1019,6 +1076,12 @@ console.log("done", caught);
       "ts",
       true,
     );
+    if (!LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe("tsinter: unsupported: structuredClone of a function value is not supported yet [SC1090]\n");
+      return;
+    }
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("done 100\n");
   });

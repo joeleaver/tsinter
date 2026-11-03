@@ -985,6 +985,10 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // Already lowered eagerly by the forward-hoisting machinery
       // (predeclareForwardFnDecl) — the varDecl is in the list's output.
       if (L.ctx.hoistedFnDecls.has(stmt)) return null;
+      // An earlier declaration of a function its scope declares again is
+      // never observable (GH #111: the last declaration is the binding's
+      // value from scope entry on) — the live one lowers in its place.
+      if (L.checker.liveFunctionDeclarationFor(stmt) !== null) return null;
       return L.lowerNestedFunctionDecl(stmt);
     }
     // Enum declarations: constant-member enums emit nothing (member reads
@@ -4241,6 +4245,26 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
         L.unsupported("SC1062", vd);
       }
       if (vd && ts.isIdentifier(vd.name)) {
+        // `var e = …` inside `catch (e)` (Annex B.3.5, sloppy and strict):
+        // the initializer writes the CATCH PARAMETER, not the function's
+        // var `e` the checker binds it to — refused by name (GH #111 sweep).
+        const pname = vd.name.text;
+        const catchBlock = stmt.catchClause.block;
+        ts.walkPreorder(catchBlock, (n) => {
+          if (n !== catchBlock && (ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n))) return "skip";
+          if (ts.isVariableDeclarationList(n) && (ts.getCombinedNodeFlags(n) & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+            const head = n.parent;
+            const loopHead = head !== undefined && (ts.isForInStatement(head) || ts.isForOfStatement(head));
+            for (const d of n.declarations) {
+              const binds = (b: ts.BindingName): boolean =>
+                ts.isIdentifier(b) ? b.text === pname : b.elements.some((e) => !ts.isOmittedExpression(e) && e.name !== undefined && binds(e.name));
+              if (binds(d.name) && (d.initializer !== undefined || loopHead)) {
+                L.unsupported("SC1090", d, `'var ${pname}' assigned inside 'catch (${pname})' (Node writes the catch parameter, not the function's var)`);
+              }
+            }
+          }
+          return undefined;
+        });
         L.scopes.push(new Map());
         try {
           const local = L.declareLocal(vd.name, vd.name.text, CAUGHT, false);

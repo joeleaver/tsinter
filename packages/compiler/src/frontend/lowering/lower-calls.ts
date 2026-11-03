@@ -7,7 +7,7 @@ import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
-import { isJsSourceFile, locOf } from "../program.js";
+import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, newFnCtx, nodeThrowExpr } from "./lowerer.js";
 import { isTypedComposite } from "./island-views.js";
@@ -841,6 +841,8 @@ export function collectSignatureInner(L: Lowerer, decl: ts.FunctionDeclaration):
     // Node's ReferenceError at the use site — the `declare const` /
     // ambient-namespace undefRead stance, ambientUndefinedFnSymbolOf).
     if (!decl.body) return;
+    // GH #111: duplicate declarations, var merges, Annex B (lowerNestedFunctionDecl's twin).
+    if (decl.name) checkFunctionDeclBinding(L, decl);
     // A MIXIN function (`function M(Base: T) { return class extends Base
     // {…} }`) has no callable signature of its own — its return type is a
     // per-call class, so calls instantiate per site (lower-mixins.ts) and
@@ -1456,7 +1458,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       const body = [...declared.prologue];
       const bodyBlock = blockBodyOf(decl);
       if (bodyBlock) {
-        body.push(...L.lowerStmts(bodyBlock.statements));
+        body.push(...scopeEntryFences(L, decl), ...L.lowerStmts(bodyBlock.statements));
         if (fnCtx.inferReturn) {
           bodyReturn = resolveInferredReturn(L, inst, fnCtx.inferReturn, body, decl);
         }
@@ -5518,6 +5520,293 @@ const inliningPredicates = new Set<ts.Symbol>();
     );
   }
 
+/** Per var-scope body: each name a `var` declaration ASSIGNS (an
+   * initializer, a for-in/of head, a destructuring) → its first such
+   * declaration. Nested functions and classes are their own scopes. */
+  const assignedVarsCache = new WeakMap<ts.Node, Map<string, ts.VariableDeclaration>>();
+  function assignedVarsOf(body: ts.Node): Map<string, ts.VariableDeclaration> {
+    let out = assignedVarsCache.get(body);
+    if (out !== undefined) return out;
+    const found = new Map<string, ts.VariableDeclaration>();
+    const names = (b: ts.BindingName, d: ts.VariableDeclaration): void => {
+      if (ts.isIdentifier(b)) {
+        if (!found.has(b.text)) found.set(b.text, d);
+        return;
+      }
+      for (const e of b.elements) if (!ts.isOmittedExpression(e) && e.name !== undefined) names(e.name, d);
+    };
+    // An explicit-stack walk (ts.walkPreorder): absurd nesting must reach
+    // the lowering's own nesting fence, never overflow here.
+    ts.walkPreorder(body, (n) => {
+      if (n !== body && (ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n))) return "skip";
+      if (ts.isVariableDeclarationList(n) && (ts.getCombinedNodeFlags(n) & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+        const head = n.parent;
+        const loopHead = head !== undefined && (ts.isForInStatement(head) || ts.isForOfStatement(head));
+        for (const d of n.declarations) {
+          if (d.initializer !== undefined || loopHead || !ts.isIdentifier(d.name)) names(d.name, d);
+        }
+      }
+      return undefined;
+    });
+    out = found;
+    assignedVarsCache.set(body, out);
+    return out;
+  }
+
+  /** True when `n` runs as strict code: an ES module, a 'use strict'
+   * prologue in the file or an enclosing function, or a class body. */
+  export function isStrictCodeAt(n: ts.Node): boolean {
+    const sf = n.getSourceFile();
+    if (isNodeEsmFile(sf)) return true;
+    const hasDirective = (stmts: readonly ts.Statement[]): boolean => {
+      for (const st of stmts) {
+        if (!ts.isExpressionStatement(st) || !ts.isStringLiteral(st.expression)) return false;
+        if (st.expression.text === "use strict") return true;
+      }
+      return false;
+    };
+    if (hasDirective(sf.statements)) return true;
+    for (let p: ts.Node | undefined = n.parent; p !== undefined && !ts.isSourceFile(p); p = p.parent) {
+      if (ts.isClassDeclaration(p) || ts.isClassExpression(p)) return true;
+      if (ts.isFunctionLike(p)) {
+        const body = (p as { body?: ts.Node }).body;
+        if (body !== undefined && ts.isBlock(body) && hasDirective(body.statements)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** The function-like (or source file) whose VAR scope `n` belongs to. */
+  function varScopeOf(n: ts.Node): ts.Node {
+    let p: ts.Node | undefined = n.parent;
+    while (p !== undefined && !ts.isSourceFile(p) && !(ts.isFunctionLike(p) && (p as { body?: ts.Node }).body !== undefined) && !ts.isClassStaticBlockDeclaration(p)) p = p.parent;
+    return p ?? n.getSourceFile();
+  }
+
+  /** True when `decl` sits directly in its var scope's statement list (a
+   * function body, a source file, a namespace body) rather than in a
+   * nested block or case clause. */
+  function isVarScopeLevelFnDecl(decl: ts.FunctionDeclaration): boolean {
+    const p = decl.parent;
+    if (ts.isSourceFile(p) || ts.isModuleBlock(p)) return true;
+    return ts.isBlock(p) && p.parent !== undefined && ts.isFunctionLike(p.parent);
+  }
+
+  /** True when `n` names a binding in a USE — a read or a write — rather
+   * than a property name, a label or a declaration's own name. */
+  function isUseIdentifier(n: ts.Identifier): boolean {
+    const p = n.parent;
+    if (p === undefined) return false;
+    const named = (x: ts.Node): boolean => (x as { name?: ts.Node }).name === n;
+    if (ts.isPropertyAccessExpression(p)) return p.name !== n;
+    if (ts.isQualifiedName(p)) return p.left === n;
+    if (
+      ts.isPropertyAssignment(p) || ts.isMethodDeclaration(p) || ts.isPropertyDeclaration(p) ||
+      ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p) || ts.isPropertySignature(p) ||
+      ts.isEnumMember(p)
+    ) return !named(p);
+    if (ts.isBindingElement(p)) return p.propertyName !== n && p.name !== n;
+    if (ts.isLabeledStatement(p) || ts.isBreakStatement(p) || ts.isContinueStatement(p)) return false;
+    if (ts.isImportSpecifier(p) || ts.isExportSpecifier(p)) return false;
+    if (
+      ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isFunctionDeclaration(p) || ts.isFunctionExpression(p) ||
+      ts.isClassDeclaration(p) || ts.isClassExpression(p)
+    ) return !named(p);
+    return true;
+  }
+
+  function bindsNameIn(b: ts.BindingName, name: string): boolean {
+    return ts.isIdentifier(b) ? b.text === name : b.elements.some((e) => !ts.isOmittedExpression(e) && e.name !== undefined && bindsNameIn(e.name, name));
+  }
+
+  /** Annex B.3.3 (sloppy code): a block-level function declaration also
+   * creates a VAR of its name in the enclosing function (or script),
+   * undefined from that scope's entry and assigned the function when the
+   * declaration is evaluated — unless that var would clash with a
+   * parameter or a let/const/class of the scopes in between. The checker
+   * models only the block binding, so a use it resolves to another
+   * binding names a different binding than Node's. Answers the first such
+   * use and whether Node's binding differs from scope ENTRY (the use
+   * resolves outside the scope: Node's fresh var is undefined until the
+   * block runs) or only from the declaration on (the use resolves to a
+   * var or function of the same scope, which Node's var IS). Null when
+   * Annex B skips the declaration or every use agrees. */
+  function annexBConflict(L: Lowerer, decl: ts.FunctionDeclaration): { use: ts.Identifier; fromEntry: boolean } | null {
+    if (!decl.name || !decl.body || isVarScopeLevelFnDecl(decl) || isStrictCodeAt(decl)) return null;
+    const sym = L.checker.getSymbolAtLocation(decl.name);
+    if (!sym) return null;
+    const name = decl.name.text;
+    const scope = varScopeOf(decl);
+    if (ts.isFunctionLike(scope)) {
+      if ((scope as ts.SignatureDeclaration).parameters.some((p) => bindsNameIn(p.name, name))) return null;
+      if (name === "arguments") return null;
+    }
+    for (let p: ts.Node | undefined = decl.parent.parent; p !== undefined && p !== scope.parent; p = p.parent) {
+      const stmts = ts.isBlock(p) || ts.isSourceFile(p) || ts.isCaseClause(p) || ts.isDefaultClause(p) ? (p as { statements: ts.NodeArray<ts.Statement> }).statements : ts.isCaseBlock(p) ? p.clauses.flatMap((c) => [...c.statements]) : undefined;
+      if (stmts === undefined) continue;
+      for (const s of stmts) {
+        if (ts.isVariableStatement(s) && (ts.getCombinedNodeFlags(s.declarationList) & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+            s.declarationList.declarations.some((d) => bindsNameIn(d.name, name))) return null;
+        if (ts.isClassDeclaration(s) && s.name?.text === name) return null;
+      }
+      if (p === scope) break;
+    }
+    // A binding Node resolves the use to as the checker does: lexical
+    // (let/const/class, a block-level function, a catch parameter) inside
+    // the scope, or owned by a nested function's own var scope.
+    const isLexical = (d: ts.Node): boolean =>
+      (ts.isVariableDeclaration(d) && (ts.isCatchClause(d.parent) || (ts.getCombinedNodeFlags(d) & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0)) ||
+      (ts.isBindingElement(d) && (ts.getCombinedNodeFlags(d) & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0) ||
+      ts.isClassDeclaration(d) ||
+      (ts.isFunctionDeclaration(d) && !isVarScopeLevelFnDecl(d));
+    const inside = (d: ts.Node): boolean =>
+      d.getSourceFile() === scope.getSourceFile() && d.pos >= scope.pos && d.end <= scope.end && d !== scope;
+    let firstInner: ts.Identifier | null = null;
+    let outer: ts.Identifier | null = null;
+    const visit = (n: ts.Node): void | "stop" => {
+      if (outer !== null) return "stop";
+      if (ts.isIdentifier(n) && n.text === name && n !== decl.name && isUseIdentifier(n)) {
+        const parent = n.parent;
+        let s = L.checker.getSymbolAtLocation(n);
+        if (parent !== undefined && ts.isShorthandPropertyAssignment(parent)) s = L.checker.getShorthandAssignmentValueSymbol(parent) ?? s;
+        if (s !== undefined && s !== sym) {
+          const decls = L.checker.declarationsOf(s);
+          if (decls.length === 0 || !decls.every(inside)) outer = n;
+          else if (!decls.every((d) => isLexical(d) || varScopeOf(d) !== scope)) firstInner ??= n;
+        }
+      }
+      return undefined;
+    };
+    const body = ts.isSourceFile(scope) ? scope : (scope as { body?: ts.Node }).body;
+    if (body !== undefined) ts.walkPreorder(body, visit);
+    if (outer !== null) return { use: outer, fromEntry: true };
+    if (firstInner !== null) return { use: firstInner, fromEntry: false };
+    return null;
+  }
+
+  function lineOf(n: ts.Node): number {
+    return n.getSourceFile().getLineAndCharacterOfPosition(n.getStart()).line + 1;
+  }
+
+  /** The Annex B refusal's text: what Node's extra var does to the use. */
+  function annexBText(name: string, c: { use: ts.Identifier; fromEntry: boolean }): string {
+    return c.fromEntry
+      ? `the sloppy-mode block function '${name}' (Annex B: Node gives the enclosing function its own var '${name}', undefined until the block runs, and the use of '${name}' at line ${lineOf(c.use)} names that var, not the binding it names here)`
+      : `the sloppy-mode block function '${name}' (Annex B: when the block runs Node also assigns the function to the var '${name}' that the use at line ${lineOf(c.use)} names)`;
+  }
+
+  /** GH #111 (review): the binding changes Node makes at a scope's ENTRY —
+   * a function declaration replacing a parameter of the same name, a
+   * declaration merged with a `var` the scope assigns, an Annex B var
+   * that shadows an outer binding — refuse at that entry, so code before
+   * the declaration and unreached declarations are covered too. A
+   * JavaScript scope gets a runtime fence as its first statement; a
+   * TypeScript one is a compile refusal. `scope` is a function-like with a
+   * block body, or a source file. */
+  export function scopeEntryFences(L: Lowerer, scope: ts.Node): IrStmt[] {
+    const body = ts.isSourceFile(scope) ? scope : (scope as { body?: ts.Node }).body;
+    if (body === undefined || !(ts.isSourceFile(body) || ts.isBlock(body))) return [];
+    const stmts = (body as ts.Block | ts.SourceFile).statements;
+    let reason: { node: ts.Node; text: string } | null = null;
+    for (const s of stmts) {
+      if (reason !== null) break;
+      if (!ts.isFunctionDeclaration(s) || !s.name || !s.body) continue;
+      const name = s.name.text;
+      if (ts.isFunctionLike(scope) && (scope as ts.SignatureDeclaration).parameters.some((p) => bindsNameIn(p.name, name))) {
+        reason = { node: s, text: `function '${name}' declared in a function with a parameter of the same name (Node's declaration replaces the argument from the function's entry)` };
+        break;
+      }
+      const hit = assignedVarsOf(body).get(name);
+      if (hit !== undefined) {
+        reason = { node: hit, text: `'var ${name}' assigned in the scope that declares function '${name}' (Node's one binding takes the var's value at that statement)` };
+      }
+    }
+    if (reason === null) {
+      ts.walkPreorder(body, (n) => {
+        if (reason !== null) return "stop";
+        if (n !== body && (ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n))) {
+          if (ts.isFunctionDeclaration(n) && n.name && n.body && !isVarScopeLevelFnDecl(n)) {
+            const c = annexBConflict(L, n);
+            if (c !== null && c.fromEntry) reason = { node: n, text: annexBText(n.name.text, c) };
+          }
+          return "skip";
+        }
+        return undefined;
+      });
+    }
+    if (reason === null) return [];
+    if (!isJsSourceFile(scope.getSourceFile())) L.unsupported("SC1090", reason.node, reason.text);
+    return [{ kind: "runtimeFence", code: "SC1090", message: `${reason.text} is not supported yet`, loc: locOf(reason.node) }];
+  }
+
+  /** GH #111 (review): the duplicate function declarations Node rejects
+   * before running anything — two in an ES module's top level, or in one
+   * block of strict code (SyntaxError: Identifier has already been
+   * declared) — are BUILD refusals, never run-time fences. */
+  export function duplicateFnSyntaxErrors(sf: ts.SourceFile): { node: ts.FunctionDeclaration; text: string }[] {
+    const out: { node: ts.FunctionDeclaration; text: string }[] = [];
+    const check = (stmts: readonly ts.Statement[], where: string, applies: () => boolean = () => true): void => {
+      const seen = new Set<string>();
+      for (const s of stmts) {
+        if (!ts.isFunctionDeclaration(s) || !s.name || !s.body) continue;
+        if (seen.has(s.name.text) && applies()) {
+          out.push({ node: s, text: `function '${s.name.text}' declared twice ${where} (Node rejects the program before it runs: SyntaxError, Identifier '${s.name.text}' has already been declared)` });
+        }
+        seen.add(s.name.text);
+      }
+    };
+    if (isNodeEsmFile(sf)) check(sf.statements, "at an ES module's top level");
+    ts.walkPreorder(sf, (n) => {
+      const block = ts.isBlock(n) && !(n.parent !== undefined && ts.isFunctionLike(n.parent)) && !(n.parent !== undefined && ts.isClassStaticBlockDeclaration(n.parent));
+      if (block || ts.isCaseBlock(n)) {
+        check(ts.isCaseBlock(n) ? n.clauses.flatMap((c) => [...c.statements]) : (n as ts.Block).statements, "in one block of strict code", () => isStrictCodeAt(n));
+      }
+      return undefined;
+    });
+    return out;
+  }
+
+  /** GH #111: what a function declaration's own lowering checks (the
+   * entry-time forms are scopeEntryFences', the SyntaxError forms
+   * duplicateFnSyntaxErrors'):
+   * - the same function declared again in one scope: the LAST declaration
+   *   is the value (the checker facade reports only that one; earlier ones
+   *   never lower). Declarations whose results or shared parameters type
+   *   differently refuse (call sites are typed against the first); a
+   *   differing parameter COUNT lowers — calls run the last declaration.
+   * - a sloppy-mode block-level declaration whose name a use in the same
+   *   function resolves to that function's own var or function: from the
+   *   declaration on, Node's binding holds the block function — refused at
+   *   the declaration. */
+  export function checkFunctionDeclBinding(L: Lowerer, decl: ts.FunctionDeclaration): void {
+    if (!decl.name || !decl.body) return;
+    const name = decl.name.text;
+    const all = L.checker.allFunctionDeclarationsOf(decl) as ts.FunctionDeclaration[];
+    if (all.length > 1) {
+      const live = L.lambdaSignature(decl);
+      for (const d of all) {
+        if (d === decl) continue;
+        let same = false;
+        const diagsBefore = L.diags.length;
+        try {
+          const other = L.lambdaSignature(d);
+          const n = Math.min(other.funcType.params.length, live.funcType.params.length);
+          same =
+            typeEquals(other.funcType.ret, live.funcType.ret) &&
+            other.funcType.params.slice(0, n).every((t, i) => typeEquals(t, live.funcType.params[i]!));
+        } catch (e) {
+          if (!(e instanceof PoisonError)) throw e;
+          L.diags.length = diagsBefore;
+        }
+        if (!same) {
+          L.unsupported("SC1090", d, `function '${name}' declared again with a different signature (Node calls the last declaration; call sites here are typed against the first)`);
+        }
+      }
+    }
+    const c = annexBConflict(L, decl);
+    if (c !== null && !c.fromEntry) L.unsupported("SC1090", decl, annexBText(name, c));
+  }
+
 /** Nested `function name(...) {...}`: lowered as `const name = <lambda>`
    * at the declaration's statement position (JS hoists function declarations
    * to the top of the enclosing function — calling one before this statement
@@ -5526,6 +5815,7 @@ const inliningPredicates = new Set<ts.Symbol>();
    * closure would be an RC cycle. */
   export function lowerNestedFunctionDecl(L: Lowerer, stmt: ts.FunctionDeclaration): IrStmt[] {
     if (!stmt.name) L.unsupported("SC1090", stmt, "anonymous function declarations");
+    checkFunctionDeclBinding(L, stmt);
     const { funcType } = L.lambdaSignature(stmt);
     const loc = locOf(stmt);
     // A REASSIGNED declaration (Babel's lazy-require helper `function
@@ -5838,7 +6128,7 @@ const inliningPredicates = new Set<ts.Symbol>();
       const block = ts.isArrowFunction(node) ? (ts.isBlock(node.body) ? node.body : null) : blockBodyOf(node);
       if (!ts.isArrowFunction(node) && !block) L.unsupported("SC1090", node, "functions whose block body the frontend cannot locate");
       if (block) {
-        body = L.lowerStmts(block.statements);
+        body = [...scopeEntryFences(L, node), ...L.lowerStmts(block.statements)];
       } else {
         // Bare-expression arrow body: `x => e` is `x => { return e; }`
         // (or an expression statement when the signature returns void — or
@@ -8033,7 +8323,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
       if (!bodyBlock) {
         L.unsupported("SC1090", decl, "function declarations whose block body the frontend cannot locate");
       }
-      const body = [...prologue, ...L.lowerStmts(bodyBlock.statements)];
+      const body = [...prologue, ...scopeEntryFences(L, decl), ...L.lowerStmts(bodyBlock.statements)];
       appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(decl));
       const fn: IrFunction = {
         name: sig.name,

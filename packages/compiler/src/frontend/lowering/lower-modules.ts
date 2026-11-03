@@ -14,7 +14,7 @@ import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, u
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
-import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
+import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { stdlibGlobalAliasDecl } from "./surfaces.js";
@@ -41,10 +41,19 @@ export interface FileParts {
   export function splitFiles(L: Lowerer): FileParts[] {
     const files = L.moduleOrder.length > 0 ? L.moduleOrder : [L.entry];
     return files.map((sf) => {
+      // GH #111 (review): duplicate declarations Node rejects at parse
+      // time refuse the BUILD (a JavaScript source too — nothing runs).
+      if (!sf.isDeclarationFile && !L.syntaxErrorChecked.has(sf)) {
+        L.syntaxErrorChecked.add(sf);
+        for (const e of duplicateFnSyntaxErrors(sf)) L.pushDiag(unsupportedDiag("SC1090", locOf(e.node), e.text));
+      }
       const fp: FileParts = { sf, fnDecls: [], classDecls: [], topStmts: [] };
       for (const stmt of sf.statements) {
-        if (ts.isFunctionDeclaration(stmt)) fp.fnDecls.push(stmt);
-        else if (ts.isClassDeclaration(stmt)) fp.classDecls.push(stmt);
+        if (ts.isFunctionDeclaration(stmt)) {
+          // GH #111: only the LAST of a same-scope run of declarations of
+          // one function is live (checker facade's declarationsOf).
+          if (L.checker.liveFunctionDeclarationFor(stmt) === null) fp.fnDecls.push(stmt);
+        } else if (ts.isClassDeclaration(stmt)) fp.classDecls.push(stmt);
         // Namespaces: ambient/type-only ones are zero-runtime and skip;
         // instantiated bodies FLATTEN into this file's parts (functions/
         // classes hoist under namespace-qualified names, statements join
@@ -2021,7 +2030,16 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         }
       }
       statics.sort((a, b) => a.pos - b.pos);
-      const body = [...header, ...prelude];
+      // GH #111 (review): the module scope's entry-time binding refusals
+      // (scopeEntryFences), after the import header — Node hoists before
+      // the body's first statement runs.
+      let entryFences: IrStmt[] = [];
+      try {
+        entryFences = scopeEntryFences(L, sf);
+      } catch (e) {
+        if (!(e instanceof PoisonError)) throw e; // a TypeScript source: the compile refusal is recorded
+      }
+      const body = [...header, ...entryFences, ...prelude];
       let at = 0;
       for (const stmt of stmts) {
         // `<=`: a mixin instantiation's position IS its statement's start

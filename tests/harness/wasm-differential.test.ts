@@ -3705,6 +3705,15 @@ const TIER_FLOOR: string[] = [
   "2913-cycle-reaches-pending-module/main.ts",
   "2914-cycle-var-early-write/main.ts",
   "2915-cjs-default-reexport/main.ts",
+  "2940-cjs-export-value-copy/main.ts",
+  "2941-cjs-export-value-copy-require/main.cjs",
+  "2942-cjs-export-value-copy-mjs/main.mjs",
+  "2943-fn-decl-duplicates.cjs",
+  "2944-fn-decl-duplicates-strict.cjs",
+  "2945-fn-decl-duplicates.mjs",
+  "2946-fn-decl-duplicates-ts.ts",
+  "2947-cjs-export-duplicate-fn/main.ts",
+  "2948-fn-decl-binding-review.cjs",
 ];
 
 interface RunResult {
@@ -10568,4 +10577,85 @@ describe("module forms rows", () => {
       }),
     ).toEqual({ stdout: "", exitCode: 1 });
   }, 120000);
+});
+
+/* ── GH #110 / #111 binding-form refusal rows: the forms of a function
+ * declaration's name that do not lower to what Node runs refuse by name —
+ * at the scope's ENTRY where Node changes the binding there, at the
+ * declaration where Node changes it there, and at BUILD time where Node
+ * rejects the program — never the first-declaration / dropped-initializer
+ * reading the lowering used to give. Each row pins the stdout printed
+ * before the fence (where it sits) and the fence text. The Node-matching
+ * forms are corpus programs 2940-2948. ── */
+
+describe("GH #110 / #111 binding-form refusal rows", () => {
+  /** Builds `name` (with `body`) on the wasm lane and runs it: its stdout
+   * and the named fence's text (location dropped), or the build refusal. */
+  async function outcome(name: string, body: string): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), "gh111-"));
+    try {
+      const file = join(dir, name);
+      writeFileSync(file, body);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) return "refused: " + res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ");
+      const r = await runWasm(res.binaryPath);
+      return `exit ${r.exitCode}: ${JSON.stringify(r.stdout.toString("utf8"))} ` + r.stderr.toString("utf8").replace(/ \[SC\d+ at [^\]]+\]/, "").trim();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const H = "// @ts-nocheck\n";
+  const fence = (stdout: string, text: string): string => `exit 1: ${JSON.stringify(stdout)} tsinter: unsupported: ${text} is not supported yet`;
+  const varMsg = (n: string): string =>
+    `'var ${n}' assigned in the scope that declares function '${n}' (Node's one binding takes the var's value at that statement)`;
+  const paramMsg = (n: string): string =>
+    `function '${n}' declared in a function with a parameter of the same name (Node's declaration replaces the argument from the function's entry)`;
+  const annexEntry = (n: string, line: number): string =>
+    `the sloppy-mode block function '${n}' (Annex B: Node gives the enclosing function its own var '${n}', undefined until the block runs, and the use of '${n}' at line ${line} names that var, not the binding it names here)`;
+  const annexDecl = (n: string, line: number): string =>
+    `the sloppy-mode block function '${n}' (Annex B: when the block runs Node also assigns the function to the var '${n}' that the use at line ${line} names)`;
+  const dupSyntax = (n: string, where: string): string =>
+    `refused: SC1090 function '${n}' declared twice ${where} (Node rejects the program before it runs: SyntaxError, Identifier '${n}' has already been declared) is not supported yet`;
+  const rows: [string, string, string, string][] = [
+    // [row, file name, source, expected outcome]
+    // A var the scope assigns, merged with a function: at the scope's entry.
+    ["V-01 a var initializer merged with a module function", "v.cjs", H + "console.log('start');\nvar f = 5;\nfunction f() {}\nconsole.log(typeof f);\n", fence("", varMsg("f"))],
+    ["V-02 a var initializer merged with a nested function", "v.cjs", H + "function g() { var h = 5; function h() {} return typeof h; }\nconsole.log('start', g());\n", fence("", varMsg("h"))],
+    ["V-03 a var initializer after the function", "v.cjs", H + "function g() { function h() {} var h = 's'; return typeof h; }\nconsole.log(g());\n", fence("", varMsg("h"))],
+    ["V-04 a for-in var head", "v.cjs", H + "function g() { for (var h in { a: 1 }) {} function h() {} return typeof h; }\nconsole.log(g());\n", fence("", varMsg("h"))],
+    ["V-05 a var initializer inside a nested block", "v.cjs", H + "function g() { if (true) { var h = 1; } function h() {} return typeof h; }\nconsole.log(g());\n", fence("", varMsg("h"))],
+    // (an unreachable assignment fences too: Node would print f1 — loud, kept)
+    ["V-06 a var assignment after a return still fences at entry", "v.cjs", H + "function nm(){\n  if (true) return f(1);\n  function f(a){ return 'f1'; }\n  var f = 3;\n}\nconsole.log(nm());\n", fence("", varMsg("f"))],
+    // A parameter named like a function declaration: at the function's entry.
+    ["P-01 a function named like a parameter", "p.cjs", H + "function g(f) { const before = typeof f; function f() { return 2; } return before + ' ' + typeof f; }\nconsole.log(g(1));\n", fence("", paramMsg("f"))],
+    ["P-02 a function named like a destructured parameter", "p.cjs", H + "function g({ f }) { function f() {} return typeof f; }\nconsole.log(g({ f: 1 }));\n", fence("", paramMsg("f"))],
+    ["P-03 the parameter read before an unreached declaration", "p.cjs", H + "function p(cb){\n  return typeof cb;\n  function cb(){ return 'decl'; }\n}\nconsole.log(p(5));\n", fence("", paramMsg("cb"))],
+    ["P-04 the parameter called before the declaration", "p.cjs", H + "function p(cb){\n  if (typeof cb === 'function') return cb();\n  return 'no-fn';\n  function cb(){ return 'decl'; }\n}\nconsole.log(p(5));\n", fence("", paramMsg("cb"))],
+    ["P-05 the function's first statement reads the parameter", "p.cjs", H + "function p(cb){\n  console.log('entered', typeof cb);\n  function cb(){ return 'decl'; }\n  return cb();\n}\nconsole.log(p(5));\n", fence("", paramMsg("cb"))],
+    // Duplicates whose results differ: at the declaration.
+    ["D-01 duplicates with different results", "d.cjs", H + "function o() { function f() { return 1; } function f() { return 'two'; } return f(); }\nconsole.log(o());\n",
+      fence("", "function 'f' declared again with a different signature (Node calls the last declaration; call sites here are typed against the first)")],
+    // Duplicates Node rejects at parse time: the build.
+    ["D-02 duplicates in a strict block", "d.cjs", H + "'use strict';\nconsole.log('before');\nfunction never(){ { function f(){ return 1; } function f(){ return 2; } return f(); } }\nconsole.log('after');\n", dupSyntax("f", "in one block of strict code")],
+    ["D-03 duplicates at an ES module's top level", "d.mjs", H + "console.log('before');\nfunction f() { return 1; }\nfunction f() { return 2; }\nconsole.log('after');\n", dupSyntax("f", "at an ES module's top level")],
+    // Annex B over a binding outside the function: at the function's (or module's) entry.
+    ["A-01 Annex B: a block function over the module's var", "a.cjs", H + "var f = 1;\n{ function f() { return 2; } }\nconsole.log(typeof f);\n", fence("", annexDecl("f", 4))],
+    ["A-02 Annex B: an outer var, read before an unreached block", "a.cjs", H + "var x = 'global';\nfunction o(){\n  var seen = x;\n  if (false) { function x(){} }\n  return seen;\n}\nconsole.log(o());\n", fence("", annexEntry("x", 4))],
+    ["A-03 Annex B: an outer function, read before the block", "a.cjs", H + "function h(){ return 'outer'; }\nfunction o(flag){\n  var r = typeof h;\n  if (flag) { function h(){ return 'inner'; } }\n  return r;\n}\nconsole.log(o(false));\n", fence("", annexEntry("h", 4))],
+    ["A-04 Annex B: an outer function called before the block", "a.cjs", H + "function h(){ return 'outer'; }\nfunction o(){\n  try { console.log(h()); } catch (e) { console.log('TypeError?', e instanceof TypeError); }\n  { function h(){ return 'inner'; } }\n  console.log(h());\n}\no();\n", fence("", annexEntry("h", 4))],
+    ["A-05 Annex B: a global shadowed at the module's entry", "a.cjs", H + "console.log(typeof parseInt);\nif (false) { function parseInt(){} }\n", fence("", annexEntry("parseInt", 2))],
+    ["A-06 Annex B: a function in a catch block over an outer var", "a.cjs", H + "var h = 0;\nfunction run() { try { throw 1; } catch (e) { function h() { return 'h'; } } return typeof h; }\nconsole.log(run());\n", fence("", annexEntry("h", 3))],
+    ["A-07 Annex B: a switch-case function over a module function", "a.cjs", H + "function f() { return 'outer'; }\n/** @param {number} k */\nfunction g(k) { switch (k) { case 1: function f() { return 'inner'; } } return f(); }\nconsole.log(g(1));\n", fence("", annexEntry("f", 4))],
+    // Annex B over the same function's var or function: at the declaration.
+    ["A-08 Annex B: the same function's var, read before and after the block", "a.cjs", H + "function o(){\n  var v = 1;\n  console.log(typeof v);\n  {\n    function v(){ }\n  }\n  console.log(typeof v);\n}\no();\n", fence("number\n", annexDecl("v", 4))],
+    ["A-09 Annex B: the same function's function", "a.cjs", H + "function g() { function f() { return 1; } console.log(f()); { function f() { return 2; } } return f(); }\nconsole.log(g());\n", fence("1\n", annexDecl("f", 2))],
+    // A var initializer inside catch writes the catch parameter.
+    ["C-01 a var initializer inside catch writes the catch parameter", "c.cjs", H + "function run2() { try { throw 1; } catch (e) { var e = 2; console.log(e); } return typeof e; }\nconsole.log(run2());\n",
+      fence("", "'var e' assigned inside 'catch (e)' (Node writes the catch parameter, not the function's var)")],
+  ];
+  for (const [row, name, src, want] of rows) {
+    test(row, async () => {
+      expect(await outcome(name, src)).toBe(want);
+    }, 120000);
+  }
 });

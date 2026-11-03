@@ -74,7 +74,7 @@ export const LEGACY_MIXED: Readonly<Record<string, string>> = {
   "tests/harness/deadstrip.test.ts": "the emitted-C grep; the same dead-strip check runs on the IR, and the reached-construct refusals run",
   "tests/harness/regex.test.ts": "the c-lane abort, size and memory pins; the too-many-captures refusal runs on wasm",
   "tests/harness/errors.test.ts": "nothing: every row builds wasm-native instead of --backend c (S117's trap line set aside)",
-  "tests/harness/dyncheck.test.ts": "10 c-only rows (native-handle fence texts, c-island fences, a dynCheck the wasm tier refuses); the other 38 build wasm-native",
+  "tests/harness/dyncheck.test.ts": "nothing: every row builds wasm-native; the 10 rows where the lanes part (GH #113) pin each lane's own outcome, compared with Node where wasm-native matches it",
   "tests/harness/project-config.test.ts": "the procStream row (refused by the wasm tier); the other compile-and-run rows build wasm-native, not the flagless default",
   "tests/harness/npm-static.test.ts": "nothing: the pilots build wasm-native instead of --backend c / the flagless default",
   "tests/harness/provenance.test.ts": "the island builds (the wasm tier embeds no npm package yet); the source-static build runs on wasm-native",
