@@ -63,12 +63,12 @@ export const isCopyHelper = (name: string): boolean => COPY_HELPER.test(name);
  * narrows), the program's own lambdas, and the array HOF loops (they hand
  * elements to a program callback): their argument positions are
  * transparent. */
-const TRANSPARENT_HELPER = /^%(union\.(retag|narrow|strand|recv)|nullish\.retag|unit\.strand|deferred\.read|fn\d+|arr\.(map|filter|forEach|reduce|reduceRight|find|findIndex|findLast|findLastIndex|some|every|flatMap|filterNarrow|concat)|object\.groupBy|map\.(groupBy|keys|values|entries)|obj\.fromEntries)(\.|_|$|\d)/;
+const TRANSPARENT_HELPER = /^%(union\.(retag|narrow|strand|recv)|nullish\.retag|unit\.strand|deferred\.read|fn\d+|obj\.assign|arr\.(map|filter|forEach|reduce|reduceRight|find|findIndex|findLast|findLastIndex|some|every|flatMap|filterNarrow|concat)|object\.groupBy|map\.(groupBy|keys|values|entries)|obj\.fromEntries)(\.|_|$|\d)/;
 /** The array HOF loops alone: they read the array's spine. */
 const HOF_HELPER = /^%arr\.(map|filter|forEach|reduce|reduceRight|find|findIndex|findLast|findLastIndex|some|every|flatMap|filterNarrow)\./;
 /** Helpers that BUILD a fresh record or map and return it: their own
  * writes construct it (no one else holds it yet). */
-const BUILDER = /^%(object\.groupBy|map\.groupBy|obj\.fromEntries)\./;
+const BUILDER = /^%(object\.groupBy|map\.groupBy|obj\.(fromEntries|keys|values|entries))\./;
 /** Array helpers that MUTATE their array argument (sort, reverse, ...):
  * the write is noted at the call; their own bodies are not writes. */
 const ARG_MUTATOR = /^%arr\.(sort|reverse|fill|copyWithin|unshift|splice|push|pop|shift)\.\d+$/;
@@ -158,6 +158,44 @@ interface Site {
   dest: { key: string; param: boolean } | null;
 }
 
+/** A dynamic crossing (S125 (c)): "in" copies typed `t` into a dynamic
+ * value, "out" copies a dynamic value into typed `t`. `consumed`: the
+ * crossing's result is only read at once (nothing holds it). */
+interface DynSite extends Site {
+  dir: "in" | "out";
+  t: IrType;
+  consumed: boolean;
+  /** An out-crossing that builds (part of) a `return` statement's value. */
+  atReturn?: boolean;
+  /** An out-crossing into a sequence expression's own temporary: the
+   * sequence node, outside which the copy is never read. */
+  scope?: unknown;
+}
+
+/** Does a function body hold a dynamic crossing of a composite or a
+ * function value? (The pass's cheap entry test.) */
+function hasDynCrossing(n: unknown): boolean {
+  if (n === null || typeof n !== "object") return false;
+  if (Array.isArray(n)) return n.some(hasDynCrossing);
+  const r = n as Record<string, unknown>;
+  if (r["kind"] === "dynFrom" || r["kind"] === "dynCheck") {
+    const t = (r["kind"] === "dynFrom" ? (r["value"] as IrExpr).type : (r["type"] as IrType)).kind;
+    if (t !== "f64" && t !== "string" && t !== "bool" && t !== "dyn" && t !== "jsval" && t !== "undefinedT" && t !== "nullT" && t !== "bytes") return true;
+  }
+  for (const key of Object.keys(r)) {
+    if (key === "type" || key === "loc") continue;
+    if (hasDynCrossing(r[key])) return true;
+  }
+  return false;
+}
+
+/** While an out-crossing's copy is alive: the functions that can run,
+ * and (when the copy lives inside one node of its own function) that node. */
+interface DynWindow {
+  fns: Set<string>;
+  inside: unknown;
+}
+
 interface Binding {
   uses: Use[];
   /** For each use that READS a part of the value (`b.f`, `b.f.g`,
@@ -173,10 +211,54 @@ const isComposite = (t: IrType | undefined): boolean =>
   t !== undefined && (t.kind === "record" || t.kind === "object" || t.kind === "array" || t.kind === "union" ||
     t.kind === "map" || t.kind === "set" || t.kind === "promise");
 
+/* ── Dynamic crossings (SEMANTICS.md S125 (c), S014) ──────────────────────
+ *
+ * The checked-dynamic world (`unknown`, `object`, and `any` outside
+ * `--dynamic`) copies at both of its edges: a typed composite entering a
+ * dynamic slot is deep-copied (`dynFrom`), a dynamic value cast or checked
+ * back out into a typed composite is copied again (`dynCheck`), and a typed
+ * function boxed into a dynamic value receives a copy of each composite
+ * argument and hands back a copy of a composite result (its call thunk).
+ * JavaScript shares the object at every one of them. They are judged here
+ * as one more kind of copy, with the width copies' write, identity and
+ * ordering machinery. The dynamic side is ONE type, so a write to any
+ * dynamic value counts as a write to every dynamic copy, unless the copy's
+ * own binding is only read. What can write a dynamic value: the keyed
+ * write, Object.assign/defineProperty onto one, the mutating array methods
+ * through dynamic dispatch, island property writes and method calls, and
+ * every write the program's own functions make (a boxed program function
+ * a dynamic call reaches is read here like any other). The runtime library
+ * reads the dynamic values it is handed and hands them on to program
+ * callbacks; it writes none outside the helpers listed in DYN_WRITER.
+ * Under `--dynamic` a dynamic call may reach island code this pass cannot
+ * read, so handing it a dynamic value counts as a write. A write whose
+ * receiver is a binding holding a value built fresh (JSON.parse, a dynamic
+ * literal) changes only that object, which no copy can be (unless the copy
+ * was checked out of that very object). Printing a copy at once, testing
+ * it, or reading scalars out of it is not an observation: the copy equals
+ * the original at that moment. Width tolerance (a cast keeps only the
+ * type's own fields) is S009's, not judged here. */
+
+/** Runtime readers of dynamic values: inspection, JSON, and the dynamic
+ * helpers that only read or that build a fresh value. */
+const DYN_READER = /^(insp\.|json\.|dyn\.(argStr|arrAt|arrLen|errInstanceof|hasKey|hasOwn|iterLive|iterPack|packPush|packPushSpread|packPushSpreadIter|structuredClone|cloneMissing|cloneTransferFail|this|toNumber|toString|toStringCoerce|typeof|objCreateNullProto)$)/;
+/** Runtime helpers that write their first (dynamic) argument. */
+const DYN_WRITER = /^dyn\.(keySet|assign|assignAll|defineProps)$/;
+/** Runtime helpers that answer a fresh dynamic value. */
+const DYN_FRESH_LIB = /^(json\.parse|dyn\.(structuredClone|objCreateNullProto|objKeys))$/;
+/** Dynamic dispatch: methods that write their receiver, and methods that
+ * compare by identity. */
+const DYN_MUTATING = new Set(["push", "pop", "shift", "unshift", "reverse", "sort", "splice", "fill", "copyWithin"]);
+const DYN_IDENTITY = new Set(["includes", "indexOf", "lastIndexOf"]);
+/** Island operations that write an operand or run code that may. */
+const JS_WRITING_OPS = new Set(["setProp", "setIdx", "callMethod", "callFn", "callSpread", "construct", "defineGetter", "optCallMethod"]);
+
+const isDynType = (t: IrType | undefined): boolean => t !== undefined && (t.kind === "dyn" || t.kind === "jsval");
+
 export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   const byName = new Map<string, IrFunction>();
   for (const f of functions) byName.set(f.name, f);
-  if (![...byName.keys()].some(isCopyHelper)) return;
+  if (![...byName.keys()].some(isCopyHelper) && !functions.some((f) => hasDynCrossing(f.body))) return;
 
   const classPrefixes = [...L.classes.keys()].map((c) => `%${c}.`);
   const transparentCallee = (name: string): boolean => {
@@ -207,6 +289,91 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     escapedKeys.add(k);
     escaped.push({ t, w });
   };
+  /** Dynamic crossings (S125 (c)): every dynFrom of a value that holds a
+   * reference, every dynCheck into one, and every typed function boxed
+   * into a dynamic value. */
+  const dynSites: DynSite[] = [];
+  /** Writes to dynamic values: where, and the receiver when one is known. */
+  const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[] }[] = [];
+  const noteDynWrite = (recv: IrExpr | null): void => {
+    dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]) });
+  };
+  /** The program compares dynamic values by identity somewhere. */
+  let dynIdentity = false;
+  /** The functions handed to each function-value adapter (`%fn.adapt.N`). */
+  const adapterArgs = new Map<string, { e: IrExpr; fn: string }[]>();
+  /** Can a dynamic call reach code this pass does not read? Without
+   * `--dynamic` every dynamic function is a boxed program function (whose
+   * body's writes are noted where they are) or a runtime method that only
+   * reads its arguments; with it, an island function may be anything, so
+   * handing it a dynamic value counts as a write. */
+  const opaqueCalls = L.dynamic;
+  /** Per dynamic binding: how each use treats the value ("ro": read at
+   * once, a scalar or a test taken from it; "other": anything else). */
+  const dynUses = new Map<string, ("ro" | "other")[]>();
+  /** Per dynamic binding: each use as OWNERSHIP sees it — read at once,
+   * the receiver of a write or a key/element search (with the values the
+   * write stores), an out-crossing, or anything else. */
+  const ownUses = new Map<string, { use: "ro" | "recv" | "exit" | "other"; stored?: IrExpr[] }[]>();
+  /** The reference-holding types a value of type `t` is or contains (a
+   * deep copy copies every one of them), and the function types inside
+   * it (boxed with a copying thunk). */
+  const refsMemo = new Map<string, { refs: IrType[]; fns: (IrType & { kind: "func" })[] }>();
+  const refsOf = (t: IrType): { refs: IrType[]; fns: (IrType & { kind: "func" })[] } => {
+    const memo = refsMemo.get(tkey(t));
+    if (memo) return memo;
+    const out = { refs: [] as IrType[], fns: [] as (IrType & { kind: "func" })[] };
+    const seen = new Set<string>();
+    const walk = (x: IrType): void => {
+      const k = tkey(x);
+      if (seen.has(k)) return;
+      seen.add(k);
+      switch (x.kind) {
+        case "record": {
+          out.refs.push(x);
+          const s = L.shapes.get(x.shapeId);
+          for (const f of s?.fields ?? []) walk(f.type);
+          if (s?.indexValue) walk(s.indexValue);
+          return;
+        }
+        case "object":
+          // The only class the boundary admits is an Error, which crosses
+          // through the identity cache (one box per error, `===` holds);
+          // that its members are copied at the first crossing is S021's.
+          return;
+        case "union":
+          for (const a of L.unions.get(x.unionId)?.arms ?? []) walk(a);
+          return;
+        case "func":
+          // A function's own parameter and result types are its thunk's
+          // business (judged per boxing), not part of this value.
+          out.fns.push(x);
+          return;
+        case "promise":
+          // Boxed BY REFERENCE (identity is the promise); a composite
+          // settled value is converted at the first dynamic read.
+          break;
+        case "array":
+          // `any[]` is the dynamic array's own vector: shared, never copied.
+          if (isDynType(x.elem)) return;
+          out.refs.push(x);
+          break;
+        case "map":
+        case "set":
+          out.refs.push(x);
+          break;
+        default:
+          break;
+      }
+      for (const v of Object.values(x as Record<string, unknown>)) {
+        if (v && typeof v === "object" && typeof (v as { kind?: unknown }).kind === "string") walk(v as IrType);
+      }
+    };
+    walk(t);
+    refsMemo.set(tkey(t), out);
+    return out;
+  };
+  const hasRef = (t: IrType): boolean => refsOf(t).refs.length > 0;
   const bindings = new Map<string, Binding>();
   const binding = (k: string): Binding => {
     let b = bindings.get(k);
@@ -322,6 +489,96 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     }
     return i;
   };
+  /** How the kinded ancestor at stack index `i` (and up) uses a DYNAMIC
+   * value it holds: "ro" when the value is only read at once — tested,
+   * printed, serialized, compared with a scalar, checked out into a typed
+   * value (a copy judged on its own), or a member of it read that way —
+   * and "other" otherwise. */
+  const dynUseAt = (i: number, consuming = false): "ro" | "other" => {
+    if (i < 0) return "other";
+    i = forwardFrom(i);
+    for (;;) {
+      const [anc, key] = stack[i]!;
+      const ak = anc["kind"];
+      if (!((ak === "dynKeyGet" || ak === "dynDestrCheck") && key === "value")) break;
+      if (i === 0) return "other";
+      i = forwardFrom(i - 1);
+    }
+    const [anc, key] = stack[i]!;
+    switch (anc["kind"]) {
+      case "dynCheck":
+        // An out-crossing into a reference-holding type copies the value on:
+        // for a value crossing in right there, its copy lives on as that one.
+        return consuming && refsOf(anc["type"] as IrType).refs.length > 0 ? "other" : "ro";
+      case "dynTest":
+      case "dynHasKey":
+      case "jsonStringify":
+        return "ro";
+      case "intrinsic":
+        return /^console\./.test(anc["name"] as string) ? "ro" : "other";
+      case "dynScalarEq": {
+        const other = (key === "left" ? anc["right"] : anc["left"]) as IrExpr;
+        return isDynType(other.type) ? "other" : "ro";
+      }
+      case "libCall":
+        // An element read or an iteration hands a part of the value on.
+        if (/^dyn\.(arrAt|iterLive|iterPack)$/.test(anc["fn"] as string)) return "other";
+        return DYN_READER.test(anc["fn"] as string) || PURE_LIB.test(anc["fn"] as string) ? "ro" : "other";
+      case "dynInvoke":
+        return key === "recv" && anc["method"] === "join" ? "ro" : "other";
+      default:
+        return "other";
+    }
+  };
+  /** The use a dynamic binding's reference `ref` makes, for ownership
+   * (its kinded parent sits at stack index `i`). */
+  const ownUseAt = (i: number, ref: unknown): { use: "ro" | "recv" | "exit" | "other"; stored?: IrExpr[] } => {
+    const [anc, key] = stack[i]!;
+    const ak = anc["kind"];
+    if (ak === "dynInvoke" && key === "recv" && (DYN_MUTATING.has(anc["method"] as string) || DYN_IDENTITY.has(anc["method"] as string) || anc["method"] === "join")) {
+      return { use: "recv", stored: anc["args"] as IrExpr[] };
+    }
+    if (ak === "libCall" && key === "args" && DYN_WRITER.test(anc["fn"] as string) && (anc["args"] as unknown[])[0] === ref) {
+      return { use: "recv", stored: (anc["args"] as IrExpr[]).slice(1) };
+    }
+    if (ak === "dynCheck") return { use: "exit" };
+    return dynUseAt(i) === "ro" ? { use: "ro" } : { use: "other" };
+  };
+  /** Does the out-crossing whose parent sits at stack index `i` build
+   * (part of) a `return` statement's value? */
+  const atReturn = (i: number): boolean => {
+    while (i >= 0) {
+      i = forwardFrom(i);
+      const [anc, key] = stack[i]!;
+      const ak = anc["kind"];
+      if (ak === "return") return true;
+      const builds = (ak === "recordLit" && key === "fields") || (ak === "arrayLit" && key === "elems") || (ak === "unionWrap" && key === "value") || (ak === "upcast" && key === "value");
+      if (!builds) return false;
+      i--;
+    }
+    return false;
+  };
+  /** How the ancestors use a TYPED value an out-crossing just built: true
+   * when it is consumed at once without anything holding it or a part of
+   * it — a scalar read off it, a print, a key listing. */
+  const consumedAt = (i: number, t: IrType): boolean => {
+    if (i < 0) return false;
+    i = forwardFrom(i);
+    let part = t;
+    for (;;) {
+      const [anc, key] = stack[i]!;
+      const ak = anc["kind"];
+      const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
+      if (!read) break;
+      part = anc["type"] as IrType;
+      if (!hasRef(part)) return true;
+      if (i === 0) return false;
+      i = forwardFrom(i - 1);
+    }
+    const [anc, key] = stack[i]!;
+    const use = useOf(anc, key);
+    return use === "print" || use === "keys" || (use === "read" && exposedParts(part, anc, key).length === 0);
+  };
   /** Visits `n`; `mode` says where a VALUE found directly here sits in
    * its nearest kinded parent: a transparent position ("t"), a read-only
    * observer's operand ("r"), or anything else ("w" — an observer that
@@ -379,6 +636,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         }
       }
     }
+    if (k === "varRef" && parent && isDynType(t)) {
+      const key = bkey(curFn, r["localId"] as string);
+      let u = dynUses.get(key);
+      if (!u) dynUses.set(key, (u = []));
+      u.push(dynUseAt(stack.length - 1));
+      let o = ownUses.get(key);
+      if (!o) ownUses.set(key, (o = []));
+      o.push(ownUseAt(stack.length - 1, r));
+    }
+    noteDynNode(r, parent, pkey);
     let kids: readonly string[] = Object.hasOwn(TRANSPARENT, k) ? TRANSPARENT[k]! : [];
     let rest: Mode = PRINT_KINDS.has(k) || KEYS_KINDS.has(k) ? "r" : "w";
     switch (k) {
@@ -423,6 +690,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "bytesNew":
         // Typed-array construction reads the source array's numbers.
         rest = "r";
+        break;
+      case "libCall":
+        // The data-in, data-out library families read their arguments
+        // (`path.join(...)` over a string array, say); they never write one.
+        if (/^(math|num|number|string|str|insp|json|path|sym|os|text|strdec)\./.test(r["fn"] as string)) rest = "r";
         break;
       case "recordSet":
         if (!building) noteWrite(`record:${r["shapeId"] as string}:${r["field"] as string}`);
@@ -482,6 +754,114 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       stack.pop();
     }
   };
+  /** Dynamic crossings and dynamic writes at node `r` (S125 (c)). */
+  function noteDynNode(r: Record<string, unknown>, parent: Record<string, unknown> | null, pkey: string): void {
+    const loc = r["loc"] as SrcLoc;
+    // A variadic callback's adapter (restFuncAdapter) calls the boxed
+    // function with its arguments crossed, and checks its result back:
+    // copies GH #22 already vets (the callback may only read the count and
+    // the scalar positions; any other use refuses by name).
+    if (/^%fn\.adapt\.\d+\.impl$/.test(curFn) && (isAdapterCall(r) || (parent !== null && pkey === "args" && isAdapterCall(parent)))) return;
+    switch (r["kind"]) {
+      case "call": {
+        const callee = r["callee"] as string;
+        const a0 = (r["args"] as IrExpr[])[0];
+        if (/^%fn\.adapt\.\d+$/.test(callee) && a0) {
+          let at = adapterArgs.get(callee);
+          if (!at) adapterArgs.set(callee, (at = []));
+          at.push({ e: a0, fn: curFn });
+        }
+        return;
+      }
+      case "dynFrom": {
+        const v = r["value"] as IrExpr;
+        const { refs, fns } = refsOf(v.type);
+        if (refs.length === 0 && fns.length === 0) return;
+        dynSites.push({
+          dir: "in", callee: "%dyn.from", arg: v, t: v.type, loc, where: curFn, top: curTop,
+          dest: destOf(parent, pkey, r), consumed: stack.length > 0 && dynUseAt(stack.length - 1, true) === "ro",
+        });
+        return;
+      }
+      case "dynCheck": {
+        const t = r["type"] as IrType;
+        const { refs, fns } = refsOf(t);
+        if (refs.length === 0 && fns.length === 0) return;
+        dynSites.push({
+          dir: "out", callee: "%dyn.check", arg: r["value"] as IrExpr, t, loc, where: curFn, top: curTop,
+          dest: destOf(parent, pkey, r), consumed: consumedAt(stack.length - 1, t), atReturn: atReturn(stack.length - 1),
+          scope: parent?.["kind"] === "varDecl" && pkey === "init" && stack.length >= 2 && stack[stack.length - 2]![0]["kind"] === "seqExpr" &&
+            stack[stack.length - 2]![1] === "stmts" ? stack[stack.length - 2]![0] : undefined,
+        });
+        return;
+      }
+      case "libCall": {
+        const fn = r["fn"] as string;
+        const args = r["args"] as IrExpr[];
+        if (DYN_WRITER.test(fn)) noteDynWrite(args[0] ?? null);
+        return;
+      }
+      case "dynInvoke": {
+        const m = r["method"] as string;
+        if (DYN_MUTATING.has(m)) noteDynWrite(r["recv"] as IrExpr);
+        if (DYN_IDENTITY.has(m)) dynIdentity = true;
+        if (opaqueCalls && (r["args"] as IrExpr[]).some(passesDyn)) noteDynWrite(null);
+        return;
+      }
+      case "dynCall":
+        if (opaqueCalls && (r["args"] as IrExpr[]).some(passesDyn)) noteDynWrite(null);
+        return;
+      case "dynScalarEq":
+        if (isDynType((r["left"] as IrExpr).type) && isDynType((r["right"] as IrExpr).type)) dynIdentity = true;
+        return;
+      case "mapIntrinsic":
+      case "setIntrinsic": {
+        const rt = (r["receiver"] as IrExpr).type;
+        if ((rt.kind === "map" && isDynType(rt.key)) || (rt.kind === "set" && isDynType(rt.elem))) dynIdentity = true;
+        return;
+      }
+      case "jsOp": {
+        const op = r["op"] as string;
+        const args = r["args"] as IrExpr[];
+        // A property write or a method call writes (or may write) its
+        // receiver; a call writes what it is handed (the callee itself
+        // and marshaled scalars hand nothing).
+        if (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter") noteDynWrite(null);
+        else if (JS_WRITING_OPS.has(op) && args.slice(1).some(passesJs)) noteDynWrite(null);
+        if (op === "eq" || op === "neq") dynIdentity = true;
+        return;
+      }
+      case "jsMarshal":
+        // A checked-dynamic value marshaled into the island is the same
+        // value there (S014's jsMarshal amendment): island code may write it.
+        if (isDynType((r["value"] as IrExpr).type)) noteDynWrite(null);
+        return;
+      default:
+        return;
+    }
+  }
+  /** restFuncAdapter's call: `dynCall(dynFrom(f), args...)` over its
+   * captured function `f.0` — or the out-crossing of that call's result. */
+  function isAdapterCall(n: Record<string, unknown>): boolean {
+    const c = (n["kind"] === "dynCheck" ? n["value"] : n) as Record<string, unknown>;
+    if (c["kind"] !== "dynCall") return false;
+    const callee = c["callee"] as IrExpr;
+    return callee.kind === "dynFrom" && callee.value.kind === "varRef" && callee.value.localId === "f.0";
+  }
+  /** An island argument that hands a VALUE to the callee — not a
+   * marshaled scalar. */
+  function passesJs(a: IrExpr): boolean {
+    if (!isDynType(a.type)) return hasRef(a.type);
+    if (a.kind === "jsMarshal") return isDynType(a.value.type) || hasRef(a.value.type) || a.value.type.kind === "func";
+    return a.kind !== "strLit" && a.kind !== "numLit";
+  }
+  /** A dynamic argument that hands a dynamic VALUE to the callee — not a
+   * boxed scalar or a boxed function. */
+  function passesDyn(a: IrExpr): boolean {
+    if (!isDynType(a.type)) return false;
+    if (a.kind === "dynFrom") return hasRef(a.value.type);
+    return true;
+  }
   /** The binding a copy lands in: a local or global it initializes or is
    * assigned to, or the parameter of a directly called program function
    * it is passed as. */
@@ -1057,5 +1437,375 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         `give the slot the value's own type ('${L.fmt(top.from)}'), or make the function generic over it (<T extends ${L.fmt(top.to)}>(x: T) keeps the object)`,
       ),
     );
+  }
+  judgeDynSites();
+
+  /** S125 (c): every dynamic crossing the program could observe refuses
+   * by name. */
+  function judgeDynSites(): void {
+    if (dynSites.length === 0) return;
+    const DYN_WRITE_TO = "the program writes to dynamic values, and a write through the copy would not reach the original";
+    const DYN_WRITE_FROM = "the program writes to dynamic values, and the copy would not see the write";
+    const DYN_SAME = "the program compares dynamic values by identity, and the copy is a different object";
+    const ORIG_WRITTEN = "the program writes to values of the original's type, and the copy would not see the write";
+    const COPY_WRITTEN = "the program writes to values of the copy's type, and a write through the copy would not reach the dynamic value";
+    const COPY_IDENTITY = "the program compares values of the copy's type by identity, and the copy is a different object";
+    const unwrap = (e: IrExpr | undefined): IrExpr | undefined => {
+      while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck")) {
+        e = e.kind === "call" ? e.args[0] : e.value;
+      }
+      return e;
+    };
+    /** A binding assigned exactly once, never captured, with that value. */
+    const onlyValue = (fn: string, id: string): IrExpr | null => {
+      const b = bindings.get(bkey(fn, id));
+      return b && !b.captured && b.assigns.length === 1 ? b.assigns[0]! : null;
+    };
+    /** A typed value no one else holds ALL THE WAY DOWN (a deep copy
+     * copies every part): a literal whose reference-holding members are
+     * themselves such values, a new array of scalars, or a binding
+     * initialized with one whose only use is this. */
+    const deepFresh = (e: IrExpr | undefined, fn: string, depth = 0): boolean => {
+      e = unwrap(e);
+      if (!e || depth > 8) return false;
+      if (!hasRef(e.type)) return true;
+      switch (e.kind) {
+        case "recordLit":
+          return e.fields.every((f) => deepFresh(f.value, fn, depth + 1));
+        case "arrayLit":
+          return e.elems.every((x) => x !== null && typeof x === "object" && "kind" in x && deepFresh(x as IrExpr, fn, depth + 1));
+        case "unionWrap":
+        case "upcast":
+          return deepFresh(e.value, fn, depth + 1);
+        case "varRef": {
+          const b = bindings.get(bkey(fn, e.localId));
+          return !!b && !b.captured && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
+        }
+        default:
+          // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
+          return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
+      }
+    };
+    /** A dynamic value nothing else holds: built fresh (JSON.parse, a
+     * dynamic literal of such values, a crossing of a deeply fresh typed
+     * value), a member of one, or a binding holding one whose only use is
+     * this. */
+    const uniqueDyn = (e: IrExpr | undefined, fn: string, depth = 0): boolean => {
+      e = unwrap(e);
+      if (!e || depth > 8) return false;
+      if (!isDynType(e.type)) return !hasRef(e.type);
+      switch (e.kind) {
+        case "libCall":
+          return DYN_FRESH_LIB.test(e.fn);
+        case "dynArrLit":
+          return e.elems.every((x) => uniqueDyn(x, fn, depth + 1));
+        case "dynObjLit":
+          return (e.fields ?? []).every((f) => uniqueDyn(f.value, fn, depth + 1));
+        case "dynFrom":
+          return deepFresh(e.value, fn, depth + 1);
+        case "dynKeyGet":
+          return uniqueDyn(e.value, fn, depth + 1);
+        case "dynInvoke":
+          // sort and reverse answer their receiver.
+          return (e.method === "sort" || e.method === "reverse") && uniqueDyn(e.recv, fn, depth + 1);
+        case "varRef": {
+          const b = bindings.get(bkey(fn, e.localId));
+          if (!b || b.captured || b.assigns.length !== 1 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
+          return uniqueDyn(b.assigns[0], fn, depth + 1);
+        }
+        default:
+          return false;
+      }
+    };
+    /** A dynamic value built fresh and held only by the binding `e` names:
+     * a write to ITS OWN members changes no copy. */
+    const freshRooted = (e: IrExpr | null, fn: string): boolean => {
+      const v = unwrap(e ?? undefined);
+      if (!v || v.kind !== "varRef") return false;
+      const init = onlyValue(fn, v.localId);
+      const i = unwrap(init ?? undefined);
+      if (!i) return false;
+      return (i.kind === "libCall" && DYN_FRESH_LIB.test(i.fn)) || i.kind === "dynArrLit" || i.kind === "dynObjLit";
+    };
+    /** The binding a dynamic expression reads from (through member reads). */
+    const rootKey = (e: IrExpr | null | undefined, fn: string): string | null => {
+      let v = unwrap(e ?? undefined);
+      while (v && v.kind === "dynKeyGet") v = unwrap(v.value);
+      return v?.kind === "varRef" ? bkey(fn, v.localId) : null;
+    };
+    /** Is a dynamic value written where a copy taken at `site` could still
+     * be held (`during`: only in these functions)? The width copies'
+     * ordering rule: an earlier top-level statement of the same module
+     * initializer has already run. A write to the own members of a
+     * fresh-rooted binding counts only for a copy taken OUT of that
+     * binding's value (`outOf`). */
+    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null): boolean =>
+      dynWrites.some((w) => {
+        if (freshRooted(w.recv, w.fn) && !(outOf !== null && rootKey(w.recv, w.fn) === outOf)) return false;
+        if (during === null) return !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top);
+        if (during instanceof Set) return during.has(w.fn);
+        // A window: in the crossing's own function only inside its scope.
+        if (site !== null && w.fn === site.where && during.inside !== null) return w.anc.includes(during.inside);
+        return during.fns.has(w.fn);
+      });
+    /** A local dynamic binding that owns its value all the way down: built
+     * fresh, never captured, and only read, written in place (storing
+     * values nothing else holds) or crossed out. Once the function returns
+     * nothing can reach it, so a copy built for the `return` is the only
+     * holder left. */
+    const ownedLocal = (e: IrExpr | undefined, fn: string): boolean => {
+      const v = unwrap(e);
+      if (!v || v.kind !== "varRef") return false;
+      const key = bkey(fn, v.localId);
+      if (key.startsWith("g\0")) return false;
+      const b = bindings.get(key);
+      if (!b || b.captured || b.assigns.length === 0 || !b.assigns.every((a) => uniqueDyn(a, fn))) return false;
+      return (ownUses.get(key) ?? []).every((u) =>
+        u.use === "ro" || u.use === "exit" || (u.use === "recv" && (u.stored ?? []).every((x) => !passesDyn(x) || uniqueDyn(x, fn))));
+    };
+    /** The functions that can run while an out-crossing's copy is alive,
+     * when its binding is a local nothing captures and every use of it is
+     * known (null: anything can). */
+    const copyWindow = (s: DynSite): DynWindow | null => {
+      if (s.dest === null || s.dest.param || s.dest.key.startsWith("g\0")) return null;
+      const db = destBinding(s);
+      if (db === null || db.uses.includes("other") || db.parts.some((p) => p.use === "other" || p.via !== undefined)) return null;
+      // A sequence's temporary lives while the sequence evaluates.
+      const reach = s.scope !== undefined ? nodeReach(s.scope) : callReach(s.where);
+      return reach.suspends ? null : { fns: reach.fns, inside: s.scope ?? null };
+    };
+    /** The functions evaluating `node` can run, and whether that set is
+     * open (callReach's rules, for one node). */
+    const nodeReach = (node: unknown): { fns: Set<string>; suspends: boolean } => {
+      const fns = new Set<string>();
+      let suspends = false;
+      const enter = (name: string): void => {
+        if (fns.has(name)) return;
+        const r = callReach(name);
+        for (const f of r.fns) fns.add(f);
+        suspends ||= r.suspends;
+      };
+      const scan = (n: unknown): void => {
+        if (n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) return n.forEach(scan);
+        const r = n as Record<string, unknown>;
+        const k = r["kind"];
+        if (k === "call") enter(r["callee"] as string);
+        else if (k === "closure") enter(r["fnName"] as string);
+        else if (k === "new") enter(`%${r["className"] as string}.constructor`);
+        else if (k === "virtualCall") {
+          for (const other of byName.keys()) if (other.endsWith(`.${r["method"] as string}`)) enter(other);
+        } else if (k === "callValue" || k === "dynCall" || k === "dynInvoke") {
+          for (const v of valueFns) enter(v);
+        } else if (k === "awaitExpr" || k === "awaitUnionExpr" || k === "yieldExpr" || k === "genResume") suspends = true;
+        else if (k === "libCall") {
+          if (!PURE_LIB.test(r["fn"] as string) && !DYN_READER.test(r["fn"] as string)) suspends = true;
+        } else if (k === "intrinsic") {
+          if (!/^console\./.test(r["name"] as string)) suspends = true;
+        } else if (k === "arrIntrinsic") {
+          if (["sort", "toSorted", "typedSort"].includes(r["method"] as string)) for (const v of valueFns) enter(v);
+        } else if (k === "dynFrom" || k === "dynCheck") {
+          // A crossing runs code only through a function it boxes or unboxes.
+          const t = k === "dynFrom" ? (r["value"] as IrExpr).type : (r["type"] as IrType);
+          if (t.kind === "func" || refsOf(t).fns.length > 0) suspends = true;
+        } else if (RUNTIME_KINDS.has(k as string)) suspends = true;
+        for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
+      };
+      scan(node);
+      return { fns, suspends };
+    };
+    const anyWritten = (types: IrType[], site: Site | null, during: Set<string> | null = null): boolean =>
+      types.some((t) => isWritten(t, undefined, site, during));
+    const anyIdentity = (types: IrType[]): boolean => types.some((t) => identity.has(tkey(t)));
+    /** The uses of a dynamic binding a crossing lands in, when they are
+     * all known and all read at once. */
+    const dynDestReadOnly = (s: Site): boolean => {
+      if (s.dest === null) return false;
+      const b = bindings.get(s.dest.key);
+      if (b && (b.captured || b.assigns.length !== (s.dest.param ? 0 : 1))) return false;
+      return (dynUses.get(s.dest.key) ?? []).every((u) => u === "ro");
+    };
+    /** Is the TYPED copy (or a part of it) written, or handed where it
+     * could be? Through its binding when every use is known, else by
+     * type. */
+    const typedSideWritten = (s: Site, t: IrType, during: Set<string> | null): boolean => {
+      const db = destBinding(s);
+      if (db !== null && !db.uses.includes("other")) {
+        const partsOk = db.parts.every((p) => {
+          if (p.via === undefined) return p.use !== "other";
+          const vb = bindings.get(p.via);
+          return !vb || (!vb.captured && vb.assigns.length === 0 && !vb.uses.includes("other") && vb.parts.every((q) => q.use !== "other" && q.via === undefined));
+        });
+        if (partsOk) return false;
+      }
+      return anyWritten(refsOf(t).refs, s, during);
+    };
+    /** A function value boxed into (or out of) the dynamic world: its
+     * thunk copies each composite argument and its composite result. By
+     * type: a copy any write or identity test could meet. */
+    const fnTypeObservable = (f: IrType & { kind: "func" }): string | null => {
+      for (const pt of [...f.params, f.ret]) {
+        const refs = refsOf(pt).refs;
+        if (refs.length === 0) continue;
+        if (anyWritten(refs, null)) return COPY_WRITTEN;
+        if (anyIdentity(refs)) return COPY_IDENTITY;
+        if (dynWritten(null, null)) return DYN_WRITE_FROM;
+        if (dynIdentity) return DYN_SAME;
+      }
+      return null;
+    };
+    /** The program functions a boxed value carries, when they can be
+     * named; `open` when some function inside cannot. */
+    const boxedFns = (e: IrExpr | undefined, fn: string, depth = 0): { fns: string[]; open: boolean } => {
+      e = unwrap(e);
+      if (!e || depth > 6) return { fns: [], open: true };
+      if (refsOf(e.type).fns.length === 0 && e.type.kind !== "func") return { fns: [], open: false };
+      const merge = (xs: IrExpr[]): { fns: string[]; open: boolean } => {
+        const out = { fns: [] as string[], open: false };
+        for (const x of xs) {
+          const r = boxedFns(x, fn, depth + 1);
+          out.fns.push(...r.fns);
+          out.open ||= r.open;
+        }
+        return out;
+      };
+      switch (e.kind) {
+        case "closure":
+          return byName.has(e.fnName) ? { fns: [e.fnName], open: false } : { fns: [], open: true };
+        case "recordLit":
+          return merge(e.fields.map((f) => f.value));
+        case "arrayLit":
+          return merge(e.elems.filter((x): x is IrExpr => x !== null && typeof x === "object" && "kind" in x));
+        case "ternary":
+          return merge([e.then, e.else_]);
+        case "varRef": {
+          // A function adapter's captured function: whatever its callers hand it.
+          const adapter = /^(%fn\.adapt\.\d+)\.impl$/.exec(fn);
+          if (adapter && e.localId === "f.0") {
+            const given = adapterArgs.get(adapter[1]!) ?? [];
+            const out = { fns: [] as string[], open: given.length === 0 };
+            for (const g of given) {
+              const r = boxedFns(g.e, g.fn, depth + 1);
+              out.fns.push(...r.fns);
+              out.open ||= r.open;
+            }
+            return out;
+          }
+          const init = onlyValue(fn, e.localId);
+          return init ? boxedFns(init, fn, depth + 1) : { fns: [], open: true };
+        }
+        default:
+          return { fns: [], open: true };
+      }
+    };
+    /** A program function boxed into a dynamic value: each composite
+     * parameter receives a copy of the dynamic argument, and a composite
+     * result goes back as a copy. */
+    const judgeBoxedFn = (name: string): { why: string; what: string } | null => {
+      const f = byName.get(name)!;
+      for (const p of f.params) {
+        const refs = refsOf(p.type).refs;
+        if (refs.length === 0) continue;
+        const ps: Site = { callee: "%dyn.param", arg: undefined, loc: f.loc, where: name, top: 0, dest: { key: `${name}\0${p.localId}`, param: true } };
+        const db = destBinding(ps);
+        const reachFns = callReach(name);
+        const transient = !reachFns.suspends && db !== null && !db.uses.includes("other");
+        const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
+        if (typedSideWritten(ps, p.type, null)) return { why: COPY_WRITTEN, what };
+        if (anyIdentity(refs)) return { why: COPY_IDENTITY, what };
+        if (dynWritten(null, transient ? reachFns.fns : null)) return { why: DYN_WRITE_FROM, what };
+      }
+      const rrefs = refsOf(f.returnType).refs;
+      if (rrefs.length > 0) {
+        const rets: IrExpr[] = [];
+        const scan = (n: unknown): void => {
+          if (n === null || typeof n !== "object") return;
+          if (Array.isArray(n)) return n.forEach(scan);
+          const r = n as Record<string, unknown>;
+          if (r["kind"] === "return" && r["value"]) rets.push(r["value"] as IrExpr);
+          for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
+        };
+        scan(f.body);
+        const what = `its result typed '${L.fmt(f.returnType)}'`;
+        for (const v0 of rets) {
+          const v = unwrap(v0);
+          if (!v || deepFresh(v, name)) continue;
+          if (anyWritten(refsOf(v.type).refs, null)) return { why: ORIG_WRITTEN, what };
+          if (dynWritten(null, null)) return { why: DYN_WRITE_TO, what };
+          if (dynIdentity || anyIdentity(refsOf(v.type).refs)) return { why: DYN_SAME, what };
+        }
+      }
+      return null;
+    };
+
+    const reportedDyn = new Set<string>();
+    const judgedFns = new Map<string, { why: string; what: string } | null>();
+    for (const s of dynSites) {
+      let why: string | null = null;
+      let feature = "";
+      let hint = "";
+      const refs = refsOf(s.t).refs;
+      if (s.dir === "in") {
+        feature = `a '${L.fmt(s.t)}' value converted to a dynamic ('unknown', 'any' or 'object') value`;
+        hint = "keep the value typed where it is shared, or hand the dynamic slot a value nothing else holds (a literal, a spread, structuredClone)";
+        const x = unwrap(s.arg);
+        const src = x?.kind === "varRef" ? bindings.get(bkey(s.where, x.localId)) : undefined;
+        const sole = x !== undefined && (fresh(x) || (src !== undefined && !src.captured && src.assigns.length === 1 && fresh(src.assigns[0]) && src.uses.every((u) => u === "read" || u === "copy" || u === "keys" || u === "print")));
+        const unique = deepFresh(x, s.where);
+        if (refs.length > 0 && !unique && !s.consumed) {
+          // The original is still held: a write on the dynamic side is
+          // lost to it, and a write to it (or to anything inside it) is
+          // lost to the copy.
+          const destRO = dynDestReadOnly(s);
+          if (!destRO && dynWritten(s, null)) why = DYN_WRITE_TO;
+          else if (anyWritten(sole ? refs.filter((r) => tkey(r) !== tkey(s.t)) : refs, s)) why = ORIG_WRITTEN;
+          else if (!destRO && dynIdentity) why = DYN_SAME;
+        }
+      } else {
+        feature = `a dynamic ('unknown', 'any' or 'object') value checked into '${L.fmt(s.t)}'`;
+        hint = "keep the value dynamic and read its members through it, or cast a value nothing else holds (JSON.parse(text) as T)";
+        if (refs.length > 0 && !s.consumed && !uniqueDyn(s.arg, s.where) && !(s.atReturn && ownedLocal(s.arg, s.where))) {
+          // While the copy is alive: only the function its local binding
+          // lives in (and what that can call) runs, unless it suspends.
+          const window = copyWindow(s);
+          if (typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
+          else if (dynWritten(s, window, rootKey(s.arg, s.where))) why = DYN_WRITE_FROM;
+          else if (anyIdentity(refs)) why = COPY_IDENTITY;
+        }
+      }
+      // Functions boxed with the value (or unboxed from it).
+      if (!why) {
+        const fnTypes = refsOf(s.t).fns;
+        if (fnTypes.length > 0) {
+          const boxed = s.dir === "in" ? boxedFns(s.arg, s.where) : { fns: [], open: true };
+          for (const name of boxed.fns) {
+            if (!judgedFns.has(name)) judgedFns.set(name, judgeBoxedFn(name));
+            const j = judgedFns.get(name);
+            if (j) {
+              why = j.why;
+              feature = `a function crossing into a dynamic value, ${j.what}`;
+              hint = "leave the parameter dynamic ('unknown' or 'any') or return a fresh value, so dynamic code and the function share one object";
+              break;
+            }
+          }
+          if (!why && boxed.open) {
+            for (const f of fnTypes) {
+              const j = fnTypeObservable(f);
+              if (j) {
+                why = j;
+                feature = `a '${L.fmt(f)}' function crossing ${s.dir === "in" ? "into" : "out of"} a dynamic value (its composite arguments and result cross as copies)`;
+                hint = "type the function's composite parameters and result as 'unknown' or 'any', so both sides share one object";
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (!why) continue;
+      const at = `${s.loc.file}:${s.loc.start}`;
+      if (reportedDyn.has(at)) continue;
+      reportedDyn.add(at);
+      L.pushDiag(unsupportedDiag("SC1090", s.loc, `${feature}: it would be a COPY where JavaScript shares the object, and ${why} (SEMANTICS.md S125)`, hint));
+    }
   }
 }
