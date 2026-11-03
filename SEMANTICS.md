@@ -9451,9 +9451,11 @@ read, while no code that can run in between writes a dynamic value; a
 `return` that checks a local dynamic value the function built and owns
 (the evolving-array idiom `const acc = []; … return acc`); and a callback
 parameter that only reads its copy while the call cannot reach a write.
-An `Error` crosses through the identity cache (S021), a `Promise` and an
-`any[]` cross by reference, and a variadic callback's adapter is vetted
-by GH #22: none of them is judged here. The width tolerance of a cast (a
+An `Error` crosses through the identity cache (S021), an `any[]` crosses
+by reference, and a variadic callback's adapter is vetted by GH #22: none
+of them is judged here. A `Promise` crosses by reference too; its
+composite settled value is converted at the first dynamic read, and that
+copy is judged like any other. The width tolerance of a cast (a
 record copy keeps only the type's fields, in the type's order) is S009's,
 not (c)'s. **Rationale:** a stopgap until unit U1 makes the dynamic
 crossings share (docs/design/dynamic-values.md); until then a silent

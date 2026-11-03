@@ -122,6 +122,17 @@ r.n = 2;
 console.log(t.n);`,
     refused: "in",
   },
+  // A fresh dynamic object written through an alias of it, after a copy
+  // was checked out of it.
+  {
+    id: "out-fresh-aliased-write",
+    src: `const d: any = JSON.parse('{"k":1}');
+const alias = d;
+const t = alias as { k: number };
+d.k = 7;
+console.log(t.k);`,
+    refused: "out",
+  },
   // A typed value into `any`, written through the dynamic side.
   { id: "in-any-write", src: `const r = { a: 1 }; const a: any = r; a.a = 2; console.log(r.a);`, refused: "in" },
   // A typed array into `unknown`, pushed to afterwards.

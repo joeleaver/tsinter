@@ -542,6 +542,14 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       return { use: "recv", stored: (anc["args"] as IrExpr[]).slice(1) };
     }
     if (ak === "dynCheck") return { use: "exit" };
+    // A callback loop hands the callback the elements — and the array
+    // itself as the third argument, which a callback of fewer parameters
+    // never receives.
+    if (ak === "dynInvoke" && key === "recv" && /^(forEach|map|filter|some|every|find|findIndex)$/.test(anc["method"] as string)) {
+      const cb = (anc["args"] as IrExpr[])[0];
+      const f = cb?.kind === "dynFrom" && cb.value.kind === "closure" ? byName.get(cb.value.fnName) : undefined;
+      if (f && f.params.length < 3) return { use: "recv", stored: [] };
+    }
     return dynUseAt(i) === "ro" ? { use: "ro" } : { use: "other" };
   };
   /** Does the out-crossing whose parent sits at stack index `i` build
@@ -1481,6 +1489,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           const b = bindings.get(bkey(fn, e.localId));
           return !!b && !b.captured && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
         }
+        case "libCall":
+          // The data-in, data-out library families build what they return
+          // (`s.split(" ")`, a regex match).
+          return /^(math|num|number|string|str|path|sym|os|text|strdec|regex|regexp)\./.test(e.fn);
         default:
           // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
           return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
@@ -1525,7 +1537,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       const init = onlyValue(fn, v.localId);
       const i = unwrap(init ?? undefined);
       if (!i) return false;
-      return (i.kind === "libCall" && DYN_FRESH_LIB.test(i.fn)) || i.kind === "dynArrLit" || i.kind === "dynObjLit";
+      if (!((i.kind === "libCall" && DYN_FRESH_LIB.test(i.fn)) || i.kind === "dynArrLit" || i.kind === "dynObjLit")) return false;
+      // ...and the binding never hands the object anywhere (an alias, an
+      // argument, an element pushed elsewhere would make it reachable as
+      // something a copy was taken from).
+      return (ownUses.get(bkey(fn, v.localId)) ?? []).every((u) => u.use !== "other");
     };
     /** The binding a dynamic expression reads from (through member reads). */
     const rootKey = (e: IrExpr | null | undefined, fn: string): string | null => {
@@ -1659,7 +1675,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const boxedFns = (e: IrExpr | undefined, fn: string, depth = 0): { fns: string[]; open: boolean } => {
       e = unwrap(e);
       if (!e || depth > 6) return { fns: [], open: true };
-      if (refsOf(e.type).fns.length === 0 && e.type.kind !== "func") return { fns: [], open: false };
+      if (!isDynType(e.type) && refsOf(e.type).fns.length === 0 && e.type.kind !== "func") return { fns: [], open: false };
       const merge = (xs: IrExpr[]): { fns: string[]; open: boolean } => {
         const out = { fns: [] as string[], open: false };
         for (const x of xs) {
@@ -1672,6 +1688,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       switch (e.kind) {
         case "closure":
           return byName.has(e.fnName) ? { fns: [e.fnName], open: false } : { fns: [], open: true };
+        case "dynFrom":
+          // Boxed right here (an out-crossing of a function just boxed).
+          return boxedFns(e.value, fn, depth + 1);
         case "recordLit":
           return merge(e.fields.map((f) => f.value));
         case "arrayLit":
@@ -1777,7 +1796,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       if (!why) {
         const fnTypes = refsOf(s.t).fns;
         if (fnTypes.length > 0) {
-          const boxed = s.dir === "in" ? boxedFns(s.arg, s.where) : { fns: [], open: true };
+          const boxed = boxedFns(s.arg, s.where);
           for (const name of boxed.fns) {
             if (!judgedFns.has(name)) judgedFns.set(name, judgeBoxedFn(name));
             const j = judgedFns.get(name);
