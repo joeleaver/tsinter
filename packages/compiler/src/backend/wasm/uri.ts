@@ -1418,7 +1418,6 @@ export class UriBuilder {
         S = 1,
         N = 2,
         I = 3,
-        CH = 4,
         OUT = 5,
         O = 6,
         B0 = 7,

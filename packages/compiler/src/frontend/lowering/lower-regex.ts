@@ -24,6 +24,10 @@ import type { FnCtx, Lowerer } from "./lowerer.js";
 import { BOOL, F64, IrExpr, IrFunction, IrLocal, IrStmt, IrType, REGEX, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, typeEquals } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
 import { bindOnce, isMatchSliceType, isUndefExpr, lowerGroupsProjection, mayHoldSlotUndef, namedCaptureGroupsOfPattern, undefinedAsText } from "./lower-exprs.js";
+// Deliberate boundary crossing: regex literals fold through the ONE build-time regex
+// compiler (backend/wasm/regex-fold.ts) rather than a second frontend copy. Moving it
+// out of backend/ is a separate change.
+// eslint-disable-next-line no-restricted-imports
 import { foldRegexLiteral } from "../../backend/wasm/regex-fold.js";
 import { typeKey } from "../types.js";
 import { bodyReadsArguments } from "./lower-calls.js";

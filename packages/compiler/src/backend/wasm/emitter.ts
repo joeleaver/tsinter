@@ -66,7 +66,6 @@ import {
   typeKey,
   DYN,
   VOID,
-  funcOf,
   JSVAL,
   NULL_T,
   UNDEFINED_T,
@@ -98,13 +97,11 @@ import {
   EXPORT_TICK,
   FD_STDERR,
   FD_STDOUT,
-  HOST_NUM_KIND_ARGC,
   HOST_NUM_KIND_AVAILABLE_MEMORY,
   HOST_NUM_KIND_COLUMNS,
   HOST_NUM_KIND_CONSTRAINED_MEMORY,
   HOST_NUM_KIND_CPU_SYSTEM,
   HOST_NUM_KIND_CPU_USER,
-  HOST_NUM_KIND_ENV_PAIR_COUNT,
   HOST_NUM_KIND_GID,
   HOST_NUM_KIND_IS_TTY,
   HOST_NUM_KIND_PID,
@@ -114,13 +111,9 @@ import {
   HOST_NUM_KIND_UID,
   HOST_NUM_KIND_UPTIME,
   HOST_STR_KIND_ARCH,
-  HOST_STR_KIND_ARGV,
   HOST_STR_KIND_CWD,
-  HOST_STR_KIND_ENV_KEY,
-  HOST_STR_KIND_ENV_VALUE,
   HOST_STR_KIND_EXEC_PATH,
   HOST_NUM_KIND_OS_TOTALMEM,
-  PLATFORM_ID_DARWIN,
   PLATFORM_ID_WIN32,
   HOST_STR_KIND_OS_HOMEDIR,
   HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON,
@@ -161,7 +154,6 @@ import {
 } from "./abi.js";
 import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
 import {
-  BYTES_PAYLOAD_IS_BUFFER,
   DK,
   DYN_KIND,
   DYN_NUM,
@@ -170,7 +162,6 @@ import {
   ENTRY_KEY,
   ENTRY_VALUE,
   FN_CLOS,
-  FN_NAME,
   FN_SRC,
   FN_SIG,
   VIEW_SIG,
@@ -265,13 +256,13 @@ const FOLD_DEPTH_CAP = 32;
 /** GH #86: the stderr line a runtime fence ends the program with —
  * `tsinter: unsupported: <message> [SC#### at <file>:<line>]`. */
 export const FENCE_FATAL_PREFIX = "tsinter: unsupported: ";
-import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
-import { BytesBuilder, type BytesElem } from "./typedarrays.js";
+import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY } from "./regex-opcodes.js";
+import { BytesBuilder } from "./typedarrays.js";
 import { StrdecBuilder } from "./strdec.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
 import { DcBuilder, alsBlockedFamily } from "./dc.js";
-import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
+import { EventsBuilder } from "./events.js";
 import {
   StreamBuilder,
   RS_HWM,
@@ -8726,7 +8717,6 @@ class Assembler {
     }
     const rootRef = this.classes.ref(rootInfo);
     const ROOT_FIELD = 1;
-    const WREQ_FIELD = 2; // write only
     const fields: FieldType[] = [
       { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
       { storage: rootRef, mutable: false },
@@ -9824,7 +9814,7 @@ class Assembler {
    * zero exercise, since it reuses the exact DK-check shape already on
    * hand. emitClose is defaulted true unconditionally — no claim reads
    * the record for it at all. */
-  private emitInitDynScalars(code: Code, root: number, st: number, hasOpts: number, dynOpts: number, hwmField: number, sides: number, loc: SrcLoc | undefined): void {
+  private emitInitDynScalars(code: Code, root: number, st: number, hasOpts: number, dynOpts: number, hwmField: number, sides: number): void {
     const dynRefT = this.dyn.dynRef();
     const dynT = this.dyn.dynT();
     // highWaterMark.
@@ -12268,7 +12258,7 @@ class Assembler {
         const V = this.acquireScratch(F64);
         this.walkExpr(e.args[0]!);
         code.localSet(V);
-        this.emitNetInt32Check(code, () => code.localGet(V), "value", "argument");
+        this.emitNetInt32Check(code, () => code.localGet(V), "value");
         code.localGet(V);
         code.f64Const(10);
         code.f64Max();
@@ -12551,9 +12541,8 @@ class Assembler {
 
   /** validateInt32(value, name, 1) over the f64 `push` pushes: Node's
    * ERR_OUT_OF_RANGE for a non-integer and for one outside [1, 2^31 - 1]
-   * (the caller's pending check unwinds). `kind` is ERR_INVALID_ARG_TYPE's
-   * word for the name (unused for a number). */
-  private emitNetInt32Check(c: Code, push: () => void, name: string, _kind: "argument" | "property"): void {
+   * (the caller's pending check unwinds). */
+  private emitNetInt32Check(c: Code, push: () => void, name: string): void {
     // !NumberIsInteger: NaN, +-Infinity, or a fraction.
     push();
     c.f64Trunc();
@@ -12719,24 +12708,6 @@ class Assembler {
       c.else_();
       c.localGet(V);
       c.call(this.dyn.truthy());
-      c.end();
-    };
-    // A member other than undefined / null (`!= null`).
-    const present = (): void => {
-      c.localGet(V);
-      c.refIsNull();
-      c.ifResult(I32);
-      c.i32Const(0);
-      c.else_();
-      c.localGet(V);
-      c.structGet(dynT, 0);
-      c.i32Const(6);
-      c.i32Ne();
-      c.localGet(V);
-      c.structGet(dynT, 0);
-      c.i32Const(0);
-      c.i32Ne();
-      c.i32And();
       c.end();
     };
     const argValue = (prop: string, push: () => void): void => {
@@ -38543,7 +38514,7 @@ class Assembler {
           // never observed.
           this.walkExpr(e.args[0]!);
           code.drop();
-          this.emitMaxListenersArgCheckStatic(code, "setMaxListeners", e.args[1]!, e.loc);
+          this.emitMaxListenersArgCheckStatic(code, "setMaxListeners", e.args[1]!);
           this.emitPendingCheck();
           code.unreachable(); // the static path always throws; nothing falls through
           return true;
@@ -38587,7 +38558,7 @@ class Assembler {
           return true;
         }
         if (innerKind0 !== null) {
-          this.emitMaxListenersArgCheckStatic(code, nameArg.value, e.args[0]!, e.loc);
+          this.emitMaxListenersArgCheckStatic(code, nameArg.value, e.args[0]!);
           this.emitPendingCheck();
           code.unreachable();
           return true;
@@ -39129,7 +39100,7 @@ class Assembler {
         code.i32Const(DK.OBJ);
         code.i32Eq();
         code.localSet(hasOpts);
-        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, RS_HWM, FIN_SIDE_R, e.loc);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, RS_HWM, FIN_SIDE_R);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "read", readFallbackExpr, RS_READ_CLOS, RS_READ_THUNK, readAdapterThunkIdx, readAdapter.fn, readAdapter.env, readFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
         this.releaseScratch(I32, hasOpts);
@@ -39438,7 +39409,7 @@ class Assembler {
         code.i32Const(DK.OBJ);
         code.i32Eq();
         code.localSet(hasOpts);
-        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, WS_HWM, FIN_SIDE_W, e.loc);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, WS_HWM, FIN_SIDE_W);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "write", writeFallbackExpr, WS_WRITE_CLOS, WS_WRITE_THUNK, writeAdapterThunkIdx, writeAdapter.fn, writeAdapter.env, writeFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "final", finalFallbackExpr, WS_FINAL_CLOS, WS_FINAL_THUNK, finalAdapterThunkIdx, finalAdapter.fn, finalAdapter.env, finalFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
@@ -45040,7 +45011,7 @@ class Assembler {
    * Caller's contract: check `dynFromStaticKind(dynExpr) !== null` FIRST
    * (before evaluating anything, so a "no" costs nothing), then call
    * this — which always succeeds when that check passed. */
-  private emitMaxListenersArgCheckStatic(code: Code, argName: string, dynExpr: IrExpr, loc: SrcLoc | undefined): void {
+  private emitMaxListenersArgCheckStatic(code: Code, argName: string, dynExpr: IrExpr): void {
     const kind = this.dynFromStaticKind(dynExpr);
     if (kind === null) throw new Error("wasm emitter bug: emitMaxListenersArgCheckStatic called without dynFromStaticKind first");
     const inner = (dynExpr as Extract<IrExpr, { kind: "dynFrom" }>).value;
@@ -48494,6 +48465,9 @@ class Assembler {
       this.refuse("dynFrom:promise:race-copy", this.copyRaceLoc);
       return null;
     }
+    // The read is kept for its side effect: the promT getter registers the promise
+    // struct type on first use, and dropping it could reorder the module's type indices.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const promT = this.proms.promT;
     const entryT = this.proms.raceEntryT;
     const c = new Code();

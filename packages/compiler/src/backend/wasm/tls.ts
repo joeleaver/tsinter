@@ -189,7 +189,7 @@ const X_HELD = 15; // bytes: a write held until then (null)
 
 /* ── $tsrv: a tls.Server's state (the $srv's V_TLS) ─────────────────── */
 const TS_CTX = 0; // i32
-const TS_HTTPS = 1; // i32
+// TS_HTTPS = 1: not read in this file. (i32)
 
 /* ── $tlso: an https request's TLS options (http.ts carries it) ─────── */
 export const TO_REJECT = 0; // i32

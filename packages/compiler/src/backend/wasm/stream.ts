@@ -4058,7 +4058,7 @@ export class StreamBuilder {
     return this.cached(`fromArrReadThunk:${strings}`, () => {
       const idx = this.mb.declareFunc(this.readThunkSig(), `%w.rs.fromArrRead:${strings ? "str" : "bytes"}`);
       const c = new Code();
-      const CLOS = 0, ROOT = 1, SIZE = 2, CL = 3, N = 4, I = 5, ELEM = 6;
+      const CLOS = 0, ROOT = 1, CL = 3, N = 4, I = 5, ELEM = 6;
       const closT = this.fromArrClosT(strings);
       const vecStructT = this.deps.vecStruct(strings);
       const vecBufT = this.deps.vecBufType(strings);
@@ -8071,7 +8071,7 @@ export class StreamBuilder {
     return this.cached("identityTransformThunk", () => {
       const idx = this.mb.declareFunc(this.writeThunkSig(), "%w.ws.identityTransformThunk");
       const c = new Code();
-      const CLOS = 0, THIS = 1, CHUNK = 2, ENC = 3, WREQ = 4;
+      const THIS = 1, CHUNK = 2;
       c.localGet(THIS);
       c.localGet(CHUNK);
       c.i32Const(0); // front: false
@@ -8122,7 +8122,7 @@ export class StreamBuilder {
     return this.cached("identityFlushThunk", () => {
       const idx = this.mb.declareFunc(this.finalThunkSig(), "%w.ws.identityFlushThunk");
       const c = new Code();
-      const CLOS = 0, THIS = 1;
+      const THIS = 1;
       c.localGet(THIS);
       c.refNull(this.errType());
       c.refNull(this.deps.bytesStructType());

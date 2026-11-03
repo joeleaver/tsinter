@@ -38,7 +38,7 @@
  * discharge — NOT-APPLICABLE) each one.
  */
 import { Code } from "./code.js";
-import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
+import { I32, ModuleBuilder, type ValType } from "./module.js";
 import { LEN, type VecInfo } from "./arrays.js";
 import { HOST_STR_KIND_CWD } from "./abi.js";
 
@@ -3249,7 +3249,6 @@ export class PathBuilder {
       const CI = 11;
       const PDLEN = 12;
       const DEVSCRATCH = 13;
-      const DEVO = 14;
       const TAIL = 15;
       const NORM = 16;
       const RESULT = 17;
@@ -4518,7 +4517,6 @@ export class PathBuilder {
       const TAIL = 4;
       const RESOLVEDABS = 5;
       const PATHB = 6;
-      const ARGLEN = 7;
       const FAST = 8;
       const A0 = 9;
       const EMPTYORDOT = 10;
@@ -4535,7 +4533,6 @@ export class PathBuilder {
       const K = 21;
       const NORM = 22;
       const OUT = 23;
-      const POS = 24;
       const NT = 25;
       const strT = this.strType();
       const vi = this.deps.stringVecInfo();
@@ -5265,7 +5262,6 @@ export class PathBuilder {
       const RESULT = 15;
       const HASRESULT = 16;
       const K = 17;
-      const CH = 18;
       const SCRATCH = 19;
       const O = 20;
       const J = 21;
