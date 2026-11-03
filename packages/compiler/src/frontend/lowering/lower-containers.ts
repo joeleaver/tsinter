@@ -3283,6 +3283,38 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     };
   }
 
+/** GH #121: `Map.prototype.set` and `Set.prototype.add` answer their
+ * receiver. The lowered intrinsic is a void statement, so where the call's
+ * value is used (`m.set(k, v).size`, a chain, an initializer, an argument)
+ * the receiver is evaluated once into a hidden local — before the
+ * arguments, as in JS — and the call answers that local. In statement
+ * position the void intrinsic stands alone. */
+function receiverResult(L: Lowerer, call: ts.CallExpression, receiver: IrExpr, loc: SrcLoc,
+  build: (recv: IrExpr) => IrExpr): IrExpr {
+  if (!callValueUsed(call)) return build(receiver);
+  const t = L.declareHiddenLocal("%recv", receiver.type);
+  const read: IrExpr = { kind: "varRef", localId: t.id, type: receiver.type, loc };
+  return {
+    kind: "seqExpr",
+    stmts: [{ kind: "varDecl", localId: t.id, init: receiver, loc }, { kind: "exprStmt", expr: build(read), loc }],
+    result: read,
+    type: receiver.type,
+    loc,
+  };
+}
+
+/** False when a call's value is discarded: an expression statement, the
+ * left operand of a comma, a `void` operand, a for-loop's init/update. */
+export function callValueUsed(call: ts.CallExpression): boolean {
+  let n: ts.Node = call;
+  while (ts.isParenthesizedExpression(n.parent)) n = n.parent;
+  const p = n.parent;
+  if (ts.isExpressionStatement(p) || ts.isVoidExpression(p)) return false;
+  if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.CommaToken && p.left === n) return false;
+  if (ts.isForStatement(p) && (p.incrementor === n || p.initializer === n)) return false;
+  return true;
+}
+
 /** Ambient Map method calls. `get`/`set`/`has`/`delete`/`clear` lower to
    * mapIntrinsic; `forEach` desugars to a direct call of a synthetic loop
    * function over the iteration primitives (lowerMapForEachCall). Null when
@@ -3330,7 +3362,7 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     if (name === "set") {
       const k = L.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
       const v = L.lowerExprExpecting(call.arguments[1]!, receiverIr.value);
-      return { kind: "mapIntrinsic", method: "set", receiver, args: [k, v], type: VOID, loc };
+      return receiverResult(L, call, receiver, loc, (r) => ({ kind: "mapIntrinsic", method: "set", receiver: r, args: [k, v], type: VOID, loc }));
     }
     if (name === "has" || name === "delete") {
       const k = L.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
@@ -3711,7 +3743,7 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
     }
     if (name === "add") {
       const v = L.lowerExprExpecting(call.arguments[0]!, receiverIr.elem);
-      return { kind: "setIntrinsic", method: "add", receiver, args: [v], type: VOID, loc };
+      return receiverResult(L, call, receiver, loc, (r) => ({ kind: "setIntrinsic", method: "add", receiver: r, args: [v], type: VOID, loc }));
     }
     if (name === "has" || name === "delete") {
       const v = L.lowerExprExpecting(call.arguments[0]!, receiverIr.elem);

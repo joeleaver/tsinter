@@ -1,5 +1,5 @@
 // The Map surface beyond the lowering: the lib declares all of this, so
-// it TYPECHECKS (seeded constructors, iterators, chaining, 3-param forEach
+// it TYPECHECKS (seeded constructors, iterators, 3-param forEach
 // callbacks) — each use is fenced per site by the lowerer, never truncated.
 const m = new Map<string, number>();
 
@@ -18,9 +18,6 @@ const es = m.entries();
 // for-of over the map and spreads of its keys()/values()/entries() are the
 // lowered iteration forms.
 const spread = [...m];
-
-// set() is declared void (not the JS `this`), so chaining is a type error.
-m.set("a", 1).set("b", 2);
 
 // The forEach callback receives (value, key) — no third map parameter.
 m.forEach((v, k, theMap) => console.log(k, v));

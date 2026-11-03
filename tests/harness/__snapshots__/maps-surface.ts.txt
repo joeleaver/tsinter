@@ -68,20 +68,11 @@ maps-surface.ts:20:17 - error SC1090: spreading 'Map<string, number>' into a '[s
      |                 ^~~~
   21 | 
 
-maps-surface.ts:23:1 - error SC2020: 'chained Map method calls' is part of the standard library types but has no scriptc lowering yet
+maps-surface.ts:23:11 - error SC2011: values of type '(v: number, k: string, theMap: Map<string, number>) => void' have no static representation but run in the embedded dynamic engine, which this build does not include
 
-  22 | // set() is declared void (not the JS `this`), so chaining is a type error.
-  23 | m.set("a", 1).set("b", 2);
-     | ^~~~~~~~~~~~~
-  24 | 
-
-  hint: the lowered set() produces no value — call each set(k, v) as its own statement
-
-maps-surface.ts:26:11 - error SC2011: values of type '(v: number, k: string, theMap: Map<string, number>) => void' have no static representation but run in the embedded dynamic engine, which this build does not include
-
-  25 | // The forEach callback receives (value, key) — no third map parameter.
-  26 | m.forEach((v, k, theMap) => console.log(k, v));
+  22 | // The forEach callback receives (value, key) — no third map parameter.
+  23 | m.forEach((v, k, theMap) => console.log(k, v));
      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  27 | 
+  24 | 
 
   hint: build with --dynamic to run these values in the embedded engine (adds ~620KB to the binary), or restate the type inside the static surface (https://scriptc.dev/limitations describes the boundary)

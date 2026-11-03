@@ -941,3 +941,85 @@ export function lowerArrayFill(L: Lowerer, call: ts.CallExpression, access: ts.P
   );
   return { kind: "call", callee: helper, args: [recv, value, start, end], type: arrT, loc };
 }
+
+/** GH #121: Array.prototype.copyWithin(target, start, end) — the three
+ * positions resolve like fill's (ToIntegerOrInfinity, negatives from the
+ * end, clamped; end defaults to the length); count = min(end - start,
+ * length - target) elements move, backwards when the ranges overlap with
+ * the source first, so the move reads the original elements. A stored hole
+ * moves as the stored value (the S119 hole observers still see it).
+ * Answers the receiver. */
+export function lowerArrayCopyWithin(L: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression): IrExpr | null {
+  if (L.chainBlocked(access, call)) return null;
+  if (access.name.text !== "copyWithin") return null;
+  const args = call.arguments;
+  if (args.length < 1 || args.length > 3 || args.some((a) => ts.isSpreadElement(a))) return null;
+  const arrT = L.mapTypeOf(L.typeOf(access.expression));
+  if (arrT?.kind !== "array") return null;
+  if (!L.isStdlibMember(access)) return null;
+  const loc = locOf(call);
+  const recv = guardedRecv(L, access);
+  if (!typeEquals(recv.type, arrT)) return null;
+  const target = optionalNumber(L, args[0]!, num(0, loc));
+  if (!target) return null;
+  const start = args.length >= 2 ? optionalNumber(L, args[1]!, num(0, loc)) : num(0, loc);
+  if (!start) return null;
+  const end = args.length >= 3 ? optionalNumber(L, args[2]!, num(Infinity, loc)) : num(Infinity, loc);
+  if (!end) return null;
+  const helper = internHelper(
+    L,
+    `arr.copyWithin:${typeKey(arrT)}`,
+    "arr.copyWithin", // width-copies.ts ARG_MUTATOR
+    [{ id: "a.0", type: arrT }, { id: "t.0", type: F64 }, { id: "s.0", type: F64 }, { id: "e.0", type: F64 }],
+    [{ id: "n.0", type: F64 }, { id: "to.0", type: F64 }, { id: "fr.0", type: F64 }, { id: "fi.0", type: F64 }, { id: "c.0", type: F64 }, { id: "d.0", type: F64 }],
+    arrT,
+    loc,
+    () => {
+      const a = ref("a.0", arrT, loc);
+      const nn = ref("n.0", F64, loc);
+      const to = ref("to.0", F64, loc);
+      const fr = ref("fr.0", F64, loc);
+      const fi = ref("fi.0", F64, loc);
+      const c = ref("c.0", F64, loc);
+      const d = ref("d.0", F64, loc);
+      const relative = (local: string, from: IrExpr): IrStmt[] => {
+        const v = ref(local, F64, loc);
+        return [
+          decl(local, truncOf(from, loc), loc),
+          ifThen(isNaNOf(v, loc), [assign(local, num(0, loc), loc)], loc),
+          ifThen(
+            bin("<", v, num(0, loc), loc),
+            [assign(local, bin("+", nn, v, loc), loc), ifThen(bin("<", v, num(0, loc), loc), [assign(local, num(0, loc), loc)], loc)],
+            loc,
+            [ifThen(bin(">", v, nn, loc), [assign(local, nn, loc)], loc)],
+          ),
+        ];
+      };
+      return [
+        decl("n.0", arrLen(a, loc), loc),
+        ...relative("to.0", ref("t.0", F64, loc)),
+        ...relative("fr.0", ref("s.0", F64, loc)),
+        ...relative("fi.0", ref("e.0", F64, loc)),
+        // count = min(final - from, len - to)
+        decl("c.0", bin("-", fi, fr, loc), loc),
+        ifThen(bin(">", c, bin("-", nn, to, loc), loc), [assign("c.0", bin("-", nn, to, loc), loc)], loc),
+        decl("d.0", num(1, loc), loc),
+        ifThen(bin("<", fr, to, loc), [
+          ifThen(bin("<", to, bin("+", fr, c, loc), loc), [
+            assign("d.0", num(-1, loc), loc),
+            assign("fr.0", bin("-", bin("+", fr, c, loc), num(1, loc), loc), loc),
+            assign("to.0", bin("-", bin("+", to, c, loc), num(1, loc), loc), loc),
+          ], loc),
+        ], loc),
+        whileLoop(bin(">", c, num(0, loc), loc), [
+          { kind: "arraySet", arr: a, index: to, value: { kind: "arrayGet", arr: a, index: fr, type: arrT.elem, loc }, loc },
+          assign("fr.0", bin("+", fr, d, loc), loc),
+          assign("to.0", bin("+", to, d, loc), loc),
+          assign("c.0", bin("-", c, num(1, loc), loc), loc),
+        ], loc),
+        ret(a, loc),
+      ];
+    },
+  );
+  return { kind: "call", callee: helper, args: [recv, target, start, end], type: arrT, loc };
+}
