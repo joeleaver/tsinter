@@ -8,9 +8,9 @@ Everything below was run in the session; times are wall-clock.
 
 | workload | move to cloud? | needs |
 |---|---|---|
-| wasm census (`wasm-differential.test.ts`) | **yes** | `scripts/cloud-setup.sh` (Node 24.18.1 + pnpm). 1132/1135 claimed, same as the laptop. ~11 min with 4 workers. 4 of 5 row failures are environmental (no IPv6 in the container, see below); the 5th is a timing race under load |
+| wasm census (`wasm-differential.test.ts`) | **yes** | `scripts/cloud-setup.sh` (Node 24.18.1 + pnpm). 1132/1135 claimed, same as the laptop. 10m46s with 4 workers. 4 row failures come from the container (no IPv6). Two child-process ordering rows (U3-ORD-01, U3-BIG-01) also fail **on main**, while Node orders them correctly here, so they are a real divergence that this slower box exposes. See below |
 | non-harness suite (`vitest run packages`) | **yes** | clang 21 on PATH (some package tests call `clang`). 3 failures, all `fs-errno-rows` because the container runs as root. They pass as `nobody`. ~12 min |
-| wasm-native tests | RESULT_WASMNATIVE_VERDICT | clang 21.1.8 from the LLVM GitHub release (apt.llvm.org is blocked) |
+| wasm-native tests | **yes** | clang 21.1.8 from the LLVM GitHub release (apt.llvm.org is blocked), `/usr/bin/time`, and run in a bare environment (`cleanenv`). Differential: 1132/1135 claimed, **1136/1136 passed** (12m19s). Host rows: 245/252. 5 failures come from the environment and pass once it is fixed, and 2 TLS-hint rows still fail in a bare environment (see below) |
 | full run (`SCRIPTC_NO_CACHE=1 npx vitest run`) | RESULT_FULL_VERDICT | everything above |
 | survey re-runs | **yes, with two changes** | `SURVEY_MEMMAX=0` (no systemd) and `@types/node` pre-seeded into `$SURVEY_CACHE/node-types` (`SURVEY=1 scripts/cloud-setup.sh`) |
 | **pushing results** | **blocked in this session** | `git push` to `joeleaver/tsinter` got HTTP 403 for every branch (see "Git push") |
@@ -27,6 +27,10 @@ The constraints that shape all of this:
   `EAFNOSUPPORT`, and `localhost` resolves only to 127.0.0.1). Node-oracle rows that bind `::`/`::1` or that
   expect `localhost` to resolve to two addresses fail on both sides of the comparison in an environment-specific way.
 - **Runs as root.** Tests that assert a non-root uid class fail.
+- **The session environment leaks into tests.** It exports `NODE_OPTIONS=--use-openssl-ca`, `NODE_EXTRA_CA_CERTS`,
+  `SSL_CERT_FILE`, `HTTPS_PROXY` and a `NO_PROXY` that lists localhost. The Node oracle and the compiled programs
+  both inherit them. Run tests under `cleanenv` (from `env.sh`); they need no network.
+- **`/usr/bin/time` is not installed** (one host row measures RSS with it). The setup script installs it.
 
 ## 1. Hardware
 
@@ -36,7 +40,7 @@ The constraints that shape all of this:
 | RAM | 15.7 GiB, no swap |
 | Disk | 30 GB available for the session (`/` reports 252 GB, but the per-session allowance is what counts) |
 | OS | Ubuntu 24.04.5 LTS, kernel 6.18 (Firecracker VM) |
-| Long processes | The first census ran 11m23s and the non-harness suite 11m51s as background jobs without trouble, and RESULT_LONGEST. Between turns the VM rebooted (see above) |
+| Long processes | Detached `nohup setsid` jobs ran unattended: census, wasm-native and host rows back to back (31 min), then the full run (RESULT_LONGEST). Between turns, while idle, the VM rebooted once (see above) |
 
 ## 2. Toolchain
 
@@ -52,6 +56,7 @@ The constraints that shape all of this:
 | network: npm | `registry.npmjs.org` | works (proxy bypass list) |
 | network: nodejs.org | dist tarballs | works |
 | network: GitHub | `git clone`/`fetch` of public repos, release downloads | works |
+| apt (archive.ubuntu.com) | `apt-get install time` | works |
 | | `gh api search/...` | works |
 | | `gh api repos/<owner>/<repo>` for repos outside the session | **denied** (403 "GitHub access to this repository is not enabled for this session") |
 | | `git push` to joeleaver/tsinter | **denied**, see below |
@@ -101,7 +106,15 @@ wasm work queue (2 distinct constructs, by programs needing them): libCall:islan
 real 11m23s
 ```
 
-RESULT_CENSUS2
+Run 2 (final tree after the lint fix, box otherwise idle):
+
+```
+wasm tier: 1132/1135 corpus programs claimed; first refusals: module:embedded×3
+wasm work queue (2 distinct constructs, by programs needing them): libCall:island.import×3, module:embedded×3
+ Test Files  1 failed (1)
+      Tests  6 failed | 1566 passed (1572)
+   Duration  634.16s
+```
 
 The claimed number matches the laptop: **1132/1135**, and the only refusals are the 3 `module:embedded` programs.
 Every corpus program passes. The failures are all hand-written rows:
@@ -112,11 +125,55 @@ Every corpus program passes. The failures are all hand-written rows:
 | INC-29 U1 N1-ERR-03 (refused connect through `localhost`, AggregateError) | environmental: `localhost` has only one address here, so Node gives a plain Error, not an AggregateError |
 | INC-29 U1 N1-REG-01 (S087 (a), same AggregateError) | environmental: same cause |
 | INC-29 U4 U4-R-03 (IPv6 literal host, checkServerIdentity) | environmental: no IPv6 |
-| INC-28 U3 U3-ORD-01 (child stdout `data` vs `setImmediate` order) | timing: under load the immediate ran before the child's chunk arrived. RESULT_U3 |
+| INC-28 U3 U3-ORD-01 (child stdout `data` vs `setImmediate` order) | **real, timing-exposed.** tsinter runs the immediate before the child's chunk arrives |
+| INC-28 U3 U3-BIG-01 (1 MB child output: `end` before `exit`) | **real, timing-exposed.** tsinter delivers `exit` before the stream's `end` (run 2 only) |
+
+For the two U3 rows I extracted each row's source and ran it under Node 24.18.1 here. Node prints the expected
+order 5 out of 5 times. Re-run alone, both rows fail 3/3 on an untouched `main` worktree (`d844ab9`), and on the
+lint branch ORD-01 failed 0/3 and BIG-01 3/3. So the lint change did not cause this. The wasm lane's
+child-process host orders pipe data/EOF against `setImmediate`/`exit` differently from libuv when the child is
+slower to start (this VM), and the laptop presumably wins the race. That makes these flaky rows over a real
+ordering gap, not cloud noise.
 
 ### wasm-native
 
-RESULT_WASMNATIVE
+With clang 21.1.8 on PATH:
+
+`SCRIPTC_TEST_WORKERS=4 corepack pnpm@10 exec vitest run tests/harness/wasmnative-differential.test.ts`
+
+```
+wasm-native lane: 1132/1135 corpus programs claimed; refusals by reason: module:embedded×3
+ Test Files  1 passed (1)
+      Tests  1136 passed (1136)
+   Duration  738.00s
+```
+
+That matches the laptop: **1132/1135**, only `module:embedded`, and nothing fails.
+
+`SCRIPTC_TEST_WORKERS=4 corepack pnpm@10 exec vitest run tests/harness/wasmnative-host-rows.test.ts`
+
+```
+ Test Files  1 failed (1)
+      Tests  7 failed | 245 passed (252)
+   Duration  397.30s
+```
+
+I re-ran the 7 failures alone after installing `time`, and again under `env -i` (PATH and HOME only):
+
+| row | first run | `env -i` + `time` | cause |
+|---|---|---|---|
+| U1-RUN-06 (#1) `spawnSync` timeout kill, SIGPIPE | fail (`trapped: 7 null` vs `null SIGPIPE`) | pass | environmental: it ran under `nohup setsid`. It passes from an ordinary shell |
+| N1-ERR-03 (#128) | fail (port in the message) | fail | environmental: no IPv6, `localhost` has one address |
+| notes: … IPv6 host … | fail (`EAFNOSUPPORT ::ffff:7f00:1`) | fail | environmental: no IPv6 |
+| TLS back-pressure (256 MiB flood) | fail (`ENOENT …/rss.txt`) | pass | environmental: `/usr/bin/time` missing. `cloud-setup.sh` installs it |
+| proxy-optin (fetch fixtures) | fail (proxy hits 0, want 2) | pass | environmental: the session's `NO_PROXY` lists 127.0.0.1/localhost |
+| U4-R-10 (#183) chain-trust-inter-only | fail | **fail** | **unresolved**: Node appends `; if the root CA is installed locally, try running Node.js with --use-system-ca` to UNABLE_TO_GET_ISSUER_CERT, and tsinter does not |
+| SECURITY 2-3 partial_chain(_leafonly) | fail | **fail** | **unresolved**, same hint |
+
+The two hint rows fail even with a bare environment, and both sides run on this machine. Either the laptop's own
+environment hides this (e.g. `NODE_USE_SYSTEM_CA=1` or `--use-system-ca` in its `NODE_OPTIONS`, which turn the
+hint off for Node and the native host alike), or it is a gap in tsinter. Check it on the laptop before treating it
+as cloud noise.
 
 ### Full run
 
@@ -163,15 +220,26 @@ the Claude GitHub App on joeleaver/tsinter or reconnect GitHub in claude.ai sett
 `scripts/cloud-setup.sh` reproduces the working toolchain from a fresh clone: Node 24.18.1 (checksum-verified),
 `pnpm install --frozen-lockfile` + build, clang 21.1.8 (pinned SHA256, cross-checked against the attestation), and
 optionally (`SURVEY=1`) the survey's node types. It writes `$TSINTER_TOOLS/env.sh` (default `/opt/tsinter-tools`),
-and every shell then needs `source /opt/tsinter-tools/env.sh`. RESULT_SETUP
+and every shell then needs `source /opt/tsinter-tools/env.sh`. Tested end to end: a fresh `git clone` of this branch, run under `env -i` with the empty
+tools directory (the LLVM tarball was reused through `TSINTER_DL`; its download was timed separately at 83 s),
+finished with exit 0 in **4m39s** at `nice 19` while the wasm-native run had the CPU. The first attempt found a
+bug, now fixed: the root `build` script calls bare `pnpm -r`, a clean PATH has no `pnpm`, and in the interactive
+shell the build had silently used the image's `/opt/node22/bin/pnpm`. The script now puts a `pnpm` shim
+(`corepack pnpm@10`) on PATH. It also installs `time` and defines `cleanenv`, which runs a command with
+`NODE_OPTIONS`, the proxy variables and `NO_PROXY` stripped.
 
 Suggested cloud recipe for a gate run:
 
 ```bash
 bash scripts/cloud-setup.sh && source /opt/tsinter-tools/env.sh
-nohup setsid bash -c 'SCRIPTC_WASM_REFUSALS=1 SCRIPTC_TEST_WORKERS=4 corepack pnpm@10 exec vitest run tests/harness/wasm-differential.test.ts > census.log 2>&1' &
+export SCRIPTC_WASM_REFUSALS=1 SCRIPTC_TEST_WORKERS=4
+cleanenv corepack pnpm@10 exec vitest run tests/harness/wasm-differential.test.ts > census.log 2>&1
 ```
 
-Rows that will always fail in this container (no IPv6, root): N1-ERR-02, N1-ERR-03, N1-REG-01, U4-R-03 and the
-three `fs-errno-rows` tests. A cloud gate needs either an allow-list for these or a container with IPv6 and a
+For runs longer than a turn, detach the job and write a status file, as in this probe's chain
+(`nohup setsid chain.sh &`, with each step appending `START`/`END rc= secs=` lines to a status file). A later turn
+reads the logs. A VM recycle kills the job, so check `uptime` first.
+
+Rows that will always fail in this container (no IPv6, root): N1-ERR-02, N1-ERR-03, N1-REG-01, U4-R-03
+(census), N1-ERR-03 and the IPv6 notes row (host rows), and the three `fs-errno-rows` tests. A cloud gate needs either an allow-list for these or a container with IPv6 and a
 non-root user.
