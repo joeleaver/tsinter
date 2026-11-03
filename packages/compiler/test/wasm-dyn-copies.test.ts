@@ -313,6 +313,33 @@ console.log(JSON.stringify(out));`,
 main();`,
   },
   {
+    // Totals counted by a callback a dynamic array loop runs, then returned.
+    id: "ok-return-own-captured-by-dynamic-loop",
+    src: `function totals(map: any): any {
+  const ret = { total: 0, covered: 0 };
+  Object.keys(map).forEach((k: string) => { ret.total += 1; if (map[k]) ret.covered += 1; });
+  return ret;
+}
+const t = totals(JSON.parse('{"a":1,"b":0}'));
+const sink: any = JSON.parse("{}");
+sink.t = t;
+sink.t.total = 9;
+console.log(JSON.stringify(sink));`,
+  },
+  {
+    // A call of a function that returns an array it built: fresh.
+    id: "ok-call-returns-own",
+    src: `function make(n: number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) out.push(i);
+  return out;
+}
+const sink: any = JSON.parse("[]");
+sink.push(make(3));
+sink.at(0).push(9);
+console.log(JSON.stringify(sink));`,
+  },
+  {
     // A library result nothing else holds.
     id: "ok-library-result",
     src: `const keys: unknown = Object.keys({ a: 1, b: 2 }).map((k) => k + "!");

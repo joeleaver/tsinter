@@ -573,7 +573,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     }
     if (ak === "call" && key === "args" && HOF_HELPER.test(anc["callee"] as string)) return { ok: elemFree };
     if (ak === "forOf" && key === "iterable") return { ok: elemFree };
-    if (ak === "dynFrom") return { ok: true };
+    // The crossing itself, or the value leaving the function (the call's
+    // result is then its only holder).
+    if (ak === "dynFrom" || ak === "return") return { ok: true };
     const u = useOf(anc, key);
     return { ok: u === "print" || u === "keys" };
   };
@@ -712,7 +714,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     if (k === "closure") {
       closureCaptures.push({
         fnName: r["fnName"] as string, fn: curFn, captures: (r["captures"] as string[] | undefined) ?? [],
-        transient: parent !== null && parent["kind"] === "call" && pkey === "args" && HOF_HELPER.test(parent["callee"] as string),
+        // (A typed array loop, or a dynamic one: `xs.forEach(cb)` on a
+        // dynamic array boxes `cb` and the runtime runs it the same way.)
+        transient: parent !== null && ((parent["kind"] === "call" && pkey === "args" && HOF_HELPER.test(parent["callee"] as string)) ||
+          (parent["kind"] === "dynFrom" && stack.length >= 2 && stack[stack.length - 2]![0]["kind"] === "dynInvoke" && stack[stack.length - 2]![1] === "args" &&
+            /^(forEach|map|filter|some|every|find|findIndex)$/.test(stack[stack.length - 2]![0]["method"] as string))),
       });
     }
     noteDynNode(r, parent, pkey);
@@ -1994,10 +2000,39 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // directory listing, a regex match); none is a program value.
           // (process.argv and the like answer one shared value.)
           return !/^(dyn|process|global|emitter|stdin)\./.test(e.fn);
+        case "call":
+          // A program function every return of which builds a value from
+          // its own locals.
+          if (!e.callee.startsWith("%") && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
+          return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
         default:
           // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
           return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
       }
+    };
+    const returnsOwnedMemo = new Map<string, boolean>();
+    const returnsOwned = (name: string, depth: number): boolean => {
+      const memo = returnsOwnedMemo.get(name);
+      if (memo !== undefined) return memo;
+      returnsOwnedMemo.set(name, false); // recursion: not proven
+      const f = byName.get(name)!;
+      if (f.async || f.generator || depth > 6) return false;
+      const rets: IrExpr[] = [];
+      let bare = false;
+      const scan = (n: unknown): void => {
+        if (n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) return n.forEach(scan);
+        const r = n as Record<string, unknown>;
+        if (r["kind"] === "return") {
+          if (r["value"]) rets.push(r["value"] as IrExpr);
+          else bare = true;
+        }
+        for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
+      };
+      scan(f.body);
+      const ok = !bare && rets.length > 0 && rets.every((v) => ownedTyped(v, name, depth));
+      returnsOwnedMemo.set(name, ok);
+      return ok;
     };
     /** A dynamic value nothing else holds: built fresh (JSON.parse, a
      * dynamic literal of such values, a crossing of a deeply fresh typed
