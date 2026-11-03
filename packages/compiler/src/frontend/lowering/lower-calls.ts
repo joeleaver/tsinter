@@ -151,6 +151,10 @@ export interface GenericInstance {
    * (GH #107: a second call site reused the key and called a function the
    * module never got). */
   implicitState?: "lowering" | "done" | "failed";
+  /** GH #109: a per-call-site instance of a plain function over a class or
+   * wider-record argument (widthSpecializedCall) — the source body also
+   * lowers as itself, so coverage never counts the instance. */
+  widthInstance?: true;
   /** Same-key recursion observed the fallback return type mid-lowering, so
    * the ABI is locked to it — the return post-pass coerces every return
    * value to the pinned type instead of adopting the inferred one. */
@@ -1376,7 +1380,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     // Coverage counts a generic source body once: re-instantiations of the
     // method AND re-instantiations of the declaring generic class re-visit
     // the same source lines.
-    L.suppressStats = inst.ordinal > 0 || (cls?.genericInstance?.ordinal ?? 0) > 0;
+    L.suppressStats = inst.ordinal > 0 || inst.widthInstance === true || (cls?.genericInstance?.ordinal ?? 0) > 0;
     // A generic ASYNC instance is an async IrFunction like any other: the
     // body returns the resolved promise's INNER type, calls enter through
     // the instance's own spawn wrapper (the emitter routes by fn.async),
@@ -2021,6 +2025,165 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     inst.implicitState = "done";
     return inst;
   }
+
+/** GH #109 (SEMANTICS.md S125): a direct call of a plain TypeScript
+ * function passing a CLASS INSTANCE or a WIDER RECORD where a parameter
+ * is typed by a record (`bump(p)` against `function bump(o: { n: number
+ * })`). The slot's record struct cannot hold the caller's object, and a
+ * width copy would lose its identity and writes — so the call names an
+ * instance of the function lowered with that parameter typed by the
+ * ARGUMENT's own type, the implicit-any machinery's per-site
+ * monomorphization: the body reads, writes, prints and compares the
+ * caller's object itself. Null (the ordinary call, whose copies
+ * widthCopyPass checks) unless some argument binds. A parameter binds
+ * when it is a plain identifier the body never reassigns, its declared
+ * type maps to a record with no method fields, and the argument's own
+ * type is a class or record carrying every one of those fields with the
+ * same type. */
+export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: FnSig, loc: SrcLoc): IrExpr | null {
+  if (!ts.isIdentifier(expr.expression)) return null;
+  if (expr.arguments.some((a) => ts.isSpreadElement(a))) return null;
+  const sym = L.resolveValueSymbol(expr.expression);
+  const decls = sym ? L.checker.declarationsOf(sym) : [];
+  if (decls.length !== 1) return null;
+  const decl = decls[0]!;
+  if (!ts.isFunctionDeclaration(decl) || !decl.body || decl.typeParameters !== undefined) return null;
+  const sf = decl.getSourceFile();
+  if (sf.isDeclarationFile || isJsSourceFile(sf)) return null;
+  if (bodyReadsArguments(decl)) return null;
+  if (decl.parameters.length !== sig.params.length) return null;
+  const bindings = new Map<ts.Symbol, ts.Type>();
+  const shapes: ParamShape[] = sig.params.slice();
+  decl.parameters.forEach((param, i) => {
+    const arg = expr.arguments[i];
+    const shape = sig.params[i]!;
+    if (!arg || shape.type.kind !== "record" || shape.mode !== "required") return;
+    if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.questionToken || param.initializer) return;
+    if (isThisParameter(param)) return;
+    const psym = L.checker.getSymbolAtLocation(param.name);
+    if (!psym || paramWrittenInBody(L, decl.body!, psym, param.name.text)) return;
+    let a: ts.Expression = arg;
+    while (ts.isParenthesizedExpression(a)) a = a.expression;
+    // Literals lower against the slot's own shape: no copy to avoid.
+    if (ts.isObjectLiteralExpression(a) || ts.isArrayLiteralExpression(a)) return;
+    const at = L.typeOf(arg);
+    let ir: IrType | null;
+    try {
+      ir = L.mapTypeOf(at);
+    } catch (e) {
+      if (!(e instanceof PoisonError)) throw e;
+      return;
+    }
+    if (!ir || typeEquals(ir, shape.type) || !carriesFields(L, ir, shape.type.shapeId)) return;
+    bindings.set(psym, at);
+    shapes[i] = { type: ir, mode: "required" };
+  });
+  if (bindings.size === 0) return null;
+  let info = L.widthSpecInfos.get(decl);
+  if (!info) {
+    info = {
+      decl,
+      baseName: expr.expression.text,
+      qualifiedName: `${sig.name}%w`,
+      typeParams: [],
+      instances: new Map(),
+      implicitParams: decl.parameters.map(() => null),
+    };
+    L.widthSpecInfos.set(decl, info);
+  }
+  for (const b of bindings.keys()) L.widthBoundParams.add(b);
+  const inst = widthInstance(L, info, shapes, bindings);
+  if (inst === null) return null;
+  const args = L.completeArgs(expr.arguments, inst.params, loc, expr);
+  return { kind: "call", callee: inst.name, args, type: inst.returnType, loc };
+}
+
+/** The instance of `info` over `shapes`, lowered eagerly at first demand
+ * (internImplicitInstance's discipline), or null when the body does not
+ * lower over the bound types (a construct the class instance does not
+ * support — `JSON.stringify` of an instance, say): the call then keeps its
+ * ordinary path, whose copy widthCopyPass judges. Nothing the failed
+ * attempt reported survives it. */
+function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], argTypes: Map<ts.Symbol, ts.Type>): GenericInstance | null {
+  const key = shapes.map((s) => typeKey(s.type)).join(",");
+  const existing = info.instances.get(key);
+  if (existing) {
+    if (existing.implicitState === "failed") return null;
+    if (existing.implicitState === "lowering") existing.returnPinned = true;
+    return existing;
+  }
+  if (info.instances.size >= MAX_GENERIC_INSTANCES) return null;
+  const rendered = shapes.map((s) => L.fmt(s.type)).join(", ");
+  const declared = implicitDeclaredReturn(L, info);
+  if (declared === null) return null;
+  const inst: GenericInstance = {
+    name: `${info.qualifiedName}%${info.instances.size}`,
+    ordinal: info.instances.size,
+    params: shapes,
+    returnType: declared,
+    bindings: new Map(),
+    typeArgsText: `(${rendered.length > 80 ? rendered.slice(0, 77) + "..." : rendered})`,
+    implicitArgTypes: argTypes,
+    implicitState: "lowering",
+    widthInstance: true,
+  };
+  info.instances.set(key, inst);
+  const savedSink = L.diagSink;
+  const captured: ScrDiagnostic[] = [];
+  L.diagSink = captured;
+  const liftedBefore = L.liftedFns.length;
+  let fn: IrFunction | null = null;
+  try {
+    fn = L.lowerGenericInstance(info, inst);
+  } catch (e) {
+    if (!(e instanceof PoisonError)) {
+      L.diagSink = savedSink;
+      throw e;
+    }
+  } finally {
+    L.diagSink = savedSink;
+  }
+  if (fn === null || captured.length > 0) {
+    inst.implicitState = "failed";
+    // A function lifted out of the failed body (a lambda) that calls the
+    // instance would name a function that never exists: keep the failure.
+    if (L.liftedFns.slice(liftedBefore).some((f) => JSON.stringify(f.body).includes(JSON.stringify(inst.name)))) {
+      for (const d of captured) L.pushDiag(d);
+      throw new PoisonError();
+    }
+    return null;
+  }
+  inst.implicitState = "done";
+  L.implicitFns.push(fn);
+  return inst;
+}
+
+/** Does a value of type `t` (a class instance or a plain record) carry
+ * every field of record shape `shapeId`, each with exactly its type — and
+ * does the shape hold data only (no methods, accessors, index signature
+ * or tuple positions)? */
+function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
+  const target = L.shapes.get(shapeId);
+  if (!target || target.tuple || target.indexValue) return false;
+  if (target.fields.some((f) => f.type.kind === "func" || f.name.startsWith("%"))) return false;
+  if (t.kind === "object") {
+    const cls = L.classes.get(t.className);
+    if (!cls || cls.def.runtime) return false;
+    return target.fields.every((f) => {
+      const ft = cls.fields.get(f.name);
+      return ft !== undefined && typeEquals(ft, f.type);
+    });
+  }
+  if (t.kind === "record") {
+    const src = L.shapes.get(t.shapeId);
+    if (!src || src.tuple || src.indexValue || shapeHasAccessorSlots(src)) return false;
+    return target.fields.every((f) => {
+      const sf = src.fields.find((x) => x.name === f.name);
+      return sf !== undefined && typeEquals(sf.type, f.type);
+    });
+  }
+  return false;
+}
 
 /** The implicit-any twin of bindingGenericFnNodeOf, for LOCAL and module
    * bindings alike (`const knownBy = (cmd) => [cmd.name()].concat(...)`
@@ -3828,6 +3991,10 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         if (generic && !(jsSpreadArgs && generic.implicitParams)) return L.lowerGenericCall(expr, generic);
         const sig = generic ? null : L.fnSigOf(expr.expression);
         if (sig && !(jsSpreadArgs && spreadNeedsRuntimeArity(sig.params, expr.arguments))) {
+          // GH #109: a class instance or wider record argument keeps its
+          // identity through a per-site instance (widthSpecializedCall).
+          const spec = widthSpecializedCall(L, expr, sig, loc);
+          if (spec) return reconcileOverloadReturn(L, expr, spec);
           L.noteEdge(sig.name);
           const args = L.completeArgs(expr.arguments, sig.params, loc, expr);
           return reconcileOverloadReturn(L, expr, { kind: "call", callee: sig.name, args, type: sig.returnType, loc });

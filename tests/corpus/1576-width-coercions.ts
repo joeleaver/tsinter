@@ -58,8 +58,8 @@ function createProxy(opts: { getRoutes: () => NarrowRoute[]; tld: string }): () 
 const proxy = createProxy({ getRoutes: () => cachedRoutes, tld: ".dev" });
 proxy();
 
-// The adapter reads THROUGH the original closure: later mutations of the
-// backing array are visible on the next call, exactly a fresh map per
-// invocation.
-cachedRoutes.push({ hostname: "c.localhost", port: 5000, pid: 33, ngrokUrl: undefined, tailscaleUrl: undefined });
+// (A later write to the backing array, `cachedRoutes.push(...)`, is
+// refused by name since GH #109: the adapter hands out a COPY of the
+// array, and a caller holding one would not see the write —
+// SEMANTICS.md S125, pinned in wasm-width-identity.test.ts.)
 proxy();

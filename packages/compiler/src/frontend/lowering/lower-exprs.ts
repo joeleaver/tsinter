@@ -10011,6 +10011,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * Folding is limited to side-effect-free operands — dropping a computed
    * operand would skip its effects, so those are rejected instead. */
   export function lowerInstanceOf(L: Lowerer, expr: ts.BinaryExpression, loc: SrcLoc): IrExpr {
+    // GH #109 (S125): `instanceof` asks for the operand's CLASS — a fold
+    // may answer it from the static type alone, without the value, so a
+    // width copy into that type must know it is asked.
+    try {
+      const lt = L.mapTypeOf(L.typeOf(expr.left));
+      if (lt) L.classObservedTypes.push(lt);
+    } catch (e) {
+      if (!(e instanceof PoisonError)) throw e;
+    }
     // `x instanceof net.Socket` over a union with a netSocket arm — the
     // h2 compat 'connect' narrowing (lower-server.ts): a union tag test.
     const sockTest = lowerSocketInstanceOf(L, expr, loc);
@@ -10541,6 +10550,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       return OBJECT_PROTO_NAMES.has(key) ? { kind: "logical", op: "||", left: present, right: protoInFenceExpr(L, null, loc), type: BOOL, loc } : present;
     }
     const recv = L.lowerExpr(expr.right);
+    // GH #109 (S125): a folded `in` reads the receiver's KEYS — a width
+    // copy of a wider value would answer for the copy's.
+    L.keyObservedTypes.push(recv.type);
     // Error-rooted receivers (builtin or user subclass — the isErrnoException
     // predicate's `err instanceof Error && "code" in err` shape): `code`
     // answers from the runtime error's code slot (stamped by fs/system/

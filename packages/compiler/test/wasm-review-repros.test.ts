@@ -603,7 +603,10 @@ console.log(ks(w), ks({ ...w }), ks([w][0]));`,
 const w = JSON.parse('{"a":1}') as R;
 type N = { a: number };
 const n: N = w;
-console.log(n, Object.keys(n));`,
+// GH #109: printing the narrowed COPY is refused by name (S125: when the
+// value has its note, Node prints it and the copy could not), so the key
+// question is asked of the checked record itself.
+console.log(n.a, w, Object.keys(w));`,
   },
   {
     id: "r4-s24-keys-of-explicit",

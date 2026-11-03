@@ -88,6 +88,7 @@ import {
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
 import { exitIsConsumedCopy, exitIsFresh, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
+import { widthCopyPass } from "./width-copies.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinConstLit, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
 import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
@@ -936,6 +937,13 @@ export class Lowerer {
    * types are inferred from the body — the call site needs them settled),
    * collected here for run()'s function list (the liftedFns discipline). */
   readonly implicitFns: IrFunction[] = [];
+  /** GH #109 (SEMANTICS.md S125): the per-declaration infos of plain
+   * functions instantiated per call site over a class-instance or wider
+   * record argument (widthSpecializedCall), and the parameter symbols
+   * such an instance binds — typeOf answers the bound argument type for
+   * them whatever the checker declared. */
+  readonly widthSpecInfos = new Map<ts.Node, GenericFnInfo>();
+  readonly widthBoundParams = new Set<ts.Symbol>();
   /** ALIASED-TYPEOF narrowing (npm-static JS — ms's `var type = typeof
    * val; if (type === 'string') ...`): while a branch such a test proves
    * lowers, the tested operand's symbol maps to the proven ARM's checker
@@ -1309,6 +1317,12 @@ export class Lowerer {
    * see lowerStmts): off the build, preserved here so coverage reporting
    * can still name every deferred fence. */
   readonly runtimeFences: ScrDiagnostic[] = [];
+  /** GH #109 (SEMANTICS.md S125): types whose keys a lowering answered
+   * statically without referencing the value (a folded `in`) — key
+   * observers the width-copy pass cannot see in the IR. */
+  readonly keyObservedTypes: IrType[] = [];
+  /** The same for class questions (`instanceof`, which can fold). */
+  readonly classObservedTypes: IrType[] = [];
   /** --provenance-sources: diagnostics of ELIDED pure-annotated dead
    * consts in fetched source modules (lowerStmts's elision rule) — off
    * the build entirely (the statement lowers to its poisoned bindings and
@@ -2128,6 +2142,9 @@ export class Lowerer {
     // Module-scope TDZ guards (board #265): every access the analysis
     // could not prove late enough tests its binding's init flag.
     insertModuleTdzChecks(this.moduleTdz, functions, this.globalsList);
+    // GH #109 (SEMANTICS.md S125): a width copy the program could tell
+    // from the shared object refuses by name.
+    widthCopyPass(this, functions);
 
     if (this.remainder) {
       // Deferred collection diagnostics nothing flushed — declarations no
@@ -2896,6 +2913,9 @@ export class Lowerer {
       const bound = sym !== undefined ? this.implicitParamTypes.get(sym) : undefined;
       if (bound !== undefined && bound !== t) {
         if (t.flags & ts.TypeFlags.Any) return bound;
+        // GH #109: a record-typed parameter bound to the caller's class
+        // or wider record type IS that object in this instance.
+        if (this.widthBoundParams.has(sym!)) return bound;
         const narrowedIr = this.mapTypeOf(t);
         const boundIr = this.mapTypeOf(bound);
         if (narrowedIr === null || boundIr === null) return bound;
@@ -3964,9 +3984,11 @@ export class Lowerer {
    * display-table pattern): TS's width subtyping is free on erased types,
    * but monomorphic structs must RESHAPE, so the value is rebuilt with the
    * subset of fields copied — per element, via an interned helper, for
-   * arrays. A deliberate divergence from JS's aliasing (SEMANTICS.md 35,
-   * next to the marshal-copy stance): mutations through the narrowed value
-   * don't reach the original and vice versa. Exactly two flows coerce —
+   * arrays. JS shares the object, so the copy is exact only while the
+   * program cannot tell: mutations through the narrowed value would not
+   * reach the original and vice versa, so widthCopyPass (width-copies.ts,
+   * SEMANTICS.md S125) refuses every copy a write, an identity test or a
+   * key observer could see. Exactly two flows coerce —
    * record→record and record-array→record-array, each target field copied
    * from a same-named source field whose type matches exactly or LIFTS
    * into the target field's union (see recordWidthHelper); anything

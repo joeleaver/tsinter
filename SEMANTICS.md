@@ -9322,3 +9322,64 @@ different representations; sharing them needs one object both can view,
 which is not built. The pattern this serves (reading a version or a config
 once) does not mutate. **Tested by:** corpus 2631/2637 (createRequire
 reads); nothing pins the identity.
+
+## S125 — A value whose representation differs from its typed slot's is shared only through a direct call of a plain function; elsewhere the slot holds a copy, and every copy the program could tell from the original refuses by name *(every lane; tested on wasm and wasm-native)*
+
+Records are monomorphic structs and every class is its own struct, so a
+class instance where a record type is expected (`bump(p)` against
+`function bump(o: { n: number })`, an `implements`-style interface
+parameter), a wider record into a narrower record type, `P[]` into
+`{ n: number }[]`, a tuple into an array, or a record into an
+index-signature record (`Record<string, number>`) cannot be the same
+object in the slot. Until GH #109 the slot silently held a COPY (the width
+helpers), where JavaScript shares the object: writes through either side
+were lost, `===` and `includes` answered false, and printing, JSON and
+`Object.keys` showed only the slot's fields and no class name.
+
+(a) **A direct call keeps the object.** A call of a plain, non-generic
+function declaration whose record-typed parameter receives a class
+instance or a wider record carrying every one of the parameter's fields
+with the same type is compiled as an instance of the function with that
+parameter typed by the argument's own type (the generic machinery's
+per-call-site monomorphization), so the body reads, writes, prints and
+compares the caller's object itself, exactly as Node does. A body that
+does not compile over the argument's type (JSON or `Object.keys` of a
+class instance, say) keeps the copy below. The workaround spelled in the
+diagnostic — `<T extends { n: number }>(o: T)` — has always shared.
+
+(b) **Every other flow copies, and a copy the program could observe is
+refused at compile time** (SC1090, "the slot would hold a COPY where
+JavaScript shares the object"): a write to a copied field through the copy
+or through the original, an identity test (`===`, `includes`, `indexOf`)
+on either, or a printer or key observer (console output, `util.inspect`,
+JSON, `Object.keys/values/entries`, for-in, `in`, `instanceof`, spread, a
+crossing into `unknown`) of the copy when its keys or class differ from the original's (a copy
+into an index-signature record keeps every key; that it lists its declared
+fields first is S031's).
+The check (width-copies.ts) follows the copy through the binding it
+lands in when nothing else assigns or captures that binding, and otherwise
+judges by type: a write to any value of the type counts (every field and
+element when the copy is an array or index-signature record), unless it
+provably happened before the copy (an earlier top-level statement of the
+module initializer) or provably cannot run while a copy handed to a
+parameter that never lets it go is alive (a function that call cannot
+reach, the call neither suspending nor calling into the runtime where program callbacks could run — an emitter, a stream, a promise). Loops, other calls and closures are not
+ordered, so it can refuse a program whose copy no run could observe (it
+never accepts one that could). A constructor's write to its own instance is
+construction unless the constructor hands `this` away (a call, a closure
+capturing it); a write to another object is an ordinary write. A copy of a fresh value (a literal, a
+`new` whose constructor keeps `this` to itself), or of a binding initialized
+fresh whose only use is this copy, is observable only by its keys. One
+corpus case changed with this entry: 1576-width-coercions.ts no longer
+pushes onto the array its function adapter copies on every call (a caller
+holding an earlier copy would not see the push; the refusal is pinned in the
+test file below).
+
+Spreads, `Object.assign` and `structuredClone` copy in JavaScript too and
+are not affected. **Rationale:** sharing needs one representation for both
+types; making every record field access dispatch over representations
+would slow every field read of the affected shapes, and the per-call-site
+instance covers the dominant spelling (an interface- or record-typed
+parameter) at no run-time cost. **Tested by:**
+`packages/compiler/test/wasm-width-identity.test.ts` (exact rows against
+Node on wasm and wasm-native, and the refused rows).
