@@ -696,8 +696,103 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     if (e.kind === "call" && /^%arr\.(map|filter|flatMap|filterNarrow|concat)\./.test(e.callee)) return true;
     if (e.kind === "arrIntrinsic" && ["slice", "toSorted", "toReversed", "toSpliced", "with"].includes(e.method)) return true;
     if (e.kind === "new" && e.type.kind === "object") return !ctorLeaks.has(rootOf(e.type.className));
+    // GH #118: a direct call of a program function that hands out only
+    // values nothing else holds once it returns.
+    if (e.kind === "call" && returnsFresh(e.callee)) return true;
     return false;
   };
+  /** GH #118 (chess.js history()): does every `return` of this program
+   * function answer a value no one else holds after the call — a fresh
+   * value, a fresh-returning call, or a local of its own that it built
+   * from a fresh value and only ever filled, read and returned (never
+   * captured, reassigned, stored, passed on or handed out by a method that
+   * answers its receiver)? Writes the function made to it happened before
+   * the call returned, so a copy the caller takes is the only reference
+   * left — as unobservable as a copy of a literal. Direct calls only: the
+   * callee is exactly this function. */
+  const freshMemo = new Map<string, boolean>();
+  function returnsFresh(name: string): boolean {
+    const memo = freshMemo.get(name);
+    if (memo !== undefined) return memo;
+    freshMemo.set(name, false); // recursion: assume not
+    const f = byName.get(name);
+    if (!f || f.async || f.generator) return false;
+    const returns: IrExpr[] = [];
+    let open = false;
+    const owned = new Map<string, number>(); // local id -> fresh varDecl count
+    const scanRet = (n: unknown): void => {
+      if (open || n === null || typeof n !== "object") return;
+      if (Array.isArray(n)) {
+        for (const x of n) scanRet(x);
+        return;
+      }
+      const r = n as Record<string, unknown>;
+      if (r["kind"] === "return") {
+        const v = r["value"] as IrExpr | null | undefined;
+        if (!v) open = true;
+        else returns.push(v);
+      }
+      if (r["kind"] === "varDecl" && typeof r["localId"] === "string") {
+        owned.set(r["localId"] as string, (owned.get(r["localId"] as string) ?? 0) + (r["init"] && fresh(r["init"] as IrExpr) ? 1 : 1000));
+      }
+      for (const key of Object.keys(r)) {
+        if (key === "type" || key === "loc") continue;
+        scanRet(r[key]);
+      }
+    };
+    scanRet(f.body);
+    if (open || returns.length === 0) return false;
+    const locals = new Set<string>();
+    for (const v of returns) {
+      if (v.kind === "varRef" && owned.get(v.localId) === 1 && !f.params.some((p) => p.localId === v.localId)) {
+        locals.add(v.localId);
+        continue;
+      }
+      if (!fresh(v)) return false;
+    }
+    // Every reference to an owned local: a receiver of a method that does
+    // not answer it, an element/field read or write, a loop over it, a
+    // truth or undefined test, or the `return` itself.
+    const SAFE_ARR = new Set(["length", "push", "pop", "shift", "slice", "join", "indexOf", "includes", "toReversed", "toSorted", "toSpliced", "with"]);
+    let ok = true;
+    const scanUse = (n: unknown, parent: Record<string, unknown> | null, pkey: string): void => {
+      if (!ok || n === null || typeof n !== "object") return;
+      if (Array.isArray(n)) {
+        for (const x of n) scanUse(x, parent, pkey);
+        return;
+      }
+      const r = n as Record<string, unknown>;
+      const k = r["kind"];
+      if (k === "closure" && ((r["captures"] as string[] | undefined) ?? []).some((c) => locals.has(c))) {
+        ok = false;
+        return;
+      }
+      if ((k === "assign" || k === "assignExpr" || k === "incDec") && locals.has(r["localId"] as string)) {
+        ok = false;
+        return;
+      }
+      if (k === "varRef" && locals.has(r["localId"] as string)) {
+        const pk = parent?.["kind"];
+        const objRead = (pk === "recordGet" && !parent!["spreadCopy"]) || pk === "recordSet" || pk === "fieldGet" || pk === "fieldSet";
+        const safe =
+          (pk === "arrIntrinsic" && pkey === "receiver" && SAFE_ARR.has(parent!["method"] as string)) ||
+          ((pk === "arrayGet" || pk === "arraySet") && pkey === "arr") ||
+          (objRead && pkey === "obj") ||
+          (pk === "forOf" && pkey === "iterable") ||
+          ((pk === "isUndef" || pk === "toBool") && pkey === "operand") ||
+          (pk === "return" && pkey === "value");
+        if (!safe) ok = false;
+        return;
+      }
+      for (const key of Object.keys(r)) {
+        if (key === "type" || key === "loc") continue;
+        scanUse(r[key], r, key);
+      }
+    };
+    scanUse(f.body, null, "");
+    freshMemo.set(name, ok);
+    return ok;
+  }
   /** The source binding when the copy reads a plain binding. */
   const sourceBinding = (s: Site): Binding | null => {
     if (s.arg?.kind !== "varRef") return null;

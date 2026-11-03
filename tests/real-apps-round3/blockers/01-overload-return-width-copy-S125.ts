@@ -3,6 +3,9 @@
 // shares the one array; tsinter now refuses both calls by name (SC1090, "the slot would hold a
 // COPY ... (SEMANTICS.md S125)"). Round 2 built this. Loud, not silent.
 // Node: "1 2". Splitting the implementation into one exactly-typed array per overload builds.
+// Fixed by GH #118: the array is the call's own fresh result, so the copy is the only reference
+// left; this builds and matches Node on both lanes (row gh118-overload-history in
+// packages/compiler/test/wasm-width-identity.test.ts).
 class Move {
   constructor(public san: string) {}
   isCapture(): boolean {

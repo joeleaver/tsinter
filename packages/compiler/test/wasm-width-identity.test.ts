@@ -1134,6 +1134,123 @@ const r = new Svc().show(t);
 setTimeout(() => console.log(r[0]), 5);`,
     refused: "some",
   },
+  // ── GH #118: a call that hands out an array nothing else holds ───────
+  {
+    // chess.js history(): one (Move | string)[] handed out as Move[] or
+    // string[] by the overloads; the copy is the only reference left.
+    id: "gh118-overload-history",
+    src: `class Move {
+  constructor(public san: string) {}
+  isCapture(): boolean { return this.san.includes("x"); }
+}
+class Game {
+  private moves = ["e4", "exd5"];
+  history(): string[];
+  history(o: { verbose: true }): Move[];
+  history(o: { verbose: boolean } = { verbose: false }) {
+    const out: (Move | string)[] = [];
+    for (const m of this.moves) {
+      if (o.verbose) out.push(new Move(m));
+      else out.push(m);
+    }
+    return out;
+  }
+}
+const g = new Game();
+const verbose = g.history({ verbose: true });
+console.log(verbose.filter((m) => m.isCapture()).length, g.history().length);
+verbose.push(new Move("Nf3"));
+console.log(verbose.map((m) => m.san), g.history(), verbose[0] instanceof Move);`,
+  },
+  {
+    id: "gh118-overload-function",
+    src: `function hist(): string[];
+function hist(v: true): number[];
+function hist(v?: boolean) {
+  const out: (number | string)[] = [];
+  for (let i = 0; i < 3; i++) out.push(v ? i : "s" + i);
+  out.pop();
+  return out;
+}
+const a = hist();
+const b = hist(true);
+a.push("x");
+b[0] = 7;
+console.log(a, b, a.length + b.length, JSON.stringify(a), b.includes(7));
+function both(flag: boolean): string[] | number[] { return flag ? hist(true) : hist(); }
+console.log(both(true), both(false));`,
+  },
+  {
+    // The callee also stores the array: the caller's copy would miss a
+    // later write through the stored reference (Node: 2).
+    id: "gh118-callee-stores",
+    src: `class Move { constructor(public san: string) {} }
+class Game {
+  cache: (Move | string)[] = [];
+  history(): string[];
+  history(o: { verbose: true }): Move[];
+  history(o: { verbose: boolean } = { verbose: false }) {
+    const out: (Move | string)[] = [];
+    out.push(o.verbose ? new Move("e4") : "e4");
+    this.cache = out;
+    return out;
+  }
+}
+const g = new Game();
+const h = g.history();
+g.cache.push("zz");
+console.log(h.length);`,
+    refused: "some",
+  },
+  {
+    // The callee hands out an array it does not own (Node: 2).
+    id: "gh118-callee-returns-field",
+    src: `class Move { constructor(public san: string) {} }
+class Game {
+  moves: (Move | string)[] = ["a"];
+  history(): string[];
+  history(o: { verbose: true }): Move[];
+  history(o: { verbose: boolean } = { verbose: false }) { return this.moves; }
+}
+const g = new Game();
+const h = g.history();
+g.moves.push("zz");
+console.log(h.length);`,
+    refused: "some",
+  },
+  {
+    // A closure keeps the array past the return (Node: 2).
+    id: "gh118-callee-captures",
+    src: `let keep: () => number = () => 0;
+function hist(): string[];
+function hist(v: true): number[];
+function hist(v?: boolean) {
+  const out: (number | string)[] = [];
+  keep = () => { out.push(1); return out.length; };
+  out.push(v ? 1 : "a");
+  return out;
+}
+const h = hist();
+keep();
+console.log(h.length);`,
+    refused: "some",
+  },
+  {
+    // A method that answers its receiver aliases it (Node: 2 true).
+    id: "gh118-callee-aliases",
+    src: `let last: (number | string)[] = [];
+function hist(): string[];
+function hist(v: true): number[];
+function hist(v?: boolean) {
+  const out: (number | string)[] = ["b", "a"];
+  last = out.sort();
+  return out;
+}
+const h = hist();
+last.push("z");
+console.log(h.length, last.length === 3);`,
+    refused: "some",
+  },
 ];
 
 async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
