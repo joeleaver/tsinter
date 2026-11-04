@@ -650,6 +650,8 @@ int32_t host_tlsCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
     case 7:
       wn_ossl_init();
       return ca_store(P, (uint32_t)len, x);
+    case 8: /* SYSTEM_CA: --use-system-ca / NODE_USE_SYSTEM_CA=1 */
+      return wn_trust_use_system_ca();
     default:
       wn_host_fail("tlsCall: an op outside the contract");
   }

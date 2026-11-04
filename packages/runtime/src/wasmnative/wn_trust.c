@@ -99,7 +99,10 @@ static void options_once(void) {
       "ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:"
       "!SRP:!CAMELLIA");
   if (!opt_tls_cipher_list) abort();
+  /* node.cc: NODE_USE_SYSTEM_CA=1 BEFORE the options, so NODE_OPTIONS's
+   * --no-use-system-ca clears it */
   const char *v = wn_safe_getenv("NODE_USE_SYSTEM_CA");
+  if (v && !strcmp(v, "1")) opt_use_system_ca = 1;
   const char *o = wn_safe_getenv("NODE_OPTIONS");
   if (o) {
     size_t n = strlen(o);
@@ -182,8 +185,6 @@ static void options_once(void) {
     }
     free(tok);
   }
-  /* node.cc: NODE_USE_SYSTEM_CA=1 after the options */
-  if (v && !strcmp(v, "1")) opt_use_system_ca = 1;
   /* node_options.cc EnvironmentOptions::CheckOptions */
   if (opt_tls_min_v1_3 && opt_tls_max_v1_2 && !opt_error) opt_error = strdup("either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
 }

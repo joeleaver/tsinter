@@ -52,6 +52,7 @@ const OP_CTX_SET_CERT = 4;
 const OP_CTX_SET_KEY = 5;
 const OP_SECURE = 6;
 const OP_CA_STORE = 7;
+const OP_SYSTEM_CA = 8;
 
 const HOST_FAILURE = "tlsCall: host failure";
 /** The reply room every material op gets (abi.ts: a failure's two runs). */
@@ -1231,6 +1232,7 @@ export class TlsBuilder {
       const ERR = f.local(this.errRef);
       const CODE = f.local(this.strRef);
       const MSG = f.local(this.strRef);
+      const SYS = f.local(I32);
       $.put(S, $.get(this.xT(), X_SOCK, $.l(X_)));
       $.if($.ne($.l(VER), $.i(0)), () => {
         $.put(CODE, this.lit($, "UNSPECIFIED"));
@@ -1239,8 +1241,17 @@ export class TlsBuilder {
           $.if($.eq($.l(VER), $.i(n)), () => {
             $.put(CODE, this.lit($, code));
             // crypto_common.cc GetValidationErrorReason: Node suggests
-            // --use-system-ca for these three (the flag is never set here)
-            $.put(MSG, this.lit($, n === 18 || n === 21 ? `${text}; if the root CA is installed locally, try running Node.js with --use-system-ca` : text));
+            // --use-system-ca for UNABLE_TO_VERIFY_LEAF_SIGNATURE (21) and
+            // DEPTH_ZERO_SELF_SIGNED_CERT (18) always, and for
+            // UNABLE_TO_GET_ISSUER_CERT (2) unless the system store is in
+            // use (--use-system-ca / NODE_USE_SYSTEM_CA=1): the host's
+            // SYSTEM_CA answer (abi.ts tlsCall op 8)
+            const hinted = `${text}; if the root CA is installed locally, try running Node.js with --use-system-ca`;
+            if (n === 2) {
+              $.put(SYS, this.tlsCall($, OP_SYSTEM_CA, $.i(0), $.i(0), $.i(0), $.i(0)));
+              $.if($.either($.lt($.l(SYS), $.i(0)), $.gt($.l(SYS), $.i(1))), () => this.trap($));
+              $.put(MSG, $.sel(this.strRef, $.l(SYS), this.lit($, text), this.lit($, hinted)));
+            } else $.put(MSG, this.lit($, n === 18 || n === 21 ? hinted : text));
           });
         }
         $.put(ERR, () => this.deps.newError(f.c, "%Error", "Error", (c) => c.localGet(MSG), (c) => c.localGet(CODE)));
