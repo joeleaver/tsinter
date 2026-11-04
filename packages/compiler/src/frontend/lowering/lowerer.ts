@@ -738,16 +738,6 @@ function dynArmPattern(p: ts.ArrayBindingPattern): boolean {
   });
 }
 
-/** Does a binding pattern (at any depth) hold a rest element? The
- * checked-dynamic pattern arm has no rest form. */
-function patternHasRest(p: ts.ArrayBindingPattern | ts.ObjectBindingPattern): boolean {
-  for (const el of p.elements) {
-    if (ts.isOmittedExpression(el)) continue;
-    if (el.dotDotDotToken) return true;
-    const n = el.name; if (n !== undefined && (ts.isArrayBindingPattern(n) || ts.isObjectBindingPattern(n)) && patternHasRest(n)) return true;
-  }
-  return false;
-}
 
 export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType | null {
   if (t.flags & ts.TypeFlags.Void) return null;

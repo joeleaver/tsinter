@@ -189,7 +189,9 @@ function lowerCallbackArg(
     cb.type.kind === "func" &&
     (cb.type.rest === true ||
       (cb.type.params.length > 0 && cb.type.params.some((p) => !paramOk(p)))) &&
-    cb.type.params.every((p) => p.kind === "dyn") &&
+    // (One world, U1a: an `any`/`unknown` parameter is the island value —
+    // the same \$dyn — and boxes the same way.)
+    cb.type.params.every((p) => p.kind === "dyn" || (L.sharedDynamic && p.kind === "jsval")) &&
     canBoxFuncIntoDyn(cb.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))
   ) {
     // A plain-JS listener whose params carry no contextual type (a

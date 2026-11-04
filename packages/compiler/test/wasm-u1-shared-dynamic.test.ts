@@ -335,7 +335,8 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
     expect(node.stdout.startsWith(got.stdout)).toBe(true);
     expect(got.stderr).toMatch(/^tsinter: unsupported: /);
     expect(got.stderr).toMatch(row.fence.text);
-    expect(got.stderr.trimEnd().split("\n")).toHaveLength(1);
+    // One fence line first; the wasm-native host may add its trap report after it.
+    expect(got.stderr.split("\n")[0]).toMatch(row.fence.text);
     return;
   }
   if (row.world !== undefined) {
