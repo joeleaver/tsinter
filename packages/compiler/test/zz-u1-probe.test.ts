@@ -13,7 +13,7 @@ const scratch = mkdtempSync(join(process.env["U1_SCRATCH"] ?? tmpdir(), "u1p-"))
 const files = (process.env["U1_FILES"] ?? "").split(",").filter(Boolean);
 
 test.for(files)("%s", async (rel) => {
-  const file = join(corpus, rel);
+  const file = rel.startsWith("/") ? rel : join(corpus, rel);
   const dynamic = readFileSync(file, "utf8").split("\n", 2).some((l) => /^\/\/ @dynamic\s*$/.test(l));
   const dir = join(scratch, rel.replace(/\W/g, "_"));
   const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, backend: "wasm", dynamic });

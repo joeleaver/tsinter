@@ -8433,6 +8433,15 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
     if (inner.type.kind !== "dyn" && inner.type.kind !== "jsval") {
       // A STATIC value cast `as any` is the explicit island entrance.
       const targetTs0 = L.checker.getTypeFromTypeNode(expr.type);
+      // The one-world lanes: the double cast `x as unknown as T` (and
+      // `as any as T`) is pure typing — the value never lands anywhere
+      // dynamic, so the inner cast erases, as it did when unknown was the
+      // checked-dynamic world (no box, identity and representation kept).
+      if (L.sharedDynamic && L.mapTypeOf(targetTs0)?.kind === "jsval") {
+        let up: ts.Node = expr.parent;
+        while (ts.isParenthesizedExpression(up)) up = up.parent;
+        if (ts.isAssertionExpression(up)) return inner;
+      }
       if (targetTs0.flags & ts.TypeFlags.Any && L.dynamic) {
         return L.jsvalIn(inner, expr.expression);
       }
@@ -8481,7 +8490,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // (functions, bytes, handles, undefined-armed unions) take that
       // exit over the same value (jsval and dyn are one representation).
       if (!L.boundarySafe(target) && L.sharedDynamic) {
-        return lowerDynCastTo(L, expr, { kind: "dynFromJsval", value: inner, type: DYN, loc: inner.loc }, target);
+        return lowerDynCastTo(L, expr, asDynOperand(inner), target);
       }
       if (!L.boundarySafe(target)) {
         L.unsupported(
@@ -8590,7 +8599,11 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
 /** An island operand (any/unknown on the one-world lanes) seen by a
  * checked-dynamic lowering: the same \$dyn value under the dyn type. */
 export function asDynOperand(e: IrExpr): IrExpr {
-  return e.type.kind === "jsval" ? { kind: "dynFromJsval", value: e, type: DYN, loc: e.loc } : e;
+  if (e.type.kind !== "jsval") return e;
+  // A checked-dynamic value marshaled in right here: that value itself
+  // (the folds over `dynCheck(dynFrom(f))` see their own shape).
+  if (e.kind === "jsMarshal" && e.value.type.kind === "dyn") return e.value;
+  return { kind: "dynFromJsval", value: e, type: DYN, loc: e.loc };
 }
 
 export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): IrExpr {
