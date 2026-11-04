@@ -22,6 +22,8 @@
  * same), or a row whose output is not a function of the program (a pid).
  * TIMED lists rows whose Node answer depends on a child's speed against
  * the program's own start (S086 (l), S117): each gets three attempts.
+ * ORDERS lists rows whose Node output is one of a known few by timing
+ * (GH #124): Node's run and the lane's must each be one of them.
  *
  * Runs concurrently within the file, at most SCRIPTC_TEST_WORKERS (default
  * 4) rows at once. */
@@ -157,9 +159,20 @@ const NEEDS: Record<string, readonly [boolean, string]> = {
 };
 const TIMED: Record<string, string> = {
   "U3-TWO-02": "S086 (l): close-together children's exit and end follow the reads",
-  // Node itself prints either order: whether the last read reaches end of
-  // file before the child's exit is processed is the kernel's timing
-  "U3-BIG-01": "S086 (l): a child's exit and its stream's end, when the exit lands mid-drain",
+};
+/* Rows whose Node output is one of a few, by timing (GH #124): Node and the
+ * lane must each print one of the listed outputs (stderr and exit status
+ * still equal), not the same one — the wasm lane's row accepts the same
+ * set. */
+const ORDERS: Record<string, readonly [string, readonly string[]]> = {
+  // S086 (l): libuv reads the end of file in the iteration after a short
+  // read and runs the SIGCHLD watcher at the end of the current one, so a
+  // child that exits before the poll that reads its last bytes gives
+  // 'exit' first — every byte delivered by then (the exit line's total)
+  "U3-BIG-01": [
+    "S086 (l): a child's exit and its stream's end, when the exit lands mid-drain",
+    ["end 1000000 true true\nexit 0 1000000\n", "exit 0 1000000\nend 1000000 true true\n"],
+  ],
 };
 
 interface Out {
@@ -255,6 +268,14 @@ describe(`the wasm lane's host rows on the wasm-native lane (${rows.length} rows
           return;
         }
         if (row.id in KNOWN) return;
+        const orders = ORDERS[row.id];
+        if (orders !== undefined) {
+          expect(orders[1], "Node's own output").toContain(node!.stdout.toString("latin1"));
+          expect(orders[1], `the lane's output (${orders[0]})`).toContain(native!.stdout.toString("latin1"));
+          expect(native!.stderr.toString("latin1")).toBe(node!.stderr.toString("latin1"));
+          expect({ code: native!.code, signal: native!.signal }).toEqual({ code: node!.code, signal: node!.signal });
+          return;
+        }
         if (row.id in UNPINNED) {
           console.info(`${row.id} differs from Node (unpinned: ${UNPINNED[row.id]})`);
           return;
@@ -270,7 +291,7 @@ describe(`the wasm lane's host rows on the wasm-native lane (${rows.length} rows
 
   test("KNOWN is exact: no listed row equals Node now, and every entry names a row", () => {
     const stale = Object.keys(KNOWN).filter((id) => equalNode.has(id) || !seen.has(id));
-    const missing = [...Object.keys(KNOWN), ...Object.keys(TIMED), ...Object.keys(UNPINNED), ...Object.keys(NEEDS)].filter((id) => !rows.some((r) => r.id === id));
+    const missing = [...Object.keys(KNOWN), ...Object.keys(TIMED), ...Object.keys(ORDERS), ...Object.keys(UNPINNED), ...Object.keys(NEEDS)].filter((id) => !rows.some((r) => r.id === id));
     expect({ stale, missing }).toEqual({ stale: [], missing: [] });
   });
 });
@@ -1261,9 +1282,27 @@ conn("tls12", ${port12}, () => conn("tls13", ${port13}, () => {}));
       const native = await run(b.bin, [], repoRoot, undefined, { NODE_OPTIONS: `--tls-keylog=${kw}`, NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
       expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
       expect(errOf(native.stderr).replace(kw, "<file>")).toBe(errOf(node.stderr).replace(kn, "<file>"));
-      const labels = (f: string): string[] => readFileSync(f, "latin1").split("\n").map((l) => l.split(" ")[0]!);
-      expect(labels(kw)).toEqual(labels(kn));
-      expect(labels(kn)).toContain("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
+      // The lines' ORDER is not Node's to keep (GH #116): Node writes each
+      // keylog line with its own async fs.appendFile (lib/internal/tls/
+      // wrap.js), so the threadpool races them and Node alone prints
+      // different orders run to run, within one connection too. Compared
+      // instead: every line well formed and newline-ended, and per
+      // connection (its client random) the multiset of labels — so a
+      // missing, extra, duplicated-once-too-often or misattributed label
+      // still fails.
+      const perConn = (f: string): string[] => {
+        const text = readFileSync(f, "latin1");
+        expect(text.endsWith("\n"), f).toBe(true);
+        const conns = new Map<string, string[]>();
+        for (const l of text.slice(0, -1).split("\n")) {
+          expect(l, f).toMatch(/^[A-Z][A-Z0-9_]* [0-9a-f]{64} [0-9a-f]+$/);
+          const [label, random] = l.split(" ") as [string, string];
+          conns.set(random, [...(conns.get(random) ?? []), label]);
+        }
+        return [...conns.values()].map((ls) => ls.sort().join(",")).sort();
+      };
+      expect(perConn(kw)).toEqual(perConn(kn));
+      expect(perConn(kn).join(",")).toContain("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
       expect(statSync(kw).mode & 0o777).toBe(statSync(kn).mode & 0o777);
     } finally {
       tls12.close();

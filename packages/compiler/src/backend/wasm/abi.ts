@@ -938,6 +938,13 @@
  *                               or -(the bytes needed) when cap is short
  *                               (the module grows its room and asks
  *                               again).
+ *       op 8 SYSTEM_CA          -> 1 iff CTX_ROOTS trusts the platform's
+ *                               (the OS's) certificate store, else 0. The
+ *                               module asks it for UNABLE_TO_GET_ISSUER_CERT,
+ *                               whose text carries Node's --use-system-ca
+ *                               suggestion only when the answer is 0
+ *                               (crypto_common.cc
+ *                               GetValidationErrorReason).
  *     Any answer or record out of these shapes is the named trap
  *     "tlsCall: host failure".
  *     THE CAPABILITY (S004): a host without a TLS engine DOES NOT SUPPLY

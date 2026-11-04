@@ -99,7 +99,10 @@ static void options_once(void) {
       "ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:"
       "!SRP:!CAMELLIA");
   if (!opt_tls_cipher_list) abort();
+  /* node.cc: NODE_USE_SYSTEM_CA=1 BEFORE the options, so NODE_OPTIONS's
+   * --no-use-system-ca clears it */
   const char *v = wn_safe_getenv("NODE_USE_SYSTEM_CA");
+  if (v && !strcmp(v, "1")) opt_use_system_ca = 1;
   const char *o = wn_safe_getenv("NODE_OPTIONS");
   if (o) {
     size_t n = strlen(o);
@@ -155,12 +158,16 @@ static void options_once(void) {
           char **slot;
         } strs[] = {{"openssl-config", &opt_openssl_config}, {"tls-cipher-list", &opt_tls_cipher_list}, {"tls-keylog", &opt_tls_keylog}};
         int matched = 0;
+        /* a boolean's name ends at any '=': Node ignores the value
+         * (--use-system-ca=false sets it, --no-use-system-ca=1 clears it;
+         * measured against Node 24.18.1) */
+        size_t bl = strcspn(name, "=");
         for (size_t j = 0; j < sizeof bools / sizeof bools[0] && !matched; j++)
-          if (!strcmp(name, bools[j].name)) {
+          if (strlen(bools[j].name) == bl && !strncmp(name, bools[j].name, bl)) {
             *bools[j].flag = !neg;
             matched = 1;
           }
-        if (!strcmp(name, "use-bundled-ca") && !neg) opt_use_openssl_ca = 0;
+        if (bl == strlen("use-bundled-ca") && !strncmp(name, "use-bundled-ca", bl) && !neg) opt_use_openssl_ca = 0;
         for (size_t j = 0; j < sizeof strs / sizeof strs[0] && !matched && !neg; j++) {
           size_t ln = strlen(strs[j].name);
           if (!strncmp(name, strs[j].name, ln) && name[ln] == '=') {
@@ -182,8 +189,6 @@ static void options_once(void) {
     }
     free(tok);
   }
-  /* node.cc: NODE_USE_SYSTEM_CA=1 after the options */
-  if (v && !strcmp(v, "1")) opt_use_system_ca = 1;
   /* node_options.cc EnvironmentOptions::CheckOptions */
   if (opt_tls_min_v1_3 && opt_tls_max_v1_2 && !opt_error) opt_error = strdup("either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
 }
