@@ -3650,7 +3650,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         return islandPrimitiveExit(L, expr, result);
       }
       const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
-      const result: IrExpr = { kind: "jsOp", op: "callFn", args: [callee, ...args], type: JSVAL, loc };
+      // The callee as V8 spells it in "<x> is not a function" (dynCall's
+      // calleeName rule): a member read's source text, an identifier's name.
+      const callee0 = ts.isParenthesizedExpression(expr.expression) ? null : expr.expression;
+      const spelling = callee0 === null ? undefined
+        : ts.isPropertyAccessExpression(callee0) || ts.isElementAccessExpression(callee0) ? callee0.getText()
+        : ts.isIdentifier(callee0) ? callee0.text : undefined;
+      const result: IrExpr = { kind: "jsOp", op: "callFn", ...(spelling !== undefined ? { spelling } : {}), args: [callee, ...args], type: JSVAL, loc };
       return islandPrimitiveExit(L, expr, result);
     }
 

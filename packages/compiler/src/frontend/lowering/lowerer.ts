@@ -108,7 +108,7 @@ import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
-import { isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -704,6 +704,17 @@ export function ladderFenceExpr(L: Lowerer, surface: string, node: ts.Node, hint
  * this fallback for `any` (mapType answers jsval first).
  *
  * Null for void (no value exists to represent). */
+/** Does a binding pattern (at any depth) hold a rest element? The
+ * checked-dynamic pattern arm has no rest form. */
+function patternHasRest(p: ts.ArrayBindingPattern | ts.ObjectBindingPattern): boolean {
+  for (const el of p.elements) {
+    if (ts.isOmittedExpression(el)) continue;
+    if (el.dotDotDotToken) return true;
+    const n = el.name; if (n !== undefined && (ts.isArrayBindingPattern(n) || ts.isObjectBindingPattern(n)) && patternHasRest(n)) return true;
+  }
+  return false;
+}
+
 export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType | null {
   if (t.flags & ts.TypeFlags.Void) return null;
   if (!isJsSourceFile(node.getSourceFile())) {
@@ -7888,6 +7899,16 @@ export class Lowerer {
     // protocol), empty patterns (the coercion checks), holes, rest,
     // defaults — run the REAL pattern in a synthesized engine function
     // instead (lowerJsvalBindingPattern).
+    // The one-world lanes without the engine: the island source is the
+    // same $dyn value, and the checked-dynamic pattern arm — the one the
+    // default build ran these patterns through, with V8's source-spelled
+    // TypeErrors (dynSpell) — destructures it. Bound names typed 'any'
+    // take the value back as the island value (erasure).
+    if (this.sharedDynamic && !this.engine && srcType.kind === "jsval" && !patternHasRest(pattern)) {
+      const src0 = srcRef;
+      srcRef = () => asDynOperand(src0());
+      srcType = DYN;
+    }
     const elementWise =
       srcType.kind === "jsval" &&
       ts.isObjectBindingPattern(pattern) &&

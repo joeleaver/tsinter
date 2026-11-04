@@ -4896,8 +4896,8 @@ function validateFunction(
         if (named !== (e.name !== undefined)) {
           err(`jsOp ${e.op} ${named ? "requires" : "forbids"} a name`, e.loc);
         }
-        if (e.spelling !== undefined && e.op !== "callMethod") {
-          err(`jsOp ${e.op} forbids a callee spelling (callMethod only)`, e.loc);
+        if (e.spelling !== undefined && e.op !== "callMethod" && e.op !== "callFn") {
+          err(`jsOp ${e.op} forbids a callee spelling (callMethod and callFn only)`, e.loc);
         }
         const arity: Record<string, number | null> = {
           add: 2, sub: 2, mul: 2, div: 2, mod: 2, pow: 2,

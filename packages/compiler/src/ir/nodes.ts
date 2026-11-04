@@ -5291,10 +5291,11 @@ export type IrExpr =
       kind: "jsOp";
       op: IrJsOp;
       name?: string;
-      /** callMethod only: V8's rendering of the callee (`o.zz`, `o[16]`,
-       * board #243 review), for "<x> is not a function" where the backend
-       * builds that text itself; absent when the source has no rendered
-       * form (the backend then names the method). */
+      /** callMethod and callFn: V8's rendering of the callee (`o.zz`,
+       * `o[16]`, `num`, board #243 review), for "<x> is not a function"
+       * where the backend builds that text itself; absent when the source
+       * has no rendered form (the backend then names the method, or the
+       * callee binding). */
       spelling?: string;
       args: IrExpr[];
       type: IrType;

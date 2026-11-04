@@ -31839,7 +31839,7 @@ class Assembler {
             // names a bare-identifier tag the way Node does ("tag is not
             // a function").
             const tagCall = e.args[1]?.kind === "jsOp" && e.args[1].op === "tplStrings";
-            this.pushStrLit(tagCall ? this.islandCalleeSpelling(e.args[0]!) : "value");
+            this.pushStrLit(e.spelling ?? (tagCall ? this.islandCalleeSpelling(e.args[0]!) : "value"));
             code.call(this.dyn.callFn());
             this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), fn);
