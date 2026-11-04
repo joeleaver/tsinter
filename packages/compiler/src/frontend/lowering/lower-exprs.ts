@@ -8463,6 +8463,12 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // A target that IS an island value (`as any[]`, `as Record<string,
       // any>` — SEMANTICS.md S014's unit-H amendment): erasure, like `as any`.
       if (target.kind === "jsval") return inner;
+      // The one-world lanes: targets only the checked-dynamic exits know
+      // (functions, bytes, handles, undefined-armed unions) take that
+      // exit over the same value (jsval and dyn are one representation).
+      if (!L.boundarySafe(target) && L.sharedDynamic) {
+        return lowerDynCastTo(L, expr, { kind: "dynFromJsval", value: inner, type: DYN, loc: inner.loc }, target);
+      }
       if (!L.boundarySafe(target)) {
         L.unsupported(
           "SC1090",
@@ -8496,6 +8502,17 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
     const target = L.mapTypeOf(targetTs);
     if (!target) L.badType(expr.type, targetTs);
     if (target.kind === "dyn") return inner; // `as unknown`: erasure
+    // `as any` / `as unknown` on the one-world lanes (jsval targets): the
+    // same value under the island type — erasure (design §4.1, probe c1).
+    if (target.kind === "jsval") return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
+    return lowerDynCastTo(L, expr, inner, target);
+  }
+
+/** A checked cast of a checked-dynamic value (`inner`, dyn-typed) to a
+ * typed `target` — lowerAs's dyn arm, shared with the one-world lanes'
+ * jsval casts to targets only this arm knows. */
+function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, inner: IrExpr, target: IrType): IrExpr {
+    {
     if (target.kind === "void" || !L.jsonSafe(target)) {
       // Bare undefined-armed targets pass when every OTHER arm is
       // JSON-safe: the checked-dynamic tree holds a first-class undefined value now
@@ -8552,8 +8569,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           `number, string, boolean, records, arrays, and unions of those)`,
       );
     }
+    }
     return L.dynExitGate(expr.expression, inner, { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) });
-  }
+}
 
 export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): IrExpr {
     const loc = locOf(expr);
