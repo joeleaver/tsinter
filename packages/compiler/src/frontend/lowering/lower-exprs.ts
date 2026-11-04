@@ -24,7 +24,7 @@ import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
 import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
-import { exitIsConsumedCopy, exitIsFresh, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, exitIntoFieldOrElement, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
@@ -8482,6 +8482,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           return { kind: "jsUnview", value: inner, typeKey: typeKey(target), what: unviewWhat(L, target), type: target, loc: locOf(expr) };
         }
         if (!exitIsFresh(L, expr.expression, target)) {
+          // S115 (d)'s WasmGC amendment: a judged copy unless the cast
+          // lands in a field or element (J4).
+          if (L.sharedDynamic && !exitIntoFieldOrElement(expr)) return judgedExit(inner, target, locOf(expr));
           L.pushDiag(s115Diag(locOf(expr), exitRefusal(L, target)));
           throw new PoisonError();
         }

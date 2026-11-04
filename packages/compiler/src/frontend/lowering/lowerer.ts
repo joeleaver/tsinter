@@ -87,7 +87,7 @@ import {
   UnionRegistry,
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
-import { exitIsConsumedCopy, exitIsFresh, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, exitIntoFieldOrElement, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -2685,6 +2685,8 @@ export class Lowerer {
       };
     }
     if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
+    // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy.
+    if (this.sharedDynamic && ts.isExpression(node) && !exitIntoFieldOrElement(node)) return check;
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -6479,6 +6481,10 @@ export class Lowerer {
       if (ts.isExpression(node) && exitIsOwnView(this, node, e.type)) {
         e = { kind: "jsUnview", value: e.value, typeKey: typeKey(e.type), what: unviewWhat(this, e.type), type: e.type, loc: e.loc };
       } else if (ts.isExpression(node) && (exitIsFresh(this, node, e.type) || exitIsConsumedCopy(this, node, e.type))) e.fresh = true;
+      // S115 (d)'s WasmGC amendment: a local, parameter or return takes a
+      // judged copy (S125 (c) refuses the observable ones); fields and
+      // elements refuse by name (J4).
+      else if (this.sharedDynamic && ts.isExpression(node) && !exitIntoFieldOrElement(node)) e = judgedExit(e.value, e.type, e.loc);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters

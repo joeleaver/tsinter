@@ -259,6 +259,9 @@ const DYN_IDENTITY = new Set(["includes", "indexOf", "lastIndexOf"]);
 /** Island operations that write an operand or run code that may. */
 const JS_WRITING_OPS = new Set(["setProp", "setIdx", "callMethod", "callFn", "callSpread", "construct", "defineGetter", "optCallMethod"]);
 
+/** An island-native literal (the one-world lanes' `{...}` / `[...]`). */
+const isIslandLit = (e: IrExpr): boolean => e.kind === "jsOp" && (e.op === "objLit" || e.op === "arrLit" || e.op === "objSpread");
+
 const isDynType = (t: IrType | undefined): boolean => t !== undefined && (t.kind === "dyn" || t.kind === "jsval");
 
 export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
@@ -952,7 +955,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // A property write or a method call writes (or may write) its
         // receiver; a call writes what it is handed (the callee itself
         // and marshaled scalars hand nothing).
-        if (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter") noteDynWrite(null);
+        // On the one-world lanes (sharedDynamic) no engine code runs: a
+        // method reached through dynamic dispatch is the runtime's (which
+        // writes only its receiver and, for the assign-like statics, the
+        // values it is handed) or a boxed program function (whose writes
+        // are noted where they are), so the write is pinned to the
+        // receiver and to each dynamic value handed on.
+        if (L.sharedDynamic && !opaqueCalls && (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter")) {
+          noteDynWrite(args[0] ?? null);
+          for (const a of args.slice(1)) if (isDynType(a.type) && passesJs(a)) noteDynWrite(a);
+        } else if (L.sharedDynamic && !opaqueCalls && JS_WRITING_OPS.has(op)) {
+          for (const a of args.slice(1)) if (isDynType(a.type) && passesJs(a)) noteDynWrite(a);
+        } else if (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter") noteDynWrite(null);
         else if (JS_WRITING_OPS.has(op) && args.slice(1).some(passesJs)) noteDynWrite(null);
         if (op === "eq" || op === "neq") {
           dynIdentity = true;
@@ -963,7 +977,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "jsMarshal":
         // A checked-dynamic value marshaled into the island is the same
         // value there (S014's jsMarshal amendment): island code may write it.
-        if (isDynType((r["value"] as IrExpr).type)) noteDynWrite(null);
+        // On the one-world lanes there is no engine: the marshal is the
+        // same value under the island type, written where island ops write.
+        if (isDynType((r["value"] as IrExpr).type) && !(L.sharedDynamic && !opaqueCalls)) noteDynWrite(null);
         return;
       default:
         return;
@@ -1711,7 +1727,24 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           n = node(e.value, fn);
           break;
         case "dynDestrCheck":
+        case "dynFromJsval":
           n = node(e.value, fn);
+          break;
+        case "jsOp":
+          if ((e.op === "getProp" || e.op === "getIdx") && e.args[0] && isDyn(e.args[0])) {
+            n = node(e.args[0], fn);
+            for (const a of e.args.slice(1)) walk(a, fn, null);
+          } else if (e.op === "arrLit" || e.op === "objLit" || e.op === "objSpread") {
+            // A new value holding what it is built from.
+            n = `\0f${fresh++}`;
+            for (const x of e.args) {
+              if (isDyn(x)) union(n, node(x, fn));
+              else walk(x, fn, null);
+            }
+          } else {
+            walk(r, fn, null, true);
+            n = UNKNOWN;
+          }
           break;
         case "ternary":
           walk(e.cond, fn, null);
@@ -2077,7 +2110,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const COPY_WRITTEN = "the program writes to values of the copy's type, and a write through the copy would not reach the dynamic value";
     const COPY_IDENTITY = "the program compares values of the copy's type by identity, and the copy is a different object";
     const unwrap = (e: IrExpr | undefined): IrExpr | undefined => {
-      while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck")) {
+      while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck" || e.kind === "dynFromJsval")) {
         e = e.kind === "call" ? e.args[0] : e.value;
       }
       return e;
@@ -2201,9 +2234,13 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           return uniqueDyn(e.value, fn, depth + 1);
         case "seqExpr":
           return uniqueDyn(e.result, fn, depth + 1);
-        case "dynFromJsval":
-          // An empty island literal ({} or [] in a --dynamic build).
-          return e.value.kind === "jsOp" && (e.value.op === "objLit" || e.value.op === "arrLit") && e.value.args.length === 0;
+        case "jsOp":
+          // An island literal of such values (its marshaled keys are
+          // strings), a member of one, or a spread completion onto one.
+          if (e.op === "arrLit" || e.op === "objLit") return e.args.every((x) => uniqueDyn(x, fn, depth + 1));
+          if (e.op === "getProp" || e.op === "getIdx") return uniqueDyn(e.args[0], fn, depth + 1);
+          if (e.op === "objSpread") return uniqueDyn(e.args[0], fn, depth + 1) && e.args.slice(1).every((a) => shallowFresh(a, fn, depth + 1));
+          return false;
         case "dynInvoke":
           // sort and reverse answer their receiver.
           return (e.method === "sort" || e.method === "reverse") && uniqueDyn(e.recv, fn, depth + 1);
@@ -2245,12 +2282,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       if (!v) return false;
       // A receiver built right there (`JSON.parse(s).sort(f)`) is a new object
       // at the moment of the write.
-      if ((v.kind === "libCall" && DYN_FRESH_LIB.test(v.fn)) || v.kind === "dynArrLit" || v.kind === "dynObjLit") return true;
+      if ((v.kind === "libCall" && DYN_FRESH_LIB.test(v.fn)) || v.kind === "dynArrLit" || v.kind === "dynObjLit" || isIslandLit(v)) return true;
       if (v.kind !== "varRef") return false;
       const init = onlyValue(fn, v.localId);
       const i = unwrap(init ?? undefined);
       if (!i) return false;
-      if (!((i.kind === "libCall" && DYN_FRESH_LIB.test(i.fn)) || i.kind === "dynArrLit" || i.kind === "dynObjLit")) return false;
+      if (!((i.kind === "libCall" && DYN_FRESH_LIB.test(i.fn)) || i.kind === "dynArrLit" || i.kind === "dynObjLit" || isIslandLit(i))) return false;
       // ...and the binding never hands the object anywhere (an alias, an
       // argument, an element pushed elsewhere would make it reachable as
       // something a copy was taken from).
@@ -2259,7 +2296,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     /** The binding a dynamic expression reads from (through member reads). */
     const rootKey = (e: IrExpr | null | undefined, fn: string): string | null => {
       let v = unwrap(e ?? undefined);
-      while (v && v.kind === "dynKeyGet") v = unwrap(v.value);
+      while (v && (v.kind === "dynKeyGet" || (v.kind === "jsOp" && (v.op === "getProp" || v.op === "getIdx")))) {
+        v = unwrap(v.kind === "dynKeyGet" ? v.value : v.args[0]);
+      }
       return v?.kind === "varRef" ? bkey(fn, v.localId) : null;
     };
     const alias = dynAliasClasses();
@@ -2659,7 +2698,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           const window = copyWindow(s);
           const viaHolder = s.dest === null && holderBinding(s) !== null;
           if (!viaHolder && typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
-          else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) why = DYN_WRITE_FROM;
+          else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) {
+            why = DYN_WRITE_FROM;
+            if (process.env["SCRIPTC_U1_DEBUG"]) for (const w of dynWrites) console.error("U1DBG write", JSON.stringify(w.anc[w.anc.length - 1], (k, v) => (k === "loc" || k === "type" ? undefined : v)).slice(0, 600), w.fn, w.anc.map((a) => { const x = a as Record<string, unknown>; return `${x["kind"] as string}${x["op"] ? ":" + (x["op"] as string) : ""}${x["fn"] ? ":" + (x["fn"] as string) : ""}${x["method"] ? ":" + (x["method"] as string) : ""}`; }).join(">"), w.recv?.kind, (w.recv as { op?: string } | null)?.op, JSON.stringify(w.recv?.loc), "src", s.arg?.kind, JSON.stringify(s.loc));
+          }
           else if (anyIdentity(refs)) why = COPY_IDENTITY;
         }
       }
