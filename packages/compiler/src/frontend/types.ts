@@ -570,6 +570,18 @@ export interface TypeMapperCtx {
 }
 
 
+/** A record field, index-signature value or tuple element typed exactly
+ * `unknown` or `object` on the one-world lanes: the slot keeps the
+ * checked-dynamic slot type (DYN) — the shape needs a slot, and DYN and
+ * jsval are one runtime value (the same \$dyn reference, shared: storing a
+ * dynamic value there copies nothing). `any` members keep unit H's
+ * absorb (the whole composite is the island value). */
+function slotOfMember<T extends IrType | null>(memberTs: ts.Type, mapped: T, ctx: TypeMapperCtx): T | IrType {
+  if (ctx.sharedDynamic !== true || mapped === null || mapped.kind !== "jsval") return mapped;
+  if ((memberTs.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0) return DYN;
+  return mapped;
+}
+
 /** lower-calls.ts's bodyReadsArguments, duplicated here (types.ts must not
  * import from lowering/ — that edge is a module cycle): does the function's
  * OWN body read `arguments`? Nested plain functions/methods own theirs
@@ -1000,7 +1012,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     }
     const fields: { name: string; type: IrType }[] = [];
     for (let i = 0; i < args.length; i++) {
-      let et = mapType(args[i]!, ctx);
+      let et = slotOfMember(args[i]!, mapType(args[i]!, ctx), ctx);
       // A unit-only element (`[number, undefined]`) rides the unit-only
       // union, the record-field rule.
       if (et?.kind === "void" && isUnitOnlyTsType(args[i]!)) et = unitOnlyUnion(unions);
@@ -3052,7 +3064,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     let v: IrType | null = null;
     for (const info of indexInfos) {
       if (!stringKey(info.keyType) && !(info.keyType.flags & ts.TypeFlags.Number)) return null;
-      const iv = mapType(info.valueType, ctx);
+      const iv = slotOfMember(info.valueType, mapType(info.valueType, ctx), ctx);
       // A jsval-valued signature absorbs the shape: `Record<string,
       // JSONValue>` (a package's own JSON alias) and `Record<string, any>`
       // are one island object — the overflow map has no handle slot, and
@@ -3262,6 +3274,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // members as the same handle, static members marshaled). jsval-
       // BEARING composite fields (`content: any[]`) keep their static
       // shape — the lift covers them.
+      pt = slotOfMember(fieldTs, pt, ctx);
       if (pt.kind === "jsval") return JSVAL;
       fields.push({ name: p.name, type: pt, ...((p.flags & ts.SymbolFlags.Optional) !== 0 ? { optional: true as const } : {}) });
     }

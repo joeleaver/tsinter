@@ -703,6 +703,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         if (L.sharedDynamic && !L.engine) {
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
+          // An argument of a STANDARD-LIBRARY call whose parameter is
+          // `any` (Object.is, util.inspect, assert): the library has a
+          // static lowering over the literal's own type, which it took
+          // when `any` had no mapping.
+          if ((own?.kind === "record" || own?.kind === "array") && stdlibAnyArgument(L, expr)) return false;
         }
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an
         // EMPTY array literal under a const assertion is the empty tuple —
@@ -3000,7 +3005,10 @@ function parenIsWriteReceiver(paren: ts.Expression): boolean {
     const leftIsNull = left.kind === ts.SyntaxKind.NullKeyword;
     if (!leftIsNull && right.kind !== ts.SyntaxKind.NullKeyword) return null;
     const otherNode = leftIsNull ? right : left;
-    const other = L.lowerExpr(otherNode);
+    let other = L.lowerExpr(otherNode);
+    // The one-world lanes: an island operand is the same \$dyn value, and
+    // its nullish test is the checked-dynamic one.
+    if (L.sharedDynamic) other = asDynOperand(other);
     if (isUnitType(other.type)) {
       // `null == null`, `undefined == null`: units are mutually loose-equal.
       return { kind: "boolLit", value: !negated, type: BOOL, loc };
@@ -5044,6 +5052,11 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
     const ctxType = L.checker.getContextualType(expr);
     const tsType = ctxType ?? L.typeOf(expr);
     let mapped = expected ?? L.mapTypeOf(tsType);
+    // The one-world lanes: see lowerObjectLiteral's rule.
+    if (L.sharedDynamic && !expected && mapped?.kind === "jsval") {
+      const own = L.mapTypeOf(L.typeOf(expr));
+      if (own?.kind === "array" || own?.kind === "record") mapped = own;
+    }
     // A JS literal whose OWN inferred type is never-tainted
     // (neverTaintedJsType — the evolving `const gb = []`, the mixed
     // command tuple `['pwd', []]`) carries no element information: route
@@ -5980,6 +5993,13 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       tsType = L.checker.getAwaitedType(tsType) ?? tsType;
     }
     let mapped = L.mapTypeOf(tsType);
+    // The one-world lanes: an island context the island-literal rule
+    // declined (lowerExpr's static-literal rules) builds as the literal's
+    // own type.
+    if (L.sharedDynamic && mapped?.kind === "jsval") {
+      const own = L.mapTypeOf(L.typeOf(expr));
+      if (own?.kind === "record") mapped = own;
+    }
     // An EMPTY-record context under a NON-empty literal (`Object.keys({
     // ...process.env })` — the lib's `{}`-typed parameters admit every
     // object): `{}` carries no shape information, so the literal builds as
@@ -8594,6 +8614,18 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
     }
     }
     return L.dynExitGate(expr.expression, inner, { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) });
+}
+
+/** Is `expr` an argument of a call resolving to a standard-library
+ * declaration (the one-world lanes' static-literal rule)? */
+function stdlibAnyArgument(L: Lowerer, expr: ts.Expression): boolean {
+  let n: ts.Node = expr;
+  while (ts.isParenthesizedExpression(n.parent)) n = n.parent;
+  const p = n.parent;
+  if (!(ts.isCallExpression(p) || ts.isNewExpression(p)) || !p.arguments?.includes(n as ts.Expression)) return false;
+  const sig = L.checker.getResolvedSignature(p);
+  const decl = sig ? L.checker.signatureDeclaration(sig) : undefined;
+  return decl !== undefined && L.isStdlibFile(decl.getSourceFile());
 }
 
 /** An island operand (any/unknown on the one-world lanes) seen by a
