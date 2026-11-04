@@ -8239,9 +8239,16 @@ describe("INC-28 U3 child output stream rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("U3-ORD-01 data then end then exit (the child closes its stdout long before it exits): 'data' runs where the chunk arrives and its ticks and microtask drain before the immediate; 'end' is one tick after the EOF; each listener's tick chain and microtask run before the next event", async () => {
+  test("U3-ORD-01 data then end then exit (the child closes its stdout long before it exits): 'data' runs where the chunk arrives (before or after the immediate, the child's timing: S086 (m)) and its ticks and microtask drain before the next callback; 'end' is one tick after the EOF; each listener's tick chain and microtask run before the next event", async () => {
     const r = await runU3Source("// data then end (the child closes its stdout long before it exits), then exit; each listener queues a nextTick chain and a microtask.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf abc; exec 1>&-; sleep 0.4\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nconst mark = (name: string): void => {\n  console.log(name);\n  process.nextTick(() => {\n    console.log(name + \":t1\");\n    process.nextTick(() => {\n      console.log(name + \":t2\");\n      process.nextTick(() => console.log(name + \":t3\"));\n    });\n  });\n  void Promise.resolve().then(() => console.log(name + \":m\"));\n};\nc.stdout?.on(\"data\", (chunk: Buffer) => mark(\"data \" + chunk.toString()));\nc.stdout?.on(\"end\", () => mark(\"end\"));\nc.on(\"exit\", (code) => mark(\"exit \" + code));\nsetImmediate(() => console.log(\"immediate\"));\nconsole.log(\"main done\");\n");
-    expect(r.stdout.toString("utf8")).toBe("main done\ndata abc\ndata abc:t1\ndata abc:t2\ndata abc:t3\ndata abc:m\nimmediate\nend\nend:t1\nend:t2\nend:t3\nend:m\nexit 0\nexit 0:t1\nexit 0:t2\nexit 0:t3\nexit 0:m\n");
+    // GH #124, SEMANTICS.md S086 (m): whether the chunk is read in the
+    // first poll phase (before the immediate) or a later one is the
+    // child's start against the program's own; Node alone prints both
+    // (Node 24.18.1 here: immediate first in 3/20 runs idle, 5/20 pinned
+    // to one core). The rest is Node's order either way.
+    const block = (n: string): string => `${n}\n${n}:t1\n${n}:t2\n${n}:t3\n${n}:m\n`;
+    const rest = `${block("end")}${block("exit 0")}`;
+    expect([`main done\n${block("data abc")}immediate\n${rest}`, `main done\nimmediate\n${block("data abc")}${rest}`]).toContain(r.stdout.toString("utf8"));
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
@@ -8275,9 +8282,16 @@ describe("INC-28 U3 child output stream rows", () => {
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
-  test("U3-BIG-01 a large output (1 MB) with a reader: Node's own chunks, at most 64 KiB each, add up to every byte", async () => {
+  test("U3-BIG-01 a large output (1 MB) with a reader: Node's own chunks, at most 64 KiB each, add up to every byte; 'end' and 'exit' each once, in either order (S086 (l))", async () => {
     const r = await runU3Source("// a large output with a reader: Node's own chunks (at most 64 KiB each) add up to every byte.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"head\", [\"-c\", \"1000000\", \"/dev/zero\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nlet total = 0;\nlet chunks = 0;\nlet max = 0;\nc.stdout?.on(\"data\", (chunk: Buffer) => {\n  total += chunk.length;\n  chunks += 1;\n  if (chunk.length > max) max = chunk.length;\n});\nc.stdout?.on(\"end\", () => console.log(\"end\", total, chunks >= 2, max <= 65536));\nc.on(\"exit\", (code) => console.log(\"exit\", code));\n");
-    expect(r.stdout.toString("utf8")).toBe("end 1000000 true true\nexit 0\n");
+    // GH #124, SEMANTICS.md S086 (l): 'exit' before 'end' when the child
+    // exits before the poll phase that reads its last bytes — libuv stops
+    // at a short read and reads end of file in the next iteration, while
+    // the SIGCHLD watcher runs at the end of this one. Node alone prints
+    // both orders when its loop is slow to poll (a 3 ms check phase:
+    // exit first 32/100 runs); the wasm lane's host loop runs the module
+    // in its check phase.
+    expect(["end 1000000 true true\nexit 0\n", "exit 0\nend 1000000 true true\n"]).toContain(r.stdout.toString("utf8"));
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
