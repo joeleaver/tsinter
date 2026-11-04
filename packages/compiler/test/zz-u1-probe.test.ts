@@ -5,7 +5,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { compile } from "../src/index.js";
+import { compile as compileSrc } from "../src/index.js";
+const compile: typeof compileSrc = process.env["U1_COMPILER"] ? (await import(process.env["U1_COMPILER"])).compile : compileSrc;
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 const corpus = join(import.meta.dirname, "../../../tests/corpus");

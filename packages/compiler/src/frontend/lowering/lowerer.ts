@@ -7921,6 +7921,31 @@ export class Lowerer {
           ts.isIdentifier(el.propertyName ?? el.name),
       );
     if (srcType.kind === "jsval" && !elementWise) {
+      // The one-world lanes: the synthesized pattern steps only arrays and
+      // strings (dyn.iterN), and its own not-iterable text cannot spell
+      // the source — V8's text (dynSpell) is thrown first, as the
+      // checked-dynamic arm did.
+      if (this.sharedDynamic && !this.engine && ts.isArrayBindingPattern(pattern) && dynSpell !== undefined) {
+        const loc = locOf(pattern);
+        const d = asDynOperand(srcRef());
+        const iterable: IrExpr = {
+          kind: "logical", op: "||",
+          left: { kind: "dynTest", test: "array", value: d, type: BOOL, loc },
+          right: { kind: "dynTest", test: "string", value: asDynOperand(srcRef()), type: BOOL, loc },
+          type: BOOL, loc,
+        };
+        out.push({
+          kind: "if",
+          cond: { kind: "unary", op: "!", operand: iterable, type: BOOL, loc },
+          then: [{
+            kind: "throw",
+            value: { kind: "libCall", fn: "error.new", args: [{ kind: "strLit", value: dynSpell, type: STRING, loc }], type: { kind: "object", className: "%TypeError" }, loc },
+            loc,
+          }],
+          else_: null,
+          loc,
+        });
+      }
       if (lowerJsvalBindingPattern(this, pattern, srcRef, isLet, out)) return;
       // No engine form (computed keys, untransportable defaults): fall
       // through to the static fences below.
