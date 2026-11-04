@@ -87,7 +87,7 @@ import {
   UnionRegistry,
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
-import { exitIsConsumedCopy, exitIsFresh, exitIntoFieldOrElement, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -449,6 +449,12 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
+/** Does the program carry a JavaScript source (U1a's language split)? */
+export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[]): boolean {
+  const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
+  return moduleOrder.some(isJs) || program.getSourceFiles().some(isJs);
+}
+
 export function lowerToIr(
   program: ts.Program,
   entry: ts.SourceFile,
@@ -459,7 +465,14 @@ export function lowerToIr(
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
   const undefSlots = options.undefSlots ?? false;
-  const sharedDynamic = options.sharedDynamic ?? false;
+  // Unit U1a (coordinator's ruling: split by source language): the one
+  // dynamic world is for TypeScript programs. A program with ANY JavaScript
+  // source in it (a .js/.cjs/.mjs file of the program, an embedded npm
+  // package) keeps today's checked-dynamic path whole, until U1b — the
+  // type mapping cannot tell a JS file's `any` from a TS file's, so a
+  // per-file switch would give a function crossing between them two
+  // representations. Per program there is no seam to cross.
+  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder);
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -1182,6 +1195,11 @@ export class Lowerer {
    * engine handle (a dynamic import's namespace object) — paramShape's
    * early-out. */
   readonly jsvalParamOverrides = new Set<ts.ParameterDeclaration>();
+  /** Parameters forced to the checked-dynamic type (DYN) regardless of
+   * their checker type: on the one-world lanes, an `unknown`/`any`-typed
+   * callback parameter of a checked-dynamic receiver's HOF, whose helper
+   * hands it the dyn element — the same value under the dyn type (U1a). */
+  readonly dynParamOverrides = new Set<ts.ParameterDeclaration>();
   /** File → qualifier prefix: "" for the entry, "%mI." otherwise. */
   readonly fileTag = new Map<ts.SourceFile, string>();
   /** Namespace ModuleBlocks this program lowers, filled by splitFiles:
@@ -2698,7 +2716,7 @@ export class Lowerer {
     }
     if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
     // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy.
-    if (this.sharedDynamic && ts.isExpression(node) && !exitIntoFieldOrElement(node)) return check;
+    if (this.sharedDynamic && ts.isExpression(node)) return check;
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -2824,6 +2842,7 @@ export class Lowerer {
         !(widened.flags & ts.TypeFlags.Any) &&
         mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
       ) {
+        if (process.env["U1_TRACE"]) console.error("U1TRACE", new Error().stack);
         this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
         throw new PoisonError();
       }
@@ -2877,6 +2896,7 @@ export class Lowerer {
       !(widened.flags & ts.TypeFlags.Any) &&
       mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
     ) {
+      if (process.env["U1_TRACE"]) console.error("U1TRACE", new Error().stack);
       this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
       throw new PoisonError();
     }
@@ -6526,10 +6546,10 @@ export class Lowerer {
       if (ts.isExpression(node) && exitIsOwnView(this, node, e.type)) {
         e = { kind: "jsUnview", value: e.value, typeKey: typeKey(e.type), what: unviewWhat(this, e.type), type: e.type, loc: e.loc };
       } else if (ts.isExpression(node) && (exitIsFresh(this, node, e.type) || exitIsConsumedCopy(this, node, e.type))) e.fresh = true;
-      // S115 (d)'s WasmGC amendment: a local, parameter or return takes a
-      // judged copy (S125 (c) refuses the observable ones); fields and
-      // elements refuse by name (J4).
-      else if (this.sharedDynamic && ts.isExpression(node) && !exitIntoFieldOrElement(node)) e = judgedExit(e.value, e.type, e.loc);
+      // S115 (d)'s U1a amendment: a local, parameter, return, field or
+      // element takes a judged copy (S125 (c) refuses the observable ones;
+      // a copy it cannot follow is judged by its type).
+      else if (this.sharedDynamic && ts.isExpression(node)) e = judgedExit(e.value, e.type, e.loc);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters

@@ -950,53 +950,6 @@ export function exitIsOwnView(L: Lowerer, node: ts.Expression, t: IrType): boole
   return false;
 }
 
-/** Does the exit at `node` land in a typed FIELD or ELEMENT — an object
- * literal member, an array literal element, the right side of a member or
- * element assignment, a class property initializer, or the argument of a
- * method that stores into a typed container (`push`, `unshift`, `splice`,
- * `fill`, `Map.set`, `Set.add`)? Joe's ruling J4 (dynamic-values design
- * §4.3 containment): those slots never take a judged copy of a shared
- * dynamic value; locals, parameters and returns do (S115 (d)'s WasmGC
- * amendment). Wrapping expressions (parentheses, `as`, `!`, conditionals,
- * `??`/`||`/`&&`, comma) pass through to their own context. */
-export function exitIntoFieldOrElement(node: ts.Expression): boolean {
-  let n: ts.Node = node;
-  for (;;) {
-    const p = n.parent;
-    if (!p) return false;
-    if (
-      ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p) ||
-      ts.isSatisfiesExpression(p) ||
-      (ts.isConditionalExpression(p) && p.condition !== n) ||
-      (ts.isBinaryExpression(p) && p.right === n &&
-        (p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
-          p.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
-          p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
-          p.operatorToken.kind === ts.SyntaxKind.CommaToken)) ||
-      (ts.isBinaryExpression(p) && p.left === n &&
-        (p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
-          p.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
-          p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken))
-    ) {
-      n = p;
-      continue;
-    }
-    if (ts.isPropertyAssignment(p) && p.initializer === n) return true;
-    if (ts.isShorthandPropertyAssignment(p)) return true;
-    if (ts.isArrayLiteralExpression(p)) return true;
-    if (ts.isSpreadElement(p)) return false;
-    if (ts.isPropertyDeclaration(p) && p.initializer === n) return true;
-    if (ts.isBinaryExpression(p) && p.right === n && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      let l: ts.Node = p.left;
-      while (ts.isParenthesizedExpression(l)) l = l.expression;
-      return ts.isPropertyAccessExpression(l) || ts.isElementAccessExpression(l);
-    }
-    if (ts.isCallExpression(p) && p.arguments.includes(n as ts.Expression) && ts.isPropertyAccessExpression(p.expression)) {
-      return /^(push|unshift|splice|fill|set|add)$/.test(p.expression.name.text);
-    }
-    return false;
-  }
-}
 
 /** A judged exit (S115 (d)'s WasmGC amendment, Joe's checkpoint ruling 1):
  * a non-fresh dynamic value entering a typed local, parameter or return

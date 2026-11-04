@@ -24,7 +24,7 @@ import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
 import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
-import { exitIsConsumedCopy, exitIsFresh, exitIntoFieldOrElement, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
@@ -8531,9 +8531,8 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           return { kind: "jsUnview", value: inner, typeKey: typeKey(target), what: unviewWhat(L, target), type: target, loc: locOf(expr) };
         }
         if (!exitIsFresh(L, expr.expression, target)) {
-          // S115 (d)'s WasmGC amendment: a judged copy unless the cast
-          // lands in a field or element (J4).
-          if (L.sharedDynamic && !exitIntoFieldOrElement(expr)) return judgedExit(inner, target, locOf(expr));
+          // S115 (d)'s U1a amendment: a judged copy, wherever it lands.
+          if (L.sharedDynamic) return judgedExit(inner, target, locOf(expr));
           L.pushDiag(s115Diag(locOf(expr), exitRefusal(L, target)));
           throw new PoisonError();
         }
@@ -9869,7 +9868,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           const recv = unparen(pn.expression);
           if (ts.isAsExpression(recv) || ts.isTypeAssertion(recv)) {
             const inner = unparen(recv.expression);
-            const obj = probeLower(L, inner);
+            const obj0 = probeLower(L, inner);
+            // One world (U1a): an island value is the same \$dyn value.
+            const obj = obj0 && L.sharedDynamic && !L.engine ? asDynOperand(obj0) : obj0;
             if (obj?.type.kind === "dyn") {
               keyed = {
                 kind: "dynKeyGet",
@@ -9891,7 +9892,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           // "string") ... }`, the validateConfig idiom). Probe the lowering
           // and claim exactly the dyn results; anything else keeps its
           // sibling lowerings and fences untouched.
-          const probed = probeLower(L, a.expression);
+          const probed = probeLowerDyn(L, a.expression);
           if (probed?.type.kind !== "dyn") continue;
           value = probed;
         }
@@ -10062,6 +10063,14 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * its diagnostic BEFORE throwing, so the probe runs behind a diagnostic
    * sink: a declined probe's diagnostics vanish (the sibling lowerings
    * own the site), a successful probe's flush through afterwards. */
+  /** probeLower, with an island result retyped as the checked-dynamic
+   * value it is on the one-world lanes without the engine (U1a): the
+   * dyn-keyed special cases claim island operands too. */
+  export function probeLowerDyn(L: Lowerer, node: ts.Expression): IrExpr | null {
+    const e = probeLower(L, node);
+    return e !== null && L.sharedDynamic && !L.engine ? asDynOperand(e) : e;
+  }
+
   export function probeLower(L: Lowerer, node: ts.Expression): IrExpr | null {
     const saved = L.diagSink;
     const captured: typeof L.diags = [];
@@ -10660,12 +10669,13 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // stringified like every property key (o[k] is o[String(k)] in JS;
       // `in` shares the coercion).
       {
-        const probed = probeLower(L, expr.right);
+        const probed = probeLowerDyn(L, expr.right);
         if (probed?.type.kind === "dyn") {
           let k = L.lowerExpr(expr.left); // JS order: the key evaluates first
           if (k.type.kind === "f64" || k.type.kind === "string" || k.type.kind === "dyn") {
             k = undefinedAsText(L, L.ensureString(k, expr.left), loc);
-            const recvD = L.lowerExpr(expr.right);
+            const recvD0 = L.lowerExpr(expr.right);
+            const recvD = L.sharedDynamic && !L.engine ? asDynOperand(recvD0) : recvD0;
             if (recvD.type.kind === "dyn") {
               // S015 (lead ruling): the not-own path asks whether the key
               // names an Object.prototype member (the named fence).
@@ -10708,7 +10718,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // S015 (lead ruling): an Object.prototype name process.env does not own.
       return OBJECT_PROTO_NAMES.has(key) ? { kind: "logical", op: "||", left: present, right: protoInFenceExpr(L, null, loc), type: BOOL, loc } : present;
     }
-    const recv = L.lowerExpr(expr.right);
+    // The one-world lanes: an island receiver is the same \$dyn value, and
+    // the checked-dynamic `in` below answers it (S015's lead ruling kept).
+    const recv0 = L.lowerExpr(expr.right);
+    const recv = L.sharedDynamic && !L.engine ? asDynOperand(recv0) : recv0;
     // GH #109 (S125): a folded `in` reads the receiver's KEYS — a width
     // copy of a wider value would answer for the copy's.
     L.keyObservedTypes.push(recv.type);
@@ -12338,7 +12351,7 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     // receiver is an identifier (checked above), so evaluating it for
     // read and write matches JS's once-evaluation observably.
     if (ts.isPropertyAccessExpression(access)) {
-      const probed = probeLower(L, access.expression);
+      const probed = probeLowerDyn(L, access.expression);
       if (probed?.type.kind === "dyn") {
         const key: IrExpr = { kind: "strLit", value: access.name.text, type: STRING, loc: locOf(access.name) };
         const read: IrExpr = { kind: "dynKeyGet", key, value: probed, type: DYN, loc };
@@ -12348,7 +12361,8 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
           : { kind: "numLit", value: 1, type: F64, loc };
         if (rhs.type.kind !== "f64") L.unsupported("SC1043", access);
         const value: IrExpr = { kind: "bin", op, left: cur, right: rhs, type: F64, loc };
-        const recv2 = L.lowerExpr(access.expression);
+        const recv20 = L.lowerExpr(access.expression);
+        const recv2 = L.sharedDynamic && !L.engine ? asDynOperand(recv20) : recv20;
         const boxed: IrExpr = { kind: "dynFrom", value, type: DYN, loc };
         return {
           kind: "exprStmt",

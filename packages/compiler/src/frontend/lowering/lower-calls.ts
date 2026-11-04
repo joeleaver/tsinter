@@ -19,7 +19,7 @@ import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
-import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -188,6 +188,9 @@ export interface GenericInstance {
     // contextual type spelled.
     if (ts.isIdentifier(param.name) && L.jsvalParamOverrides.has(param)) {
       return { type: JSVAL, mode: param.questionToken ? "omittable" : "required" };
+    }
+    if (ts.isIdentifier(param.name) && L.dynParamOverrides.has(param)) {
+      return { type: DYN, mode: param.questionToken ? "omittable" : "required" };
     }
     if (!ts.isIdentifier(param.name)) {
       // A destructuring pattern parameter — `([label, value]) => ...`,
@@ -3491,6 +3494,15 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       ts.isPropertyAccessExpression(expr.expression) &&
       L.isIslandExpr(expr.expression.expression)
     ) {
+      // The one-world lanes without the engine: the island value is the
+      // \$dyn value, and the checked-dynamic method machinery (validated
+      // receiver, then the static string/regex tables, the runtime's
+      // receiver-kind dispatch) answers every method it answered for
+      // `unknown` — the island dispatch knows far fewer.
+      if (L.sharedDynamic && !L.engine) {
+        const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
+        if (served) return served;
+      }
       const receiver = L.lowerExpr(expr.expression.expression);
       // A checker-`any` receiver whose VALUE lives in the checked-dynamic tree (a
       // checked-dynamic local behind the any-typed spelling — the JS
@@ -4681,12 +4693,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     let recv: IrExpr;
     if (recvTs.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || anyArray) {
       recv = L.lowerExpr(access.expression);
+      // One world (U1a): the island receiver is the same \$dyn value.
+      if (L.sharedDynamic && !L.engine) recv = asDynOperand(recv);
     } else {
       // A checker-TYPED spelling whose VALUE is still checked-dynamic (an
       // evolving `let h = {}` object flowing back out of a JS helper —
       // tsc types the return by the evolved shape, the binding lowered
       // dyn): probe the lowering and claim exactly the dyn results.
-      const probed = probeLower(L, access.expression);
+      const probed = probeLowerDyn(L, access.expression);
       if (probed?.type.kind !== "dyn") return null;
       recv = probed;
     }

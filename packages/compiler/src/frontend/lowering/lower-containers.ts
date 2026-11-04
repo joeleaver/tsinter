@@ -693,6 +693,18 @@ function lowerOptionalDefaultArg(
     // callback's params by the pushed elements): the lead params BIND the
     // handles the loop passes, whatever the contextual type spelled —
     // paramShape's island-handle early-out, the then-handler rule.
+    // The one-world lanes: a dyn-receiver HOF hands the dyn element to a
+    // parameter whose checker type (`unknown`, or `any` narrowed to it
+    // above) maps to the island type — the same value; the parameter binds
+    // it as dyn, so the body reads it through the checked-dynamic arms.
+    if (L.sharedDynamic && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode))) {
+      argNode.parameters.forEach((p, i) => {
+        if (i >= lead.length || lead[i]!.kind !== "dyn") return;
+        if (!ts.isIdentifier(p.name) || p.initializer || p.dotDotDotToken) return;
+        const declared = L.chainNarrowedType.get(p.name) ?? L.checker.getTypeAtLocation(p.name);
+        if (L.mapTypeOf(declared)?.kind === "jsval") L.dynParamOverrides.add(p);
+      });
+    }
     if (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode)) {
       argNode.parameters.forEach((p, i) => {
         if (i >= lead.length || lead[i]!.kind !== "jsval") return;

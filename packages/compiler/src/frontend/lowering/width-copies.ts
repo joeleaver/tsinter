@@ -1043,7 +1043,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
             const g = args[0]?.kind === "jsOp" && args[0].op === "globalGet" ? args[0].name : undefined;
             const m = r["name"] as string;
             if (g === "Object" && m === "assign") noteDynWrite(args[1] ?? null);
-            else if (!(g !== undefined && staticReadsArgs(g, m))) {
+            // A reading method reads what it is handed too: a callback it
+            // runs is a program function whose own writes are noted where
+            // they are (a receiver whose own member of that name is a
+            // program function is the same case).
+            else if (!readOnly && !(g !== undefined && staticReadsArgs(g, m))) {
               for (const a of args.slice(1)) if (isDynType(a.type) && passesJs(a)) noteDynWrite(a);
             }
           }
