@@ -1261,9 +1261,27 @@ conn("tls12", ${port12}, () => conn("tls13", ${port13}, () => {}));
       const native = await run(b.bin, [], repoRoot, undefined, { NODE_OPTIONS: `--tls-keylog=${kw}`, NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
       expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
       expect(errOf(native.stderr).replace(kw, "<file>")).toBe(errOf(node.stderr).replace(kn, "<file>"));
-      const labels = (f: string): string[] => readFileSync(f, "latin1").split("\n").map((l) => l.split(" ")[0]!);
-      expect(labels(kw)).toEqual(labels(kn));
-      expect(labels(kn)).toContain("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
+      // The lines' ORDER is not Node's to keep (GH #116): Node writes each
+      // keylog line with its own async fs.appendFile (lib/internal/tls/
+      // wrap.js), so the threadpool races them and Node alone prints
+      // different orders run to run, within one connection too. Compared
+      // instead: every line well formed and newline-ended, and per
+      // connection (its client random) the multiset of labels — so a
+      // missing, extra, duplicated-once-too-often or misattributed label
+      // still fails.
+      const perConn = (f: string): string[] => {
+        const text = readFileSync(f, "latin1");
+        expect(text.endsWith("\n"), f).toBe(true);
+        const conns = new Map<string, string[]>();
+        for (const l of text.slice(0, -1).split("\n")) {
+          expect(l, f).toMatch(/^[A-Z][A-Z0-9_]* [0-9a-f]{64} [0-9a-f]+$/);
+          const [label, random] = l.split(" ") as [string, string];
+          conns.set(random, [...(conns.get(random) ?? []), label]);
+        }
+        return [...conns.values()].map((ls) => ls.sort().join(",")).sort();
+      };
+      expect(perConn(kw)).toEqual(perConn(kn));
+      expect(perConn(kn).join(",")).toContain("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
       expect(statSync(kw).mode & 0o777).toBe(statSync(kn).mode & 0o777);
     } finally {
       tls12.close();
