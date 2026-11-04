@@ -2842,7 +2842,6 @@ export class Lowerer {
         !(widened.flags & ts.TypeFlags.Any) &&
         mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
       ) {
-        if (process.env["U1_TRACE"]) console.error("U1TRACE", new Error().stack);
         this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
         throw new PoisonError();
       }
@@ -2896,7 +2895,6 @@ export class Lowerer {
       !(widened.flags & ts.TypeFlags.Any) &&
       mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
     ) {
-      if (process.env["U1_TRACE"]) console.error("U1TRACE", new Error().stack);
       this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
       throw new PoisonError();
     }
@@ -7924,7 +7922,7 @@ export class Lowerer {
     // default build ran these patterns through, with V8's source-spelled
     // TypeErrors (dynSpell) — destructures it. Bound names typed 'any'
     // take the value back as the island value (erasure).
-    if (this.sharedDynamic && !this.engine && srcType.kind === "jsval" && !patternHasRest(pattern)) {
+    if (this.sharedDynamic && !this.engine && srcType.kind === "jsval" && ts.isArrayBindingPattern(pattern) && !patternHasRest(pattern)) {
       const src0 = srcRef;
       srcRef = () => asDynOperand(src0());
       srcType = DYN;

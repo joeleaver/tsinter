@@ -2802,7 +2802,6 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           if (!viaHolder && typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
           else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) {
             why = DYN_WRITE_FROM;
-            if (process.env["SCRIPTC_U1_DEBUG"]) for (const w of dynWrites) { if (w.recv !== null && !alias.same(w.recv, w.fn, s.arg!, s.where)) continue; if (freshRooted(w.recv, w.fn)) continue; console.error("U1DBG write", w.fn, w.top, "site top", s.top, JSON.stringify(w.anc[w.anc.length - 1], (k, v) => (k === "loc" || k === "type" ? undefined : v)).slice(0, 400)); }
           }
           else if (anyIdentity(refs)) why = COPY_IDENTITY;
         }

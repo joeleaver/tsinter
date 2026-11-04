@@ -8581,6 +8581,22 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
       ) {
         return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
       }
+      // The one-world lanes: a target whose parameters or result are the
+      // island type (`unknown`/`any`) adapts as the same signature over
+      // the checked-dynamic type (the same values), then converts to the
+      // target through the identity-keeping function adapter.
+      if (target.kind === "func" && L.sharedDynamic && !target.rest &&
+          (target.ret.kind === "jsval" || target.params.some((p) => p.kind === "jsval"))) {
+        const toDyn = (t: IrType): IrType => (t.kind === "jsval" ? DYN : t);
+        const dynTarget: IrType & { kind: "func" } = { ...target, params: target.params.map(toDyn), ret: toDyn(target.ret) };
+        if (canAdaptDynFuncTo(dynTarget, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
+          const adapter = L.funcCoerceAdapter(dynTarget, target, locOf(expr));
+          if (adapter) {
+            const checked: IrExpr = { kind: "dynCheck", value: inner, type: dynTarget, loc: locOf(expr) };
+            return { kind: "call", callee: adapter, args: [checked], type: target, loc: locOf(expr) };
+          }
+        }
+      }
       // Runtime HANDLE targets (`u as IncomingMessage` — a boxed handle
       // coming back out of an untyped wrapper): a tag-checked reference
       // unwrap, identity preserved (DYN_HANDLE_KINDS).
