@@ -287,3 +287,17 @@ reads the logs. A VM recycle kills the job, so check `uptime` first.
 Rows that will always fail in this container (no IPv6, root): N1-ERR-02, N1-ERR-03, N1-REG-01, U4-R-03
 (census), N1-ERR-03 and the IPv6 notes row (host rows), and the three `fs-errno-rows` tests. A cloud gate needs either an allow-list for these or a container with IPv6 and a
 non-root user.
+
+## 7. Follow-up (GH #123, #124, #116)
+
+- **The CA hint rows (U4-R-10, SECURITY 2-3) were a real gap, now fixed.** Node's
+  `crypto_common.cc` appends the `--use-system-ca` suggestion to UNABLE_TO_GET_ISSUER_CERT only while
+  `--use-system-ca` is off, and `NODE_USE_SYSTEM_CA=1` turns it on (the laptop sets it). The module wrote
+  that code's text without the suggestion unconditionally. It now asks the host (tlsCall op 8,
+  SYSTEM_CA), so both lanes match Node with and without the variable.
+- **U3-ORD-01 and U3-BIG-01 are Node's own timing, not host bugs.** Node alone prints both orders of each
+  (ORD-01: the immediate first in 3/20 idle runs on the laptop; BIG-01: `exit` before `end` whenever the
+  child exits before the poll phase that reads its last bytes, 32/100 with a 3 ms check phase). The rows
+  now accept either order and pin the rest. See SEMANTICS.md S086 (l) and (m).
+- **O23-B1's keylog order is Node's threadpool.** Node writes each keylog line with its own async
+  `fs.appendFile`, so the lines race. The row compares, per connection, the multiset of labels.
