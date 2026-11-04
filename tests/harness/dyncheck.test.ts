@@ -652,19 +652,21 @@ console.log("recovered");
     expect(r.stdout).toBe("assigned 2\nnever: boom\nrecovered\n");
   });
 
-  test("a NAMED record into an `any` slot is a deep copy — dyn writes never alias the original", async () => {
+  test("a NAMED record into an `any` slot is a deep copy — a program that writes through it refuses by name (S125 (c))", async () => {
     // dynFrom's aliasing stance (documented for 'unknown' slots) applies
     // to any-typed storage identically: JS would alias, the dyn copies.
-    const r = await compileAndRun(
-      "any-record-copy",
-      `const base = { a: 1 };
+    // Node prints "2 2"; the copy would print "1 2", so since GH #120 the
+    // program refuses at compile time instead.
+    await expect(
+      compileAndRun(
+        "any-record-copy",
+        `const base = { a: 1 };
 const boxed: any = base;
 boxed.a = 2;
 console.log(base.a, boxed.a);
 `,
-    );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("1 2\n");
+      ),
+    ).rejects.toThrow(/SC1090: a '\{ a: number \}' value converted to a dynamic .*it would be a COPY where JavaScript shares the object/);
   });
 
   test("an uninitialized `any` binding is the dyn undefined, not a trap", async () => {

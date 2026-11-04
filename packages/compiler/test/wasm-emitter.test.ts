@@ -1872,13 +1872,11 @@ test("S015: keyed reads on unknown see OWN properties only", async () => {
   );
 });
 
-test("S014: crossing the dyn boundary COPIES — mutations do not propagate", async () => {
-  // No corpus program can ever pin this, and not for the usual reason: a
-  // program whose output depends on the aliasing would DIVERGE from Node
-  // and fail the differential by construction. Node erases the casts and
-  // hands the same object back, so it prints 3 where every tsinter lane
-  // prints 2 — the source mutation lands on an object the extracted value
-  // does not share. Reproduced identically on the C lane.
+test("S014: crossing the dyn boundary COPIES — a program that would observe the copy refuses by name (S125 (c))", async () => {
+  // Node erases the casts and hands the same object back, so it prints
+  // "3 3" and "2 2" where the copies would print "2 2" and "1 2". Since
+  // GH #120 (unit U0) such a program no longer runs silently wrong: the
+  // crossings it could observe refuse at compile time.
   const res = await buildWasm(
     "dyn-copy.ts",
     [
@@ -1897,10 +1895,9 @@ test("S014: crossing the dyn boundary COPIES — mutations do not propagate", as
       "",
     ].join("\n"),
   );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(["2 2", "1 2", ""].join("\n"));
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics.some((d) => d.code === "SC1090" && /it would be a COPY where JavaScript shares the object.*SEMANTICS\.md S125/.test(d.message))).toBe(true);
 });
 
 test("dyn keyed write: V8's refusal texts on every receiver that has no slot", async () => {

@@ -274,7 +274,55 @@ r.value.push(2);
 console.log(a);`,
     refused: "in",
   },
+  // A function value called through a binding: the call reaches it.
+  {
+    id: "in-call-through-value-write",
+    src: `const f = (x: any) => { x.n = 2; };
+const g = f;
+const r = { n: 1 };
+g(r);
+console.log(r.n);`,
+    refused: "in",
+  },
+  {
+    id: "in-callback-param-write",
+    src: `function each(xs: { n: number }[], cb: (x: any) => void) { for (const x of xs) cb(x); }
+const xs = [{ n: 1 }];
+each(xs, (x: any) => { x.n = 5; });
+console.log(xs[0].n);`,
+    refused: "in",
+  },
   // ── unobservable: exact ────────────────────────────────────────────
+  {
+    // A part read straight off a caught value's cast, then only read.
+    id: "ok-caught-cause-read",
+    src: `try {
+  throw JSON.parse('{"cause":{"code":"E1","message":"inner"}}');
+} catch (e) {
+  const x: unknown = e;
+  const c = (x as { cause: { code: string; message: string } }).cause;
+  console.log(c.code, c.message);
+}`,
+  },
+  {
+    // A typed value returned through a () => unknown callback and printed at once.
+    id: "ok-returned-and-printed",
+    src: `const shared = [1, 2];
+const show = (f: () => unknown): void => { console.log(f()); };
+show(() => shared);
+shared.push(3);
+show(() => shared);`,
+  },
+  {
+    // Object.assign takes a typed source's own (scalar) property values.
+    id: "ok-assign-scalar-source",
+    src: `const w = { a: 1, note: "x" };
+const q: any = {};
+Object.assign(q, w);
+q.a = 2;
+w.note = "y";
+console.log(q, w);`,
+  },
   // A function's own local value, built and returned into `any`: it dies at the return.
   {
     id: "ok-return-own-record",

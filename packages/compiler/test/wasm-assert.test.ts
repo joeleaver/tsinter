@@ -631,9 +631,11 @@ test("F.2 comparison: BYTES payload identity under SameValue (two crossings of O
 test("F.2 comparison: the cycle memo — structurally-equal self-cycles PASS deepStrictEqual silently (the coinductive step is real, not just non-crashing)", async () => {
   const path = await build("f2-cycle-pass.ts", [
     "import assert from 'node:assert';",
-    "const a: Record<string, unknown> = { x: 1 };",
+    // Built as dynamic objects: a typed record stored into its own
+    // `unknown` slot would be a copy the program could tell apart (S125 (c)).
+    "const a: any = JSON.parse('{\"x\":1}');",
     "a.self = a;",
-    "const b: Record<string, unknown> = { x: 1 };",
+    "const b: any = JSON.parse('{\"x\":1}');",
     "b.self = b;",
     "const au: unknown = a;",
     "const bu: unknown = b;",

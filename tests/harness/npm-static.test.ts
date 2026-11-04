@@ -202,7 +202,16 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     });
     expect(coverage.npmStatic).toEqual([{ package: "commander", status: "static" }]);
     expect(coverage.preflightFailed).toBe(false);
-    expect(coverage.diagnostics).toHaveLength(0); // builds — fences are runtime
+    // Builds but for the dynamic-crossing copies S125 (c) refuses (GH #120,
+    // unit U0): every remaining diagnostic is one of those. Some are real —
+    // editDistance's evolving `d` matrix is checked out into a typed copy
+    // and then written (`d[0][j] = j`), a write Node makes and the copy
+    // would lose — and the rest are the analysis' conservatism in class
+    // methods (reached by virtual calls, so their dynamic parameters are
+    // not followed). Unit U1 (sharing) removes them all.
+    const u0 = /it would be a COPY where JavaScript shares the object.*SEMANTICS\.md S125/;
+    expect(coverage.diagnostics.filter((d) => !u0.test(d.message))).toEqual([]);
+    expect(coverage.diagnostics.some((d) => d.loc.file.endsWith("suggestSimilar.js") && u0.test(d.message))).toBe(true);
     const total = coverage.stats.statementsTotal + (coverage.unreached?.stats.statementsTotal ?? 0);
     const failed = coverage.stats.statementsFailed + (coverage.unreached?.stats.statementsFailed ?? 0);
     expect(total).toBeGreaterThan(1000); // the whole package joined the program

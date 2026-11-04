@@ -9435,11 +9435,14 @@ where JavaScript shares the object, and …") when the program could tell:
   "May be" is a unification over the program's dynamic values: bindings,
   parameters, results and the dynamic fields of typed values join one
   class through assignment, argument passing, returns, captures, stores
-  into a dynamic container and reads out of one; whatever the analysis
+  into a dynamic container and reads out of one. Function values flow the
+  same way, so a call through a function value reaches the functions that
+  can flow to its callee; whatever the analysis
   does not follow (a dynamic call, a runtime function that is not a known
   reader or writer, a throw, the parameters and results of every function
-  not reached only by direct calls — functions used as values,
-  constructors, methods, async functions and generators — the dynamic
+  not reached only by direct calls and calls through values it follows —
+  functions whose value escapes, constructors, methods, async functions and
+  generators — the dynamic
   fields of a typed value the runtime made, any other expression) meets in
   one shared unknown class. A
   write to the own members of a binding that holds a value built fresh
@@ -9464,8 +9467,14 @@ read, while no code that can run in between writes a dynamic value; a
 that converts a value the function built from its own locals, which die
 with the call (`return { flags }` into `any`); a copy whose local binding
 is last read before the function writes the original; library results
-(`readdirSync`, `split`, a match); and a callback parameter that only
-reads its copy while the call cannot reach a write.
+(`readdirSync`, `split`, a match); a copy that no binding, field or
+unknown code holds, or that only printing helpers hold, read where it is
+made (`console.log(f())` over a `() => unknown` callback); a part read
+straight off an out-crossing into a local read only in the next
+statements, while nothing they run writes a dynamic value (`const c =
+(e as { cause: C }).cause; console.log(c.code)`); the source of an
+`Object.assign` whose property values are scalars; and a callback
+parameter that only reads its copy while the call cannot reach a write.
 An `Error` crosses through the identity cache (S021), an `any[]` crosses
 by reference, and a variadic callback's adapter is vetted by GH #22: none
 of them is judged here. A `Promise` crosses by reference too; its

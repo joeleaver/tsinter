@@ -465,11 +465,14 @@ test("row44 S080 --dynamic shape: the strings array crosses into `any` as a FROZ
 });
 
 test("row75 S080 CommonJS/sloppy shape: an in-bounds index write is SILENTLY IGNORED by Node; this tier's own answer is the SAME shape as row44's", async () => {
-  const out = await runRow(
+  // GH #120 (unit U0): the template-strings array reaches the program as a
+  // dynamic COPY, and the program writes through it (`q[0] = "Q"`) and
+  // reads the site again — an observable copy, so it now refuses by name.
+  await expect(runRow(
     "row75",
     'function tag(strings, ...values) { return strings; } function site2() { return tag`c${1}d`; } const q = site2(); q[0] = "Q"; console.log(q[0], site2()[0]);',
     "cjs",
-  );
+  ))
   // Node (CommonJS/sloppy mode): an in-bounds index write on a frozen
   // array is SILENTLY IGNORED (no throw, unlike strict-mode ESM) — Node
   // prints "c c" (the write never took effect, q[0] itself still reads
@@ -483,7 +486,7 @@ test("row75 S080 CommonJS/sloppy shape: an in-bounds index write is SILENTLY IGN
   // unchanged on re-evaluation), not a third distinct one; only the
   // print format differs (space- vs newline-joined) because row75's
   // source is untyped from the start rather than cast to `any`.
-  expect(out.trimEnd()).toBe("Q c");
+    .rejects.toThrow(/it would be a COPY where JavaScript shares the object/);
 });
 
 // ============================================================
