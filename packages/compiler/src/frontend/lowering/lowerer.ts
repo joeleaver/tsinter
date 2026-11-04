@@ -373,6 +373,14 @@ export interface LowerOptions {
    * compile() sets it for the wasm backends only; the native lanes keep
    * SEMANTICS.md S003/S006/S032 and their IR is unchanged. */
   undefSlots?: boolean;
+  /** One dynamic world (the WasmGC lanes — dynamic-values design §4.1,
+   * Joe's ruling J1): `any`, `unknown`, `object` and JS inference residue
+   * all lower as the shared island value (jsval) whether or not --dynamic
+   * is set; --dynamic then means only "embed the engine for package
+   * code". compile() sets it for the wasm backends only; the c and llvm
+   * lanes keep the checked-dynamic world (SEMANTICS.md S014/S015/S016/
+   * S042) and their IR is unchanged. */
+  sharedDynamic?: boolean;
   /** Node's startup refusal (LoadResult.startupCrash — preflight's
    * resolution walk and CJS named-import link check): the program
    * compiles to that startup crash. */
@@ -408,6 +416,8 @@ export interface LowererMode {
   hostFetch?: boolean;
   /** LowerOptions.undefSlots — lowerToIr passes it to every pass. */
   undefSlots?: boolean;
+  /** LowerOptions.sharedDynamic — lowerToIr passes it to every pass. */
+  sharedDynamic?: boolean;
   /** Node's startup refusal (preflight's resolution walk / CJS named-
    * import link check): %main opens with exactly this throw, before any
    * module init — Node refuses the whole graph before anything evaluates,
@@ -449,6 +459,7 @@ export function lowerToIr(
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
   const undefSlots = options.undefSlots ?? false;
+  const sharedDynamic = options.sharedDynamic ?? false;
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -471,6 +482,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     ffiImports,
   });
   const ffiValidation = validateFfiImports(validation);
@@ -486,6 +498,7 @@ export function lowerToIr(
         targetPlatform,
         hostFetch,
         undefSlots,
+        sharedDynamic,
         ffiImports,
         ffiBindingSymbols: ffiValidation.symbolsByName,
       });
@@ -495,6 +508,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     startupCrash,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
@@ -510,6 +524,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
   });
@@ -730,7 +745,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
       retT.flags & ts.TypeFlags.Void ? VOID : L.mapTypeOf(retT) ?? DYN;
     return { kind: "func", params, ret };
   }
-  return DYN;
+  return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
 }
 
 /** The one call signature of a PURE function type — single signature, no
@@ -1295,6 +1310,14 @@ export class Lowerer {
   readonly hostFetch: boolean;
   /** LowererMode.undefSlots: typed slots carry undefined (wasm lanes). */
   readonly undefSlots: boolean;
+  /** LowererMode.sharedDynamic: one dynamic world (wasm lanes) — `any`,
+   * `unknown`, `object` and JS residue are the shared island value. */
+  readonly sharedDynamic: boolean;
+  /** The island world is on: --dynamic, or the WasmGC lanes' one dynamic
+   * world (sharedDynamic). Every island lowering gates on this; the
+   * engine-only surfaces (package code, `__island_eval`, the
+   * requires-dynamic diagnostics) gate on `engine`. */
+  readonly dynamic: boolean;
   /** LowererMode.startupCrash — buildMain opens %main with the throw. */
   readonly startupCrash: StartupCrash | null;
   /** Outbound native bindings by their source-level ambient name. */
@@ -1352,9 +1375,14 @@ export class Lowerer {
     readonly program: ts.Program,
     readonly entry: ts.SourceFile,
     readonly moduleOrder: ts.SourceFile[],
-    readonly dynamic: boolean,
+    /** --dynamic: the build embeds the engine for package code (npm
+     * imports, dynamic import() of the program's own files, the
+     * requires-dynamic diagnostics' gate). */
+    readonly engine: boolean,
     mode: LowererMode = {},
   ) {
+    this.sharedDynamic = mode.sharedDynamic ?? false;
+    this.dynamic = engine || this.sharedDynamic;
     this.reachable = mode.reachable ?? null;
     this.remainder = mode.remainder ?? false;
     this.alreadyFlushed = mode.alreadyFlushed ?? new Set();
@@ -1382,6 +1410,8 @@ export class Lowerer {
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
       dynamic: this.dynamic,
+      engine: this.engine,
+      sharedDynamic: this.sharedDynamic,
       hostFetch: this.hostFetch,
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
@@ -2715,7 +2745,7 @@ export class Lowerer {
     // story is the per-site SC2012 — the same one the fetch call itself
     // reports — not the generic supported-types recitation.
     if (
-      !this.dynamic &&
+      !this.engine &&
       typeSym &&
       (ISLAND_AMBIENT_TYPES as readonly string[]).includes(typeSym.name) &&
       this.isStdlibSymbol(typeSym)
@@ -2776,9 +2806,9 @@ export class Lowerer {
       // object, jsval-entangled members) reports the retry-eligible
       // SC2011 choice instead of the static recitation.
       if (
-        !this.dynamic &&
+        !this.engine &&
         !(widened.flags & ts.TypeFlags.Any) &&
-        mapType(widened, { ...this.typeCtx, dynamic: true }) !== null
+        mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
       ) {
         this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
         throw new PoisonError();
@@ -2792,7 +2822,7 @@ export class Lowerer {
     // types map to jsval, so reaching here means the type is genuinely
     // unrepresentable (a jsval union arm, a jsval array element) — the
     // generic type message tells that story better.
-    if (!this.dynamic) {
+    if (!this.engine) {
       const pkg = this.npmPackageOf(widened);
       if (pkg) {
         this.pushDiag(requiresDynamicPackageDiag(pkg, locOf(node)));
@@ -2829,9 +2859,9 @@ export class Lowerer {
     // SC2011 arm tells that story with the stronger stay-static remedy
     // ('unknown' + a checked cast).
     if (
-      !this.dynamic &&
+      !this.engine &&
       !(widened.flags & ts.TypeFlags.Any) &&
-      mapType(widened, { ...this.typeCtx, dynamic: true }) !== null
+      mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
     ) {
       this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
       throw new PoisonError();

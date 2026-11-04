@@ -316,7 +316,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * body's writes are noted where they are) or a runtime method that only
    * reads its arguments; with it, an island function may be anything, so
    * handing it a dynamic value counts as a write. */
-  const opaqueCalls = L.dynamic;
+  const opaqueCalls = L.engine;
   /** Per dynamic binding: how each use treats the value ("ro": read at
    * once, a scalar or a test taken from it; "other": anything else). */
   const dynUses = new Map<string, ("ro" | "other")[]>();

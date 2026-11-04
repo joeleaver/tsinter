@@ -126,7 +126,7 @@ function lowerEnumMemberRead(
     // them). What remains is the user's own `declare enum` — the
     // `declare const __VERSION__` stance: ReferenceError at the access.
     const sf = enumDecl.getSourceFile();
-    if (L.isStdlibFile(sf) || (L.dynamic && L.isNpmFile(sf))) return null;
+    if (L.isStdlibFile(sf) || (L.engine && L.isNpmFile(sf))) return null;
     const declared = L.mapTypeOf(L.typeOf(expr));
     if (!declared || declared.kind === "void") return null;
     return {
@@ -167,7 +167,7 @@ function lowerEnumReverseRead(
   const enumName = recvSym.name;
   // Ambient: no object exists — the member-read stance.
   if (decls.every((d) => isAmbientEnumDecl(d))) {
-    if (decls.some((d) => L.isStdlibFile(d.getSourceFile()) || (L.dynamic && L.isNpmFile(d.getSourceFile())))) {
+    if (decls.some((d) => L.isStdlibFile(d.getSourceFile()) || (L.engine && L.isNpmFile(d.getSourceFile())))) {
       return null;
     }
     return {

@@ -294,7 +294,12 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * SC2012. Null for anything that isn't `import(...)`. */
   export function lowerDynamicImportCall(L: Lowerer, call: ts.CallExpression): IrExpr | null {
     if (call.expression.kind !== ts.SyntaxKind.ImportKeyword) return null;
-    L.requireDynamicApi("'import()'", call);
+    // import() embeds the program's own modules for the engine microtask
+    // (appendDynamicImportModules): the engine gate, not the world's.
+    if (!L.engine) {
+      L.pushDiag(requiresDynamicApiDiag("'import()'", locOf(call)));
+      throw new PoisonError();
+    }
     const loc = locOf(call);
     const arg = call.arguments[0];
     if (arg === undefined || !ts.isStringLiteralLike(arg)) {
@@ -896,7 +901,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * method rejection. No-op under --dynamic (the island paths claimed
    * these) and for non-package receivers, so callers' fallbacks apply. */
   export function npmMemberFence(L: Lowerer, access: ts.PropertyAccessExpression): void {
-    if (L.dynamic) return;
+    if (L.engine) return;
     const pkg =
       L.npmPackageOf(L.typeOf(access.expression)) ??
       L.npmPackageOfSymbol(L.checker.getSymbolAtLocation(access.name));

@@ -384,7 +384,7 @@ import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTRE
       // pending check's unwind).
       return nodeThrowExpr(0, "MODULE_NOT_FOUND", refusal.message, DYN, loc);
     }
-    if (!L.dynamic) {
+    if (!L.engine) {
       L.pushDiag(requiresDynamicImportDiag(pkgName, loc));
       throw new PoisonError();
     }

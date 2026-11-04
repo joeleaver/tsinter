@@ -3471,7 +3471,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       expr.expression.text === "__island_eval" &&
       L.isStdlibSymbol(L.resolveValueSymbol(expr.expression) ?? undefined)
     ) {
-      if (!L.dynamic) {
+      if (!L.engine) {
         L.pushDiag(requiresDynamicDiag("'__island_eval'", loc));
         throw new PoisonError();
       }
