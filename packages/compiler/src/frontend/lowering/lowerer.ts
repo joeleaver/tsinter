@@ -3752,11 +3752,12 @@ export class Lowerer {
     // the first dynamic read, PROM_CONV).
     if (t.kind === "promise") return true;
     if (!this.dynConvertible(t)) return false;
-    // A function the island marshals (a host closure whose composite
-    // results reach dynamic code as their views, S115 (a)) takes that
-    // entrance; the checked-dynamic box (its thunk copies composites) only
-    // carries the rest.
-    if (t.kind === "func") return !canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+    // Under --dynamic a function the island marshals takes that entrance
+    // (main's: its composite results reach dynamic code as views, S115
+    // (a)); otherwise — and for one it cannot marshal — the checked-dynamic
+    // box, whose composite arguments and results S125 (c) judges (the
+    // world `unknown` always had).
+    if (t.kind === "func") return !this.engine || !canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
     return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex";
   }
 
@@ -3922,7 +3923,7 @@ export class Lowerer {
       // checked-dynamic position (a routed method's callback) as that same
       // marshal — one box either way (dynFnBox), whose composite results
       // reach dynamic code as views (S115 (a)).
-      if (this.sharedDynamic && expr.type.kind === "func" &&
+      if (this.sharedDynamic && this.engine && expr.type.kind === "func" &&
           canMarshalTypedFuncIntoIsland(expr.type, (id) => this.shapes.get(id), (id) => this.unions.get(id))) {
         return { kind: "dynFromJsval", value: { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }, type: DYN, loc: expr.loc };
       }

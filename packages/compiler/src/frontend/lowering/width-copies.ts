@@ -2231,7 +2231,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const COPY_WRITTEN = "the program writes to values of the copy's type, and a write through the copy would not reach the dynamic value";
     const COPY_IDENTITY = "the program compares values of the copy's type by identity, and the copy is a different object";
     const unwrap = (e: IrExpr | undefined): IrExpr | undefined => {
-      while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck" || e.kind === "dynFromJsval")) {
+      // (jsMarshal of a dynamic value is the same value retyped — one world.)
+      while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck" || e.kind === "dynFromJsval" ||
+        (e.kind === "jsMarshal" && isDynType(e.value.type)))) {
         e = e.kind === "call" ? e.args[0] : e.value;
       }
       return e;

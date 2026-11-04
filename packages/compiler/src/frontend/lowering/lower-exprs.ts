@@ -1764,6 +1764,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // re-throw), anything else takes JS's one-hop non-thenable await
         // and answers itself. Thenable adoption stays unmodeled
         // (SEMANTICS.md).
+        // One world (U1a): the island bridge below awaits the same \$dyn value
+        // (the WasmGC lanes have no async.awaitDyn), its result retyped dyn.
+        if (value.type.kind === "dyn" && L.sharedDynamic) {
+          const bridged: IrExpr = { kind: "jsBridgePromise", value: { kind: "jsMarshal", value, type: JSVAL, loc }, type: { kind: "promise", inner: JSVAL }, loc };
+          return { kind: "dynFromJsval", value: { kind: "awaitExpr", value: bridged, type: JSVAL, loc }, type: DYN, loc };
+        }
         if (value.type.kind === "dyn") {
           return { kind: "libCall", fn: "async.awaitDyn", args: [value], type: DYN, loc };
         }

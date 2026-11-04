@@ -3503,7 +3503,11 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const recvTs0 = L.typeOf(expr.expression.expression);
       const recvAny = (recvTs0.flags & ts.TypeFlags.Any) !== 0 ||
         (L.checker.isArrayType(recvTs0) && ((L.checker.getTypeArguments(recvTs0 as ts.TypeReference)[0]?.flags ?? 0) & ts.TypeFlags.Any) !== 0);
-      if (L.sharedDynamic && !(L.engine && recvAny)) {
+      // Only the dynamic types themselves route: a library-typed island
+      // value (a fetch Response, Headers) keeps the island dispatch that
+      // serves its own members.
+      const recvDynamic = recvAny || (recvTs0.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0;
+      if (L.sharedDynamic && recvDynamic && !(L.engine && recvAny)) {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
       }

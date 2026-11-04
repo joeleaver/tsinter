@@ -110,7 +110,8 @@ console.log(t.k, d.k);`,
     src: `const r = { n: 1 };
 const u: unknown = r;
 console.log((u as { n: number }) === r);`,
-    refused: "out",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // A round trip through an `unknown` binding, then the original is written.
   {
@@ -120,7 +121,8 @@ const u: unknown = r;
 const t = u as { n: number };
 r.n = 2;
 console.log(t.n);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // A fresh dynamic object written through an alias of it, after a copy
   // was checked out of it.
@@ -134,27 +136,29 @@ console.log(t.k);`,
     refused: "out",
   },
   // A typed value into `any`, written through the dynamic side.
-  { id: "in-any-write", src: `const r = { a: 1 }; const a: any = r; a.a = 2; console.log(r.a);`, refused: "in" },
+  { id: "in-any-write", src: `const r = { a: 1 }; const a: any = r; a.a = 2; console.log(r.a);` } /* U1a: shared now, matches Node */,
   // A typed array into `unknown`, pushed to afterwards.
-  { id: "in-later-push", src: `const xs = [1, 2]; const u: unknown = xs; xs.push(3); console.log(u);`, refused: "in" },
-  { id: "in-later-write", src: `const r = { n: 1 };\nconst u: unknown = r;\nr.n = 2;\nconsole.log(u);`, refused: "in" },
-  { id: "in-object-slot", src: `const xs = [1, 2];\nconst o: object = xs;\nxs.push(3);\nconsole.log(o);`, refused: "in" },
+  { id: "in-later-push", src: `const xs = [1, 2]; const u: unknown = xs; xs.push(3); console.log(u);` } /* U1a: shared now, matches Node */,
+  { id: "in-later-write", src: `const r = { n: 1 };\nconst u: unknown = r;\nr.n = 2;\nconsole.log(u);` } /* U1a: shared now, matches Node */,
+  { id: "in-object-slot", src: `const xs = [1, 2];\nconst o: object = xs;\nxs.push(3);\nconsole.log(o);` } /* U1a: shared now, matches Node */,
   {
     id: "in-nested-shared",
     src: `const shared = { n: 1 };
 const u: unknown = { inner: shared };
 shared.n = 2;
 console.log(u);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
-  { id: "in-param-write", src: `function bump(x: any) { x.n = 5; }\nconst r = { n: 1 };\nbump(r);\nconsole.log(r.n);`, refused: "in" },
+  { id: "in-param-write", src: `function bump(x: any) { x.n = 5; }\nconst r = { n: 1 };\nbump(r);\nconsole.log(r.n);` } /* U1a: shared now, matches Node */,
   {
     id: "in-dynamic-call-write",
     src: `const bump: any = (x: any) => { x.n = 5; };
 const r = { n: 1 };
 bump(r);
 console.log(r.n);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   {
     id: "in-listener-write",
@@ -172,7 +176,8 @@ console.log(r.n);`,
 const a: unknown = r;
 const b: unknown = r;
 console.log(a === b);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   {
     id: "in-pushed-into-dynamic",
@@ -181,7 +186,8 @@ const list: any = JSON.parse("[]");
 list.push(r);
 r.n = 2;
 console.log(list);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // A typed callback parameter on a dynamic call receives a copy.
   {
@@ -220,7 +226,8 @@ console.log(out);`,
 const o = { n: 1 };
 new A(o);
 console.log(o);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // The plugin pattern: a method reached through a virtual call.
   {
@@ -232,7 +239,8 @@ const ctx = { tags: [] as string[], log: 0 };
 const ps: Plugin[] = [new Tag(), new Log()];
 for (const p of ps) p.apply(ctx);
 console.log(ctx);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // An async function's result reaches its caller through the promise.
   {
@@ -240,7 +248,8 @@ console.log(ctx);`,
     src: `const o = { n: 1 };
 async function f(): Promise<any> { return o; }
 f().then((v) => { v.n = 2; console.log(o.n); });`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   {
     id: "in-async-result-await",
@@ -252,7 +261,8 @@ async function main() {
   console.log(a);
 }
 main();`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // A generator's yield reaches its caller through the iterator.
   {
@@ -262,7 +272,8 @@ const d: any = a;
 function* g(): Generator<any> { yield d; }
 for (const v of g()) v.push(2);
 console.log(a);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   {
     id: "in-generator-yield-next",
@@ -272,7 +283,8 @@ const it = g();
 const r = it.next();
 r.value.push(2);
 console.log(a);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // A function value called through a binding: the call reaches it.
   {
@@ -282,7 +294,8 @@ const g = f;
 const r = { n: 1 };
 g(r);
 console.log(r.n);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   {
     id: "in-callback-param-write",
@@ -290,7 +303,8 @@ console.log(r.n);`,
 const xs = [{ n: 1 }];
 each(xs, (x: any) => { x.n = 5; });
 console.log(xs[0].n);`,
-    refused: "in",
+    // Unit U1a: the dynamic world is shared now (S014's U1a amendment) —
+    // no copy, so the program runs and matches Node.
   },
   // ── unobservable: exact ────────────────────────────────────────────
   {
