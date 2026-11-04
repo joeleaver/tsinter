@@ -2497,7 +2497,10 @@ test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", a
       // function; Node fixes the name at definition.
       "[alias] [realName]",
       "[got]", // S020 — Node: "[innerFn2]"
-      "[] []", // S020 — Node: "[inner] [passed]"
+      // S020 — Node: "[inner] [passed]". The thunk's result has no binding
+      // (anonymous); `passed` is re-boxed at `f as unknown` inside takesFn
+      // (unit U1a: a cast to unknown boxes there), whose binding is `f`.
+      "[] [f]",
       // S020's four length shapes, in order: def / def2 / opt / mix.
       // Node: "1 0 2 2" — only `opt` (the `?` marker, which erases and so
       // gets counted on both lanes) agrees, and `mix` shows the split

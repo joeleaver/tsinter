@@ -326,13 +326,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     at.push({ fn: curFn, top: curTop });
   };
   const identity = new Set<string>();
-  const escaped: { t: IrType; w: boolean }[] = [];
+  const escaped: { t: IrType; w: boolean; view: boolean }[] = [];
   const escapedKeys = new Set<string>();
-  const escape = (t: IrType, w: boolean): void => {
-    const k = `${w ? "w" : "r"}${tkey(t)}`;
+  /** `view`: the value escapes only as the argument of a view factory
+   * (island-views.ts) — dynamic code reaches it through the view, whose
+   * stores are noted as dynamic writes where they are made. */
+  const escape = (t: IrType, w: boolean, view = false): void => {
+    const k = `${w ? "w" : "r"}${view ? "v" : ""}${tkey(t)}`;
     if (escapedKeys.has(k)) return;
     escapedKeys.add(k);
-    escaped.push({ t, w });
+    escaped.push({ t, w, view });
   };
   /** Dynamic crossings (S125 (c)): every dynFrom of a value that holds a
    * reference, every dynCheck into one, and every typed function boxed
@@ -465,6 +468,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     switch (pk) {
       case "recordGet":
         return key === "obj" && !parent["spreadCopy"] ? "read" : "other";
+      // An index-signature read: a key observation, and — when the value
+      // it answers is composite — a part of the record read out (whose
+      // own uses are followed like a recordGet's).
+      case "recordKeyGet":
+        return key === "obj" ? "read" : "other";
       case "fieldGet":
       case "arrayGet":
       case "toBool":
@@ -622,7 +630,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const [anc, key] = stack[i]!;
     const ak = anc["kind"] as string;
     const elemFree = t.kind !== "array" || !hasRef(t.elem);
-    if ((ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr")) {
+    if ((ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "recordKeyGet" && key === "obj") || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr")) {
       return { ok: !hasRef(anc["type"] as IrType) };
     }
     if ((ak === "recordSet" || ak === "fieldSet" || ak === "recordKeySet") && key === "obj") return { ok: true, stored: [anc["value"] as IrExpr] };
@@ -691,7 +699,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     for (;;) {
       const [anc, key] = stack[i]!;
       const ak = anc["kind"];
-      const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
+      const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "recordKeyGet" && key === "obj") || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
       if (!read || i === 0) break;
       i = forwardFrom(i - 1);
     }
@@ -732,7 +740,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     for (;;) {
       const [anc, key] = stack[i]!;
       const ak = anc["kind"];
-      const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
+      const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "recordKeyGet" && key === "obj") || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
       if (!read) break;
       part = anc["type"] as IrType;
       if (!hasRef(part)) return true;
@@ -767,7 +775,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const t = r["type"] as IrType | undefined;
     // A composite VALUE in a non-transparent position escapes.
     if (mode !== "t" && t !== undefined && r["loc"] !== undefined && isComposite(t) && k !== "slotUndef") {
-      escape(t, mode === "w");
+      const viewArg = (parent !== null && parent["kind"] === "call" && pkey === "args" && /^%view\.\d+$/.test(parent["callee"] as string)) ||
+        /^%view\./.test(curFn);
+      escape(t, mode === "w", viewArg);
     }
     if (k === "varRef" && parent) {
       // A pass-through check answers its argument: the use is its own
@@ -784,7 +794,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       for (;;) {
         const [anc, key] = stack[j]!;
         const ak = anc["kind"];
-        const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
+        const read = (ak === "recordGet" && key === "obj" && !anc["spreadCopy"]) || (ak === "recordKeyGet" && key === "obj") || (ak === "fieldGet" && key === "obj") || (ak === "arrayGet" && key === "arr");
         if (!read) break;
         part = anc["type"] as IrType;
         j--;
@@ -1176,6 +1186,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   for (const e of escaped) reachType(e.t);
   into = reachW;
   for (const e of escaped) if (e.w) reachType(e.t);
+  // The same, without view-factory escapes (S125 (c)'s judgment: see escape).
+  const reachWDyn = new Set<string>();
+  into = reachWDyn;
+  for (const e of escaped) if (e.w && !e.view) reachType(e.t);
 
   // A constructor that hands `this` to anything other than its own field
   // accesses (or its base constructor) lets the instance escape before
@@ -1245,8 +1259,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * (which runs once), in a top-level statement before the copy's, has
    * already happened; everything else (a write in any other function, a
    * closure, a later statement) counts. */
+  let judgingDyn = false;
   const isWritten = (t: IrType, fields: string[] | undefined, site: Site | null, during: Set<string> | null = null, deadAfter: { fn: string; top: number } | null = null): boolean => {
-    if (reachW.has(tkey(t))) return true;
+    if ((judgingDyn ? reachWDyn : reachW).has(tkey(t))) return true;
     // A TRANSIENT copy (handed to a parameter that never lets it go) dies
     // when the call returns: only a write in a function the call can run
     // (`during`) can meet it. A copy whose binding is last read in
@@ -1254,6 +1269,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // write that function makes in a later statement.
     const counts = (key: string): boolean =>
       (written.get(key) ?? []).some((w) =>
+        // Judging a dynamic crossing (S125 (c)): a view accessor's own write
+        // (island-views.ts) runs only for a store through that view, which
+        // is noted as a dynamic write on its receiver where it is made.
+        !(judgingDyn && /^%view\./.test(w.fn)) &&
         !(deadAfter !== null && w.fn === deadAfter.fn && w.top > deadAfter.top) &&
         (during !== null ? during.has(w.fn) : !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top)));
     const fs = fields ?? fieldNames(t);
@@ -2756,6 +2775,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
 
     const reportedDyn = new Set<string>();
     const judgedFns = new Map<string, { why: string; what: string } | null>();
+    judgingDyn = true;
     for (const s of dynSites) {
       let why: string | null = null;
       let feature = "";
@@ -2840,5 +2860,6 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       reportedDyn.add(at);
       L.pushDiag(unsupportedDiag("SC1090", s.loc, `${feature}: it would be a COPY where JavaScript shares the object, and ${why} (SEMANTICS.md S125)`, hint));
     }
+    judgingDyn = false;
   }
 }

@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { afterArgs, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
+import { afterArgs, asDynOperand, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -842,8 +842,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const mapped = L.mapTypeOf(L.typeOf(node));
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return raw;
-    const boxed: IrExpr | null = raw.type.kind === "dyn"
-      ? raw
+    // One world (U1a): an island value is the dyn value the check reads.
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic && !L.engine)
+      ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
         : null;
@@ -892,8 +893,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const mapped = L.mapTypeOf(L.typeOf(node));
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return null;
-    const boxed: IrExpr | null = raw.type.kind === "dyn"
-      ? raw
+    // One world (U1a): an island value is the dyn value the check reads.
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic && !L.engine)
+      ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
         : null;
@@ -3638,7 +3640,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (member === "stringify") {
       const indent = stringifySpaceIndent(L, call);
       const argNode = call.arguments[0]!;
-      const value = L.lowerExpr(argNode);
+      const value0 = L.lowerExpr(argNode);
+      // One world (U1a): an island value is the \$dyn value the dyn ROOT
+      // arm below serializes — with S119's undefined result for a dropped
+      // root (GH #102), where the engine arm answers the text.
+      const value = L.sharedDynamic && !L.engine ? asDynOperand(value0) : value0;
       // An ISLAND value (`JSON.stringify(err)` on a package handle — the
       // island error-inspection idiom): the ENGINE's own JSON.stringify
       // runs, so key order, nesting, toJSON, and getters match Node by

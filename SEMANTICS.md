@@ -1142,7 +1142,10 @@ inner function's own name. And a value boxed inside a CONVERTING
 COMPOSITE — a union arm, a thunk's result, an adapter's argument — has
 no binding to read at all, so it is ANONYMOUS and answers the empty
 string where Node answers the real name: a function returned through a
-boxed call, or handed back out of one, loses its name entirely.
+boxed call, or handed back out of one, loses its name entirely. *(Unit
+U1a, TypeScript programs on the wasm lanes: a cast `f as unknown` is a box
+site too, so a function re-boxed there answers that binding's spelling —
+"f" — where Node answers its definition's name.)*
 
 **`f.length` is the DECLARED parameter count**, where JS stops counting
 at the first parameter with a DEFAULT. The two markers that look alike

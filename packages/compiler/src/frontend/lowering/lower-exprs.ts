@@ -8527,6 +8527,13 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       if (!L.boundarySafe(target) && L.sharedDynamic) {
         return lowerDynCastTo(L, expr, asDynOperand(inner), target);
       }
+      // A scalar target takes the checked-dynamic cast too (its failure
+      // names the path, `expected number at $, got string`, S009); composite
+      // targets keep the island exit below, which unwraps a program's own
+      // view instead of copying it.
+      if (L.sharedDynamic && !L.engine && (target.kind === "f64" || target.kind === "bool" || target.kind === "string")) {
+        return { kind: "dynCheck", value: asDynOperand(inner), type: target, loc: locOf(expr) };
+      }
       if (!L.boundarySafe(target)) {
         L.unsupported(
           "SC1090",
