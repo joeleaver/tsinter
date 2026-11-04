@@ -3499,7 +3499,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // receiver, then the static string/regex tables, the runtime's
       // receiver-kind dispatch) answers every method it answered for
       // `unknown` — the island dispatch knows far fewer.
-      if (L.sharedDynamic && !L.engine) {
+      if (L.sharedDynamic) {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
       }
@@ -4694,7 +4694,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     if (recvTs.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || anyArray) {
       recv = L.lowerExpr(access.expression);
       // One world (U1a): the island receiver is the same \$dyn value.
-      if (L.sharedDynamic && !L.engine) recv = asDynOperand(recv);
+      if (L.sharedDynamic) recv = asDynOperand(recv);
     } else {
       // A checker-TYPED spelling whose VALUE is still checked-dynamic (an
       // evolving `let h = {}` object flowing back out of a JS helper —

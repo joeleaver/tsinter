@@ -570,8 +570,11 @@ test("G16 GEN: B-i: spreading a generator of closures", async () => {
 });
 
 test("G17 GEN: B-i: a void yield as a call operand", async () => {
-  const { diagnostics, survey } = await refuseRow("G17", "function show(x: unknown): void { console.log(\"show\", x); }\nfunction* g(): Generator<number, void, void> { show(yield 1); console.log(\"end\"); }\nconst it = g();\nit.next(); it.next();", "ts");
-  expect(diagnostics).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a lifts B-i: a void value enters 'unknown' as undefined, after its effects (Node's answer).
+  const { stdout, stderr, exitCode } = await runRow("G17", "function show(x: unknown): void { console.log(\"show\", x); }\nfunction* g(): Generator<number, void, void> { show(yield 1); console.log(\"end\"); }\nconst it = g();\nit.next(); it.next();", "ts");
+  expect(stdout).toBe("show undefined\nend\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("G18 GEN: async twin of G07: a loop box in a try with a finally and an early break, read after the await", async () => {
@@ -679,18 +682,27 @@ test("H07 HOISTVOID: control: a void await returned", async () => {
 });
 
 test("H08 HOISTVOID: B-i: a void await as a call argument", async () => {
-  const { diagnostics, survey } = await refuseRow("H08", "async function v(): Promise<void> { console.log(\"v ran\"); }\nfunction show(x: unknown): void { console.log(\"show\", x); }\nasync function f(): Promise<void> { show(await v()); console.log(\"after\"); }\nf();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(diagnostics).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a lifts B-i: a void value enters 'unknown' as undefined, after its effects (Node's answer).
+  const { stdout, stderr, exitCode } = await runRow("H08", "async function v(): Promise<void> { console.log(\"v ran\"); }\nfunction show(x: unknown): void { console.log(\"show\", x); }\nasync function f(): Promise<void> { show(await v()); console.log(\"after\"); }\nf();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("v ran\nsync\nshow undefined\nafter\nobs\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("H09 HOISTVOID: B-i: two void call arguments", async () => {
-  const { diagnostics, survey } = await refuseRow("H09", "async function v(tag: string): Promise<void> { console.log(\"v\", tag); }\nfunction two(a: unknown, b: unknown): void { console.log(\"two\", a, b); }\nasync function f(): Promise<void> { two(await v(\"a\"), await v(\"b\")); }\nf();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(diagnostics).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a lifts B-i: a void value enters 'unknown' as undefined, after its effects (Node's answer).
+  const { stdout, stderr, exitCode } = await runRow("H09", "async function v(tag: string): Promise<void> { console.log(\"v\", tag); }\nfunction two(a: unknown, b: unknown): void { console.log(\"two\", a, b); }\nasync function f(): Promise<void> { two(await v(\"a\"), await v(\"b\")); }\nf();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("v a\nsync\nv b\nobs\ntwo undefined undefined\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("H10 HOISTVOID: B-i: void awaits as call arguments with side effects", async () => {
-  const { diagnostics, survey } = await refuseRow("H10", "let log: string[] = [];\nasync function v(): Promise<void> { log.push(\"v\"); }\nfunction tick(tag: string): number { log.push(tag); return 1; }\nfunction three(a: number, b: unknown, c: number): void { log.push(\"three\"); }\nasync function f(): Promise<void> { three(tick(\"a\"), await v(), tick(\"c\")); console.log(log.join(\",\")); }\nf();\nconsole.log(\"sync\");", "ts");
-  expect(diagnostics).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a lifts B-i: a void value enters 'unknown' as undefined, after its effects (Node's answer).
+  const { stdout, stderr, exitCode } = await runRow("H10", "let log: string[] = [];\nasync function v(): Promise<void> { log.push(\"v\"); }\nfunction tick(tag: string): number { log.push(tag); return 1; }\nfunction three(a: number, b: unknown, c: number): void { log.push(\"three\"); }\nasync function f(): Promise<void> { three(tick(\"a\"), await v(), tick(\"c\")); console.log(log.join(\",\")); }\nf();\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\na,v,c,three\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("H11 HOISTVOID: B-i: console.log of a void await", async () => {
@@ -699,8 +711,11 @@ test("H11 HOISTVOID: B-i: console.log of a void await", async () => {
 });
 
 test("H12 HOISTVOID: B-i: a void await in a template", async () => {
-  const { diagnostics, survey } = await refuseRow("H12", "async function v(): Promise<void> {}\nasync function f(): Promise<void> { console.log(`t:${await v()}`); }\nf();\nconsole.log(\"sync\");", "ts");
-  expect(diagnostics).toEqual(["SC2011:values of type 'void' have no static representation but run in the embedded dynamic engine, which this build does not include"]);
+  // Unit U1a lifts B-i: a void value enters 'unknown' as undefined, after its effects (Node's answer).
+  const { stdout, stderr, exitCode } = await runRow("H12", "async function v(): Promise<void> {}\nasync function f(): Promise<void> { console.log(`t:${await v()}`); }\nf();\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nt:undefined\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ============================================================

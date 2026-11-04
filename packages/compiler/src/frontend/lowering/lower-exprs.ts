@@ -700,7 +700,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // a Map/Set, a RegExp, an accessor inside) builds statically, as
         // it did when `any` had no mapping; its consumer takes the typed
         // value (inspect, console.log) or the checked-dynamic box.
-        if (L.sharedDynamic && !L.engine) {
+        if (L.sharedDynamic) {
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
           // An argument of a STANDARD-LIBRARY call whose parameter is
@@ -2806,7 +2806,7 @@ function parenIsWriteReceiver(paren: ts.Expression): boolean {
     // One world (U1a): an island value narrowed by `instanceof Error` takes
     // the checked-dynamic arm's validated %Error extraction above (the
     // same \$dyn value; SEMANTICS.md 67's rebuild).
-    if (expr.type.kind === "jsval" && L.sharedDynamic && !L.engine) {
+    if (expr.type.kind === "jsval" && L.sharedDynamic) {
       const narrowed = L.mapTypeOf(L.typeOf(node));
       if (narrowed?.kind === "object" && narrowed.className === "%Error") {
         return { kind: "dynCheck", value: asDynOperand(expr), type: narrowed, loc: expr.loc };
@@ -7695,7 +7695,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     // One world (U1a, SEMANTICS.md S015): a keyed read that misses on a key
     // naming an inherited member ends at a named fence instead of the
     // own-only `undefined`.
-    const read: IrExpr = L.sharedDynamic && !L.engine && obj.type.kind === "jsval" && key.type.kind === "jsval"
+    const read: IrExpr = L.sharedDynamic && obj.type.kind === "jsval" && key.type.kind === "jsval"
       ? { kind: "call", callee: inheritedKeyReadHelper(L, loc), args: [obj, key], type: JSVAL, loc }
       : { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
     if (!expr.questionDotToken) {
@@ -8389,7 +8389,16 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       pieces.push(
         stringWrapperToString(L, span.expression) ??
           L.caughtToString(span.expression) ??
-          L.ensureString(L.lowerExpr(span.expression), span.expression),
+          ((): IrExpr => {
+            const v = L.lowerExpr(span.expression);
+            // One world (U1a): a `void` substitution is its effects, then
+            // "undefined" (an awaited Promise<void>).
+            if (v.type.kind === "void" && L.sharedDynamic) {
+              const sl = locOf(span.expression);
+              return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: v, loc: sl }], result: { kind: "strLit", value: "undefined", type: STRING, loc: sl }, type: STRING, loc: sl };
+            }
+            return L.ensureString(v, span.expression);
+          })(),
       );
       if (span.literal.text !== "") {
         pieces.push({ kind: "strLit", value: span.literal.text, type: STRING, loc: locOf(span.literal) });
@@ -8531,7 +8540,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // names the path, `expected number at $, got string`, S009); composite
       // targets keep the island exit below, which unwraps a program's own
       // view instead of copying it.
-      if (L.sharedDynamic && !L.engine && (target.kind === "f64" || target.kind === "bool" || target.kind === "string")) {
+      if (L.sharedDynamic && (target.kind === "f64" || target.kind === "bool" || target.kind === "string")) {
         return { kind: "dynCheck", value: asDynOperand(inner), type: target, loc: locOf(expr) };
       }
       if (!L.boundarySafe(target)) {
@@ -8691,7 +8700,7 @@ const INHERITED_BY_KIND: [("array" | "string" | "function" | "number" | "boolean
  * (chain-guarded) read, and every read outside those programs stay as
  * they are. */
 function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
-  if (e.kind !== "dynKeyGet" || !L.sharedDynamic || L.engine || e.optional) return e;
+  if (e.kind !== "dynKeyGet" || !L.sharedDynamic || e.optional) return e;
   if (e.key.kind === "strLit" && !INHERITED_NAMES.has(e.key.value)) return e;
   const loc = e.loc;
   const call: IrExpr = {
@@ -10012,7 +10021,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
             const inner = unparen(recv.expression);
             const obj0 = probeLower(L, inner);
             // One world (U1a): an island value is the same \$dyn value.
-            const obj = obj0 && L.sharedDynamic && !L.engine ? asDynOperand(obj0) : obj0;
+            const obj = obj0 && L.sharedDynamic ? asDynOperand(obj0) : obj0;
             if (obj?.type.kind === "dyn") {
               keyed = {
                 kind: "dynKeyGet",
@@ -10210,7 +10219,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * dyn-keyed special cases claim island operands too. */
   export function probeLowerDyn(L: Lowerer, node: ts.Expression): IrExpr | null {
     const e = probeLower(L, node);
-    return e !== null && L.sharedDynamic && !L.engine ? asDynOperand(e) : e;
+    return e !== null && L.sharedDynamic ? asDynOperand(e) : e;
   }
 
   export function probeLower(L: Lowerer, node: ts.Expression): IrExpr | null {
@@ -10275,7 +10284,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // been thrown, so the caught payload takes `unknown`'s conversion
     // (the error encoding / snapshot, SEMANTICS.md S021) as the same \$dyn
     // value under the island type.
-    if (narrowed?.kind === "jsval" && L.sharedDynamic && !L.engine) {
+    if (narrowed?.kind === "jsval" && L.sharedDynamic) {
       return { kind: "jsMarshal", value: { kind: "caughtToDyn", value: ref, type: DYN, loc }, type: JSVAL, loc };
     }
     if (narrowed?.kind === "jsval") {
@@ -10817,7 +10826,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           if (k.type.kind === "f64" || k.type.kind === "string" || k.type.kind === "dyn") {
             k = undefinedAsText(L, L.ensureString(k, expr.left), loc);
             const recvD0 = L.lowerExpr(expr.right);
-            const recvD = L.sharedDynamic && !L.engine ? asDynOperand(recvD0) : recvD0;
+            const recvD = L.sharedDynamic ? asDynOperand(recvD0) : recvD0;
             if (recvD.type.kind === "dyn") {
               // S015 (lead ruling): the not-own path asks whether the key
               // names an Object.prototype member (the named fence).
@@ -10863,7 +10872,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // The one-world lanes: an island receiver is the same \$dyn value, and
     // the checked-dynamic `in` below answers it (S015's lead ruling kept).
     const recv0 = L.lowerExpr(expr.right);
-    const recv = L.sharedDynamic && !L.engine ? asDynOperand(recv0) : recv0;
+    const recv = L.sharedDynamic ? asDynOperand(recv0) : recv0;
     // GH #109 (S125): a folded `in` reads the receiver's KEYS — a width
     // copy of a wider value would answer for the copy's.
     L.keyObservedTypes.push(recv.type);
@@ -12504,7 +12513,7 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
         if (rhs.type.kind !== "f64") L.unsupported("SC1043", access);
         const value: IrExpr = { kind: "bin", op, left: cur, right: rhs, type: F64, loc };
         const recv20 = L.lowerExpr(access.expression);
-        const recv2 = L.sharedDynamic && !L.engine ? asDynOperand(recv20) : recv20;
+        const recv2 = L.sharedDynamic ? asDynOperand(recv20) : recv20;
         const boxed: IrExpr = { kind: "dynFrom", value, type: DYN, loc };
         return {
           kind: "exprStmt",

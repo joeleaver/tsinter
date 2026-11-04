@@ -3162,7 +3162,10 @@ function validateFunction(
         // function type (the checked-dynamic tree's function kind — canConvertToDyn folds
         // all four in).
         const vt = e.value.type;
-        if (!canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
+        // The WasmGC lanes box every promise by reference: a jsval payload
+        // rides the dyn payload's slot (the emitter's promise arm).
+        const wasmPromise = undefSlots && vt.kind === "promise" && (vt.inner.kind === "jsval" || vt.inner.kind === "dyn");
+        if (!wasmPromise && !canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
           err(`dynFrom of non-dyn-convertible type ${vt.kind}`, e.loc);
         }
         break;

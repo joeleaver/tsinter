@@ -726,6 +726,18 @@ export function ladderFenceExpr(L: Lowerer, surface: string, node: ts.Node, hint
  * this fallback for `any` (mapType answers jsval first).
  *
  * Null for void (no value exists to represent). */
+/** An array pattern the checked-dynamic pattern arm lowers whole in a
+ * TypeScript source: identifiers (with or without defaults), holes and
+ * nested array patterns of the same — no rest element, no object pattern. */
+function dynArmPattern(p: ts.ArrayBindingPattern): boolean {
+  return p.elements.every((el) => {
+    if (ts.isOmittedExpression(el)) return true;
+    if (el.dotDotDotToken) return false;
+    const n = el.name;
+    return n !== undefined && (ts.isIdentifier(n) || (ts.isArrayBindingPattern(n) && dynArmPattern(n)));
+  });
+}
+
 /** Does a binding pattern (at any depth) hold a rest element? The
  * checked-dynamic pattern arm has no rest form. */
 function patternHasRest(p: ts.ArrayBindingPattern | ts.ObjectBindingPattern): boolean {
@@ -2685,7 +2697,7 @@ export class Lowerer {
    * the reason a construct refuses: the compiled dynamic values have no
    * form for it yet. Same code; the text and hint say that. */
   private oneWorldDiag(d: ScrDiagnostic): ScrDiagnostic {
-    if (!this.sharedDynamic || this.engine) return d;
+    if (!this.sharedDynamic) return d;
     if (d.code !== "SC2010" && d.code !== "SC2011" && d.code !== "SC2012") return d;
     const m = /^(.*?) (?:have no static representation but )?(?:runs?|requires) (?:in )?the embedded dynamic engine, which this build does not include$/.exec(d.message)
       ?? /^(.*?) (?:have no static representation but )?run in the embedded dynamic engine, which this build does not include$/.exec(d.message);
@@ -3734,10 +3746,14 @@ export class Lowerer {
    * per closure identity) and the values the island cannot view (class
    * instances, Map/Set, records holding them, accessor records). */
   oneWorldDynBox(t: IrType): boolean {
-    if (!this.sharedDynamic || this.engine || t.kind === "dyn" || t.kind === "jsval") return false;
+    if (!this.sharedDynamic || t.kind === "dyn" || t.kind === "jsval") return false;
+    // A promise boxes itself whatever its payload (the emitter's promise
+    // arm: a dyn/jsval payload rides the same slot, any other converts at
+    // the first dynamic read, PROM_CONV).
+    if (t.kind === "promise") return true;
     if (!this.dynConvertible(t)) return false;
     if (t.kind === "func") return true;
-    return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex" && t.kind !== "promise";
+    return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex";
   }
 
   /** Can a typed value of type `t` enter the island at all (jsvalIn's
@@ -3745,7 +3761,7 @@ export class Lowerer {
   canEnterIsland(t: IrType): boolean {
     if (t.kind === "jsval" || t.kind === "dyn" || isUnitType(t)) return true;
     if (this.oneWorldDynBox(t) || this.boundarySafe(t) || this.jsvalLiftable(t)) return true;
-    if (this.sharedDynamic && !this.engine && t.kind === "object" && this.errorHierarchyClassOf(t.className)) return true;
+    if (this.sharedDynamic && t.kind === "object" && this.errorHierarchyClassOf(t.className)) return true;
     if (t.kind === "func") return canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
     if (t.kind === "promise") return islandPromisePayloadTag(t.inner) !== null;
     return t.kind === "regex";
@@ -3756,8 +3772,19 @@ export class Lowerer {
    * Error-hierarchy object crosses through the error encoding's identity
    * cache (S021), upcast to the %Error root first. */
   oneWorldDynFrom(expr: IrExpr, node: ts.Node | null): IrExpr | null {
-    if (!this.sharedDynamic || this.engine) return null;
+    if (!this.sharedDynamic) return null;
     const loc = expr.loc;
+    // A `void` value (an awaited Promise<void>, a void call as an
+    // argument): its effects, then JS's undefined.
+    if (expr.type.kind === "void") {
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "exprStmt", expr, loc }],
+        result: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc },
+        type: JSVAL,
+        loc,
+      };
+    }
     if (expr.type.kind === "object" && this.errorHierarchyClassOf(expr.type.className)) {
       return { kind: "jsMarshal", value: { kind: "dynFrom", value: this.upcastTo(expr, "%Error"), type: DYN, loc }, type: JSVAL, loc };
     }
@@ -7970,7 +7997,7 @@ export class Lowerer {
     // default build ran these patterns through, with V8's source-spelled
     // TypeErrors (dynSpell) — destructures it. Bound names typed 'any'
     // take the value back as the island value (erasure).
-    if (this.sharedDynamic && !this.engine && srcType.kind === "jsval" && ts.isArrayBindingPattern(pattern) && !patternHasRest(pattern)) {
+    if (this.sharedDynamic && srcType.kind === "jsval" && ts.isArrayBindingPattern(pattern) && dynArmPattern(pattern)) {
       const src0 = srcRef;
       srcRef = () => asDynOperand(src0());
       srcType = DYN;
@@ -7991,7 +8018,7 @@ export class Lowerer {
       // strings (dyn.iterN), and its own not-iterable text cannot spell
       // the source — V8's text (dynSpell) is thrown first, as the
       // checked-dynamic arm did.
-      if (this.sharedDynamic && !this.engine && ts.isArrayBindingPattern(pattern) && dynSpell !== undefined) {
+      if (this.sharedDynamic && ts.isArrayBindingPattern(pattern) && dynSpell !== undefined) {
         const loc = locOf(pattern);
         const d = asDynOperand(srcRef());
         const iterable: IrExpr = {
@@ -8597,7 +8624,7 @@ export class Lowerer {
       // `new Uint8Array(u)` over a dynamic value narrowed to bytes takes the
       // checked-dynamic arm's validated bytes extraction, then the static
       // copy (what `unknown` did before).
-      if (!this.engine && expr.expression.text === "Uint8Array") {
+      if ((!this.engine || this.sharedDynamic) && expr.expression.text === "Uint8Array") {
         const bytesT = this.mapTypeOf(this.typeOf(expr));
         if (bytesT?.kind === "bytes") {
           const src: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: bytesT, loc };

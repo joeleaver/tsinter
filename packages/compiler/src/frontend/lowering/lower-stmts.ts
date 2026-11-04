@@ -1413,7 +1413,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     }
     // The one-world lanes: an island source is the same \$dyn value (and
     // TypeScript `any`/`unknown` sources take V8's text too).
-    const islandSrc = L.sharedDynamic && !L.engine && init.type.kind === "jsval";
+    const islandSrc = L.sharedDynamic && init.type.kind === "jsval";
     if ((isJsSourceFile(decl.getSourceFile()) && init.type.kind === "dyn") || islandSrc) {
       const msgU = destructureNullishMessage(decl, "undefined");
       const msgN = destructureNullishMessage(decl, "null");
@@ -7738,7 +7738,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     // The one-world lanes have no engine iterator: every island source
     // takes this walk (a non-Array drains through the checked-dynamic pack,
     // the for-of the default build ran for these values).
-    const arrayMode = (L.sharedDynamic && !L.engine) || L.checker.isArrayType(L.typeOf(stmt.expression)) || L.checker.isTupleType(L.typeOf(stmt.expression));
+    const arrayMode = (L.sharedDynamic) || L.checker.isArrayType(L.typeOf(stmt.expression)) || L.checker.isTupleType(L.typeOf(stmt.expression));
     const valueOf: IrExpr = arrayMode ? rRef : { kind: "jsOp", op: "getProp", name: "value", args: [rRef], type: JSVAL, loc };
     L.scopes.push(new Map());
     try {

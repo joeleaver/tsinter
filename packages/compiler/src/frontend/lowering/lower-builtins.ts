@@ -843,7 +843,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return raw;
     // One world (U1a): an island value is the dyn value the check reads.
-    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic && !L.engine)
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic)
       ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
@@ -894,7 +894,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return null;
     // One world (U1a): an island value is the dyn value the check reads.
-    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic && !L.engine)
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic)
       ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
@@ -3644,7 +3644,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // One world (U1a): an island value is the \$dyn value the dyn ROOT
       // arm below serializes — with S119's undefined result for a dropped
       // root (GH #102), where the engine arm answers the text.
-      const value = L.sharedDynamic && !L.engine ? asDynOperand(value0) : value0;
+      const value = L.sharedDynamic ? asDynOperand(value0) : value0;
       // An ISLAND value (`JSON.stringify(err)` on a package handle — the
       // island error-inspection idiom): the ENGINE's own JSON.stringify
       // runs, so key order, nesting, toJSON, and getters match Node by

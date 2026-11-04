@@ -213,7 +213,7 @@ export function enforceLibBoundary(L: Lowerer, node: unknown): void {
       // One world (U1a): a checked-dynamic value IS the island value, and
       // a typed value takes jsvalIn's one-world entrances (the box / the
       // error encoding).
-      if (L.sharedDynamic && !L.engine) {
+      if (L.sharedDynamic) {
         if (a.type.kind === "dyn") {
           e.args[i] = { kind: "jsMarshal", value: a, type: JSVAL, loc: a.loc };
           return;
