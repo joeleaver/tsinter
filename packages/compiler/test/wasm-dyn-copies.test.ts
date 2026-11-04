@@ -294,6 +294,32 @@ console.log(xs[0].n);`,
   },
   // ── unobservable: exact ────────────────────────────────────────────
   {
+    // The gate's SECURITY 5 shape: a cast out of a caught value, read in
+    // the next statement beside a host object's property read (`r.status`),
+    // which runs no program code.
+    id: "ok-caught-cast-beside-host-read",
+    src: `async function go(): Promise<void> {
+  try {
+    const r = await fetch("http://127.0.0.1:1/");
+    let t = "";
+    try {
+      t = await r.text();
+    } catch (e) {
+      const x: unknown = e;
+      const c = x as { message: string; cause: { name: string } };
+      console.log("BODY", r.status, c.message, c.cause.name);
+      return;
+    }
+    console.log("OK", t.length);
+  } catch (e) {
+    const x: unknown = e;
+    const c = x as { message: string; cause: { code: string } };
+    console.log("ERR", c.message, c.cause.code);
+  }
+}
+go();`,
+  },
+  {
     // A part read straight off a caught value's cast, then only read.
     id: "ok-caught-cause-read",
     src: `try {

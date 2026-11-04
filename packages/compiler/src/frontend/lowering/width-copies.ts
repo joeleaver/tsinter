@@ -2346,6 +2346,25 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") c += countRefs(r[key], id);
       return c;
     };
+    /** Does the program define an accessor a property read could run
+     * (an island getter, Object.defineProperty on a dynamic value)? */
+    let accessorsMemo: boolean | null = null;
+    const accessorsDefined = (): boolean => {
+      if (accessorsMemo !== null) return accessorsMemo;
+      let found = false;
+      const scan = (n: unknown): void => {
+        if (found || n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) return n.forEach(scan);
+        const r = n as Record<string, unknown>;
+        if ((r["kind"] === "jsOp" && r["op"] === "defineGetter") || (r["kind"] === "libCall" && r["fn"] === "dyn.defineProps")) {
+          found = true;
+          return;
+        }
+        for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
+      };
+      for (const f of functions) scan(f.body);
+      return (accessorsMemo = found);
+    };
     /** The functions evaluating `node` can run, and whether that set is
      * open (callReach's rules, for one node). */
     const nodeReach = (node: unknown): { fns: Set<string>; suspends: boolean } => {
@@ -2380,6 +2399,17 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // A crossing runs code only through a function it boxes or unboxes.
           const t = k === "dynFrom" ? (r["value"] as IrExpr).type : (r["type"] as IrType);
           if (t.kind === "func" || refsOf(t).fns.length > 0) suspends = true;
+        } else if (k === "jsExit" || k === "jsUnview" || k === "jsMarshal" || k === "jsView") {
+          // Checking, viewing or marshaling a value runs no code (a function
+          // value is boxed or unboxed, not called).
+        } else if (k === "jsOp") {
+          // Island operations run code (a call, a setter, a valueOf), except
+          // tests, literals and plain reads — and a read runs a getter only
+          // where the program defines one.
+          const op = r["op"] as string;
+          const pure = ["typeof", "truthy", "not", "objLit", "arrLit", "tplStrings", "globalGet"].includes(op) ||
+            ((op === "getProp" || op === "getIdx") && !accessorsDefined());
+          if (!pure) suspends = true;
         } else if (RUNTIME_KINDS.has(k as string)) suspends = true;
         for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") scan(r[key]);
       };
