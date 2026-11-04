@@ -8619,8 +8619,12 @@ OpenSSL's own error with Node's code (`ERR_OSSL_PEM_NO_START_LINE`,
 shares the one root store `NewRootCertStore` builds — Node's bundled
 roots, the very bytes the module carries for `tls.rootCertificates`
 (`backend/wasm/tls-roots.ts`, compiled into the runner from that module),
-then the system store with `--use-system-ca` (`NODE_OPTIONS`) or
-`NODE_USE_SYSTEM_CA=1`, then `NODE_EXTRA_CA_CERTS`'s certificates;
+then the system store while Node's `--use-system-ca` is on, set as
+`node.cc` sets it (`NODE_USE_SYSTEM_CA=1` first, then `NODE_OPTIONS`, where
+`--use-system-ca` sets it and `--no-use-system-ca` clears it, any `=value`
+ignored; the same switch decides UNABLE_TO_GET_ISSUER_CERT's
+`--use-system-ca` suggestion, which the module asks for as tlsCall op 8),
+then `NODE_EXTRA_CA_CERTS`'s certificates;
 `--use-openssl-ca` puts OpenSSL's default locations in place of the bundled
 and system sets; no `X509_V_FLAG_*` is set — and a `ca` adds to the
 context's own copy (`SetCACert`, `GetCertStoreOwnedByThisSecureContext`).

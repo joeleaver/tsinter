@@ -158,12 +158,16 @@ static void options_once(void) {
           char **slot;
         } strs[] = {{"openssl-config", &opt_openssl_config}, {"tls-cipher-list", &opt_tls_cipher_list}, {"tls-keylog", &opt_tls_keylog}};
         int matched = 0;
+        /* a boolean's name ends at any '=': Node ignores the value
+         * (--use-system-ca=false sets it, --no-use-system-ca=1 clears it;
+         * measured against Node 24.18.1) */
+        size_t bl = strcspn(name, "=");
         for (size_t j = 0; j < sizeof bools / sizeof bools[0] && !matched; j++)
-          if (!strcmp(name, bools[j].name)) {
+          if (strlen(bools[j].name) == bl && !strncmp(name, bools[j].name, bl)) {
             *bools[j].flag = !neg;
             matched = 1;
           }
-        if (!strcmp(name, "use-bundled-ca") && !neg) opt_use_openssl_ca = 0;
+        if (bl == strlen("use-bundled-ca") && !strncmp(name, "use-bundled-ca", bl) && !neg) opt_use_openssl_ca = 0;
         for (size_t j = 0; j < sizeof strs / sizeof strs[0] && !matched && !neg; j++) {
           size_t ln = strlen(strs[j].name);
           if (!strncmp(name, strs[j].name, ln) && name[ln] == '=') {
