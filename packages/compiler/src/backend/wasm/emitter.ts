@@ -30729,7 +30729,10 @@ class Assembler {
               return;
             }
             this.walkExpr(e.value);
-            code.refNull(this.strType);
+            // U1a: a marshaled function carries its binding's spelling
+            // (S020), as dynFrom's box does.
+            if (e.fnName !== undefined && e.fnName !== "") this.pushStrLitInto(code, e.fnName);
+            else code.refNull(this.strType);
             code.refNull(this.strType);
             code.i32Const(0);
             code.call(box);

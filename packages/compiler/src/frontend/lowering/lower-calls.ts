@@ -3494,12 +3494,16 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       ts.isPropertyAccessExpression(expr.expression) &&
       L.isIslandExpr(expr.expression.expression)
     ) {
-      // The one-world lanes without the engine: the island value is the
-      // \$dyn value, and the checked-dynamic method machinery (validated
-      // receiver, then the static string/regex tables, the runtime's
-      // receiver-kind dispatch) answers every method it answered for
-      // `unknown` — the island dispatch knows far fewer.
-      if (L.sharedDynamic) {
+      // The one-world lanes: the island value is the \$dyn value, and the
+      // checked-dynamic method machinery (validated receiver, then the
+      // static string/regex tables, the runtime's receiver-kind dispatch)
+      // answers every method it answered for `unknown` — the island
+      // dispatch knows far fewer. Under --dynamic an `any` receiver keeps
+      // the island dispatch it always had (main's parity there).
+      const recvTs0 = L.typeOf(expr.expression.expression);
+      const recvAny = (recvTs0.flags & ts.TypeFlags.Any) !== 0 ||
+        (L.checker.isArrayType(recvTs0) && ((L.checker.getTypeArguments(recvTs0 as ts.TypeReference)[0]?.flags ?? 0) & ts.TypeFlags.Any) !== 0);
+      if (L.sharedDynamic && !(L.engine && recvAny)) {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
       }

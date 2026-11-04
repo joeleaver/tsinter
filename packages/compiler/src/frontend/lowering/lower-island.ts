@@ -183,7 +183,9 @@ import { regexCrossingChecked } from "./lower-regex.js";
       if (L.jsvalLiftable(e.type)) return L.jsvalLiftExpr(e, e.loc);
       L.unsupported("SC1090", node, boundaryIntoIslandMsg(L.fmt(e.type)));
     }
-    return { kind: "jsMarshal", value: e, type: JSVAL, loc: e.loc };
+    // U1a: a marshaled function carries its binding's spelling (S020).
+    const fnName = L.sharedDynamic && e.type.kind === "func" ? jsFuncNameOf(node) : null;
+    return { kind: "jsMarshal", value: e, ...(fnName !== null ? { fnName } : {}), type: JSVAL, loc: e.loc };
   }
 
 /** A static RegExp value as a fresh ENGINE RegExp — `new RegExp(source,

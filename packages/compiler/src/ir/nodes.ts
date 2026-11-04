@@ -5274,7 +5274,7 @@ export type IrExpr =
    * type-directed JSON serializer and the engine's JSON parser; the
    * aliasing divergence is documented in SEMANTICS.md). Result is an
    * owned (+1) jsval; the operand is borrowed. Never throws. */
-  | { kind: "jsMarshal"; value: IrExpr; type: IrType; loc: SrcLoc }
+  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; type: IrType; loc: SrcLoc }
   /** An operation on island values (--dynamic builds only), executed by
    * the embedded engine with JS-exact semantics (coercions come from
    * pinned prelude closures, not C reimplementations). `args` are

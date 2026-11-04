@@ -3752,7 +3752,11 @@ export class Lowerer {
     // the first dynamic read, PROM_CONV).
     if (t.kind === "promise") return true;
     if (!this.dynConvertible(t)) return false;
-    if (t.kind === "func") return true;
+    // A function the island marshals (a host closure whose composite
+    // results reach dynamic code as their views, S115 (a)) takes that
+    // entrance; the checked-dynamic box (its thunk copies composites) only
+    // carries the rest.
+    if (t.kind === "func") return !canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
     return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex";
   }
 
@@ -3914,6 +3918,14 @@ export class Lowerer {
       return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
     }
     if (expected.kind === "dyn" && expr.type.kind !== "dyn") {
+      // One world (U1a): a function the island marshals enters a
+      // checked-dynamic position (a routed method's callback) as that same
+      // marshal — one box either way (dynFnBox), whose composite results
+      // reach dynamic code as views (S115 (a)).
+      if (this.sharedDynamic && expr.type.kind === "func" &&
+          canMarshalTypedFuncIntoIsland(expr.type, (id) => this.shapes.get(id), (id) => this.unions.get(id))) {
+        return { kind: "dynFromJsval", value: { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }, type: DYN, loc: expr.loc };
+      }
       if (expr.kind === "unitLit" || this.dynConvertible(expr.type)) {
         return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc };
       }
@@ -6611,6 +6623,10 @@ export class Lowerer {
       const fnName = jsFuncNameOf(node);
       if (fnName !== null) e = { ...e, value: { ...e.value, fnName } };
     } else if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
+      if (this.sharedDynamic) {
+        const fnName = jsFuncNameOf(node);
+        if (fnName !== null) e = { ...e, fnName };
+      }
       this.lastHostShallow = false;
       if (this.checkHostFunctionCopies(node, expr.type)) this.checkedHostMarshals.add(e);
       if (this.lastHostShallow) this.shallowHostMarshals.add(e);

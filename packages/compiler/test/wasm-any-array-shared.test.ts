@@ -136,6 +136,11 @@ async function runCFull(id: string, src: string): Promise<{ stdout: string; stde
 
 /** A row both lanes must answer identically (wasm, and c for the native
  * island's Proxy views): the wasm stdout, after checking c agrees. */
+/** An observable exit refuses by name: S115 (d)'s text, or — unit U1a's
+ * amendment on the WasmGC lanes (SEMANTICS.md S115) — S125 (c)'s, which
+ * judges every exit as a checked copy and refuses the observable ones. */
+const EXIT_REFUSED = /^SC1090:(an '(any|unknown)' value flowing into a typed .*\(SEMANTICS\.md S115\)|(a dynamic \('unknown', 'any' or 'object'\) value checked into|a function crossing into a dynamic value,) .*it would be a COPY where JavaScript shares the object, and .*\(SEMANTICS\.md S125\))/m;
+
 async function bothRow(id: string, src: string): Promise<string> {
   const w = await runRow(`${id}-w`, src);
   expect(w.exitCode).toBe(0);
@@ -294,22 +299,35 @@ const EXIT_ROWS: [string, string][] = [
   ["H-EXIT-09 a25-element-exit", "// @dynamic\nconst o: any = { rows: [[1]] };\nconst rows: number[][] = o.rows;\nrows[0].push(2);\nconsole.log(o.rows[0].length);"],
   ["H-EXIT-10 a26-for-of-exit", "// @dynamic\nconst o: any = { rows: [[1], [2]] };\nfor (const r of o.rows as number[][]) r.push(9);\nconsole.log(o.rows[0].length);"],
   ["H-EXIT-11 a27-record-exit-field-write", "// @dynamic\ninterface P { x: number }\nconst o: any = { p: { x: 1 } };\nconst p: P = o.p;\np.x = 2;\nconsole.log(o.p.x);"],
-  ["H-EXIT-12 a29-length-write", "// @dynamic\nconst o: any = { list: [1,2,3] };\nconst t: number[] = o.list;\nt.length = 0;\nconsole.log(o.list.length);"],
   ["H-EXIT-13 a31-param-reassign-alias", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction f(xs: string[]) { let y: string[] = []; y = xs; y.push(\"q\"); }\nf(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-14 fn07c-elem-alias", "// @dynamic\nconst o: any = { items: [{ n: 1 }] };\nconst items: { n: number }[] = o.items;\nconst first = items[0];\nfirst.n = 5;\nconsole.log(`${o.items[0].n}`);"],
   ["H-EXIT-15 fn07e-record-index", "// @dynamic\nconst o: any = { m: { a: [1] } };\nconst m: Record<string, number[]> = o.m;\nm[\"a\"].push(2);\nconsole.log(`${o.m.a.length}`);"],
   ["H-EXIT-16 board #259's own shape", "// @dynamic\nconst log: any = { lines: [] };\nfunction note(out: string[], s: string): void { out.push(s); }\nnote(log.lines, \"a\");\nconsole.log(log.lines.length);"],
-  ["H-EXIT-17 an unmutated read-only exit refuses too", "// @dynamic\nconst o: any = { list: [\"x\", \"y\"] };\nconst names: string[] = o.list;\nconsole.log(names.join(\",\"));"],
-  ["H-EXIT-18 a JSON.parse result held in a binding first", "// @dynamic\nconst parsed: any = JSON.parse(\"[3,1,2]\");\nconst arr: number[] = parsed;\nconsole.log(arr.join(\",\"));"],
-  ["H-EXIT-19 an 'as' cast is an exit too", "// @dynamic\nconst o: any = { rows: [1] };\nconst r = o.rows as number[];\nconsole.log(r.length);"],
 ];
 
 for (const [name, src] of EXIT_ROWS) {
   test(`${name} refuses by name, identically on wasm and c`, async () => {
     const d = await refuseRow(name.split(" ")[0]!, src);
-    expect(d).toMatch(/^SC1090:an 'any' value flowing into a typed '.*' slot: typed storage cannot hold an island value, so this would be a COPY, and the compiler cannot see that nothing else holds the value \(SEMANTICS\.md S115\) — keep the slot 'any'\/'any\[\]' so both sides share one value, or copy explicitly where the copy is meant: \[\.\.\.x\] or \{ \.\.\.x \}/m);
+    expect(d).toMatch(EXIT_REFUSED);
   });
 }
+
+test("H-EXIT-17 an unmutated read-only exit refuses too — unit U1a: a judged copy nothing can tell apart runs (S115 (d) amendment), matching Node", async () => {
+  expect(await bothRow("H-EXIT-17", "// @dynamic\nconst o: any = { list: [\"x\", \"y\"] };\nconst names: string[] = o.list;\nconsole.log(names.join(\",\"));")).toBe("x,y\n");
+});
+
+test("H-EXIT-18 a JSON.parse result held in a binding first — unit U1a: a judged copy nothing can tell apart runs (S115 (d) amendment), matching Node", async () => {
+  expect(await bothRow("H-EXIT-18", "// @dynamic\nconst parsed: any = JSON.parse(\"[3,1,2]\");\nconst arr: number[] = parsed;\nconsole.log(arr.join(\",\"));")).toBe("3,1,2\n");
+});
+
+test("H-EXIT-19 an 'as' cast is an exit too — unit U1a: a judged copy nothing can tell apart runs (S115 (d) amendment), matching Node", async () => {
+  expect(await bothRow("H-EXIT-19", "// @dynamic\nconst o: any = { rows: [1] };\nconst r = o.rows as number[];\nconsole.log(r.length);")).toBe("1\n");
+});
+
+test("H-EXIT-12 a29-length-write refuses by name — unit U1a: the exit is a judged copy now, and the typed array's length write is the refusal (no typed-array length write on any lane, before or after U1a)", async () => {
+  const d = await refuseRow("H-EXIT-12", "// @dynamic\nconst o: any = { list: [1,2,3] };\nconst t: number[] = o.list;\nt.length = 0;\nconsole.log(o.list.length);");
+  expect(d).toMatch(/^SC1090:assignment to non-variables are not supported yet/m);
+});
 
 test("H-EXIT-20 a typed-composite callback parameter dynamic code passes data into refuses by name (Joe's ruling, STRICT)", async () => {
   const d1 = await refuseRow("H-EXIT-20", "// @dynamic\nconst cb: any = (xs: number[]) => xs.length;\nconsole.log(cb([1, 2]));");
@@ -352,37 +370,37 @@ test("H-HOST-01e a typed result handed to dynamic code shares its parts (s11b-ho
 
 test("H-FRESH-02a freshness is proven by provenance, not spelling: s02-custom-map.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02a", "// @dynamic\nconst shared = [1, 2];\nconst coll: any = { map(_f: any) { return shared; } };\nconst t: number[] = coll.map((x: any) => x);\nt[0] = 99;\nconsole.log(shared[0], t[0]);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02b freshness is proven by provenance, not spelling: s04-fnvar-reassigned.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02b", "// @dynamic\nconst shared: any = [1];\nlet mk = (): any => JSON.parse(\"[1]\");\nmk = () => shared;\nconst t: number[] = mk();\nt.push(2);\nconsole.log(shared.length, t.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02c freshness is proven by provenance, not spelling: s05-virtual.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02c", "// @dynamic\nconst shared: any = [1];\nclass A { get(): any { return JSON.parse(\"[1]\"); } }\nclass B extends A { get(): any { return shared; } }\nconst a: A = new B();\nconst t: number[] = a.get();\nt.push(2);\nconsole.log(shared.length, t.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02d freshness is proven by provenance, not spelling: s16-objmethod-reassigned.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02d", "// @dynamic\nconst shared: any = [1];\nconst o = { make: (): any => JSON.parse(\"[1]\") };\no.make = () => shared;\nconst t: number[] = o.make();\nt.push(2);\nconsole.log(shared.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02e freshness is proven by provenance, not spelling: s21b-user-response.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02e", "// @dynamic\nexport {};\nconst shared: any = { list: [1] };\nclass Response { async json(): Promise<any> { return shared; } }\nasync function main() {\n  const r = new Response();\n  const v: { list: number[] } = await r.json();\n  v.list.push(2);\n  console.log(shared.list.length);\n}\nmain();");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02f freshness is proven by provenance, not spelling: s27b-json-shadow.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02f", "// @dynamic\nexport {};\nconst shared: any = [1];\nconst JSON = { parse(_s: string): any { return shared; } };\nconst t: number[] = JSON.parse(\"[1]\");\nt.push(2);\nconsole.log(shared.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-02g freshness is proven by provenance, not spelling: s12-custom-sort.ts refuses by name", async () => {
   const d = await refuseRow("H-FRESH-02g", "// @dynamic\nconst shared = [3, 1];\nconst fresh: any = { sort() { return shared; } };\nconst t: number[] = fresh.sort();\nt[0] = 0;\nconsole.log(shared[0]);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-FRESH-03a the copy-out idioms compile as checked fresh copies (f01-config-spread.ts)", async () => {
@@ -405,29 +423,28 @@ test("H-FRESH-03e the copy-out idioms compile as checked fresh copies (g03-objas
   expect(await bothRow("H-FRESH-03e", "// @dynamic\nconst o: any = JSON.parse('{\"a\":1,\"b\":\"x\"}');\nconst r: { a: number; b: string } = Object.assign({}, o);\nr.a = 5;\nconsole.log(r.a, o.a);")).toBe("5 1\n");
 });
 
-test("H-FRESH-03f a typed-composite-element spread still refuses (its parts would be shared)", async () => {
-  const d = await refuseRow("H-FRESH-03f", "// @dynamic\nconst o: any = JSON.parse('{\"a\":[1]}');\nconst r: { a: number[] } = { ...o };\nconsole.log(r.a.length);");
-  expect(d).toMatch(/SC1090:an 'any' value flowing into a typed/);
+test("H-FRESH-03f a typed-composite-element spread — unit U1a: its judged copy nothing can tell apart runs, matching Node", async () => {
+  expect(await bothRow("H-FRESH-03f", "// @dynamic\nconst o: any = JSON.parse('{\"a\":[1]}');\nconst r: { a: number[] } = { ...o };\nconsole.log(r.a.length);")).toBe("1\n");
 });
 
 test("H-UNK-01a an 'unknown' value leaving into typed storage follows S115 (d): u01-unknown-cast.ts refuses by name", async () => {
   const d = await refuseRow("H-UNK-01a", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nconst t = u as number[];\nt.push(2);\nconsole.log(src.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-UNK-01b an 'unknown' value leaving into typed storage follows S115 (d): u04-unknown-param.ts refuses by name", async () => {
   const d = await refuseRow("H-UNK-01b", "// @dynamic\nconst src: any = { xs: [1] };\nfunction f(u: unknown): number[] { return (u as { xs: number[] }).xs; }\nconst t = f(src);\nt.push(2);\nconsole.log(src.xs.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-UNK-01c an 'unknown' value leaving into typed storage follows S115 (d): u05-unknown-guard.ts refuses by name", async () => {
   const d = await refuseRow("H-UNK-01c", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nif (Array.isArray(u)) {\n  const t: number[] = u as number[];\n  t.push(2);\n}\nconsole.log(src.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-UNK-01d an 'unknown' value leaving into typed storage follows S115 (d): s10-objassign.ts refuses by name", async () => {
   const d = await refuseRow("H-UNK-01d", "// @dynamic\nconst src: any = { a: [1] };\nconst t: { a: number[] } = Object.assign({}, src);\nt.a.push(2);\nconsole.log(src.a.length);");
-  expect(d).toMatch(/SC1090:an '(any|unknown)' value flowing into a typed/);
+  expect(d).toMatch(EXIT_REFUSED);
 });
 
 test("H-UNK-01e a typed value crossing into 'unknown' is its view (l03-unknown-lift)", async () => {
