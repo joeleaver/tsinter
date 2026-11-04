@@ -10223,7 +10223,6 @@ class Assembler {
         this.emitSetCellError(c, className, name, pushMessage, null),
       fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
-      ...((this.mod as { sharedDynamic?: true }).sharedDynamic === true ? { padIslandWrites: true } : {}),
       excKind: () => this.exc().kindG,
       strCmpU16: () => this.strCmpHelper(true),
       strSlice: () => this.strs.slice(),

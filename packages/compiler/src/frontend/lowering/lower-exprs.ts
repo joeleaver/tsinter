@@ -1917,13 +1917,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // catchable TypeError, exactly Node). Never a jsOp over a dyn —
         // the two dynamic worlds don't share a value representation.
         if (receiver.type.kind === "dyn") {
-          return {
+          return checkedDynKeyGet(L, {
             kind: "dynKeyGet",
             key: { kind: "strLit", value: expr.name.text, type: STRING, loc },
             value: receiver,
             type: DYN,
             loc,
-          };
+          });
         }
         const read: IrExpr = { kind: "jsOp", op: "getProp", name: expr.name.text, args: [receiver], type: JSVAL, loc };
         // A member the .d.ts DECLARES as a primitive exits eagerly to that
@@ -2277,7 +2277,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           const key: IrExpr = { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) };
           const opt = chainGuardedByQuestionDot(expr.expression);
           return L.maybeNarrow(
-            { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recv, type: DYN, loc },
+            checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recv, type: DYN, loc }),
             expr,
           );
         }
@@ -2308,7 +2308,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             loc,
           };
           const key: IrExpr = { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) };
-          return L.maybeNarrow({ kind: "dynKeyGet", key, value: boxed, type: DYN, loc }, expr);
+          return L.maybeNarrow(checkedDynKeyGet(L, { kind: "dynKeyGet", key, value: boxed, type: DYN, loc }), expr);
         }
       }
       // A NARROWED IteratorResult receiver (`if (!r.done) r.value` — the
@@ -2404,7 +2404,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         const key: IrExpr = { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) };
         const opt = chainGuardedByQuestionDot(expr.expression);
         return L.maybeNarrow(
-          { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recvLowered, type: DYN, loc },
+          checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recvLowered, type: DYN, loc }),
           expr,
         );
       }
@@ -7406,7 +7406,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       if (key) {
         const opt = chainGuardedByQuestionDot(expr.expression);
         return L.maybeNarrow(
-          { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recv, type: DYN, loc: locOf(expr) },
+          checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recv, type: DYN, loc: locOf(expr) }),
           expr,
         );
       }
@@ -7455,7 +7455,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
               : rawKey.type.kind === "f64"
                 ? { kind: "toString", operand: rawKey, type: STRING, loc: rawKey.loc }
                 : null;
-          if (key) return { kind: "dynKeyGet", key, value: obj, type: DYN, loc: locOf(expr) };
+          if (key) return checkedDynKeyGet(L, { kind: "dynKeyGet", key, value: obj, type: DYN, loc: locOf(expr) });
         }
         const idx = tupleLiteralIndex(expr.argumentExpression);
         if (idx === null) {
@@ -7514,7 +7514,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         if (key) {
           const opt = chainGuardedByQuestionDot(expr.expression);
           return L.maybeNarrow(
-            { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: obj, type: DYN, loc: locOf(expr) },
+            checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: obj, type: DYN, loc: locOf(expr) }),
             expr,
           );
         }
@@ -7682,7 +7682,12 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
   function islandElementRead(L: Lowerer, expr: ts.ElementAccessExpression, obj: IrExpr): IrExpr {
     const loc = locOf(expr);
     const key = L.jsvalIn(L.lowerExpr(expr.argumentExpression), expr.argumentExpression);
-    const read: IrExpr = { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
+    // One world (U1a, SEMANTICS.md S015): a keyed read that misses on a key
+    // naming an inherited member ends at a named fence instead of the
+    // own-only `undefined`.
+    const read: IrExpr = L.sharedDynamic && !L.engine
+      ? { kind: "call", callee: inheritedKeyReadHelper(L, loc), args: [obj, key], type: JSVAL, loc }
+      : { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
     if (!expr.questionDotToken) {
       const declared = L.mapTypeOf(L.typeOf(expr));
       if (
@@ -7742,7 +7747,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       if (dk.type.kind !== "string") {
         L.unsupported("SC1090", keyNode, "indexing records with non-string or non-number keys");
       }
-      return L.maybeNarrow({ kind: "dynKeyGet", key: dk, value: obj, type: DYN, loc }, expr);
+      return L.maybeNarrow(checkedDynKeyGet(L, { kind: "dynKeyGet", key: dk, value: obj, type: DYN, loc }), expr);
     }
     if (litKey !== null) {
       const field = shape.fields.find((f) => f.name === litKey);
@@ -8641,6 +8646,110 @@ function stdlibAnyArgument(L: Lowerer, expr: ts.Expression): boolean {
   const sig = L.checker.getResolvedSignature(p);
   const decl = sig ? L.checker.signatureDeclaration(sig) : undefined;
   return decl !== undefined && L.isStdlibFile(decl.getSourceFile());
+}
+
+/** Prototype member names by receiver kind (functions only, as Node's
+ * `Object.getOwnPropertyNames(<C>.prototype)` lists them; `constructor`
+ * is on every chain) — the S015 keyed-read fence's tables. */
+const INHERITED_ALL = ["constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf",
+  "toLocaleString", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "__proto__"];
+const INHERITED_BY_KIND: [("array" | "string" | "function" | "number" | "boolean"), string[]][] = [
+  ["array", ["at", "concat", "copyWithin", "fill", "find", "findIndex", "findLast", "findLastIndex", "lastIndexOf", "pop",
+    "push", "reverse", "shift", "unshift", "slice", "sort", "splice", "includes", "indexOf", "join", "keys", "entries",
+    "values", "forEach", "filter", "flat", "flatMap", "map", "every", "some", "reduce", "reduceRight", "toReversed",
+    "toSorted", "toSpliced", "with"]],
+  ["string", ["anchor", "at", "big", "blink", "bold", "charAt", "charCodeAt", "codePointAt", "concat", "endsWith",
+    "fontcolor", "fontsize", "fixed", "includes", "indexOf", "isWellFormed", "italics", "lastIndexOf", "link",
+    "localeCompare", "match", "matchAll", "normalize", "padEnd", "padStart", "repeat", "replace", "replaceAll", "search",
+    "slice", "small", "split", "strike", "sub", "substr", "substring", "sup", "startsWith", "toWellFormed", "trim",
+    "trimStart", "trimLeft", "trimEnd", "trimRight", "toLocaleLowerCase", "toLocaleUpperCase", "toLowerCase", "toUpperCase"]],
+  ["function", ["apply", "bind", "call"]],
+  ["number", ["toFixed", "toExponential", "toPrecision"]],
+];
+
+/** A checked-dynamic keyed read in a TypeScript program on the one-world
+ * lanes (U1a, SEMANTICS.md S015): routed through `%idx.inherited` so a miss
+ * on a key naming an inherited member is the named fence, not the own-only
+ * `undefined`. A literal key that names no inherited member, an optional
+ * (chain-guarded) read, and every read outside those programs stay as
+ * they are. */
+function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
+  if (e.kind !== "dynKeyGet" || !L.sharedDynamic || L.engine || e.optional) return e;
+  if (e.key.kind === "strLit" && !INHERITED_NAMES.has(e.key.value)) return e;
+  const loc = e.loc;
+  const call: IrExpr = {
+    kind: "call",
+    callee: inheritedKeyReadHelper(L, loc),
+    args: [{ kind: "jsMarshal", value: e.value, type: JSVAL, loc }, { kind: "jsMarshal", value: e.key, type: JSVAL, loc }],
+    type: JSVAL,
+    loc,
+  };
+  return { kind: "dynFromJsval", value: call, type: DYN, loc };
+}
+
+const INHERITED_NAMES: ReadonlySet<string> = new Set([...INHERITED_ALL, ...INHERITED_BY_KIND.flatMap(([, ns]) => ns)]);
+
+/** `%idx.inherited(o, k)`: the island keyed read `o[k]`, then — when it
+ * answered `undefined`, `k` is a string `o` does not own, and `k` names a
+ * member `o`'s prototype chain carries — the S015 fence (Node would answer
+ * the inherited member). Interned once per module. */
+function inheritedKeyReadHelper(L: Lowerer, loc: SrcLoc): string {
+  const hkey = "idx:inherited";
+  const hit = L.retagHelpers.get(hkey);
+  if (hit) return hit;
+  const name = `%idx.inherited.${L.retagHelpers.size}`;
+  L.retagHelpers.set(hkey, name);
+  const o: IrExpr = { kind: "varRef", localId: "o.0", type: JSVAL, loc };
+  const k: IrExpr = { kind: "varRef", localId: "k.0", type: JSVAL, loc };
+  const r: IrExpr = { kind: "varRef", localId: "r.0", type: JSVAL, loc };
+  const ks: IrExpr = { kind: "varRef", localId: "ks.0", type: STRING, loc };
+  const dynOf = (e: IrExpr): IrExpr => ({ kind: "dynFromJsval", value: e, type: DYN, loc });
+  const test = (t: "undefined" | "string" | "array" | "function" | "number" | "boolean", e: IrExpr): IrExpr =>
+    ({ kind: "dynTest", test: t, value: dynOf(e), type: BOOL, loc });
+  const or = (xs: IrExpr[]): IrExpr => xs.reduce((a, b) => ({ kind: "logical", op: "||", left: a, right: b, type: BOOL, loc }));
+  const and = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: a, right: b, type: BOOL, loc });
+  const named = (names: string[]): IrExpr =>
+    or(names.map((nm): IrExpr => ({ kind: "strEq", negated: false, left: ks, right: { kind: "strLit", value: nm, type: STRING, loc }, type: BOOL, loc })));
+  const inherited = or([named(INHERITED_ALL), ...INHERITED_BY_KIND.map(([kind, names]) => and(test(kind, o), named(names)))]);
+  const fence: IrStmt = {
+    kind: "runtimeFence",
+    code: "SC1090",
+    message: "a keyed read of a member a dynamic value inherits from its prototype (Node answers the inherited member; this tier reads own members only — SEMANTICS.md S015)",
+    loc,
+  };
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "o.0", name: "o", type: JSVAL }, { localId: "k.0", name: "k", type: JSVAL }],
+    returnType: JSVAL,
+    locals: [
+      { id: "o.0", name: "o", type: JSVAL, mutable: false },
+      { id: "k.0", name: "k", type: JSVAL, mutable: false },
+      { id: "r.0", name: "r", type: JSVAL, mutable: false },
+      { id: "ks.0", name: "ks", type: STRING, mutable: false },
+    ],
+    body: [
+      { kind: "varDecl", localId: "r.0", init: { kind: "jsOp", op: "getIdx", args: [o, k], type: JSVAL, loc }, loc },
+      {
+        kind: "if",
+        cond: and(test("undefined", r), test("string", k)),
+        then: [
+          { kind: "varDecl", localId: "ks.0", init: { kind: "dynCheck", value: dynOf(k), type: STRING, loc }, loc },
+          {
+            kind: "if",
+            cond: and({ kind: "unary", op: "!", operand: { kind: "libCall", fn: "dyn.hasOwn", args: [dynOf(o), ks], type: BOOL, loc }, type: BOOL, loc }, inherited),
+            then: [fence],
+            else_: null,
+            loc,
+          },
+        ],
+        else_: null,
+        loc,
+      },
+      { kind: "return", value: r, loc },
+    ],
+    loc,
+  });
+  return name;
 }
 
 /** An island operand (any/unknown on the one-world lanes) seen by a
@@ -11627,7 +11736,7 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
     // dyn keyed read like the unmappable-receiver path below the chain.
     if (value.type.kind === "dyn") {
       const key: IrExpr = { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) };
-      return { kind: "dynKeyGet", key, value, type: DYN, loc: locOf(expr) };
+      return checkedDynKeyGet(L, { kind: "dynKeyGet", key, value, type: DYN, loc: locOf(expr) });
     }
     if (value.type.kind === "record") {
       const shape = L.shapes.get(value.type.shapeId);
@@ -12003,13 +12112,13 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
       (target.container === "record" || target.container === "recordOvf") &&
       target.obj.type.kind === "dyn"
     ) {
-      return {
+      return checkedDynKeyGet(L, {
         kind: "dynKeyGet",
         key: { kind: "strLit", value: target.field, type: STRING, loc },
         value: target.obj,
         type: DYN,
         loc,
-      };
+      });
     }
     if (target.container === "accessor") {
       const getF = L.findMethodOn(L.classes.get(target.className) ?? null, `get:${target.field}`);

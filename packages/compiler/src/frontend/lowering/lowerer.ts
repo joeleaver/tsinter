@@ -449,10 +449,19 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
-/** Does the program carry a JavaScript source (U1a's language split)? */
-export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[]): boolean {
+/** Does the program carry a JavaScript source (U1a's language split)? A
+ * .js/.cjs/.mjs file of the program, or — under --dynamic, where package
+ * code is embedded and runs as JavaScript — any file of an npm package the
+ * program loaded (its own .d.ts included; `@types` and the TypeScript
+ * libraries are declarations of nothing embedded). */
+export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[], dynamic: boolean): boolean {
   const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
-  return moduleOrder.some(isJs) || program.getSourceFiles().some(isJs);
+  if (moduleOrder.some(isJs) || program.getSourceFiles().some(isJs)) return true;
+  if (!dynamic) return false;
+  return program.getSourceFiles().some((sf) => {
+    const f = sf.fileName.replace(/\\/g, "/");
+    return /\/node_modules\//.test(f) && !/\/node_modules\/(@types|typescript|@typescript)\//.test(f) && !/\/lib\.[^/]*\.d\.ts$/.test(f);
+  });
 }
 
 export function lowerToIr(
@@ -472,7 +481,7 @@ export function lowerToIr(
   // type mapping cannot tell a JS file's `any` from a TS file's, so a
   // per-file switch would give a function crossing between them two
   // representations. Per program there is no seam to cross.
-  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder);
+  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder, dynamic);
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -2386,7 +2395,6 @@ export class Lowerer {
             entry: ENTRY_NAME,
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
-            ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
           };
     return {
       module,
@@ -2670,7 +2678,26 @@ export class Lowerer {
   /** All diagnostics land here; while a generic instance body is lowering,
    * the instantiation context is appended so the user knows which concrete
    * types made the (source-anchored) construct fail. */
-  pushDiag(diag: ScrDiagnostic): void {
+  /** U1a: on the one-world lanes a TypeScript program's `any`/`unknown`
+   * values are compiled, so the dynamic-family texts' "runs in the
+   * embedded dynamic engine, which this build does not include" is not
+   * the reason a construct refuses: the compiled dynamic values have no
+   * form for it yet. Same code; the text and hint say that. */
+  private oneWorldDiag(d: ScrDiagnostic): ScrDiagnostic {
+    if (!this.sharedDynamic || this.engine) return d;
+    if (d.code !== "SC2010" && d.code !== "SC2011" && d.code !== "SC2012") return d;
+    const m = /^(.*?) (?:have no static representation but )?(?:runs?|requires) (?:in )?the embedded dynamic engine, which this build does not include$/.exec(d.message)
+      ?? /^(.*?) (?:have no static representation but )?run in the embedded dynamic engine, which this build does not include$/.exec(d.message);
+    if (!m) return d;
+    return {
+      ...d,
+      message: `${m[1]}: dynamic ('any'/'unknown') values are compiled on this lane, and this construct has no compiled form for them yet`,
+      hint: "the construct runs only in the embedded dynamic engine (--dynamic); narrow or validate the value to a static type first ('typeof', 'Array.isArray', or a checked cast 'x as T')",
+    };
+  }
+
+  pushDiag(diag0: ScrDiagnostic): void {
+    const diag = this.oneWorldDiag(diag0);
     const d = this.instantiationContext
       ? { ...diag, message: `${diag.message} (${this.instantiationContext})` }
       : diag;

@@ -364,10 +364,6 @@ export interface DynDeps {
    * Node may keep a hole, so `in`/Object.hasOwn over such an index fences
    * once the program has made one. */
   holesMade?: () => number;
-  /** One dynamic world (IrModule.sharedDynamic): an island index write
-   * past an array's end pads like the checked-dynamic keySet (S016)
-   * instead of fencing (S110 (f)). */
-  padIslandWrites?: boolean;
   /** The exception cell's kind global — 0 when nothing is pending. The
    * invoke helpers test it after a sub-helper that may have thrown, which
    * is C's `if (scr_exc_pending()) return NULL`. */
@@ -5706,14 +5702,6 @@ export class DynBuilder {
     return this.cached("islandSetIdx", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
       const c = new Code();
       const I = 3;
-      if (this.deps.padIslandWrites === true) {
-        c.localGet(0);
-        c.localGet(1);
-        c.localGet(2);
-        c.call(this.keySet());
-        this.mb.setBody(idx, [I32], c.bytes());
-        return;
-      }
       c.localGet(0);
       c.structGet(this.dynT(), DYN_KIND);
       c.i32Const(DK.ARR);

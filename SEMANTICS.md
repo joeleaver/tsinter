@@ -732,7 +732,7 @@ and `any[]` exceptions above share already and are not judged.
 
 **Amendment (unit U1a, wasm and wasm-native, TypeScript programs): one
 dynamic world; the typed-composite copy into a dynamic slot is retired.** In
-a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), `unknown`, `object` and `any` are one value, the island value
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), `unknown`, `object` and `any` are one value, the island value
 (docs/design/dynamic-values.md §4.1; no `--dynamic` needed). A typed record,
 array or tuple entering any of them is S115 (a)'s live view, not this
 entry's copy: a write on either side is seen on the other and `===` holds
@@ -818,16 +818,27 @@ output observed the divergence would fail the differential by
 construction; the test pins tsinter's answer (`undefined`, and `false`
 for the presence form) with Node's in a comment.
 
-**Amendment (unit U1a, wasm and wasm-native, TypeScript programs).** In
-a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry covers `any` and `object` as well as `unknown` (one
-value, S014's U1a amendment): a computed keyed read of an inherited name
-(`o["toString"]`) still answers `undefined`. A DOT read of an
-Object/Array prototype member used as a value (`o.valueOf`, `a.slice`
-without calling it) ends the program at its named fence (S122, `'Array.prototype.slice'
-on an island value is not supported yet`) instead; calls of those members
-(`o.toString()`, `o.hasOwnProperty(k)`, `a.slice(1)`) answer as in Node,
-and `in` keeps the lead ruling above. **Tested by:**
-`packages/compiler/test/wasm-u1-shared-dynamic.test.ts` (U1-S015-01).
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs): an
+inherited member read is loud.** In a TypeScript program (one with no
+JavaScript source: no .js/.cjs/.mjs file and, under `--dynamic`, no npm
+package — U1a's language split), `any`, `unknown` and `object` are one
+value, and a read of a member the value inherits from its prototype ends
+the program at a named fence (S122) instead of answering this entry's
+`undefined`: the dot form (`o.valueOf`, `a.slice` used as a value —
+`'Array.prototype.slice' on an island value is not supported yet`) and the
+keyed form, literal or computed (`o["toString"]`, `o[k]` with `k =
+"hasOwnProperty"`, `([1] as any)["map"]` — `a keyed read of a member a
+dynamic value inherits from its prototype (Node answers the inherited
+member; this tier reads own members only — SEMANTICS.md S015)`). The keyed
+check runs when the read answered `undefined`, the key is a string the
+value does not own, and it names an Object.prototype member or one of the
+receiver kind's own (Array, String, Function, Number); own members, indices
+and `length` read as before. Calls of those members (`o.toString()`,
+`o.hasOwnProperty(k)`, `a.slice(1)`) answer as in Node, and `in` keeps the
+lead ruling above. A chain-guarded read (`o?.[k]`) keeps this entry's
+`undefined`. Programs with a JavaScript source keep the body unchanged until
+U1b. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
+(U1-S015-01..04).
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -978,16 +989,19 @@ island write past the length (jsOp setIdx) now throws a named Error
 instead (S110 (f)). The checked-dynamic (`unknown`) keyed write described
 above keeps its padding.
 
-**Amendment (unit U1a, wasm and wasm-native, TypeScript programs): the
-padding is kept, and now covers `any`.** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), an index write past an
-array's length through `any`, `unknown` or `object` pads with `undefined` as
-this entry describes (the unit-H fence of the amendment above, S110 (f), is
-retired there): `a[3] = 9` on `JSON.parse("[1]")` answers `length` 4 and
-`a[1]` `undefined` as Node does, and `Object.keys` answers `0,1,2,3` where
-Node answers `0,3` — the silent case of this entry. The write sets the
-"a hole was made" flag, so `in` / `Object.hasOwn` over an index then fence
-as the GH #86 amendment says. Programs with a JavaScript source keep the
-unit-H fence for island writes. **Tested by:**
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs): island
+writes keep the unit-H fence.** In a TypeScript program (one with no
+JavaScript source: no .js/.cjs/.mjs file and, under `--dynamic`, no npm package —
+U1a's language split), `any`, `unknown` and `object` are one island value,
+and an index write past an array's length through any of them ends the
+program at S110 (f)'s named fence (S122, `tsinter: unsupported: writing an
+island array at index <k> past its length (the holes Node leaves) is not
+supported yet on the wasm lane [SC1090]`, exit 1), where this entry's
+checked-dynamic write used to pad: padding would answer every later
+observer (`forEach`, `filter`, `reduce`, `some`, `indexOf`, `map`, `sort`,
+`Object.values/entries`, printing) differently from Node's holes,
+silently. Programs with a JavaScript source keep this entry's padding as
+written until U1b. **Tested by:**
 `packages/compiler/test/wasm-u1-shared-dynamic.test.ts` (U1-PAD-01).
 
 ## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
@@ -8281,8 +8295,9 @@ the rest — are retired with that model (follow-up unit H).
   supported yet on the wasm lane` (shrinking it truncates, as in Node;
   the native engine has holes and answers as Node; the checked-dynamic
   `unknown` index write keeps S016's padding). *(Unit U1a: in a
-  TypeScript program on the wasm lanes the island write pads instead —
-  S016's U1a amendment; programs with a JavaScript source keep this fence.)* Index arguments of the
+  TypeScript program on the wasm lanes `unknown` and `object` are island
+  values too, so their index writes past the length meet this fence as
+  well — S016's U1a amendment; the fence ends the program, S122.)* Index arguments of the
   Array methods run ToNumber for strings, booleans and null; an object
   index (ToPrimitive) is a named `non-number index arguments on a dynamic
   receiver` TypeError. `keys`, `values`, `entries`, `toSpliced`,
@@ -8316,7 +8331,7 @@ S122's c/llvm island residue.*
 
 **Amendment (unit U1a, wasm and wasm-native, TypeScript programs — Joe's
 ruling J1 as carried out by unit U1a; (d) amended by the coordinator's
-ruling of 2026-11-04, option A and J4 lifted).** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry
+ruling of 2026-11-04, option A and J4 lifted).** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry
 holds WITHOUT `--dynamic`: `any`, `unknown` and `object` are the island
 value, so (a)'s views, (b)'s write checks and (c)'s wasm column apply to
 every TypeScript program. (d) is amended there: a dynamic value that is not
@@ -9536,7 +9551,7 @@ where JavaScript shares the object, and …") when the program could tell:
   value to a dynamic call counts as a write.
 
 *Unit U1a amendment (wasm and wasm-native, TypeScript programs).* In
-a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), the dynamic world is the island (S014's and S115's U1a
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), the dynamic world is the island (S014's and S115's U1a
 amendments), and (c) judges its copies: S115 (d)'s checked copies at
 locals, parameters, returns, fields, elements and casts, and the values
 that still cross into a dynamic slot by copy (class instances, Map/Set,
