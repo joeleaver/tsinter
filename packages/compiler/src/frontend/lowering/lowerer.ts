@@ -2395,6 +2395,7 @@ export class Lowerer {
             entry: ENTRY_NAME,
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
+            ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
           };
     return {
       module,
@@ -3744,9 +3745,30 @@ export class Lowerer {
   canEnterIsland(t: IrType): boolean {
     if (t.kind === "jsval" || t.kind === "dyn" || isUnitType(t)) return true;
     if (this.oneWorldDynBox(t) || this.boundarySafe(t) || this.jsvalLiftable(t)) return true;
+    if (this.sharedDynamic && !this.engine && t.kind === "object" && this.errorHierarchyClassOf(t.className)) return true;
     if (t.kind === "func") return canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
     if (t.kind === "promise") return islandPromisePayloadTag(t.inner) !== null;
     return t.kind === "regex";
+  }
+
+  /** The one-world entrance by the checked-dynamic box/copy (oneWorldDynBox)
+   * as an island value, or null when the type takes another entrance. An
+   * Error-hierarchy object crosses through the error encoding's identity
+   * cache (S021), upcast to the %Error root first. */
+  oneWorldDynFrom(expr: IrExpr, node: ts.Node | null): IrExpr | null {
+    if (!this.sharedDynamic || this.engine) return null;
+    const loc = expr.loc;
+    if (expr.type.kind === "object" && this.errorHierarchyClassOf(expr.type.className)) {
+      return { kind: "jsMarshal", value: { kind: "dynFrom", value: this.upcastTo(expr, "%Error"), type: DYN, loc }, type: JSVAL, loc };
+    }
+    if (!this.oneWorldDynBox(expr.type)) return null;
+    const fnName = expr.type.kind === "func" && node !== null ? jsFuncNameOf(node) : null;
+    return {
+      kind: "jsMarshal",
+      value: { kind: "dynFrom", value: expr, ...(fnName !== null ? { fnName } : {}), type: DYN, loc },
+      type: JSVAL,
+      loc,
+    };
   }
 
   coerceToExpected(expr: IrExpr, expected: IrType): IrExpr {
@@ -3774,9 +3796,8 @@ export class Lowerer {
       // The one-world lanes without the engine: jsvalIn's rule — a
       // function crosses as the checked-dynamic box, and a typed value the
       // island cannot view as the checked-dynamic copy (S125 (c) judges it).
-      if (this.oneWorldDynBox(expr.type)) {
-        return { kind: "jsMarshal", value: { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc }, type: JSVAL, loc: expr.loc };
-      }
+      const boxed = this.oneWorldDynFrom(expr, null);
+      if (boxed) return boxed;
       if (this.boundarySafe(expr.type)) {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
       }

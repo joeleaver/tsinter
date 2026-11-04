@@ -210,6 +210,20 @@ export function enforceLibBoundary(L: Lowerer, node: unknown): void {
         e.args[i] = { kind: "jsOp", op: a.type.kind === "undefinedT" ? "undefLit" : "nullLit", args: [], type: JSVAL, loc: a.loc };
         return;
       }
+      // One world (U1a): a checked-dynamic value IS the island value, and
+      // a typed value takes jsvalIn's one-world entrances (the box / the
+      // error encoding).
+      if (L.sharedDynamic && !L.engine) {
+        if (a.type.kind === "dyn") {
+          e.args[i] = { kind: "jsMarshal", value: a, type: JSVAL, loc: a.loc };
+          return;
+        }
+        const boxed = L.oneWorldDynFrom(a, null);
+        if (boxed) {
+          e.args[i] = boxed;
+          return;
+        }
+      }
       if (a.type.kind === "dyn") {
         fence(L, "SC1100", a.loc, "passing 'unknown' values into dynamically-executed ('any'-typed) code (validate with 'as <type>' first)");
       }

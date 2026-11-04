@@ -2803,6 +2803,16 @@ function parenIsWriteReceiver(paren: ts.Expression): boolean {
       }
       return expr;
     }
+    // One world (U1a): an island value narrowed by `instanceof Error` takes
+    // the checked-dynamic arm's validated %Error extraction above (the
+    // same \$dyn value; SEMANTICS.md 67's rebuild).
+    if (expr.type.kind === "jsval" && L.sharedDynamic && !L.engine) {
+      const narrowed = L.mapTypeOf(L.typeOf(node));
+      if (narrowed?.kind === "object" && narrowed.className === "%Error") {
+        return { kind: "dynCheck", value: asDynOperand(expr), type: narrowed, loc: expr.loc };
+      }
+      return expr;
+    }
     // instanceof narrowing for classes: tsc types this USE as a subclass of
     // the IR value's class (only a dynamic instanceof test narrows a class
     // type), so the read bridges with an unchecked static downcast — the
@@ -7685,7 +7695,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     // One world (U1a, SEMANTICS.md S015): a keyed read that misses on a key
     // naming an inherited member ends at a named fence instead of the
     // own-only `undefined`.
-    const read: IrExpr = L.sharedDynamic && !L.engine
+    const read: IrExpr = L.sharedDynamic && !L.engine && obj.type.kind === "jsval" && key.type.kind === "jsval"
       ? { kind: "call", callee: inheritedKeyReadHelper(L, loc), args: [obj, key], type: JSVAL, loc }
       : { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
     if (!expr.questionDotToken) {

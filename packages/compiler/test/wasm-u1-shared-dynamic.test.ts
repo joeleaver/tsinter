@@ -9,7 +9,7 @@
  * at its named run-time fence (S122). Rows run on the wasm lane; the
  * wasm-native describe repeats them for the cloud gate. */
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -35,8 +35,13 @@ interface Row {
   /** Further files of the program, by name. */
   files?: Record<string, string>;
   refused?: { code: string; s125?: boolean; text?: RegExp };
-  /** Ends at a run-time fence whose message matches. */
-  fence?: RegExp;
+  /** Ends at a run-time fence whose message matches, after printing
+   * exactly `stdout` (a prefix of Node's). */
+  fence?: { text: RegExp; stdout: string };
+  /** Which dynamic world the build took, read off the emitted IR module
+   * (`sharedDynamic`): "new" for a TypeScript-only program, "old" for a
+   * program with a JavaScript source. */
+  world?: "old" | "new";
 }
 
 const S125_TAIL = /it would be a COPY where JavaScript shares the object, and .* \(SEMANTICS\.md S125\) (is|are) not supported yet$/;
@@ -104,14 +109,89 @@ console.log(arr.slice(1).length);`,
     src: `const arr: any = JSON.parse("[1,2]");
 console.log("before");
 console.log(typeof arr.slice);`,
-    fence: /'Array\.prototype\.slice' on an island value is not supported yet/,
+    fence: { text: /'Array\.prototype\.slice' on an island value is not supported yet/, stdout: "before\n" },
+  },
+  {
+    id: "U1-S015-03 a keyed read of an inherited name is a named fence",
+    src: `const o: any = JSON.parse('{"a":1}');
+console.log(o["a"]);
+console.log(o["toString"]);`,
+    fence: { text: /a keyed read of a member a dynamic value inherits from its prototype .*SEMANTICS\.md S015/, stdout: "1\n" },
+  },
+  {
+    id: "U1-S015-04 a computed keyed read of an inherited name is a named fence",
+    src: `const a: any = [1, 2];
+const k = ["length", "map"];
+console.log(a[k[0]!]);
+console.log(typeof a[k[1]!]);`,
+    fence: { text: /a keyed read of a member a dynamic value inherits from its prototype/, stdout: "2\n" },
   },
   // ── S016 ─────────────────────────────────────────────────────────────
   {
-    id: "U1-PAD-01 an index write past the end pads",
+    id: "U1-PAD-01 an index write past the end is a named fence (S110 (f))",
     src: `const a: any = JSON.parse("[1]");
+a[1] = 2;
+console.log(a.length);
 a[3] = 9;
 console.log(a.length, a[1], a[3]);`,
+    fence: { text: /writing an island array at index 3 past its length \(the holes Node leaves\) is not supported yet on the wasm lane/, stdout: "2\n" },
+  },
+  // ── the U1a ports, each against Node ────────────────────────────────
+  {
+    id: "U1-ERASE-01 a double cast through unknown keeps the function itself",
+    src: `function base(a: number): void { console.log("base", a); }
+const wide: (a: number, b: string) => void = base;
+console.log(wide === (base as unknown as typeof wide));
+const f2 = base as unknown as (a: number) => void;
+console.log(f2 === base);
+f2(3);`,
+  },
+  {
+    id: "U1-BYTES-01 new Uint8Array over an unknown narrowed by instanceof copies",
+    src: `const u: unknown = new Uint8Array([1, 2]);
+if (u instanceof Uint8Array) {
+  const c = new Uint8Array(u);
+  c[0] = 9;
+  console.log(c[0], c.length, u[0]);
+}`,
+  },
+  {
+    id: "U1-CAUGHT-01 caught payloads entering unknown keep their kind",
+    src: `const describe = (x: unknown): string => x instanceof Error ? "Error " + x.message : typeof x;
+try { throw new TypeError("boom"); } catch (e) { console.log(describe(e)); }
+try { throw "str"; } catch (e) { console.log(describe(e)); }
+try { throw 42; } catch (e) { console.log(describe(e)); }`,
+  },
+  {
+    id: "U1-TEXT-06 array destructuring of a call's non-iterable result names the callee",
+    src: `const get = (): any => JSON.parse("5");
+try { const [x] = get(); console.log(x); } catch (e) { console.log((e as Error).message); }`,
+  },
+  {
+    id: "U1-DYNPARAM-01 an unknown-typed callback of a parsed array's filter",
+    src: `function globs(raw: string): string[] | null {
+  const pkg = JSON.parse(raw);
+  const w = pkg.ws;
+  if (Array.isArray(w)) return w.filter((g: unknown) => typeof g === "string");
+  return null;
+}
+console.log(globs('{"ws":["a",2,"b"]}')!.join());`,
+  },
+  {
+    id: "U1-FNCAST-01 a cast to a function with an unknown result adapts",
+    src: `const add = (a: number, b: number): number => a + b;
+const u: unknown = add;
+const loose = u as (a: number, b: number) => unknown;
+const r = loose(4, 5);
+console.log(typeof r, r as number);`,
+  },
+  {
+    id: "U1-FNCAST-02 a cast of a non-function to a function type is a named fence (S009)",
+    src: `const u: unknown = JSON.parse("5");
+const f = u as (a: number) => unknown;
+console.log("cast");
+console.log(f(1));`,
+    fence: { text: /expected function at \$, got number/, stdout: "" },
   },
   // ── S115 (d) U1a: judged copies at every exit ───────────────────────
   {
@@ -168,10 +248,16 @@ ee.emit("x", 1);`,
   },
   // ── the language seam: a program with a JS source keeps today's path ─
   {
+    id: "U1-WORLD-01 a TypeScript-only program takes the one dynamic world",
+    src: `console.log("ts only");`,
+    world: "new",
+  },
+  {
     id: "U1-SEAM-01 a TypeScript entry calls a JavaScript module",
     src: `import { twice } from "./lib.js";
 console.log(twice(21));`,
     files: { "lib.js": "export function twice(x) { return x * 2; }\n" },
+    world: "old",
   },
   {
     id: "U1-SEAM-02 a JavaScript entry calls a TypeScript module",
@@ -179,6 +265,7 @@ console.log(twice(21));`,
     src: `import { twice } from "./lib.ts";
 console.log(twice(21));`,
     files: { "lib.ts": "export function twice(x: number): number { return x * 2; }\n" },
+    world: "old",
   },
   {
     id: "U1-SEAM-03 a TypeScript function value passed into JavaScript",
@@ -186,6 +273,7 @@ console.log(twice(21));`,
 const inc = (n: number): number => n + 1;
 console.log(applyTo(inc, 41));`,
     files: { "lib.js": "export function applyTo(f, x) { return f(x); }\n" },
+    world: "old",
   },
   {
     id: "U1-SEAM-04 a JavaScript function value passed into TypeScript",
@@ -193,6 +281,7 @@ console.log(applyTo(inc, 41));`,
     src: `import { applyTo } from "./lib.ts";
 console.log(applyTo((n) => n + 1, 41));`,
     files: { "lib.ts": "export function applyTo(f: (n: number) => number, x: number): number { return f(x); }\n" },
+    world: "old",
   },
 ];
 
@@ -242,10 +331,20 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
       ? await runWasmToTrap(res.binaryPath!).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: 1 }))
       : await nativeRun(res.binaryPath!);
     expect(got.exitCode).toBe(1);
+    expect(got.stdout).toBe(row.fence.stdout);
     expect(node.stdout.startsWith(got.stdout)).toBe(true);
     expect(got.stderr).toMatch(/^tsinter: unsupported: /);
-    expect(got.stderr).toMatch(row.fence);
+    expect(got.stderr).toMatch(row.fence.text);
+    expect(got.stderr.trimEnd().split("\n")).toHaveLength(1);
     return;
+  }
+  if (row.world !== undefined) {
+    // The emitted IR module records the world the build took.
+    const withIr = await compile(entry, { outPath: join(dir, backend === "wasm" ? "w.wasm" : "wprogram"), outDir: dir, backend, emitIr: true });
+    expect(withIr.ok).toBe(true);
+    if (!withIr.ok || withIr.irPath === undefined) throw new Error(`${row.id}: no IR emitted`);
+    const mod = JSON.parse(readFileSync(withIr.irPath, "utf8")) as { sharedDynamic?: boolean };
+    expect(mod.sharedDynamic === true).toBe(row.world === "new");
   }
   expect(node.exitCode).toBe(0);
   const got: Out = backend === "wasm"

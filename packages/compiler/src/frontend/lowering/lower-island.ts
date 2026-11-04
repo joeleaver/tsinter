@@ -106,14 +106,9 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // accessor record) crosses as the checked-dynamic copy S014 made,
     // which S125 (c) judges like every copy. The \$dyn value IS the
     // island value.
-    if (L.oneWorldDynBox(e.type)) {
-      const fnName = e.type.kind === "func" ? jsFuncNameOf(node) : null;
-      return {
-        kind: "jsMarshal",
-        value: { kind: "dynFrom", value: e, ...(fnName !== null ? { fnName } : {}), type: DYN, loc: e.loc },
-        type: JSVAL,
-        loc: e.loc,
-      };
+    {
+      const boxed = L.oneWorldDynFrom(e, node);
+      if (boxed) return boxed;
     }
     if (e.type.kind === "dyn") {
       // A CHECKED-DYNAMIC value entering the island: the dyn tree

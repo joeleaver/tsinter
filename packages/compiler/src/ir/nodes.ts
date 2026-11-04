@@ -817,6 +817,12 @@ export interface IrModule {
    * an empty array and a missing record key with the slot's undefined
    * instead of trapping). Set for the WasmGC lanes only. */
   undefSlots?: true;
+  /** Unit U1a: the program took the one dynamic world (a TypeScript program
+   * on the WasmGC lanes — `any`/`unknown`/`object` are one island value);
+   * absent when it kept the checked-dynamic world (a program with a
+   * JavaScript source, every other lane). Informational: no backend reads
+   * it; tests and tools observe which world a build took. */
+  sharedDynamic?: true;
 }
 
 /** One outbound native FFI declaration, copied from the validated format-1
