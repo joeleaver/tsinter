@@ -652,21 +652,25 @@ console.log("recovered");
     expect(r.stdout).toBe("assigned 2\nnever: boom\nrecovered\n");
   });
 
-  test("a NAMED record into an `any` slot is a deep copy — a program that writes through it refuses by name (S125 (c))", async () => {
-    // dynFrom's aliasing stance (documented for 'unknown' slots) applies
-    // to any-typed storage identically: JS would alias, the dyn copies.
-    // Node prints "2 2"; the copy would print "1 2", so since GH #120 the
-    // program refuses at compile time instead.
-    await expect(
-      compileAndRun(
-        "any-record-copy",
-        `const base = { a: 1 };
+  test("a NAMED record into an `any` slot shares the object (U1a: one dynamic world, S125 (c))", async () => {
+    // Before U1a the dyn copied and the program refused by name (GH #120).
+    // Under the one dynamic world a TS program's 'any' slot holds the
+    // island value itself, so the write is seen through both names, as
+    // in Node: "2 2".
+    // The legacy c lane keeps the copy and its refusal.
+    const run = compileAndRun(
+      "any-record-copy",
+      `const base = { a: 1 };
 const boxed: any = base;
 boxed.a = 2;
 console.log(base.a, boxed.a);
 `,
-      ),
-    ).rejects.toThrow(/SC1090: a '\{ a: number \}' value converted to a dynamic .*it would be a COPY where JavaScript shares the object/);
+    );
+    if (lane === "c") {
+      await expect(run).rejects.toThrow(/SC1090: a '\{ a: number \}' value converted to a dynamic .*it would be a COPY where JavaScript shares the object/);
+      return;
+    }
+    expect((await run).stdout).toBe("2 2\n");
   });
 
   test("an uninitialized `any` binding is the dyn undefined, not a trap", async () => {

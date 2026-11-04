@@ -342,13 +342,13 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * into a dynamic value. */
   const dynSites: DynSite[] = [];
   /** Writes to dynamic values: where, and the receiver when one is known. */
-  const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[] }[] = [];
-  const noteDynWrite = (recv: IrExpr | null): void => {
+  const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[]; method?: string }[] = [];
+  const noteDynWrite = (recv: IrExpr | null, method?: string): void => {
     // A view's own accessors (island-views.ts) write only the fresh
     // values they build (a keys list, a snapshot); their stores into the
     // typed value are typed writes, noted as such.
     if (/^%view\./.test(curFn)) return;
-    dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]) });
+    dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]), ...(method !== undefined ? { method } : {}) });
   };
   /** The program compares dynamic values by identity somewhere. */
   let dynIdentity = false;
@@ -1011,7 +1011,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       }
       case "dynInvoke": {
         const m = r["method"] as string;
-        if (DYN_MUTATING.has(m)) noteDynWrite(r["recv"] as IrExpr);
+        if (DYN_MUTATING.has(m)) noteDynWrite(r["recv"] as IrExpr, m);
         if (DYN_IDENTITY.has(m)) {
           dynIdentity = true;
           dynIdentityOps.push({ e: r["recv"] as IrExpr, fn: curFn });
@@ -1054,7 +1054,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           const g0 = args[0]?.kind === "jsOp" && args[0].op === "globalGet" ? args[0].name : undefined;
           const readOnly = (op === "callMethod" || op === "optCallMethod") &&
             (JS_READING_METHODS.has(r["name"] as string) || (g0 !== undefined && staticReadsArgs(g0, r["name"] as string)) || (g0 === "Object" && r["name"] === "assign"));
-          if (!readOnly) noteDynWrite(args[0] ?? null);
+          if (!readOnly) noteDynWrite(args[0] ?? null, op === "callMethod" || op === "optCallMethod" ? (r["name"] as string) : undefined);
           // A method may write what it is handed (Object.assign's sources
           // are read, its target written — the receiver there is the
           // Object global); a store only stores.
@@ -2245,6 +2245,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     if (dynSites.length === 0) return;
     const DYN_WRITE_TO = "the program writes to dynamic values, and a write through the copy would not reach the original";
     const DYN_WRITE_FROM = "the program writes to dynamic values, and the copy would not see the write";
+    /** A record type with no member named `m` and no index signature. */
+    const recordLacks = (t: IrType, m: string): boolean => {
+      if (t.kind !== "record") return false;
+      const sh = L.shapes.get(t.shapeId);
+      return sh !== undefined && sh.indexValue === undefined && !sh.fields.some((f) => f.name === m);
+    };
     const DYN_SAME = "the program compares dynamic values by identity, and the copy is a different object";
     const ORIG_WRITTEN = "the program writes to values of the original's type, and the copy would not see the write";
     const COPY_WRITTEN = "the program writes to values of the copy's type, and a write through the copy would not reach the dynamic value";
@@ -2456,9 +2462,15 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
      * binding's value (`outOf`). With `value` (the copy, or the value a
      * copy was taken from), only a write whose receiver may be that value
      * counts (dynAliasClasses). */
-    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null, value: { e: IrExpr; fn: string } | null = null, dead: { fn: string; top: number } | null = null): boolean =>
+    const dynWritten = (site: Site | null, during: Set<string> | DynWindow | null, outOf: string | null = null, value: { e: IrExpr; fn: string } | null = null, dead: { fn: string; top: number } | null = null, refs: IrType[] | null = null): boolean =>
       dynWrites.some((w) => {
         if (dead !== null && w.fn === dead.fn && w.top > dead.top) return false;
+        // An array mutator called by name changes only its receiver, and
+        // only a receiver that has that method: a copy made of records
+        // with no member of that name (and no index signature) cannot be
+        // the receiver, so the call cannot write it. (Not with --dynamic:
+        // an engine object's own method of that name may be anything.)
+        if (!opaqueCalls && refs !== null && w.method !== undefined && DYN_MUTATING.has(w.method) && refs.every((t) => recordLacks(t, w.method!))) return false;
         if (value !== null && w.recv !== null && !alias.same(w.recv, w.fn, value.e, value.fn)) return false;
         if (freshRooted(w.recv, w.fn) && !(outOf !== null && rootKey(w.recv, w.fn) === outOf)) return false;
         if (during === null) return !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top);
@@ -2773,7 +2785,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
         if (typedSideWritten(ps, p.type, null)) return { why: COPY_WRITTEN, what };
         if (anyIdentity(refs)) return { why: COPY_IDENTITY, what };
-        if (dynWritten(null, transient ? reachFns.fns : null)) return { why: DYN_WRITE_FROM, what };
+        if (dynWritten(null, transient ? reachFns.fns : null, null, null, null, refs)) return { why: DYN_WRITE_FROM, what };
       }
       const rrefs = refsOf(f.returnType).refs;
       if (rrefs.length > 0) {

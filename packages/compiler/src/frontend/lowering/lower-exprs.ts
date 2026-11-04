@@ -4463,6 +4463,10 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         L.chainRecvByNode.delete(recvNode);
         L.chainHandled.delete(dotNode);
       }
+      // One-world lanes: a dynamic-typed receiver's method call lowers
+      // through the checked-dynamic dispatch (lower-calls.ts) — its $dyn
+      // result is the island value.
+      if (L.sharedDynamic && body.type.kind !== "jsval") body = L.jsvalIn(body, expr);
       if (body.type.kind !== "jsval") L.badType(expr, L.typeOf(expr));
       return { kind: "optChain", id, receiver, body, type: JSVAL, loc };
     }

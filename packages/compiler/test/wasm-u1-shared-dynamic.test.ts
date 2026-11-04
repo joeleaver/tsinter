@@ -284,6 +284,18 @@ function get(): unknown { return shared; }
 const xs: P[] = [get() as P];
 console.log(xs.length, xs[0]!.n);`,
   },
+  {
+    id: "U1-EXIT-11 an array mutator on the source cannot write a record parameter's copy",
+    src: `const data: any = JSON.parse('[{"a":1}]');
+data.forEach((o: { a: number }) => { data.push(1); console.log(o.a); });
+console.log(data.length);`,
+  },
+  {
+    id: "U1-EXIT-12 an array mutator reaching an array inside the parameter's copy refuses",
+    src: `const data: any = JSON.parse('[{"a":[1]}]');
+data.forEach((o: { a: number[] }) => { data[0].a.push(2); console.log(o.a.length); });`,
+    refused: { code: "SC1090", s125: true },
+  },
   // ── S042: TypeScript cannot reach the unbound listener `this` ───────
   {
     id: "U1-THIS-01 this outside a class method refuses by name",

@@ -384,7 +384,7 @@ test("TY07 TYPED: a boxed TYPED promise (gated module) adopted through both a ty
   expect(exitCode).toBe(0);
 });
 
-test("TY08 TYPED: a record-typed destination adopting an `any`-held value refuses at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
+test("TY08 TYPED: a record-typed destination adopting an `any`-held value refuses at compile time (unit H; U1a: S125 (c) judged copy, SEMANTICS.md S115 (d))", async () => {
   // The island value would enter typed storage as a COPY of a value the
   // compiler cannot see is fresh. (Before unit H the adopted record was
   // cast by the composite walker; Node: sync, o1, o2, g 3 s, np 3 s, o3..o5.)
@@ -392,7 +392,7 @@ test("TY08 TYPED: a record-typed destination adopting an `any`-held value refuse
   await writeFile(entry, "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function rec(): Promise<unknown> { return { a: 3, b: \"s\" }; }\nconst x: any = id(rec());\nasync function g(): Promise<{ a: number; b: string }> { return x; }\ng().then((v) => console.log(`g ${v.a} ${v.b}`));\n");
   const res = await compile(entry, { outPath: join(scratch, "TY08.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
   expect(res.ok).toBe(false);
-  expect(res.diagnostics.map((d) => d.message).join("\n")).toContain("an 'any' value flowing into a typed '{ a: number; b: string }' slot");
+  expect(res.diagnostics.map((d) => d.message).join("\n")).toContain("a dynamic ('unknown', 'any' or 'object') value checked into '{ a: number; b: string }': it would be a COPY where JavaScript shares the object");
 });
 
 test("TY09 TYPED: Promise.withResolvers' typed resolve adopts an any-held promise", async () => {
