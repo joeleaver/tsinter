@@ -835,8 +835,10 @@ value does not own, and it names an Object.prototype member or one of the
 receiver kind's own (Array, String, Function, Number); own members, indices
 and `length` read as before. Calls of those members (`o.toString()`,
 `o.hasOwnProperty(k)`, `a.slice(1)`) answer as in Node, and `in` keeps the
-lead ruling above. A chain-guarded read (`o?.[k]`) keeps this entry's
-`undefined`. Programs with a JavaScript source keep the body unchanged until
+lead ruling above. One read keeps this entry's silent `undefined`: a
+chain-guarded keyed read (`o?.[k]`, `o?.toString`) whose receiver lowered
+as a checked-dynamic value (a local bound straight from `JSON.parse`, say);
+the same read through an island value fences. Programs with a JavaScript source keep the body unchanged until
 U1b. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 (U1-S015-01..04).
 
