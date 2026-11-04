@@ -9309,8 +9309,14 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       if (test) return test;
     }
 
-    const left = L.lowerExpr(expr.left);
-    const right = L.lowerExpr(expr.right);
+    let left = L.lowerExpr(expr.left);
+    let right = L.lowerExpr(expr.right);
+    // One world (U1a): beside a checked-dynamic operand, an island operand
+    // is the same \$dyn value — the dyn arms below answer the pair.
+    if (L.sharedDynamic && (left.type.kind === "dyn" || right.type.kind === "dyn")) {
+      left = asDynOperand(left);
+      right = asDynOperand(right);
+    }
     if (left.type.kind === "dyn" || right.type.kind === "dyn") {
       // The narrowing unit comparisons ARE answerable on unknown: `v ===
       // undefined` / `v !== null` test the dyn node's kind directly, and

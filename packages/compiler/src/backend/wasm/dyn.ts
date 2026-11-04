@@ -5672,6 +5672,9 @@ export class DynBuilder {
   private unmodeledKindFence(c: Code, kinds: number[]): void {
     const what = kinds.map((k) => (k === DK.BYTES ? "a typed array" : k === DK.HANDLE ? "a runtime handle" : k === DK.JSVAL ? "an accessor cell" : `kind ${k}`)).join(" or ");
     this.deps.fence(c, (x) => this.deps.lit(x, `this operation on ${what} held in a dynamic value is not supported yet`));
+    // The arm's value slot: control never reaches past the fence (a
+    // directly built module's stub fence included).
+    c.unreachable();
   }
 
   /** %w.dyn.keySet(d, k, v) — `d[k] = v`, `scr_dyn_key_set` ported. OBJ
