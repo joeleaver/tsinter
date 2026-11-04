@@ -999,7 +999,7 @@ test("R63 SPREAD: a rest parameter spread in the second position", async () => {
 });
 
 test("R64 SPREAD: a spread reads the array as it is at the call", async () => {
-  const src = "'use strict';\nfunction f(...a) { a.push(99); return a.length; }\nconst src = [1, 2];\nfunction fw(xs) { const g = (...args) => f(...args); return g(...xs); }\nconsole.log(fw(src), src.length, JSON.stringify(src));\n";
+  const src = "'use strict';\nfunction f(...a) { a.push(99); return a.length; }\nconst src = JSON.parse(\"[1,2]\");\nfunction fw(xs) { const g = (...args) => f(...args); return g(...xs); }\nconsole.log(fw(src), src.length, JSON.stringify(src));\n";
   const { stdout, stderr, exitCode } = await runRow("R64", src, "cjs");
   expect(stdout).toBe("3 2 [1,2]\n");
   expect(stderr).toBe("");

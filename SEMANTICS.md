@@ -712,6 +712,24 @@ P-ASYNC-03, P-IDENT-01 (now Node's answers), the increment-21 jsExit pins
 in `wasm-emitter.test.ts` (the C lane now shares too), and corpus 2787
 on every lane.
 
+**Amendment (GH #120, unit U0, wasm and wasm-native): a copy the program
+could observe now refuses by name.** The body above says the copies are
+unobservable only in programs that never look; nothing enforced that, so
+a program that looked was silently wrong (`(u as number[]).push(2)` left
+`u` at `[ 1 ]`, `const a: any = r; a.a = 2` left `r.a` at 1, a typed
+callback parameter on a dynamic `forEach` wrote to a copy). Every copy
+this entry describes — a typed composite converted into `unknown`, `any`
+(outside `--dynamic`) or `object`, a dynamic value cast or checked back
+into a typed composite, and the arguments and result a boxed typed
+function's thunk converts — is now one more kind of S125 copy, judged by
+S125 (c): where a write on either side, or an identity test, could tell
+the copy from the original, the program refuses at compile time (SC1090,
+"it would be a COPY where JavaScript shares the object"). Copies nothing
+can observe still run: fresh values, values nobody writes after the
+crossing, a copy read once and dropped. This is a stopgap: unit U1 is to
+share instead (docs/design/dynamic-values.md). The bytes, `jsMarshal(dyn)`
+and `any[]` exceptions above share already and are not judged.
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -9398,3 +9416,82 @@ instance covers the dominant spelling (an interface- or record-typed
 parameter) at no run-time cost. **Tested by:**
 `packages/compiler/test/wasm-width-identity.test.ts` (exact rows against
 Node on wasm and wasm-native, and the refused rows).
+
+(c) **Dynamic crossings are copies too (GH #120, unit U0; wasm and
+wasm-native).** The checked-dynamic world (`unknown`, `object`, and `any`
+outside `--dynamic`) deep-copies at both edges (S014): a typed composite
+entering a dynamic slot, a dynamic value cast or checked back into a typed
+composite (`u as T`, an implicit check), and a typed function boxed into a
+dynamic value, whose thunk hands each composite parameter a copy of the
+dynamic argument and hands back a copy of a composite result. Each is
+judged with (b)'s machinery and refuses (SC1090, "… it would be a COPY
+where JavaScript shares the object, and …") when the program could tell:
+- a write through the copy, or a write to the original (or anything a
+  deep copy copied from it) while the copy is still held;
+- an identity test on the copy's type, or between dynamic values one of
+  which may be the copy;
+- on a dynamic side, a write counts when its receiver may be the copy
+  (an in-crossing) or the value a copy was taken from (an out-crossing).
+  "May be" is a unification over the program's dynamic values: bindings,
+  parameters, results and the dynamic fields of typed values join one
+  class through assignment, argument passing, returns, captures, stores
+  into a dynamic container and reads out of one. Function values flow the
+  same way, so a call through a function value reaches the functions that
+  can flow to its callee; whatever the analysis
+  does not follow (a dynamic call, a runtime function that is not a known
+  reader or writer, a throw, the parameters and results of every function
+  not reached only by direct calls and calls through values it follows —
+  functions whose value escapes, constructors, methods, async functions and
+  generators — the dynamic
+  fields of a typed value the runtime made, any other expression) meets in
+  one shared unknown class. A
+  write to the own members of a binding that holds a value built fresh
+  (`JSON.parse`, a dynamic literal) and never hands it anywhere changes no
+  copy, unless the copy was checked out of that very value. Writes are the
+  keyed write, `Object.assign`/`defineProperty` onto a dynamic value, the
+  mutating array methods through dynamic dispatch, and every write the
+  program's own functions make. Without `--dynamic` a dynamic call reaches
+  only boxed program functions (whose writes are noted where they are) and
+  runtime methods that read their arguments; with it, handing a dynamic
+  value to a dynamic call counts as a write.
+
+Not observable, so they run: a crossing of a value nothing else holds
+(a literal all the way down, `JSON.parse(text) as T`, a binding used only
+by that crossing, a member of such a value); a crossing whose result is
+read once and dropped (`console.log(r as unknown)`, `(u as R).k`); a
+crossing with no write and no identity test after it on either side; an
+out-crossing into a sequence temporary or a local whose every use is a
+read, while no code that can run in between writes a dynamic value; a
+`return` that checks a local dynamic value the function built and owns
+(the evolving-array idiom `const acc = []; … return acc`); a `return`
+that converts a value the function built from its own locals, which die
+with the call (`return { flags }` into `any`); a copy whose local binding
+is last read before the function writes the original; library results
+(`readdirSync`, `split`, a match); a copy that no binding, field or
+unknown code holds, or that only printing helpers hold, read where it is
+made (`console.log(f())` over a `() => unknown` callback); a part read
+straight off an out-crossing into a local read only in the next
+statements, while nothing they run writes a dynamic value (`const c =
+(e as { cause: C }).cause; console.log(c.code)`); the source of an
+`Object.assign` whose property values are scalars; and a callback
+parameter that only reads its copy while the call cannot reach a write.
+An `Error` crosses through the identity cache (S021), an `any[]` crosses
+by reference, and a variadic callback's adapter is vetted by GH #22: none
+of them is judged here. A `Promise` crosses by reference too; its
+composite settled value is converted at the first dynamic read, and that
+copy is judged like any other. The width tolerance of a cast (a
+record copy keeps only the type's fields, in the type's order) is S009's,
+not (c)'s. **Rationale:** a stopgap until unit U1 makes the dynamic
+crossings share (docs/design/dynamic-values.md); until then a silent
+divergence becomes a named refusal. Known cost: the corpus loses no
+program. In a 73-package sample of the round-3 npm survey (stratum A),
+25 packages carry a refused crossing and 11 refuse because of it alone.
+Some of those are real (react-dom's hooks share one object through three
+dynamic slots; chai's esbuild `__export` defines exports on a copy); most
+are not, because the analysis is context-insensitive (a helper used as a
+value puts every argument it is ever handed in one shared class, which
+merges nearly all of lodash) and judges typed writes by type (a write to
+any `string[]` counts against every `string[]` copy). **Tested by:**
+`packages/compiler/test/wasm-dyn-copies.test.ts` (#120's two forms and
+each refused shape on wasm and wasm-native, and the unobservable shapes
+diffed against Node).
