@@ -7979,6 +7979,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             }
             for (let i = 0; i < lastEffect; i++) {
               if (!ts.isSpreadElement(sources[i]!)) continue;
+              // (One world, U1a: an island spread source is the dyn value.)
+              if (L.sharedDynamic && lowered[i]!.type.kind === "jsval") lowered[i] = asDynOperand(lowered[i]!);
               const v = lowered[i]!;
               const sloc = locOf(sources[i]!);
               if (v.type.kind === "array") {
@@ -9703,7 +9705,9 @@ function islandMethodSpreadCall(
  * nested composites by reference — where the checked-dynamic conversion
  * would deep-copy them. */
 function assignSourceDyn(L: Lowerer, src: IrExpr, node: ts.Node): IrExpr {
-  if (L.dynamic && isTypedComposite(L, src.type)) {
+  // (--dynamic: the source's view, as main built it; the one dynamic world
+  // without the flag keeps main's checked-dynamic source conversion.)
+  if (L.engine && isTypedComposite(L, src.type)) {
     return { kind: "dynFromJsval", value: L.jsvalIn(src, node), type: DYN, loc: src.loc };
   }
   return L.coerceToExpected(src, DYN);

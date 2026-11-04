@@ -24,6 +24,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * declared types: a package promise held as a handle keeps its existing
    * checker-driven dispatch (the await/.catch bridge lowerings own it). */
   export function isIslandExpr(L: Lowerer, node: ts.Expression): boolean {
+    // The `arguments` binding of a compiled function is never an island
+    // value (its IArguments type absorbs to jsval through the `any` index
+    // signature once `any` maps — unit U1a); its own lowerings claim it.
+    if (L.sharedDynamic && ts.isIdentifier(node) && node.text === "arguments" && L.typeOf(node).getSymbol()?.name === "IArguments") return false;
     const mapped = L.mapTypeOf(L.typeOf(node));
     if (mapped?.kind === "jsval") return true;
     if (mapped?.kind !== "promise" && ts.isIdentifier(node)) {
