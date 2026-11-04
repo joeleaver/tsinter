@@ -730,6 +730,20 @@ crossing, a copy read once and dropped. This is a stopgap: unit U1 is to
 share instead (docs/design/dynamic-values.md). The bytes, `jsMarshal(dyn)`
 and `any[]` exceptions above share already and are not judged.
 
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs): one
+dynamic world; the typed-composite copy into a dynamic slot is retired.** In
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), `unknown`, `object` and `any` are one value, the island value
+(docs/design/dynamic-values.md §4.1; no `--dynamic` needed). A typed record,
+array or tuple entering any of them is S115 (a)'s live view, not this
+entry's copy: a write on either side is seen on the other and `===` holds
+(`const u: unknown = p; p.n = 2` reads 2 through `u`, and `u === p`). A
+value the island cannot view — a class instance, a Map or Set, a record
+holding one, a record with accessors — still crosses as this entry's copy,
+and a function crosses as its box (one per closure identity, named as Node
+names it); both are judged by S125 (c). Out-crossings follow S115 (d) as
+amended there. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
+(U1-SHARE-01..02).
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -803,6 +817,17 @@ emitter unit test — no corpus program can pin it, because a program whose
 output observed the divergence would fail the differential by
 construction; the test pins tsinter's answer (`undefined`, and `false`
 for the presence form) with Node's in a comment.
+
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs).** In
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry covers `any` and `object` as well as `unknown` (one
+value, S014's U1a amendment): a computed keyed read of an inherited name
+(`o["toString"]`) still answers `undefined`. A DOT read of an
+Object/Array prototype member used as a value (`o.valueOf`, `a.slice`
+without calling it) ends the program at its named fence (S122, `'Array.prototype.slice'
+on an island value is not supported yet`) instead; calls of those members
+(`o.toString()`, `o.hasOwnProperty(k)`, `a.slice(1)`) answer as in Node,
+and `in` keeps the lead ruling above. **Tested by:**
+`packages/compiler/test/wasm-u1-shared-dynamic.test.ts` (U1-S015-01).
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -952,6 +977,18 @@ padding would have answered silently for every `any[]` growth write; an
 island write past the length (jsOp setIdx) now throws a named Error
 instead (S110 (f)). The checked-dynamic (`unknown`) keyed write described
 above keeps its padding.
+
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs): the
+padding is kept, and now covers `any`.** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), an index write past an
+array's length through `any`, `unknown` or `object` pads with `undefined` as
+this entry describes (the unit-H fence of the amendment above, S110 (f), is
+retired there): `a[3] = 9` on `JSON.parse("[1]")` answers `length` 4 and
+`a[1]` `undefined` as Node does, and `Object.keys` answers `0,1,2,3` where
+Node answers `0,3` — the silent case of this entry. The write sets the
+"a hole was made" flag, so `in` / `Object.hasOwn` over an index then fence
+as the GH #86 amendment says. Programs with a JavaScript source keep the
+unit-H fence for island writes. **Tested by:**
+`packages/compiler/test/wasm-u1-shared-dynamic.test.ts` (U1-PAD-01).
 
 ## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
 
@@ -3019,6 +3056,20 @@ suspension-fence pin (exact kind string). No corpus program can pin
 the divergence itself — a program printing the unbound read would
 fail Node-vs-native on every lane, which is exactly why it survived
 unregistered until the wasm rider made it reachable.
+
+**Amendment (unit U1a; the emitter-listener form, wasm and wasm-native).**
+One instance of this entry is common in CommonJS code: a listener the
+runtime calls (measured: a Readable's `'data'` listener) that reads
+`this` through a forwarding wrapper, `function () { return fn.apply(this,
+arguments) }`, sees `this` as `undefined` where Node passes the emitter
+(`typeof this` prints `undefined` for `object`). It
+holds on main and is unchanged by U1a: programs with a JavaScript source keep
+the checked-dynamic path whole. TypeScript programs cannot reach it — every
+route refuses by name at compile time: `this` outside a class method
+(SC1080), `.call`/`.apply` on a compiled function value (SC1090), the
+`arguments` binding (SC1090) and rest parameters in a function value
+(SC2009). **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
+(U1-THIS-01, the TypeScript refusals).
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
@@ -8229,7 +8280,9 @@ the rest — are retired with that model (follow-up unit H).
   array's length past its elements (the holes Node leaves) is not
   supported yet on the wasm lane` (shrinking it truncates, as in Node;
   the native engine has holes and answers as Node; the checked-dynamic
-  `unknown` index write keeps S016's padding). Index arguments of the
+  `unknown` index write keeps S016's padding). *(Unit U1a: in a
+  TypeScript program on the wasm lanes the island write pads instead —
+  S016's U1a amendment; programs with a JavaScript source keep this fence.)* Index arguments of the
   Array methods run ToNumber for strings, booleans and null; an object
   index (ToPrimitive) is a named `non-number index arguments on a dynamic
   receiver` TypeError. `keys`, `values`, `entries`, `toSpliced`,
@@ -8260,6 +8313,28 @@ lanes the same holds for every refusal the compiled view accessors make;
 the native island's own Proxy traps (a non-index member on an array view,
 `defineProperty`, `delete`, freezing) still throw inside the engine —
 S122's c/llvm island residue.*
+
+**Amendment (unit U1a, wasm and wasm-native, TypeScript programs — Joe's
+ruling J1 as carried out by unit U1a; (d) amended by the coordinator's
+ruling of 2026-11-04, option A and J4 lifted).** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry
+holds WITHOUT `--dynamic`: `any`, `unknown` and `object` are the island
+value, so (a)'s views, (b)'s write checks and (c)'s wasm column apply to
+every TypeScript program. (d) is amended there: a dynamic value that is not
+fresh and not its own view no longer refuses at the exit. It enters typed
+storage as a CHECKED COPY — at a local, a parameter, a return, a record
+field, an array element and a cast `x as T` alike — and that copy is judged
+by S125 (c): where a write on either side, or an identity test, could tell
+the copy from the original, the program refuses at compile time with
+S125's text ("… it would be a COPY where JavaScript shares the object, and
+…"); where nothing could, the copy runs. S125 (c) judges a copy it cannot
+follow (one stored into a field or an element, one whose holder escapes) by
+TYPE: any write to a value of that type counts — it can refuse a program no
+run could tell apart, never accept one that could. The copy's content is
+(d)'s checked conversion (S009's width tolerance for records; a value that
+does not fit throws `expected <T> at <path>, got <kind>`). Fresh values and
+own views exit as (d) says. Programs with a JavaScript source keep (d) as
+written. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
+(U1-EXIT-01..05).
 
 Joe's ruling D2 as approved 2026-10-26 (follow-up unit H, boards
 #259/#268). Node has one object on both sides of every assignment; this
@@ -9459,6 +9534,24 @@ where JavaScript shares the object, and …") when the program could tell:
   only boxed program functions (whose writes are noted where they are) and
   runtime methods that read their arguments; with it, handing a dynamic
   value to a dynamic call counts as a write.
+
+*Unit U1a amendment (wasm and wasm-native, TypeScript programs).* In
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and no embedded npm package (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), the dynamic world is the island (S014's and S115's U1a
+amendments), and (c) judges its copies: S115 (d)'s checked copies at
+locals, parameters, returns, fields, elements and casts, and the values
+that still cross into a dynamic slot by copy (class instances, Map/Set,
+accessor records). The island's own operations count with the checked-
+dynamic ones above: a member or element store through a dynamic value, a
+mutating method called through one (`push`, `splice`, `sort`, …), and
+`Object.assign` onto one are writes to their receiver; reading methods
+(`map`, `slice`, `join`, `toString`, …), the reading statics of `JSON`,
+`Math`, `Number`, `String`, `Array` and `Object` (`keys`, `entries`,
+`is`, …) and the compiler's own destructuring helpers are not; a method's
+result joins the class of its receiver and arguments; an island literal is
+fresh; a member read off a dynamic value is part of it. With no engine in
+the module a dynamic call reaches only boxed program functions and those
+runtime methods, as above. A copy stored into a field or an element, or
+into a holder (c) cannot follow, is judged by its type as (b) says.
 
 Not observable, so they run: a crossing of a value nothing else holds
 (a literal all the way down, `JSON.parse(text) as T`, a binding used only
