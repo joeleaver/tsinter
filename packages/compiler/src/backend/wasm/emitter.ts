@@ -32325,6 +32325,15 @@ class Assembler {
       }
 
       case "jsView": {
+        // A querystring parse result is a NULL-PROTOTYPE object in Node; a
+        // view would answer Object.prototype's members (hasOwnProperty,
+        // String()) where Node throws — the same named refusal as its
+        // dynamic copy (dynFromHelper's gate), never a silent answer.
+        if (this.qsNullProtoType(e.value.type)) {
+          this.refuse("libCall:qs.parse:null-proto-dyn", e.loc);
+          code.unreachable();
+          return;
+        }
         // Unit H (SEMANTICS.md S115): the typed composite's live view —
         // the static value itself as the token, the accessor closures
         // (FUNC boxes) the frontend built per static type.

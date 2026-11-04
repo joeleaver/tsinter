@@ -584,7 +584,9 @@ test("B-i gate 1 (const s: any = Symbol('d')) — plain and dynamic, with a numb
   const sym = "const s: any = Symbol('d');\nconsole.log('done');";
   const num = "const s: any = 1;\nconsole.log('done');";
   const plain = await compileDiag("bi-g1-plain", sym, false);
-  expect(plain).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a: the plain build takes the one dynamic world too, so it
+  // refuses with the --dynamic build's text.
+  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
   const dyn = await compileDiag("bi-g1-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -597,7 +599,9 @@ test("B-i gate 2 (const t: symbol = ...; const s: any = t) — plain and dynamic
   const sym = "const t: symbol = Symbol('d');\nconst s: any = t;\nconsole.log('done');";
   const num = "const t: number = 1;\nconst s: any = t;\nconsole.log('done');";
   const plain = await compileDiag("bi-g2-plain", sym, false);
-  expect(plain).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a: the plain build takes the one dynamic world too, so it
+  // refuses with the --dynamic build's text.
+  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
   const dyn = await compileDiag("bi-g2-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -610,7 +614,9 @@ test("B-i gate 3 (f(Symbol('d')) where f(v: any)) — plain and dynamic, with a 
   const sym = "function f(v: any) { }\nf(Symbol('d'));\nconsole.log('done');";
   const num = "function f(v: any) { }\nf(1);\nconsole.log('done');";
   const plain = await compileDiag("bi-g3-plain", sym, false);
-  expect(plain).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a: the plain build takes the one dynamic world too, so it
+  // refuses with the --dynamic build's text.
+  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
   const dyn = await compileDiag("bi-g3-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -627,9 +633,10 @@ test("B-i gate 4 (const a: any[] = [Symbol('d')]) — DYNAMIC ONLY; plain fences
   // a symbol row here, a stated exclusion, so only the CODE is checked
   // (not a full row), and the twin's plain-mode refusal is the proof.
   const plain = await compileDiag("bi-g4-plain", sym, false);
-  expect(plain).toEqual(["SC2011:values of type 'any[]' have no static representation but run in the embedded dynamic engine, which this build does not include"]);
-  const plainTwin = await compileDiag("bi-g4-num-plain", num, false);
-  expect(plainTwin).toEqual(["SC2011:values of type 'any[]' have no static representation but run in the embedded dynamic engine, which this build does not include"]);
+  // Unit U1a: the plain build takes the one dynamic world too, so it
+  // refuses with the --dynamic build's text.
+  expect(plain).toEqual(["SC1090:passing a value of type 'symbol[]' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  await compileOk("bi-g4-num-plain", num, false);
   // Dynamic mode DOES discriminate: the symbol shape refuses, the number
   // twin compiles — this IS the row.
   const dyn = await compileDiag("bi-g4-dyn", sym, true);
@@ -644,7 +651,8 @@ test("B-i gate 5 (const u: unknown = Symbol('d')) — mode-invariant, with a num
   const num = "const u: unknown = 1;\nconsole.log(u);";
   for (const dynamic of [false, true]) {
     const codes = await compileDiag(`bi-g5-${dynamic ? "dyn" : "plain"}`, sym, dynamic);
-    expect(codes).toEqual(["SC1101:converting typed values to 'unknown' is not supported yet"]);
+    // Unit U1a: `unknown` is the island value in both builds.
+    expect(codes).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
     await compileOk(`bi-g5-num-${dynamic ? "dyn" : "plain"}`, num, dynamic);
   }
 });
@@ -690,11 +698,9 @@ test("B-i gate 8 (an island-minted symbol) — mode-invariant: no node:island mo
 test("B-i gate 9 (Reflect.ownKeys over a symbol-computed key) — both modes name SC1090 + SC2020", async () => {
   const sym = 'const s = Symbol("k");\nconst o: any = { [s]: 1 };\nconsole.log(Reflect.ownKeys(o).length);';
   const plain = await compileDiag("bi-g9-plain", sym, false);
-  expect(plain).toEqual([
-    "SC1090:computed property keys (compile-time-known keys fold — a pure expression whose checker type is one string or number literal: consts, enum members, quoted keys, templates of those — `{ [MARKER]: v }`; runtime string keys write through an index-signature target; symbol keys stay out) are not supported yet",
-    "SC2020:'Reflect.ownKeys' is part of the standard library types but has no scriptc lowering yet",
-  ]);
   const dyn = await compileDiag("bi-g9-dyn", sym, true);
+  // Unit U1a: both builds take the one dynamic world.
+  expect(plain).toEqual(dyn);
   expect(dyn).toEqual([
     "SC1090:this property form in an 'any'-typed object literal (only `name: value`, shorthand names, methods, and get accessors are supported) is not supported yet",
     "SC2020:'Reflect.ownKeys' is part of the standard library types but has no scriptc lowering yet",

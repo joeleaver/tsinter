@@ -196,7 +196,9 @@ function emitterEvents(L: Lowerer): Map<string, EventSig> {
           // adapter and constrain nothing: a dyn parameter accepts any
           // tuple position, and positions past the tuple read the boxed
           // undefined (exactly JS's extra-parameter semantics).
-          if (cbT?.kind === "dyn" || (cbT?.kind === "func" && cbT.params.some((p) => p.kind === "dyn"))) {
+          // (One world, U1a: an `any`/`unknown` parameter is the island
+          // value — the same \$dyn — and registers the same way.)
+          if (cbT?.kind === "dyn" || (cbT?.kind === "func" && cbT.params.some((p) => p.kind === "dyn" || (L.sharedDynamic && p.kind === "jsval")))) {
             sigOf(name).dynListener = true;
           } else if (cbT?.kind === "func") {
             mergeListener(name, cbT.params);
@@ -260,7 +262,7 @@ function dynListenerFlavor(L: Lowerer, node: ts.Expression): "dyn" | "func" | nu
     return null;
   }
   if (t?.kind === "dyn") return "dyn";
-  if (t?.kind === "func") return t.params.some((p) => p.kind === "dyn") ? "func" : null;
+  if (t?.kind === "func") return t.params.some((p) => p.kind === "dyn" || (L.sharedDynamic && p.kind === "jsval")) ? "func" : null;
   // A statically-known NON-function listener (a literal number, a record,
   // null): route it through the dyn path too — the registration helper's
   // checkListener throws Node's exact ERR_INVALID_ARG_TYPE TypeError

@@ -700,7 +700,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // a Map/Set, a RegExp, an accessor inside) builds statically, as
         // it did when `any` had no mapping; its consumer takes the typed
         // value (inspect, console.log) or the checked-dynamic box.
-        if (L.sharedDynamic) {
+        if (L.sharedDynamic && !L.engine) {
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
           // An argument of a STANDARD-LIBRARY call whose parameter is

@@ -208,18 +208,23 @@ test("R06 DYNCHECK: a DOMException narrowed as an Error, then its fields", async
   expect(exitCode).toBe(0);
 });
 
-test("R07 DYNCHECK: not lifted: an instanceof TypeError narrow on unknown stays a front-end refusal (board #189)", async () => {
+test("R07 DYNCHECK: lifted by unit U1a: an instanceof TypeError narrow on unknown (board #189) answers Node's output", async () => {
   const src = "function show(u: unknown): void {\n  if (u instanceof TypeError) console.log(`TE ${u.message}`);\n  else console.log(\"not TE\");\n}\ntry { throw new TypeError(\"t\"); } catch (e) { show(e); }\ntry { throw new Error(\"e\"); } catch (e) { show(e); }\n";
-  const { diagnostics, survey } = await refuseRow("R07", src, "ts");
-  expect(survey).toEqual([]);
-  expect(diagnostics).toEqual(["SC9001: internal compiler error: in show: fieldGet receiver: expected object, got dyn — please report this"]);
+  // Unit U1a: `unknown` is the island value, and the narrowed member read
+  // answers it (main pinned an internal compiler error here).
+  const { stdout, stderr, exitCode } = await runRow("R07", src, "ts");
+  expect(stdout).toBe("TE t\nnot TE\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("R08 DYNCHECK: not lifted: instanceof a user class on unknown stays a named front-end refusal", async () => {
   const src = "class Box { v = 3; }\nfunction show(u: unknown): void {\n  if (u instanceof Box) console.log(`Box ${u.v}`);\n  else console.log(\"not Box\");\n}\nshow(new Box());\nshow(1);\n";
   const { diagnostics, survey } = await refuseRow("R08", src, "ts");
   expect(survey).toEqual([]);
-  expect(diagnostics).toEqual(["SC1090: 'instanceof Box' on 'unknown' values (only the Error classes answer — test 'instanceof Error' and read '.name') are not supported yet","SC1101: converting typed values to 'unknown' is not supported yet"]);
+  // Unit U1a: the class instance entering `unknown` refuses with the one
+  // dynamic world's boundary text.
+  expect(diagnostics).toEqual(["SC1090: 'instanceof Box' on 'unknown' values (only the Error classes answer — test 'instanceof Error' and read '.name') are not supported yet","SC1090: passing a value of type 'Box' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
 });
 
 test("R09 DYNCHECK: not lifted: a checked cast of unknown to Error stays a named front-end refusal", async () => {

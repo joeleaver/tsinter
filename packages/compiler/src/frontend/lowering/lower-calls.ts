@@ -8070,7 +8070,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // static shapes have no property table to extend.
     if (member === "defineProperties" && call.arguments.length === 2 &&
         !call.arguments.some((a) => ts.isSpreadElement(a))) {
-      let target = probeLower(L, call.arguments[0]!);
+      // (One world, U1a: an island target is the same \$dyn value.)
+      let target = probeLowerDyn(L, call.arguments[0]!);
       // A FUNCTION-typed target boxes through the dyn boundary: the
       // property table lives on the CLOSURE (shared by every box of this
       // function value), so defining through a fresh box sticks — the
