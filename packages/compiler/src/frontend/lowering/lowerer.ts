@@ -8447,6 +8447,17 @@ export class Lowerer {
         kind: "jsOp", op: "globalGet", name: expr.expression.text, args: [], type: JSVAL, loc,
       };
       const arg = this.lowerExpr(expr.arguments[0]!);
+      // The one-world lanes have no engine to construct with: a
+      // `new Uint8Array(u)` over a dynamic value narrowed to bytes takes the
+      // checked-dynamic arm's validated bytes extraction, then the static
+      // copy (what `unknown` did before).
+      if (!this.engine && expr.expression.text === "Uint8Array") {
+        const bytesT = this.mapTypeOf(this.typeOf(expr));
+        if (bytesT?.kind === "bytes") {
+          const src: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: bytesT, loc };
+          return { kind: "bytesNew", source: src, type: bytesT, loc };
+        }
+      }
       return { kind: "jsOp", op: "construct", args: [ctor, arg], type: JSVAL, loc };
     }
     return lowerNew(this, expr);

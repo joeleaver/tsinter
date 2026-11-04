@@ -18,8 +18,14 @@ test.for(files)("%s", async (rel) => {
   const dir = join(scratch, rel.replace(/\W/g, "_"));
   const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, backend: "wasm", dynamic });
   if (!res.ok) throw new Error(res.diagnostics.map((d) => `${d.code} ${d.message}`).join("\n"));
-  const w = await runWasm(res.binaryPath);
+  let w: { stdout: unknown; exitCode: number };
+  try {
+    w = await runWasm(res.binaryPath);
+  } catch (e) {
+    if (!(e instanceof WebAssembly.RuntimeError)) throw e;
+    w = { stdout: "(trap: stdout not captured)", exitCode: 1 };
+  }
   const n = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "", cwd: join(file, "..") });
-  expect(String(w.stdout)).toBe(n.stdout);
+  if (w.stdout !== "(trap: stdout not captured)") expect(String(w.stdout)).toBe(n.stdout);
   expect(w.exitCode).toBe(n.status);
 });

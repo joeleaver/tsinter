@@ -8573,6 +8573,12 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
     return L.dynExitGate(expr.expression, inner, { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) });
 }
 
+/** An island operand (any/unknown on the one-world lanes) seen by a
+ * checked-dynamic lowering: the same \$dyn value under the dyn type. */
+export function asDynOperand(e: IrExpr): IrExpr {
+  return e.type.kind === "jsval" ? { kind: "dynFromJsval", value: e, type: DYN, loc: e.loc } : e;
+}
+
 export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): IrExpr {
     const loc = locOf(expr);
     switch (expr.operator) {
@@ -10177,7 +10183,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         L.isStdlibGlobal(expr.right, "Uint8Array") &&
         !L.caughtLocalOf(expr.left)
       ) {
-        const left = L.lowerExpr(expr.left);
+        const left = asDynOperand(L.lowerExpr(expr.left));
         if (left.type.kind === "dyn") {
           return { kind: "dynTest", test: "bytes", value: left, type: BOOL, loc };
         }
@@ -10294,7 +10300,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         loc,
       };
     }
-    const left = L.lowerExpr(expr.left);
+    const left = asDynOperand(L.lowerExpr(expr.left));
     // `u instanceof Error` on an `unknown` value: the checked-dynamic tree's error encoding
     // (the shape caughtToDyn builds for Error payloads — the reserved
     // "%error" marker) answers the test, so a caught Error passed through

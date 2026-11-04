@@ -231,7 +231,7 @@ function lowerAssertEqual(
   // A dyn other side adopts number[] — the dyn array a boxed empty
   // literal builds is elementless, so any elem type serves.
   const adoptedEmpty = (other: IrType): IrExpr | null =>
-    other.kind === "array" ? emptyOf(other) : other.kind === "dyn" ? emptyOf({ kind: "array", elem: F64 }) : null;
+    other.kind === "array" ? emptyOf(other) : other.kind === "dyn" || other.kind === "jsval" ? emptyOf({ kind: "array", elem: F64 }) : null;
   let a: IrExpr;
   let b: IrExpr;
   if (emptyArrayLit(aNode) && !emptyArrayLit(bNode)) {
@@ -241,6 +241,25 @@ function lowerAssertEqual(
     a = L.lowerExpr(aNode);
     b = emptyArrayLit(bNode) ? (adoptedEmpty(a.type) ?? L.lowerExpr(bNode)) : L.lowerExpr(bNode);
   }
+  // A LITERAL the checker typed as an island value (`[h1, h2]` against
+  // an `unknown` parameter) beside a static other side re-lowers into
+  // that side's type: literals have no side effects, and the old world
+  // built it statically the same way.
+  const relit = (n: ts.Expression, e: IrExpr, other: IrExpr): IrExpr => {
+    let u = n;
+    while (ts.isParenthesizedExpression(u)) u = u.expression;
+    if (e.type.kind !== "jsval" || other.type.kind === "jsval" || other.type.kind === "dyn") return e;
+    if (ts.isArrayLiteralExpression(u) && (other.type.kind === "array" || other.type.kind === "record")) {
+      return L.lowerArrayLiteral(u, other.type);
+    }
+    return e;
+  };
+  a = relit(aNode, a, b);
+  b = relit(bNode, b, a);
+  // Island operands (any/unknown on the one-world lanes) are the same
+  // \$dyn value: they take the checked-dynamic arm below.
+  if (a.type.kind === "jsval") a = { kind: "dynFromJsval", value: a, type: DYN, loc: a.loc };
+  if (b.type.kind === "jsval") b = { kind: "dynFromJsval", value: b, type: DYN, loc: b.loc };
   const { msg, hasMsg } = lowerMessageArg(L, expr.arguments[2], loc);
   const flag = (value: boolean): IrExpr => ({ kind: "boolLit", value, type: BOOL, loc });
   // CHECKED-DYNAMIC operands (dyn-vs-dyn, dyn-vs-static): both sides
