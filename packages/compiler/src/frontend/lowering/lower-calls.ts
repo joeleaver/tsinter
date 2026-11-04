@@ -18,7 +18,7 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
+import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -4202,6 +4202,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         lowerStringMemberExtra(L, expr, expr.expression) ??
         lowerArrayMemberExtra(L, expr, expr.expression) ??
         lowerArrayFill(L, expr, expr.expression) ??
+        lowerArrayCopyWithin(L, expr, expr.expression) ??
         L.lowerStringLastIndexOfCall(expr, expr.expression) ??
         L.lowerPromiseMethodCall(expr, expr.expression) ??
         // Homogeneous promise-tuple literals claim BEFORE the static path
@@ -7930,25 +7931,58 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             // earlier source is seen; a static source converts (copies)
             // into the dyn world only after the last argument with an
             // effect. A spread flattens where it stands (Node iterates it
-            // there), so a spread with a write after an earlier source
-            // has no order to keep here — refused by name.
+            // there): GH #122 — a spread before the last argument with an
+            // effect takes its spine where it stands (a static array's
+            // shallow slice, a dyn iterable drained into a fresh dyn
+            // array), so a later argument's push/pop/element store is not
+            // seen while a write INTO an element still is (the elements
+            // keep their identity and convert after the last argument).
+            // Any other spread kind there keeps the refusal.
             const srcNodes = sources.map((a) => (ts.isSpreadElement(a) ? a.expression : a));
+            const lowered = srcNodes.map((n) => L.lowerExpr(n));
+            let lastEffect = -1;
+            for (let i = lowered.length - 1; i >= 0; i--) {
+              if (!droppableStatic(lowered[i]!)) {
+                lastEffect = i;
+                break;
+              }
+            }
+            for (let i = 0; i < lastEffect; i++) {
+              if (!ts.isSpreadElement(sources[i]!)) continue;
+              const v = lowered[i]!;
+              const sloc = locOf(sources[i]!);
+              if (v.type.kind === "array") {
+                lowered[i] = { kind: "arrIntrinsic", method: "slice", receiver: v, args: [], type: v.type, loc: sloc };
+              } else if (v.type.kind === "dyn") {
+                const snap = L.declareHiddenLocal("%oaspread", DYN);
+                const sRef: IrExpr = { kind: "varRef", localId: snap.id, type: DYN, loc: sloc };
+                lowered[i] = {
+                  kind: "seqExpr",
+                  stmts: [
+                    { kind: "varDecl", localId: snap.id, init: { kind: "dynArrLit", elems: [], type: DYN, loc: sloc }, loc: sloc },
+                    { kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.packPushSpreadIter", args: [sRef, v], type: VOID, loc: sloc }, loc: sloc },
+                  ],
+                  result: sRef,
+                  type: DYN,
+                  loc: sloc,
+                };
+              } else if (v.type.kind !== "string") {
+                L.noLowering(
+                  "Object.assign with spread sources and a later argument that may write",
+                  call,
+                  "Node evaluates every argument before it copies — compute the sources into consts first",
+                );
+              }
+            }
             // Only a STATIC source copies when it enters the pack; a dyn or
             // island source rides by reference, as Node's does.
             const bound = evaluateArgsFirst(
               L,
-              srcNodes.map((n) => L.lowerExpr(n)),
+              lowered,
               loc,
               false,
               (t) => !(t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "void" || t.kind === "dyn" || t.kind === "jsval" || isUnitType(t)),
             );
-            if (bound.stmts.length > 0 && spreadCount > 0) {
-              L.noLowering(
-                "Object.assign with spread sources and a later argument that may write",
-                call,
-                "Node evaluates every argument before it copies — compute the sources into consts first",
-              );
-            }
             stmts.push(...bound.stmts);
             let ok = true;
             for (let i = 0; i < sources.length; i++) {

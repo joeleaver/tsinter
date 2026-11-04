@@ -9374,8 +9374,17 @@ ordered, so it can refuse a program whose copy no run could observe (it
 never accepts one that could). A constructor's write to its own instance is
 construction unless the constructor hands `this` away (a call, a closure
 capturing it); a write to another object is an ordinary write. A copy of a fresh value (a literal, a
-`new` whose constructor keeps `this` to itself), or of a binding initialized
-fresh whose only use is this copy, is observable only by its keys. One
+`new` whose constructor keeps `this` to itself, or — GH #118 — the result of
+a direct call of a function whose every `return` answers such a value or a
+local it initialized fresh and only filled, read and returned: never
+captured, reassigned, stored, passed on, or aliased by a method answering
+its receiver), or of a binding initialized
+fresh whose only use is this copy, is observable only by its keys. The
+GH #118 case is chess.js's `history()`: one `(Move | string)[]` handed out
+through overloads as `Move[]` or `string[]`; the caller's copy is the only
+reference left, its elements are the original's (narrowed by the checked
+extraction — an element of another arm, which only a lying overload can
+put there, stops by name). One
 corpus case changed with this entry: 1576-width-coercions.ts no longer
 pushes onto the array its function adapter copies on every call (a caller
 holding an earlier copy would not see the push; the refusal is pinned in the
