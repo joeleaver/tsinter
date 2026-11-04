@@ -352,6 +352,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   };
   /** The program compares dynamic values by identity somewhere. */
   let dynIdentity = false;
+  /** Typed composites that entered the island as a view or a marshal
+   * (U1a): with any dynamic identity operation in the program, each is
+   * identity-observed — an island `===`, `includes`, `indexOf`, a Set or
+   * Map key may compare it against a copy. Conservative by design. */
+  const islandEntered = new Set<string>();
   /** The dynamic operands of those comparisons (null: a comparison whose
    * operands are not followed — a Map/Set keyed by dynamic values). */
   const dynIdentityOps: ({ e: IrExpr; fn: string } | null)[] = [];
@@ -777,6 +782,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     if (mode !== "t" && t !== undefined && r["loc"] !== undefined && isComposite(t) && k !== "slotUndef") {
       const viewArg = (parent !== null && parent["kind"] === "call" && pkey === "args" && /^%view\.\d+$/.test(parent["callee"] as string)) ||
         /^%view\./.test(curFn);
+      if (viewArg || (parent !== null && parent["kind"] === "jsMarshal")) {
+        islandEntered.add(tkey(t));
+        if (t.kind === "union") for (const a of L.unions.get(t.unionId)?.arms ?? []) islandEntered.add(tkey(a));
+      }
       escape(t, mode === "w", viewArg);
     }
     if (k === "varRef" && parent) {
@@ -1071,6 +1080,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         if (op === "eq" || op === "neq") {
           dynIdentity = true;
           dynIdentityOps.push(null);
+          // An operand that is a typed composite's view (or marshal) is an
+          // identity test on that type: a copy of it compares unequal where
+          // JavaScript's one object compares equal (U1a).
+          for (const a of args) {
+            const viewed = a.kind === "call" && /^%view\.\d+$/.test(a.callee) ? a.args[0] : a.kind === "jsMarshal" ? a.value : undefined;
+            if (viewed !== undefined && isComposite(viewed.type)) {
+              identity.add(tkey(viewed.type));
+              if (viewed.type.kind === "union") for (const arm of L.unions.get(viewed.type.unionId)?.arms ?? []) identity.add(tkey(arm));
+            }
+          }
         }
         return;
       }
@@ -2353,6 +2372,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           return (e.fields ?? []).every((f) => uniqueDyn(f.value, fn, depth + 1));
         case "dynFrom":
           return deepFresh(e.value, fn, depth + 1);
+        // A typed value marshaled into the island (a literal's scalar
+        // member): as fresh as the value (a dyn one unwraps above).
+        case "jsMarshal":
+          return deepFresh(e.value, fn, depth + 1);
         case "dynKeyGet":
           return uniqueDyn(e.value, fn, depth + 1);
         case "seqExpr":
@@ -2777,6 +2800,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
 
     const reportedDyn = new Set<string>();
     const judgedFns = new Map<string, { why: string; what: string } | null>();
+    if (dynIdentity) for (const k of islandEntered) identity.add(k);
     judgingDyn = true;
     for (const s of dynSites) {
       let why: string | null = null;

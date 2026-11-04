@@ -701,6 +701,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // it did when `any` had no mapping; its consumer takes the typed
         // value (inspect, console.log) or the checked-dynamic box.
         if (L.sharedDynamic && !L.engine) {
+          // A computed key: the island literal has no form for it; the
+          // static build (an index-signature record) does, as before U1a.
+          if (ts.isObjectLiteralExpression(expr) && expr.properties.some((p) => !ts.isSpreadAssignment(p) && p.name !== undefined && ts.isComputedPropertyName(p.name))) return false;
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
           // An argument of a STANDARD-LIBRARY call whose parameter is

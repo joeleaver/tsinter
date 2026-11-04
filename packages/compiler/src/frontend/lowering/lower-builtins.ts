@@ -3045,7 +3045,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (ts.isIdentifier(node) && node.text === "undefined") {
       return dynUndefinedExpr(locOf(node));
     }
-    const msg = L.lowerExpr(node);
+    const msg0 = L.lowerExpr(node);
+    // One world (U1a): an island message is the same \$dyn value.
+    const msg = L.sharedDynamic ? asDynOperand(msg0) : msg0;
     if (msg.type.kind === "dyn") return msg;
     if (canConvertToDyn(msg.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
       return { kind: "dynFrom", value: msg, type: DYN, loc: locOf(node) };

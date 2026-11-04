@@ -3435,7 +3435,9 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // representation (`Boolean(rec && list.some(f))` — a record and a
       // bool) that a value lowering of the `&&` would fence on.
       if (name === "Boolean") return boolCanon(L, L.lowerCondition(argNode));
-      const arg = L.lowerExpr(argNode);
+      const arg0 = L.lowerExpr(argNode);
+      // One world (U1a): Number(x) of an island value is the dyn ToNumber.
+      const arg = name === "Number" && L.sharedDynamic ? asDynOperand(arg0) : arg0;
       if (name === "String") return undefinedAsText(L, L.ensureString(arg, argNode), loc);
       if (arg.type.kind === "f64") return toNumberCanon(L, arg);
       if (arg.type.kind === "bool") return boolToNumber(L, arg, loc);

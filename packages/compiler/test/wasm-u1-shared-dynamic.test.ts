@@ -222,6 +222,53 @@ console.log(shared.n);`,
     refused: { code: "SC1090", s125: true },
   },
   {
+    id: "U1-EXIT-06 a copy compared by identity through a view refuses",
+    src: `type P = { n: number };
+const shared: any = { n: 1 };
+function get(): unknown { return shared; }
+const xs: P[] = [];
+xs.push(get() as P);
+console.log(xs[0] === shared);`,
+    refused: { code: "SC1090", s125: true },
+  },
+  {
+    id: "U1-EXIT-07 a copy found by includes in a dynamic array refuses",
+    src: `type P = { n: number };
+const shared: any = { n: 1 };
+function get(): unknown { return shared; }
+const p = get() as P;
+const arr: any[] = [shared];
+console.log(arr.includes(p));`,
+    refused: { code: "SC1090", s125: true },
+  },
+  {
+    id: "U1-EXIT-08 a copy searched by indexOf refuses",
+    src: `type P = { n: number };
+const shared: any = { n: 1 };
+function get(): unknown { return shared; }
+const p = get() as P;
+console.log([shared].indexOf(p));`,
+    refused: { code: "SC1090", s125: true },
+  },
+  {
+    id: "U1-EXIT-09 a copy re-entering unknown and compared refuses",
+    src: `type P = { n: number };
+const shared: any = { n: 1 };
+function get(): unknown { return shared; }
+const p = get() as P;
+const u: unknown = p;
+console.log(u === shared);`,
+    refused: { code: "SC1090", s125: true },
+  },
+  {
+    id: "U1-EXIT-10 a write through an index-signature part of a copy refuses (gate S1)",
+    src: `const o: any = { m: { a: [1] } };
+const m: Record<string, number[]> = o.m;
+m["a"]!.push(2);
+console.log(o.m.a.length);`,
+    refused: { code: "SC1090", s125: true },
+  },
+  {
     id: "U1-EXIT-04 a copy into a field nobody writes runs",
     src: `type P = { n: number };
 const shared: any = { n: 1 };

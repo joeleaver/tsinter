@@ -1167,7 +1167,9 @@ function lowerAssertIfError(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): I
       loc,
     };
   }
-  const v = L.lowerExpr(argNode);
+  const v0 = L.lowerExpr(argNode);
+  // One world (U1a): an island value takes the dyn arm (assert.ifErrorDyn).
+  const v = L.sharedDynamic && v0.type.kind === "jsval" ? { kind: "dynFromJsval" as const, value: v0, type: DYN, loc: v0.loc } : v0;
   const fence = (t: IrType): never =>
     L.noLowering(
       `assert.ifError over '${L.fmt(t)}' values`,
