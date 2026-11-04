@@ -9476,9 +9476,13 @@ not (c)'s. **Rationale:** a stopgap until unit U1 makes the dynamic
 crossings share (docs/design/dynamic-values.md); until then a silent
 divergence becomes a named refusal. Known cost: the corpus loses no
 program. In a 73-package sample of the round-3 npm survey (stratum A),
-26 packages carry a refused crossing and 13 refuse because of it alone
-(among them react-dom, whose hooks share one object through three
-dynamic slots, express and lodash). **Tested by:**
+25 packages carry a refused crossing and 11 refuse because of it alone.
+Some of those are real (react-dom's hooks share one object through three
+dynamic slots; chai's esbuild `__export` defines exports on a copy); most
+are not, because the analysis is context-insensitive (a helper used as a
+value puts every argument it is ever handed in one shared class, which
+merges nearly all of lodash) and judges typed writes by type (a write to
+any `string[]` counts against every `string[]` copy). **Tested by:**
 `packages/compiler/test/wasm-dyn-copies.test.ts` (#120's two forms and
 each refused shape on wasm and wasm-native, and the unobservable shapes
 diffed against Node).
