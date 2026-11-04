@@ -695,6 +695,15 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // the slot then wraps.
         if (L.dynamic && mapped?.kind === "dyn" && L.mapTypeOf(L.typeOf(expr))?.kind === "jsval") return true;
         if (mapped?.kind !== "jsval") return false;
+        // The one-world lanes without the engine: a literal whose own type
+        // is a static composite the island cannot hold (a class instance,
+        // a Map/Set, a RegExp, an accessor inside) builds statically, as
+        // it did when `any` had no mapping; its consumer takes the typed
+        // value (inspect, console.log) or the checked-dynamic box.
+        if (L.sharedDynamic && !L.engine) {
+          const own = L.mapTypeOf(L.typeOf(expr));
+          if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
+        }
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an
         // EMPTY array literal under a const assertion is the empty tuple —
         // its `any` answer is a panicked query, not an island slot.
@@ -8430,6 +8439,11 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // `xs as any[]` (and every other target that IS an island value —
       // SEMANTICS.md S014's unit-H amendment): the island entrance too.
       if (L.dynamic && L.mapTypeOf(targetTs0)?.kind === "jsval") {
+        // The one-world lanes: `x as unknown` / `x as object` over a typed
+        // value the island cannot hold (an accessor record, a class
+        // instance it cannot box) stays the typed value — the erasure the
+        // checked-dynamic world made; its uses fence or answer statically.
+        if (L.sharedDynamic && !(targetTs0.flags & ts.TypeFlags.Any) && !L.canEnterIsland(inner.type)) return inner;
         return L.jsvalIn(inner, expr.expression);
       }
       // `u as Arm` on a UNION value is `u!`'s spelling with a named arm
@@ -10061,6 +10075,13 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // the reason came from, by reference (identity, kind, aliasing as in
     // Node); a statically thrown object has no such form and throws a
     // catchable named Error at the read instead of crossing as a copy.
+    // The one-world lanes without the engine: no engine value can have
+    // been thrown, so the caught payload takes `unknown`'s conversion
+    // (the error encoding / snapshot, SEMANTICS.md S021) as the same \$dyn
+    // value under the island type.
+    if (narrowed?.kind === "jsval" && L.sharedDynamic && !L.engine) {
+      return { kind: "jsMarshal", value: { kind: "caughtToDyn", value: ref, type: DYN, loc }, type: JSVAL, loc };
+    }
     if (narrowed?.kind === "jsval") {
       return { kind: "libCall", fn: "island.caughtToJsval", args: [ref], type: JSVAL, loc };
     }

@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -2357,6 +2357,7 @@ export class Lowerer {
             entry: ENTRY_NAME,
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
+            ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
           };
     return {
       module,
@@ -3670,6 +3671,28 @@ export class Lowerer {
    * arm's canonical tag. Same-union values pass through untouched; anything
    * else (including a DIFFERENT union) is left for requireExactShape, which
    * rejects union mismatches with SC2003. */
+  /** The one-world lanes without the engine: does a typed value of type
+   * `t` enter the island as the checked-dynamic box/copy (dynFrom) rather
+   * than the island's own marshal or view? Functions (the named box, one
+   * per closure identity) and the values the island cannot view (class
+   * instances, Map/Set, records holding them, accessor records). */
+  oneWorldDynBox(t: IrType): boolean {
+    if (!this.sharedDynamic || this.engine || t.kind === "dyn" || t.kind === "jsval") return false;
+    if (!this.dynConvertible(t)) return false;
+    if (t.kind === "func") return true;
+    return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex" && t.kind !== "promise";
+  }
+
+  /** Can a typed value of type `t` enter the island at all (jsvalIn's
+   * domain, without its refusals)? */
+  canEnterIsland(t: IrType): boolean {
+    if (t.kind === "jsval" || t.kind === "dyn" || isUnitType(t)) return true;
+    if (this.oneWorldDynBox(t) || this.boundarySafe(t) || this.jsvalLiftable(t)) return true;
+    if (t.kind === "func") return canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+    if (t.kind === "promise") return islandPromisePayloadTag(t.inner) !== null;
+    return t.kind === "regex";
+  }
+
   coerceToExpected(expr: IrExpr, expected: IrType): IrExpr {
     // Island boundary, both directions. IN: any static value flowing into
     // an any-typed slot marshals implicitly (tsc allows the assignment;
@@ -3691,6 +3714,12 @@ export class Lowerer {
       // TypeError at runtime (trust-but-verify, like every boundary).
       if (expr.type.kind === "dyn") {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
+      }
+      // The one-world lanes without the engine: jsvalIn's rule — a
+      // function crosses as the checked-dynamic box, and a typed value the
+      // island cannot view as the checked-dynamic copy (S125 (c) judges it).
+      if (this.oneWorldDynBox(expr.type)) {
+        return { kind: "jsMarshal", value: { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc }, type: JSVAL, loc: expr.loc };
       }
       if (this.boundarySafe(expr.type)) {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
@@ -6472,7 +6501,12 @@ export class Lowerer {
     if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "array" && isTemplateStrings(this, node)) {
       e = viewOf(this, expr, e.loc, true);
     }
-    if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
+    // The checked-dynamic box of a function: named like every boxed
+    // closure; its composite parameters and result are S125 (c)'s to judge.
+    if (e !== expr && e.kind === "jsMarshal" && e.value.kind === "dynFrom" && expr.type.kind === "func") {
+      const fnName = jsFuncNameOf(node);
+      if (fnName !== null) e = { ...e, value: { ...e.value, fnName } };
+    } else if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
       this.lastHostShallow = false;
       if (this.checkHostFunctionCopies(node, expr.type)) this.checkedHostMarshals.add(e);
       if (this.lastHostShallow) this.shallowHostMarshals.add(e);

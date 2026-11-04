@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 const corpus = join(import.meta.dirname, "../../../tests/corpus");
 const scratch = mkdtempSync(join(process.env["U1_SCRATCH"] ?? tmpdir(), "u1p-"));
@@ -23,7 +23,9 @@ test.for(files)("%s", async (rel) => {
     w = await runWasm(res.binaryPath);
   } catch (e) {
     if (!(e instanceof WebAssembly.RuntimeError)) throw e;
-    w = { stdout: "(trap: stdout not captured)", exitCode: 1 };
+    const t = await runWasmToTrap(res.binaryPath);
+    w = { stdout: t.stdout, exitCode: 1 };
+    if (process.env["U1_SHOW"]) console.log("U1OUT stdout:\n" + t.stdout + "\nstderr:\n" + t.stderr);
   }
   const n = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "", cwd: join(file, "..") });
   if (w.stdout !== "(trap: stdout not captured)") expect(String(w.stdout)).toBe(n.stdout);

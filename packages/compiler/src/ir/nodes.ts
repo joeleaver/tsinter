@@ -817,6 +817,12 @@ export interface IrModule {
    * an empty array and a missing record key with the slot's undefined
    * instead of trapping). Set for the WasmGC lanes only. */
   undefSlots?: true;
+  /** One dynamic world (dynamic-values design §4.1): any/unknown/object
+   * and JS residue are one island value. An island index write past an
+   * array's end pads with `undefined` (SEMANTICS.md S016's padding, kept
+   * on the WasmGC lanes) instead of S110 (f)'s fence — the checked-
+   * dynamic write `unknown` always took. Set for the WasmGC lanes only. */
+  sharedDynamic?: true;
 }
 
 /** One outbound native FFI declaration, copied from the validated format-1

@@ -10,7 +10,7 @@ import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundar
 import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
-import { PoisonError, newFnCtx, own } from "./lowerer.js";
+import { PoisonError, jsFuncNameOf, newFnCtx, own } from "./lowerer.js";
 import { regexCrossingChecked } from "./lower-regex.js";
 
 /** True iff the checker's type for this node maps to jsval ('any') —
@@ -98,6 +98,22 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // no other producers), so dropping the operand loses nothing.
     if (isUnitType(e.type)) {
       return { kind: "jsOp", op: e.type.kind === "undefinedT" ? "undefLit" : "nullLit", args: [], type: JSVAL, loc: e.loc };
+    }
+    // The one-world lanes without the engine: a function crosses as the
+    // checked-dynamic box (named, one box per closure identity — what an
+    // `unknown` crossing always built), and a typed value the island
+    // cannot view (a class instance, a Map/Set, a record holding one, an
+    // accessor record) crosses as the checked-dynamic copy S014 made,
+    // which S125 (c) judges like every copy. The \$dyn value IS the
+    // island value.
+    if (L.oneWorldDynBox(e.type)) {
+      const fnName = e.type.kind === "func" ? jsFuncNameOf(node) : null;
+      return {
+        kind: "jsMarshal",
+        value: { kind: "dynFrom", value: e, ...(fnName !== null ? { fnName } : {}), type: DYN, loc: e.loc },
+        type: JSVAL,
+        loc: e.loc,
+      };
     }
     if (e.type.kind === "dyn") {
       // A CHECKED-DYNAMIC value entering the island: the dyn tree
