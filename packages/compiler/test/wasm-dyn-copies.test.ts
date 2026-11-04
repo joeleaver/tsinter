@@ -340,6 +340,18 @@ sink.at(0).push(9);
 console.log(JSON.stringify(sink));`,
   },
   {
+    // A new array a dynamic map builds, checked into string[].
+    id: "ok-dynamic-map-result",
+    src: `function toOptions(config: any): string[] {
+  return Object.keys(config).map((k: string) => "--" + k);
+}
+const cfg: any = JSON.parse('{"a":1}');
+const opts = toOptions(cfg);
+opts.push("--z");
+cfg.b = 2;
+console.log(opts, cfg);`,
+  },
+  {
     // A library result nothing else holds.
     id: "ok-library-result",
     src: `const keys: unknown = Object.keys({ a: 1, b: 2 }).map((k) => k + "!");

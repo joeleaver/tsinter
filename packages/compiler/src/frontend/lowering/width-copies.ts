@@ -2003,7 +2003,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "call":
           // A program function every return of which builds a value from
           // its own locals.
-          if (!e.callee.startsWith("%") && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
+          if ((!e.callee.startsWith("%") || /^%fn\d+$/.test(e.callee)) && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
           return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
         default:
           // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
@@ -2371,7 +2371,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       } else {
         feature = `a dynamic ('unknown', 'any' or 'object') value checked into '${L.fmt(s.t)}'`;
         hint = "keep the value dynamic and read its members through it, or cast a value nothing else holds (JSON.parse(text) as T)";
-        if (refs.length > 0 && !s.consumed && !uniqueDyn(s.arg, s.where) && !(s.atReturn && ownedLocal(s.arg, s.where))) {
+        // A new array a dynamic map/filter/slice/concat just built, checked
+        // into an array of scalars: its spine is all the copy holds.
+        const src = unwrap(s.arg);
+        const freshSpine = s.t.kind === "array" && !hasRef(s.t.elem) && src?.kind === "dynInvoke" && /^(map|filter|slice|concat)$/.test(src.method);
+        if (refs.length > 0 && !s.consumed && !freshSpine && !uniqueDyn(s.arg, s.where) && !(s.atReturn && ownedLocal(s.arg, s.where))) {
           // While the copy is alive: only the function its local binding
           // lives in (and what that can call) runs, unless it suspends.
           const window = copyWindow(s);
