@@ -316,7 +316,7 @@ ee.emit("x", 1);`,
     src: `import { twice } from "./lib.js";
 console.log(twice(21));`,
     files: { "lib.js": "export function twice(x) { return x * 2; }\n" },
-    world: "old",
+    world: "new", // U1b: JavaScript sources join the one world
   },
   {
     id: "U1-SEAM-02 a JavaScript entry calls a TypeScript module",
@@ -324,7 +324,7 @@ console.log(twice(21));`,
     src: `import { twice } from "./lib.ts";
 console.log(twice(21));`,
     files: { "lib.ts": "export function twice(x: number): number { return x * 2; }\n" },
-    world: "old",
+    world: "new", // U1b: JavaScript sources join the one world
   },
   {
     id: "U1-SEAM-03 a TypeScript function value passed into JavaScript",
@@ -332,7 +332,7 @@ console.log(twice(21));`,
 const inc = (n: number): number => n + 1;
 console.log(applyTo(inc, 41));`,
     files: { "lib.js": "export function applyTo(f, x) { return f(x); }\n" },
-    world: "old",
+    world: "new", // U1b: JavaScript sources join the one world
   },
   {
     id: "U1-SEAM-04 a JavaScript function value passed into TypeScript",
@@ -340,7 +340,7 @@ console.log(applyTo(inc, 41));`,
     src: `import { applyTo } from "./lib.ts";
 console.log(applyTo((n) => n + 1, 41));`,
     files: { "lib.ts": "export function applyTo(f: (n: number) => number, x: number): number { return f(x); }\n" },
-    world: "old",
+    world: "new", // U1b: JavaScript sources join the one world
   },
 ];
 

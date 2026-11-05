@@ -2711,7 +2711,6 @@ export class Lowerer {
 
   pushDiag(diag0: ScrDiagnostic): void {
     const diag = this.oneWorldDiag(diag0);
-    if (process.env["DBGDIAG"] && diag.message.includes(process.env["DBGDIAG"])) console.log("DBGSTACK", new Error().stack?.split("\n").slice(2, 9).map((l) => l.replace(/\(.*\/src\//, "(").trim()).join(" < "));
     const d = this.instantiationContext
       ? { ...diag, message: `${diag.message} (${this.instantiationContext})` }
       : diag;

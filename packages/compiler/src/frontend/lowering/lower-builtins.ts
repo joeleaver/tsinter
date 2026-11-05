@@ -3679,7 +3679,6 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // types the return `string`, so no static consumer can tell), and a
       // runtime handle inside the tree throws (Node would walk its own
       // enumerable props, which the handle does not model).
-      if (process.env["DBGDIAG"]) console.log("DBGJSON", argNode.getText(), JSON.stringify(value.type), value.kind, JSON.stringify(L.mapTypeOf(L.typeOf((argNode as ts.PropertyAccessExpression).expression))));
       if (!L.jsonSafe(value.type) && value.type.kind !== "dyn") {
         // Bare undefined-armed unions get their own wording: Node's
         // stringify of bare undefined is not a string at all — per-type
