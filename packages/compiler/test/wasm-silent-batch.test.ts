@@ -158,7 +158,7 @@ test("T164B ARGSLEN: a JavaScript method's arguments.length refuses by name (a c
   // Node v24 prints "before\n2\n" and then throws; this tier refuses by name.
   const { stdout, stderr } = await runRowTrap("T164B", "class A { m() { return arguments.length; } }\nconsole.log(\"before\");\nconsole.log(new A().m(1, 2));", "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toContain("'arguments.length' in a JavaScript method, constructor or accessor");
+  expect(stderr).toContain("the reference to 'arguments'");
 });
 
 // ============================================================

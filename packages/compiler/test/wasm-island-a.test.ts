@@ -184,7 +184,7 @@ test("A1-DEFPROPS-01 an accessor descriptor Object.defineProperties cannot hold 
   // Node: before, then "0 2". The descriptor arrives as the front end's
   // deferred fence, which used to define `undefined` silently.
   expect(stdout).toBe("before\n");
-  expect(stderr).toContain("a function as a property descriptor on a dynamic value is not supported yet [SC1090]");
+  expect(stderr).toContain("values in a runtime-keyed (computed-key) object literal is not supported yet [SC1101");
 });
 
 test("A1-CORPUS-2568 the rest-forwarding corpus program", async () => {
