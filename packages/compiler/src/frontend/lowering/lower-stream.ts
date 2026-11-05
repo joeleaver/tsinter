@@ -35,7 +35,7 @@ import { newFnCtx, own } from "./lowerer.js";
 import { appendImplicitUndefinedReturn } from "./lower-calls.js";
 import { bufEncoding, knownBufEncoding } from "./lower-containers.js";
 import { probeLower } from "./lower-exprs.js";
-import { BOOL, DYN, F64, IrExpr, IrFunction, IrLibFn, IrStmt, IrType, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, VOID, arrayOf, bytesOf, canBoxFuncIntoDyn, funcOf, typeEquals, typeKey } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, IrExpr, IrFunction, IrLibFn, IrStmt, IrType, JSVAL, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, VOID, arrayOf, bytesOf, canBoxFuncIntoDyn, funcOf, typeEquals, typeKey } from "../../ir/nodes.js";
 
 const BYTES = bytesOf("u8");
 
@@ -808,7 +808,10 @@ function streamMethodWrapper(L: Lowerer, info: ClassInfo, which: string,
         "declare the Node signature's parameters plainly (any prefix is fine)",
       );
     }
-    if (got.type.kind === "dyn") {
+    // One world (U1a): an `unknown`/`any` parameter is the island value,
+    // the same \$dyn the thunk boxes for a dyn position.
+    const islandParam = got.type.kind === "jsval" && L.sharedDynamic;
+    if (got.type.kind === "dyn" || islandParam) {
       // The JS lane's implicitly-any parameters: the emitted invoke
       // thunk boxes each position by kind.
     } else if (want === "fn") {
@@ -825,7 +828,7 @@ function streamMethodWrapper(L: Lowerer, info: ClassInfo, which: string,
         "annotate the parameter with the Node signature's type (chunks are Buffers here)",
       );
     }
-    paramTypes.push(got.type);
+    paramTypes.push(islandParam ? DYN : got.type);
   }
   const ret = found.sig.ret;
   const fnName = `%fn${L.lambdaCounter++}_${which}vt`;
@@ -838,7 +841,9 @@ function streamMethodWrapper(L: Lowerer, info: ClassInfo, which: string,
     for (let i = 0; i < paramTypes.length; i++) {
       const local = L.declareHiddenLocal(`a${i}`, paramTypes[i]!);
       params.push({ localId: local.id, name: local.name, type: paramTypes[i]! });
-      argRefs.push({ kind: "varRef", localId: local.id, type: paramTypes[i]!, loc });
+      const ref: IrExpr = { kind: "varRef", localId: local.id, type: paramTypes[i]!, loc };
+      // An island-typed method parameter takes the dyn position retyped.
+      argRefs.push(declared[i]!.type.kind === "jsval" && paramTypes[i]!.kind === "dyn" ? { kind: "jsMarshal", value: ref, type: JSVAL, loc } : ref);
     }
     const thisRef: IrExpr = { kind: "varRef", localId: thisLocal.id, type: thisType, loc };
     let call: IrExpr;

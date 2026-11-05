@@ -263,7 +263,7 @@ export interface FileParts {
    * site. Type-only imports are free either way: the .d.ts is a type
    * surface, not code. */
   export function collectNpmImports(L: Lowerer, parts: FileParts[]): void {
-    const builder = L.dynamic ? new NpmGraphBuilder() : null;
+    const builder = L.engine ? new NpmGraphBuilder() : null;
     for (const fp of parts) {
       for (const stmt of fp.sf.statements) {
         // STAR re-exports (`export * from "pkg"`, `export * as ns from

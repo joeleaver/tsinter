@@ -4756,7 +4756,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
     // the per-package requires-dynamic diagnostic (the constructor runs in
     // the embedded engine). Under --dynamic, X is jsval-typed and lowers
     // to the construct op below.
-    if (!L.dynamic) {
+    if (!L.engine) {
       const pkg = ts.isIdentifier(expr.expression)
         ? L.npmPackageOfSymbol(L.resolveValueSymbol(expr.expression) ?? undefined)
         : null;

@@ -547,7 +547,15 @@ export interface TypeMapperCtx {
   /** --dynamic: `any` maps to the island handle type (jsval). Off, `any`
    * stays unmapped and the requires-dynamic diagnostic fires per site. */
   dynamic: boolean;
-  /** LowererMode.hostFetch: the backend's host supplies fetch, so the
+  /** The engine is embedded (the user's --dynamic): types a package's
+   * .d.ts declares map to jsval (the package's code runs in the engine).
+   * Absent: same as `dynamic`. */
+  engine?: boolean;
+  /** One dynamic world (the WasmGC lanes, dynamic-values design §4.1):
+   * `unknown` and `object` map to jsval too — the island value is the
+   * only user-visible dynamic representation. */
+  sharedDynamic?: boolean;
+  /** LowerOptions.hostFetch: the backend's host supplies fetch, so the
    * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
    * without --dynamic (the module serves them — SEMANTICS.md S098). */
   hostFetch?: boolean;
@@ -561,6 +569,18 @@ export interface TypeMapperCtx {
   isProgramFile: (sf: ts.SourceFile) => boolean;
 }
 
+
+/** A record field, index-signature value or tuple element typed exactly
+ * `unknown` or `object` on the one-world lanes: the slot keeps the
+ * checked-dynamic slot type (DYN) — the shape needs a slot, and DYN and
+ * jsval are one runtime value (the same \$dyn reference, shared: storing a
+ * dynamic value there copies nothing). `any` members keep unit H's
+ * absorb (the whole composite is the island value). */
+function slotOfMember<T extends IrType | null>(memberTs: ts.Type, mapped: T, ctx: TypeMapperCtx): T | IrType {
+  if (ctx.sharedDynamic !== true || mapped === null || mapped.kind !== "jsval") return mapped;
+  if ((memberTs.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0) return DYN;
+  return mapped;
+}
 
 /** lower-calls.ts's bodyReadsArguments, duplicated here (types.ts must not
  * import from lowering/ — that edge is a module cycle): does the function's
@@ -790,7 +810,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (flags & ts.TypeFlags.Never) return F64;
   // `unknown` is a VALUE with a runtime representation (the dyn JSON dyn —
   // JSON.parse results and unknown-typed locals/params/returns).
-  if (flags & ts.TypeFlags.Unknown) return DYN;
+  if (flags & ts.TypeFlags.Unknown) return ctx.sharedDynamic === true && process.env["SCRIPTC_U1_STAGE"] !== "world" ? JSVAL : DYN;
   // `object` (the NonPrimitive intrinsic) is a TOP type over non-primitive
   // values — tsc admits every record, array, function, or class instance
   // into an `object` slot, so no exact record shape can hold it. It lowers
@@ -798,7 +818,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // outside the checked-dynamic tree fence there, same as unknown), reads narrow back out
   // through the same checked casts. Member accesses tsc allows on `object`
   // (the Object.prototype surface) fence at their use sites.
-  if (flags & ts.TypeFlags.NonPrimitive) return DYN;
+  if (flags & ts.TypeFlags.NonPrimitive) return ctx.sharedDynamic === true && process.env["SCRIPTC_U1_STAGE"] !== "world" ? JSVAL : DYN;
   // `any` is the island handle type under --dynamic (the type-hole becomes
   // dynamically-executed code); without the flag it stays unmapped and the
   // per-site diagnostic tells the user about --dynamic and the static
@@ -861,7 +881,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       return sf.isDeclarationFile && !ctx.isStdlibFile(sf);
     })
   ) {
-    return ctx.dynamic ? JSVAL : null;
+    return (ctx.engine ?? ctx.dynamic) ? JSVAL : null;
   }
   // NOTE on module NAMESPACE types (`typeof import("./x.mjs")` — what a
   // dynamic import resolves to): non-stdlib ones fall under the rule
@@ -992,7 +1012,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     }
     const fields: { name: string; type: IrType }[] = [];
     for (let i = 0; i < args.length; i++) {
-      let et = mapType(args[i]!, ctx);
+      let et = slotOfMember(args[i]!, mapType(args[i]!, ctx), ctx);
       // A unit-only element (`[number, undefined]`) rides the unit-only
       // union, the record-field rule.
       if (et?.kind === "void" && isUnitOnlyTsType(args[i]!)) et = unitOnlyUnion(unions);
@@ -3044,7 +3064,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     let v: IrType | null = null;
     for (const info of indexInfos) {
       if (!stringKey(info.keyType) && !(info.keyType.flags & ts.TypeFlags.Number)) return null;
-      const iv = mapType(info.valueType, ctx);
+      const iv = slotOfMember(info.valueType, mapType(info.valueType, ctx), ctx);
       // A jsval-valued signature absorbs the shape: `Record<string,
       // JSONValue>` (a package's own JSON alias) and `Record<string, any>`
       // are one island object — the overflow map has no handle slot, and
@@ -3254,6 +3274,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // members as the same handle, static members marshaled). jsval-
       // BEARING composite fields (`content: any[]`) keep their static
       // shape — the lift covers them.
+      pt = slotOfMember(fieldTs, pt, ctx);
       if (pt.kind === "jsval") return JSVAL;
       fields.push({ name: p.name, type: pt, ...((p.flags & ts.SymbolFlags.Optional) !== 0 ? { optional: true as const } : {}) });
     }

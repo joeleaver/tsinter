@@ -3162,7 +3162,10 @@ function validateFunction(
         // function type (the checked-dynamic tree's function kind — canConvertToDyn folds
         // all four in).
         const vt = e.value.type;
-        if (!canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
+        // The WasmGC lanes box every promise by reference: a jsval payload
+        // rides the dyn payload's slot (the emitter's promise arm).
+        const wasmPromise = undefSlots && vt.kind === "promise" && (vt.inner.kind === "jsval" || vt.inner.kind === "dyn");
+        if (!wasmPromise && !canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
           err(`dynFrom of non-dyn-convertible type ${vt.kind}`, e.loc);
         }
         break;
@@ -4896,8 +4899,8 @@ function validateFunction(
         if (named !== (e.name !== undefined)) {
           err(`jsOp ${e.op} ${named ? "requires" : "forbids"} a name`, e.loc);
         }
-        if (e.spelling !== undefined && e.op !== "callMethod") {
-          err(`jsOp ${e.op} forbids a callee spelling (callMethod only)`, e.loc);
+        if (e.spelling !== undefined && e.op !== "callMethod" && e.op !== "callFn") {
+          err(`jsOp ${e.op} forbids a callee spelling (callMethod and callFn only)`, e.loc);
         }
         const arity: Record<string, number | null> = {
           add: 2, sub: 2, mul: 2, div: 2, mod: 2, pow: 2,

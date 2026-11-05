@@ -734,6 +734,11 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
         // (SEMANTICS.md S003/S006/S032 are retired there); the native
         // lanes keep trapping and their IR is unchanged.
         ...(opts.backend === "wasm" || opts.backend === "wasm-native" ? { undefSlots: true } : {}),
+        // One dynamic world (dynamic-values design §4.1, Joe's ruling J1):
+        // the WasmGC lanes lower any/unknown/object and JS residue as the
+        // shared island value; the native lanes keep the checked-dynamic
+        // world (SEMANTICS.md S014/S015/S016/S042, c/llvm only).
+        ...(opts.backend === "wasm" || opts.backend === "wasm-native" ? { sharedDynamic: true } : {}),
         ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
       });
     } catch (e) {

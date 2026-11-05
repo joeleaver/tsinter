@@ -817,6 +817,12 @@ export interface IrModule {
    * an empty array and a missing record key with the slot's undefined
    * instead of trapping). Set for the WasmGC lanes only. */
   undefSlots?: true;
+  /** Unit U1a: the program took the one dynamic world (a TypeScript program
+   * on the WasmGC lanes — `any`/`unknown`/`object` are one island value);
+   * absent when it kept the checked-dynamic world (a program with a
+   * JavaScript source, every other lane). Informational: no backend reads
+   * it; tests and tools observe which world a build took. */
+  sharedDynamic?: true;
 }
 
 /** One outbound native FFI declaration, copied from the validated format-1
@@ -5268,7 +5274,7 @@ export type IrExpr =
    * type-directed JSON serializer and the engine's JSON parser; the
    * aliasing divergence is documented in SEMANTICS.md). Result is an
    * owned (+1) jsval; the operand is borrowed. Never throws. */
-  | { kind: "jsMarshal"; value: IrExpr; type: IrType; loc: SrcLoc }
+  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; type: IrType; loc: SrcLoc }
   /** An operation on island values (--dynamic builds only), executed by
    * the embedded engine with JS-exact semantics (coercions come from
    * pinned prelude closures, not C reimplementations). `args` are
@@ -5285,10 +5291,11 @@ export type IrExpr =
       kind: "jsOp";
       op: IrJsOp;
       name?: string;
-      /** callMethod only: V8's rendering of the callee (`o.zz`, `o[16]`,
-       * board #243 review), for "<x> is not a function" where the backend
-       * builds that text itself; absent when the source has no rendered
-       * form (the backend then names the method). */
+      /** callMethod and callFn: V8's rendering of the callee (`o.zz`,
+       * `o[16]`, `num`, board #243 review), for "<x> is not a function"
+       * where the backend builds that text itself; absent when the source
+       * has no rendered form (the backend then names the method, or the
+       * callee binding). */
       spelling?: string;
       args: IrExpr[];
       type: IrType;

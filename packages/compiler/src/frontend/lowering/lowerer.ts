@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -87,7 +87,7 @@ import {
   UnionRegistry,
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
-import { exitIsConsumedCopy, exitIsFresh, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -98,7 +98,7 @@ import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowe
 import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
 import { lowerEmitOverrideSpec, type EmitSpecCtx, type EmitSpecRequest } from "./lower-emitter.js";
-import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, promisifiedExecFileDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall } from "./lower-builtins.js";
+import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, promisifiedExecFileDecl, isPromisifyCall, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall } from "./lower-builtins.js";
 import { isIslandExpr, islandFuncValueFence, islandRegexpOf, jsvalIn, requireDynamicApi, islandGlobalFnOf, lowerDynamicImportCall, lowerFetchCall, lowerIslandMethodCall, lowerMathProperty, npmPackageOf, npmMemberFence, npmPackageOfSymbol } from "./lower-island.js";
 import { lowerHttpHeadersElement, lowerNetModuleCall, lowerServerMethodCall, lowerServerProperty, lowerTlsRootCertificates } from "./lower-server.js";
 import { lowerDgramDnsModuleCall, lowerDgramMethodCall } from "./lower-dgram.js";
@@ -108,7 +108,7 @@ import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
-import { isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -373,6 +373,14 @@ export interface LowerOptions {
    * compile() sets it for the wasm backends only; the native lanes keep
    * SEMANTICS.md S003/S006/S032 and their IR is unchanged. */
   undefSlots?: boolean;
+  /** One dynamic world (the WasmGC lanes — dynamic-values design §4.1,
+   * Joe's ruling J1): `any`, `unknown`, `object` and JS inference residue
+   * all lower as the shared island value (jsval) whether or not --dynamic
+   * is set; --dynamic then means only "embed the engine for package
+   * code". compile() sets it for the wasm backends only; the c and llvm
+   * lanes keep the checked-dynamic world (SEMANTICS.md S014/S015/S016/
+   * S042) and their IR is unchanged. */
+  sharedDynamic?: boolean;
   /** Node's startup refusal (LoadResult.startupCrash — preflight's
    * resolution walk and CJS named-import link check): the program
    * compiles to that startup crash. */
@@ -408,6 +416,8 @@ export interface LowererMode {
   hostFetch?: boolean;
   /** LowerOptions.undefSlots — lowerToIr passes it to every pass. */
   undefSlots?: boolean;
+  /** LowerOptions.sharedDynamic — lowerToIr passes it to every pass. */
+  sharedDynamic?: boolean;
   /** Node's startup refusal (preflight's resolution walk / CJS named-
    * import link check): %main opens with exactly this throw, before any
    * module init — Node refuses the whole graph before anything evaluates,
@@ -439,6 +449,21 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
+/** Does the program carry a JavaScript source (U1a's language split)? A
+ * .js/.cjs/.mjs file of the program, or — under --dynamic, where package
+ * code is embedded and runs as JavaScript — any file of an npm package the
+ * program loaded (its own .d.ts included; `@types` and the TypeScript
+ * libraries are declarations of nothing embedded). */
+export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[], dynamic: boolean): boolean {
+  const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
+  if (moduleOrder.some(isJs) || program.getSourceFiles().some(isJs)) return true;
+  if (!dynamic) return false;
+  return program.getSourceFiles().some((sf) => {
+    const f = sf.fileName.replace(/\\/g, "/");
+    return /\/node_modules\//.test(f) && !/\/node_modules\/(@types|typescript|@typescript)\//.test(f) && !/\/lib\.[^/]*\.d\.ts$/.test(f);
+  });
+}
+
 export function lowerToIr(
   program: ts.Program,
   entry: ts.SourceFile,
@@ -449,6 +474,14 @@ export function lowerToIr(
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
   const undefSlots = options.undefSlots ?? false;
+  // Unit U1a (coordinator's ruling: split by source language): the one
+  // dynamic world is for TypeScript programs. A program with ANY JavaScript
+  // source in it (a .js/.cjs/.mjs file of the program, an embedded npm
+  // package) keeps today's checked-dynamic path whole, until U1b — the
+  // type mapping cannot tell a JS file's `any` from a TS file's, so a
+  // per-file switch would give a function crossing between them two
+  // representations. Per program there is no seam to cross.
+  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder, dynamic);
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -471,6 +504,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     ffiImports,
   });
   const ffiValidation = validateFfiImports(validation);
@@ -486,6 +520,7 @@ export function lowerToIr(
         targetPlatform,
         hostFetch,
         undefSlots,
+        sharedDynamic,
         ffiImports,
         ffiBindingSymbols: ffiValidation.symbolsByName,
       });
@@ -495,6 +530,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     startupCrash,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
@@ -510,6 +546,7 @@ export function lowerToIr(
     targetPlatform,
     hostFetch,
     undefSlots,
+    sharedDynamic,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
   });
@@ -689,6 +726,19 @@ export function ladderFenceExpr(L: Lowerer, surface: string, node: ts.Node, hint
  * this fallback for `any` (mapType answers jsval first).
  *
  * Null for void (no value exists to represent). */
+/** An array pattern the checked-dynamic pattern arm lowers whole in a
+ * TypeScript source: identifiers (with or without defaults), holes and
+ * nested array patterns of the same — no rest element, no object pattern. */
+function dynArmPattern(p: ts.ArrayBindingPattern): boolean {
+  return p.elements.every((el) => {
+    if (ts.isOmittedExpression(el)) return true;
+    if (el.dotDotDotToken) return false;
+    const n = el.name;
+    return n !== undefined && (ts.isIdentifier(n) || (ts.isArrayBindingPattern(n) && dynArmPattern(n)));
+  });
+}
+
+
 export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType | null {
   if (t.flags & ts.TypeFlags.Void) return null;
   if (!isJsSourceFile(node.getSourceFile())) {
@@ -730,7 +780,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
       retT.flags & ts.TypeFlags.Void ? VOID : L.mapTypeOf(retT) ?? DYN;
     return { kind: "func", params, ret };
   }
-  return DYN;
+  return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
 }
 
 /** The one call signature of a PURE function type — single signature, no
@@ -1156,6 +1206,11 @@ export class Lowerer {
    * engine handle (a dynamic import's namespace object) — paramShape's
    * early-out. */
   readonly jsvalParamOverrides = new Set<ts.ParameterDeclaration>();
+  /** Parameters forced to the checked-dynamic type (DYN) regardless of
+   * their checker type: on the one-world lanes, an `unknown`/`any`-typed
+   * callback parameter of a checked-dynamic receiver's HOF, whose helper
+   * hands it the dyn element — the same value under the dyn type (U1a). */
+  readonly dynParamOverrides = new Set<ts.ParameterDeclaration>();
   /** File → qualifier prefix: "" for the entry, "%mI." otherwise. */
   readonly fileTag = new Map<ts.SourceFile, string>();
   /** Namespace ModuleBlocks this program lowers, filled by splitFiles:
@@ -1295,6 +1350,14 @@ export class Lowerer {
   readonly hostFetch: boolean;
   /** LowererMode.undefSlots: typed slots carry undefined (wasm lanes). */
   readonly undefSlots: boolean;
+  /** LowererMode.sharedDynamic: one dynamic world (wasm lanes) — `any`,
+   * `unknown`, `object` and JS residue are the shared island value. */
+  readonly sharedDynamic: boolean;
+  /** The island world is on: --dynamic, or the WasmGC lanes' one dynamic
+   * world (sharedDynamic). Every island lowering gates on this; the
+   * engine-only surfaces (package code, `__island_eval`, the
+   * requires-dynamic diagnostics) gate on `engine`. */
+  readonly dynamic: boolean;
   /** LowererMode.startupCrash — buildMain opens %main with the throw. */
   readonly startupCrash: StartupCrash | null;
   /** Outbound native bindings by their source-level ambient name. */
@@ -1352,9 +1415,14 @@ export class Lowerer {
     readonly program: ts.Program,
     readonly entry: ts.SourceFile,
     readonly moduleOrder: ts.SourceFile[],
-    readonly dynamic: boolean,
+    /** --dynamic: the build embeds the engine for package code (npm
+     * imports, dynamic import() of the program's own files, the
+     * requires-dynamic diagnostics' gate). */
+    readonly engine: boolean,
     mode: LowererMode = {},
   ) {
+    this.sharedDynamic = mode.sharedDynamic ?? false;
+    this.dynamic = engine || this.sharedDynamic;
     this.reachable = mode.reachable ?? null;
     this.remainder = mode.remainder ?? false;
     this.alreadyFlushed = mode.alreadyFlushed ?? new Set();
@@ -1382,6 +1450,8 @@ export class Lowerer {
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
       dynamic: this.dynamic,
+      engine: this.engine,
+      sharedDynamic: this.sharedDynamic,
       hostFetch: this.hostFetch,
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
@@ -2327,6 +2397,7 @@ export class Lowerer {
             entry: ENTRY_NAME,
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
+            ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
           };
     return {
       module,
@@ -2610,7 +2681,30 @@ export class Lowerer {
   /** All diagnostics land here; while a generic instance body is lowering,
    * the instantiation context is appended so the user knows which concrete
    * types made the (source-anchored) construct fail. */
-  pushDiag(diag: ScrDiagnostic): void {
+  /** U1a: on the one-world lanes a TypeScript program's `any`/`unknown`
+   * values are compiled, so the dynamic-family texts' "runs in the
+   * embedded dynamic engine, which this build does not include" is not
+   * the reason a construct refuses: the compiled dynamic values have no
+   * form for it yet. Same code; the text and hint say that. */
+  private oneWorldDiag(d: ScrDiagnostic): ScrDiagnostic {
+    if (!this.sharedDynamic) return d;
+    if (d.code !== "SC2010" && d.code !== "SC2011" && d.code !== "SC2012") return d;
+    const m = /^(.*?) (?:have no static representation but )?(?:runs?|requires) (?:in )?the embedded dynamic engine, which this build does not include$/.exec(d.message)
+      ?? /^(.*?) (?:have no static representation but )?run in the embedded dynamic engine, which this build does not include$/.exec(d.message);
+    if (!m) return d;
+    // A static type with no static representation (a tuple's toString)
+    // is not a dynamic value: the engine text stays the true one.
+    const vt = /^values of type '(.*)'$/.exec(m[1]!);
+    if (vt && !/\b(any|unknown|object)\b/.test(vt[1]!)) return d;
+    return {
+      ...d,
+      message: `${m[1]}: dynamic ('any'/'unknown') values are compiled on this lane, and this construct has no compiled form for them yet`,
+      hint: "the construct runs only in the embedded dynamic engine (--dynamic); narrow or validate the value to a static type first ('typeof', 'Array.isArray', or a checked cast 'x as T')",
+    };
+  }
+
+  pushDiag(diag0: ScrDiagnostic): void {
+    const diag = this.oneWorldDiag(diag0);
     const d = this.instantiationContext
       ? { ...diag, message: `${diag.message} (${this.instantiationContext})` }
       : diag;
@@ -2655,6 +2749,8 @@ export class Lowerer {
       };
     }
     if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
+    // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy.
+    if (this.sharedDynamic && ts.isExpression(node)) return check;
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -2715,7 +2811,7 @@ export class Lowerer {
     // story is the per-site SC2012 — the same one the fetch call itself
     // reports — not the generic supported-types recitation.
     if (
-      !this.dynamic &&
+      !this.engine &&
       typeSym &&
       (ISLAND_AMBIENT_TYPES as readonly string[]).includes(typeSym.name) &&
       this.isStdlibSymbol(typeSym)
@@ -2776,9 +2872,9 @@ export class Lowerer {
       // object, jsval-entangled members) reports the retry-eligible
       // SC2011 choice instead of the static recitation.
       if (
-        !this.dynamic &&
+        !this.engine &&
         !(widened.flags & ts.TypeFlags.Any) &&
-        mapType(widened, { ...this.typeCtx, dynamic: true }) !== null
+        mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
       ) {
         this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
         throw new PoisonError();
@@ -2792,7 +2888,7 @@ export class Lowerer {
     // types map to jsval, so reaching here means the type is genuinely
     // unrepresentable (a jsval union arm, a jsval array element) — the
     // generic type message tells that story better.
-    if (!this.dynamic) {
+    if (!this.engine) {
       const pkg = this.npmPackageOf(widened);
       if (pkg) {
         this.pushDiag(requiresDynamicPackageDiag(pkg, locOf(node)));
@@ -2829,9 +2925,9 @@ export class Lowerer {
     // SC2011 arm tells that story with the stronger stay-static remedy
     // ('unknown' + a checked cast).
     if (
-      !this.dynamic &&
+      !this.engine &&
       !(widened.flags & ts.TypeFlags.Any) &&
-      mapType(widened, { ...this.typeCtx, dynamic: true }) !== null
+      mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
     ) {
       this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
       throw new PoisonError();
@@ -3638,6 +3734,69 @@ export class Lowerer {
    * arm's canonical tag. Same-union values pass through untouched; anything
    * else (including a DIFFERENT union) is left for requireExactShape, which
    * rejects union mismatches with SC2003. */
+  /** The one-world lanes without the engine: does a typed value of type
+   * `t` enter the island as the checked-dynamic box/copy (dynFrom) rather
+   * than the island's own marshal or view? Functions (the named box, one
+   * per closure identity) and the values the island cannot view (class
+   * instances, Map/Set, records holding them, accessor records). */
+  oneWorldDynBox(t: IrType): boolean {
+    if (!this.sharedDynamic || t.kind === "dyn" || t.kind === "jsval") return false;
+    // A promise boxes itself whatever its payload (the emitter's promise
+    // arm: a dyn/jsval payload rides the same slot, any other converts at
+    // the first dynamic read, PROM_CONV).
+    if (t.kind === "promise") return true;
+    if (!this.dynConvertible(t)) return false;
+    // Under --dynamic a function the island marshals takes that entrance
+    // (main's: its composite results reach dynamic code as views, S115
+    // (a)); otherwise — and for one it cannot marshal — the checked-dynamic
+    // box, whose composite arguments and results S125 (c) judges (the
+    // world `unknown` always had).
+    if (t.kind === "func") return !this.engine || !canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+    return !this.boundarySafe(t) && !this.jsvalLiftable(t) && t.kind !== "regex";
+  }
+
+  /** Can a typed value of type `t` enter the island at all (jsvalIn's
+   * domain, without its refusals)? */
+  canEnterIsland(t: IrType): boolean {
+    if (t.kind === "jsval" || t.kind === "dyn" || isUnitType(t)) return true;
+    if (this.oneWorldDynBox(t) || this.boundarySafe(t) || this.jsvalLiftable(t)) return true;
+    if (this.sharedDynamic && t.kind === "object" && this.errorHierarchyClassOf(t.className)) return true;
+    if (t.kind === "func") return canMarshalTypedFuncIntoIsland(t, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+    if (t.kind === "promise") return islandPromisePayloadTag(t.inner) !== null;
+    return t.kind === "regex";
+  }
+
+  /** The one-world entrance by the checked-dynamic box/copy (oneWorldDynBox)
+   * as an island value, or null when the type takes another entrance. An
+   * Error-hierarchy object crosses through the error encoding's identity
+   * cache (S021), upcast to the %Error root first. */
+  oneWorldDynFrom(expr: IrExpr, node: ts.Node | null): IrExpr | null {
+    if (!this.sharedDynamic) return null;
+    const loc = expr.loc;
+    // A `void` value (an awaited Promise<void>, a void call as an
+    // argument): its effects, then JS's undefined.
+    if (expr.type.kind === "void") {
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "exprStmt", expr, loc }],
+        result: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc },
+        type: JSVAL,
+        loc,
+      };
+    }
+    if (expr.type.kind === "object" && this.errorHierarchyClassOf(expr.type.className)) {
+      return { kind: "jsMarshal", value: { kind: "dynFrom", value: this.upcastTo(expr, "%Error"), type: DYN, loc }, type: JSVAL, loc };
+    }
+    if (!this.oneWorldDynBox(expr.type)) return null;
+    const fnName = expr.type.kind === "func" && node !== null ? jsFuncNameOf(node) : null;
+    return {
+      kind: "jsMarshal",
+      value: { kind: "dynFrom", value: expr, ...(fnName !== null ? { fnName } : {}), type: DYN, loc },
+      type: JSVAL,
+      loc,
+    };
+  }
+
   coerceToExpected(expr: IrExpr, expected: IrType): IrExpr {
     // Island boundary, both directions. IN: any static value flowing into
     // an any-typed slot marshals implicitly (tsc allows the assignment;
@@ -3660,6 +3819,11 @@ export class Lowerer {
       if (expr.type.kind === "dyn") {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
       }
+      // The one-world lanes without the engine: jsvalIn's rule — a
+      // function crosses as the checked-dynamic box, and a typed value the
+      // island cannot view as the checked-dynamic copy (S125 (c) judges it).
+      const boxed = this.oneWorldDynFrom(expr, null);
+      if (boxed) return boxed;
       if (this.boundarySafe(expr.type)) {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
       }
@@ -3749,6 +3913,14 @@ export class Lowerer {
       return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
     }
     if (expected.kind === "dyn" && expr.type.kind !== "dyn") {
+      // One world (U1a): a function the island marshals enters a
+      // checked-dynamic position (a routed method's callback) as that same
+      // marshal — one box either way (dynFnBox), whose composite results
+      // reach dynamic code as views (S115 (a)).
+      if (this.sharedDynamic && this.engine && expr.type.kind === "func" &&
+          canMarshalTypedFuncIntoIsland(expr.type, (id) => this.shapes.get(id), (id) => this.unions.get(id))) {
+        return { kind: "dynFromJsval", value: { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }, type: DYN, loc: expr.loc };
+      }
       if (expr.kind === "unitLit" || this.dynConvertible(expr.type)) {
         return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc };
       }
@@ -6440,7 +6612,16 @@ export class Lowerer {
     if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "array" && isTemplateStrings(this, node)) {
       e = viewOf(this, expr, e.loc, true);
     }
-    if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
+    // The checked-dynamic box of a function: named like every boxed
+    // closure; its composite parameters and result are S125 (c)'s to judge.
+    if (e !== expr && e.kind === "jsMarshal" && e.value.kind === "dynFrom" && expr.type.kind === "func") {
+      const fnName = jsFuncNameOf(node);
+      if (fnName !== null) e = { ...e, value: { ...e.value, fnName } };
+    } else if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
+      if (this.sharedDynamic) {
+        const fnName = jsFuncNameOf(node);
+        if (fnName !== null) e = { ...e, fnName };
+      }
       this.lastHostShallow = false;
       if (this.checkHostFunctionCopies(node, expr.type)) this.checkedHostMarshals.add(e);
       if (this.lastHostShallow) this.shallowHostMarshals.add(e);
@@ -6449,6 +6630,10 @@ export class Lowerer {
       if (ts.isExpression(node) && exitIsOwnView(this, node, e.type)) {
         e = { kind: "jsUnview", value: e.value, typeKey: typeKey(e.type), what: unviewWhat(this, e.type), type: e.type, loc: e.loc };
       } else if (ts.isExpression(node) && (exitIsFresh(this, node, e.type) || exitIsConsumedCopy(this, node, e.type))) e.fresh = true;
+      // S115 (d)'s U1a amendment: a local, parameter, return, field or
+      // element takes a judged copy (S125 (c) refuses the observable ones;
+      // a copy it cannot follow is judged by its type).
+      else if (this.sharedDynamic && ts.isExpression(node)) e = judgedExit(e.value, e.type, e.loc);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters
@@ -7818,6 +8003,16 @@ export class Lowerer {
     // protocol), empty patterns (the coercion checks), holes, rest,
     // defaults — run the REAL pattern in a synthesized engine function
     // instead (lowerJsvalBindingPattern).
+    // The one-world lanes without the engine: the island source is the
+    // same $dyn value, and the checked-dynamic pattern arm — the one the
+    // default build ran these patterns through, with V8's source-spelled
+    // TypeErrors (dynSpell) — destructures it. Bound names typed 'any'
+    // take the value back as the island value (erasure).
+    if (this.sharedDynamic && srcType.kind === "jsval" && ts.isArrayBindingPattern(pattern) && dynArmPattern(pattern)) {
+      const src0 = srcRef;
+      srcRef = () => asDynOperand(src0());
+      srcType = DYN;
+    }
     const elementWise =
       srcType.kind === "jsval" &&
       ts.isObjectBindingPattern(pattern) &&
@@ -7830,6 +8025,31 @@ export class Lowerer {
           ts.isIdentifier(el.propertyName ?? el.name),
       );
     if (srcType.kind === "jsval" && !elementWise) {
+      // The one-world lanes: the synthesized pattern steps only arrays and
+      // strings (dyn.iterN), and its own not-iterable text cannot spell
+      // the source — V8's text (dynSpell) is thrown first, as the
+      // checked-dynamic arm did.
+      if (this.sharedDynamic && ts.isArrayBindingPattern(pattern) && dynSpell !== undefined) {
+        const loc = locOf(pattern);
+        const d = asDynOperand(srcRef());
+        const iterable: IrExpr = {
+          kind: "logical", op: "||",
+          left: { kind: "dynTest", test: "array", value: d, type: BOOL, loc },
+          right: { kind: "dynTest", test: "string", value: asDynOperand(srcRef()), type: BOOL, loc },
+          type: BOOL, loc,
+        };
+        out.push({
+          kind: "if",
+          cond: { kind: "unary", op: "!", operand: iterable, type: BOOL, loc },
+          then: [{
+            kind: "throw",
+            value: { kind: "libCall", fn: "error.new", args: [{ kind: "strLit", value: dynSpell, type: STRING, loc }], type: { kind: "object", className: "%TypeError" }, loc },
+            loc,
+          }],
+          else_: null,
+          loc,
+        });
+      }
       if (lowerJsvalBindingPattern(this, pattern, srcRef, isLet, out)) return;
       // No engine form (computed keys, untransportable defaults): fall
       // through to the static fences below.
@@ -7961,7 +8181,11 @@ export class Lowerer {
       // require binding and its builtin-namespace bindings) — never
       // island values; the standard path's skips own them.
       !createRequireBindingDecl(this, decl.name, decl.initializer) &&
-      !createRequireNamespaceDecl(this, decl.name, decl.initializer)
+      !createRequireNamespaceDecl(this, decl.name, decl.initializer) &&
+      // Nor is `const run = promisify(execFile)`: the one lowered
+      // util.promisify shape registers and emits nothing (its value
+      // never exists); the standard path's promisify hook owns it.
+      isPromisifyCall(this, decl.initializer) === null
     ) {
       const mapped = this.mapTypeOf(this.typeOf(decl.name));
       const handleOnly =
@@ -8411,6 +8635,17 @@ export class Lowerer {
         kind: "jsOp", op: "globalGet", name: expr.expression.text, args: [], type: JSVAL, loc,
       };
       const arg = this.lowerExpr(expr.arguments[0]!);
+      // The one-world lanes have no engine to construct with: a
+      // `new Uint8Array(u)` over a dynamic value narrowed to bytes takes the
+      // checked-dynamic arm's validated bytes extraction, then the static
+      // copy (what `unknown` did before).
+      if ((!this.engine || this.sharedDynamic) && expr.expression.text === "Uint8Array") {
+        const bytesT = this.mapTypeOf(this.typeOf(expr));
+        if (bytesT?.kind === "bytes") {
+          const src: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: bytesT, loc };
+          return { kind: "bytesNew", source: src, type: bytesT, loc };
+        }
+      }
       return { kind: "jsOp", op: "construct", args: [ctor, arg], type: JSVAL, loc };
     }
     return lowerNew(this, expr);

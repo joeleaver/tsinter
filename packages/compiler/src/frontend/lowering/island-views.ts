@@ -21,7 +21,7 @@
  * lane). Inside a view's own set accessor an island value entering a
  * nested typed slot must BE a view of that slot's type (jsUnview — it
  * unwraps, no copy) or the write throws a named TypeError. */
-import { plainFieldPresent } from "./lower-exprs.js";
+import { isUndefExpr, plainFieldPresent } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import {
@@ -493,11 +493,25 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
     params: [{ localId: "x.0", name: "x", type: t }],
     returnType: JSVAL,
     locals: [capLocal],
-    body: [{
-      kind: "return",
-      value: { kind: "jsView", value: x(), typeKey: typeKey(t), record: !arrayLike, label: what, fns, type: JSVAL, loc },
-      loc,
-    }],
+    body: [
+      // Unit U (S119): a typed slot holding `undefined` crosses as the
+      // dynamic undefined — there is no value to view (an absent element
+      // reaching Array.isArray, inspect, a spread or a checked exit).
+      ...(L.undefSlots
+        ? [{
+          kind: "if" as const,
+          cond: isUndefExpr(x(), false, loc),
+          then: [{ kind: "return" as const, value: { kind: "jsOp" as const, op: "undefLit" as const, args: [], type: JSVAL, loc }, loc }],
+          else_: null,
+          loc,
+        }]
+        : []),
+      {
+        kind: "return",
+        value: { kind: "jsView", value: x(), typeKey: typeKey(t), record: !arrayLike, label: what, fns, type: JSVAL, loc },
+        loc,
+      },
+    ],
     loc,
   });
   return name;
@@ -759,6 +773,9 @@ export function exitIsFresh(L: Lowerer, node: ts.Expression, t: IrType, seen: Se
     if (isStdCall(L, n, "Object", "assign") && n.arguments.length >= 1 && !partsShared(L, t)) {
       const target = unwrapTs(n.arguments[0]!);
       if (ts.isObjectLiteralExpression(target) && target.properties.length === 0) return true;
+      // A literal target is as fresh as the literal itself: nothing else
+      // holds it, and the sources' members land on it (U1a).
+      if (ts.isObjectLiteralExpression(target) && exitIsFresh(L, target, t, seen)) return true;
     }
     if (isStdCall(L, n, "Array", "from") || isStdCall(L, n, "Object", "values") || isStdCall(L, n, "Object", "entries")) {
       return n.arguments.length === 1 && !partsShared(L, t);
@@ -948,6 +965,17 @@ export function exitIsOwnView(L: Lowerer, node: ts.Expression, t: IrType): boole
     return sameStatic(decl.name) && sameStatic(n);
   }
   return false;
+}
+
+
+/** A judged exit (S115 (d)'s WasmGC amendment, Joe's checkpoint ruling 1):
+ * a non-fresh dynamic value entering a typed local, parameter or return
+ * is copied — the checked-dynamic copy (`dynCheck` over the same `$dyn`
+ * value; jsval and dyn share one wasm representation) — and S125 (c)'s
+ * observation checker (width-copies.ts) refuses the copies a program could
+ * tell from the shared value. */
+export function judgedExit(value: IrExpr, t: IrType, loc: SrcLoc): IrExpr {
+  return { kind: "dynCheck", value: { kind: "dynFromJsval", value, type: DYN, loc: value.loc }, type: t, loc };
 }
 
 /** The jsUnview `what` of an exit into a typed `t` slot. */

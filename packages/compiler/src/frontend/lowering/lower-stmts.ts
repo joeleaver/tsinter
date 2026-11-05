@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, droppableStatic, emptyArrayOf, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -1411,7 +1411,10 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     if (isJsSourceFile(decl.getSourceFile()) && isUnitType(init.type) && ts.isObjectBindingPattern(decl.name)) {
       init = L.coerceToExpected(init, DYN); // `const { a } = undefined`
     }
-    if (isJsSourceFile(decl.getSourceFile()) && init.type.kind === "dyn") {
+    // The one-world lanes: an island source is the same \$dyn value (and
+    // TypeScript `any`/`unknown` sources take V8's text too).
+    const islandSrc = L.sharedDynamic && init.type.kind === "jsval";
+    if ((isJsSourceFile(decl.getSourceFile()) && init.type.kind === "dyn") || islandSrc) {
       const msgU = destructureNullishMessage(decl, "undefined");
       const msgN = destructureNullishMessage(decl, "null");
       if (msgU !== null && msgN !== null) {
@@ -1421,7 +1424,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         for (const [test, msg] of [["undefined", msgU], ["null", msgN]] as const) {
           out.push({
             kind: "if",
-            cond: { kind: "dynTest", test, value: dref, type: BOOL, loc },
+            cond: { kind: "dynTest", test, value: asDynOperand(dref), type: BOOL, loc },
             then: [{
               kind: "throw",
               value: {
@@ -7543,14 +7546,33 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * generators/Maps/Sets step exactly once like Node; every other kind
    * throws V8's not-iterable TypeError, the identifier spelling when the
    * head has one), and the loop binds each element as a dyn value. */
+  /** V8's for-of CallPrinter spellings: named sources (identifiers and
+   * plain property chains) read "<src> is not iterable", call heads with a
+   * nameable callee "<callee> is not a function or its return value is not
+   * iterable"; everything else keeps the runtime kind wording (""). The
+   * runtime uses the spelling VERBATIM when non-empty. */
+  function forOfSpelling(head: ts.Expression): string {
+    const headText = (e: ts.Expression): string | null => {
+      if (ts.isIdentifier(e)) return e.text;
+      if (ts.isPropertyAccessExpression(e) && !e.questionDotToken && ts.isIdentifier(e.name)) {
+        const base = headText(e.expression);
+        return base !== null ? `${base}.${e.name.text}` : null;
+      }
+      return null;
+    };
+    const headName = headText(head);
+    const calleeName = ts.isCallExpression(head) ? headText(head.expression) : null;
+    return headName !== null
+      ? `${headName} is not iterable`
+      : calleeName !== null
+        ? `${calleeName} is not a function or its return value is not iterable`
+        : "";
+  }
+
   function lowerForOfDyn(L: Lowerer, stmt: ts.ForOfStatement, iterable: IrExpr, labels?: string[]): IrStmt {
     const loc = locOf(stmt);
     const head = stmt.expression;
-    // V8's for-of CallPrinter spellings: named sources (identifiers and
-    // plain property chains) read "<src> is not iterable", call heads
-    // with a nameable callee "<callee> is not a function or its return
-    // value is not iterable"; everything else keeps the runtime kind
-    // wording. The runtime uses the spelling VERBATIM when non-empty.
+    // V8's for-of CallPrinter spellings (forOfSpelling).
     const headText = (e: ts.Expression): string | null => {
       if (ts.isIdentifier(e)) return e.text;
       if (ts.isPropertyAccessExpression(e) && !e.questionDotToken && ts.isIdentifier(e.name)) {
@@ -7713,7 +7735,10 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     // with no iterator object on any lane; a value that is not an Array
     // at run time (the type lied) drains through the checked-dynamic
     // pack (the engine's own protocol on the native lanes).
-    const arrayMode = L.checker.isArrayType(L.typeOf(stmt.expression)) || L.checker.isTupleType(L.typeOf(stmt.expression));
+    // The one-world lanes have no engine iterator: every island source
+    // takes this walk (a non-Array drains through the checked-dynamic pack,
+    // the for-of the default build ran for these values).
+    const arrayMode = (L.sharedDynamic) || L.checker.isArrayType(L.typeOf(stmt.expression)) || L.checker.isTupleType(L.typeOf(stmt.expression));
     const valueOf: IrExpr = arrayMode ? rRef : { kind: "jsOp", op: "getProp", name: "value", args: [rRef], type: JSVAL, loc };
     L.scopes.push(new Map());
     try {
@@ -7761,7 +7786,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
                 kind: "ternary",
                 cond: isArr,
                 then: dynUndefinedExpr(loc),
-                else_: { kind: "libCall", fn: "dyn.iterPack", args: [asDyn, { kind: "strLit", value: "", type: STRING, loc }], type: DYN, loc },
+                else_: { kind: "libCall", fn: "dyn.iterPack", args: [asDyn, { kind: "strLit", value: forOfSpelling(stmt.expression), type: STRING, loc }], type: DYN, loc },
                 type: DYN,
                 loc,
               },

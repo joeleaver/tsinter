@@ -1600,7 +1600,7 @@ export class DynBuilder {
         this.deps.throwTypeError(c, (x) => x.localGet(MSG));
         c.refNull(dynT);
       });
-      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       this.deps.fence(c, (x) =>
         this.deps.lit(x, "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"));
       c.refNull(dynT);
@@ -3955,9 +3955,9 @@ export class DynBuilder {
           c.structGet(dynT, DYN_REF);
           c.refEq();
         });
-        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       } else {
-        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.HANDLE, DK.JSVAL]));
       }
       // ARR compares its VECTOR (unit P, review B2): an `any[]` value is
       // an island array's own vector, and crossing back into a dynamic
@@ -4689,7 +4689,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => c.i32Const(0));
       // An island value's ToBoolean is the ENGINE's answer (the bigint 0n
       // edge); nothing constructs one on this tier.
-      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       c.i32Const(1); // OBJ, ARR, BYTES, FUNC, HANDLE, PROMISE
       this.mb.setBody(idx, [I32, F64], c.bytes());
     });
@@ -4714,7 +4714,7 @@ export class DynBuilder {
       // this tier can spell, and it must not fall through to the default's
       // "undefined". Unconstructible here, so it traps instead of guessing
       // (truthy's JSVAL arm, same stance, same reason).
-      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.BOOL], () => this.deps.lit(c, "boolean"));
       this.arm(c, K, [DK.NUM], () => this.deps.lit(c, "number"));
@@ -5005,7 +5005,7 @@ export class DynBuilder {
         c.end();
       });
       // HANDLE and JSVAL remain unconstructible on this tier.
-      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.HANDLE, DK.JSVAL]));
       c.unreachable();
       this.mb.setBody(
         idx,
@@ -5641,9 +5641,9 @@ export class DynBuilder {
             c.localGet(1);
             c.call(handle.keyGet());
           });
-          this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+          this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
         } else {
-          this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+          this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.HANDLE, DK.JSVAL]));
         }
         // NUM and BOOL have no own properties: JS reads undefined.
         c.globalGet(this.undefinedGlobal());
@@ -5661,6 +5661,20 @@ export class DynBuilder {
         );
       },
     );
+  }
+
+  /** A dynamic-value kind a helper does not model reaching it (a typed
+   * array, a runtime handle, an accessor cell). These arms were trusted
+   * unreachable while such kinds could not reach the helper; with one
+   * dynamic world on the WasmGC lanes (dynamic-values design §4.1) they
+   * can, so each ends the program at a named fence (S122) instead of a
+   * bare trap — never a silent stop. */
+  private unmodeledKindFence(c: Code, kinds: number[]): void {
+    const what = kinds.map((k) => (k === DK.BYTES ? "a typed array" : k === DK.HANDLE ? "a runtime handle" : k === DK.JSVAL ? "an accessor cell" : `kind ${k}`)).join(" or ");
+    this.deps.fence(c, (x) => this.deps.lit(x, `this operation on ${what} held in a dynamic value is not supported yet`));
+    // The arm's value slot: control never reaches past the fence (a
+    // directly built module's stub fence included).
+    c.unreachable();
   }
 
   /** %w.dyn.keySet(d, k, v) — `d[k] = v`, `scr_dyn_key_set` ported. OBJ
@@ -5942,9 +5956,9 @@ export class DynBuilder {
         } else {
           this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "setting a property"));
         }
-        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       } else {
-        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.HANDLE, DK.JSVAL]));
       }
       // P4 / H-2: FUNC RETIRES S016's own write-throw — `f.x = 1` now
       // lands in the enum table (a PLAIN assignment is enumerable,
@@ -6361,7 +6375,7 @@ export class DynBuilder {
       });
       // C routes an island receiver to the ENGINE's own Object.hasOwn;
       // unconstructible here, and `false` would be a silent wrong answer.
-      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       c.i32Const(0);
       this.mb.setBody(
         idx,
@@ -6875,9 +6889,9 @@ export class DynBuilder {
           this.handleFence(c, "walking the keys");
           c.refNull(dynT);
         });
-        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       } else {
-        this.arm(c, K, [DK.JSVAL, DK.HANDLE], () => c.unreachable());
+        this.arm(c, K, [DK.JSVAL, DK.HANDLE], () => this.unmodeledKindFence(c, [DK.JSVAL, DK.HANDLE]));
       }
       this.pushNewArr(c);
       c.localSet(OUT);
@@ -7102,7 +7116,7 @@ export class DynBuilder {
       c.return_();
       c.end();
       // An ENGINE target runs the copy engine-side in C; unconstructible.
-      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       this.regexWriteFence(c, 0, K, (x) => x.refNull(dynT)); // Unit F1
       // INC-29 U1: a net handle as the target or a source is fenced
       // (SEMANTICS.md S087 (f)) — copying nothing would be a silent wrong
@@ -7678,7 +7692,7 @@ export class DynBuilder {
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       // Buffers step by BYTE in C; unconstructible here, and the
       // not-iterable throw below would be a wrong claim about one.
-      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.JSVAL]));
       c.localGet(K);
       c.i32Const(DK.ARR);
       c.i32Eq();
@@ -7719,7 +7733,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
-      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.JSVAL]));
       c.localGet(K);
       c.i32Const(DK.ARR);
       c.i32Eq();
@@ -7916,9 +7930,9 @@ export class DynBuilder {
       // Unconstructible on this tier (the header): no guess at them.
       if (this.deps.handle !== undefined) {
         this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "spreading"));
-        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       } else {
-        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.HANDLE, DK.JSVAL]));
       }
       this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.OBJ, DK.FUNC, DK.PROMISE], () => {
         c.localGet(3);
@@ -12156,9 +12170,9 @@ export class DynBuilder {
               c.refNull(dynT);
             }
           });
-          this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+          this.arm(c, K, [DK.BYTES, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.JSVAL]));
         } else {
-          this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+          this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.HANDLE, DK.JSVAL]));
         }
 
         // Board #191: the Object.prototype names every remaining kind

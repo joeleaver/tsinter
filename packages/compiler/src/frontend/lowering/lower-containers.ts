@@ -693,6 +693,18 @@ function lowerOptionalDefaultArg(
     // callback's params by the pushed elements): the lead params BIND the
     // handles the loop passes, whatever the contextual type spelled —
     // paramShape's island-handle early-out, the then-handler rule.
+    // The one-world lanes: a dyn-receiver HOF hands the dyn element to a
+    // parameter whose checker type (`unknown`, or `any` narrowed to it
+    // above) maps to the island type — the same value; the parameter binds
+    // it as dyn, so the body reads it through the checked-dynamic arms.
+    if (L.sharedDynamic && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode))) {
+      argNode.parameters.forEach((p, i) => {
+        if (i >= lead.length || lead[i]!.kind !== "dyn") return;
+        if (!ts.isIdentifier(p.name) || p.initializer || p.dotDotDotToken) return;
+        const declared = L.chainNarrowedType.get(p.name) ?? L.checker.getTypeAtLocation(p.name);
+        if (L.mapTypeOf(declared)?.kind === "jsval") L.dynParamOverrides.add(p);
+      });
+    }
     if (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode)) {
       argNode.parameters.forEach((p, i) => {
         if (i >= lead.length || lead[i]!.kind !== "jsval") return;
@@ -3223,7 +3235,8 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     if (
       fnArg.type.kind !== "func" ||
       fnArg.type.params.length > 2 ||
-      (fnArg.type.params.length >= 1 && fnArg.type.params[0]!.kind !== "dyn") ||
+      // (an island `v` on the one-world lanes: the same undefined value)
+      (fnArg.type.params.length >= 1 && fnArg.type.params[0]!.kind !== "dyn" && fnArg.type.params[0]!.kind !== "jsval") ||
       (fnArg.type.params.length === 2 && fnArg.type.params[1]!.kind !== "f64")
     ) {
       L.badType(args[1]!, L.typeOf(args[1]!));
@@ -3232,12 +3245,13 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     const fnRet = fnT.ret;
     if (fnRet.kind === "void" || fnRet.kind === "func") L.badType(call, L.typeOf(call));
     const arity = fnT.params.length;
-    const key = `fromLen:${typeKey(fnRet)}:${arity}`;
+    const v0: IrType = fnT.params[0]?.kind === "jsval" ? JSVAL : DYN;
+    const key = `fromLen:${typeKey(fnRet)}:${arity}:${v0.kind}`;
     let helper = L.arrHofHelpers.get(key);
     if (!helper) {
       helper = `%arr.fromLen.${L.arrHofHelpers.size}`;
       L.arrHofHelpers.set(key, helper);
-      L.liftedFns.push(buildArrayFromLenFn(helper, fnRet, arity, loc));
+      L.liftedFns.push(buildArrayFromLenFn(helper, fnRet, arity, loc, v0));
     }
     return { kind: "call", callee: helper, args: [n, fnArg], type: arrayOf(fnRet), loc };
   }
@@ -3321,17 +3335,18 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
    *   for (i = 0; i <= n - 1; i++) out.push(f(undefined, i));
    *   return out;
    */
-  function buildArrayFromLenFn(name: string, fnRet: IrType, arity: number, loc: SrcLoc): IrFunction {
+  function buildArrayFromLenFn(name: string, fnRet: IrType, arity: number, loc: SrcLoc, v0: IrType = DYN): IrFunction {
     const outT = arrayOf(fnRet);
-    const fnT = funcOf([DYN, F64].slice(0, arity), fnRet);
+    const fnT = funcOf([v0, F64].slice(0, arity), fnRet);
     const ref = (localId: string, type: IrType): IrExpr => ({ kind: "varRef", localId, type, loc });
     const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
-    const undef: IrExpr = {
+    const undefDyn: IrExpr = {
       kind: "dynFrom",
       value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
       type: DYN,
       loc,
     };
+    const undef: IrExpr = v0.kind === "jsval" ? { kind: "jsMarshal", value: undefDyn, type: JSVAL, loc } : undefDyn;
     const body: IrStmt[] = [
       { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: outT, loc }, loc },
       {

@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { afterArgs, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
+import { afterArgs, asDynOperand, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -384,7 +384,7 @@ import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTRE
       // pending check's unwind).
       return nodeThrowExpr(0, "MODULE_NOT_FOUND", refusal.message, DYN, loc);
     }
-    if (!L.dynamic) {
+    if (!L.engine) {
       L.pushDiag(requiresDynamicImportDiag(pkgName, loc));
       throw new PoisonError();
     }
@@ -842,8 +842,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const mapped = L.mapTypeOf(L.typeOf(node));
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return raw;
-    const boxed: IrExpr | null = raw.type.kind === "dyn"
-      ? raw
+    // One world (U1a): an island value is the dyn value the check reads.
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic)
+      ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
         : null;
@@ -892,8 +893,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const mapped = L.mapTypeOf(L.typeOf(node));
     const raw = mapped?.kind === "string" ? L.lowerExprExpecting(node, STRING) : lowerArgLoose(L, node);
     if (raw.type.kind === "string" && !mayHoldSlotUndef(L, raw)) return null;
-    const boxed: IrExpr | null = raw.type.kind === "dyn"
-      ? raw
+    // One world (U1a): an island value is the dyn value the check reads.
+    const boxed: IrExpr | null = raw.type.kind === "dyn" || (raw.type.kind === "jsval" && L.sharedDynamic)
+      ? asDynOperand(raw)
       : raw.type.kind === "string" || L.dynConvertible(raw.type)
         ? { kind: "dynFrom", value: raw, type: DYN, loc }
         : null;
@@ -3043,7 +3045,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (ts.isIdentifier(node) && node.text === "undefined") {
       return dynUndefinedExpr(locOf(node));
     }
-    const msg = L.lowerExpr(node);
+    const msg0 = L.lowerExpr(node);
+    // One world (U1a): an island message is the same \$dyn value.
+    const msg = L.sharedDynamic ? asDynOperand(msg0) : msg0;
     if (msg.type.kind === "dyn") return msg;
     if (canConvertToDyn(msg.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
       return { kind: "dynFrom", value: msg, type: DYN, loc: locOf(node) };
@@ -3638,7 +3642,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (member === "stringify") {
       const indent = stringifySpaceIndent(L, call);
       const argNode = call.arguments[0]!;
-      const value = L.lowerExpr(argNode);
+      const value0 = L.lowerExpr(argNode);
+      // One world (U1a): an island value is the \$dyn value the dyn ROOT
+      // arm below serializes — with S119's undefined result for a dropped
+      // root (GH #102), where the engine arm answers the text.
+      const value = L.sharedDynamic ? asDynOperand(value0) : value0;
       // An ISLAND value (`JSON.stringify(err)` on a package handle — the
       // island error-inspection idiom): the ENGINE's own JSON.stringify
       // runs, so key order, nesting, toJSON, and getters match Node by

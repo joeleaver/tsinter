@@ -10,7 +10,7 @@ import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundar
 import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
-import { PoisonError, newFnCtx, own } from "./lowerer.js";
+import { PoisonError, jsFuncNameOf, newFnCtx, own } from "./lowerer.js";
 import { regexCrossingChecked } from "./lower-regex.js";
 
 /** True iff the checker's type for this node maps to jsval ('any') —
@@ -24,6 +24,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * declared types: a package promise held as a handle keeps its existing
    * checker-driven dispatch (the await/.catch bridge lowerings own it). */
   export function isIslandExpr(L: Lowerer, node: ts.Expression): boolean {
+    // The `arguments` binding of a compiled function is never an island
+    // value (its IArguments type absorbs to jsval through the `any` index
+    // signature once `any` maps — unit U1a); its own lowerings claim it.
+    if (L.sharedDynamic && ts.isIdentifier(node) && node.text === "arguments" && L.typeOf(node).getSymbol()?.name === "IArguments") return false;
     const mapped = L.mapTypeOf(L.typeOf(node));
     if (mapped?.kind === "jsval") return true;
     if (mapped?.kind !== "promise" && ts.isIdentifier(node)) {
@@ -99,6 +103,17 @@ import { regexCrossingChecked } from "./lower-regex.js";
     if (isUnitType(e.type)) {
       return { kind: "jsOp", op: e.type.kind === "undefinedT" ? "undefLit" : "nullLit", args: [], type: JSVAL, loc: e.loc };
     }
+    // The one-world lanes without the engine: a function crosses as the
+    // checked-dynamic box (named, one box per closure identity — what an
+    // `unknown` crossing always built), and a typed value the island
+    // cannot view (a class instance, a Map/Set, a record holding one, an
+    // accessor record) crosses as the checked-dynamic copy S014 made,
+    // which S125 (c) judges like every copy. The \$dyn value IS the
+    // island value.
+    {
+      const boxed = L.oneWorldDynFrom(e, node);
+      if (boxed) return boxed;
+    }
     if (e.type.kind === "dyn") {
       // A CHECKED-DYNAMIC value entering the island: the dyn tree
       // deep-copies into engine values — exactly coerceToExpected's
@@ -172,7 +187,9 @@ import { regexCrossingChecked } from "./lower-regex.js";
       if (L.jsvalLiftable(e.type)) return L.jsvalLiftExpr(e, e.loc);
       L.unsupported("SC1090", node, boundaryIntoIslandMsg(L.fmt(e.type)));
     }
-    return { kind: "jsMarshal", value: e, type: JSVAL, loc: e.loc };
+    // U1a: a marshaled function carries its binding's spelling (S020).
+    const fnName = L.sharedDynamic && e.type.kind === "func" ? jsFuncNameOf(node) : null;
+    return { kind: "jsMarshal", value: e, ...(fnName !== null ? { fnName } : {}), type: JSVAL, loc: e.loc };
   }
 
 /** A static RegExp value as a fresh ENGINE RegExp — `new RegExp(source,
@@ -294,7 +311,12 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * SC2012. Null for anything that isn't `import(...)`. */
   export function lowerDynamicImportCall(L: Lowerer, call: ts.CallExpression): IrExpr | null {
     if (call.expression.kind !== ts.SyntaxKind.ImportKeyword) return null;
-    L.requireDynamicApi("'import()'", call);
+    // import() embeds the program's own modules for the engine microtask
+    // (appendDynamicImportModules): the engine gate, not the world's.
+    if (!L.engine) {
+      L.pushDiag(requiresDynamicApiDiag("'import()'", locOf(call)));
+      throw new PoisonError();
+    }
     const loc = locOf(call);
     const arg = call.arguments[0];
     if (arg === undefined || !ts.isStringLiteralLike(arg)) {
@@ -896,7 +918,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * method rejection. No-op under --dynamic (the island paths claimed
    * these) and for non-package receivers, so callers' fallbacks apply. */
   export function npmMemberFence(L: Lowerer, access: ts.PropertyAccessExpression): void {
-    if (L.dynamic) return;
+    if (L.engine) return;
     const pkg =
       L.npmPackageOf(L.typeOf(access.expression)) ??
       L.npmPackageOfSymbol(L.checker.getSymbolAtLocation(access.name));

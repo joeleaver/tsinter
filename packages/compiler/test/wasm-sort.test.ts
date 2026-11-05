@@ -590,20 +590,16 @@ a.sort((x, y) => {
   return (x as number) - (y as number);
 });
 console.log(a.length);
-const c: any = JSON.parse("[3,1]");
-c[3] = 0;
-c.sort((p: number, q: number) => {
-  for (let n: number = c.length; n > 0; n--) c.pop();
-  return p - q;
-});
-console.log(c.length);
 `,
   );
-  // Node answers 2 and 3; a hole here is the element's undefined, which sort stores.
-  expect((await exec("node", ["--experimental-transform-types", "--no-warnings", file])).stdout).toBe("2\n3\n");
+  // Node answers 2; a hole here is the element's undefined, which sort stores.
+  // (The dynamic-array half of this carve-out — a padded \`any\` array — is
+  // gone in a TypeScript program: unit U1a keeps S110 (f)'s fence for an
+  // island index write past the end, pinned by U1-PAD-01.)
+  expect((await exec("node", ["--experimental-transform-types", "--no-warnings", file])).stdout).toBe("2\n");
   const res = await compile(file, { outPath: join(scratch, "hole-shrink.wasm"), outDir: scratch, backend: "wasm" });
   if (!res.ok) throw new Error(res.diagnostics.map((d) => d.message).join(" | "));
-  expect(String((await runWasm(res.binaryPath)).stdout)).toBe("3\n4\n");
+  expect(String((await runWasm(res.binaryPath)).stdout)).toBe("3\n");
 });
 
 test("a lie that undefined is a comparator stops by name where no default order exists", async () => {

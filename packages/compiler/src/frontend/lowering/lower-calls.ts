@@ -19,7 +19,7 @@ import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
-import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -188,6 +188,9 @@ export interface GenericInstance {
     // contextual type spelled.
     if (ts.isIdentifier(param.name) && L.jsvalParamOverrides.has(param)) {
       return { type: JSVAL, mode: param.questionToken ? "omittable" : "required" };
+    }
+    if (ts.isIdentifier(param.name) && L.dynParamOverrides.has(param)) {
+      return { type: DYN, mode: param.questionToken ? "omittable" : "required" };
     }
     if (!ts.isIdentifier(param.name)) {
       // A destructuring pattern parameter — `([label, value]) => ...`,
@@ -3432,7 +3435,9 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // representation (`Boolean(rec && list.some(f))` — a record and a
       // bool) that a value lowering of the `&&` would fence on.
       if (name === "Boolean") return boolCanon(L, L.lowerCondition(argNode));
-      const arg = L.lowerExpr(argNode);
+      const arg0 = L.lowerExpr(argNode);
+      // One world (U1a): Number(x) of an island value is the dyn ToNumber.
+      const arg = name === "Number" && L.sharedDynamic ? asDynOperand(arg0) : arg0;
       if (name === "String") return undefinedAsText(L, L.ensureString(arg, argNode), loc);
       if (arg.type.kind === "f64") return toNumberCanon(L, arg);
       if (arg.type.kind === "bool") return boolToNumber(L, arg, loc);
@@ -3471,7 +3476,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       expr.expression.text === "__island_eval" &&
       L.isStdlibSymbol(L.resolveValueSymbol(expr.expression) ?? undefined)
     ) {
-      if (!L.dynamic) {
+      if (!L.engine) {
         L.pushDiag(requiresDynamicDiag("'__island_eval'", loc));
         throw new PoisonError();
       }
@@ -3491,6 +3496,23 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       ts.isPropertyAccessExpression(expr.expression) &&
       L.isIslandExpr(expr.expression.expression)
     ) {
+      // The one-world lanes: the island value is the \$dyn value, and the
+      // checked-dynamic method machinery (validated receiver, then the
+      // static string/regex tables, the runtime's receiver-kind dispatch)
+      // answers every method it answered for `unknown` — the island
+      // dispatch knows far fewer. Under --dynamic an `any` receiver keeps
+      // the island dispatch it always had (main's parity there).
+      const recvTs0 = L.typeOf(expr.expression.expression);
+      const recvAny = (recvTs0.flags & ts.TypeFlags.Any) !== 0 ||
+        (L.checker.isArrayType(recvTs0) && ((L.checker.getTypeArguments(recvTs0 as ts.TypeReference)[0]?.flags ?? 0) & ts.TypeFlags.Any) !== 0);
+      // Only the dynamic types themselves route: a library-typed island
+      // value (a fetch Response, Headers) keeps the island dispatch that
+      // serves its own members.
+      const recvDynamic = recvAny || (recvTs0.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0;
+      if (L.sharedDynamic && recvDynamic && !(L.engine && recvAny)) {
+        const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
+        if (served) return served;
+      }
       const receiver = L.lowerExpr(expr.expression.expression);
       // A checker-`any` receiver whose VALUE lives in the checked-dynamic tree (a
       // checked-dynamic local behind the any-typed spelling — the JS
@@ -3650,7 +3672,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         return islandPrimitiveExit(L, expr, result);
       }
       const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
-      const result: IrExpr = { kind: "jsOp", op: "callFn", args: [callee, ...args], type: JSVAL, loc };
+      // The callee as V8 spells it in "<x> is not a function" (dynCall's
+      // calleeName rule): a member read's source text, an identifier's name.
+      const callee0 = ts.isParenthesizedExpression(expr.expression) ? null : expr.expression;
+      const spelling = callee0 === null ? undefined
+        : ts.isPropertyAccessExpression(callee0) || ts.isElementAccessExpression(callee0) ? callee0.getText()
+        : ts.isIdentifier(callee0) ? callee0.text : undefined;
+      const result: IrExpr = { kind: "jsOp", op: "callFn", ...(spelling !== undefined ? { spelling } : {}), args: [callee, ...args], type: JSVAL, loc };
       return islandPrimitiveExit(L, expr, result);
     }
 
@@ -4675,12 +4703,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     let recv: IrExpr;
     if (recvTs.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || anyArray) {
       recv = L.lowerExpr(access.expression);
+      // One world (U1a): the island receiver is the same \$dyn value.
+      if (L.sharedDynamic) recv = asDynOperand(recv);
     } else {
       // A checker-TYPED spelling whose VALUE is still checked-dynamic (an
       // evolving `let h = {}` object flowing back out of a JS helper —
       // tsc types the return by the evolved shape, the binding lowered
       // dyn): probe the lowering and claim exactly the dyn results.
-      const probed = probeLower(L, access.expression);
+      const probed = probeLowerDyn(L, access.expression);
       if (probed?.type.kind !== "dyn") return null;
       recv = probed;
     }
@@ -7851,10 +7881,10 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         // CHECKED-DYNAMIC target and source (the JS file-scope
         // object-literal identity story): the runtime dyn copy — own
         // members of the source land on the target, which returns.
-        if (tProbe?.type.kind === "dyn") {
+        if (tProbe?.type.kind === "dyn" || (L.sharedDynamic && tProbe?.type.kind === "jsval")) {
           const loc = locOf(call);
-          const target = L.lowerExpr(call.arguments[0]!);
-          const source = assignSourceDyn(L, L.lowerExpr(call.arguments[1]!), call.arguments[1]!);
+          const target = asDynOperand(L.lowerExpr(call.arguments[0]!));
+          const source = assignSourceDyn(L, asDynOperand(L.lowerExpr(call.arguments[1]!)), call.arguments[1]!);
           if (target.type.kind === "dyn" && source.type.kind === "dyn") {
             return { kind: "libCall", fn: "dyn.assign", args: [target, source], type: DYN, loc };
           }
@@ -7949,6 +7979,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             }
             for (let i = 0; i < lastEffect; i++) {
               if (!ts.isSpreadElement(sources[i]!)) continue;
+              // (One world, U1a: an island spread source is the dyn value.)
+              if (L.sharedDynamic && lowered[i]!.type.kind === "jsval") lowered[i] = asDynOperand(lowered[i]!);
               const v = lowered[i]!;
               const sloc = locOf(sources[i]!);
               if (v.type.kind === "array") {
@@ -8042,7 +8074,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // static shapes have no property table to extend.
     if (member === "defineProperties" && call.arguments.length === 2 &&
         !call.arguments.some((a) => ts.isSpreadElement(a))) {
-      let target = probeLower(L, call.arguments[0]!);
+      // (One world, U1a: an island target is the same \$dyn value.)
+      let target = probeLowerDyn(L, call.arguments[0]!);
       // A FUNCTION-typed target boxes through the dyn boundary: the
       // property table lives on the CLOSURE (shared by every box of this
       // function value), so defining through a fresh box sticks — the
@@ -8108,9 +8141,9 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       // A CHECKED-DYNAMIC receiver (the JS file-scope object-literal
       // identity story): the runtime dyn probe — OBJ member presence, ARR
       // index bounds, Node's ToObject TypeError on nullish.
-      if (probed?.type.kind === "dyn") {
+      if (probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval")) {
         const loc = locOf(call);
-        const receiver = L.lowerExpr(recvNode);
+        const receiver = asDynOperand(L.lowerExpr(recvNode));
         let key = L.lowerExpr(keyNode);
         if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
           key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
@@ -8147,13 +8180,14 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // JS's own-key order) and answers a dyn array.
     {
       const probed = probeLower(L, argNode);
-      const isDyn = probed?.type.kind === "dyn";
+      // The one-world lanes: an island argument is the same \$dyn value.
+      const isDyn = probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval");
       // Unit-typed arguments (Object.keys(null)) ride the same runtime
       // walk: it throws Node's catchable TypeError.
       const isUnit = probed !== null && probed !== undefined && isUnitType(probed.type);
       if (isDyn || isUnit) {
         const fn = member === "keys" ? "dyn.objKeys" : member === "values" ? "dyn.objValues" : "dyn.objEntries";
-        let v = L.lowerExpr(argNode);
+        let v = asDynOperand(L.lowerExpr(argNode));
         if (v.type.kind !== "dyn") v = { kind: "dynFrom", value: v, type: DYN, loc: locOf(call) };
         return { kind: "libCall", fn, args: [v], type: DYN, loc: locOf(call) };
       }
@@ -9671,7 +9705,9 @@ function islandMethodSpreadCall(
  * nested composites by reference — where the checked-dynamic conversion
  * would deep-copy them. */
 function assignSourceDyn(L: Lowerer, src: IrExpr, node: ts.Node): IrExpr {
-  if (L.dynamic && isTypedComposite(L, src.type)) {
+  // (--dynamic: the source's view, as main built it; the one dynamic world
+  // without the flag keeps main's checked-dynamic source conversion.)
+  if (L.engine && isTypedComposite(L, src.type)) {
     return { kind: "dynFromJsval", value: L.jsvalIn(src, node), type: DYN, loc: src.loc };
   }
   return L.coerceToExpected(src, DYN);

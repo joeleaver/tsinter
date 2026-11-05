@@ -1429,9 +1429,9 @@ test("JSON.stringify over a dyn ROOT: the tree's own kinds drive the walk", asyn
       "console.log(JSON.stringify(o as unknown));",
       "const arr: any = [1, undefined, 2];",
       "console.log(JSON.stringify(arr as unknown));",
-      "const hole: any = [];",
-      "hole[3] = 1;",
-      "console.log(JSON.stringify(hole as unknown));",
+      // (An index write past an island array's end is S110 (f)'s named
+      // fence in a TypeScript program — unit U1a; U1-PAD-01 pins it. The
+      // hole case left this row there.)
       "const gone: unknown = undefined;",
       "console.log(JSON.stringify(gone));",
       // Through a dyn-typed BINDING: `p as unknown` keeps the static
@@ -1476,7 +1476,6 @@ test("JSON.stringify over a dyn ROOT: the tree's own kinds drive the walk", asyn
       '{"1":2,"2":1,"b":3,"a":4}',
       '{"a":1,"d":2}',
       "[1,null,2]",
-      "[null,null,null,1]",
       "undefined",
       "{}",
       "[1e+21,0.1,0]",
@@ -2497,7 +2496,10 @@ test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", a
       // function; Node fixes the name at definition.
       "[alias] [realName]",
       "[got]", // S020 — Node: "[innerFn2]"
-      "[] []", // S020 — Node: "[inner] [passed]"
+      // S020 — Node: "[inner] [passed]". The thunk's result has no binding
+      // (anonymous); `passed` is re-boxed at `f as unknown` inside takesFn
+      // (unit U1a: a cast to unknown boxes there), whose binding is `f`.
+      "[] [f]",
       // S020's four length shapes, in order: def / def2 / opt / mix.
       // Node: "1 0 2 2" — only `opt` (the `?` marker, which erases and so
       // gets counted on both lanes) agrees, and `mix` shows the split
@@ -7783,10 +7785,14 @@ test("dyn↔bytes crossing: a non-u8 typed array refuses loudly, not a silent mi
       "\n",
     ),
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) throw new Error("expected a refusal");
-  expect(res.diagnostics[0]?.code).toBe("SC1101");
-  expect(res.diagnostics[0]?.message).toBe("converting typed values to 'unknown' is not supported yet");
+  // Unit U1a (TypeScript programs on the WasmGC lanes): `unknown` is the
+  // island value, which holds a typed array of any element kind, so the
+  // crossing compiles; inspecting one held dynamically is still a named
+  // fence (S122) — loud, at the read instead of at the crossing.
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString()).toBe("");
+  expect(run.stderr.toString()).toBe("tsinter: unsupported: inspecting a typed array held in a dynamic value is not supported yet [SC1090]\n");
 });
 
 test("dyn↔bytes crossing: Object.hasOwn/keys/values/entries see numeric indices ONLY — never 'length' (measured: a typed array's own-key list has no length entry, unlike arrays and strings)", async () => {
@@ -9834,7 +9840,9 @@ test("assert.match (INC-24 P6, error-arm reachability): an any-typed flow (both 
   expect(res.ok).toBe(false);
   if (res.ok) return;
   const codes = res.diagnostics.map((d) => d.code).sort();
-  expect(codes).toEqual(["SC1101", "SC2020"]);
+  // Unit U1a: the RegExp argument now enters `any` as a rebuilt island
+  // RegExp (no SC1101 at the call); assert.match over `any` still refuses.
+  expect(codes).toEqual(["SC2020"]);
 });
 
 test("value-path-flag matrix completion: search() is safe across ALL FOUR flag combinations (Symbol.search saves/forces-0/restores lastIndex every call regardless of flags — measured against Node for none/g/y/gy, byte-exact here too)", async () => {
