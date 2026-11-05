@@ -783,7 +783,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
   // A JavaScript binding on the one-world lanes without the engine keeps
   // the JS lane's checked-dynamic storage (U1b): the same $dyn value the
   // island type names, held where every use takes the JS-exact arms.
-  if (L.sharedDynamic && (!L.engine || isJsSourceFile(node.getSourceFile()))) return DYN;
+  if (L.sharedDynamic && !L.engine) return DYN;
   return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
 }
 
@@ -3597,7 +3597,7 @@ export class Lowerer {
     // Under --dynamic an `any` mapped to the island before U1a too (the
     // engine's handle type): only what maps because `unknown`/`object` do
     // now is unmapped there.
-    if (this.engine && (t.flags & ts.TypeFlags.Any) !== 0) return false;
+    if (this.engine) return (t.flags & ts.TypeFlags.Any) === 0 && m.kind === "jsval";
     return this.sharedDynamic && (m.kind === "jsval" || this.nestsJsval(m));
   }
 

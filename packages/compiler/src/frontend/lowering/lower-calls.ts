@@ -3528,6 +3528,21 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (receiver.type.kind === "dyn") {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
+        // A JavaScript source (U1b): main's checked-dynamic receiver call —
+        // the runtime's receiver-kind dispatch (Object.prototype's own
+        // methods included, board #191), as for every dyn receiver there.
+        if (isJsSourceFile(expr.getSourceFile()) && !expr.questionDotToken && !expr.expression.questionDotToken &&
+            !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+          return {
+            kind: "dynInvoke",
+            recv: receiver,
+            method: expr.expression.name.text,
+            calleeName: expr.expression.getText(),
+            args: expr.arguments.map((a) => L.lowerExprExpecting(a, DYN)),
+            type: DYN,
+            loc,
+          };
+        }
         L.unsupported(
           "SC1100",
           expr,

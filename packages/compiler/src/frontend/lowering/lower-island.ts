@@ -53,7 +53,8 @@ import { regexCrossingChecked } from "./lower-regex.js";
       }
       if (ts.isIdentifier(base) && base.text !== "arguments") {
         const t = L.peekLocal(base)?.type;
-        if (t !== undefined && ["array", "record", "object", "f64", "string", "bool", "union", "map", "set"].includes(t.kind)) return false;
+        const islandElems = t?.kind === "array" && (t.elem.kind === "jsval" || t.elem.kind === "dyn");
+        if (t !== undefined && !islandElems && !L.nestsJsval(t) && ["array", "record", "object", "f64", "string", "bool", "union", "map", "set"].includes(t.kind)) return false;
       }
     }
     const mapped = L.mapTypeOf(L.typeOf(node));

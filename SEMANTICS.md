@@ -744,6 +744,28 @@ names it); both are judged by S125 (c). Out-crossings follow S115 (d) as
 amended there. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 (U1-SHARE-01..02).
 
+**Amendment (unit U1b, wasm and wasm-native): JavaScript sources join the
+one world.** U1a's language split is lifted: in every program on these
+lanes — JavaScript sources and mixed programs included — `any`, `unknown`
+and `object` are the one island value. A JavaScript source's own
+operations on such a value take the checked-dynamic arms the JS lane always
+used (member reads, calls, keyed reads and writes, arithmetic, iteration,
+destructuring — V8's texts as before): on these lanes the island value IS
+the `$dyn` value, so the retype makes no copy. A JavaScript declaration
+whose type maps only because `unknown`/`object` (and, without `--dynamic`,
+`any`) map now — an implicit-any binding, a JSDoc type with such a piece —
+keeps the JS lane's checked-dynamic storage rules; under `--dynamic` an
+`any` stays the engine handle it was before U1a. Typed values crossing
+between a JavaScript and a TypeScript source are the same object (S115 (a)
+views), and typed exits follow S115 (d) / S125 (c) as amended by U1a, now
+in JavaScript sources too. Two crossings keep the copy this entry
+describes, judged by S125 (c): a tagged template's strings array in a
+JavaScript source (frozen in Node; a view would let writes through), and
+an object literal passed straight into an implicit-any JavaScript
+parameter (built as the checked-dynamic literal, as before). **Tested by:**
+the JS corpus on the wasm lanes, and the hand-written rows of
+`wasm-dynsmalls-u5`, `wasm-review-repros` and `wasm-smalls-u2` (row75).
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -841,6 +863,14 @@ as a checked-dynamic value (a local bound straight from `JSON.parse`, say);
 the same read through an island value fences. Programs with a JavaScript source keep the body unchanged until
 U1b. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 (U1-S015-01..04).
+
+**Amendment (unit U1b, wasm and wasm-native): JavaScript sources keep this
+entry's body.** A keyed or dot read in a JavaScript source answers the
+receiver's own member or `undefined`, as written above — the silent
+divergence for an inherited member read as a value (`o.toString` is
+`undefined` here) stays registered for JavaScript sources; U1a's fence is
+TypeScript-only. (Parity with the JS lane: the rows that pin it — the wasm
+emitter's S015 row, `wasm-dynsmalls-u5` R85 — answer as before.)
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -1005,6 +1035,15 @@ observer (`forEach`, `filter`, `reduce`, `some`, `indexOf`, `map`, `sort`,
 silently. Programs with a JavaScript source keep this entry's padding as
 written until U1b. **Tested by:**
 `packages/compiler/test/wasm-u1-shared-dynamic.test.ts` (U1-PAD-01).
+
+**Amendment (unit U1b, wasm and wasm-native — Joe's ruling): JavaScript
+sources keep the padding.** A JavaScript source's index write past the end
+of a dynamic array pads as this entry's body describes (parity with the JS
+lane before U1b), while TypeScript sources keep U1a's S110 (f) fence. The
+padding is a KNOWN SILENT divergence for every hole observer (`forEach`,
+`filter`, `Object.keys`, `in`, printing, ...): the padded slots are real
+own members here and holes in Node. It is to be replaced by real holes in
+unit U3. **Tested by:** the wasm emitter's S016 row.
 
 ## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
 
