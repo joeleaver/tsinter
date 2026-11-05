@@ -28,6 +28,35 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // value (its IArguments type absorbs to jsval through the `any` index
     // signature once `any` maps — unit U1a); its own lowerings claim it.
     if (L.sharedDynamic && ts.isIdentifier(node) && node.text === "arguments" && L.typeOf(node).getSymbol()?.name === "IArguments") return false;
+    // One world without the engine (U1b): a member of a BUILTIN value
+    // (`EventEmitter.setMaxListeners`, `events.EventEmitter.x`,
+    // `URL.revokeObjectURL`) that a JS source's checker types 'any' is
+    // never an island value — no engine object exists; the builtin
+    // surfaces own it (and fence what they do not model).
+    if (L.sharedDynamic && ts.isPropertyAccessExpression(node) && isJsSourceFile(node.getSourceFile())) {
+      const recv = node.expression;
+      if (L.builtinMemberOf(node) !== null) return false;
+      if (ts.isPropertyAccessExpression(recv) && L.builtinMemberOf(recv) !== null) return false;
+      if (ts.isIdentifier(recv) && (L.builtinImportOf(recv) !== null || L.isStdlibSymbol(L.checker.getSymbolAtLocation(recv)))) return false;
+    }
+    // One world without the engine (U1b): a JS local the lowering holds
+    // TYPED although the checker says 'any' (an implicit-any parameter in
+    // a per-site instance — `merge(target, source)` instantiated with
+    // (number[], number[])), and a member of one, are that typed value:
+    // its own lowerings answer, as on main.
+    if (L.sharedDynamic && (isJsSourceFile(node.getSourceFile()) || !L.engine)) {
+      let base: ts.Expression = node;
+      while (ts.isParenthesizedExpression(base)) base = base.expression;
+      if (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {
+        base = base.expression;
+        while (ts.isParenthesizedExpression(base)) base = base.expression;
+      }
+      if (ts.isIdentifier(base) && base.text !== "arguments") {
+        const t = L.peekLocal(base)?.type;
+        const islandElems = t?.kind === "array" && (t.elem.kind === "jsval" || t.elem.kind === "dyn");
+        if (t !== undefined && !islandElems && !L.nestsJsval(t) && ["array", "record", "object", "f64", "string", "bool", "union", "map", "set"].includes(t.kind)) return false;
+      }
+    }
     const mapped = L.mapTypeOf(L.typeOf(node));
     if (mapped?.kind === "jsval") return true;
     if (mapped?.kind !== "promise" && ts.isIdentifier(node)) {
@@ -233,7 +262,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * (poison-recovered, so every site in the program reports — and the
    * coverage report groups them under "runs with --dynamic"). */
   export function requireDynamicApi(L: Lowerer, feature: string, node: ts.Node): void {
-    if (L.dynamic) return;
+    // (One world in a JavaScript source without the engine — U1b: the
+    // engine API is still absent, so the JS lane's named fence stands, as
+    // on main.)
+    if (L.dynamic && !(L.sharedDynamic && !L.engine && isJsSourceFile(node.getSourceFile()))) return;
     L.pushDiag(requiresDynamicApiDiag(feature, locOf(node)));
     throw new PoisonError();
   }

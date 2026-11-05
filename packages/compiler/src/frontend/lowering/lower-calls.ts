@@ -254,7 +254,9 @@ export interface GenericInstance {
         // value crosses as a REST host function (the withPlugins
         // `async (...args) =>` shape). Static builds keep the variadic
         // dyn form for every unmappable JS rest.
-        if (restMapped?.kind === "jsval" && L.dynamic) {
+        // (The engine's own arguments array: only with the engine — a JS
+        // source on the one-world lanes keeps the variadic dyn form, U1b.)
+        if (restMapped?.kind === "jsval" && L.engine) {
           return { type: JSVAL, mode: "islandRest" };
         }
         if (restMapped?.kind !== "array") {
@@ -265,7 +267,7 @@ export interface GenericInstance {
       // An `any[]` rest (`...args: any[]`) IS the island array itself
       // (SEMANTICS.md S014's unit-H amendment): the binding is a fresh
       // engine array per call, exactly the JS `(...args)` island form.
-      if (type.kind === "jsval" && L.dynamic) return { type: JSVAL, mode: "islandRest" };
+      if (type.kind === "jsval" && (L.engine || (L.dynamic && !isJsSourceFile(param.getSourceFile())))) return { type: JSVAL, mode: "islandRest" };
       // Tuple-typed rest params don't map to an array; generic rest is the
       // generic path's business. Anything non-array here is unmappable.
       if (type.kind !== "array") L.badType(param.name, L.typeOf(param.name));
@@ -407,6 +409,10 @@ export interface GenericInstance {
         // .js builds (SEMANTICS.md 116), so the completion lands here.
         if (shape.type.kind === "dyn") {
           return { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
+        }
+        // One world (U1b): an island-typed param takes the island's undefined.
+        if (L.sharedDynamic && shape.type.kind === "jsval") {
+          return { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc };
         }
         // tsc's arity checking admits omitting only the omittable suffix;
         // reaching here means a call form we don't model — defensive.
@@ -3522,6 +3528,21 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (receiver.type.kind === "dyn") {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
+        // A JavaScript source (U1b): main's checked-dynamic receiver call —
+        // the runtime's receiver-kind dispatch (Object.prototype's own
+        // methods included, board #191), as for every dyn receiver there.
+        if (isJsSourceFile(expr.getSourceFile()) && !expr.questionDotToken && !expr.expression.questionDotToken &&
+            !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+          return {
+            kind: "dynInvoke",
+            recv: receiver,
+            method: expr.expression.name.text,
+            calleeName: expr.expression.getText(),
+            args: expr.arguments.map((a) => L.lowerExprExpecting(a, DYN)),
+            type: DYN,
+            loc,
+          };
+        }
         L.unsupported(
           "SC1100",
           expr,
@@ -3637,8 +3658,16 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // calls the stored member with Node's is-not-a-function TypeError
       // on refusal.
       if (callee.type.kind === "dyn") {
+        // One world in JS sources (U1b): an island callee retypes to the
+        // checked-dynamic value, so its spread arguments take the JS
+        // lane's runtime-arity spread call (V8's spread-call texts, any
+        // spread position) exactly as a dyn-typed callee did on main.
+        if (expr.arguments.some((a) => ts.isSpreadElement(a))) {
+          const spreadServed = lowerSpreadArgsCall(L, expr, callee, loc);
+          if (spreadServed) return spreadServed;
+        }
         const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-        const calleeName = ts.isPropertyAccessExpression(expr.expression)
+        const calleeName = ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
           ? expr.expression.getText()
           : ts.isIdentifier(expr.expression)
             ? expr.expression.text
@@ -4815,6 +4844,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       loc: locOf(access),
     };
     const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+    // One world, a TypeScript call site (U1b): `c.who()` over a dynamic
+    // value is a METHOD call — the receiver-kind dispatch whose OBJ arm
+    // reads the own member and calls it with `this` bound, as Node does
+    // (a JavaScript function stored on the object may read `this`).
+    // JavaScript sources keep the plain call (SEMANTICS.md S042).
+    if (L.sharedDynamic && !isJsSourceFile(call.getSourceFile())) {
+      return { kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc };
+    }
     return { kind: "dynCall", callee: member, calleeName: access.getText(), args, type: DYN, loc };
   }
 

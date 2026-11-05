@@ -34,7 +34,7 @@ import { isJsSourceFile, locOf } from "../program.js";
 import { newFnCtx, own } from "./lowerer.js";
 import { appendImplicitUndefinedReturn } from "./lower-calls.js";
 import { bufEncoding, knownBufEncoding } from "./lower-containers.js";
-import { probeLower } from "./lower-exprs.js";
+import { asDynOperand, probeLower } from "./lower-exprs.js";
 import { BOOL, DYN, F64, IrExpr, IrFunction, IrLibFn, IrStmt, IrType, JSVAL, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, VOID, arrayOf, bytesOf, canBoxFuncIntoDyn, funcOf, typeEquals, typeKey } from "../../ir/nodes.js";
 
 const BYTES = bytesOf("u8");
@@ -156,6 +156,7 @@ function lowerStreamCallback(
   fullTuple: IrType[],
 ): IrExpr {
   const loc = locOf(node);
+  markIslandParamsDyn(L, node);
   const { shapes, funcType } = L.lambdaSignature(node);
   if (node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) {
     L.unsupported("SC1090", node, `async stream '${which}' callbacks`);
@@ -411,11 +412,19 @@ function lowerStreamCallbackValue(
     t = null;
   }
   let cbDyn: IrExpr;
-  if (t?.kind === "dyn") {
-    const v = L.lowerExpr(node);
+  if (t?.kind === "dyn" || (L.sharedDynamic && t?.kind === "jsval")) {
+    const v = asDynOperand(L.lowerExpr(node));
     cbDyn = v.type.kind === "dyn" ? v : { kind: "dynFrom", value: v, type: DYN, loc };
   } else if (t?.kind === "func") {
-    const cb = L.lowerExpr(node);
+    const cb0 = L.lowerExpr(node);
+    // One world (U1b): a function the checker types but the lowering
+    // already holds as a dynamic value (a JS wrapper's boxed closure).
+    const cb = L.sharedDynamic ? asDynOperand(cb0) : cb0;
+    if (cb.type.kind === "dyn") {
+      cbDyn = cb;
+      const adapterT0 = funcOf(Array.from({ length: fullLen }, () => DYN), VOID);
+      return { kind: "dynCheck", value: cbDyn, type: adapterT0, loc };
+    }
     if (cb.type.kind !== "func" || !canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
       L.noLowering(
         `the ${ctorName} option '${which}' with a function value of this signature`,
@@ -450,8 +459,8 @@ function dynOptionsValue(L: Lowerer, arg: ts.Expression): IrExpr | null {
   } catch {
     return null;
   }
-  if (t?.kind !== "dyn") return null;
-  const v = L.lowerExpr(followed);
+  if (t?.kind !== "dyn" && !(L.sharedDynamic && t?.kind === "jsval")) return null;
+  const v = asDynOperand(L.lowerExpr(followed));
   return v.type.kind === "dyn" ? v : null;
 }
 
@@ -1258,11 +1267,14 @@ function lowerEosCallback(
   } catch {
     t = null;
   }
-  if (t?.kind === "dyn") {
-    const v = L.lowerExpr(node);
+  if (t?.kind === "dyn" || (L.sharedDynamic && t?.kind === "jsval")) {
+    const v = asDynOperand(L.lowerExpr(node));
     if (v.type.kind === "dyn") return { cb: v, dyn: true };
   } else if (t?.kind === "func") {
-    const cb = L.lowerExpr(node);
+    const cb0 = L.lowerExpr(node);
+    // One world (U1b): a JS wrapper's result already held as a dynamic value.
+    const cb = L.sharedDynamic ? asDynOperand(cb0) : cb0;
+    if (cb.type.kind === "dyn") return { cb, dyn: true };
     if (cb.type.kind === "func" && canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
       return { cb: { kind: "dynFrom", value: cb, type: DYN, loc: locOf(node) }, dyn: true };
     }
@@ -1484,6 +1496,15 @@ export function lowerStreamMethodCall(L: Lowerer, call: ts.CallExpression,
     if (t?.kind === "bytes" && t.elem === "u8") return "bytes";
     if (t?.kind === "string") return "string";
     if (t?.kind === "nullT") return "null";
+    if (L.sharedDynamic && t?.kind === "jsval") {
+      // One world (U1b): an island-typed chunk expression may still lower
+      // to a static kind (`chunk.toString()` routes through the checked-
+      // dynamic dispatch, a string) — probe first, as for untyped chunks.
+      const probed = probeLower(L, node);
+      if (probed?.type.kind === "string") return "string";
+      if (probed?.type.kind === "bytes" && probed.type.elem === "u8") return "bytes";
+      return "dyn";
+    }
     if (t?.kind === "dyn") {
       // The JS lane's any-typed chunk: the runtime dispatches by dyn tag
       // (bytes / string / null; anything else is the write TypeError).
@@ -1503,7 +1524,7 @@ export function lowerStreamMethodCall(L: Lowerer, call: ts.CallExpression,
       const probed = probeLower(L, node);
       if (probed?.type.kind === "string") return "string";
       if (probed?.type.kind === "bytes" && probed.type.elem === "u8") return "bytes";
-      if (probed?.type.kind === "dyn") return "dyn";
+      if (probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval")) return "dyn";
       if (probed?.type.kind === "nullT") return "null";
     }
     L.noLowering(
@@ -1935,4 +1956,17 @@ export function lowerStreamProperty(L: Lowerer, expr: ts.PropertyAccessExpressio
     return propCall(BOOL);
   }
   return null;
+}
+
+/** One world (U1b): an implicit-any parameter of a callback handed to a
+ * runtime surface (stream callbacks and options, handler params) maps to
+ * the island type; the runtime's invoke thunks box each position as the
+ * checked-dynamic value, which IS the island value — so the parameter
+ * binds as dyn, the shape those surfaces already take. */
+export function markIslandParamsDyn(L: Lowerer, node: ts.SignatureDeclaration): void {
+  if (!L.sharedDynamic) return;
+  for (const p of node.parameters) {
+    if (!ts.isIdentifier(p.name) || p.initializer || p.dotDotDotToken) continue;
+    if (L.mapTypeOf(L.checker.getTypeAtLocation(p.name))?.kind === "jsval") L.dynParamOverrides.add(p);
+  }
 }

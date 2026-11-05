@@ -1317,12 +1317,6 @@ describe(`wasm-native differential corpus (${files.length} programs${shardSuffix
       const res = await build(file);
       if (!res.ok) {
         // Out of the lane: LOUD, and exactly the one refusal.
-        const tail = U1A_TAIL_CODES[rel];
-        if (tail !== undefined) {
-          expect([...new Set(res.diagnostics.map((d) => d.code))].sort()).toEqual(tail);
-          u1bTailRefused.add(rel);
-          return;
-        }
         expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
         const kind = refusalKey(res.diagnostics[0]!.message);
         refusalKinds.set(kind, (refusalKinds.get(kind) ?? 0) + 1);
@@ -1352,9 +1346,7 @@ describe(`wasm-native differential corpus (${files.length} programs${shardSuffix
   test("claim floor: EXACTLY the claimed set, both directions", () => {
     const floorHere = new Set(shardSelect(CLAIM_FLOOR, (n) => n));
     const claimedHere = new Set(claimed);
-    // U1b pending: a tail program is excused only after refusing with its
-    // pinned codes; everything else missing is a regression.
-    const missingFromClaimed = [...floorHere].filter((n) => !claimedHere.has(n) && !(U1B_PENDING.has(n) && u1bTailRefused.has(n))).sort();
+    const missingFromClaimed = [...floorHere].filter((n) => !claimedHere.has(n)).sort();
     const missingFromFloor = [...claimedHere].filter((n) => !floorHere.has(n)).sort();
     expect(
       { missingFromClaimed, missingFromFloor },
@@ -1381,37 +1373,3 @@ describe(`wasm-native differential corpus (${files.length} programs${shardSuffix
   });
 });
 
-/** Unit U1a's open tail (the U1b candidates): claimed programs that the
- * one dynamic world turns into a NAMED compile-time refusal from the
- * lowering rather than the backend's SC3001 — each pinned to the codes it
- * actually names (distinct, sorted). The floor still lists them, so the
- * floor row reports them until U1b closes the tail or Joe rescopes. */
-const U1A_TAIL_CODES: Record<string, string[]> = {
-  "2082-destructuring-assignment.ts": ["SC1031"],
-  "2537-destructuring-assign-member-targets.ts": ["SC1031"],
-  "2446-performance-global.ts": ["SC2020"],
-  "2743-http-option-carry.ts": ["SC2020"],
-  "2553-generics-signature-bindings.ts": ["SC1090"],
-  "2554-generics-frontier-mix.ts": ["SC1090"],
-  "2796-regex-replace-callbacks.ts": ["SC1090"],
-  "2551-generics-value-aliases.ts": ["SC1090", "SC2004"],
-  "2630-stream-consumers-errors.ts": ["SC1090", "SC2004"],
-};
-/** U1b removes this set (with U1A_TAIL_CODES): the U1a tail programs Joe
- * approved leaving unclaimed when U1a merged. The floor keeps listing
- * them; the floor row accepts one as missing ONLY while its corpus row
- * saw it refuse with exactly the codes U1A_TAIL_CODES pins
- * (`u1bTailRefused`). Any other program dropping out still fails. */
-const U1B_PENDING: ReadonlySet<string> = new Set([
-  "2082-destructuring-assignment.ts",
-  "2537-destructuring-assign-member-targets.ts",
-  "2446-performance-global.ts",
-  "2743-http-option-carry.ts",
-  "2553-generics-signature-bindings.ts",
-  "2554-generics-frontier-mix.ts",
-  "2796-regex-replace-callbacks.ts",
-  "2551-generics-value-aliases.ts",
-  "2630-stream-consumers-errors.ts",
-]);
-/** The U1B_PENDING programs whose corpus row refused with their pinned codes. */
-const u1bTailRefused = new Set<string>();

@@ -810,7 +810,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (flags & ts.TypeFlags.Never) return F64;
   // `unknown` is a VALUE with a runtime representation (the dyn JSON dyn —
   // JSON.parse results and unknown-typed locals/params/returns).
-  if (flags & ts.TypeFlags.Unknown) return ctx.sharedDynamic === true && process.env["SCRIPTC_U1_STAGE"] !== "world" ? JSVAL : DYN;
+  if (flags & ts.TypeFlags.Unknown) return ctx.sharedDynamic === true ? JSVAL : DYN;
   // `object` (the NonPrimitive intrinsic) is a TOP type over non-primitive
   // values — tsc admits every record, array, function, or class instance
   // into an `object` slot, so no exact record shape can hold it. It lowers
@@ -818,7 +818,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // outside the checked-dynamic tree fence there, same as unknown), reads narrow back out
   // through the same checked casts. Member accesses tsc allows on `object`
   // (the Object.prototype surface) fence at their use sites.
-  if (flags & ts.TypeFlags.NonPrimitive) return ctx.sharedDynamic === true && process.env["SCRIPTC_U1_STAGE"] !== "world" ? JSVAL : DYN;
+  if (flags & ts.TypeFlags.NonPrimitive) return ctx.sharedDynamic === true ? JSVAL : DYN;
   // `any` is the island handle type under --dynamic (the type-hole becomes
   // dynamically-executed code); without the flag it stays unmapped and the
   // per-site diagnostic tells the user about --dynamic and the static

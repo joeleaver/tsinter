@@ -2396,7 +2396,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         }
       }
       const g = L.globalsBySymbol.get(symbol);
-      if (g !== undefined && g.type.kind !== "string" && g.type.kind !== "dyn") {
+      if (g !== undefined && g.type.kind !== "string" && g.type.kind !== "dyn" && g.type.kind !== "jsval") {
         L.unsupported("SC1031", el, `bindings with '${L.fmt(g.type)}' storage over the builtin global '${globalName}'`);
       }
       binds.push({ name: el.name, token, alias, g });
@@ -3605,8 +3605,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // to the union's real array arm). Const only — an evolving-`any`
     // `let` may be reassigned a different shape later; genuine `any`
     // only — every other unmappable keeps its own diagnostic.
+    // (One world in JS sources without the engine — U1b: a checker-`any`
+    // const maps to the island type now, but main's rule still answers —
+    // the initializer's static value is the binding's truth.)
+    const jsAnyIsland = type?.kind === "jsval" && L.sharedDynamic && !L.engine && isJsSourceFile(decl.getSourceFile()) &&
+      (L.typeOf(decl.name).flags & ts.TypeFlags.Any) !== 0;
     if (
-      type === null && !isLet &&
+      (type === null || jsAnyIsland) && !isLet &&
       ((L.typeOf(decl.name).flags & ts.TypeFlags.Any) !== 0 ||
         (L.checkerAnyArray(decl.name) && init.type.kind === "array") ||
         // JS declarations carry no annotations: an unmappable inferred
@@ -6931,6 +6936,15 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       // next() through callMethod, done/value reads through getProp — so
       // engine arrays, Maps, Sets, generators, and Symbol.iterator
       // implementations all iterate exactly as Node runs them.
+      // One world in JS sources (U1b): the island value is the $dyn value;
+      // the checked-dynamic iteration below is the JS lane's own form.
+      // (With the engine too when the loop variable is pre-declared: the
+      // island loop has no form for it; the checked-dynamic one drains
+      // the engine's own iterator through the by-reference wrap.)
+      if (iterable.type.kind === "jsval" && L.sharedDynamic && isJsSourceFile(stmt.getSourceFile()) &&
+          (!L.engine || !ts.isVariableDeclarationList(stmt.initializer) || (stmt.initializer.flags & ts.NodeFlags.BlockScoped) === 0)) {
+        iterable = asDynOperand(iterable);
+      }
       if (iterable.type.kind === "jsval") {
         return lowerForOfIsland(L, stmt, iterable, labels);
       }

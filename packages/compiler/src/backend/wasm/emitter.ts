@@ -18615,7 +18615,8 @@ class Assembler {
     c.localSet(r);
     this.emitWalkerPending(c, retVal);
     if (t.ret.kind === "void") return true;
-    if (t.ret.kind === "dyn") {
+    // jsval ≡ dyn: an island-typed result is the raw result (U1b).
+    if (t.ret.kind === "dyn" || t.ret.kind === "jsval") {
       c.localGet(r);
       return true;
     }

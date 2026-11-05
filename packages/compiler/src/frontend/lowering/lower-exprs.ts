@@ -15,7 +15,7 @@ import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDy
 import { PoisonError, dynUndefinedExpr, jsFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
-import { unsupportedModuleFeatureOf } from "../shared.js";
+import { isJsSourceFileName, unsupportedModuleFeatureOf } from "../shared.js";
 import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
@@ -436,8 +436,16 @@ export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     lowerExprDepth++;
     try {
       const tdz = L.moduleTdz;
-      if (tdz !== null && tdz.occByFile.size > 0) return guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr));
-      return lowerExprInner(L, expr);
+      const out = tdz !== null && tdz.occByFile.size > 0 ? guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr)) : lowerExprInner(L, expr);
+      // One world in JavaScript sources (U1b): an island-typed expression
+      // IS the $dyn value (one representation, the retype is free), and a
+      // JS source's operations on it take the checked-dynamic arms — the
+      // JS lane's own JS-exact semantics, V8's error texts included.
+      // Storage stays the island type (coerceInto's jsMarshal(dyn) is the
+      // same retype back), so a value crossing into TypeScript is the
+      // same object, never a copy.
+      if (out.type.kind === "jsval" && L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile())) return asDynOperand(out);
+      return out;
     } finally {
       lowerExprDepth--;
     }
@@ -717,6 +725,14 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           // which it took when `any` had no mapping.
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && stdlibAnyArgument(L, expr)) return false;
+          // The source of a destructuring assignment (`[h, ...t] = [1, 2,
+          // 3]`): its contextual type is the PATTERN's (a rest element
+          // reads `any[]`), not a slot's — the literal builds its own
+          // static type, as before U1a.
+          const parent = expr.parent;
+          if ((own?.kind === "record" || own?.kind === "array") && ts.isBinaryExpression(parent) && parent.right === expr &&
+              parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+              (ts.isArrayLiteralExpression(parent.left) || ts.isObjectLiteralExpression(parent.left))) return false;
         }
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an
         // EMPTY array literal under a const assertion is the empty tuple —
@@ -1354,7 +1370,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           kind: "func",
           params: sig.params.filter((p) => p.mode !== "dynRest").map((p) => p.type),
           ret: sig.returnType,
-          ...(sig.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
+          ...(sig.params.some((p) => p.mode === "dynRest" || p.mode === "islandRest") ? { rest: true as const } : {}),
+          // An island rest (`...args: any[]`): the last declared slot IS the
+          // rest array — a boxed call packs the surplus into it (U1b).
+          ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
         L.requireExactArityValue(expr, expr, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
@@ -1922,6 +1941,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // lowering's re-dispatch (a questionDotToken past the gate above is
       // always chain-handled; the receiver reads back as the chain's
       // bound handle).
+      // One world (U1b): `s._readableState.<name>` types its inner access
+      // 'any' (an island receiver now) — the state-read surface claims it
+      // first, as it did over the checked-dynamic spelling.
+      if (L.sharedDynamic) {
+        const state = lowerStreamStateProperty(L, expr);
+        if (state) return state;
+      }
       if (L.isIslandExpr(expr.expression)) {
         const receiver = L.lowerExpr(expr.expression);
         // The checker said 'any' but the VALUE lives in the checked-dynamic tree (`this`
@@ -2279,6 +2305,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       if (
         (isJsSourceFile(expr.getSourceFile()) &&
           (L.mapTypeOf(L.typeOf(expr.expression)) === null ||
+            // One world (U1b): the island type is the unmapped JS value's
+            // type now (the `arguments` object, an any-typed member).
+            (L.sharedDynamic && L.mapTypeOf(L.typeOf(expr.expression))?.kind === "jsval") ||
             // A never-tainted receiver type maps (never rides as f64) but
             // its VALUE lowered checked-dynamic — same dyn read.
             neverTaintedJsType(L, expr.expression, L.typeOf(expr.expression)))) ||
@@ -5608,6 +5637,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           key = { kind: "strLit", value: folded, type: STRING, loc: locOf(name) };
         } else {
           let k = L.lowerExpr(name.expression);
+          if (L.sharedDynamic) k = asDynOperand(k);
           if (k.type.kind === "f64" || k.type.kind === "bool" || k.type.kind === "dyn") {
             k = { kind: "toString", operand: k, type: STRING, loc: locOf(name) };
           }
@@ -7278,7 +7308,10 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
           kind: "func",
           params: sig.params.filter((p) => p.mode !== "dynRest").map((p) => p.type),
           ret: sig.returnType,
-          ...(sig.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
+          ...(sig.params.some((p) => p.mode === "dynRest" || p.mode === "islandRest") ? { rest: true as const } : {}),
+          // An island rest (`...args: any[]`): the last declared slot IS the
+          // rest array — a boxed call packs the surplus into it (U1b).
+          ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
         L.requireExactArityValue(prop, propName, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
@@ -7426,10 +7459,13 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       const recv = L.lowerExpr(expr.expression);
       if (recv.type.kind !== "dyn") return islandElementRead(L, expr, recv);
       const rawKey = L.lowerExpr(expr.argumentExpression);
+      // One world in JS sources (U1b): bool and dynamic keys stringify
+      // (ToPropertyKey), exactly the checked-dynamic receiver branch below.
+      const jsKeys = L.sharedDynamic && isJsSourceFile(expr.getSourceFile());
       const key: IrExpr | null =
         rawKey.type.kind === "string"
           ? rawKey
-          : rawKey.type.kind === "f64"
+          : rawKey.type.kind === "f64" || (jsKeys && (rawKey.type.kind === "bool" || rawKey.type.kind === "dyn"))
             ? { kind: "toString", operand: rawKey, type: STRING, loc: rawKey.loc }
             : null;
       if (key) {
@@ -8489,7 +8525,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
         narrowed &&
         (narrowed.kind === "f64" || narrowed.kind === "bool" || narrowed.kind === "string" ||
           narrowed.kind === "object" ||
-          (narrowed.kind === "dyn" && isJsSourceFile(expr.getSourceFile())));
+          ((narrowed.kind === "dyn" || (L.sharedDynamic && narrowed.kind === "jsval")) && isJsSourceFile(expr.getSourceFile())));
       if (!bridged) L.unsupported("SC1063", expr);
     }
     const inner = L.lowerExpr(expr.expression);
@@ -8627,7 +8663,7 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
       // fence below.
       if (
         target.kind === "func" &&
-        canAdaptDynFuncTo(target, (id) => L.shapes.get(id), (id) => L.unions.get(id))
+        canAdaptDynFuncTo(target, (id) => L.shapes.get(id), (id) => L.unions.get(id), L.sharedDynamic)
       ) {
         return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
       }
@@ -8639,7 +8675,7 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
           (target.ret.kind === "jsval" || target.params.some((p) => p.kind === "jsval"))) {
         const toDyn = (t: IrType): IrType => (t.kind === "jsval" ? DYN : t);
         const dynTarget: IrType & { kind: "func" } = { ...target, params: target.params.map(toDyn), ret: toDyn(target.ret) };
-        if (canAdaptDynFuncTo(dynTarget, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
+        if (canAdaptDynFuncTo(dynTarget, (id) => L.shapes.get(id), (id) => L.unions.get(id), L.sharedDynamic)) {
           const adapter = L.funcCoerceAdapter(dynTarget, target, locOf(expr));
           if (adapter) {
             const checked: IrExpr = { kind: "dynCheck", value: inner, type: dynTarget, loc: locOf(expr) };
@@ -8720,6 +8756,9 @@ const INHERITED_BY_KIND: [("array" | "string" | "function" | "number" | "boolean
  * they are. */
 function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
   if (e.kind !== "dynKeyGet" || !L.sharedDynamic || e.optional) return e;
+  // A JavaScript source keeps the JS lane's own-members answer (S015's
+  // body; U1b parity): the fence is U1a's TypeScript amendment.
+  if (isJsSourceFileName(e.loc.file)) return e;
   if (e.key.kind === "strLit" && !INHERITED_NAMES.has(e.key.value)) return e;
   const loc = e.loc;
   const call: IrExpr = {
@@ -8886,7 +8925,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
           target?.container === "class" &&
           !RUNTIME_ERROR_CLASSES.has(target.className) &&
           (target.fieldType.kind === "f64" ||
-            (target.fieldType.kind === "dyn" && isJsSourceFile(expr.getSourceFile())))
+            ((target.fieldType.kind === "dyn" || (L.sharedDynamic && target.fieldType.kind === "jsval")) && isJsSourceFile(expr.getSourceFile())))
         ) {
           return {
             kind: "fieldIncDec",
@@ -8896,7 +8935,8 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
             obj: expr.operand.expression.kind === ts.SyntaxKind.ThisKeyword ? target.obj : undefRecvGuard(L, target.obj, target.field, loc),
             className: target.className,
             field: target.field,
-            fieldDyn: target.fieldType.kind === "dyn",
+            // One world (U1b): an island field is the same $dyn slot.
+            fieldDyn: target.fieldType.kind === "dyn" || target.fieldType.kind === "jsval",
             type: F64,
             loc,
           };
@@ -12554,17 +12594,24 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     // Through an accessor target this desugars to get, op, set — with the
     // receiver an identifier/this, the observable order matches JS exactly:
     // getter, rhs side effects, setter (verified against Node).
-    const read = L.fieldGetExpr(target, locOf(access), access);
-    const rhs: IrExpr = rhsNode
+    // One world (U1b): an island-typed field (an implicit-any JS field)
+    // is the checked-dynamic field's value; its compound assignment takes
+    // the same checked arm, and the result goes back as the island value.
+    const islandField = L.sharedDynamic && target.fieldType.kind === "jsval";
+    const read0 = L.fieldGetExpr(target, locOf(access), access);
+    const read = islandField ? asDynOperand(read0) : read0;
+    const rhs0: IrExpr = rhsNode
       ? L.lowerExpr(rhsNode)
       : { kind: "numLit", value: 1, type: F64, loc };
+    const rhs = islandField ? asDynOperand(rhs0) : rhs0;
+    const fieldKind = islandField ? "dyn" : target.fieldType.kind;
     let value: IrExpr;
     if (op === "+" && target.fieldType.kind === "string") {
       value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, rhsNode ?? access), type: STRING, loc }));
     } else if (target.fieldType.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op, left: read, right: rhs, type: F64, loc };
     } else if (
-      target.fieldType.kind === "dyn" &&
+      fieldKind === "dyn" &&
       isJsSourceFile(access.getSourceFile()) &&
       (op === "+" || op === "-" || op === "*" || op === "/" || op === "%" || op === "**")
     ) {
@@ -12599,7 +12646,7 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     }
     // Second, independent evaluation of the (side-effect-free) receiver.
     const target2 = targetOf()!;
-    return L.fieldSetStmt(target2, value, loc, access);
+    return L.fieldSetStmt(target2, islandField ? L.jsvalIn(value, access) : value, loc, access);
   }
 
 /** Stream-rooted receivers' property surface (readableEnded, destroyed,

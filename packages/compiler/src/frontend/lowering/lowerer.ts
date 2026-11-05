@@ -449,19 +449,25 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
-/** Does the program carry a JavaScript source (U1a's language split)? A
- * .js/.cjs/.mjs file of the program, or — under --dynamic, where package
- * code is embedded and runs as JavaScript — any file of an npm package the
- * program loaded (its own .d.ts included; `@types` and the TypeScript
- * libraries are declarations of nothing embedded). */
-export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[], dynamic: boolean): boolean {
+/** Does a --dynamic program carry a JavaScript source: a .js/.cjs/.mjs
+ * file of the program, or any file of an npm package it loaded (package
+ * code is embedded and runs as JavaScript; `@types` and the TypeScript
+ * libraries are declarations of nothing embedded)? */
+function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[]): boolean {
   const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
   if (moduleOrder.some(isJs) || program.getSourceFiles().some(isJs)) return true;
-  if (!dynamic) return false;
   return program.getSourceFiles().some((sf) => {
     const f = sf.fileName.replace(/\\/g, "/");
     return /\/node_modules\//.test(f) && !/\/node_modules\/(@types|typescript|@typescript)\//.test(f) && !/\/lib\.[^/]*\.d\.ts$/.test(f);
   });
+}
+
+/** An await or a call, under parentheses, casts and non-null
+ * assertions (lowerVarDecl's one-world handle-rescue gate). */
+function isProducerInit(e: ts.Expression): boolean {
+  let cur = e;
+  while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isTypeAssertion(cur) || ts.isNonNullExpression(cur)) cur = cur.expression;
+  return ts.isAwaitExpression(cur) || ts.isCallExpression(cur);
 }
 
 export function lowerToIr(
@@ -474,14 +480,14 @@ export function lowerToIr(
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
   const undefSlots = options.undefSlots ?? false;
-  // Unit U1a (coordinator's ruling: split by source language): the one
-  // dynamic world is for TypeScript programs. A program with ANY JavaScript
-  // source in it (a .js/.cjs/.mjs file of the program, an embedded npm
-  // package) keeps today's checked-dynamic path whole, until U1b — the
-  // type mapping cannot tell a JS file's `any` from a TS file's, so a
-  // per-file switch would give a function crossing between them two
-  // representations. Per program there is no seam to cross.
-  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder, dynamic);
+  // The one dynamic world (units U1a/U1b): on the WasmGC lanes `any`,
+  // `unknown` and `object` are one island value in every program,
+  // JavaScript sources included (SEMANTICS.md S014's amendments) — except
+  // under --dynamic, where a program with a JavaScript source (its own
+  // .js/.cjs/.mjs file, or an embedded npm package) keeps the pre-U1
+  // checked-dynamic world whole, as on main (S014's U1b amendment): the
+  // engine-mode JS paths were never ported to the one world.
+  const sharedDynamic = (options.sharedDynamic ?? false) && !(dynamic && programHasJsSource(program, moduleOrder));
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -753,7 +759,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
     const elemTainted =
       elem !== undefined &&
       ((elem.flags & ts.TypeFlags.Never) !== 0 || neverTaintedJsType(L, node, elem));
-    const mappedElem = elem !== undefined && !elemTainted ? L.mapTypeOf(elem) : null;
+    const mappedElem = elem !== undefined && !elemTainted && !L.jsUnmapped(elem) ? L.mapTypeOf(elem) : null;
     // A mappable element keeps the static array; an unmappable one makes
     // the WHOLE value dyn (the checked-dynamic tree has real arrays — length/index/push
     // read through the keyed-dyn paths; dyn-element STATIC arrays have no
@@ -780,7 +786,11 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
       retT.flags & ts.TypeFlags.Void ? VOID : L.mapTypeOf(retT) ?? DYN;
     return { kind: "func", params, ret };
   }
-  return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
+  // A JavaScript binding on the one-world lanes without the engine keeps
+  // the JS lane's checked-dynamic storage (U1b): the same $dyn value the
+  // island type names, held where every use takes the JS-exact arms.
+  if (L.sharedDynamic && !L.engine) return DYN;
+  return L.sharedDynamic ? JSVAL : DYN;
 }
 
 /** The one call signature of a PURE function type — single signature, no
@@ -912,6 +922,8 @@ export function withEsFnName(L: Lowerer, e: IrExpr & { kind: "dynFrom" }, node: 
  * copies (S014). */
 export function isPrimitiveArgType(L: Lowerer, t: IrType): boolean {
   if (t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "dyn" || isUnitType(t)) return true;
+  // One world (U1b): the island value IS the $dyn value — by reference.
+  if (L.sharedDynamic && t.kind === "jsval") return true;
   if (t.kind === "union") {
     return L.unions.get(t.unionId)?.arms.every((a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a)) ?? false;
   }
@@ -2750,7 +2762,7 @@ export class Lowerer {
     }
     if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
     // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy.
-    if (this.sharedDynamic && ts.isExpression(node)) return check;
+    if (this.sharedDynamic) return check;
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -3580,12 +3592,76 @@ export class Lowerer {
     visit(roots);
   }
 
+  /** A JavaScript declaration's type the JS lane treats as UNMAPPED: no
+   * mapping, or — on the one-world lanes without the engine (U1b) — one
+   * that maps only because `any` maps now (the island type itself, or a
+   * composite with an island piece). Those keep the JS lane's
+   * checked-dynamic storage rules. */
+  jsUnmapped(t: ts.Type): boolean {
+    const m = this.mapTypeOf(t);
+    if (!m) return true;
+    // Under --dynamic an `any` mapped to the island before U1a too (the
+    // engine's handle type): only what maps because `unknown`/`object` do
+    // now is unmapped there.
+    // (An `any[]` maps to the island through its `any` element, as before
+    // U1a: only an `unknown`/`object` root, element or union arm counts.)
+    if (this.engine) return m.kind === "jsval" && this.mentionsUnknownOrObject(t);
+    return this.sharedDynamic && (m.kind === "jsval" || this.nestsJsval(m));
+  }
+
+  /** Does a checker type name `unknown` or the non-primitive `object` at
+   * its root, as an array/tuple element or as a union arm? */
+  private mentionsUnknownOrObject(t: ts.Type, depth = 0): boolean {
+    if (depth > 6) return false;
+    if ((t.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0) return true;
+    if ((t.flags & ts.TypeFlags.Any) !== 0) return false;
+    if (t.isUnionType()) return t.getTypes().some((x) => this.mentionsUnknownOrObject(x, depth + 1));
+    if (this.checker.isArrayType(t) || this.checker.isTupleType(t)) {
+      return this.checker.getTypeArguments(t as ts.TypeReference).some((x) => this.mentionsUnknownOrObject(x, depth + 1));
+    }
+    return false;
+  }
+
+  /** Does a mapped type hold an island-typed piece below its root (a
+   * record field, an index value, a union arm, a container element)?
+   * Function signatures are not walked (their island params are the same
+   * $dyn value the JS lane's dyn params were). */
+  nestsJsval(t: IrType, seen = new Set<string>()): boolean {
+    const k = typeKey(t);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    switch (t.kind) {
+      case "jsval":
+        return true;
+      case "record": {
+        const s = this.shapes.get(t.shapeId);
+        return (s?.fields.some((f) => this.nestsJsval(f.type, seen)) ?? false) || (s?.indexValue !== undefined && this.nestsJsval(s.indexValue, seen));
+      }
+      case "union":
+        return this.unions.get(t.unionId)?.arms.some((a) => this.nestsJsval(a, seen)) ?? false;
+      case "map":
+        return this.nestsJsval(t.key, seen) || this.nestsJsval(t.value, seen);
+      case "set":
+        return this.nestsJsval(t.elem, seen);
+      default:
+        return false;
+    }
+  }
+
   irTypeOf(node: ts.Node): IrType {
     const t = this.typeOf(node);
     // A never-tainted JS type (neverTaintedJsType) maps — never rides as
     // f64 — but must not: pre-empt the mapping so the JS fallback below
     // answers instead.
-    const mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeOf(t);
+    let mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeOf(t);
+    // One world in JavaScript sources (U1b): a composite whose pieces map
+    // only because `any` maps now (a JSDoc type with an island-typed
+    // member) keeps the JS lane's checked-dynamic storage — the value is
+    // the same object either way; the dynamic storage keeps every use on
+    // the JS-exact dynamic arms instead of the static ones.
+    if (mapped && mapped.kind !== "jsval" && this.sharedDynamic && !this.engine && isJsSourceFile(node.getSourceFile()) && this.nestsJsval(mapped)) {
+      mapped = null;
+    }
     if (!mapped) {
       // The checked-dynamic declaration fallback (dynFallbackType): a
       // JAVASCRIPT binding of any inference residue, or a TypeScript
@@ -3744,7 +3820,9 @@ export class Lowerer {
     // A promise boxes itself whatever its payload (the emitter's promise
     // arm: a dyn/jsval payload rides the same slot, any other converts at
     // the first dynamic read, PROM_CONV).
-    if (t.kind === "promise") return true;
+    // (A payload the box cannot convert at all — a class instance — keeps
+    // the boundary's named refusal: the validator admits only these.)
+    if (t.kind === "promise") return t.inner.kind === "jsval" || t.inner.kind === "dyn" || this.dynConvertible(t);
     if (!this.dynConvertible(t)) return false;
     // Under --dynamic a function the island marshals takes that entrance
     // (main's: its composite results reach dynamic code as views, S115
@@ -3890,6 +3968,14 @@ export class Lowerer {
       if (this.boundaryExitSafe(expected)) {
         return { kind: "jsExit", value: expr, type: expected, loc: expr.loc };
       }
+      // One world (U1b): an island value leaving into a FUNCTION slot
+      // takes the checked-dynamic function boundary's OUT direction (the
+      // $dyn value is the island value): check callable, then unwrap an
+      // identical boxed signature or adapt per the slot.
+      if (this.sharedDynamic && !this.engine && expected.kind === "func" &&
+          canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic)) {
+        return { kind: "dynCheck", value: { kind: "dynFromJsval", value: expr, type: DYN, loc: expr.loc }, type: expected, loc: expr.loc };
+      }
       return expr;
     }
     // A TYPED value flowing into an 'unknown' slot (`const u: unknown = 5`,
@@ -3909,6 +3995,16 @@ export class Lowerer {
       expected.inner.kind === "void" &&
       expr.type.kind === "promise" &&
       expr.type.inner.kind !== "void"
+    ) {
+      return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
+    }
+    // One world (U1a): a promise of the checked-dynamic value and a
+    // promise of the island value hold the same $dyn payload (a
+    // `Promise<unknown>` stream consumer read into a `Promise<any>`
+    // binding) — the same type-only reinterpret.
+    if (
+      this.sharedDynamic && expected.kind === "promise" && expr.type.kind === "promise" &&
+      ((expected.inner.kind === "jsval" && expr.type.inner.kind === "dyn") || (expected.inner.kind === "dyn" && expr.type.inner.kind === "jsval"))
     ) {
       return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
     }
@@ -3966,7 +4062,7 @@ export class Lowerer {
       // arguments/results per F.
       const funcOk =
         expected.kind === "func" &&
-        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic);
       if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || funcOk) {
         return { kind: "dynCheck", value: expr, type: expected, loc: expr.loc };
       }
@@ -4007,7 +4103,7 @@ export class Lowerer {
       if (
         sf !== undefined && isJsSourceFile(sf) &&
         canConvertToDyn(expr.type, (id) => this.shapes.get(id), (id) => this.unions.get(id)) &&
-        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id))
+        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic)
       ) {
         return {
           kind: "dynCheck",
@@ -5305,7 +5401,7 @@ export class Lowerer {
       // — the production/development function-choice ternary shape).
       return (
         this.jsonSafe(dst) ||
-        (dst.kind === "func" && canAdaptDynFuncTo(dst, (id) => this.shapes.get(id), (id) => this.unions.get(id)))
+        (dst.kind === "func" && canAdaptDynFuncTo(dst, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic))
       );
     }
     if (dst.kind === "union") {
@@ -6633,7 +6729,7 @@ export class Lowerer {
       // S115 (d)'s U1a amendment: a local, parameter, return, field or
       // element takes a judged copy (S125 (c) refuses the observable ones;
       // a copy it cannot follow is judged by its type).
-      else if (this.sharedDynamic && ts.isExpression(node)) e = judgedExit(e.value, e.type, e.loc);
+      else if (this.sharedDynamic) e = judgedExit(e.value, e.type, e.loc);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters
@@ -6792,6 +6888,20 @@ export class Lowerer {
       while (ts.isParenthesizedExpression(x)) x = x.expression;
       if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile())) {
         return lowerDynObjectLiteral(this, x);
+      }
+    }
+    // One world in JS sources (U1b): an island slot (an implicit-any JS
+    // parameter) IS the checked-dynamic value — the literal builds as the
+    // JS lane's dyn literal and crosses by the free retype, so its members
+    // keep the dyn tree's crossing rules (a promise member is a boxed
+    // value, as on main) instead of a typed record's exact-shape check.
+    if (expected?.kind === "jsval" && this.sharedDynamic) {
+      let x: ts.Expression = node;
+      while (ts.isParenthesizedExpression(x)) x = x.expression;
+      if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile()) &&
+          x.properties.every((p) => (ts.isPropertyAssignment(p) && !ts.isComputedPropertyName(p.name)) || ts.isShorthandPropertyAssignment(p))) {
+        const lit = lowerDynObjectLiteral(this, x);
+        return lit.type.kind === "dyn" ? { kind: "jsMarshal", value: lit, type: JSVAL, loc: lit.loc } : this.coerceInto(node, lit, expected);
       }
     }
     // An ARRAY LITERAL against a UNION slot whose own type has no static
@@ -7508,6 +7618,17 @@ export class Lowerer {
         params.push({ localId: slot.id, name: "%param", type: shape.type });
         let srcType = shape.type;
         let srcRef = (): IrExpr => ({ kind: "varRef", localId: slot.id, type: shape.type, loc });
+        // One world in JS sources (U1b): an island pattern source is the
+        // checked-dynamic value — the JS lane's destructuring (V8's
+        // "Cannot destructure property" texts) reads it.
+        const jsRetype = (): void => {
+          if (srcType.kind === "jsval" && this.sharedDynamic && isJsSourceFile(decl.getSourceFile())) {
+            const r0 = srcRef;
+            srcType = DYN;
+            srcRef = () => asDynOperand(r0());
+          }
+        };
+        if (!(shape.mode === "omittable" && shape.bodyType && decl.initializer)) jsRetype();
         if (shape.mode === "omittable" && shape.bodyType && decl.initializer) {
           // A WHOLE-PATTERN default (`({ x } = { x: 1 })`): pick the
           // default exactly when the argument was omitted or undefined
@@ -7574,6 +7695,7 @@ export class Lowerer {
         } else if (ts.isObjectBindingPattern(decl.name)) {
           paramPatternGuards(this, decl.name, srcRef, srcType, prologue);
         }
+        jsRetype();
         this.lowerBindingPattern(decl.name, srcRef, srcType, true, prologue);
         return;
       }
@@ -8168,7 +8290,19 @@ export class Lowerer {
       return !lambda;
     };
     if (
-      this.dynamic &&
+      (this.engine ||
+        (this.dynamic && !isJsSourceFile(decl.getSourceFile()) &&
+          // One world without the engine (U1b): a handle candidate is an
+          // initializer the checker types as an island value ('any'/
+          // 'unknown'/'object'), or a producer (an await or a call — the
+          // host-fetch slice's `await res.arrayBuffer()` handle). A bare
+          // name or member — a generic function's alias, a stdlib
+          // global's snapshot (`const perf = performance`) — keeps the
+          // standard path's own rules, as when `any` had no mapping.
+          decl.initializer !== undefined &&
+          (this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval" || isProducerInit(decl.initializer) ||
+            // (an alias of a rescued handle: `const ab2 = ab`)
+            (ts.isIdentifier(decl.initializer) && this.peekLocal(decl.initializer)?.type.kind === "jsval")))) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't

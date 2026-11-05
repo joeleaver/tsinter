@@ -780,7 +780,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const t = r["type"] as IrType | undefined;
     // A composite VALUE in a non-transparent position escapes.
     if (mode !== "t" && t !== undefined && r["loc"] !== undefined && isComposite(t) && k !== "slotUndef") {
-      const viewArg = (parent !== null && parent["kind"] === "call" && pkey === "args" && /^%view\.\d+$/.test(parent["callee"] as string)) ||
+      // (`%jsin.union.N` is the per-arm tag switch whose composite arms
+      // enter as views or marshals, each visited in its own body: its
+      // argument escapes the way a view factory's does.)
+      const viewArg = (parent !== null && parent["kind"] === "call" && pkey === "args" && /^%(view|jsin\.union)\.\d+$/.test(parent["callee"] as string)) ||
         /^%view\./.test(curFn);
       if (viewArg || (parent !== null && parent["kind"] === "jsMarshal")) {
         islandEntered.add(tkey(t));
@@ -1204,7 +1207,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   };
   for (const e of escaped) reachType(e.t);
   into = reachW;
-  for (const e of escaped) if (e.w) reachType(e.t);
+  // A view's stores into its typed value run only for a dynamic store made
+  // through it (noted as a dynamic write where it is made): a program
+  // with no dynamic write anywhere writes through no view (U1b).
+  const viewWritesLive = dynWrites.length > 0;
+  for (const e of escaped) if (e.w && (!e.view || viewWritesLive)) reachType(e.t);
   // The same, without view-factory escapes (S125 (c)'s judgment: see escape).
   const reachWDyn = new Set<string>();
   into = reachWDyn;
@@ -1291,7 +1298,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // Judging a dynamic crossing (S125 (c)): a view accessor's own write
         // (island-views.ts) runs only for a store through that view, which
         // is noted as a dynamic write on its receiver where it is made.
-        !(judgingDyn && /^%view\./.test(w.fn)) &&
+        !((judgingDyn || !viewWritesLive) && /^%view\./.test(w.fn)) &&
         !(deadAfter !== null && w.fn === deadAfter.fn && w.top > deadAfter.top) &&
         (during !== null ? during.has(w.fn) : !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top)));
     const fs = fields ?? fieldNames(t);
@@ -1356,6 +1363,23 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // values nothing else holds once it returns.
     if (e.kind === "call" && returnsFresh(e.callee)) return true;
     return false;
+  };
+  /** A literal whose every part is a literal or a scalar, through union
+   * wraps: nothing but the literal itself references any of its parts. */
+  const deepFresh = (e: IrExpr | undefined): boolean => {
+    if (!e) return false;
+    switch (e.kind) {
+      case "numLit": case "strLit": case "boolLit": case "unitLit":
+        return true;
+      case "unionWrap":
+        return deepFresh(e.value);
+      case "arrayLit":
+        return !(e.spreads?.length) && e.elems.every((x) => deepFresh(x));
+      case "recordLit":
+        return e.fields.every((f) => deepFresh(f.value));
+      default:
+        return false;
+    }
   };
   /** GH #118 (chess.js history()): does every `return` of this program
    * function answer a value no one else holds after the call — a fresh
@@ -1652,6 +1676,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // binding this copy is the one use of. Writes and identity cannot
     // tell then; only the copy's keys can.
     const unique = fresh(s.arg) || (sole && sourceBinding(s)?.uses.length === 1);
+    // A literal built only of literals and scalars (`[undefined, {}, {
+    // t: [] }]`): no part has another reference, so a nested copy is as
+    // unobservable to writes and identity as the top one (U1b — the JS
+    // lane's option-table and case-list literals crossing into island
+    // slots); only its keys can tell.
+    const allFresh = deepFresh(s.arg);
     const db = destBinding(s);
     const uses = db?.uses ?? null;
     // The copy's PARTS are followed through the binding too, when nothing
@@ -1688,13 +1718,15 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         } else if (reach.has(tkey(p.to)) && printDiffer(p.from, p.to)) {
           why = KEYS;
         }
+      } else if (allFresh) {
+        if (reach.has(tkey(p.to)) && printDiffer(p.from, p.to)) why = KEYS;
       } else {
         const j = partsKnown ? judgeValue(db!, top.to, p, 0) : UNKNOWN;
         why = j === UNKNOWN ? byType() : j;
       }
       // (Comparing ORIGINALS involves no copy: a copy's static type is the
       // slot's, so a test that could meet one is on the slot's type.)
-      if (!why && !(isTop && sole) && isWritten(p.from, copiedFields(p.from, p.to), s, (isTop ? transient : partsTransient) ? calleeReach!.fns : null)) why = WRITE_FROM;
+      if (!why && !(isTop && sole) && !allFresh && isWritten(p.from, copiedFields(p.from, p.to), s, (isTop ? transient : partsTransient) ? calleeReach!.fns : null)) why = WRITE_FROM;
       if (why) {
         reason = why;
         blame = p;
@@ -2396,10 +2428,18 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "dynInvoke":
           // sort and reverse answer their receiver.
           return (e.method === "sort" || e.method === "reverse") && uniqueDyn(e.recv, fn, depth + 1);
+        case "call":
+          // An island view of a typed value (U1b: a JS evolving binding
+          // reassigned from a typed result) shares that value's storage:
+          // nothing else holds it when nothing else holds the typed value.
+          return /^%view\.\d+$/.test(e.callee) && deepFresh(e.args[0], fn, depth + 1);
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
-          if (!b || b.captured || b.assigns.length !== 1 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
-          return uniqueDyn(b.assigns[0], fn, depth + 1);
+          // One read in all: every value the binding ever holds is fresh
+          // (an evolving `let flags = []` reassigned from a fresh result),
+          // so the one read takes a value nothing else holds.
+          if (!b || b.captured || b.assigns.length === 0 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
+          return b.assigns.every((a) => uniqueDyn(a, fn, depth + 1));
         }
         default:
           return false;

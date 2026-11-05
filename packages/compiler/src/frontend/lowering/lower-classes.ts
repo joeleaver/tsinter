@@ -4768,8 +4768,11 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
     // Island construction: a jsval-typed callee (a package-declared class,
     // or any 'any'-typed constructor value) runs JS_CallConstructor —
     // `new Command()` is the npm entry point. Arguments marshal in; the
-    // instance stays an island handle.
-    if (L.isIslandExpr(expr.expression)) {
+    // instance stays an island handle. (One world in a JavaScript source
+    // without the engine — U1b: the callee is the checked-dynamic value,
+    // so construction takes the JS lane's own paths below, as on main —
+    // a CJS export member's class value, the named fence otherwise.)
+    if (L.isIslandExpr(expr.expression) && !(L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile()))) {
       const callee = L.lowerExpr(expr.expression);
       const args = (expr.arguments ?? []).map((a) => L.jsvalIn(L.lowerExpr(a), a));
       return { kind: "jsOp", op: "construct", args: [callee, ...args], type: JSVAL, loc };

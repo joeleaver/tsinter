@@ -24,6 +24,7 @@
 import { isUndefExpr, plainFieldPresent } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
+import { isJsSourceFileName } from "../shared.js";
 import {
   BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isUnitType, typeKey,
   type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc,
@@ -613,6 +614,23 @@ function shallowArrayLift(e: IrExpr, loc: SrcLoc, L?: Lowerer): IrExpr {
   return { kind: "call", callee: name, args: [e], type: JSVAL, loc };
 }
 
+/** Does a typed composite carry an accessor-bearing record anywhere a view
+ * would reach (the record itself, a field, an element, a union arm)? */
+function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
+  const k = typeKey(t);
+  if (seen.has(k)) return false;
+  seen.add(k);
+  if (t.kind === "record") {
+    const shape = L.shapes.get(t.shapeId);
+    if (!shape) return false;
+    if (shape.fields.some((f) => f.name.startsWith("%"))) return true;
+    return shape.fields.some((f) => carriesAccessors(L, f.type, seen)) || (shape.indexValue !== undefined && carriesAccessors(L, shape.indexValue, seen));
+  }
+  if (t.kind === "array") return carriesAccessors(L, t.elem, seen);
+  if (t.kind === "union") return (L.unions.get(t.unionId)?.arms ?? []).some((a) => carriesAccessors(L, a, seen));
+  return false;
+}
+
 /** `e` (a typed array/tuple/record) as its island VIEW. */
 export function viewOf(L: Lowerer, e: IrExpr, loc: SrcLoc, frozen = false): IrExpr {
   if (frozen && e.type.kind === "array") {
@@ -641,11 +659,16 @@ export function viewOf(L: Lowerer, e: IrExpr, loc: SrcLoc, frozen = false): IrEx
       return { kind: "jsOp", op: "objLit", args, type: JSVAL, loc };
     }
   }
-  if (e.type.kind === "record") {
-    const shape = L.shapes.get(e.type.shapeId);
-    if (shape && shape.fields.some((f) => f.name.startsWith("%"))) {
-      L.pushDiag(s115Diag(loc, `a typed record with accessors crossing into an 'any' slot cannot be shared with dynamic code yet (SEMANTICS.md S115)`));
+  // A record with accessors — at the top or anywhere inside (a field, an
+  // element, a union arm) — has no view. In a JavaScript source it crosses
+  // as the checked-dynamic copy the JS lane always made (S014's U1b
+  // amendment; S125 (c) judges it); elsewhere it refuses by name.
+  if (carriesAccessors(L, e.type, new Set())) {
+    if (isJsSourceFileName(loc.file) && L.dynConvertible(e.type)) {
+      return { kind: "jsMarshal", value: { kind: "dynFrom", value: e, type: DYN, loc }, type: JSVAL, loc };
     }
+    L.pushDiag(s115Diag(loc, `a typed record with accessors crossing into an 'any' slot cannot be shared with dynamic code yet (SEMANTICS.md S115)`));
+    return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: e, loc }], result: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, type: JSVAL, loc };
   }
   return { kind: "call", callee: viewFactory(L, e.type, loc), args: [e], type: JSVAL, loc };
 }
@@ -1017,6 +1040,13 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
     const k = node["kind"];
     if (k === "jsMarshal") {
       const value = node["value"] as IrExpr;
+      // A tagged template's strings array (frozen in JS) in a JavaScript
+      // source: the checked-dynamic copy main made, which S125 (c) judges
+      // (a write through it refuses by name; sloppy-mode Node would ignore
+      // it silently, strict Node would throw) — never a writable view (U1b).
+      if (value.kind === "templateStrings" && L.sharedDynamic && isJsSourceFileName(value.loc.file)) {
+        return { ...node, value: { kind: "dynFrom", value, type: DYN, loc: value.loc } };
+      }
       if (value.type.kind === "array" || value.type.kind === "record") {
         return viewOf(L, value, node["loc"] as SrcLoc) as unknown as Record<string, unknown>;
       }

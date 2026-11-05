@@ -494,21 +494,19 @@ test("LOUD-2-instanceof value: same, through setTimeout", async () => {
   expect(stderr).toContain("'instanceof' right-hand sides other than classes declared in the program");
 });
 
-test("LOUD-3-spread direct: spreading arguments into an unknown[] literal traps with a named diagnostic", async () => {
-  const { stdout, stderr } = await runRowTrap(
+test("LOUD-3-spread direct: spreading arguments into an array literal (U1b: Node's answer)", async () => {
+  const out = await runRow(
     "loud3d",
     "'use strict';\nfunction f() {\n  const a = [...arguments];\n  console.log(a.length);\n}\nf(1, 'two');",
   );
-  expect(stdout).toBe("");
-  expect(stderr).toContain("spread elements in a dynamic (unknown[]) array literal");
+  expect(out).toBe("2\n");
 });
-test("LOUD-3-spread value: same, through setTimeout", async () => {
-  const { stdout, stderr } = await runRowTrap(
+test("LOUD-3-spread value: same, through setTimeout (U1b: Node's answer)", async () => {
+  const out = await runRow(
     "loud3v",
     "'use strict';\nsetTimeout(function () {\n  const a = [...arguments];\n  console.log(a.length);\n}, 0, 1, 'two');",
   );
-  expect(stdout).toBe("");
-  expect(stderr).toContain("spread elements in a dynamic (unknown[]) array literal");
+  expect(out).toBe("2\n");
 });
 
 test("LOUD-4-symiter direct: arguments[Symbol.iterator] traps with a named diagnostic", async () => {

@@ -58,8 +58,10 @@ async function runOn(lane: Lane, id: string, file: string): Promise<Out> {
   }
 }
 
+const SC2011_ONE_WORLD = ": dynamic ('any'/'unknown') values are compiled on this lane, and this construct has no compiled form for them yet";
 const SC2011 = (line: number): string =>
-  `tsinter: unsupported: the '|' operator on 'any'-typed values runs in the embedded dynamic engine, which this build does not include [SC2011 at <ROW>:${line}]\n`;
+  // (U1b: the one-world wording of the same named fence.)
+  `tsinter: unsupported: the '|' operator on 'any'-typed values: dynamic ('any'/'unknown') values are compiled on this lane, and this construct has no compiled form for them yet [SC2011 at <ROW>:${line}]\n`;
 const HOLES = (line: number): string =>
   "tsinter: unsupported: Array.prototype.map over an array that may hold holes (a write past an array's end leaves undefined where Node keeps a hole, " +
   `and Array.prototype.map tells them apart — SEMANTICS.md S119) [SC1090 at <ROW>:${line}]\n`;
@@ -190,7 +192,10 @@ describe("GH #86: the deferred compile fence on the c and llvm lanes", () => {
     test.for(native.map((r) => [r.id, r] as const))(`${lane}: %s`, async ([id, row]) => {
       const file = join(scratch, `${id}-${lane}.${row.ext}`);
       writeFileSync(file, row.src + "\n");
-      expect(await runOn(lane, id, file)).toEqual({ stdout: row.stdout, stderr: row.stderr, exitCode: 1 });
+      // (The legacy lanes have no one dynamic world: their SC2011 keeps the
+      // engine wording.)
+      const stderr = row.stderr.split(SC2011_ONE_WORLD).join(" runs in the embedded dynamic engine, which this build does not include");
+      expect(await runOn(lane, id, file)).toEqual({ stdout: row.stdout, stderr, exitCode: 1 });
     }, 600_000);
   }
 });

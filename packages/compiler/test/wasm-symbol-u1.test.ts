@@ -780,7 +780,9 @@ for (const row of B_II_ROWS) {
       if (!res.ok) throw new Error(`${row.id} [${tag}] refused at compile time: ${res.diagnostics[0]?.message}`);
       const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
       expect(stdout).toBe("");
-      const expected = dynamic && B_II_DYN_OVERRIDE[row.id] !== undefined ? B_II_DYN_OVERRIDE[row.id]! : row.expected;
+      // U1b: JS sources take the one world in both modes, so rows 1 and 5 name
+      // the crossing-into-`any` text with or without --dynamic.
+      const expected = B_II_DYN_OVERRIDE[row.id] ?? row.expected;
       expect(stderr.startsWith(expected)).toBe(true);
       // The suffix shape (":<line>]\n" at the very end) and exactly ONE
       // fence line in the whole message — tighter than the prefix

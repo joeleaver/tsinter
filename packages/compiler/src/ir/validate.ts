@@ -1863,7 +1863,7 @@ function validateFunction(
         else if (!field) err(`class ${e.className} has no field "${e.field}"`, e.loc);
         else {
           expectType(e.obj, { kind: "object", className: e.className }, "fieldIncDec receiver");
-          if (e.fieldDyn ? field.type.kind !== "dyn" : field.type.kind !== "f64") {
+          if (e.fieldDyn ? field.type.kind !== "dyn" && field.type.kind !== "jsval" : field.type.kind !== "f64") {
             err(`fieldIncDec ${e.className}.${e.field} field/flag mismatch (${field.type.kind})`, e.loc);
           }
         }
@@ -2834,7 +2834,12 @@ function validateFunction(
         if (e.value.type.kind !== "promise") {
           err("promiseVoidWiden over a non-promise operand", e.loc);
         }
-        if (e.type.kind !== "promise" || e.type.inner.kind !== "void") {
+        // (Or the one-world payload retype: promise<dyn> and promise<jsval>
+        // carry the same $dyn payload — U1a/U1b.)
+        const oneWorld =
+          e.type.kind === "promise" && e.value.type.kind === "promise" &&
+          ((e.type.inner.kind === "jsval" && e.value.type.inner.kind === "dyn") || (e.type.inner.kind === "dyn" && e.value.type.inner.kind === "jsval"));
+        if (!oneWorld && (e.type.kind !== "promise" || e.type.inner.kind !== "void")) {
           err("promiseVoidWiden must be promise<void>-typed", e.loc);
         }
         break;
@@ -4655,7 +4660,7 @@ function validateFunction(
         // kind (the checked-dynamic function boundary, nodes.ts).
         const funcOk =
           e.type.kind === "func" &&
-          canAdaptDynFuncTo(e.type, (id) => records.get(id), (id) => unions.get(id));
+          canAdaptDynFuncTo(e.type, (id) => records.get(id), (id) => unions.get(id), undefSlots);
         // Runtime HANDLE targets unwrap the checked-dynamic tree's handle kind by tag (a
         // retained reference, no copy — DYN_HANDLE_KINDS).
         const handleOk = DYN_HANDLE_KINDS.has(e.type.kind);
