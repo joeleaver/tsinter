@@ -8273,7 +8273,7 @@ export class Lowerer {
           // function's alias, a stdlib global's snapshot (`const perf =
           // performance`) — keeps the standard path's own rules, as when
           // `any` had no mapping.
-          this.mapTypeOf(this.typeOf(decl.initializer!))?.kind === "jsval")) &&
+          decl.initializer !== undefined && this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval")) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't

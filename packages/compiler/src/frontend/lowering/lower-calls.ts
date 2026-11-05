@@ -3667,7 +3667,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           if (spreadServed) return spreadServed;
         }
         const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-        const calleeName = ts.isPropertyAccessExpression(expr.expression)
+        const calleeName = ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
           ? expr.expression.getText()
           : ts.isIdentifier(expr.expression)
             ? expr.expression.text
