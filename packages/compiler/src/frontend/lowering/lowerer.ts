@@ -2757,7 +2757,7 @@ export class Lowerer {
     }
     if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
     // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy.
-    if (this.sharedDynamic && ts.isExpression(node)) return check;
+    if (this.sharedDynamic) return check;
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -6693,7 +6693,7 @@ export class Lowerer {
       // S115 (d)'s U1a amendment: a local, parameter, return, field or
       // element takes a judged copy (S125 (c) refuses the observable ones;
       // a copy it cannot follow is judged by its type).
-      else if (this.sharedDynamic && ts.isExpression(node)) e = judgedExit(e.value, e.type, e.loc);
+      else if (this.sharedDynamic) e = judgedExit(e.value, e.type, e.loc);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters

@@ -2398,8 +2398,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           return (e.method === "sort" || e.method === "reverse") && uniqueDyn(e.recv, fn, depth + 1);
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
-          if (!b || b.captured || b.assigns.length !== 1 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
-          return uniqueDyn(b.assigns[0], fn, depth + 1);
+          // One read in all: every value the binding ever holds is fresh
+          // (an evolving `let flags = []` reassigned from a fresh result),
+          // so the one read takes a value nothing else holds.
+          if (!b || b.captured || b.assigns.length === 0 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
+          return b.assigns.every((a) => uniqueDyn(a, fn, depth + 1));
         }
         default:
           return false;
