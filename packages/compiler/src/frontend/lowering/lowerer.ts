@@ -3795,7 +3795,9 @@ export class Lowerer {
     // A promise boxes itself whatever its payload (the emitter's promise
     // arm: a dyn/jsval payload rides the same slot, any other converts at
     // the first dynamic read, PROM_CONV).
-    if (t.kind === "promise") return true;
+    // (A payload the box cannot convert at all — a class instance — keeps
+    // the boundary's named refusal: the validator admits only these.)
+    if (t.kind === "promise") return t.inner.kind === "jsval" || t.inner.kind === "dyn" || this.dynConvertible(t);
     if (!this.dynConvertible(t)) return false;
     // Under --dynamic a function the island marshals takes that entrance
     // (main's: its composite results reach dynamic code as views, S115
@@ -6853,6 +6855,19 @@ export class Lowerer {
         return lowerDynObjectLiteral(this, x);
       }
     }
+    // One world in JS sources (U1b): an island slot (an implicit-any JS
+    // parameter) IS the checked-dynamic value — the literal builds as the
+    // JS lane's dyn literal and crosses by the free retype, so its members
+    // keep the dyn tree's crossing rules (a promise member is a boxed
+    // value, as on main) instead of a typed record's exact-shape check.
+    if (expected?.kind === "jsval" && this.sharedDynamic && !this.engine) {
+      let x: ts.Expression = node;
+      while (ts.isParenthesizedExpression(x)) x = x.expression;
+      if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile())) {
+        const lit = lowerDynObjectLiteral(this, x);
+        return lit.type.kind === "dyn" ? { kind: "jsMarshal", value: lit, type: JSVAL, loc: lit.loc } : this.coerceInto(node, lit, expected);
+      }
+    }
     // An ARRAY LITERAL against a UNION slot whose own type has no static
     // home (the JS dyn fallback — the checker gave no usable context):
     // when the union has exactly ONE array-family arm — an array, or an
@@ -7567,6 +7582,17 @@ export class Lowerer {
         params.push({ localId: slot.id, name: "%param", type: shape.type });
         let srcType = shape.type;
         let srcRef = (): IrExpr => ({ kind: "varRef", localId: slot.id, type: shape.type, loc });
+        // One world in JS sources (U1b): an island pattern source is the
+        // checked-dynamic value — the JS lane's destructuring (V8's
+        // "Cannot destructure property" texts) reads it.
+        const jsRetype = (): void => {
+          if (srcType.kind === "jsval" && this.sharedDynamic && !this.engine && isJsSourceFile(decl.getSourceFile())) {
+            const r0 = srcRef;
+            srcType = DYN;
+            srcRef = () => asDynOperand(r0());
+          }
+        };
+        if (!(shape.mode === "omittable" && shape.bodyType && decl.initializer)) jsRetype();
         if (shape.mode === "omittable" && shape.bodyType && decl.initializer) {
           // A WHOLE-PATTERN default (`({ x } = { x: 1 })`): pick the
           // default exactly when the argument was omitted or undefined
@@ -7633,6 +7659,7 @@ export class Lowerer {
         } else if (ts.isObjectBindingPattern(decl.name)) {
           paramPatternGuards(this, decl.name, srcRef, srcType, prologue);
         }
+        jsRetype();
         this.lowerBindingPattern(decl.name, srcRef, srcType, true, prologue);
         return;
       }

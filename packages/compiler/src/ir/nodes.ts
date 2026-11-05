@@ -5819,6 +5819,9 @@ export function canConvertToDyn(
   if (t.kind === "promise") {
     return (
       t.inner.kind === "dyn" ||
+      // (A jsval payload exists only on the one-world WasmGC lanes, where
+      // it IS the dyn value — the async JS closure `async (x) => x`.)
+      t.inner.kind === "jsval" ||
       t.inner.kind === "void" ||
       canConvertToDyn(t.inner, getRecord, getUnion)
     );

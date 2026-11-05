@@ -39,6 +39,23 @@ import { regexCrossingChecked } from "./lower-regex.js";
       if (ts.isPropertyAccessExpression(recv) && L.builtinMemberOf(recv) !== null) return false;
       if (ts.isIdentifier(recv) && (L.builtinImportOf(recv) !== null || L.isStdlibSymbol(L.checker.getSymbolAtLocation(recv)))) return false;
     }
+    // One world without the engine (U1b): a JS local the lowering holds
+    // TYPED although the checker says 'any' (an implicit-any parameter in
+    // a per-site instance — `merge(target, source)` instantiated with
+    // (number[], number[])), and a member of one, are that typed value:
+    // its own lowerings answer, as on main.
+    if (L.sharedDynamic && !L.engine && isJsSourceFile(node.getSourceFile())) {
+      let base: ts.Expression = node;
+      while (ts.isParenthesizedExpression(base)) base = base.expression;
+      if (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {
+        base = base.expression;
+        while (ts.isParenthesizedExpression(base)) base = base.expression;
+      }
+      if (ts.isIdentifier(base) && base.text !== "arguments") {
+        const t = L.peekLocal(base)?.type;
+        if (t !== undefined && t.kind !== "jsval" && t.kind !== "dyn" && t.kind !== "promise") return false;
+      }
+    }
     const mapped = L.mapTypeOf(L.typeOf(node));
     if (mapped?.kind === "jsval") return true;
     if (mapped?.kind !== "promise" && ts.isIdentifier(node)) {

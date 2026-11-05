@@ -15,7 +15,7 @@ import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDy
 import { PoisonError, dynUndefinedExpr, jsFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
-import { unsupportedModuleFeatureOf } from "../shared.js";
+import { isJsSourceFileName, unsupportedModuleFeatureOf } from "../shared.js";
 import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
@@ -8742,6 +8742,9 @@ const INHERITED_BY_KIND: [("array" | "string" | "function" | "number" | "boolean
  * they are. */
 function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
   if (e.kind !== "dynKeyGet" || !L.sharedDynamic || e.optional) return e;
+  // A JavaScript source keeps the JS lane's own-members answer (S015's
+  // body; U1b parity): the fence is U1a's TypeScript amendment.
+  if (isJsSourceFileName(e.loc.file)) return e;
   if (e.key.kind === "strLit" && !INHERITED_NAMES.has(e.key.value)) return e;
   const loc = e.loc;
   const call: IrExpr = {

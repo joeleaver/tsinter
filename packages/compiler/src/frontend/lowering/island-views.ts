@@ -24,6 +24,7 @@
 import { isUndefExpr, plainFieldPresent } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
+import { isJsSourceFileName } from "../shared.js";
 import {
   BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isUnitType, typeKey,
   type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc,
@@ -1017,6 +1018,13 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
     const k = node["kind"];
     if (k === "jsMarshal") {
       const value = node["value"] as IrExpr;
+      // A tagged template's strings array (frozen in JS) in a JavaScript
+      // source: the checked-dynamic copy main made, which S125 (c) judges
+      // (a write through it refuses by name; sloppy-mode Node would ignore
+      // it silently, strict Node would throw) — never a writable view (U1b).
+      if (value.kind === "templateStrings" && L.sharedDynamic && isJsSourceFileName(value.loc.file)) {
+        return { ...node, value: { kind: "dynFrom", value, type: DYN, loc: value.loc } };
+      }
       if (value.type.kind === "array" || value.type.kind === "record") {
         return viewOf(L, value, node["loc"] as SrcLoc) as unknown as Record<string, unknown>;
       }

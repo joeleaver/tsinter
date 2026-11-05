@@ -3643,6 +3643,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // calls the stored member with Node's is-not-a-function TypeError
       // on refusal.
       if (callee.type.kind === "dyn") {
+        // One world in JS sources (U1b): an island callee retypes to the
+        // checked-dynamic value, so its spread arguments take the JS
+        // lane's runtime-arity spread call (V8's spread-call texts, any
+        // spread position) exactly as a dyn-typed callee did on main.
+        if (expr.arguments.some((a) => ts.isSpreadElement(a))) {
+          const spreadServed = lowerSpreadArgsCall(L, expr, callee, loc);
+          if (spreadServed) return spreadServed;
+        }
         const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
         const calleeName = ts.isPropertyAccessExpression(expr.expression)
           ? expr.expression.getText()
