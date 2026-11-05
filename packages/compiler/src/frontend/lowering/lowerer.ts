@@ -912,6 +912,8 @@ export function withEsFnName(L: Lowerer, e: IrExpr & { kind: "dynFrom" }, node: 
  * copies (S014). */
 export function isPrimitiveArgType(L: Lowerer, t: IrType): boolean {
   if (t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "dyn" || isUnitType(t)) return true;
+  // One world (U1b): the island value IS the $dyn value — by reference.
+  if (L.sharedDynamic && t.kind === "jsval") return true;
   if (t.kind === "union") {
     return L.unions.get(t.unionId)?.arms.every((a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a)) ?? false;
   }

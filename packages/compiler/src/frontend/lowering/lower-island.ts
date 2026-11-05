@@ -28,6 +28,17 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // value (its IArguments type absorbs to jsval through the `any` index
     // signature once `any` maps — unit U1a); its own lowerings claim it.
     if (L.sharedDynamic && ts.isIdentifier(node) && node.text === "arguments" && L.typeOf(node).getSymbol()?.name === "IArguments") return false;
+    // One world without the engine (U1b): a member of a BUILTIN value
+    // (`EventEmitter.setMaxListeners`, `events.EventEmitter.x`,
+    // `URL.revokeObjectURL`) that a JS source's checker types 'any' is
+    // never an island value — no engine object exists; the builtin
+    // surfaces own it (and fence what they do not model).
+    if (L.sharedDynamic && !L.engine && ts.isPropertyAccessExpression(node) && isJsSourceFile(node.getSourceFile())) {
+      const recv = node.expression;
+      if (L.builtinMemberOf(node) !== null) return false;
+      if (ts.isPropertyAccessExpression(recv) && L.builtinMemberOf(recv) !== null) return false;
+      if (ts.isIdentifier(recv) && (L.builtinImportOf(recv) !== null || L.isStdlibSymbol(L.checker.getSymbolAtLocation(recv)))) return false;
+    }
     const mapped = L.mapTypeOf(L.typeOf(node));
     if (mapped?.kind === "jsval") return true;
     if (mapped?.kind !== "promise" && ts.isIdentifier(node)) {

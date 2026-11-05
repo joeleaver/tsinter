@@ -436,8 +436,16 @@ export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     lowerExprDepth++;
     try {
       const tdz = L.moduleTdz;
-      if (tdz !== null && tdz.occByFile.size > 0) return guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr));
-      return lowerExprInner(L, expr);
+      const out = tdz !== null && tdz.occByFile.size > 0 ? guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr)) : lowerExprInner(L, expr);
+      // One world in JavaScript sources (U1b): an island-typed expression
+      // IS the $dyn value (one representation, the retype is free), and a
+      // JS source's operations on it take the checked-dynamic arms — the
+      // JS lane's own JS-exact semantics, V8's error texts included.
+      // Storage stays the island type (coerceInto's jsMarshal(dyn) is the
+      // same retype back), so a value crossing into TypeScript is the
+      // same object, never a copy.
+      if (out.type.kind === "jsval" && L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile())) return asDynOperand(out);
+      return out;
     } finally {
       lowerExprDepth--;
     }
@@ -2286,6 +2294,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       if (
         (isJsSourceFile(expr.getSourceFile()) &&
           (L.mapTypeOf(L.typeOf(expr.expression)) === null ||
+            // One world (U1b): the island type is the unmapped JS value's
+            // type now (the `arguments` object, an any-typed member).
+            (L.sharedDynamic && !L.engine && L.mapTypeOf(L.typeOf(expr.expression))?.kind === "jsval") ||
             // A never-tainted receiver type maps (never rides as f64) but
             // its VALUE lowered checked-dynamic — same dyn read.
             neverTaintedJsType(L, expr.expression, L.typeOf(expr.expression)))) ||

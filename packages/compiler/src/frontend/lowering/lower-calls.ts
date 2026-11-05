@@ -254,7 +254,9 @@ export interface GenericInstance {
         // value crosses as a REST host function (the withPlugins
         // `async (...args) =>` shape). Static builds keep the variadic
         // dyn form for every unmappable JS rest.
-        if (restMapped?.kind === "jsval" && L.dynamic) {
+        // (The engine's own arguments array: only with the engine — a JS
+        // source on the one-world lanes keeps the variadic dyn form, U1b.)
+        if (restMapped?.kind === "jsval" && L.engine) {
           return { type: JSVAL, mode: "islandRest" };
         }
         if (restMapped?.kind !== "array") {
@@ -265,7 +267,7 @@ export interface GenericInstance {
       // An `any[]` rest (`...args: any[]`) IS the island array itself
       // (SEMANTICS.md S014's unit-H amendment): the binding is a fresh
       // engine array per call, exactly the JS `(...args)` island form.
-      if (type.kind === "jsval" && L.dynamic) return { type: JSVAL, mode: "islandRest" };
+      if (type.kind === "jsval" && (L.engine || (L.dynamic && !isJsSourceFile(param.getSourceFile())))) return { type: JSVAL, mode: "islandRest" };
       // Tuple-typed rest params don't map to an array; generic rest is the
       // generic path's business. Anything non-array here is unmappable.
       if (type.kind !== "array") L.badType(param.name, L.typeOf(param.name));
