@@ -449,6 +449,14 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
+/** An await or a call, under parentheses, casts and non-null
+ * assertions (lowerVarDecl's one-world handle-rescue gate). */
+function isProducerInit(e: ts.Expression): boolean {
+  let cur = e;
+  while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isTypeAssertion(cur) || ts.isNonNullExpression(cur)) cur = cur.expression;
+  return ts.isAwaitExpression(cur) || ts.isCallExpression(cur);
+}
+
 export function lowerToIr(
   program: ts.Program,
   entry: ts.SourceFile,
@@ -8267,13 +8275,15 @@ export class Lowerer {
     if (
       (this.engine ||
         (this.dynamic && !isJsSourceFile(decl.getSourceFile()) &&
-          // One world without the engine (U1b): only an initializer the
-          // checker itself types as an island value ('any'/'unknown'/
-          // 'object') is a handle candidate. Everything else — a generic
-          // function's alias, a stdlib global's snapshot (`const perf =
-          // performance`) — keeps the standard path's own rules, as when
-          // `any` had no mapping.
-          decl.initializer !== undefined && this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval")) &&
+          // One world without the engine (U1b): a handle candidate is an
+          // initializer the checker types as an island value ('any'/
+          // 'unknown'/'object'), or a producer (an await or a call — the
+          // host-fetch slice's `await res.arrayBuffer()` handle). A bare
+          // name or member — a generic function's alias, a stdlib
+          // global's snapshot (`const perf = performance`) — keeps the
+          // standard path's own rules, as when `any` had no mapping.
+          decl.initializer !== undefined &&
+          (this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval" || isProducerInit(decl.initializer)))) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't

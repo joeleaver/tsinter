@@ -47,6 +47,18 @@ interface Row {
 const S125_TAIL = /it would be a COPY where JavaScript shares the object, and .* \(SEMANTICS\.md S125\) (is|are) not supported yet$/;
 
 const ROWS: Row[] = [
+  // ── U1b: lowerVarDecl's island-handle rescue gate (TypeScript, no engine) ──
+  {
+    id: "U1B-RESCUE-01 an awaited producer's handle (res.arrayBuffer()) still binds; a generic alias and a stdlib snapshot keep their own rules",
+    src: `async function size(r: Response): Promise<number> {
+  const ab = await r.arrayBuffer();
+  return ab.byteLength;
+}
+function id<T>(x: T): T { return x; }
+const h = id;
+const perf = performance;
+console.log(typeof size, h(3), h("z"), typeof perf.now());`,
+  },
   // ── one world: typed composites are shared (S014, S115 (a)) ─────────
   {
     id: "U1-SHARE-01 a record entering unknown is the same object",
