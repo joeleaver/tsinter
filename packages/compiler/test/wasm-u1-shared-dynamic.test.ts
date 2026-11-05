@@ -47,6 +47,20 @@ interface Row {
 const S125_TAIL = /it would be a COPY where JavaScript shares the object, and .* \(SEMANTICS\.md S125\) (is|are) not supported yet$/;
 
 const ROWS: Row[] = [
+  // ── U1b: a record with accessors NESTED in a composite crossing into a
+  // dynamic value (readdir's Dirent array inside a literal) has no view: in
+  // a JavaScript source it is the judged copy (here refused by S125 (c)),
+  // never the lowering's internal error ──
+  {
+    id: "U1B-ACCESSOR-01 a Dirent array inside a literal crossing into a dynamic value is a named refusal, not an internal error",
+    entry: "main.cjs",
+    src: `const fs = require("fs");
+const holder = JSON.parse("{}");
+const ents = fs.readdirSync(__dirname, { withFileTypes: true }).filter((d) => d.name === "main.cjs");
+holder.box = { ents };
+console.log(holder.box.ents.length, holder.box.ents[0].name);`,
+    refused: { code: "SC1090", s125: true },
+  },
   // ── U1b: lowerVarDecl's island-handle rescue gate (TypeScript, no engine) ──
   {
     id: "U1B-RESCUE-01 an awaited producer's handle (res.arrayBuffer()) still binds; a generic alias and a stdlib snapshot keep their own rules",
