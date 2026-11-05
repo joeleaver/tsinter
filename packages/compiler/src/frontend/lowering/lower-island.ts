@@ -33,7 +33,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // `URL.revokeObjectURL`) that a JS source's checker types 'any' is
     // never an island value — no engine object exists; the builtin
     // surfaces own it (and fence what they do not model).
-    if (L.sharedDynamic && !L.engine && ts.isPropertyAccessExpression(node) && isJsSourceFile(node.getSourceFile())) {
+    if (L.sharedDynamic && ts.isPropertyAccessExpression(node) && isJsSourceFile(node.getSourceFile())) {
       const recv = node.expression;
       if (L.builtinMemberOf(node) !== null) return false;
       if (ts.isPropertyAccessExpression(recv) && L.builtinMemberOf(recv) !== null) return false;
@@ -44,7 +44,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // a per-site instance — `merge(target, source)` instantiated with
     // (number[], number[])), and a member of one, are that typed value:
     // its own lowerings answer, as on main.
-    if (L.sharedDynamic && !L.engine && isJsSourceFile(node.getSourceFile())) {
+    if (L.sharedDynamic && isJsSourceFile(node.getSourceFile())) {
       let base: ts.Expression = node;
       while (ts.isParenthesizedExpression(base)) base = base.expression;
       if (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {
@@ -53,7 +53,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
       }
       if (ts.isIdentifier(base) && base.text !== "arguments") {
         const t = L.peekLocal(base)?.type;
-        if (t !== undefined && t.kind !== "jsval" && t.kind !== "dyn" && t.kind !== "promise") return false;
+        if (t !== undefined && ["array", "record", "object", "f64", "string", "bool", "union", "map", "set"].includes(t.kind)) return false;
       }
     }
     const mapped = L.mapTypeOf(L.typeOf(node));

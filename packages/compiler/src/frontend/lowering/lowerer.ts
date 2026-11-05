@@ -783,7 +783,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
   // A JavaScript binding on the one-world lanes without the engine keeps
   // the JS lane's checked-dynamic storage (U1b): the same $dyn value the
   // island type names, held where every use takes the JS-exact arms.
-  if (L.sharedDynamic && !L.engine) return DYN;
+  if (L.sharedDynamic && (!L.engine || isJsSourceFile(node.getSourceFile()))) return DYN;
   return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
 }
 
@@ -3594,7 +3594,11 @@ export class Lowerer {
   jsUnmapped(t: ts.Type): boolean {
     const m = this.mapTypeOf(t);
     if (!m) return true;
-    return this.sharedDynamic && !this.engine && (m.kind === "jsval" || this.nestsJsval(m));
+    // Under --dynamic an `any` mapped to the island before U1a too (the
+    // engine's handle type): only what maps because `unknown`/`object` do
+    // now is unmapped there.
+    if (this.engine && (t.flags & ts.TypeFlags.Any) !== 0) return false;
+    return this.sharedDynamic && (m.kind === "jsval" || this.nestsJsval(m));
   }
 
   /** Does a mapped type hold an island-typed piece below its root (a
@@ -6860,10 +6864,11 @@ export class Lowerer {
     // JS lane's dyn literal and crosses by the free retype, so its members
     // keep the dyn tree's crossing rules (a promise member is a boxed
     // value, as on main) instead of a typed record's exact-shape check.
-    if (expected?.kind === "jsval" && this.sharedDynamic && !this.engine) {
+    if (expected?.kind === "jsval" && this.sharedDynamic) {
       let x: ts.Expression = node;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
-      if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile())) {
+      if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile()) &&
+          x.properties.every((p) => (ts.isPropertyAssignment(p) && !ts.isComputedPropertyName(p.name)) || ts.isShorthandPropertyAssignment(p))) {
         const lit = lowerDynObjectLiteral(this, x);
         return lit.type.kind === "dyn" ? { kind: "jsMarshal", value: lit, type: JSVAL, loc: lit.loc } : this.coerceInto(node, lit, expected);
       }
@@ -7586,7 +7591,7 @@ export class Lowerer {
         // checked-dynamic value — the JS lane's destructuring (V8's
         // "Cannot destructure property" texts) reads it.
         const jsRetype = (): void => {
-          if (srcType.kind === "jsval" && this.sharedDynamic && !this.engine && isJsSourceFile(decl.getSourceFile())) {
+          if (srcType.kind === "jsval" && this.sharedDynamic && isJsSourceFile(decl.getSourceFile())) {
             const r0 = srcRef;
             srcType = DYN;
             srcRef = () => asDynOperand(r0());

@@ -2296,7 +2296,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           (L.mapTypeOf(L.typeOf(expr.expression)) === null ||
             // One world (U1b): the island type is the unmapped JS value's
             // type now (the `arguments` object, an any-typed member).
-            (L.sharedDynamic && !L.engine && L.mapTypeOf(L.typeOf(expr.expression))?.kind === "jsval") ||
+            (L.sharedDynamic && L.mapTypeOf(L.typeOf(expr.expression))?.kind === "jsval") ||
             // A never-tainted receiver type maps (never rides as f64) but
             // its VALUE lowered checked-dynamic — same dyn read.
             neverTaintedJsType(L, expr.expression, L.typeOf(expr.expression)))) ||
@@ -7447,7 +7447,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       const rawKey = L.lowerExpr(expr.argumentExpression);
       // One world in JS sources (U1b): bool and dynamic keys stringify
       // (ToPropertyKey), exactly the checked-dynamic receiver branch below.
-      const jsKeys = L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile());
+      const jsKeys = L.sharedDynamic && isJsSourceFile(expr.getSourceFile());
       const key: IrExpr | null =
         rawKey.type.kind === "string"
           ? rawKey
