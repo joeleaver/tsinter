@@ -262,7 +262,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * (poison-recovered, so every site in the program reports — and the
    * coverage report groups them under "runs with --dynamic"). */
   export function requireDynamicApi(L: Lowerer, feature: string, node: ts.Node): void {
-    if (L.dynamic) return;
+    // (One world in a JavaScript source without the engine — U1b: the
+    // engine API is still absent, so the JS lane's named fence stands, as
+    // on main.)
+    if (L.dynamic && !(L.sharedDynamic && !L.engine && isJsSourceFile(node.getSourceFile()))) return;
     L.pushDiag(requiresDynamicApiDiag(feature, locOf(node)));
     throw new PoisonError();
   }
