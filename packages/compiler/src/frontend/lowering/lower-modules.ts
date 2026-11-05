@@ -870,7 +870,7 @@ function jsDynHoldableInitializer(L: Lowerer, init: ts.Expression | undefined): 
   // arrays) keep their static stories.
   if (ts.isCallExpression(e)) {
     const t = L.typeOf(e);
-    if (L.mapTypeOf(t) === null && dynFallbackType(L, e, t)?.kind === "dyn") return true;
+    if (L.jsUnmapped(t) && dynFallbackType(L, e, t)?.kind === "dyn") return true;
   }
   return false;
 }
@@ -1450,7 +1450,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
               decl.initializer.properties.every((p) => {
                 if (!ts.isPropertyAssignment(p) || ts.isComputedPropertyName(p.name)) return false;
                 const mt = L.mapTypeOf(L.typeOf(p.initializer));
-                return mt === null || mt.kind === "dyn" ||
+                return mt === null || mt.kind === "dyn" || L.jsUnmapped(L.typeOf(p.initializer)) ||
                   canConvertToDyn(mt, (id) => L.shapes.get(id), (id) => L.unions.get(id));
               })
             ) {
