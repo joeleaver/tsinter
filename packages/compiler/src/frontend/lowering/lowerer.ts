@@ -8177,7 +8177,7 @@ export class Lowerer {
       return !lambda;
     };
     if (
-      this.dynamic &&
+      (this.engine || (this.dynamic && !isJsSourceFile(decl.getSourceFile()))) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't

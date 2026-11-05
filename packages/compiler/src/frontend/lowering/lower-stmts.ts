@@ -2396,7 +2396,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         }
       }
       const g = L.globalsBySymbol.get(symbol);
-      if (g !== undefined && g.type.kind !== "string" && g.type.kind !== "dyn") {
+      if (g !== undefined && g.type.kind !== "string" && g.type.kind !== "dyn" && g.type.kind !== "jsval") {
         L.unsupported("SC1031", el, `bindings with '${L.fmt(g.type)}' storage over the builtin global '${globalName}'`);
       }
       binds.push({ name: el.name, token, alias, g });

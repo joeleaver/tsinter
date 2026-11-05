@@ -1922,6 +1922,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // lowering's re-dispatch (a questionDotToken past the gate above is
       // always chain-handled; the receiver reads back as the chain's
       // bound handle).
+      // One world (U1b): `s._readableState.<name>` types its inner access
+      // 'any' (an island receiver now) — the state-read surface claims it
+      // first, as it did over the checked-dynamic spelling.
+      if (L.sharedDynamic) {
+        const state = lowerStreamStateProperty(L, expr);
+        if (state) return state;
+      }
       if (L.isIslandExpr(expr.expression)) {
         const receiver = L.lowerExpr(expr.expression);
         // The checker said 'any' but the VALUE lives in the checked-dynamic tree (`this`
@@ -5608,6 +5615,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           key = { kind: "strLit", value: folded, type: STRING, loc: locOf(name) };
         } else {
           let k = L.lowerExpr(name.expression);
+          if (L.sharedDynamic) k = asDynOperand(k);
           if (k.type.kind === "f64" || k.type.kind === "bool" || k.type.kind === "dyn") {
             k = { kind: "toString", operand: k, type: STRING, loc: locOf(name) };
           }
