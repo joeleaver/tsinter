@@ -3597,8 +3597,23 @@ export class Lowerer {
     // Under --dynamic an `any` mapped to the island before U1a too (the
     // engine's handle type): only what maps because `unknown`/`object` do
     // now is unmapped there.
-    if (this.engine) return (t.flags & ts.TypeFlags.Any) === 0 && m.kind === "jsval";
+    // (An `any[]` maps to the island through its `any` element, as before
+    // U1a: only an `unknown`/`object` root, element or union arm counts.)
+    if (this.engine) return m.kind === "jsval" && this.mentionsUnknownOrObject(t);
     return this.sharedDynamic && (m.kind === "jsval" || this.nestsJsval(m));
+  }
+
+  /** Does a checker type name `unknown` or the non-primitive `object` at
+   * its root, as an array/tuple element or as a union arm? */
+  private mentionsUnknownOrObject(t: ts.Type, depth = 0): boolean {
+    if (depth > 6) return false;
+    if ((t.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0) return true;
+    if ((t.flags & ts.TypeFlags.Any) !== 0) return false;
+    if (t.isUnionType()) return t.getTypes().some((x) => this.mentionsUnknownOrObject(x, depth + 1));
+    if (this.checker.isArrayType(t) || this.checker.isTupleType(t)) {
+      return this.checker.getTypeArguments(t as ts.TypeReference).some((x) => this.mentionsUnknownOrObject(x, depth + 1));
+    }
+    return false;
   }
 
   /** Does a mapped type hold an island-typed piece below its root (a

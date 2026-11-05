@@ -3129,6 +3129,17 @@ route refuses by name at compile time: `this` outside a class method
 (SC2009). **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 (U1-THIS-01, the TypeScript refusals).
 
+**Amendment (unit U1b, wasm and wasm-native).** JavaScript sources join the
+one world (S014's U1b amendment) but keep this entry exactly as written: a
+method call on a dynamic receiver in a JavaScript source takes the same
+receiver-kind dispatch it took before U1b (`dynInvoke` for the modeled
+names, a stored-member call otherwise), so a bare `this` in a plain function
+called through any other name — and the emitter-listener form above — still
+reads `undefined` where Node binds the receiver. TypeScript sources still
+cannot reach it (the refusals above). **Tested by:** the wasm emitter unit
+test's `dyn.this` pins and `packages/compiler/test/wasm-island-a.test.ts`
+(A3-MCALL-09, the computed-key form).
+
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
 The wasm tier's island has no engine (jsval ≡ dyn, increment 21), so
@@ -8341,7 +8352,11 @@ the rest — are retired with that model (follow-up unit H).
   `unknown` index write keeps S016's padding). *(Unit U1a: in a
   TypeScript program on the wasm lanes `unknown` and `object` are island
   values too, so their index writes past the length meet this fence as
-  well — S016's U1a amendment; the fence ends the program, S122.)* Index arguments of the
+  well — S016's U1a amendment; the fence ends the program, S122.)*
+  *(Unit U1b, Joe's ruling: in a JavaScript source the same write keeps
+  S016's padding instead — parity with the JS lane before U1b — a known
+  silent divergence for every hole observer until unit U3 brings real
+  holes; S016's U1b amendment. TypeScript sources keep this fence.)* Index arguments of the
   Array methods run ToNumber for strings, booleans and null; an object
   index (ToPrimitive) is a named `non-number index arguments on a dynamic
   receiver` TypeError. `keys`, `values`, `entries`, `toSpliced`,
@@ -8394,6 +8409,23 @@ does not fit throws `expected <T> at <path>, got <kind>`). Fresh values and
 own views exit as (d) says. Programs with a JavaScript source keep (d) as
 written. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 (U1-EXIT-01..05).
+
+**Amendment (unit U1b, wasm and wasm-native): the language split is
+lifted.** The U1a amendment above now holds in every program on these
+lanes, JavaScript sources, mixed programs and (under `--dynamic`) programs
+loading npm packages included: a typed composite handed to dynamic code is
+its live view whichever source the code is in, and a dynamic value entering
+typed storage is (d)'s fresh value, own view or S125-judged checked copy —
+in a JavaScript source too (a JSDoc-typed parameter, return or binding). Two
+JavaScript-only rules keep the JS lane's behavior (S014's U1b amendment): a
+JavaScript declaration whose type maps only because `any`/`unknown`/
+`object` map now keeps checked-dynamic storage (its uses take the JS-exact
+arms; nothing is copied, the storage holds the same `$dyn` value), and a
+tagged template's strings array and an object literal passed straight into
+an implicit-any JavaScript parameter still cross as the copy S014
+describes, judged by S125 (c). **Tested by:** the JS corpus on the wasm
+lanes (every program main passes), `packages/compiler/test/wasm-island-a.test.ts`
+and `wasm-dynsmalls-u5.test.ts` (the `--dynamic` JS rows).
 
 Joe's ruling D2 as approved 2026-10-26 (follow-up unit H, boards
 #259/#268). Node has one object on both sides of every assignment; this
@@ -9652,3 +9684,14 @@ any `string[]` counts against every `string[]` copy). **Tested by:**
 `packages/compiler/test/wasm-dyn-copies.test.ts` (#120's two forms and
 each refused shape on wasm and wasm-native, and the unobservable shapes
 diffed against Node).
+
+*Unit U1b amendment (wasm and wasm-native).* The language split is lifted
+(S014's and S115's U1b amendments): (c) judges the crossings of JavaScript
+sources too — a JSDoc-typed binding, parameter, return or record field
+receiving a dynamic value, and a typed value handed to dynamic code. One
+more shape is not observable and runs: a JavaScript binding that evolves
+through checked-dynamic types (`let flags = []`, later reassigned from a
+typed library result such as `s.split(" ").filter(Boolean)`) holds that
+result as the island view of a value nothing else holds, so a `return {
+flags }` through a JSDoc record type copies a value no one can reach.
+**Tested by:** the JS corpus on the wasm lanes (1643 among them).
