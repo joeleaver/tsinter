@@ -725,6 +725,14 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           // which it took when `any` had no mapping.
           const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && stdlibAnyArgument(L, expr)) return false;
+          // The source of a destructuring assignment (`[h, ...t] = [1, 2,
+          // 3]`): its contextual type is the PATTERN's (a rest element
+          // reads `any[]`), not a slot's — the literal builds its own
+          // static type, as before U1a.
+          const parent = expr.parent;
+          if ((own?.kind === "record" || own?.kind === "array") && ts.isBinaryExpression(parent) && parent.right === expr &&
+              parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+              (ts.isArrayLiteralExpression(parent.left) || ts.isObjectLiteralExpression(parent.left))) return false;
         }
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an
         // EMPTY array literal under a const assertion is the empty tuple —

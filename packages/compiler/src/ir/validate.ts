@@ -2834,7 +2834,12 @@ function validateFunction(
         if (e.value.type.kind !== "promise") {
           err("promiseVoidWiden over a non-promise operand", e.loc);
         }
-        if (e.type.kind !== "promise" || e.type.inner.kind !== "void") {
+        // (Or the one-world payload retype: promise<dyn> and promise<jsval>
+        // carry the same $dyn payload — U1a/U1b.)
+        const oneWorld =
+          e.type.kind === "promise" && e.value.type.kind === "promise" &&
+          ((e.type.inner.kind === "jsval" && e.value.type.inner.kind === "dyn") || (e.type.inner.kind === "dyn" && e.value.type.inner.kind === "jsval"));
+        if (!oneWorld && (e.type.kind !== "promise" || e.type.inner.kind !== "void")) {
           err("promiseVoidWiden must be promise<void>-typed", e.loc);
         }
         break;

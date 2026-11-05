@@ -44,7 +44,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // a per-site instance — `merge(target, source)` instantiated with
     // (number[], number[])), and a member of one, are that typed value:
     // its own lowerings answer, as on main.
-    if (L.sharedDynamic && isJsSourceFile(node.getSourceFile())) {
+    if (L.sharedDynamic && (isJsSourceFile(node.getSourceFile()) || !L.engine)) {
       let base: ts.Expression = node;
       while (ts.isParenthesizedExpression(base)) base = base.expression;
       if (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {

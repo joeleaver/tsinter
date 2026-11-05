@@ -4539,7 +4539,10 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
     // or Node's FLAT ARRAY form ([name, value, name, value, ...]: a
     // string[] value, repeated names writing one line each).
     if (!ts.isObjectLiteralExpression(headersNode)) {
-      const v = L.lowerExpr(headersNode);
+      let v = L.lowerExpr(headersNode);
+      // One world (U1a/U1b): an 'any' headers value IS the checked-dynamic
+      // value — the runtime OBJ walk below serves it.
+      if (v.type.kind === "jsval" && L.sharedDynamic) v = { kind: "dynFromJsval", value: v, type: DYN, loc: v.loc };
       if (v.type.kind === "array" && v.type.elem.kind === "string") {
         return headResult("http.resWriteHeadPairs", [receiver, status, v]);
       }

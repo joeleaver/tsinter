@@ -449,21 +449,6 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
-/** Does the program carry a JavaScript source (U1a's language split)? A
- * .js/.cjs/.mjs file of the program, or — under --dynamic, where package
- * code is embedded and runs as JavaScript — any file of an npm package the
- * program loaded (its own .d.ts included; `@types` and the TypeScript
- * libraries are declarations of nothing embedded). */
-export function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[], dynamic: boolean): boolean {
-  const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
-  if (moduleOrder.some(isJs) || program.getSourceFiles().some(isJs)) return true;
-  if (!dynamic) return false;
-  return program.getSourceFiles().some((sf) => {
-    const f = sf.fileName.replace(/\\/g, "/");
-    return /\/node_modules\//.test(f) && !/\/node_modules\/(@types|typescript|@typescript)\//.test(f) && !/\/lib\.[^/]*\.d\.ts$/.test(f);
-  });
-}
-
 export function lowerToIr(
   program: ts.Program,
   entry: ts.SourceFile,
@@ -474,14 +459,10 @@ export function lowerToIr(
   const targetPlatform = options.targetPlatform ?? process.platform;
   const hostFetch = options.hostFetch ?? false;
   const undefSlots = options.undefSlots ?? false;
-  // Unit U1a (coordinator's ruling: split by source language): the one
-  // dynamic world is for TypeScript programs. A program with ANY JavaScript
-  // source in it (a .js/.cjs/.mjs file of the program, an embedded npm
-  // package) keeps today's checked-dynamic path whole, until U1b — the
-  // type mapping cannot tell a JS file's `any` from a TS file's, so a
-  // per-file switch would give a function crossing between them two
-  // representations. Per program there is no seam to cross.
-  const sharedDynamic = (options.sharedDynamic ?? false) && (process.env["U1B_OLD"] !== "1" ? true : !programHasJsSource(program, moduleOrder, dynamic));
+  // The one dynamic world (units U1a/U1b): on the WasmGC lanes `any`,
+  // `unknown` and `object` are one island value in every program,
+  // JavaScript sources included (SEMANTICS.md S014's amendments).
+  const sharedDynamic = options.sharedDynamic ?? false;
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -784,7 +765,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
   // the JS lane's checked-dynamic storage (U1b): the same $dyn value the
   // island type names, held where every use takes the JS-exact arms.
   if (L.sharedDynamic && !L.engine) return DYN;
-  return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
+  return L.sharedDynamic ? JSVAL : DYN;
 }
 
 /** The one call signature of a PURE function type — single signature, no
@@ -3989,6 +3970,16 @@ export class Lowerer {
       expected.inner.kind === "void" &&
       expr.type.kind === "promise" &&
       expr.type.inner.kind !== "void"
+    ) {
+      return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
+    }
+    // One world (U1a): a promise of the checked-dynamic value and a
+    // promise of the island value hold the same $dyn payload (a
+    // `Promise<unknown>` stream consumer read into a `Promise<any>`
+    // binding) — the same type-only reinterpret.
+    if (
+      this.sharedDynamic && expected.kind === "promise" && expr.type.kind === "promise" &&
+      ((expected.inner.kind === "jsval" && expr.type.inner.kind === "dyn") || (expected.inner.kind === "dyn" && expr.type.inner.kind === "jsval"))
     ) {
       return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
     }
@@ -8274,7 +8265,15 @@ export class Lowerer {
       return !lambda;
     };
     if (
-      (this.engine || (this.dynamic && !isJsSourceFile(decl.getSourceFile()))) &&
+      (this.engine ||
+        (this.dynamic && !isJsSourceFile(decl.getSourceFile()) &&
+          // One world without the engine (U1b): only an initializer the
+          // checker itself types as an island value ('any'/'unknown'/
+          // 'object') is a handle candidate. Everything else — a generic
+          // function's alias, a stdlib global's snapshot (`const perf =
+          // performance`) — keeps the standard path's own rules, as when
+          // `any` had no mapping.
+          this.mapTypeOf(this.typeOf(decl.initializer!))?.kind === "jsval")) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't
