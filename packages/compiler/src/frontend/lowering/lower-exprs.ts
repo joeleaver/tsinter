@@ -7445,10 +7445,13 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       const recv = L.lowerExpr(expr.expression);
       if (recv.type.kind !== "dyn") return islandElementRead(L, expr, recv);
       const rawKey = L.lowerExpr(expr.argumentExpression);
+      // One world in JS sources (U1b): bool and dynamic keys stringify
+      // (ToPropertyKey), exactly the checked-dynamic receiver branch below.
+      const jsKeys = L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile());
       const key: IrExpr | null =
         rawKey.type.kind === "string"
           ? rawKey
-          : rawKey.type.kind === "f64"
+          : rawKey.type.kind === "f64" || (jsKeys && (rawKey.type.kind === "bool" || rawKey.type.kind === "dyn"))
             ? { kind: "toString", operand: rawKey, type: STRING, loc: rawKey.loc }
             : null;
       if (key) {

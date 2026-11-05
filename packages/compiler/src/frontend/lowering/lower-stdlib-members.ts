@@ -11,7 +11,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { BOOL, F64, STRING, UNDEFINED_T, VOID, arrayOf, typeEquals, typeKey, isUnitType } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, STRING, UNDEFINED_T, VOID, arrayOf, typeEquals, typeKey, isUnitType } from "../../ir/nodes.js";
 import type { IrExpr, IrLocal, IrStmt, IrType, SrcLoc } from "../../ir/nodes.js";
 import { bindOnce, droppableStatic, mayHoldSlotUndef, plainFieldPresent, undefRecvGuard, undefinedAsAbsent, undefinedAsText } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
@@ -689,6 +689,16 @@ function convertIterable(L: Lowerer, src: IrExpr, elem: IrType | null, loc: SrcL
         arr: bindOnce(L, src, loc, (r) => ({ kind: "arrayLit", elems: plan.map((p) => p(r)), type: arrayOf(target), loc })),
         fresh: true,
       };
+    }
+    case "dyn":
+    case "jsval": {
+      // One world (U1b): a dynamic array of SCALARS (`Object.keys(obj)`
+      // over a dynamic object) seeds through the checked conversion — a
+      // scalar copy is unobservable; an element of another kind throws
+      // the catchable TypeError, never a silent answer.
+      if (!L.sharedDynamic || elem === null || (elem.kind !== "string" && elem.kind !== "f64" && elem.kind !== "bool")) return null;
+      const d: IrExpr = src.type.kind === "jsval" ? { kind: "dynFromJsval", value: src, type: DYN, loc } : src;
+      return { arr: { kind: "dynCheck", value: d, type: arrayOf(elem), loc }, fresh: true };
     }
     default:
       return null;

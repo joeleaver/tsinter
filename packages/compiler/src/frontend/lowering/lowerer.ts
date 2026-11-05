@@ -3583,12 +3583,46 @@ export class Lowerer {
     visit(roots);
   }
 
+  /** Does a mapped type hold an island-typed piece below its root (a
+   * record field, an index value, a union arm, a container element)?
+   * Function signatures are not walked (their island params are the same
+   * $dyn value the JS lane's dyn params were). */
+  nestsJsval(t: IrType, seen = new Set<string>()): boolean {
+    const k = typeKey(t);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    switch (t.kind) {
+      case "jsval":
+        return true;
+      case "record": {
+        const s = this.shapes.get(t.shapeId);
+        return (s?.fields.some((f) => this.nestsJsval(f.type, seen)) ?? false) || (s?.indexValue !== undefined && this.nestsJsval(s.indexValue, seen));
+      }
+      case "union":
+        return this.unions.get(t.unionId)?.arms.some((a) => this.nestsJsval(a, seen)) ?? false;
+      case "map":
+        return this.nestsJsval(t.key, seen) || this.nestsJsval(t.value, seen);
+      case "set":
+        return this.nestsJsval(t.elem, seen);
+      default:
+        return false;
+    }
+  }
+
   irTypeOf(node: ts.Node): IrType {
     const t = this.typeOf(node);
     // A never-tainted JS type (neverTaintedJsType) maps — never rides as
     // f64 — but must not: pre-empt the mapping so the JS fallback below
     // answers instead.
-    const mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeOf(t);
+    let mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeOf(t);
+    // One world in JavaScript sources (U1b): a composite whose pieces map
+    // only because `any` maps now (a JSDoc type with an island-typed
+    // member) keeps the JS lane's checked-dynamic storage — the value is
+    // the same object either way; the dynamic storage keeps every use on
+    // the JS-exact dynamic arms instead of the static ones.
+    if (mapped && mapped.kind !== "jsval" && this.sharedDynamic && !this.engine && isJsSourceFile(node.getSourceFile()) && this.nestsJsval(mapped)) {
+      mapped = null;
+    }
     if (!mapped) {
       // The checked-dynamic declaration fallback (dynFallbackType): a
       // JAVASCRIPT binding of any inference residue, or a TypeScript
