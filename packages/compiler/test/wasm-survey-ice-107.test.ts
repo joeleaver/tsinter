@@ -526,9 +526,8 @@ console.log(run(false, 5));
 console.log(run(true, "s"));
 `,
     },
-    // the mixed ternary is a value: it is refused by name (as on main), not
-    // lowered as a statement that would return undefined.
-    fence: { stdout: "", stderr: /^tsinter: unsupported: converting typed values to 'unknown' is not supported yet \(instantiating 'pick' with \(boolean, number\)\) \[SC1101 at <ROW>node_modules\/vta\/index\.js:3\]\n$/ },
+    // U1b: the JS source joins the one world and the mixed ternary is a
+    // value that runs as in Node (5, log:none then undefined, s).
   },
   {
     // a JSDoc cast to a record type would COPY: a write through it must

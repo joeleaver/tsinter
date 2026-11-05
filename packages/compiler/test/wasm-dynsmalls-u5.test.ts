@@ -404,7 +404,7 @@ test("W06 DOMEX-WRITE: a write in a .catch handler meets the existing named assi
   // This tier's answer (the existing SC1090 run-time fence on member assignment, every lane — since GH #86 it ends the program, SEMANTICS.md S122); Node prints "sync\nthrew true Cannot set property code of  which has only a getter\n".
   const { stdout, stderr } = await runRowTrap("W06", src, "cjs");
   expect(stdout).toBe("sync\n");
-  expect(stderr).toBe("tsinter: unsupported: assignment to non-variables are not supported yet [SC1090 at <ROW>:3]\n");
+  expect(stderr).toBe("tsinter: unsupported: writing a DOMException's code is not supported yet (Node's code is getter-only) [SC1090]\n");
 });
 
 test("W07 DOMEX-WRITE: an Error-typed binding holding a DOMException: the name write refuses by name", async () => {
@@ -869,7 +869,7 @@ test("R46 UNCLONE: a symbol stops at its crossing into a dynamic value", async (
   // This tier's answer (the existing SC1101 crossing fence, which ends the program — GH #86, SEMANTICS.md S122); Node prints "DataCloneError Symbol(s) could not be cloned.\n".
   const { stdout, stderr } = await runRowTrap("R46", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:3]\n");
+  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:3]\n");
 });
 
 test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", async () => {
@@ -885,7 +885,7 @@ test("R48 UNCLONE: a class instance stops at its crossing", async () => {
   // This tier's answer (the existing SC1101 crossing fence); Node prints "false 1 {\"x\":1}\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R48", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'P' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:4]\n");
 });
 
 // ----------------------------------------------------------------------
@@ -1016,7 +1016,7 @@ test("R65 SPREAD: a Set stops at its crossing into a dynamic value", async () =>
   // This tier's answer (the existing SC1101 crossing fence); Node prints "2\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R65", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'Set<number>' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:4]\n");
 });
 
 test("R66 SPREAD: a Map stops at its crossing into a dynamic value", async () => {
@@ -1024,7 +1024,7 @@ test("R66 SPREAD: a Map stops at its crossing into a dynamic value", async () =>
   // This tier's answer (the existing SC1101 crossing fence); Node prints "1\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R66", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:4]\n");
+  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'Map<number, number>' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:4]\n");
 });
 
 test("R67 SPREAD: a generator stops at its crossing into a dynamic value", async () => {
@@ -1032,7 +1032,7 @@ test("R67 SPREAD: a generator stops at its crossing into a dynamic value", async
   // This tier's answer (the existing SC1101 crossing fence); Node prints "2\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R67", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting typed values to 'unknown' is not supported yet [SC1101 at <ROW>:5]\n");
+  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'Generator<number, void, unknown>' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:5]\n");
 });
 
 test("R68 SPREAD: the spread TypeErrors of a forwarding call", async () => {
@@ -1342,20 +1342,22 @@ test("R87m NULLPROTO: control: a rejected plain object through a .catch handler"
 
 // R88: one row per fenced method (GH #86: the method-call fence ends the
 // program, SEMANTICS.md S122, so a combined row stops at the first one).
-test("R88 NULLPROTO: o.toString() throws; hasOwnProperty meets the existing method fence", async () => {
+test("R88 NULLPROTO: o.toString() and o.hasOwnProperty() throw Node's TypeError", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\nfor (const f of [() => o.toString(), () => o.hasOwnProperty(\"a\")]) {\n  try { console.log(f()); } catch (e) { console.log(e.name, e.message); }\n}\n";
-  // This tier's answer (the existing SC1090 method-call fence on line 3); Node prints "TypeError o.toString is not a function\nTypeError o.hasOwnProperty is not a function\n".
-  const { stdout, stderr } = await runRowTrap("R88", src, "cjs");
-  expect(stdout).toBe("TypeError o.toString is not a function\n");
-  expect(stderr).toBe("tsinter: unsupported: method calls like 'o.hasOwnProperty' is not supported yet [SC1090 at <ROW>:3]\n");
+  // U1b: the JS source's checked-dynamic receiver dispatch answers as Node does.
+  const { stdout, stderr, exitCode } = await runRow("R88", src, "cjs");
+  expect(stdout).toBe("TypeError o.toString is not a function\nTypeError o.hasOwnProperty is not a function\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R88b NULLPROTO: valueOf meets the existing method fence", async () => {
+test("R88b NULLPROTO: o.valueOf() throws Node's TypeError", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\nfor (const f of [() => o.valueOf()]) {\n  try { console.log(f()); } catch (e) { console.log(e.name, e.message); }\n}\n";
-  // This tier's answer (the existing SC1090 method-call fence on line 3); Node prints "TypeError o.valueOf is not a function\n".
-  const { stdout, stderr } = await runRowTrap("R88b", src, "cjs");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: method calls like 'o.valueOf' is not supported yet [SC1090 at <ROW>:3]\n");
+  // U1b: the JS source's checked-dynamic receiver dispatch answers as Node does.
+  const { stdout, stderr, exitCode } = await runRow("R88b", src, "cjs");
+  expect(stdout).toBe("TypeError o.valueOf is not a function\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("R89 NULLPROTO: a null-prototype object as a computed key refuses by name", async () => {
