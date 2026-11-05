@@ -1,7 +1,9 @@
-/* Unit U1a (SEMANTICS.md S014/S015/S016/S042/S115/S125 (c) U1a amendments):
- * on the WasmGC lanes a TypeScript program's `any`, `unknown` and `object`
- * are one dynamic value; a program with a JavaScript source keeps the
- * checked-dynamic path whole until U1b.
+/* Units U1a/U1b (SEMANTICS.md S014/S015/S016/S042/S115/S125 (c) U1a and
+ * U1b amendments): on the WasmGC lanes `any`, `unknown` and `object` are
+ * one dynamic value in every program, JavaScript sources included — except
+ * that under --dynamic a program with a JavaScript source (or an embedded
+ * npm package) keeps the checked-dynamic world whole (S014's U1b
+ * amendment).
  *
  * An exact row equals Node (spawned at test time). A `refused` row fails
  * to compile with the named code (and S125's text when `s125` is set). A
@@ -39,14 +41,106 @@ interface Row {
    * exactly `stdout` (a prefix of Node's). */
   fence?: { text: RegExp; stdout: string };
   /** Which dynamic world the build took, read off the emitted IR module
-   * (`sharedDynamic`): "new" for a TypeScript-only program, "old" for a
-   * program with a JavaScript source. */
+   * (`sharedDynamic`): "new" for the one world, "old" for the checked-
+   * dynamic world a --dynamic program with a JavaScript source keeps. */
   world?: "old" | "new";
+  /** Build with --dynamic (the engine). */
+  dynamic?: true;
 }
 
 const S125_TAIL = /it would be a COPY where JavaScript shares the object, and .* \(SEMANTICS\.md S125\) (is|are) not supported yet$/;
 
 const ROWS: Row[] = [
+  // ── U1b review fixes ─────────────────────────────────────────────────
+  {
+    id: "U1B-DYNJS-01 --dynamic JS: a method stored on a parsed object binds this (the old world, as on main)",
+    entry: "main.js",
+    dynamic: true,
+    src: `'use strict';
+const p = JSON.parse('{"n":3}');
+p.get = function () { return this === undefined ? "unbound" : this.n; };
+console.log(p.get());
+const o = JSON.parse('{"n":2}');
+o.get = function () { return this === undefined ? "undef-this" : this.n; };
+console.log(o.get());
+function plain() { return this === undefined ? "U" : typeof this; }
+o.p = plain;
+console.log(o.p(), o["p"]());`,
+  },
+  {
+    id: "U1B-DYNJS-02 --dynamic JS: literal members handed to implicit-any parameters are the same objects",
+    entry: "main.js",
+    dynamic: true,
+    src: `function f(o) { o.arr.push(3); o.n = 5; }
+const myArr = [1, 2];
+f({ arr: myArr });
+console.log(myArr);
+const rec = { x: 1 };
+function g(o) { o.r.x = 9; }
+g({ r: rec });
+console.log(rec);
+let saved;
+function h(o) { saved = o; }
+const a2 = [1, 2];
+h({ arr: a2 });
+a2.push(3);
+console.log(saved.arr.length, saved.arr === a2);`,
+  },
+  {
+    id: "U1B-DYNJS-03 --dynamic JS: a typed array stored into a parsed object is shared",
+    entry: "main.js",
+    dynamic: true,
+    src: `'use strict';
+const holder = JSON.parse("{}");
+const list = [1, 2];
+holder.list = list;
+holder.list.push(3);
+console.log(list, holder.list.length);
+list.push(4);
+console.log(holder.list);
+const cfg = JSON.parse('{"names":["a","b"]}');
+const names = cfg.names;
+names.push("c");
+console.log(cfg.names);`,
+  },
+  {
+    id: "U1B-REST-01 a TS function with an island rest parameter, called through a dynamic value, packs every argument",
+    src: `function r(...args: any[]): string { return typeof args + ":" + JSON.stringify(args); }
+function r2(a: number, ...rest: any[]): string { rest.push("x"); return a + ":" + JSON.stringify(rest); }
+const f: any = r;
+console.log(f(1, "a", [2]));
+const g: any = r2;
+console.log(g(1, 2, 3), r2(4, 5));
+const o: any = { m: r2 };
+console.log(o.m(0));`,
+  },
+  {
+    id: "U1B-REST-02 the same function handed to a JavaScript caller",
+    files: { "lib.js": `export function callTs(f) { return f(1, "a", [2]); }\n` },
+    src: `import { callTs } from "./lib.js";
+function r(...args: any[]): string { args.push(0); return typeof args + ":" + JSON.stringify(args); }
+console.log(callTs(r));
+console.log(callTs((...xs: unknown[]) => xs.length));`,
+  },
+  {
+    id: "U1B-THIS-01 a TS method call on a dynamic value binds this for a JavaScript function stored on it",
+    files: { "lib.js": `export function makeCounter() {\n  const o = JSON.parse('{"n":0}');\n  o.who = function () { return this === undefined ? "no receiver" : "receiver n=" + this.n; };\n  return o;\n}\n` },
+    src: `import { makeCounter } from "./lib.js";
+const c: any = makeCounter();
+console.log(c.who());
+const d: any = JSON.parse("{}");
+try { d.missing(); } catch (e) { console.log((e as Error).message); }`,
+  },
+  {
+    id: "U1B-RESCUE-02 an alias of a rescued handle keeps the rescue",
+    src: `async function size(r: Response): Promise<number> {
+  const ab = await r.arrayBuffer();
+  const ab2 = ab;
+  const v = new Uint8Array(ab2);
+  return v.length + ab.byteLength;
+}
+console.log(typeof size);`,
+  },
   // ── U1b: a record with accessors NESTED in a composite crossing into a
   // dynamic value (readdir's Dirent array inside a literal) has no view: in
   // a JavaScript source it is the judged copy (here refused by S125 (c)),
@@ -399,7 +493,7 @@ async function nativeRun(path: string): Promise<Out> {
 async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(row, backend);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic ? { dynamic: true } : {}) });
   if (row.refused !== undefined) {
     expect(res.ok).toBe(false);
     if (res.ok) return;
@@ -426,7 +520,7 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   }
   if (row.world !== undefined) {
     // The emitted IR module records the world the build took.
-    const withIr = await compile(entry, { outPath: join(dir, backend === "wasm" ? "w.wasm" : "wprogram"), outDir: dir, backend, emitIr: true });
+    const withIr = await compile(entry, { outPath: join(dir, backend === "wasm" ? "w.wasm" : "wprogram"), outDir: dir, backend, emitIr: true, ...(row.dynamic ? { dynamic: true } : {}) });
     expect(withIr.ok).toBe(true);
     if (!withIr.ok || withIr.irPath === undefined) throw new Error(`${row.id}: no IR emitted`);
     const mod = JSON.parse(readFileSync(withIr.irPath, "utf8")) as { sharedDynamic?: boolean };

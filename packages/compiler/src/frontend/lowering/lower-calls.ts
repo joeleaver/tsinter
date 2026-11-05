@@ -4844,6 +4844,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       loc: locOf(access),
     };
     const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+    // One world, a TypeScript call site (U1b): `c.who()` over a dynamic
+    // value is a METHOD call — the receiver-kind dispatch whose OBJ arm
+    // reads the own member and calls it with `this` bound, as Node does
+    // (a JavaScript function stored on the object may read `this`).
+    // JavaScript sources keep the plain call (SEMANTICS.md S042).
+    if (L.sharedDynamic && !isJsSourceFile(call.getSourceFile())) {
+      return { kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc };
+    }
     return { kind: "dynCall", callee: member, calleeName: access.getText(), args, type: DYN, loc };
   }
 

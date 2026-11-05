@@ -449,6 +449,19 @@ export interface LowererMode {
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
  * nothing flushed), reported separately: whole-program analysis without
  * letting unreached code fail builds. */
+/** Does a --dynamic program carry a JavaScript source: a .js/.cjs/.mjs
+ * file of the program, or any file of an npm package it loaded (package
+ * code is embedded and runs as JavaScript; `@types` and the TypeScript
+ * libraries are declarations of nothing embedded)? */
+function programHasJsSource(program: ts.Program, moduleOrder: ts.SourceFile[]): boolean {
+  const isJs = (sf: ts.SourceFile): boolean => !sf.isDeclarationFile && isJsSourceFile(sf);
+  if (moduleOrder.some(isJs) || program.getSourceFiles().some(isJs)) return true;
+  return program.getSourceFiles().some((sf) => {
+    const f = sf.fileName.replace(/\\/g, "/");
+    return /\/node_modules\//.test(f) && !/\/node_modules\/(@types|typescript|@typescript)\//.test(f) && !/\/lib\.[^/]*\.d\.ts$/.test(f);
+  });
+}
+
 /** An await or a call, under parentheses, casts and non-null
  * assertions (lowerVarDecl's one-world handle-rescue gate). */
 function isProducerInit(e: ts.Expression): boolean {
@@ -469,8 +482,12 @@ export function lowerToIr(
   const undefSlots = options.undefSlots ?? false;
   // The one dynamic world (units U1a/U1b): on the WasmGC lanes `any`,
   // `unknown` and `object` are one island value in every program,
-  // JavaScript sources included (SEMANTICS.md S014's amendments).
-  const sharedDynamic = options.sharedDynamic ?? false;
+  // JavaScript sources included (SEMANTICS.md S014's amendments) — except
+  // under --dynamic, where a program with a JavaScript source (its own
+  // .js/.cjs/.mjs file, or an embedded npm package) keeps the pre-U1
+  // checked-dynamic world whole, as on main (S014's U1b amendment): the
+  // engine-mode JS paths were never ported to the one world.
+  const sharedDynamic = (options.sharedDynamic ?? false) && !(dynamic && programHasJsSource(program, moduleOrder));
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -8283,7 +8300,9 @@ export class Lowerer {
           // global's snapshot (`const perf = performance`) — keeps the
           // standard path's own rules, as when `any` had no mapping.
           decl.initializer !== undefined &&
-          (this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval" || isProducerInit(decl.initializer)))) &&
+          (this.mapTypeOf(this.typeOf(decl.initializer))?.kind === "jsval" || isProducerInit(decl.initializer) ||
+            // (an alias of a rescued handle: `const ab2 = ab`)
+            (ts.isIdentifier(decl.initializer) && this.peekLocal(decl.initializer)?.type.kind === "jsval")))) &&
       ts.isIdentifier(decl.name) &&
       decl.initializer !== undefined &&
       // `var` stays out: the rescue's block-positioned jsval local can't

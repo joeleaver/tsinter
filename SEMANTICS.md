@@ -732,7 +732,7 @@ and `any[]` exceptions above share already and are not judged.
 
 **Amendment (unit U1a, wasm and wasm-native, TypeScript programs): one
 dynamic world; the typed-composite copy into a dynamic slot is retired.** In
-a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), `unknown`, `object` and `any` are one value, the island value
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one kept the checked-dynamic world whole, exactly as before — U1b lifted the split except for `--dynamic` programs with a JavaScript source, which still keep that world: S014's U1b amendment), `unknown`, `object` and `any` are one value, the island value
 (docs/design/dynamic-values.md §4.1; no `--dynamic` needed). A typed record,
 array or tuple entering any of them is S115 (a)'s live view, not this
 entry's copy: a write on either side is seen on the other and `===` holds
@@ -754,8 +754,11 @@ destructuring — V8's texts as before): on these lanes the island value IS
 the `$dyn` value, so the retype makes no copy. A JavaScript declaration
 whose type maps only because `unknown`/`object` (and, without `--dynamic`,
 `any`) map now — an implicit-any binding, a JSDoc type with such a piece —
-keeps the JS lane's checked-dynamic storage rules; under `--dynamic` an
-`any` stays the engine handle it was before U1a. Typed values crossing
+keeps the JS lane's checked-dynamic storage rules. **Under `--dynamic` the split
+stands:** a program with a JavaScript source — its own .js/.cjs/.mjs file, or
+an embedded npm package — keeps the checked-dynamic world whole, exactly as
+before U1a (its engine-mode JavaScript paths were never ported to the one
+world; the U1b review found `this` unbound in a stored method under it). Typed values crossing
 between a JavaScript and a TypeScript source are the same object (S115 (a)
 views), and typed exits follow S115 (d) / S125 (c) as amended by U1a, now
 in JavaScript sources too. Two crossings keep the copy this entry
@@ -869,8 +872,13 @@ entry's body.** A keyed or dot read in a JavaScript source answers the
 receiver's own member or `undefined`, as written above — the silent
 divergence for an inherited member read as a value (`o.toString` is
 `undefined` here) stays registered for JavaScript sources; U1a's fence is
-TypeScript-only. (Parity with the JS lane: the rows that pin it — the wasm
-emitter's S015 row, `wasm-dynsmalls-u5` R85 — answer as before.)
+TypeScript-only. The rule is the READ's: a TypeScript record handed to a
+JavaScript function and read there by key answers own members only too
+(`pick({ x: 1 }, "toString")` is `undefined`), while the same read in a
+TypeScript source meets U1a's fence. A `--dynamic` program with a JavaScript
+source keeps the checked-dynamic world whole (S014's U1b amendment). (Parity
+with the JS lane: the rows that pin it — the wasm emitter's S015 row,
+`wasm-dynsmalls-u5` R85 — answer as before.)
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -3135,8 +3143,13 @@ method call on a dynamic receiver in a JavaScript source takes the same
 receiver-kind dispatch it took before U1b (`dynInvoke` for the modeled
 names, a stored-member call otherwise), so a bare `this` in a plain function
 called through any other name — and the emitter-listener form above — still
-reads `undefined` where Node binds the receiver. TypeScript sources still
-cannot reach it (the refusals above). **Tested by:** the wasm emitter unit
+reads `undefined` where Node binds the receiver. A TypeScript call site no
+longer reaches it: `c.who()` over a dynamic value is a method call (the
+receiver-kind dispatch, whose object arm calls the own member with `this`
+bound), so a JavaScript function stored on the object sees its receiver as
+in Node (`wasm-u1-shared-dynamic` U1B-THIS-01). A `--dynamic` program with a
+JavaScript source keeps the checked-dynamic world (S014's U1b amendment) and
+this entry with it. **Tested by:** the wasm emitter unit
 test's `dyn.this` pins and `packages/compiler/test/wasm-island-a.test.ts`
 (A3-MCALL-09, the computed-key form).
 
@@ -8390,7 +8403,7 @@ S122's c/llvm island residue.*
 
 **Amendment (unit U1a, wasm and wasm-native, TypeScript programs — Joe's
 ruling J1 as carried out by unit U1a; (d) amended by the coordinator's
-ruling of 2026-11-04, option A and J4 lifted).** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), this entry
+ruling of 2026-11-04, option A and J4 lifted).** In a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one kept the checked-dynamic world whole, exactly as before — U1b lifted the split except for `--dynamic` programs with a JavaScript source, which still keep that world: S014's U1b amendment), this entry
 holds WITHOUT `--dynamic`: `any`, `unknown` and `object` are the island
 value, so (a)'s views, (b)'s write checks and (c)'s wasm column apply to
 every TypeScript program. (d) is amended there: a dynamic value that is not
@@ -8412,8 +8425,9 @@ written. **Tested by:** `packages/compiler/test/wasm-u1-shared-dynamic.test.ts`
 
 **Amendment (unit U1b, wasm and wasm-native): the language split is
 lifted.** The U1a amendment above now holds in every program on these
-lanes, JavaScript sources, mixed programs and (under `--dynamic`) programs
-loading npm packages included: a typed composite handed to dynamic code is
+lanes, JavaScript sources and mixed programs included — except a `--dynamic`
+program with a JavaScript source or an embedded npm package, which keeps the
+checked-dynamic world whole (S014's U1b amendment): a typed composite handed to dynamic code is
 its live view whichever source the code is in, and a dynamic value entering
 typed storage is (d)'s fresh value, own view or S125-judged checked copy —
 in a JavaScript source too (a JSDoc-typed parameter, return or binding). Two
@@ -9627,7 +9641,7 @@ where JavaScript shares the object, and …") when the program could tell:
   value to a dynamic call counts as a write.
 
 *Unit U1a amendment (wasm and wasm-native, TypeScript programs).* In
-a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one keeps the checked-dynamic world whole, exactly as before, until U1b), the dynamic world is the island (S014's and S115's U1a
+a TypeScript program — one with no JavaScript source in it: no .js/.cjs/.mjs file of the program and under `--dynamic`, no file of an npm package it loads (U1a's language split; a program with one kept the checked-dynamic world whole, exactly as before — U1b lifted the split except for `--dynamic` programs with a JavaScript source, which still keep that world: S014's U1b amendment), the dynamic world is the island (S014's and S115's U1a
 amendments), and (c) judges its copies: S115 (d)'s checked copies at
 locals, parameters, returns, fields, elements and casts, and the values
 that still cross into a dynamic slot by copy (class instances, Map/Set,

@@ -1370,7 +1370,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           kind: "func",
           params: sig.params.filter((p) => p.mode !== "dynRest").map((p) => p.type),
           ret: sig.returnType,
-          ...(sig.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
+          ...(sig.params.some((p) => p.mode === "dynRest" || p.mode === "islandRest") ? { rest: true as const } : {}),
+          // An island rest (`...args: any[]`): the last declared slot IS the
+          // rest array — a boxed call packs the surplus into it (U1b).
+          ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
         L.requireExactArityValue(expr, expr, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
@@ -7305,7 +7308,10 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
           kind: "func",
           params: sig.params.filter((p) => p.mode !== "dynRest").map((p) => p.type),
           ret: sig.returnType,
-          ...(sig.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
+          ...(sig.params.some((p) => p.mode === "dynRest" || p.mode === "islandRest") ? { rest: true as const } : {}),
+          // An island rest (`...args: any[]`): the last declared slot IS the
+          // rest array — a boxed call packs the surplus into it (U1b).
+          ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
         L.requireExactArityValue(prop, propName, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
