@@ -408,6 +408,10 @@ export interface GenericInstance {
         if (shape.type.kind === "dyn") {
           return { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
         }
+        // One world (U1b): an island-typed param takes the island's undefined.
+        if (L.sharedDynamic && shape.type.kind === "jsval") {
+          return { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc };
+        }
         // tsc's arity checking admits omitting only the omittable suffix;
         // reaching here means a call form we don't model — defensive.
         L.unsupported("SC1090", blame, "this call form");

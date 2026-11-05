@@ -481,7 +481,7 @@ export function lowerToIr(
   // type mapping cannot tell a JS file's `any` from a TS file's, so a
   // per-file switch would give a function crossing between them two
   // representations. Per program there is no seam to cross.
-  const sharedDynamic = (options.sharedDynamic ?? false) && !programHasJsSource(program, moduleOrder, dynamic);
+  const sharedDynamic = (options.sharedDynamic ?? false) && (process.env["U1B_OLD"] !== "1" ? true : !programHasJsSource(program, moduleOrder, dynamic));
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -2705,6 +2705,7 @@ export class Lowerer {
 
   pushDiag(diag0: ScrDiagnostic): void {
     const diag = this.oneWorldDiag(diag0);
+    if (process.env["DBGDIAG"] && diag.message.includes(process.env["DBGDIAG"])) console.log("DBGSTACK", new Error().stack?.split("\n").slice(2, 9).map((l) => l.replace(/\(.*\/src\//, "(").trim()).join(" < "));
     const d = this.instantiationContext
       ? { ...diag, message: `${diag.message} (${this.instantiationContext})` }
       : diag;
@@ -3890,6 +3891,14 @@ export class Lowerer {
       if (this.boundaryExitSafe(expected)) {
         return { kind: "jsExit", value: expr, type: expected, loc: expr.loc };
       }
+      // One world (U1b): an island value leaving into a FUNCTION slot
+      // takes the checked-dynamic function boundary's OUT direction (the
+      // $dyn value is the island value): check callable, then unwrap an
+      // identical boxed signature or adapt per the slot.
+      if (this.sharedDynamic && !this.engine && expected.kind === "func" &&
+          canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic)) {
+        return { kind: "dynCheck", value: { kind: "dynFromJsval", value: expr, type: DYN, loc: expr.loc }, type: expected, loc: expr.loc };
+      }
       return expr;
     }
     // A TYPED value flowing into an 'unknown' slot (`const u: unknown = 5`,
@@ -3966,7 +3975,7 @@ export class Lowerer {
       // arguments/results per F.
       const funcOk =
         expected.kind === "func" &&
-        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic);
       if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || funcOk) {
         return { kind: "dynCheck", value: expr, type: expected, loc: expr.loc };
       }
@@ -4007,7 +4016,7 @@ export class Lowerer {
       if (
         sf !== undefined && isJsSourceFile(sf) &&
         canConvertToDyn(expr.type, (id) => this.shapes.get(id), (id) => this.unions.get(id)) &&
-        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id))
+        canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic)
       ) {
         return {
           kind: "dynCheck",
@@ -5305,7 +5314,7 @@ export class Lowerer {
       // — the production/development function-choice ternary shape).
       return (
         this.jsonSafe(dst) ||
-        (dst.kind === "func" && canAdaptDynFuncTo(dst, (id) => this.shapes.get(id), (id) => this.unions.get(id)))
+        (dst.kind === "func" && canAdaptDynFuncTo(dst, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic))
       );
     }
     if (dst.kind === "union") {

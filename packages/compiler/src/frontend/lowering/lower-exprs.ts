@@ -8489,7 +8489,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
         narrowed &&
         (narrowed.kind === "f64" || narrowed.kind === "bool" || narrowed.kind === "string" ||
           narrowed.kind === "object" ||
-          (narrowed.kind === "dyn" && isJsSourceFile(expr.getSourceFile())));
+          ((narrowed.kind === "dyn" || (L.sharedDynamic && narrowed.kind === "jsval")) && isJsSourceFile(expr.getSourceFile())));
       if (!bridged) L.unsupported("SC1063", expr);
     }
     const inner = L.lowerExpr(expr.expression);
@@ -8627,7 +8627,7 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
       // fence below.
       if (
         target.kind === "func" &&
-        canAdaptDynFuncTo(target, (id) => L.shapes.get(id), (id) => L.unions.get(id))
+        canAdaptDynFuncTo(target, (id) => L.shapes.get(id), (id) => L.unions.get(id), L.sharedDynamic)
       ) {
         return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
       }
@@ -8639,7 +8639,7 @@ function lowerDynCastTo(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion, in
           (target.ret.kind === "jsval" || target.params.some((p) => p.kind === "jsval"))) {
         const toDyn = (t: IrType): IrType => (t.kind === "jsval" ? DYN : t);
         const dynTarget: IrType & { kind: "func" } = { ...target, params: target.params.map(toDyn), ret: toDyn(target.ret) };
-        if (canAdaptDynFuncTo(dynTarget, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
+        if (canAdaptDynFuncTo(dynTarget, (id) => L.shapes.get(id), (id) => L.unions.get(id), L.sharedDynamic)) {
           const adapter = L.funcCoerceAdapter(dynTarget, target, locOf(expr));
           if (adapter) {
             const checked: IrExpr = { kind: "dynCheck", value: inner, type: dynTarget, loc: locOf(expr) };
@@ -8886,7 +8886,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
           target?.container === "class" &&
           !RUNTIME_ERROR_CLASSES.has(target.className) &&
           (target.fieldType.kind === "f64" ||
-            (target.fieldType.kind === "dyn" && isJsSourceFile(expr.getSourceFile())))
+            ((target.fieldType.kind === "dyn" || (L.sharedDynamic && target.fieldType.kind === "jsval")) && isJsSourceFile(expr.getSourceFile())))
         ) {
           return {
             kind: "fieldIncDec",
@@ -8896,7 +8896,8 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
             obj: expr.operand.expression.kind === ts.SyntaxKind.ThisKeyword ? target.obj : undefRecvGuard(L, target.obj, target.field, loc),
             className: target.className,
             field: target.field,
-            fieldDyn: target.fieldType.kind === "dyn",
+            // One world (U1b): an island field is the same $dyn slot.
+            fieldDyn: target.fieldType.kind === "dyn" || target.fieldType.kind === "jsval",
             type: F64,
             loc,
           };
@@ -12554,17 +12555,24 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     // Through an accessor target this desugars to get, op, set — with the
     // receiver an identifier/this, the observable order matches JS exactly:
     // getter, rhs side effects, setter (verified against Node).
-    const read = L.fieldGetExpr(target, locOf(access), access);
-    const rhs: IrExpr = rhsNode
+    // One world (U1b): an island-typed field (an implicit-any JS field)
+    // is the checked-dynamic field's value; its compound assignment takes
+    // the same checked arm, and the result goes back as the island value.
+    const islandField = L.sharedDynamic && target.fieldType.kind === "jsval";
+    const read0 = L.fieldGetExpr(target, locOf(access), access);
+    const read = islandField ? asDynOperand(read0) : read0;
+    const rhs0: IrExpr = rhsNode
       ? L.lowerExpr(rhsNode)
       : { kind: "numLit", value: 1, type: F64, loc };
+    const rhs = islandField ? asDynOperand(rhs0) : rhs0;
+    const fieldKind = islandField ? "dyn" : target.fieldType.kind;
     let value: IrExpr;
     if (op === "+" && target.fieldType.kind === "string") {
       value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, rhsNode ?? access), type: STRING, loc }));
     } else if (target.fieldType.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op, left: read, right: rhs, type: F64, loc };
     } else if (
-      target.fieldType.kind === "dyn" &&
+      fieldKind === "dyn" &&
       isJsSourceFile(access.getSourceFile()) &&
       (op === "+" || op === "-" || op === "*" || op === "/" || op === "%" || op === "**")
     ) {
@@ -12599,7 +12607,7 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     }
     // Second, independent evaluation of the (side-effect-free) receiver.
     const target2 = targetOf()!;
-    return L.fieldSetStmt(target2, value, loc, access);
+    return L.fieldSetStmt(target2, islandField ? L.jsvalIn(value, access) : value, loc, access);
   }
 
 /** Stream-rooted receivers' property surface (readableEnded, destroyed,

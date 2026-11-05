@@ -5935,6 +5935,10 @@ export function canAdaptDynFuncTo(
   t: IrType,
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
+  // The one-world WasmGC lanes (jsval ≡ dyn there): an island-typed
+  // parameter or result passes through the adapter as the $dyn value
+  // itself (U1b). Off by default: other backends do not share the kinds.
+  jsvalOk = false,
 ): boolean {
   return (
     t.kind === "func" &&
@@ -5942,8 +5946,8 @@ export function canAdaptDynFuncTo(
     // param synthesized by the adapter — no adapter models that; variadic
     // values live boxed and are called through their own thunks.
     t.rest !== true &&
-    t.params.every((p) => p.kind === "dyn" || canConvertToDyn(p, getRecord, getUnion)) &&
-    (t.ret.kind === "void" || t.ret.kind === "dyn" || canDynCheckTo(t.ret, getRecord, getUnion))
+    t.params.every((p) => p.kind === "dyn" || (jsvalOk && p.kind === "jsval") || canConvertToDyn(p, getRecord, getUnion)) &&
+    (t.ret.kind === "void" || t.ret.kind === "dyn" || (jsvalOk && t.ret.kind === "jsval") || canDynCheckTo(t.ret, getRecord, getUnion))
   );
 }
 

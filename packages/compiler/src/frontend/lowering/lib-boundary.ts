@@ -52,7 +52,7 @@ function dynCheckable(L: Lowerer, want: IrType): boolean {
   if (want.kind === "bytes" && want.elem === "u8") return true;
   if (want.kind === "object" && want.className === "%Error") return true;
   if (want.kind === "func") {
-    return canAdaptDynFuncTo(want, (id) => L.shapes.get(id), (id) => L.unions.get(id));
+    return canAdaptDynFuncTo(want, (id) => L.shapes.get(id), (id) => L.unions.get(id), L.sharedDynamic);
   }
   if (want.kind === "union") {
     const def = L.unions.get(want.unionId);
