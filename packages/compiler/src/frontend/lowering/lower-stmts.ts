@@ -3605,8 +3605,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // to the union's real array arm). Const only — an evolving-`any`
     // `let` may be reassigned a different shape later; genuine `any`
     // only — every other unmappable keeps its own diagnostic.
+    // (One world in JS sources without the engine — U1b: a checker-`any`
+    // const maps to the island type now, but main's rule still answers —
+    // the initializer's static value is the binding's truth.)
+    const jsAnyIsland = type?.kind === "jsval" && L.sharedDynamic && !L.engine && isJsSourceFile(decl.getSourceFile()) &&
+      (L.typeOf(decl.name).flags & ts.TypeFlags.Any) !== 0;
     if (
-      type === null && !isLet &&
+      (type === null || jsAnyIsland) && !isLet &&
       ((L.typeOf(decl.name).flags & ts.TypeFlags.Any) !== 0 ||
         (L.checkerAnyArray(decl.name) && init.type.kind === "array") ||
         // JS declarations carry no annotations: an unmappable inferred

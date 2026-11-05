@@ -2428,6 +2428,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "dynInvoke":
           // sort and reverse answer their receiver.
           return (e.method === "sort" || e.method === "reverse") && uniqueDyn(e.recv, fn, depth + 1);
+        case "call":
+          // An island view of a typed value (U1b: a JS evolving binding
+          // reassigned from a typed result) shares that value's storage:
+          // nothing else holds it when nothing else holds the typed value.
+          return /^%view\.\d+$/.test(e.callee) && deepFresh(e.args[0], fn, depth + 1);
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
           // One read in all: every value the binding ever holds is fresh

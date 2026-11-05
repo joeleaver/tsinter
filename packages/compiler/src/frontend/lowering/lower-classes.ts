@@ -4771,6 +4771,26 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
     // instance stays an island handle.
     if (L.isIslandExpr(expr.expression)) {
       const callee = L.lowerExpr(expr.expression);
+      // One world in JS sources (U1b): a callee the checker types 'any'
+      // that the lowering resolves to a program CLASS VALUE (a CJS
+      // export member `module.exports.Sub = class {}` read through the
+      // require binding) constructs through that class value, the
+      // classval path's newValue, exactly as on main.
+      if (callee.type.kind === "classval" && L.sharedDynamic && isJsSourceFile(expr.getSourceFile())) {
+        const info = L.classes.get(callee.type.className);
+        if (info && !info.generic) {
+          L.noteEdge(`%${info.def.name}.constructor`);
+          const below = (c: ClassInfo): void => {
+            for (const s of c.subclasses) {
+              L.noteEdge(`%${s.def.name}.constructor`);
+              below(s);
+            }
+          };
+          below(info);
+          const cargs = L.completeArgs(expr.arguments ?? [], info.ctorParams, loc, expr);
+          return { kind: "newValue", callee, args: cargs, type: { kind: "object", className: info.def.name }, loc };
+        }
+      }
       const args = (expr.arguments ?? []).map((a) => L.jsvalIn(L.lowerExpr(a), a));
       return { kind: "jsOp", op: "construct", args: [callee, ...args], type: JSVAL, loc };
     }
