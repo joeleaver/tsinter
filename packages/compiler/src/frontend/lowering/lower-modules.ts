@@ -1417,7 +1417,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // declarations only: a destructured array literal binds its
             // pieces, not the array.
             if (
-              isJsSourceFile(sf) && !L.mapTypeOf(L.typeOf(nameNode)) &&
+              isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode)) &&
               ts.isIdentifier(decl.name) && nameNode === decl.name &&
               decl.initializer !== undefined && ts.isArrayLiteralExpression(decl.initializer)
             ) {
@@ -1476,7 +1476,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // the checked-dynamic tree would trade their working typed representation for
             // fences.
             if (
-              isJsSourceFile(sf) && !L.mapTypeOf(L.typeOf(nameNode)) &&
+              isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode)) &&
               ts.isIdentifier(decl.name) && nameNode === decl.name &&
               jsDynHoldableInitializer(L, decl.initializer) &&
               dynFallbackType(L, nameNode, L.typeOf(nameNode))?.kind === "dyn"
@@ -1502,7 +1502,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // and separately-declared functions reach the same engine
             // object.
             if (
-              L.dynamic && isJsSourceFile(sf) && !L.mapTypeOf(L.typeOf(nameNode)) &&
+              L.dynamic && isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode)) &&
               ts.isIdentifier(decl.name) && nameNode === decl.name &&
               decl.initializer !== undefined && ts.isObjectLiteralExpression(decl.initializer) &&
               decl.initializer.properties.some((p) => ts.isGetAccessorDeclaration(p))
@@ -1522,7 +1522,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // and closures created in the init body capture it normally.
             // References from separately-declared functions cascade to
             // their own per-site runtime fences.
-            if (isJsSourceFile(sf) && !L.mapTypeOf(L.typeOf(nameNode))) continue;
+            if (isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode))) continue;
             // `var p1 = import("./m")` at file scope: the global holds the
             // island promise/handle — the import expression's only
             // production — whatever the checker's namespace type mapped to
@@ -1733,7 +1733,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         for (const nameNode of boundIdentifiersOf(decl.name)) {
           const diagsBefore = L.diags.length;
           try {
-            if (isJsSourceFile(sf) && !L.mapTypeOf(L.typeOf(nameNode))) continue;
+            if (isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode))) continue;
             let type = L.irTypeOf(nameNode);
             // Nested-var unit-only bindings take the unit-only union too
             // (the top-level registration's rule).

@@ -753,7 +753,7 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
     const elemTainted =
       elem !== undefined &&
       ((elem.flags & ts.TypeFlags.Never) !== 0 || neverTaintedJsType(L, node, elem));
-    const mappedElem = elem !== undefined && !elemTainted ? L.mapTypeOf(elem) : null;
+    const mappedElem = elem !== undefined && !elemTainted && !L.jsUnmapped(elem) ? L.mapTypeOf(elem) : null;
     // A mappable element keeps the static array; an unmappable one makes
     // the WHOLE value dyn (the checked-dynamic tree has real arrays — length/index/push
     // read through the keyed-dyn paths; dyn-element STATIC arrays have no
@@ -780,6 +780,10 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
       retT.flags & ts.TypeFlags.Void ? VOID : L.mapTypeOf(retT) ?? DYN;
     return { kind: "func", params, ret };
   }
+  // A JavaScript binding on the one-world lanes without the engine keeps
+  // the JS lane's checked-dynamic storage (U1b): the same $dyn value the
+  // island type names, held where every use takes the JS-exact arms.
+  if (L.sharedDynamic && !L.engine) return DYN;
   return L.sharedDynamic && process.env["SCRIPTC_U1_STAGE"] !== "world" && process.env["SCRIPTC_U1_STAGE"] !== "unknown" ? JSVAL : DYN;
 }
 
@@ -3581,6 +3585,17 @@ export class Lowerer {
       for (const v of Object.values(n as Record<string, unknown>)) visit(v);
     };
     visit(roots);
+  }
+
+  /** A JavaScript declaration's type the JS lane treats as UNMAPPED: no
+   * mapping, or — on the one-world lanes without the engine (U1b) — one
+   * that maps only because `any` maps now (the island type itself, or a
+   * composite with an island piece). Those keep the JS lane's
+   * checked-dynamic storage rules. */
+  jsUnmapped(t: ts.Type): boolean {
+    const m = this.mapTypeOf(t);
+    if (!m) return true;
+    return this.sharedDynamic && !this.engine && (m.kind === "jsval" || this.nestsJsval(m));
   }
 
   /** Does a mapped type hold an island-typed piece below its root (a

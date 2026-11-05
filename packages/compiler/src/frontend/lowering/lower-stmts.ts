@@ -6931,6 +6931,15 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       // next() through callMethod, done/value reads through getProp — so
       // engine arrays, Maps, Sets, generators, and Symbol.iterator
       // implementations all iterate exactly as Node runs them.
+      // One world in JS sources (U1b): the island value is the $dyn value;
+      // the checked-dynamic iteration below is the JS lane's own form.
+      // (With the engine too when the loop variable is pre-declared: the
+      // island loop has no form for it; the checked-dynamic one drains
+      // the engine's own iterator through the by-reference wrap.)
+      if (iterable.type.kind === "jsval" && L.sharedDynamic && isJsSourceFile(stmt.getSourceFile()) &&
+          (!L.engine || !ts.isVariableDeclarationList(stmt.initializer) || (stmt.initializer.flags & ts.NodeFlags.BlockScoped) === 0)) {
+        iterable = asDynOperand(iterable);
+      }
       if (iterable.type.kind === "jsval") {
         return lowerForOfIsland(L, stmt, iterable, labels);
       }
