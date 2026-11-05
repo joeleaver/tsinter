@@ -701,15 +701,21 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // it did when `any` had no mapping; its consumer takes the typed
         // value (inspect, console.log) or the checked-dynamic box.
         if (L.sharedDynamic && !L.engine) {
+          const own = L.mapTypeOf(L.typeOf(expr));
+          if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
+        }
+        // With or without --dynamic (a TypeScript program on the one-world
+        // lanes builds the same module either way when it never reaches
+        // the engine, and refuses the same way when it cannot build):
+        if (L.sharedDynamic) {
           // A computed key: the island literal has no form for it; the
           // static build (an index-signature record) does, as before U1a.
           if (ts.isObjectLiteralExpression(expr) && expr.properties.some((p) => !ts.isSpreadAssignment(p) && p.name !== undefined && ts.isComputedPropertyName(p.name))) return false;
-          const own = L.mapTypeOf(L.typeOf(expr));
-          if ((own?.kind === "record" || own?.kind === "array") && !L.boundarySafe(own) && !L.jsvalLiftable(own)) return false;
           // An argument of a STANDARD-LIBRARY call whose parameter is
-          // `any` (Object.is, util.inspect, assert): the library has a
-          // static lowering over the literal's own type, which it took
-          // when `any` had no mapping.
+          // `any` (Object.is, util.inspect, assert, JSON.stringify): the
+          // library has a static lowering over the literal's own type,
+          // which it took when `any` had no mapping.
+          const own = L.mapTypeOf(L.typeOf(expr));
           if ((own?.kind === "record" || own?.kind === "array") && stdlibAnyArgument(L, expr)) return false;
         }
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an

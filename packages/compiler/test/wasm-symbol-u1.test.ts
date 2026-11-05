@@ -699,10 +699,12 @@ test("B-i gate 9 (Reflect.ownKeys over a symbol-computed key) — both modes nam
   const sym = 'const s = Symbol("k");\nconst o: any = { [s]: 1 };\nconsole.log(Reflect.ownKeys(o).length);';
   const plain = await compileDiag("bi-g9-plain", sym, false);
   const dyn = await compileDiag("bi-g9-dyn", sym, true);
-  // Unit U1a: both builds take the one dynamic world.
+  // Unit U1a: both builds take the one dynamic world, where a computed-key
+  // literal builds statically with or without --dynamic (the island
+  // literal has no form for it) — so both name the static refusal.
   expect(plain).toEqual(dyn);
   expect(dyn).toEqual([
-    "SC1090:this property form in an 'any'-typed object literal (only `name: value`, shorthand names, methods, and get accessors are supported) is not supported yet",
+    "SC1090:computed property keys (compile-time-known keys fold — a pure expression whose checker type is one string or number literal: consts, enum members, quoted keys, templates of those — `{ [MARKER]: v }`; runtime string keys write through an index-signature target; symbol keys stay out) are not supported yet",
     "SC2020:'Reflect.ownKeys' is part of the standard library types but has no scriptc lowering yet",
   ]);
 });
