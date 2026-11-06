@@ -5422,7 +5422,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
       shape.tuple ||
       shape.indexValue ||
       shape.fields.length !== 3 ||
-      !shape.fields.some((f) => f.name === "%dtype")
+      !shape.fields.some((f) => f.name === "%dtype" && f.internal === true)
     ) {
       fence();
     }
@@ -5444,7 +5444,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     const receiver = L.lowerExpr(access.expression);
     if (receiver.type.kind !== "record") return null;
     const shape = L.shapes.get(receiver.type.shapeId);
-    if (!shape?.fields.some((f) => f.name === "%dtype")) return null;
+    if (!shape?.fields.some((f) => f.name === "%dtype" && f.internal === true)) return null;
     const name = access.name.text;
     const loc = locOf(call);
     // libuv's UV_DIRENT encoding (scr_fs_scandir answers it).

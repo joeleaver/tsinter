@@ -4,7 +4,7 @@
  * method surfaces. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { lowerArrayFromIterable } from "./lower-stdlib-members.js";
 import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
@@ -8139,7 +8139,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       if (srcIr?.kind !== "record") return null;
       const from = L.shapes.get(srcIr.shapeId);
       if (!from || from.tuple) return null;
-      if (from.fields.some((f) => f.name.startsWith("%"))) return null;
+      if (shapeHasReservedFields(from)) return null;
       const orderedFields = from.declaredOrder
         ? from.declaredOrder.flatMap((n) => {
             const f = from.fields.find((x) => x.name === n);
@@ -8334,7 +8334,7 @@ export type IndexMergeContributor =
       const from = L.shapes.get(c.shapeId);
       if (!from || from.tuple) return null;
       if (!from.indexValue) {
-        if (from.fields.some((f) => f.name.startsWith("%"))) return null;
+        if (shapeHasReservedFields(from)) return null;
         const fields = new Map<string, WidthLift | "dyn">();
         for (const ff of from.fields) {
           const lift = typeEquals(ff.type, tIv)

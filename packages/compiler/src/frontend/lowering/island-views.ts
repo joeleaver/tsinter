@@ -26,7 +26,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFileName } from "../shared.js";
 import {
-  BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isUnitType, typeKey,
+  BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isReservedField, isUnitType, shapeHasReservedFields, typeKey,
   type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc,
 } from "../../ir/nodes.js";
 import { UNSUPPORTED, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
@@ -47,7 +47,7 @@ export function isTypedComposite(L: Lowerer, t: IrType): boolean {
 function fmtS(L: Lowerer, t: IrType): string {
   if (t.kind === "record") {
     const shape = L.shapes.get(t.shapeId);
-    if (shape && !shape.tuple && !shape.fields.some((f) => f.name.startsWith("%"))) {
+    if (shape && !shape.tuple && !shapeHasReservedFields(shape)) {
       const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
       const members = order
         .map((nm) => shape.fields.find((f) => f.name === nm))
@@ -280,8 +280,10 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
   } else if (shape) {
     const fields = (shape.declaredOrder ?? shape.fields.map((f) => f.name))
       .map((n) => shape.fields.find((f) => f.name === n)!)
-      .filter((f) => f !== undefined && !f.name.startsWith("%"));
-    if (shape.fields.some((f) => f.name.startsWith("%"))) {
+      .filter((f) => f !== undefined);
+    // GH #131: a declared "%x" is a plain own key; only RESERVED slots
+    // (accessor closures, compiler-internal fields) are refused upstream.
+    if (shapeHasReservedFields(shape)) {
       throw new Error("lowerer bug: views of accessor-carrying records are refused before the factory");
     }
     const k = ref("k.0", STRING, loc);
@@ -623,7 +625,7 @@ function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
   if (t.kind === "record") {
     const shape = L.shapes.get(t.shapeId);
     if (!shape) return false;
-    if (shape.fields.some((f) => f.name.startsWith("%"))) return true;
+    if (shapeHasReservedFields(shape)) return true;
     return shape.fields.some((f) => carriesAccessors(L, f.type, seen)) || (shape.indexValue !== undefined && carriesAccessors(L, shape.indexValue, seen));
   }
   if (t.kind === "array") return carriesAccessors(L, t.elem, seen);
@@ -645,12 +647,13 @@ export function viewOf(L: Lowerer, e: IrExpr, loc: SrcLoc, frozen = false): IrEx
   if (e.kind === "arrayLit" && !(e.spreads && e.spreads.length > 0)) {
     return { kind: "jsOp", op: "arrLit", args: e.elems.map((x) => L.jsvalLiftExpr(x, loc)), type: JSVAL, loc };
   }
-  if (e.kind === "recordLit" && e.type.kind === "record" && e.fields.every((f) => !f.overflow && !f.drop && !f.name.startsWith("%"))) {
-    const shape = L.shapes.get(e.type.shapeId);
+  const litShape = e.kind === "recordLit" && e.type.kind === "record" ? L.shapes.get(e.type.shapeId) : undefined;
+  if (e.kind === "recordLit" && e.type.kind === "record" && e.fields.every((f) => !f.overflow && !f.drop && !(litShape ? isReservedField(litShape, f.name) : f.name.startsWith("%")))) {
+    const shape = litShape;
     if (shape?.tuple) {
       return { kind: "jsOp", op: "arrLit", args: e.fields.map((f) => L.jsvalLiftExpr(f.value, loc)), type: JSVAL, loc };
     }
-    if (shape && !shape.indexValue && !shape.fields.some((f) => f.name.startsWith("%"))) {
+    if (shape && !shape.indexValue && !shapeHasReservedFields(shape)) {
       const args: IrExpr[] = [];
       for (const f of e.fields) {
         if (isUndef(f.value)) continue;
