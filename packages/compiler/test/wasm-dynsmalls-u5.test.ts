@@ -301,11 +301,11 @@ test("R17 DOMEX: board #187: an invalid atob input throws InvalidCharacterError 
   expect(exitCode).toBe(0);
 });
 
-test("R18 DOMEX: SEMANTICS.md S021: a caught atob error logged whole prints its enumerable members, code included", async () => {
+test("R18 DOMEX: SEMANTICS.md S027 (GH #137): a caught atob error logged whole prints the stackless bracket form", async () => {
   const src = "'use strict';\ntry { atob(\"*\"); } catch (e) { console.log(e); }\n";
-  // This tier's answer (SEMANTICS.md S021); Node prints "DOMException [InvalidCharacterError]: Invalid character" and its stack.
+  // This tier's answer (SEMANTICS.md S027); Node prints "DOMException [InvalidCharacterError]: Invalid character" and its stack.
   const { stdout, stderr, exitCode } = await runRow("R18", src, "cjs");
-  expect(stdout).toBe("{\n  '%error': true,\n  name: 'InvalidCharacterError',\n  message: 'Invalid character',\n  code: 5\n}\n");
+  expect(stdout).toBe("[DOMException [InvalidCharacterError]: Invalid character]\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -421,20 +421,20 @@ test("W08 DOMEX-WRITE: an Error-typed parameter holding a DOMException: the mess
   expect(stderr).toBe("tsinter: unsupported: writing a DOMException's message is not supported yet (Node's message is getter-only) [SC1090]\n");
 });
 
-test("W09 DOMEX-WRITE: control, board #199: strict writes to an ordinary caught Error keep this tier's answer", async () => {
+test("W09 DOMEX-WRITE: control, board #199: strict writes to an ordinary caught Error convert as in Node (GH #137)", async () => {
   const src = "'use strict';\nconst d = new DOMException(\"m\", \"AbortError\");\nconsole.log(d.code);\ntry { throw new TypeError(\"t\"); } catch (e) { e.name = \"R\"; e.message = \"M\"; console.log(e.name, e.message, String(e)); }\nfunction w(x) { x.message = \"Q\"; return x.message; }\ntry { throw new Error(\"p\"); } catch (e) { console.log(w(e)); }\n";
-  // This tier's answer (board #199); Node prints "20\nR M R: M\nQ\n".
+  // Node's answer since GH #137 (it was this tier's own, board #199).
   const { stdout, stderr, exitCode } = await runRow("W09", src, "cjs");
-  expect(stdout).toBe("20\nR M TypeError: t\nQ\n");
+  expect(stdout).toBe("20\nR M R: M\nQ\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("W10 DOMEX-WRITE: control, board #199: sloppy writes to an ordinary caught Error keep this tier's answer", async () => {
+test("W10 DOMEX-WRITE: control, board #199: sloppy writes to an ordinary caught Error convert as in Node (GH #137)", async () => {
   const src = "const d = new DOMException(\"m\", \"AbortError\");\nconsole.log(d.code);\ntry { throw new TypeError(\"t\"); } catch (e) { e.name = \"R\"; e.message = \"M\"; console.log(e.name, e.message, String(e)); }\nfunction w(x) { x.message = \"Q\"; return x.message; }\ntry { throw new Error(\"p\"); } catch (e) { console.log(w(e)); }\n";
-  // This tier's answer (board #199); Node prints "20\nR M R: M\nQ\n".
+  // Node's answer since GH #137 (it was this tier's own, board #199).
   const { stdout, stderr, exitCode } = await runRow("W10", src, "cjs");
-  expect(stdout).toBe("20\nR M TypeError: t\nQ\n");
+  expect(stdout).toBe("20\nR M R: M\nQ\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

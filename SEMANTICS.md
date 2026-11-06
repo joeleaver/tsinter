@@ -1484,6 +1484,29 @@ GH #135 amendment) `constructor` answer as in Node. **Tested by:**
 measured with the GH #135 rows (`typeof e.stack`), not pinned — a row
 observing it would fail against Node by construction.
 
+**Amendment (GH #137, wasm and wasm-native): the error and its encoding
+are one value for `name` and `message`.** The snapshot described above no
+longer holds for those two members. A typed write (`(e as Error).name =
+"X"`, `e.message = m` on an `Error`-typed binding, `this.name = …` in a
+user error class) also writes the encoding when one was built. A dynamic
+write of a string (`e.name = "Custom"` in a JavaScript source or through
+`any`) also writes the error's own slot. So every reader sees the write:
+`String(e)`, a template, `+`, `e.toString()`, util.format, the dynamic
+reads, a typed read and the uncaught report. The conversions follow
+Error.prototype.toString exactly: a `name` holding undefined is
+`"Error"`, any other non-string is its ToString (`e.name = 5` gives `5:
+m`), a `message` holding undefined is `""`, and an empty side drops the
+`": "`. What still differs: the error's slots hold strings only, so a
+dynamic write of a NON-string `name` or `message` is not seen by a typed
+read of the error (`(e as Error).name` keeps the previous string, where
+Node answers the number); every conversion still reads it. A string
+`code` starting `ERR_` converts the way Node's internal errors do, `Name
+[CODE]: message`, the rule the error's stamped slot already followed.
+**Tested by:**
+`packages/compiler/test/wasm-gh137-error-string.test.ts` (GH137-JS-01..04,
+GH137-TS-01..03, TS-05, TS-06; wasm and wasm-native) and the wasm emitter
+unit test's S021 row.
+
 ## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
 
 The exception cell type-erases everything that is not a scalar, an error
@@ -1884,6 +1907,33 @@ Node output measured with an emptied stack. No corpus program can pin the
 top-level form: every lane prints its own base there (the C runtime makes
 the same choice for the same reason), so the corpus programs that inspect
 errors compare wasm against Node only where the two agree.
+
+**Amendment (GH #137, wasm and wasm-native): an error held in a dynamic
+value renders in this form too.** A caught error in a JavaScript source,
+or one reached through `any` / `unknown`, used to print its encoding
+(`{ '%error': true, name: 'TypeError', message: 't' }`) through
+console.log, util.inspect and util.format's `%s`. It now renders as Node
+renders it with an emptied stack: `[TypeError: t]`, `[Custom: t]` after a
+rename, a string `code` as `{ code: 'X' }`, the same depth gate (a `code`
+collapses to `[<constructor>]`), and the message's newlines indented. The
+header follows Node's improveStack rule: when the `name` ends in `Error`
+and differs from the constructor's, the constructor replaces it if it
+contains the name (`class AppError extends Error {}` prints `[AppError:
+m]`), and otherwise both appear (`class MyType extends TypeError {}`
+prints `[MyType [TypeError]: m]`; a TypeError renamed `MyError` prints
+`[TypeError [MyError]: t]`). Node prints these properties, and they end
+the program at a named fence (S122) here: any own member beyond `name`,
+`message` and a string `code`; a non-string `name` (Node: `[5
+[TypeError]: t]`); a name that prints empty (Node: `[t]`); an own
+`stack` other than `""`; a `cause` or `errors` member; and an error
+whose class this tier cannot name (a class declaring a static `name`). A
+DOMException renders through the static rules above (`[DOMException
+[InvalidCharacterError]: Invalid character]`, `{ [cause]: 5 }`), and only
+an own member beyond its name, message, code and cause fences. Node prints the extra fields of a system error (`errno`,
+`syscall`, `path`), which S073 already registers as absent. A
+runtime-built AggregateError prints without Node's `[errors]` key.
+**Tested by:** `packages/compiler/test/wasm-gh137-error-string.test.ts`
+(GH137-JS-05..12, GH137-TS-01, TS-04; wasm and wasm-native).
 
 ## S028 — Grid-grouping DISPLAY WIDTH uses Node's non-ICU tables, un-normalized *(wasm tier)*
 

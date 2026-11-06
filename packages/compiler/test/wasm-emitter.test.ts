@@ -3068,11 +3068,11 @@ test("S025: a dyn object spelling the reserved `%error` key IS an error", async 
   );
 });
 
-test("S021: a crossed error's name and message are a SNAPSHOT of the crossing", async () => {
-  // The encoding copies both strings, and the identity cache then pins
-  // the box — so a mutation performed on the typed error AFTER it
-  // crossed is invisible on every dyn read, including a second crossing.
-  // Node reads both live. Identity holds on both lanes.
+test("S021 (GH #137): a crossed error's name and message follow a typed write", async () => {
+  // The encoding copies both strings at the first crossing and the
+  // identity cache pins the box; since GH #137 a typed write of `name` or
+  // `message` writes the box too, so every dyn read sees it, as in Node.
+  // Identity holds on both lanes.
   const res = await buildWasm(
     "dyn-error-snapshot.ts",
     [
@@ -3095,10 +3095,9 @@ test("S021: a crossed error's name and message are a SNAPSHOT of the crossing", 
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
-  // S021 — Node answers Renamed/MUTATED on both sides and
-  // [Renamed: MUTATED]; `same true` is exact on every lane.
+  // Node's answer, byte for byte.
   expect(stdout.toString("utf8")).toBe(
-    "first TypeError/boom second TypeError/boom same true str [TypeError: boom]\n",
+    "first Renamed/MUTATED second Renamed/MUTATED same true str [Renamed: MUTATED]\n",
   );
 });
 

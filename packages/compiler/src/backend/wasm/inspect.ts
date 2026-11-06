@@ -282,6 +282,18 @@ export interface InspectDeps {
     head: () => number;
     pending: (c: Code) => void;
   };
+  /** GH #137: an error held in a dynamic value (S021's encoding). `head`
+   * is `(box) -> str`, the header Node prints before `: message`
+   * (improveStack applied); `ctorName` is `(box) -> str`, its class's
+   * name (a named fence where it has none); `vt` pushes a plain Error's
+   * vt for the stand-in error the rendering is built through. */
+  errDyn?: {
+    head: () => number;
+    ctorName: () => number;
+    vt: (c: Code) => void;
+    strEq: () => number;
+    concat: () => number;
+  };
 }
 
 export class InspectBuilder {
@@ -3271,6 +3283,265 @@ export class InspectBuilder {
    * reads the stamped builtin base instead, so unfencing subclasses means
    * porting that rule first. */
 
+  /** GH #137: `%w.insp.dynError(box, recurse, depth)` → an error held in
+   * a dynamic value, rendered as Node renders it with an emptied stack
+   * (S027): `[Header: message]` through `error()`, over a stand-in error
+   * carrying the header improveStack gives (errDyn.head), the `message`
+   * member and a string `code`. Node shows an own `name` that is a string
+   * inside the header, so only a NON-string `name`, and any member beyond
+   * name/message/code, would print as properties: those, an own `stack`
+   * (Node prints it as the base), a `cause` or `errors` member (Node's
+   * `[cause]` / `[errors]` keys) and an empty header are named fences. */
+  private dynError(): number {
+    const dx = this.deps.errDyn!;
+    const dyn = this.deps.dyn();
+    return this.cached("dynError", [dyn.dynRef(), F64, F64], [this.deps.strRef()], (idx) => {
+      const dynT = dyn.dynT();
+      const errT = this.deps.errT();
+      const strT = this.deps.strType();
+      const c = new Code();
+      const D = 0;
+      const RECURSE = 1;
+      const DEPTH = 2;
+      const O = 3;
+      const ENTS = 4;
+      const V = 5;
+      const N = 6;
+      const I = 7;
+      const P = 8;
+      const KS = 9;
+      const VAL = 10;
+      const H = 11;
+      const CODE = 12;
+      const ER = 13;
+      const fence = (text: string): void => {
+        this.deps.fence(c, (x) => this.deps.lit(x, text));
+        c.refNull(strT);
+        c.return_();
+      };
+      const keyIs = (name: string): void => {
+        c.localGet(KS);
+        this.deps.lit(c, name);
+        c.call(dx.strEq());
+      };
+      dyn.objPayload(c, (x) => x.localGet(D));
+      c.localSet(O);
+      const domex = this.deps.domex;
+      if (domex !== undefined) {
+        // A DOMException renders from the error itself, through the
+        // static renderer's DOMException rules (`[DOMException [Name]:
+        // m] { [cause]: … }`): its name and message cannot be written,
+        // and its code is a prototype getter Node does not list. Only an
+        // own member beyond those (and an emptied stack) is a fence.
+        c.localGet(D);
+        c.call(dyn.toError());
+        c.localTee(ER);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        domex.isDomex(c, ER);
+        c.ifVoid();
+        c.localGet(D);
+        c.i32Const(2);
+        c.call(dyn.objWalk());
+        c.localSet(ENTS);
+        dyn.arrPayload(c, (x) => x.localGet(ENTS));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeS();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        dyn.arrPayload(c, (x) => x);
+        c.localSet(P);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, strT);
+        c.localSet(KS);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+        c.localSet(VAL);
+        keyIs("%error");
+        keyIs("name");
+        c.i32Or();
+        keyIs("message");
+        c.i32Or();
+        keyIs("code");
+        c.i32Or();
+        keyIs("cause");
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        keyIs("stack");
+        c.ifResult(I32);
+        c.localGet(VAL);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.STR);
+        c.i32Eq();
+        c.ifResult(I32);
+        c.localGet(VAL);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, strT);
+        c.arrayLen();
+        c.i32Eqz();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Eqz();
+        c.ifVoid();
+        fence("inspecting a DOMException held in a dynamic value with own properties beyond its name, message, code and cause is not supported yet");
+        c.end();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(ER);
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.call(this.error());
+        c.return_();
+        c.end();
+        c.end();
+        c.i32Const(0);
+        c.localSet(I);
+      }
+      c.localGet(D);
+      c.i32Const(2); // Object.entries mode
+      c.call(dyn.objWalk());
+      c.localSet(ENTS);
+      dyn.arrPayload(c, (x) => x.localGet(ENTS));
+      c.localSet(V);
+      dyn.arrLen(c, (x) => x.localGet(V));
+      c.localSet(N);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+      dyn.arrPayload(c, (x) => x);
+      c.localSet(P);
+      dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, strT);
+      c.localSet(KS);
+      dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+      c.localSet(VAL);
+      const valIsStr = (): void => {
+        c.localGet(VAL);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.STR);
+        c.i32Eq();
+      };
+      keyIs("%error");
+      keyIs("message");
+      c.i32Or();
+      c.ifVoid();
+      c.else_();
+      keyIs("name");
+      c.ifVoid();
+      valIsStr();
+      c.i32Eqz();
+      c.ifVoid();
+      fence("inspecting an error held in a dynamic value whose 'name' is not a string is not supported yet");
+      c.end();
+      c.else_();
+      keyIs("code");
+      c.ifVoid();
+      valIsStr();
+      c.i32Eqz();
+      c.ifVoid();
+      fence("inspecting an error held in a dynamic value whose 'code' is not a string is not supported yet");
+      c.end();
+      c.localGet(VAL);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, strT);
+      c.localSet(CODE);
+      c.else_();
+      keyIs("stack");
+      c.ifVoid();
+      // An emptied stack is the form S027 renders; any other is printed.
+      valIsStr();
+      c.ifResult(I32);
+      c.localGet(VAL);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, strT);
+      c.arrayLen();
+      c.i32Eqz();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.i32Eqz();
+      c.ifVoid();
+      fence("inspecting an error held in a dynamic value with its own 'stack' (Node prints the stack) is not supported yet");
+      c.end();
+      c.else_();
+      fence("inspecting an error held in a dynamic value with own properties beyond name, message and code is not supported yet");
+      c.end();
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      // Beyond the depth budget an error with an extra property collapses
+      // to its CONSTRUCTOR's name (Node's getCtxName), whatever its name.
+      c.localGet(CODE);
+      c.refIsNull();
+      c.i32Eqz();
+      c.localGet(RECURSE);
+      c.localGet(DEPTH);
+      c.f64Gt();
+      c.i32And();
+      c.ifVoid();
+      this.deps.lit(c, "[");
+      c.localGet(D);
+      c.call(dx.ctorName());
+      c.call(dx.concat());
+      this.deps.lit(c, "]");
+      c.call(dx.concat());
+      c.return_();
+      c.end();
+      c.localGet(D);
+      c.call(dx.head());
+      c.localTee(H);
+      c.arrayLen();
+      c.i32Eqz();
+      c.ifVoid();
+      fence("inspecting an error held in a dynamic value whose name prints empty is not supported yet");
+      c.end();
+      dx.vt(c);
+      c.localGet(H);
+      c.localGet(O);
+      c.call(dyn.errMsgPart());
+      c.localGet(CODE);
+      c.structNew(errT);
+      c.localGet(RECURSE);
+      c.localGet(DEPTH);
+      c.call(this.error());
+      this.mb.setBody(
+        idx,
+        [dyn.objRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, dyn.arrRef(), this.deps.strRef(), dyn.dynRef(), this.deps.strRef(), this.deps.strRef(), this.errRef()],
+        c.bytes(),
+      );
+    });
+  }
+
   /** `%w.insp.error(e, recurse, depth)` → the error's rendering. */
   error(): number {
     return this.cached("error", [this.errRef(), F64, F64], [this.deps.strRef()], (idx) => {
@@ -4102,6 +4373,22 @@ export class InspectBuilder {
           c.ifVoid();
           this.deps.fence(c, (x) => this.deps.lit(x, "inspecting a URL held in a dynamic value is not supported yet"));
           c.refNull(this.deps.strType());
+          c.return_();
+          c.end();
+        }
+        if (this.deps.errDyn !== undefined) {
+          // GH #137: an error held in a dynamic value prints as one
+          // (S027's stackless bracket form), not as its encoding.
+          c.localGet(O);
+          this.deps.lit(c, "%error");
+          c.call(dyn.objGet());
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(D);
+          c.localGet(RECURSE);
+          c.localGet(DEPTH);
+          c.call(this.dynError());
           c.return_();
           c.end();
         }
