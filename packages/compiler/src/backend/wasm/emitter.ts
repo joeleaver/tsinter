@@ -76,6 +76,7 @@ import {
   BYTES_U8,
   F64 as IR_F64,
   REF_TRUTHY_KINDS,
+  keyedReadRecv,
 } from "../../ir/nodes.js";
 import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -3451,6 +3452,20 @@ class Assembler {
     const mt = computeMayThrow(asIrModule(spawnSyncMayThrowView(mod)));
     this.mayThrow = mt.fns;
     this.mayThrowIndirect = mt.indirect;
+    // GH #133: the functions whose own body reads the ambient receiver
+    // (`this` in a plain JavaScript function, libCall dyn.this). A direct
+    // call of one is a plain call — `this` undefined — so it brackets the
+    // ambient stack with undefined; otherwise it would read the receiver
+    // of whatever method or element call is running around it.
+    const readsThis = (n: unknown): boolean => {
+      if (Array.isArray(n)) return n.some(readsThis);
+      if (n === null || typeof n !== "object") return false;
+      const r = n as Record<string, unknown>;
+      if (r["kind"] === "libCall" && r["fn"] === "dyn.this") return true;
+      for (const k in r) if (k !== "loc" && k !== "type" && readsThis(r[k])) return true;
+      return false;
+    };
+    for (const fn of mod.functions) if (readsThis(fn.body)) this.thisReaders.add(fn.name);
     for (const cls of mod.classes ?? []) {
       for (const m of cls.methods ?? []) {
         if (this.mayThrow.has(`%${cls.name}.${m}`)) this.mayThrowMethods.add(m);
@@ -3468,6 +3483,7 @@ class Assembler {
 
   private readonly mayThrow: Set<string>;
   private readonly mayThrowIndirect: boolean;
+  private readonly thisReaders = new Set<string>();
   /** Method names with at least one may-throw implementation — a virtual
    * dispatch cannot name its callee, so the pending check keys on the
    * METHOD (the native lanes' mayThrowMethods, ported). */
@@ -21391,7 +21407,15 @@ class Assembler {
           this.walkValue(a);
           if (a === methodRecv) this.emitUndefRecvFence(a, e.callee.slice(e.callee.lastIndexOf(".") + 1), code);
         }
+        // GH #133: a plain call of a receiver-reading function runs with
+        // `this` undefined, whatever call encloses it (thisReaders' doc).
+        const plainThis = this.thisReaders.has(e.callee);
+        if (plainThis) {
+          code.globalGet(this.dyn.undefinedGlobal());
+          code.call(this.dyn.thisPush());
+        }
         code.call(index);
+        if (plainThis) code.call(this.dyn.thisPop());
         if (this.mayThrow.has(e.callee)) this.emitPendingCheck();
         return;
       }
@@ -28605,7 +28629,11 @@ class Assembler {
         const arrRef = this.dyn.arrRef();
         const d = this.acquireScratch(dynRef);
         const a = this.acquireScratch(arrRef);
-        this.walkExpr(e.callee);
+        // GH #133: an element call (`recvThis`) keeps its read's receiver
+        // for `this` (jsOp callFn's own rule).
+        const recvT = e.recvThis === true ? this.acquireScratch(dynRef) : -1;
+        if (recvT >= 0) this.emitKeyedReadKeepRecv(e.callee, recvT);
+        else this.walkExpr(e.callee);
         code.localSet(d);
         code.f64Const(0);
         code.call(this.vecs.newLen(this.dynVecInfo()));
@@ -28646,10 +28674,17 @@ class Assembler {
           code.call(this.dyn.spreadPush());
           this.emitPendingCheck();
         });
+        // A plain call runs with `this` undefined (thisReaders' doc).
+        const bracket = recvT >= 0 || this.thisReaders.size > 0;
+        if (recvT >= 0) code.localGet(recvT);
+        else if (bracket) code.globalGet(this.dyn.undefinedGlobal());
+        if (bracket) code.call(this.dyn.thisPush());
         code.localGet(d);
         code.localGet(a);
         this.pushStrLitInto(code, e.calleeName);
         code.call(this.dyn.callFn());
+        if (bracket) code.call(this.dyn.thisPop());
+        if (recvT >= 0) this.releaseScratch(dynRef, recvT);
         this.releaseScratch(arrRef, a);
         this.releaseScratch(dynRef, d);
         this.emitPendingCheck();
@@ -31819,7 +31854,12 @@ class Assembler {
               this.releaseScratch(this.dyn.dynRef(), s);
               return;
             }
-            this.walkExpr(e.args[0]!);
+            // GH #133: an element call (`recvThis`) keeps its read's
+            // receiver for `this`, bound around the call as the invoke
+            // ladder's own-member arm binds it.
+            const recvT = e.recvThis === true ? this.acquireScratch(this.dyn.dynRef()) : -1;
+            if (recvT >= 0) this.emitKeyedReadKeepRecv(e.args[0]!, recvT);
+            else this.walkExpr(e.args[0]!);
             const fn = this.acquireScratch(this.dyn.dynRef());
             code.localSet(fn);
             const argsVec = this.acquireScratch(this.dyn.arrRef());
@@ -31831,6 +31871,11 @@ class Assembler {
               this.walkExpr(e.args[i]!);
               code.call(this.dyn.arrPush());
             }
+            // A plain call runs with `this` undefined (thisReaders' doc).
+            const bracket = recvT >= 0 || this.thisReaders.size > 0;
+            if (recvT >= 0) code.localGet(recvT);
+            else if (bracket) code.globalGet(this.dyn.undefinedGlobal());
+            if (bracket) code.call(this.dyn.thisPush());
             code.localGet(fn);
             code.localGet(argsVec);
             // `what`: callFn's own IR (nodes.ts jsOp doc) carries no
@@ -31844,6 +31889,8 @@ class Assembler {
             const tagCall = e.args[1]?.kind === "jsOp" && e.args[1].op === "tplStrings";
             this.pushStrLit(e.spelling ?? (tagCall ? this.islandCalleeSpelling(e.args[0]!) : "value"));
             code.call(this.dyn.callFn());
+            if (bracket) code.call(this.dyn.thisPop());
+            if (recvT >= 0) this.releaseScratch(this.dyn.dynRef(), recvT);
             this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), fn);
             this.releaseScratch(this.dyn.arrRef(), argsVec);
@@ -36992,7 +37039,7 @@ class Assembler {
    * the generic keyed route over the number's ToString, exactly what
    * emitJsvalIndexKeyString would hand it. Same answers, no key string on
    * the hot path. */
-  private emitIslandNumIndex(recvExpr: WExpr, indexExpr: WExpr, value: WExpr | null): void {
+  private emitIslandNumIndex(recvExpr: WExpr, indexExpr: WExpr, value: WExpr | null, keepRecv = -1): void {
     const code = this.fn.code;
     const dynT = this.dyn.dynT();
     const dynRef = this.dyn.dynRef();
@@ -37001,6 +37048,11 @@ class Assembler {
     const v = value !== null ? this.acquireScratch(dynRef) : -1;
     this.walkExpr(recvExpr);
     code.localSet(r);
+    if (keepRecv >= 0) {
+      // GH #133: an element call keeps the receiver for its `this`.
+      code.localGet(r);
+      code.localSet(keepRecv);
+    }
     this.walkExpr(indexExpr);
     code.localSet(f);
     if (value !== null) {
@@ -37114,6 +37166,52 @@ class Assembler {
     this.releaseScratch(F64, f);
     this.releaseScratch(dynRef, r);
     this.emitPendingCheck();
+  }
+
+  /** GH #133: an element call's callee — the keyed read (`keyedReadRecv`'s
+   * shapes, each exactly as its node emits) leaving the member on
+   * the stack and its receiver, evaluated once, in local `recv` for the
+   * call's `this`. */
+  private emitKeyedReadKeepRecv(read: WExpr, recv: number): void {
+    const code = this.fn.code;
+    if (read.kind === "jsOp" && read.op === "getIdx") {
+      const key = read.args[1]!;
+      if (key.kind === "jsMarshal" && key.value.type.kind === "f64") {
+        this.emitIslandNumIndex(read.args[0]!, key.value, null, recv);
+        return;
+      }
+      this.walkExpr(read.args[0]!);
+      code.localTee(recv);
+      this.emitJsvalIndexKeyString(key);
+      code.i32Const(0);
+      code.call(this.dyn.keyGet());
+      this.emitPendingCheck();
+      return;
+    }
+    if (read.kind === "dynKeyGet" && read.optional !== true) {
+      this.walkExpr(read.value);
+      code.localTee(recv);
+      this.walkExpr(read.key);
+      code.i32Const(0);
+      code.call(this.dyn.keyGet());
+      this.emitPendingCheck();
+      return;
+    }
+    if (read.kind === "call" && keyedReadRecv(read) !== null) {
+      // The one-world TypeScript read, `%idx.inherited.<n>(o, k)` (S015's
+      // U1a fence): the "call" node's own emission, keeping `o`.
+      const callee = this.funcByName.get(read.callee);
+      const index = this.funcIndexByName.get(read.callee);
+      if (callee === undefined || index === undefined) throw new Error(`call to unknown function "${read.callee}"`);
+      code.refNull(this.fnClosPair(callee).clos);
+      this.walkValue(read.args[0]!);
+      code.localTee(recv);
+      this.walkValue(read.args[1]!);
+      code.call(index);
+      if (this.mayThrow.has(read.callee)) this.emitPendingCheck();
+      return;
+    }
+    throw new Error(`emitter bug: recvThis over a ${read.kind} callee`);
   }
 
   private emitJsvalIndexKeyString(indexExpr: WExpr): void {

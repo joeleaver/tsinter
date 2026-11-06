@@ -3242,6 +3242,12 @@ export class DynBuilder {
     });
   }
 
+  /** A canonical array-index spelling ("0", "17"): an element, not a
+   * method name (GH #133). */
+  static isIndexName(name: string): boolean {
+    return /^(0|[1-9][0-9]*)$/.test(name);
+  }
+
   static readonly VIEW_MUTATORS: ReadonlySet<string> = new Set([
     "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin",
   ]);
@@ -3702,7 +3708,8 @@ export class DynBuilder {
    * while the method walked it refuses by name — the walk saw the
    * snapshot, Node's sees each write). */
   invoke(method: string): number {
-    if (!this.viewsLive) return this.invokeRaw(method);
+    // An index name reads through the view-aware keyed read (GH #133).
+    if (!this.viewsLive || DynBuilder.isIndexName(method)) return this.invokeRaw(method);
     const S = 3;
     const R = 4;
     const V = 5;
@@ -9959,6 +9966,37 @@ export class DynBuilder {
         c.localGet(0);
         c.call(this.nullishRecv(method));
         bailIfPending();
+
+        // GH #133: an INDEX name (`handlers[0](4)` reaching a method-call
+        // form) names an element, never a prototype method: the keyed read
+        // (view-aware, every kind), then a function member called with
+        // `this` bound to the receiver, else "<what> is not a function".
+        if (DynBuilder.isIndexName(method)) {
+          c.localGet(0);
+          this.deps.lit(c, method);
+          c.i32Const(0);
+          c.call(this.keyGet());
+          c.localSet(M);
+          bailIfPending();
+          c.localGet(M);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.FUNC);
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(0);
+          c.call(this.thisPush());
+          c.localGet(M);
+          c.localGet(1);
+          c.localGet(2);
+          c.call(this.callFn());
+          c.localSet(R);
+          c.call(this.thisPop());
+          c.localGet(R);
+          c.return_();
+          c.end();
+          throwNotFn();
+          c.return_();
+        }
 
         // OBJ: the OWN member calls — own properties shadow prototypes in
         // JS too, so this arm exists for every name. C binds the

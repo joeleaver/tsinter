@@ -444,11 +444,10 @@ test("A3-MCALL-08 a checked-dynamic receiver's not-a-function texts spell the wh
   expect(exitCode).toBe(0);
 });
 
-test("A3-MCALL-09 a computed-key call on an island object calls the member with this undefined (registered)", async () => {
+test("A3-MCALL-09 a computed-key call on an island object binds this to the receiver, as in Node (GH #133)", async () => {
   const { stdout, stderr, exitCode } = await runRow("A3-MCALL-09", "// @dynamic\n\"use strict\";\n// a computed-key call on an island object calls the member with this undefined (registered)\n/** @returns {*} */\nfunction mk() {\n  return { v: 7, m: function () { return typeof this === \"object\" ? this.v : String(this); } };\n}\nconst o = mk();\nconst k = \"m\";\nconsole.log(`${o[k]()} ${o[\"m\"]()} ${o.m()}`);", "js");
-  // Node: 7 7 7. A computed key keeps the plain call, so `this` is
-  // undefined in the member (SEMANTICS.md S043, unit-A3 amendment).
-  expect(stdout).toBe("undefined 7 7\n");
+  // Node: 7 7 7 (GH #133: the element call binds `this`, SEMANTICS.md S043).
+  expect(stdout).toBe("7 7 7\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
