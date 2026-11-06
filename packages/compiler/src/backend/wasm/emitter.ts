@@ -2718,6 +2718,10 @@ const NUM_PROTO_METHOD_ARITY: ReadonlyMap<string, number> = new Map([
  * function-valued too, Node-measured on every kind's chain: `typeof
  * (5).__defineGetter__` is "function", same for string/boolean/array/
  * object receivers). */
+/** The names the runtime builds a plain `Error` under (GH #135), `Error`
+ * first. */
+const RUNTIME_PLAIN_ERROR_NAMES = ["Error", "URIError", "ReferenceError", "EvalError", "AggregateError", "AssertionError"];
+
 /** A JavaScript source's location (the frontend's isJsSourceFileName):
  * where SEMANTICS.md S015's own-members answer is kept (U1b) and the
  * TypeScript-only fences (U1a) stay off. */
@@ -20375,28 +20379,20 @@ class Assembler {
             this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`), null);
             code.call(this.reportUncaughtHelper());
             this.close();
-            if (slot === ERR_NAME) {
-              code.localGet(o);
-              code.call(this.errRenameRecordHelper());
-            }
             code.localGet(o);
             code.localGet(v);
-            code.structSet(this.exc().errT, slot);
+            // GH #135: a name write keeps the built name it would erase.
+            if (slot === ERR_NAME) code.call(this.errNameWriteHelper());
+            else code.structSet(this.exc().errT, slot);
             this.releaseScratch(this.strRef, v);
             this.releaseScratch(errRef, o);
             return;
           }
           if (slot === ERR_NAME) {
             // GH #135: the name the error was built with outlives a rename.
-            const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-            const o = this.acquireScratch(errRef);
             this.walkExpr(s.obj);
-            code.localTee(o);
-            code.call(this.errRenameRecordHelper());
-            code.localGet(o);
             this.walkExpr(s.value);
-            code.structSet(this.exc().errT, slot);
-            this.releaseScratch(errRef, o);
+            code.call(this.errNameWriteHelper());
             return;
           }
           this.walkExpr(s.obj);
@@ -36420,7 +36416,7 @@ class Assembler {
       c.i32Eq();
       c.ifVoid();
       if (meta.def.name === "%Error") {
-        this.emitPlainErrorCtor(c, er, fence);
+        this.emitPlainErrorCtor(c, er);
       } else if (meta.def.staticNameOrLength === true) {
         fence("reading 'constructor' of an error whose class declares a static 'name' or 'length' (Node answers the class with them; this tier does not model them — SEMANTICS.md S015)");
       } else {
@@ -36468,9 +36464,9 @@ class Assembler {
    * carrying the class's name (URIError, ReferenceError, AggregateError,
    * AssertionError, EvalError): an `%Error`'s constructor is read off the
    * name it was BUILT with (errOrigNameHelper — a rename never moves it);
-   * any other name is a named fence. (An `e.name` assigned through a
-   * dynamic value writes the dynamic copy, never the slot.) */
-  private emitPlainErrorCtor(c: Code, er: number, fence: (text: string) => void): void {
+   * any other name answers Error. (An `e.name` assigned through a dynamic
+   * value writes the dynamic copy, never the slot.) */
+  private emitPlainErrorCtor(c: Code, er: number): void {
     const named = (name: string, arity: number, isClass: boolean): void => {
       c.localGet(er);
       c.call(this.errOrigNameHelper());
@@ -36486,7 +36482,6 @@ class Assembler {
     c.refIsNull();
     c.i32Eqz();
     c.ifVoid();
-    named("Error", 1, false);
     named("URIError", 1, false);
     named("ReferenceError", 1, false);
     named("EvalError", 1, false);
@@ -36494,7 +36489,10 @@ class Assembler {
     // node:assert's AssertionError is a JavaScript class in Node.
     named("AssertionError", 1, true);
     c.end();
-    fence("reading 'constructor' of an Error the runtime built under a name this tier does not attribute to a class (Node answers its own constructor; this tier keeps only the name — SEMANTICS.md S015)");
+    // `Error`, a rename of one (errNameWriteHelper records only what could
+    // change the answer), or a host error carrying another name (S015).
+    c.call(this.ctorPlaceholderHelper("%Error:Error", "Error", 1, false));
+    c.return_();
   }
 
   /* GH #135: the name a plain Error was BUILT with. The runtime builds
@@ -36502,8 +36500,10 @@ class Assembler {
    * as a plain Error carrying that name, so the name slot is the class —
    * until a statically typed write (`err.name = "X"`, the only writer of
    * the slot) renames it. That write records the slot's previous value
-   * here first, once per error (a linked list keyed by identity, like
-   * dyn.ts's error-box cache), so the class survives any rename. */
+   * here first, once per error and only when the rename could change the
+   * answer (errNameWriteHelper), in a linked list keyed by identity like
+   * dyn.ts's error-box cache. Entries are never removed: SEMANTICS.md S015
+   * registers the cost. */
   private errOrigType: number | null = null;
   private errOrigHead: number | null = null;
   private errOrigT(): number {
@@ -36548,28 +36548,72 @@ class Assembler {
     c.end();
     c.end();
   }
-  private errRenameRecordFn: number | null = null;
-  /** `(err) -> ()`: before a static `name` write, remember the slot. */
-  private errRenameRecordHelper(): number {
-    if (this.errRenameRecordFn !== null) return this.errRenameRecordFn;
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+  private errNameWriteFn: number | null = null;
+  /** `(err, name) -> ()`: a statically typed `err.name = name`. Before the
+   * write, a plain Error's first rename that could change its answer is
+   * recorded: the old name is one of the five runtime names (URIError,
+   * ReferenceError, EvalError, AggregateError, AssertionError), or the new
+   * one is one of those six with Error. The common rename (`Error` to
+   * `ValidationError`) records nothing: an unrecorded name outside the six
+   * answers Error anyway. */
+  private errNameWriteHelper(): number {
+    if (this.errNameWriteFn !== null) return this.errNameWriteFn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
     const t = this.errOrigT();
-    const idx = this.mb.declareFunc(this.mb.funcType([errRef], []), "%w.err.recordOrigName");
-    this.errRenameRecordFn = idx;
-    const w = this.newWalker(1);
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef], []), "%w.err.writeName");
+    this.errNameWriteFn = idx;
+    const w = this.newWalker(2);
     const c = w.c;
     const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
-    this.emitErrOrigFind(c, n);
-    c.localGet(n);
-    c.refIsNull();
-    c.ifVoid();
+    const old = this.wlocal(w, this.strRef);
+    const plain = this.classes.meta("%Error");
+    const inNames = (push: () => void, names: string[]): void => {
+      names.forEach((nm, i) => {
+        push();
+        this.pushStrLitInto(c, nm);
+        c.call(this.strEqHelper());
+        if (i > 0) c.i32Or();
+      });
+    };
+    if (plain !== undefined) {
+      c.localGet(0);
+      c.structGet(exc.errT, 0);
+      c.structGet(this.classes.ci(), CI_PRE);
+      c.i32Const(plain.pre);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(exc.errT, ERR_NAME);
+      c.localTee(old);
+      c.refIsNull();
+      c.i32Eqz();
+      c.localGet(1);
+      c.refIsNull();
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      inNames(() => c.localGet(old), RUNTIME_PLAIN_ERROR_NAMES.slice(1));
+      inNames(() => c.localGet(1), RUNTIME_PLAIN_ERROR_NAMES);
+      c.i32Or();
+      c.ifVoid();
+      this.emitErrOrigFind(c, n);
+      c.localGet(n);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(old);
+      c.globalGet(this.errOrigHeadGlobal());
+      c.structNew(t);
+      c.globalSet(this.errOrigHeadGlobal());
+      c.end();
+      c.end();
+      c.end();
+      c.end();
+    }
     c.localGet(0);
-    c.localGet(0);
-    c.structGet(this.exc().errT, ERR_NAME);
-    c.globalGet(this.errOrigHeadGlobal());
-    c.structNew(t);
-    c.globalSet(this.errOrigHeadGlobal());
-    c.end();
+    c.localGet(1);
+    c.structSet(exc.errT, ERR_NAME);
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }

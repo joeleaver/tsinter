@@ -362,6 +362,19 @@ const p: any = JSON.parse("{}");
 p.constructor = (n: number) => n + 1;
 console.log(p.constructor(4));`,
   },
+  {
+    id: "GH135-TS-16 renaming 200k errors in a loop records nothing and stays fast",
+    src: `let last = "";
+let n = 0;
+const t0 = Date.now();
+for (let i = 0; i < 200000; i++) {
+  const e = new Error("m");
+  e.name = "V" + (i % 3);
+  last = e.name;
+  if (i % 50000 === 0) { try { throw e; } catch (x: any) { if (x.constructor.name === "Error") n++; } }
+}
+console.log(last, n, Date.now() - t0 < 5000);`,
+  },
 ];
 
 function write(row: Row, backend: string): string {

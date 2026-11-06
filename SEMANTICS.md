@@ -967,8 +967,19 @@ the inherited constructor where this tier knows it:
   those five. A rename never moves it (a write through the static type,
   `err.name = "Custom"`, records the built name first), so a renamed
   `Error` still answers `Error` and a URIError renamed to `"Error"` still
-  answers `URIError`. A plain `Error` built under any other name (a host
-  error carrying one) ends the program at a named fence (S122). A user
+  answers `URIError`. A plain `Error` built under any other name answers
+  `Error`: that is a host error the runtime rebuilt carrying the host's
+  name (S098 (c): fetch's failures, say), where Node may answer another
+  class (an `AbortError` is a DOMException there). To keep the built name,
+  a rename that could change the answer (of an error built under one of
+  the five names, or to one of the six) records the old name in a table
+  keyed by the error, once per error. The table is never pruned, so each
+  such renamed error stays alive and every later record or `constructor`
+  read of a plain `Error` scans it: renaming many runtime-built URIErrors
+  (or renaming many errors to `"URIError"`) in a long-running loop costs
+  time per rename and memory per error, where Node's cost is nil. The
+  common rename (`err.name = "ValidationError"` on an `Error`) records
+  nothing. A user
   class that declares a static `name` or `length` (`static name`,
   `static ["name"]`) fences too (Node answers them);
 - a number, string, boolean or array answers `Number`, `String`, `Boolean`
