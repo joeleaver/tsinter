@@ -39,6 +39,8 @@ interface Row {
    * exactly `stdout` (a prefix of Node's) — a construct this lane does not
    * model yet, refused by name rather than answered wrongly. */
   fence?: { text: RegExp; stdout: string };
+  /** Refuses to compile with the named code (and message). */
+  refused?: { code: string; text: RegExp };
 }
 
 /** The catch-and-print helper every error row uses. */
@@ -270,6 +272,40 @@ t(() => a[++i]());
 t(() => a[i--]());
 t(() => a[~i]());`,
   },
+  {
+    id: "GH133-JS-16 a generator reading this stays refused by name (its body first runs at next(), under next()'s caller)",
+    entry: "main.js",
+    src: `'use strict';
+function* gen2() { const g = () => this; yield typeof this; yield typeof g(); }
+const it2 = gen2();
+const mk = JSON.parse("{}");
+mk.step = function () { return it2.next().value; };
+const A = JSON.parse('{"n":"A"}');
+console.log(mk.step.call(A), mk.step.call(A));`,
+    refused: { code: "SC3001", text: /dyn\.this:suspending/ },
+  },
+  {
+    id: "GH133-JS-17 an arrow reading this inside a generator is refused by name too",
+    entry: "main.js",
+    src: `'use strict';
+function* gen() { const g = () => typeof this; yield g(); }
+const it = gen();
+const A = JSON.parse('{"n":"A"}');
+const mk = JSON.parse("{}");
+mk.step = function () { return it.next().value; };
+console.log(mk.step.call(A));`,
+    refused: { code: "SC3001", text: /dyn\.this:suspending/ },
+  },
+  {
+    id: "GH133-JS-18 an async function's arrows keep its receiver across an await",
+    entry: "main.js",
+    src: `'use strict';
+const o = JSON.parse('{"n":4}');
+o.run = async function () { const g = () => this.n; await null; return g(); };
+const other = JSON.parse('{"n":9}');
+other.poke = function () { return typeof this; };
+o.run.call(o).then((v) => console.log(v, other.poke.call(other)));`,
+  },
   // ── TypeScript sources ──────────────────────────────────────────────
   {
     id: "GH133-TS-01 an any[] element called by literal and computed index (the issue's TS repro)",
@@ -395,6 +431,12 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(row, backend);
   const dir = join(entry, "..");
   const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic ? { dynamic: true } : {}) });
+  if (row.refused !== undefined) {
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.diagnostics.some((d) => d.code === row.refused!.code && row.refused!.text.test(d.message)), JSON.stringify(res.diagnostics)).toBe(true);
+    return;
+  }
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
   const node = nodeRun(entry);
   expect(node.exitCode).toBe(0);

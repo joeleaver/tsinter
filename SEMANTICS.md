@@ -3173,11 +3173,23 @@ receiver was ambient when it RAN (`() => typeof this` handed to a helper
 from a method printed `undefined`, called as `r[0]()` it saw `r`;
 GH133-JS-12..14, GH133-TS-07). A plain `function` nested in another
 JavaScript function or method no longer captures that function's `this`
-binding: it has its own, as in Node (GH133-JS-13). Still different: a SLOPPY-mode plain
-function called plainly sees `this` as `undefined` where Node passes
-`globalThis` (`function f() { return typeof this }; f()` prints
-`undefined`, Node `object`); strict-mode code, which most modules are, is
-unaffected.
+binding at compile time: its `this` is the receiver of the call that runs
+it (GH133-JS-13, an element call). That is only as good as the call's
+binding, so the typed-function-value residual above applies to a nested
+function called plainly: `function inner() { return (() => this ===
+outer)(); } return inner();` inside a method prints `true` (the method's
+receiver), Node `false`. An async function's arrows read its receiver at
+entry, before the first await (GH133-JS-18). A GENERATOR (or async
+generator) that reads `this`, itself or through an arrow, stays refused by
+name (SC3001, `libCall:dyn.this:suspending`): its body first runs at the
+first `next()`, under that caller's receiver (GH133-JS-16/17). Still
+different: a SLOPPY-mode plain function called plainly sees `this` as
+`undefined` where Node passes `globalThis` (`function f() { return typeof
+this }; f()` prints `undefined`, Node `object`); strict-mode code, which
+most modules are, is unaffected. And a CommonJS module's top-level `this`
+(and an arrow's created there) reads `undefined` where Node gives
+`module.exports` (`typeof this` at a CommonJS top level is `"undefined"`,
+Node `"object"`); an ES module's is `undefined` in both.
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
@@ -3416,7 +3428,7 @@ different, each as before:
   on main;
 - the c and llvm lanes are unchanged.
 **Tested by:** `packages/compiler/test/wasm-gh133-element-call.test.ts`
-(GH133-JS-01..15, GH133-TS-01..07, both lanes) and A3-MCALL-09.
+(GH133-JS-01..18, GH133-TS-01..07, both lanes) and A3-MCALL-09.
 
 **Amendment (unit F1): an island RegExp value.** A RegExp crossing into
 `any` (the boundary's `new RegExp(re.source, re.flags)` over a regex
