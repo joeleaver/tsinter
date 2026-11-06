@@ -4380,8 +4380,13 @@ export type IrExpr =
   /** f64|bool → string, JS-exact (Number::toString / "true"/"false").
    * Union operands dispatch through the per-union ToString helper (arms
    * fenced to unit/string/f64/bool by the frontend); a CAUGHT operand is
-   * `String(e)` over the exception snapshot (scr_caught_to_string). */
-  | { kind: "toString"; operand: IrExpr; type: IrType; loc: SrcLoc }
+   * `String(e)` over the exception snapshot (scr_caught_to_string).
+   * `hint: "default"` (GH #134, dyn operands only): the `+` operator's
+   * conversion — ToPrimitive with the DEFAULT hint (`valueOf` before
+   * `toString`), then ToString — where a bare node is `String(u)` /
+   * `${u}`, the STRING hint (`toString` first). Backends without the
+   * object protocol may ignore it. */
+  | { kind: "toString"; operand: IrExpr; hint?: "default"; type: IrType; loc: SrcLoc }
   /** Lazily-branched conditional: exactly one arm evaluates. */
   | { kind: "ternary"; cond: IrExpr; then: IrExpr; else_: IrExpr; type: IrType; loc: SrcLoc }
   /** Nullish coalescing `a ?? b` — `logical`'s lazily-branched shape with
@@ -5239,8 +5244,12 @@ export type IrExpr =
    * string payloads formatted like Node's messages) — backends must consult
    * the may-throw seed set (MAY_THROW_LIB_FNS) in their analysis and emit
    * pending checks; process.* members never throw. `process.exit` flushes
-   * stdout and terminates the process without running exit handlers. */
-  | { kind: "libCall"; fn: IrLibFn; args: IrExpr[]; type: IrType; loc: SrcLoc }
+   * stdout and terminates the process without running exit handlers.
+   * `fmtS` (GH #134, insp.dynS only): the call is util.format's `%s`
+   * specifier, which String()s an object with a user-defined toString;
+   * a plain console argument (no flag) always inspects. Backends without
+   * the object protocol may ignore it. */
+  | { kind: "libCall"; fn: IrLibFn; args: IrExpr[]; fmtS?: true; type: IrType; loc: SrcLoc }
   /** `JSON.stringify(v)` — type-DIRECTED serialization: `value`'s static IR
    * type must be JSON-safe (f64/string/bool/record/array/union of those,
    * recursively — validated), and backends emit one serializer per type used

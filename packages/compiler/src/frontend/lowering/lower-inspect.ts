@@ -1110,8 +1110,11 @@ function lowerInspectCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrE
 
 /** One argument as format's %s conversion (Node: numbers via
  * formatNumber, strings verbatim, objects through inspect at the given
- * depth) over its already-lowered value; unsupported kinds fence. */
-function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
+ * depth) over its already-lowered value; unsupported kinds fence. The
+ * rest-argument tail shares it; `pct` marks the real `%s` specifier,
+ * whose dynamic object with a user-defined toString is String()ed (GH
+ * #134) where a rest argument always inspects. */
+function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: number, loc: SrcLoc, pct = false): IrExpr {
   value = jsvalAsDyn(value);
   const t = value.type;
   if (t.kind === "string") return value;
@@ -1123,7 +1126,11 @@ function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: numbe
   // answer too, one runtime call either way.
   if (t.kind === "symbol") return { kind: "libCall", fn: "sym.toString", args: [value], type: STRING, loc };
   if (t.kind === "dyn") {
-    return { kind: "libCall", fn: "insp.dynS", args: [value, num(depth, loc)], type: STRING, loc };
+    // GH #134: the %s specifier's own rule (fmtS) — an object whose
+    // toString is user-defined is String()ed, every other one inspects.
+    return pct
+      ? { kind: "libCall", fn: "insp.dynS", args: [value, num(depth, loc)], fmtS: true, type: STRING, loc }
+      : { kind: "libCall", fn: "insp.dynS", args: [value, num(depth, loc)], type: STRING, loc };
   }
   // A UNION argument dispatches per arm at runtime: a string arm prints
   // VERBATIM (typeof arg === 'string' in Node's formatter — inspect's
@@ -1242,7 +1249,7 @@ function convertSpecArg(L: Lowerer, spec: number, node: ts.Expression, value: Ir
   const textOf =(): IrExpr => (t.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc });
   switch (spec) {
     case 115: // %s
-      return formatSArg(L, node, value, 0, loc);
+      return formatSArg(L, node, value, 0, loc, true);
     case 100: {
       // %d — Number(arg) formatted: numbers as-is, booleans 1/0,
       // strings through the runtime's ECMA-exact StringToNumber

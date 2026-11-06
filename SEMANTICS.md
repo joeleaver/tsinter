@@ -823,7 +823,9 @@ member of the same name still shadows them and a null-prototype object has
 none; the c and llvm lanes still throw "is not a function" there. `toLocaleString`
 answers the object's ToString conversion, which on the tree ignores an own
 `toString` member (`o.toString = () => "X"` still gives "[object Object]",
-the same answer `String(o)` gives). On the wasm tier one shape does have a
+the same answer `String(o)` gives) — on the c and llvm lanes only: on the
+wasm and wasm-native lanes the GH #134 amendment below retires this
+sentence and the next one's "still ignores". On the wasm tier one shape does have a
 chain (unit A2): an island object built by `Object.create(proto)` reads,
 calls methods and answers `in` through its prototype objects, live, as in
 Node — its conversion still ignores a `toString` member, own or inherited,
@@ -879,6 +881,73 @@ TypeScript source meets U1a's fence. A `--dynamic` program with a JavaScript
 source keeps the checked-dynamic world whole (S014's U1b amendment). (Parity
 with the JS lane: the rows that pin it — the wasm emitter's S015 row,
 `wasm-dynsmalls-u5` R85 — answer as before.)
+
+**Amendment (GH #134, wasm and wasm-native, TypeScript and JavaScript
+sources): a dynamic object's conversions call its own `toString` and
+`valueOf`.** The body's "conversion ignores a `toString` member" was a
+silent divergence (``const o = {}; o.toString = () => "mine";
+console.log(o.toString(), String(o), `${o}`)`` printed `[object Object]`
+three times where Node prints `mine mine mine`); on these lanes it is
+retired. A dynamic object — from a literal, `JSON.parse`, an `any`,
+`unknown` or `Record<string, any>` slot, a null-prototype object, or (in a
+`--dynamic` program) an A2 `Object.create(proto)` link, the member found
+on the chain — converts by ECMA-262 ToPrimitive over its `toString` /
+`valueOf` members (a getter-defined member is read through its getter),
+each called with `this` = the object and no arguments:
+- **String hint** (`String(o)`, `` `${o}` ``, an array's `join` /
+  `toString` / `String()` element by element and its separator, a
+  computed property key `m[o]`, the default `sort()` order, a relational
+  operand after its own ToPrimitive, `String(e)` / `` `${e}` `` of a
+  thrown dynamic value, `toLocaleString`, and util.format's `%s`
+  SPECIFIER, which String()s an object whose `toString` is a function and
+  inspects every other object, as Node's hasBuiltInToString decides — a
+  bare console argument and a format string's rest arguments always
+  inspect and never call the member, as in Node): `toString` first, then
+  `valueOf`.
+- **Default hint** (`o + ""`, `"" + o`, `s += o`, a field's `c.s += o`,
+  `o + 1` on an `any`):
+  `valueOf` first, then `toString`. An array operand's elements convert
+  inside its own ToPrimitive, before the other operand's (`arr + b` calls
+  the elements' `toString` before `b.valueOf`).
+- A member that is not callable, or answers an object, falls through to
+  the next; neither answering a primitive is V8's catchable TypeError
+  "Cannot convert object to primitive value" (a null-prototype object with
+  neither member too — it inherits none — under `String()`, templates,
+  `+`, `Number()` / unary `+` / Math, joins, keys and `String(e)`, where
+  this tier used to stop at S122's null-prototype fence). A member's throw propagates,
+  catchably, at the conversion.
+- The METHOD CALL `o.toString()` calls the member found and answers its
+  string; a non-callable member throws V8's "`o.toString` is not a
+  function"; with no member, the kind's own answer is unchanged.
+An object with no such member keeps the inherited answers this entry's
+body describes ("[object Object]", an array's join, an Error's text). An
+array met again while its own conversion or `join` runs renders "" (V8's
+join-stack cycle guard: `c.push(c); c.join("-")` is `1-2-`), where this
+tier used to overflow the stack.
+**What still refuses, by name, at run time (SC1090):** a conversion site
+that converts through the runtime's total helper (`dyn.ts` toStr) —
+`parseFloat(o)`, the host-API ToString sites (header names, DOMException
+arguments and the like) and the island helpers that ToString an argument —
+meets an object with a `toString` member, own or inherited, at
+"converting an object with its own toString member to a string at this
+site is not supported yet" instead of answering "[object Object]"; the method call `o.toString(arg)` with an
+argument and an own member stops at "calling an object's own toString
+member with an argument is not supported yet" (the call site's literal
+encoding is all the lowering keeps); and an own member answering a
+non-string through the method call stops at "an own toString member that
+answers a non-string value, called as a method, is not supported yet"
+(the call's IR type is string; `String(o)` and `` `${o}` `` convert such
+an answer exactly); and `%s` over an object whose `toString` is a getter
+stops at "util.format's %s over an object whose toString is a getter is
+not supported yet" (Node runs the getter to decide between String() and
+inspect). Two shapes stay out of reach and refuse at compile
+time as before: a STATIC class or record type declaring `toString` that
+`String()` converts (SC2011), and a symbol-keyed `Symbol.toPrimitive`
+member (the symbol-keyed write fence). In JavaScript sources the
+arithmetic operators keep the checked-number stance (`o * 2` over a
+JSON.parse'd object is the SC1100 "expected number" fence), unchanged.
+**Tested by:** `packages/compiler/test/wasm-gh134-tostring.test.ts`
+(GH134-JS-01..14, GH134-TS-01..19), both lanes.
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -3392,7 +3461,12 @@ The dot form `o.m(x)` on a checked-dynamic receiver keeps S042's answer.
 `o.toString()` on an island object (plain or linked) now answers like
 `String(o)` — Object.prototype.toString through the method call, where it
 threw "is not a function" — and an own or inherited `toString` member is
-still the one called.
+still the one called. (GH #134 correction: that held for the method-call
+dispatch the island lowering takes, but not for the `o.toString()` spelling
+an `any` / `unknown` receiver or a JavaScript `{}` lowers to, nor for the
+conversions themselves — `String(o)`, `` `${o}` `` and `o + ""` answered
+"[object Object]" over an own member. S015's GH #134 amendment makes all of
+them call it on the wasm and wasm-native lanes.)
 **Tested by:** A3-MCALL-01..09, A3-TOSTR-01 and A3-RENDER-01/02 in
 `packages/compiler/test/wasm-island-a.test.ts`.
 
@@ -9462,7 +9536,7 @@ a write to a string's own read-only members, an in-range index or
 before). Node-parity throws (ERR_* validation, V8's TypeError/RangeError/
 SyntaxError texts) stay what they are.
 
-A fence that meets a point where Node itself throws is not a fence for those inputs: there the error is Node's own, catchable, class and message and code (the GH #86 review's ruling). So a checked-dynamic stream construction's invalid `highWaterMark` throws `ERR_INVALID_ARG_VALUE` and a readable's unknown encoding `ERR_UNKNOWN_ENCODING`; a socket write's unknown encoding `ERR_UNKNOWN_ENCODING` (S087 (f)); the dynamic `writeHead`'s invalid status code `ERR_HTTP_INVALID_STATUS_CODE` and a non-string header name `ERR_INVALID_HTTP_TOKEN` (S088 (f)); `Object.assign` over a plain island object's getter-only member V8's "Cannot set property g of #<Object> which has only a getter"; `structuredClone` of a URL held in a dynamic value its DataCloneError ("Cannot clone object of unsupported type."); a wrong-typed path or data argument at a typed builtin parameter (`path.*`, the sync `fs` calls, `new URL`) `ERR_INVALID_ARG_TYPE` or `ERR_INVALID_URL`; ReflectApply over a Uint8Array, a promise or an error (S092 (a)); `new Buffer(<plain object>, enc)` (S094 (c)); and destructuring undefined or null in a JavaScript source V8's "Cannot destructure property 'a' of 'o' as it is undefined." family (the source rendered as V8 renders an identifier, `this`, a property chain or a call; an array pattern over an identifier "o is not iterable"). `structuredClone` of a function throws Node's DataCloneError (`<source text> could not be cloned.`, code 25) where the value was boxed from a known function: the module stamps each function it boxes with its source span (only a module that calls structuredClone pays). In a TypeScript source the text is the source as written, types included, because Node has no text of its own there — what it quotes is its type-stripper's output. A dynamic value reaching a string parameter of `path.*` or the sync `fs` path and data parameters throws Node's ERR_INVALID_ARG_TYPE for that parameter (`dyn.argStr`, the check at the dyn-to-builtin boundary; a slot holding `undefined` too), `new URL` ToString's a dynamic input as Node does, and an uncaught DOMException reports as `DOMException [<name>]: <message>` after S007's prefix. A Buffer, typed array, URL or (where the member takes one) file descriptor held in a dynamic value at such a parameter is a named fence, as are `fs.existsSync` and `fs.realpathSync` over a non-string (Node: false with a deprecation warning; ENOENT on the coerced path), `path.parse`/`path.format` (no lowering at all), and a wrong-type status at the statically typed `res.writeHead`. `"prototype" in f` answers where the value's function is known at the boxing (a function, an arrow, an async function, directly or through a binding every write of which is that function); a function read out of a record or passed through a parameter is the S015 fence, and `in` on a statically typed function is the build's existing SC fence. These stay fences although Node throws, because Node's text cannot be produced here: `structuredClone` of a function that reached the clone without its text (one stored and re-boxed through a typed slot, which crosses anonymously) or of a socket, `new X509Certificate` over a PEM body whose outer header is sound but which OpenSSL rejects deeper in (S093 (d)), the null-prototype object converted to a primitive (Node: "Cannot convert object to primitive value" — the conversion sites cannot propagate a catchable error), a DOMException member write and a write over an island getter (Node throws only in strict code; the source's strictness now reaches a dynamic write on a primitive, these two surfaces do not read it yet), a nullish spread into a call whose V8 rendering is unknown, a destructuring whose pattern or source V8 renders otherwise (an object-pattern parameter over `undefined` or `null` is V8's "of 'undefined'" / "of 'object null'" text; a member read with a string, number or identifier key renders as V8 does; a union-typed source keeps its fence), and fetch()'s input fences (Node rejects with undici's error and cause).
+A fence that meets a point where Node itself throws is not a fence for those inputs: there the error is Node's own, catchable, class and message and code (the GH #86 review's ruling). So a checked-dynamic stream construction's invalid `highWaterMark` throws `ERR_INVALID_ARG_VALUE` and a readable's unknown encoding `ERR_UNKNOWN_ENCODING`; a socket write's unknown encoding `ERR_UNKNOWN_ENCODING` (S087 (f)); the dynamic `writeHead`'s invalid status code `ERR_HTTP_INVALID_STATUS_CODE` and a non-string header name `ERR_INVALID_HTTP_TOKEN` (S088 (f)); `Object.assign` over a plain island object's getter-only member V8's "Cannot set property g of #<Object> which has only a getter"; `structuredClone` of a URL held in a dynamic value its DataCloneError ("Cannot clone object of unsupported type."); a wrong-typed path or data argument at a typed builtin parameter (`path.*`, the sync `fs` calls, `new URL`) `ERR_INVALID_ARG_TYPE` or `ERR_INVALID_URL`; ReflectApply over a Uint8Array, a promise or an error (S092 (a)); `new Buffer(<plain object>, enc)` (S094 (c)); and destructuring undefined or null in a JavaScript source V8's "Cannot destructure property 'a' of 'o' as it is undefined." family (the source rendered as V8 renders an identifier, `this`, a property chain or a call; an array pattern over an identifier "o is not iterable"). `structuredClone` of a function throws Node's DataCloneError (`<source text> could not be cloned.`, code 25) where the value was boxed from a known function: the module stamps each function it boxes with its source span (only a module that calls structuredClone pays). In a TypeScript source the text is the source as written, types included, because Node has no text of its own there — what it quotes is its type-stripper's output. A dynamic value reaching a string parameter of `path.*` or the sync `fs` path and data parameters throws Node's ERR_INVALID_ARG_TYPE for that parameter (`dyn.argStr`, the check at the dyn-to-builtin boundary; a slot holding `undefined` too), `new URL` ToString's a dynamic input as Node does, and an uncaught DOMException reports as `DOMException [<name>]: <message>` after S007's prefix. A Buffer, typed array, URL or (where the member takes one) file descriptor held in a dynamic value at such a parameter is a named fence, as are `fs.existsSync` and `fs.realpathSync` over a non-string (Node: false with a deprecation warning; ENOENT on the coerced path), `path.parse`/`path.format` (no lowering at all), and a wrong-type status at the statically typed `res.writeHead`. `"prototype" in f` answers where the value's function is known at the boxing (a function, an arrow, an async function, directly or through a binding every write of which is that function); a function read out of a record or passed through a parameter is the S015 fence, and `in` on a statically typed function is the build's existing SC fence. These stay fences although Node throws, because Node's text cannot be produced here: `structuredClone` of a function that reached the clone without its text (one stored and re-boxed through a typed slot, which crosses anonymously) or of a socket, `new X509Certificate` over a PEM body whose outer header is sound but which OpenSSL rejects deeper in (S093 (d)), the null-prototype object converted to a primitive at a site that still converts through the total helper (Node: "Cannot convert object to primitive value"; since GH #134 `String(o)`, templates, `+`, `Number(o)`, joins, keys and a caught value's conversion throw it catchably — S015's GH #134 amendment), a DOMException member write and a write over an island getter (Node throws only in strict code; the source's strictness now reaches a dynamic write on a primitive, these two surfaces do not read it yet), a nullish spread into a call whose V8 rendering is unknown, a destructuring whose pattern or source V8 renders otherwise (an object-pattern parameter over `undefined` or `null` is V8's "of 'undefined'" / "of 'object null'" text; a member read with a string, number or identifier key renders as V8 does; a union-typed source keeps its fence), and fetch()'s input fences (Node rejects with undici's error and cause).
 
 **Residue on the c and llvm lanes** (transitional, they retire at N4): the
 deferred compile fences (and with them every frontend-built check above:

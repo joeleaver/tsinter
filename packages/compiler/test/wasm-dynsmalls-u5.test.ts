@@ -1240,73 +1240,82 @@ test("R86 NULLPROTO: o.toString() throws Node's TypeError", async () => {
   expect(exitCode).toBe(0);
 });
 
-test("R87a NULLPROTO: String(o) refuses by name", async () => {
+test("R87a NULLPROTO: String(o) throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log(String(o)); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87a", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87a", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87b NULLPROTO: a template refuses by name", async () => {
+test("R87b NULLPROTO: a template throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log(`${o}`); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87b", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87b", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87c NULLPROTO: o + \"\" refuses by name", async () => {
+test("R87c NULLPROTO: o + \"\" throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log(o + \"\"); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87c", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87c", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87d NULLPROTO: \"x\" + o refuses by name", async () => {
+test("R87d NULLPROTO: \"x\" + o throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log(\"x\" + o); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87d", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87d", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87e NULLPROTO: [o].join() refuses by name", async () => {
+test("R87e NULLPROTO: [o].join() throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log([o].join()); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87e", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87e", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87f NULLPROTO: a nested array's toString refuses by name", async () => {
+test("R87f NULLPROTO: a nested array's toString throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\no.k = 1;\nconsole.log(\"before\");\ntry { console.log([1, [o]].toString()); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "before\nTypeError Cannot convert object to primitive value\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87f", src, "cjs");
-  expect(stdout).toBe("before\n");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87f", src, "cjs");
+  expect(stdout).toBe("before\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87g NULLPROTO: a template of a caught null-prototype object refuses by name", async () => {
+test("R87g NULLPROTO: a template of a caught null-prototype object throws Node's TypeError, uncaught (GH #134)", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log(`T ${e}`); }\n";
   const { stdout, stderr } = await runRowTrap("R87g", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's TypeError, uncaught (SEMANTICS.md S015's GH #134 amendment).
+  expect(stderr).toBe("Uncaught TypeError: Cannot convert object to primitive value\n");
 });
 
-test("R87h NULLPROTO: String of a caught null-prototype object refuses by name", async () => {
+test("R87h NULLPROTO: String of a caught null-prototype object throws Node's TypeError, uncaught (GH #134)", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log(\"S\", String(e)); }\n";
   const { stdout, stderr } = await runRowTrap("R87h", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's TypeError, uncaught (SEMANTICS.md S015's GH #134 amendment).
+  expect(stderr).toBe("Uncaught TypeError: Cannot convert object to primitive value\n");
 });
 
 test("R87i NULLPROTO: a template in a .catch handler over a rejected null-prototype object", async () => {
   const src = "'use strict';\nPromise.reject(Object.create(null)).catch((e) => console.log(`R ${e}`));\n";
   const { stdout, stderr } = await runRowTrap("R87i", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's TypeError, uncaught (SEMANTICS.md S015's GH #134 amendment).
+  expect(stderr).toBe("Unhandled promise rejection: TypeError: Cannot convert object to primitive value\n");
 });
 
 test("R87j NULLPROTO: control: a caught plain object reads [object Object]", async () => {
@@ -1317,19 +1326,21 @@ test("R87j NULLPROTO: control: a caught plain object reads [object Object]", asy
   expect(exitCode).toBe(0);
 });
 
-test("R87k NULLPROTO: concatenation with a caught null-prototype object refuses by name", async () => {
+test("R87k NULLPROTO: concatenation with a caught null-prototype object throws Node's TypeError (GH #134)", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { try { console.log(\"C \" + e); } catch (x) { console.log(\"x\"); } }\n";
-  // This tier's answer (the named ToString refusal, uncatchable where Node's TypeError is caught); Node prints "x\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R87k", src, "cjs");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's catchable TypeError (SEMANTICS.md S015's GH #134 amendment).
+  const { stdout, stderr, exitCode } = await runRow("R87k", src, "cjs");
+  expect(stdout).toBe("x\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R87l NULLPROTO: [e].join() over a caught null-prototype object refuses by name", async () => {
+test("R87l NULLPROTO: [e].join() over a caught null-prototype object throws Node's TypeError, uncaught (GH #134)", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log([e].join()); }\n";
   const { stdout, stderr } = await runRowTrap("R87l", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's TypeError, uncaught (SEMANTICS.md S015's GH #134 amendment).
+  expect(stderr).toBe("Uncaught TypeError: Cannot convert object to primitive value\n");
 });
 
 test("R87m NULLPROTO: control: a rejected plain object through a .catch handler", async () => {
@@ -1362,18 +1373,18 @@ test("R88b NULLPROTO: o.valueOf() throws Node's TypeError", async () => {
 
 test("R89 NULLPROTO: a null-prototype object as a computed key refuses by name", async () => {
   const src = "'use strict';\nconst o = Object.create(null);\nconst q = JSON.parse('{\"k\":1}');\ntry { console.log(q[o]); } catch (e) { console.log(e.name, e.message); }\ntry { console.log(Number(o)); } catch (e) { console.log(e.name, e.message); }\ntry { console.log(o * 2); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "TypeError Cannot convert object to primitive value\nTypeError Cannot convert object to primitive value\nTypeError Cannot convert object to primitive value\n" and exits 0.
+  // GH #134: the key and Number() throw Node's TypeError; `o * 2` in a JavaScript source keeps the checked-number fence (SC1100).
   const { stdout, stderr } = await runRowTrap("R89", src, "cjs");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  expect(stdout).toBe("TypeError Cannot convert object to primitive value\nTypeError Cannot convert object to primitive value\n");
+  expect(stderr).toBe("tsinter: unsupported: expected number at $, got object [SC1100]\n");
 });
 
-test("R89b NULLPROTO: board #204 (closed): String(e) === undefined still converts, and the conversion refuses by name", async () => {
+test("R89b NULLPROTO: board #204 (closed): String(e) === undefined still converts, and the conversion throws Node's TypeError, uncaught (GH #134)", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log('S', String(e) === undefined); }\n";
-  // This tier's answer (the named ToString refusal); Node prints "" and String(e) throws a TypeError (exit 1).
   const { stdout, stderr } = await runRowTrap("R89b", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet [SC1090]\n");
+  // GH #134: Node's TypeError, uncaught (SEMANTICS.md S015's GH #134 amendment).
+  expect(stderr).toBe("Uncaught TypeError: Cannot convert object to primitive value\n");
 });
 
 // ----------------------------------------------------------------------

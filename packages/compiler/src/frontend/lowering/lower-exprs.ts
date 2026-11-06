@@ -8307,6 +8307,17 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     return { kind: "arraySet", arr, index, value, loc: locOf(expr) };
   }
 
+/** An operand of string `+` / `+=` as text: ensureString, except that a
+ * dynamic operand converts with ToPrimitive's DEFAULT hint (GH #134 —
+ * `o + ""` calls an own `valueOf` before `toString`, where `String(o)`
+ * calls `toString` first). */
+export function ensureConcatString(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
+  // One world (U1a/U1b): an island value is the same dynamic value.
+  const d = e.type.kind === "jsval" && L.sharedDynamic ? asDynOperand(e) : e;
+  if (d.type.kind === "dyn") return { kind: "toString", operand: d, hint: "default", type: STRING, loc: e.loc };
+  return ensureString(L, e, node);
+}
+
 export function ensureString(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
     const k = e.type.kind;
     // GH #101 (SEMANTICS.md S119): a record, array or class-instance slot
@@ -9467,8 +9478,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
             // JS-exact dyn walker (numbers format, arrays join, objects
             // print [object Object], handles the same) — never a checked
             // cast: `'status ' + res.statusCode` concatenates like Node.
+            // GH #134: with `+`'s DEFAULT hint (an own valueOf first).
             const strOf = (e: IrExpr): IrExpr =>
-              e.type.kind === "dyn" ? { kind: "toString", operand: e, type: STRING, loc: e.loc } : e;
+              e.type.kind === "dyn" ? { kind: "toString", operand: e, hint: "default", type: STRING, loc: e.loc } : e;
             return { kind: "strConcat", left: strOf(left), right: strOf(right), type: STRING, loc };
           }
         }
@@ -9535,8 +9547,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           const ops = evaluateArgsFirst(L, [left, right], loc);
           return afterArgs(ops.stmts, undefPlusGuard(L, ops.values[0]!, ops.values[1]!, loc, (l, r) => ({
             kind: "strConcat",
-            left: L.ensureString(l, expr.left),
-            right: L.ensureString(r, expr.right),
+            left: ensureConcatString(L, l, expr.left),
+            right: ensureConcatString(L, r, expr.right),
             type: STRING, loc,
           })), loc);
         }
@@ -12607,7 +12619,7 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     const fieldKind = islandField ? "dyn" : target.fieldType.kind;
     let value: IrExpr;
     if (op === "+" && target.fieldType.kind === "string") {
-      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, rhsNode ?? access), type: STRING, loc }));
+      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: ensureConcatString(L, r, rhsNode ?? access), type: STRING, loc }));
     } else if (target.fieldType.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op, left: read, right: rhs, type: F64, loc };
     } else if (
@@ -12628,8 +12640,9 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
         const concat: IrExpr = {
           kind: "strConcat",
           // String-context read: JS's String(unknown) over the field —
-          // the JS-exact dyn walker, never a checked cast.
-          left: { kind: "toString", operand: read, type: STRING, loc },
+          // the JS-exact dyn walker, never a checked cast — with `+`'s
+          // DEFAULT hint (GH #134).
+          left: { kind: "toString", operand: read, hint: "default", type: STRING, loc },
           right: rhs,
           type: STRING,
           loc,

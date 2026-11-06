@@ -71,11 +71,11 @@ test("T195A CAUGHTSTR: thrown dyn values of every kind, an island undefined, and
 // NULLPROTO
 // ============================================================
 
-test("T229A NULLPROTO: an http agent's sockets table is a null-prototype object: String() refuses by name where Node throws", async () => {
-  // Node v24 prints "before\n" and then throws; this tier refuses by name.
+test("T229A NULLPROTO: an http agent's sockets table is a null-prototype object: String() throws Node's TypeError (GH #134)", async () => {
+  // Node v24 prints "before\n" and then throws; so does this tier (GH #134).
   const { stdout, stderr } = await runRowTrap("T229A", "const http = require(\"http\");\nconst a = new http.Agent();\nconsole.log(\"before\");\nconsole.log(String(a.sockets));", "cjs");
   expect(stdout).toBe("before\n");
-  expect(stderr).toContain("converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet");
+  expect(stderr).toBe("Uncaught TypeError: Cannot convert object to primitive value\n");
 });
 
 // ============================================================
