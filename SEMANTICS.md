@@ -1496,6 +1496,14 @@ EMPTY dyn object for them — truthy, `typeof "object"`, `String()`
 `u.a` as `undefined` here and `1` in Node, and a thrown array answers
 `Array.isArray` false here and true there.
 
+*Amendment (GH #127):* a union-typed value no longer reaches the cell
+whole: `throw u` throws the arm it holds, with that arm's own static
+type, so a number, string, boolean, Error, undefined or null arm reads
+back exactly (the split is in the frontend, so every lane; tested on
+wasm and wasm-native by `wasm-gh127-union-throw.test.ts`). Only a
+record, array, closure or non-error class arm is still the empty object
+above.
+
 The neighbours are exact. Scalars convert to their own dyn kinds
 (`throw 42`, `throw "s"`, `throw false`), errors take S021's encoding,
 and a thrown DYN value passes back BY REFERENCE — `throw u` then
@@ -7482,6 +7490,23 @@ is exact for every program that does not write `undefined` into a field that is 
 widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
 cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.
 
+**Amendment (GH #143, U1a's live views): on the wasm and wasm-native lanes the dynamic crossing reads
+by the KEY rule.** Since U1a (and U1b for JavaScript sources) a record entering `any`/`unknown` is not
+converted but shared as a live view (S115), and the view answers its own keys — and through them
+printing, `in`, `Object.keys`/`hasOwn`, JSON and every dynamic reader — by the key surfaces' rule above:
+an optional field holding `undefined` has no key. The second rule's "the conversion to a checked-dynamic
+value" clause no longer applies to the `any`/`unknown` crossing on these lanes (a class instance or a record
+with accessors does not cross there at all — both refuse with SC1090); it still describes the c and llvm
+lanes' conversion. Two cells move: (a) now reaches the view too — `const o: {
+x?: number; b: number } = { x: undefined, b: 2 }; const aq: any = o; console.log(aq, "x" in aq)` prints `{
+b: 2 } false` where Node prints `{ x: undefined, b: 2 } true` (the GH #143 repro); and (d) no longer
+applies through the view — an optional field the program left out prints `{ b: 2 }` through `any`, as
+Node does. Printing the record directly keeps the printing rule (`{ x: undefined, b: 2 }`, Node's). The
+rationale is the entry's own: the slot cannot tell left-out from explicitly-undefined, and the left-out
+field is the common case at a dynamic boundary. **Tested by:**
+`packages/compiler/test/wasm-gh143-optional-undefined-any.test.ts` (the repro pinned with Node's answer
+beside it, the Node-exact cells around it; wasm and wasm-native).
+
 ## S092 — node:diagnostics_channel and AsyncLocalStorage on the wasm lane: ReflectApply's TypeError text is rendered for primitives, plain objects, arrays, Uint8Arrays, promises and errors only, tracePromise fences a non-promise without subscribers and a non-promise thenable, setImmediate as a function value answers undefined and calls its callback with `this` undefined, and channels are never collected *(wasm lane only)*
 
 On the wasm lane `diagnostics_channel` (channels, `subscribe` / `unsubscribe` / `publish`, `bindStore` / `unbindStore` / `runStores`, tracing channels with `traceSync`, `traceCallback` and `tracePromise`) and `AsyncLocalStorage` (`run`, `exit`, `getStore`, `enterWith`, `disable`) are built in the module (`packages/compiler/src/backend/wasm/dc.ts`), transcribed from Node v24.18.1's `lib/diagnostics_channel.js`, `lib/internal/async_local_storage/async_context_frame.js` and `lib/internal/async_context_frame.js` (v24 runs AsyncContextFrame by default). No host operation is added. The ActiveChannel prototype swap, the copy-on-write subscriber list, the wrapStoreRun chain (the last-bound store outermost, a throwing transform skipped), a subscriber's or transform's throw re-raised from a nextTick job (`triggerUncaughtException`, rendered as S007 says), `run`'s ObjectIs shortcut and its restore through `enterWith(prior)`, and the frame carried by every promise job, timer, interval, immediate and nextTick callback (captured when it is scheduled) are Node's. These differ:
@@ -9607,6 +9632,15 @@ own error path where Node runs on:
   `Cannot read properties of null (reading 'm')` themselves), an
   empty-array reshape whose source is not empty, and a call through a function-typed slot the checker
   admitted but this build cannot lower (`… the call has no exact lowering`);
+- a union value the checker narrowed to one member holding another (GH
+  #126 — a dynamic value checked into a discriminated union whose
+  discriminant or shape lied, `JSON.parse('{"kind":"c","n":1}') as U`, then
+  an `if (u.kind === "a") … else u.s` whose else branch reads it as the
+  other member): `a value narrowed to one member of a union holds another
+  member`, code SC1100, where Node reads on (`undefined`). It used to be a
+  bare trap. An exhaustive `switch` over such a discriminant is no fence:
+  the function completes with `undefined`, as Node's does (the slot's
+  undefined, S119), in functions, methods and getters alike;
 - S033's `Cannot add property '<k>' to a fixed-shape object`;
 - S016's non-index member on a dynamic array (or any other receiver the
   dyn tree cannot store a member on) — `Cannot create property '<k>' on

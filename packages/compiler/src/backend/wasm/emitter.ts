@@ -22634,7 +22634,17 @@ class Assembler {
           this.emitIsUndefOnStack({ kind: "union", unionId: e.unionId });
           code.i32Eqz();
           this.openIf();
-          code.unreachable();
+          // GH #126 (SEMANTICS.md S122): the box holds another arm — a
+          // checked dynamic value whose discriminant or shape lied about
+          // its type (`JSON.parse('{"kind":"c"}') as U`, then `u.kind ===
+          // "a"` narrowing the else branch to the other arm). Node reads on
+          // regardless; this tier stops by name, never a bare trap.
+          const at = this.fenceSiteTag(e.loc);
+          this.emitFenceFatal(
+            code,
+            (c) => this.pushStrLitInto(c, "a value narrowed to one member of a union holds another member (a dynamic value checked into the union carried a discriminant or shape its static type does not admit — SEMANTICS.md S122)"),
+            `SC1100${at}`,
+          );
           this.close();
           this.emitSlotUndef(e.type, e.loc);
           this.close();
