@@ -78,6 +78,7 @@ import {
   REF_TRUTHY_KINDS,
   keyedReadRecv,
 } from "../../ir/nodes.js";
+import { readFileSync } from "node:fs";
 import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import {
@@ -28417,7 +28418,7 @@ class Assembler {
         this.walkExpr(e.value);
         if (e.key.kind === "strLit" && e.key.value === "constructor") {
           // GH #135: the class of an error, a primitive or an array.
-          code.call(this.ctorGetHelper(this.ctorKeepsUndefined(e.loc), e.optional === true));
+          code.call(this.ctorGetHelper(this.ctorKeepsUndefined(e.loc), e.optional === true, e.loc));
           this.emitPendingCheck();
           return;
         }
@@ -28770,8 +28771,14 @@ class Assembler {
         // GH #133: an element call (`recvThis`) keeps its read's receiver
         // for `this` (jsOp callFn's own rule).
         const recvT = e.recvThis === true ? this.acquireScratch(dynRef) : -1;
+        const ctorCallee = e.callee;
         if (recvT >= 0) this.emitKeyedReadKeepRecv(e.callee, recvT);
-        else this.walkExpr(e.callee);
+        else if (ctorCallee.kind === "dynKeyGet" && ctorCallee.key.kind === "strLit" && ctorCallee.key.value === "constructor") {
+          // GH #135: `x.constructor(...)` — the miss is a named fence.
+          this.walkExpr(ctorCallee.value);
+          code.call(this.ctorGetHelper(this.ctorKeepsUndefined(ctorCallee.loc), ctorCallee.optional === true, ctorCallee.loc, true));
+          this.emitPendingCheck();
+        } else this.walkExpr(e.callee);
         code.localSet(d);
         code.f64Const(0);
         code.call(this.vecs.newLen(this.dynVecInfo()));
@@ -31019,13 +31026,13 @@ class Assembler {
               });
               code.else_();
               code.localGet(r);
-              this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc));
+              this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc), e.loc);
               this.close();
               this.releaseScratch(dynRef, r);
               this.emitPendingCheck();
               return;
             }
-            this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc));
+            this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc), e.loc);
             this.emitPendingCheck();
             return;
           }
@@ -36295,13 +36302,15 @@ class Assembler {
     return this.mod.sharedDynamic !== true || isJsSourceLoc(loc);
   }
 
-  private ctorGetHelper(keepUndefined: boolean, optional: boolean): number {
-    const key = `${keepUndefined ? "undef" : "fence"}:${optional ? 1 : 0}`;
+  private ctorGetHelper(keepUndefined: boolean, optional: boolean, loc: SrcLoc | undefined, callee = false): number {
+    // A fence names its site, so a helper is per site.
+    const at = this.fenceSiteTag(loc);
+    const key = `${callee ? "call" : keepUndefined ? "undef" : "fence"}:${optional ? 1 : 0}${at}`;
     const hit = this.ctorGetFns.get(key);
     if (hit !== undefined) return hit;
     const dynRef = this.dyn.dynRef();
     const dynT = this.dyn.dynT();
-    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), `%w.dyn.getConstructor:${key}`);
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), `%w.dyn.getConstructor:${this.ctorGetFns.size}`);
     this.ctorGetFns.set(key, idx);
     const w = this.newWalker(1);
     const c = w.c;
@@ -36311,6 +36320,11 @@ class Assembler {
     const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
     const er = this.wlocal(w, errRef);
     const pre = this.wlocal(w, I32);
+    const fence = (text: string): void => {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, text), `SC1090${at}`);
+      c.refNull(dynT);
+      c.return_();
+    };
     c.localGet(0);
     this.pushStrLitInto(c, "constructor");
     c.i32Const(optional ? 1 : 0);
@@ -36333,13 +36347,28 @@ class Assembler {
     c.end();
     c.localGet(0);
     c.structGet(dynT, DYN_KIND);
-    c.localSet(k);
+    c.localTee(k);
+    // An object that HAS a `constructor` member holding undefined (own or
+    // on its chain — `e.constructor = undefined`) answers it.
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    this.dyn.objPayload(c, (x) => x.localGet(0));
+    this.pushStrLitInto(c, "constructor");
+    c.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(r);
+    c.return_();
+    c.end();
+    c.end();
     const answer = (kind: number, name: string): void => {
       c.localGet(k);
       c.i32Const(kind);
       c.i32Eq();
       c.ifVoid();
-      c.call(this.ctorPlaceholderHelper(name, name, 1));
+      c.call(this.ctorPlaceholderHelper(name, name, 1, false));
       c.return_();
       c.end();
     };
@@ -36368,13 +36397,24 @@ class Assembler {
       c.i32Const(meta.pre);
       c.i32Eq();
       c.ifVoid();
-      c.call(this.ctorPlaceholderHelper(meta.def.name, jsName, rt !== undefined ? (rt.lib === "DOMException" ? 0 : 1) : this.ctorLength(meta.def.name)));
-      c.return_();
+      if (meta.def.name === "%Error") {
+        this.emitPlainErrorCtor(c, er, fence);
+      } else if (meta.def.staticNameOrLength === true) {
+        fence("reading 'constructor' of an error whose class declares a static 'name' or 'length' (Node answers the class with them; this tier does not model them — SEMANTICS.md S015)");
+      } else {
+        c.call(this.ctorPlaceholderHelper(meta.def.name, jsName, rt !== undefined ? (rt.lib === "DOMException" ? 0 : 1) : this.ctorLength(meta.def.name), rt === undefined));
+        c.return_();
+      }
       c.end();
     }
     c.end();
+    // An error this tier cannot place (a marker-carrying object, S025).
+    fence("reading 'constructor' of an error this tier cannot attribute to a class (SEMANTICS.md S015)");
     c.end();
-    if (!keepUndefined) {
+    if (callee) {
+      // The callee of `x.constructor(...)`: Node calls the inherited
+      // constructor (`JSON.parse("{}").constructor()` builds an object),
+      // where the miss would throw "is not a function".
       c.localGet(k);
       c.i32Const(DK.UNDEF);
       c.i32Ne();
@@ -36383,11 +36423,18 @@ class Assembler {
       c.i32Ne();
       c.i32And();
       c.ifVoid();
-      this.emitFenceFatal(c, (x) => {
-        this.pushStrLitInto(x, "reading 'constructor' of a dynamic value other than an error, a number, a string, a boolean or an array (Node answers the inherited constructor; this tier does not model it — SEMANTICS.md S015)");
-      }, null);
-      c.refNull(dynT);
-      c.return_();
+      fence("calling a constructor read from a dynamic value (`x.constructor(...)`) is not supported yet on the wasm lane");
+      c.end();
+    } else if (!keepUndefined) {
+      c.localGet(k);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.localGet(k);
+      c.i32Const(DK.NULL);
+      c.i32Ne();
+      c.i32And();
+      c.ifVoid();
+      fence("reading 'constructor' of a dynamic value other than an error, a number, a string, a boolean or an array (Node answers the inherited constructor; this tier does not model it — SEMANTICS.md S015)");
       c.end();
     }
     c.localGet(r);
@@ -36395,9 +36442,78 @@ class Assembler {
     return idx;
   }
 
+  /** The runtime builds several of Node's error classes as a plain `Error`
+   * carrying the class's name (URIError, ReferenceError, AggregateError,
+   * AssertionError, EvalError): an `%Error`'s constructor is read off its
+   * name slot — `Error`, or one of those names while nothing in the
+   * program assigns the `name` of a statically typed `Error` (which writes
+   * the slot); anything else is a named fence. (An `e.name` assigned
+   * through a dynamic value writes the dynamic copy, never the slot.) */
+  private emitPlainErrorCtor(c: Code, er: number, fence: (text: string) => void): void {
+    const exc = this.exc();
+    const named = (name: string, arity: number, isClass: boolean): void => {
+      c.localGet(er);
+      c.structGet(exc.errT, ERR_NAME);
+      this.pushStrLitInto(c, name);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      c.call(this.ctorPlaceholderHelper(`%Error:${name}`, name, arity, isClass));
+      c.return_();
+      c.end();
+    };
+    c.localGet(er);
+    c.structGet(exc.errT, ERR_NAME);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    named("Error", 1, false);
+    if (!this.plainErrorNameWritten()) {
+      named("URIError", 1, false);
+      named("ReferenceError", 1, false);
+      named("EvalError", 1, false);
+      named("AggregateError", 2, false);
+      // node:assert's AssertionError is a JavaScript class in Node.
+      named("AssertionError", 1, true);
+    }
+    c.end();
+    fence("reading 'constructor' of an Error whose name was assigned or that the runtime built under another name (Node answers its own constructor; this tier keeps only the name — SEMANTICS.md S015)");
+  }
+
+  private plainErrorNameWrittenMemo: boolean | null = null;
+  /** Does the program assign `name` on a statically typed `Error`? */
+  private plainErrorNameWritten(): boolean {
+    this.plainErrorNameWrittenMemo ??= this.irNodeReachable(
+      this.mod,
+      (rec) => rec["kind"] === "fieldSet" && rec["className"] === "%Error" && rec["field"] === "name",
+    );
+    return this.plainErrorNameWrittenMemo;
+  }
+
+  private fenceSiteFiles = new Map<string, string | null>();
+  /** ` at <file>:<line>` for a fence's code tag, the form the frontend's
+   * located fences carry (lowerer.ts locateRuntimeFences); "" when the
+   * source cannot be read. */
+  private fenceSiteTag(loc: SrcLoc | undefined): string {
+    if (loc === undefined) return "";
+    let text = this.fenceSiteFiles.get(loc.file);
+    if (text === undefined) {
+      try {
+        text = readFileSync(loc.file, "utf8");
+      } catch {
+        text = null;
+      }
+      this.fenceSiteFiles.set(loc.file, text);
+    }
+    if (text === null) return "";
+    let line = 1;
+    for (let i = 0; i < loc.start && i < text.length; i++) if (text.charCodeAt(i) === 10) line++;
+    return ` at ${loc.file}:${line}`;
+  }
+
   /** A user error class's constructor `length`: its declared parameter
    * count (SEMANTICS.md S020's approximation of a function's `length`). */
   private ctorLength(className: string): number {
+    if (this.classes.meta(className)?.def.implicitCtor === true) return 0;
     const fn = this.funcByName.get(`%${className}.constructor`) ?? this.mod.functions.find((f) => f.name === `%${className}.constructor`);
     return fn === undefined ? 0 : Math.max(0, fn.params.length - 1);
   }
@@ -36405,8 +36521,11 @@ class Assembler {
   /** The interned function value `ctorGetHelper` answers for one class:
    * built once (a global), its own name string as FN_CLOS so strictEq's
    * FN_CLOS identity tells two classes apart (the placeholder discipline
-   * above), SIG -2 so a call is callFn's named fence. */
-  private ctorPlaceholderHelper(key: string, name: string, arity: number): number {
+   * above), SIG -2 so a call is callFn's named fence — SIG -3 for a class
+   * Node defines in JavaScript (a user class, AssertionError), which
+   * util.inspect renders `[class X extends Y]` in Node: inspecting one is
+   * a named fence too. */
+  private ctorPlaceholderHelper(key: string, name: string, arity: number, isClass: boolean): number {
     const hit = this.ctorPlaceholderFns.get(key);
     if (hit !== undefined) return hit;
     const dynRef = this.dyn.dynRef();
@@ -36429,7 +36548,7 @@ class Assembler {
       c,
       (x) => x.localGet(nameLocal),
       (x) => x.refNull(this.dyn.thunkSig()),
-      -2,
+      isClass ? -3 : -2,
       (x) => x.localGet(nameLocal),
       arity,
     );
@@ -36532,9 +36651,9 @@ class Assembler {
    * possibly-drifting copy of the fence-table list. May throw
    * (a nullish receiver, or the fence itself) — the caller owns the
    * pending check. */
-  private emitDynGetProp(code: Code, name: string, keepUndefined = false): void {
+  private emitDynGetProp(code: Code, name: string, keepUndefined = false, loc?: SrcLoc): void {
     if (name === "constructor") {
-      code.call(this.ctorGetHelper(keepUndefined, false));
+      code.call(this.ctorGetHelper(keepUndefined, false, loc));
       return;
     }
     const needsProtoFence =
@@ -36977,7 +37096,7 @@ class Assembler {
         // one jsOp:getProp itself uses) — a real prototype method (e.g.
         // `const {toString} = v`) must read the real function, not
         // `keyGet`'s own-properties-only undefined.
-        this.emitDynGetProp(c, prop.key.value, this.ctorKeepsUndefined(loc));
+        this.emitDynGetProp(c, prop.key.value, this.ctorKeepsUndefined(loc), loc);
       } else {
         // A COMPUTED key (extra or call-shaped): ToPropertyKey reduces
         // to ToString here — this representation has no Symbol kind, so
@@ -37446,7 +37565,7 @@ class Assembler {
       this.walkExpr(read.value);
       code.localTee(recv);
       if (read.key.kind === "strLit" && read.key.value === "constructor") {
-        code.call(this.ctorGetHelper(this.ctorKeepsUndefined(read.loc), false));
+        code.call(this.ctorGetHelper(this.ctorKeepsUndefined(read.loc), false, read.loc, true));
         this.emitPendingCheck();
         return;
       }

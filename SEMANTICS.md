@@ -951,36 +951,59 @@ JSON.parse'd object is the SC1100 "expected number" fence), unchanged.
 
 **Amendment (GH #135, wasm and wasm-native): `x.constructor` answers for
 errors, primitives and arrays.** A dot read of `constructor` (or the
-literal keyed spelling in a JavaScript source) on a dynamic value whose
-own and chain members do not answer it reads the inherited constructor
-where this tier knows it: a caught or crossed error (S021's encoding)
-answers its CLASS — the builtin (`TypeError`, `RangeError`, `SyntaxError`,
-`Error`, `DOMException`) or the user class it was built from (`class Deep
-extends AppError {}` answers `Deep`), never its `name` member, so an
-assigned `e.name` does not rename it — and a number, string, boolean or
-array answers `Number`, `String`, `Boolean` or `Array`. Each answer is one
-function value per class (two TypeErrors' constructors are `===`; a
-TypeError's and a RangeError's are not) carrying the class's `name` and a
-`length` (1 for the builtins, 0 for DOMException; a user class's is its
-constructor's declared parameter count, S020's approximation — an
-implicit derived constructor counts its base's, where Node answers 0),
-and `String()` of it is S019's native-code form (a user class: Node
-prints its source). What it cannot do is loud: calling it
-(`e.constructor("m")`, `x.constructor(...)` with no own member) ends the
-program at a named fence (S122), comparing it with the builtin
-(`e.constructor === TypeError`) meets the builtin-as-a-value fence (a
-compile-time refusal in a TypeScript source), and in a TypeScript source
-of the one dynamic world any other receiver's miss (a plain object, a
-function, a promise) ends at the fence "reading 'constructor' of a
-dynamic value other than an error, a number, a string, a boolean or an
-array", where Node answers `Object` and the rest. Two reads keep this
-entry's silent `undefined`: a JavaScript source (or a program that kept
-the checked-dynamic world) reading `constructor` off any other receiver,
-and a JavaScript keyed read whose key is computed (`e[k]` with `k =
-"constructor"`); the TypeScript keyed forms take U1a's keyed fence. (A
-thrown object, array or `null` LITERAL in a JavaScript source reaches the
-catch as S022's empty object, so its `constructor` reads `undefined`
-there too — S022's divergence, not this one.) **Tested by:**
+literal keyed spelling in a JavaScript source) on a dynamic value with no
+`constructor` member of its own or on its chain (a member holding
+`undefined` counts: `e.constructor = undefined` reads `undefined`) reads
+the inherited constructor where this tier knows it:
+
+- a caught or crossed error (S021's encoding) answers its CLASS, never its
+  `name` member, so an `e.name` assigned through the dynamic value does
+  not rename it. The class is the one the error was built from: a builtin
+  (`TypeError`, `RangeError`, `SyntaxError`, `Error`, `DOMException`) or a
+  user class (`class Deep extends AppError {}` answers `Deep`). The
+  runtime builds URIError, ReferenceError, EvalError, AggregateError and
+  node:assert's AssertionError as a plain `Error` carrying that name, so a
+  plain `Error` answers by its name slot. That slot is `Error`, or one of
+  those five names when nothing in the program assigns `name` on a
+  statically typed `Error` (that assignment writes the slot). Any other
+  slot value ends the program at a named fence (S122): a host error
+  carrying another name, an `Error` renamed through its static type
+  (`err.name = "Custom"`, where Node answers `Error`), or every one of the
+  five once the program contains such an assignment. A user class that
+  declares a static `name` or `length` fences too (Node answers them);
+- a number, string, boolean or array answers `Number`, `String`, `Boolean`
+  or `Array`. A function's `arguments` is an array here (S081), so
+  `arguments.constructor` (Node: `Object`) refuses by name.
+
+Each answer is one function value per class (two TypeErrors' constructors
+are `===`; a TypeError's and a RangeError's are not) carrying the class's
+`name` and `length`: 1 for the builtins, 2 for AggregateError, 0 for
+DOMException, 0 for a user class with no constructor of its own, and
+otherwise its constructor's declared parameter count (S020's
+approximation: a defaulted parameter counts here). `String()` of a builtin
+is the native-code form, as in Node. What it cannot do is loud, at named
+fences: calling it (`e.constructor("m")`, and `x.constructor(...)` with no
+own member, in either language — Node calls the inherited constructor),
+reading any member but `name` and `length` (`e.constructor.prototype`),
+and inspecting it or converting it to a string when it is a class Node
+defines in JavaScript (a user class, AssertionError: Node prints `[class
+AppError extends Error]` and the class's source). Comparing it with the
+builtin (`e.constructor === TypeError`) meets the builtin-as-a-value fence
+(a compile-time refusal in a TypeScript source). In a TypeScript source of
+the one dynamic world, any other receiver's miss (a plain object, a
+function, a promise) ends at the fence "reading 'constructor' of a dynamic
+value other than an error, a number, a string, a boolean or an array",
+where Node answers `Object` and the rest.
+
+Two reads keep this entry's silent `undefined`. The first is a JavaScript
+source (or a program that kept the checked-dynamic world) reading
+`constructor` off any other receiver. The second is a JavaScript keyed
+read whose key is computed (`e[k]` with `k = "constructor"`), and calling
+that read throws "e[k] is not a function" where Node calls the
+constructor. The TypeScript keyed forms take U1a's keyed fence. A thrown
+object, array or `null` LITERAL in a JavaScript source reaches the catch
+as S022's empty object, so its `constructor` reads `undefined` there too;
+that is S022's divergence, not this one. **Tested by:**
 `packages/compiler/test/wasm-gh135-error-constructor.test.ts` (wasm and
 wasm-native, JavaScript and TypeScript, against Node).
 
@@ -7082,6 +7105,13 @@ and static methods (a different, front-end-level construct), not this entry's te
 **Tested by:** S081-1, S081-2, S081-3, S081-5, S081-6, S081-7, S081-8, S081-9, S081-10, S081-11, S081-12
 (each a direct/value twin pair), AGR-1..4 and AGR-o10, and the four LOUD REFUSALS (each a direct/value
 twin pair) in `packages/compiler/test/wasm-funcrest-u3.test.ts`.
+
+*GH #135 (wasm and wasm-native):* `arguments.constructor` would answer
+`Array` here, where Node answers `Object`, so the read refuses by name
+("reading 'constructor' of a function's 'arguments' object"). An
+`arguments` value passed elsewhere first is an array there, and its
+`constructor` answers `Array` (S015's GH #135 amendment). **Tested by:**
+GH135-JS-19 in `packages/compiler/test/wasm-gh135-error-constructor.test.ts`.
 
 ## S082 — `process.nextTick` callbacks and microtasks (`queueMicrotask`, a `Promise` `.then` handler) drain in the SAME relative order on every tsinter lane, regardless of module mode; Node's CommonJS order is not reproduced
 

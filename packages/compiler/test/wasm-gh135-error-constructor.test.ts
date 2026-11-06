@@ -5,10 +5,7 @@
  * `e.message` and `e.stack` the way Node does, for the errors the runtime
  * raises (a nullish member read, a non-callable call, JSON.parse's
  * SyntaxError, an invalid array length) and for user-thrown errors, Error
- * subclasses and non-Error throws (SEMANTICS.md S015's GH #135 amendment).
- * What this tier does not model — calling the constructor, comparing it
- * with the builtin, a TypeScript read off a plain object — stops at a named
- * fence or refuses by name, and those rows pin it.
+ * subclasses and non-Error throws.
  *
  * Every row equals Node (spawned at test time), on the wasm lane and, in
  * the second describe, on the wasm-native lane. */
@@ -100,7 +97,10 @@ class Deep extends AppError {}
 class Bare extends Error {}
 try { throw new AppError("a"); } catch (e) { console.log(e.constructor.name, e.name, e.message, e instanceof AppError, e instanceof Deep, e instanceof Error); }
 try { throw new Deep("d"); } catch (e) { console.log(e.constructor.name, e.name, e.message, e instanceof AppError, e instanceof Deep, e instanceof Error); }
-try { throw new Bare("b"); } catch (e) { console.log(e.constructor.name, e.name, e instanceof Bare, typeof e.constructor); }`,
+try { throw new Bare("b"); } catch (e) { console.log(e.constructor.name, e.name, e instanceof Bare, typeof e.constructor); }
+function grab(f) { try { f(); } catch (e) { return e; } return null; }
+const a = grab(() => { throw new AppError("x"); }), d = grab(() => { throw new Deep("y"); }), b = grab(() => { throw new Bare("z"); });
+console.log(a.constructor.length, d.constructor.length, b.constructor.length);`,
   },
   {
     id: "GH135-JS-05 one constructor per class: two errors of a class share it, two classes do not",
@@ -168,6 +168,68 @@ try { nul.x; } catch (e) { console.log(e.constructor.name, e instanceof TypeErro
 try { throw new RangeError("r"); } catch (e) { console.log(e.constructor.name, e.message); }
 try { throw 5; } catch (e) { console.log(e.constructor.name); }`,
   },
+  {
+    id: "GH135-JS-13 errors the runtime builds as a plain Error under another name keep that class (URIError)",
+    entry: "main.js",
+    src: `try { decodeURIComponent("%"); } catch (e) { console.log(e.name, e.constructor.name, e.constructor.length, e instanceof Error); }
+try { encodeURIComponent("\\uD800"); } catch (e) { console.log(e.name, e.constructor.name); }
+try { throw new Error("plain"); } catch (e) { e.name = "Renamed"; console.log(e.name, e.constructor.name); }`,
+  },
+  {
+    id: "GH135-JS-14 an assigned constructor member answers, undefined included",
+    entry: "main.js",
+    src: `try { throw new TypeError("t"); } catch (e) { e.constructor = undefined; console.log(typeof e.constructor, e.constructor); }
+try { throw new TypeError("t"); } catch (e) { e.constructor = function () { return 10; }; console.log(e.constructor(), typeof e.constructor); }
+const o = JSON.parse("{}"); o.constructor = 5; console.log(o.constructor);`,
+  },
+  {
+    id: "GH135-JS-15 inspecting a builtin error's constructor prints it as Node does",
+    entry: "main.js",
+    src: `try { throw new TypeError("t"); } catch (e) { console.log(e.constructor); }
+try { throw new RangeError("r"); } catch (e) { console.log([e.constructor.name]); }`,
+  },
+  {
+    id: "GH135-JS-16 inspecting a user error class read as a constructor stops at its named fence",
+    entry: "main.js",
+    src: `class AppError extends Error {}
+try { throw new AppError("a"); } catch (e) { console.log("before"); console.log(e.constructor); }`,
+    fence: { text: /inspecting a class read as a dynamic value's constructor .*is not supported yet/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-JS-17 String() of a user error class read as a constructor stops at its named fence",
+    entry: "main.js",
+    src: `class AppError extends Error {}
+try { throw new AppError("a"); } catch (e) { console.log("before"); console.log(String(e.constructor)); }`,
+    fence: { text: /converting a class read as a dynamic value's constructor to a string .*is not supported yet/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-JS-18 a class with a static name stops at its named fence",
+    entry: "main.js",
+    src: `class Named extends Error { static name = "Other"; }
+try { throw new Named("n"); } catch (e) { console.log("before"); console.log(e.constructor.name); }`,
+    fence: { text: /reading 'constructor' of an error whose class declares a static 'name' or 'length' .*\[SC1090 at .*main\.js:2\]/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-JS-19 arguments.constructor stops at its named fence (this tier's arguments is an array)",
+    entry: "main.js",
+    src: `function f() { console.log("before", arguments.length); return arguments.constructor.name; }
+console.log(f(1, 2));`,
+    fence: { text: /reading 'constructor' of a function's 'arguments' object .*S081/, stdout: "before 2\n" },
+  },
+  {
+    id: "GH135-JS-20 calling a plain object's constructor stops at its named fence",
+    entry: "main.js",
+    src: `const o = JSON.parse("{}");
+console.log("before");
+try { const r = o.constructor(); console.log(typeof r); } catch (x) { console.log("caught", x.name); }`,
+    fence: { text: /calling a constructor read from a dynamic value \(`x.constructor\(...\)`\) is not supported yet .*\[SC1090 at .*main\.js:3\]/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-JS-21 reading the prototype of a constructor read from a dynamic value stops at its named fence",
+    entry: "main.js",
+    src: `try { throw new TypeError("t"); } catch (e) { console.log("before"); console.log(typeof e.constructor.prototype); }`,
+    fence: { text: /reading 'prototype' of a constructor read from a dynamic value/, stdout: "before\n" },
+  },
   // ── TypeScript sources ──────────────────────────────────────────────
   {
     id: "GH135-TS-01 catch (e: any): errors the runtime raises",
@@ -197,7 +259,7 @@ class Deep extends AppError {}
 function grab(f: () => void): any { try { f(); } catch (e) { return e; } return null; }
 const a = grab(() => { throw new Deep("x"); }), b = grab(() => { throw new Deep("y"); }), c = grab(() => { throw new AppError("z"); });
 console.log(a.constructor.name, a.name, a.message, a instanceof Error);
-console.log(c.constructor.name, c.constructor.length, a.constructor === b.constructor, a.constructor === c.constructor);
+console.log(c.constructor.name, c.constructor.length, a.constructor.length, a.constructor === b.constructor, a.constructor === c.constructor);
 try { throw new TypeError("t"); } catch (e: any) { e.name = "Renamed"; console.log(e.constructor.name, e?.constructor.name, e.name); }`,
   },
   {
@@ -225,7 +287,7 @@ console.log(r.constructor.name, name(r), r instanceof RangeError, r.constructor 
   {
     id: "GH135-TS-06 a plain object's constructor stops at the S015 fence (Node answers Object)",
     src: `try { throw JSON.parse('{"a":1}'); } catch (e: any) { console.log("before", e.a); console.log(typeof e.constructor); }`,
-    fence: { text: /reading 'constructor' of a dynamic value other than an error, a number, a string, a boolean or an array .*S015/, stdout: "before 1\n" },
+    fence: { text: /reading 'constructor' of a dynamic value other than an error, a number, a string, a boolean or an array .*S015\) \[SC1090 at .*main\.ts:1\]/, stdout: "before 1\n" },
   },
   {
     id: "GH135-TS-07 calling a caught error's constructor stops at its named fence",
@@ -242,6 +304,27 @@ try { nul.x; } catch (e: any) { console.log("before"); const x = e.constructor("
     id: "GH135-TS-09 a keyed constructor read stops at the S015 keyed fence",
     src: `try { throw new TypeError("t"); } catch (e: any) { console.log("before"); console.log(e["constructor"].name); }`,
     fence: { text: /a keyed read of a member a dynamic value inherits from its prototype .*S015\) \[SC1090/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-TS-10 errors the runtime builds as a plain Error under another name: URIError, AssertionError",
+    src: `import assert from "node:assert";
+try { decodeURIComponent("%"); } catch (e: any) { console.log(e.name, e.constructor.name, e.code); }
+try { assert.strictEqual(1, 2); } catch (e: any) { console.log(e.name, e.constructor.name, e.constructor.length); }
+try { throw new Error("plain"); } catch (e: any) { e.name = "Renamed"; console.log(e.name, e.constructor.name); }`,
+  },
+  {
+    id: "GH135-TS-11 a statically renamed plain Error stops at its named fence",
+    src: `const err = new Error("x");
+err.name = "Custom";
+try { throw err; } catch (e: any) { console.log("before", e.name); console.log(e.constructor.name); }`,
+    fence: { text: /reading 'constructor' of an Error whose name was assigned or that the runtime built under another name .*S015/, stdout: "before Custom\n" },
+  },
+  {
+    id: "GH135-TS-12 an assigned constructor member answers, undefined included",
+    src: `try { throw new TypeError("t"); } catch (e: any) { e.constructor = undefined; console.log(typeof e.constructor); }
+const p: any = JSON.parse("{}");
+p.constructor = (n: number) => n + 1;
+console.log(p.constructor(4));`,
   },
 ];
 

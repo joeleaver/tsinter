@@ -931,6 +931,15 @@ export interface IrClassDef {
    * binding name for `const x = class {}`, or "" for truly anonymous
    * expressions. Absent on the runtime-provided defs (never valuable). */
   jsName?: string;
+  /** The class declares a STATIC member named `name` or `length` (GH #135):
+   * the constructor's own `name`/`length` are then not jsName and the
+   * declared parameter count, so the wasm backend's dynamic
+   * `x.constructor` answer fences instead of naming the class. */
+  staticNameOrLength?: true;
+  /** The class declares no constructor of its own (GH #135): its
+   * constructor's `length` is 0 in Node, whatever the synthesized one
+   * forwards to its base. */
+  implicitCtor?: true;
   /** RUNTIME-PROVIDED class (the builtin Error hierarchy): the struct, RC
    * helpers, and vtable live in the runtime (ScrError / scr_error_*), so
    * backends emit no definitions for it — only the preorder-interval
