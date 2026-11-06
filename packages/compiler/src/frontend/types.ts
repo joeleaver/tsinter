@@ -3,7 +3,7 @@ import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
 import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
-import { accessorSlotProp } from "../ir/nodes.js";
+import { accessorSlotProp, shapeFieldCopy } from "../ir/nodes.js";
 // typeKey moved to ir/nodes.ts (the backend needs it too, for per-type
 // helper interning); re-exported here so frontend call sites keep their
 // import path.
@@ -52,11 +52,13 @@ export class ShapeRegistry {
 
   /** The interning key of a canonical field list — shared by intern and
    * finalizeRecursive so the two registration paths can never disagree. */
-  private keyOf(fields: { name: string; type: IrType }[], tuple: boolean, indexValue?: IrType): string {
+  private keyOf(fields: { name: string; type: IrType; internal?: true }[], tuple: boolean, indexValue?: IrType): string {
     return (
       (tuple ? "tuple!" : "") +
       (indexValue ? `idx<${typeKey(indexValue)}>!` : "") +
-      JSON.stringify(fields.map((f) => [f.name, typeKey(f.type)]))
+      // GH #131: an internal slot is identity — a user-spelled "%call"
+      // never collapses into the hybrid shape (nor "%dtype" into Dirent).
+      JSON.stringify(fields.map((f) => (f.internal === true ? [f.name, typeKey(f.type), "internal"] : [f.name, typeKey(f.type)])))
     );
   }
 
@@ -94,7 +96,7 @@ export class ShapeRegistry {
    * registers the structural key (first writer wins — the key may already
    * belong to a structurally identical shape; the recursive id stays
    * authoritative for its own checker type either way). */
-  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true }[], indexValue?: IrType, declaredOrder?: string[]): string {
+  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true; internal?: true }[], indexValue?: IrType, declaredOrder?: string[]): string {
     const id = this.recIds.get(t);
     if (id === undefined) throw new Error("shape registry bug: finalizeRecursive without a placeholder");
     if (this.pendingRec.has(id)) {
@@ -117,7 +119,7 @@ export class ShapeRegistry {
    * value type (`indexValue`) is part of the identity too: the same
    * declared fields with and without an overflow portion — or with
    * differently-typed ones — are different structs. */
-  intern(fields: { name: string; type: IrType; optional?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[],): string {
+  intern(fields: { name: string; type: IrType; optional?: true; internal?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[],): string {
     const key = this.keyOf(fields, tuple, indexValue);
     let id = this.byKey.get(key);
     if (id !== undefined) this.mergeOptional(id, fields);
@@ -1304,8 +1306,8 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     return {
       kind: "record",
       shapeId: ctx.shapes.intern([
-        { name: "%enc", type: STRING },
-        { name: "%pending", type: F64 },
+        { name: "%enc", type: STRING, internal: true },
+        { name: "%pending", type: F64, internal: true },
       ]),
     };
   }
@@ -1991,7 +1993,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       kind: "record",
       shapeId: ctx.shapes.intern(
         [
-          { name: "%dtype", type: F64 },
+          { name: "%dtype", type: F64, internal: true },
           { name: "name", type: STRING },
           { name: "parentPath", type: STRING },
         ],
@@ -2677,11 +2679,11 @@ function mapGenericUtilityAlias(widened: ts.Type, ctx: TypeMapperCtx): IrType | 
   // Partial over an index-signature shape would need `V | undefined`
   // overflow arming; no generic body needs it yet — stay unmapped.
   if (shape.indexValue) return null;
-  const fields: { name: string; type: IrType; optional?: true }[] = [];
+  const fields: { name: string; type: IrType; optional?: true; internal?: true }[] = [];
   for (const f of shape.fields) {
     const armed = withUndefinedArm(f.type, unions);
     if (!armed) return null;
-    fields.push({ name: f.name, type: armed, optional: true });
+    fields.push(shapeFieldCopy(f, armed, true));
   }
   // Fields inherit the source shape's canonical (name-sorted) order — and
   // its declaration order (mapped types preserve property order in TS).
@@ -2883,7 +2885,7 @@ function mapHybridCallableIntersection(widened: ts.Type, ctx: TypeMapperCtx): Ir
   if (!funcPart) return null;
   const fn = mapType(funcPart, ctx);
   if (!fn || fn.kind !== "func") return null;
-  const fields: { name: string; type: IrType; optional?: true }[] = [{ name: "%call", type: fn }];
+  const fields: { name: string; type: IrType; optional?: true; internal?: true }[] = [{ name: "%call", type: fn, internal: true }];
   const declaredOrder: string[] = [];
   for (const p of checker.getPropertiesOfType(widened)) {
     if (p.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return null;

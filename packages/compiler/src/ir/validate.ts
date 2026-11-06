@@ -4052,7 +4052,7 @@ function validateFunction(
             !shape.tuple &&
             shape.indexValue === undefined &&
             shape.fields.length === 3 &&
-            shape.fields[0]!.name === "%dtype" && shape.fields[0]!.type.kind === "f64" &&
+            shape.fields[0]!.name === "%dtype" && shape.fields[0]!.internal === true && shape.fields[0]!.type.kind === "f64" &&
             shape.fields[1]!.name === "name" && shape.fields[1]!.type.kind === "string" &&
             shape.fields[2]!.name === "parentPath" && shape.fields[2]!.type.kind === "string";
           if (!ok) {

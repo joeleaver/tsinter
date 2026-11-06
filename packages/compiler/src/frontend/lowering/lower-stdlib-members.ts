@@ -11,7 +11,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { BOOL, DYN, F64, STRING, UNDEFINED_T, VOID, arrayOf, typeEquals, typeKey, isUnitType } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, STRING, UNDEFINED_T, VOID, accessorSlotProp, arrayOf, isInternalField, typeEquals, typeKey, isUnitType } from "../../ir/nodes.js";
 import type { IrExpr, IrLocal, IrStmt, IrType, SrcLoc } from "../../ir/nodes.js";
 import { bindOnce, droppableStatic, mayHoldSlotUndef, plainFieldPresent, undefRecvGuard, undefinedAsAbsent, undefinedAsText } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
@@ -808,8 +808,10 @@ export function recordHasOwnIndexHelper(L: Lowerer, shapeId: string, loc: SrcLoc
       const t: IrExpr = { kind: "boolLit", value: true, type: BOOL, loc };
       const body: IrStmt[] = [];
       for (const f of shape.fields) {
-        const accessor = f.name.startsWith("%get:") || f.name.startsWith("%set:");
-        if (f.name.startsWith("%") && !accessor) continue;
+        // GH #131: skip only compiler-internal slots — a declared key the
+        // program spelled "%x" is an own property and answers here.
+        const accessor = accessorSlotProp(f.name) !== null;
+        if (isInternalField(shape, f.name)) continue;
         const name = accessor ? f.name.slice(5) : f.name;
         const eq: IrExpr = { kind: "strEq", negated: false, left: k, right: { kind: "strLit", value: name, type: STRING, loc }, type: BOOL, loc };
         const utag = !accessor && f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;

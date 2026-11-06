@@ -8672,7 +8672,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
     const mapped = L.mapTypeOf(L.typeOf(call));
     if (mapped?.kind !== "record") return null;
     const shape = L.shapes.get(mapped.shapeId);
-    const callField = shape?.fields.find((f) => f.name === "%call");
+    const callField = shape?.fields.find((f) => f.name === "%call" && f.internal === true);
     if (!shape || !callField || callField.type.kind !== "func") return null;
     if (call.arguments.length < 2 || call.arguments.some((a) => ts.isSpreadElement(a))) return null;
     const loc = locOf(call);

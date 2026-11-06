@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -3802,7 +3802,7 @@ export class Lowerer {
   hybridCallUnwrap(expr: IrExpr): IrExpr {
     if (expr.type.kind !== "record") return expr;
     const shape = this.shapes.get(expr.type.shapeId);
-    const call = shape?.fields.find((f) => f.name === "%call");
+    const call = shape?.fields.find((f) => f.name === "%call" && f.internal === true);
     if (!call || call.type.kind !== "func") return expr;
     return { kind: "recordGet", obj: expr, shapeId: expr.type.shapeId, field: "%call", type: call.type, loc: expr.loc };
   }
@@ -6274,7 +6274,7 @@ export class Lowerer {
       // An INDEX-SIGNATURE record lifts when its value slot does (dyn
       // included): declared fields write first, then the overflow keys.
       if (shape.indexValue && !this.jsvalLiftable(shape.indexValue, visiting)) return false;
-      return shape.fields.every((f) => !f.name.startsWith("%") && this.jsvalLiftable(f.type, visiting));
+      return shape.fields.every((f) => !isReservedField(shape, f.name) && this.jsvalLiftable(f.type, visiting));
     }
     if (t.kind === "array") return this.jsvalLiftable(t.elem, visiting);
     // A union crossing IN lifts arm by arm (a runtime tag switch — see

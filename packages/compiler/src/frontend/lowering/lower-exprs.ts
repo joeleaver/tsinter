@@ -8,7 +8,7 @@ import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
 import type { ModuleTdz } from "./module-tdz.js";
-import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -6234,7 +6234,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       if (accessorNames.size > 0) {
         const narrowed = shape.fields.filter((f) => !accessorNames.has(f.name));
         const narrowedId = L.shapes.intern(
-          narrowed.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
+          narrowed.map((f) => shapeFieldCopy(f)),
           false,
           shape.indexValue,
         );
@@ -7026,7 +7026,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     if (droppedNames.size > 0) {
       const narrowed = shape.fields.filter((f) => !droppedNames.has(f.name));
       const narrowedId = L.shapes.intern(
-        narrowed.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
+        narrowed.map((f) => shapeFieldCopy(f)),
         false,
         shape.indexValue,
       );
@@ -11193,8 +11193,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       const body: IrStmt[] = [];
       const ret = (value: IrExpr): IrStmt => ({ kind: "return", value, loc });
       for (const f of shape.fields) {
-        const accessor = f.name.startsWith("%get:") || f.name.startsWith("%set:");
-        if (f.name.startsWith("%") && !accessor) continue;
+        // GH #131: skip only compiler-internal slots — a declared key the
+        // program spelled "%x" is an own property and answers here.
+        const accessor = accessorSlotProp(f.name) !== null;
+        if (isInternalField(shape, f.name)) continue;
         const name = accessor ? f.name.slice(5) : f.name;
         const eq: IrExpr = { kind: "strEq", negated: false, left: k, right: { kind: "strLit", value: name, type: STRING, loc }, type: BOOL, loc };
         const utag = !accessor && f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;

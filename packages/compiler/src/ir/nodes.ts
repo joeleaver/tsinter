@@ -1057,8 +1057,15 @@ export interface IrRecordShape {
    * the field with `?` — NOT identity (structurally identical shapes still
    * share one id; the flag ORs across them). Key PRESENCE follows it: a
    * required field is always an own key, an optional one is an own key
-   * exactly while it does not hold undefined (SEMANTICS.md S091). */
-  fields: { name: string; type: IrType; optional?: true }[];
+   * exactly while it does not hold undefined (SEMANTICS.md S091).
+   * `internal` (GH #131): a COMPILER-INTERNAL data slot (Dirent's
+   * `%dtype`, a hybrid's `%call`, StringDecoder's `%enc`/`%pending`) —
+   * never a key the program spelled. Unlike `optional` it IS identity
+   * (ShapeRegistry.keyOf): a user type spelling `"%call"` never shares a
+   * shape with the internal slot, so every key surface may read the flag
+   * instead of guessing from the '%' prefix. Only the internal shapes'
+   * mapType sites set it; shapes derived field by field carry it over. */
+  fields: { name: string; type: IrType; optional?: true; internal?: true }[];
   /** A TUPLE shape (`[string, number]`): fields are exactly "0".."n-1" —
    * one per position, arity = fields.length. Same struct/RC/trace emission
    * as any record; the flag changes the SURFACE (literal-index access,
@@ -1109,6 +1116,42 @@ export function accessorSlotProp(fieldName: string): { kind: "get" | "set"; prop
   if (fieldName.startsWith("%get:")) return { kind: "get", prop: fieldName.slice(5) };
   if (fieldName.startsWith("%set:")) return { kind: "set", prop: fieldName.slice(5) };
   return null;
+}
+
+/** True when `fieldName` is a COMPILER-INTERNAL data slot of `shape`
+ * (the field's `internal` flag — see IrRecordShape.fields) rather than a
+ * key the program spelled. Not the '%' prefix: a program may declare
+ * `"%x"` (sinon's `"%ArrayPrototype%"`), an ordinary own property every
+ * key surface must see (GH #131). Accessor slots (`%get:` / `%set:`, see
+ * accessorSlotProp) are not data slots and answer false here; callers
+ * handle them by name. */
+export function isInternalField(shape: IrRecordShape, fieldName: string): boolean {
+  return shape.fields.some((f) => f.name === fieldName && f.internal === true);
+}
+
+/** `field` with only its identity flags kept ({name, type, optional?,
+ * internal?}) — what a shape DERIVED from another (a narrowing, a
+ * rest, Partial) interns per field, so an internal slot stays internal. */
+export function shapeFieldCopy(
+  f: { name: string; type: IrType; optional?: true; internal?: true },
+  type: IrType = f.type,
+  optional: boolean = f.optional === true,
+): { name: string; type: IrType; optional?: true; internal?: true } {
+  return { name: f.name, type, ...(optional ? { optional: true as const } : {}), ...(f.internal === true ? { internal: true as const } : {}) };
+}
+
+/** True when `fieldName` is a RESERVED slot of `shape` — an accessor
+ * closure slot or a compiler-internal data slot (isInternalField) — and
+ * so not a plain own data property. A declared `"%x"` is not reserved. */
+export function isReservedField(shape: IrRecordShape, fieldName: string): boolean {
+  return accessorSlotProp(fieldName) !== null || isInternalField(shape, fieldName);
+}
+
+/** True when the shape carries at least one reserved slot (see
+ * isReservedField) — the predicate behind the fences that must not treat
+ * a slot as program-visible storage. */
+export function shapeHasReservedFields(shape: IrRecordShape): boolean {
+  return shape.fields.some((f) => isReservedField(shape, f.name));
 }
 
 /** True when the shape carries at least one accessor slot (see

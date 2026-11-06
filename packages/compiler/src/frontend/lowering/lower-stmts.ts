@@ -5,7 +5,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -2706,7 +2706,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           name: f.name,
           value: { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: f.name, spreadCopy: true, type: f.type, loc } as IrExpr,
         })),
-        type: { kind: "record", shapeId: L.shapes.intern(rem.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) }))) },
+        type: { kind: "record", shapeId: L.shapes.intern(rem.map((f) => shapeFieldCopy(f))) },
         loc,
       };
       return L.coerceInto(el, packed, DYN);
@@ -6002,7 +6002,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
         const remaining = shape.fields.filter((f) => !consumed.has(f.name));
         const restShapeId = L.shapes.intern(
-          remaining.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
+          remaining.map((f) => shapeFieldCopy(f)),
           false,
           undefined,
           shape.declaredOrder?.filter((n) => !consumed.has(n)),
