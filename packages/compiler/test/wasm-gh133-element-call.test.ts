@@ -220,6 +220,56 @@ box.f = who;
 a.push(function () { const g = box.f; return box.f.call(undefined) + "/" + g(); });
 console.log(a[2]());`,
   },
+  {
+    id: "GH133-JS-12 an arrow keeps its creator's this through a helper, an object member and an array element",
+    entry: "main.js",
+    src: `'use strict';
+function call1(cb) { return cb(); }
+const o = JSON.parse('{"n":5}');
+o.viaHelper = function () { return call1(() => typeof this); };
+o.viaObj = function () { const h = JSON.parse("{}"); h.cb = () => typeof this; return h.cb(); };
+o.viaArr = function () { const r = JSON.parse("[]"); r.push(() => typeof this); const f = r[0]; return f(); };
+o.viaN = function () { const r = JSON.parse("[]"); r.push(() => this.n); return r[0]() + call1(() => this.n); };
+console.log(o.viaHelper.call(o), o.viaObj.call(o), o.viaArr.call(o), o.viaN.call(o));`,
+  },
+  {
+    id: "GH133-JS-13 an element-called arrow does not see the array as this",
+    entry: "main.js",
+    src: `'use strict';
+const o = JSON.parse('{"n":1}');
+o.mk = function () {
+  const r = JSON.parse("[]");
+  r.push(() => this === o, () => Array.isArray(this), function () { return Array.isArray(this); });
+  let i = 1;
+  return [r[0](), r[i](), r["0"](), r[2]()].join(" ");
+};
+console.log(o.mk.call(o));`,
+  },
+  {
+    id: "GH133-JS-14 nested arrows keep the lexical this",
+    entry: "main.js",
+    src: `'use strict';
+function later(cb) { return cb(); }
+const o = JSON.parse('{"tag":"T"}');
+o.label = function () { const xs = JSON.parse("[1,2]"); return xs.map((x) => later(() => this.tag)).join(","); };
+o.inner = function () { const f = function () { return 1; }; return f() + "/" + (() => typeof this)() + "/" + (() => () => this.tag)()(); };
+console.log(o.label.call(o), o.inner.call(o));`,
+  },
+  {
+    id: "GH133-JS-15 template-literal and unary keys spell as V8 prints them",
+    entry: "main.js",
+    src: `${T}
+const a = JSON.parse("[]");
+let i = 0;
+t(() => a[\`0\`]());
+t(() => a[\`\${i}\`]());
+t(() => a[\`x\${i}y\${a}z\`]());
+t(() => a[+i]());
+t(() => a[--i]());
+t(() => a[++i]());
+t(() => a[i--]());
+t(() => a[~i]());`,
+  },
   // ── TypeScript sources ──────────────────────────────────────────────
   {
     id: "GH133-TS-01 an any[] element called by literal and computed index (the issue's TS repro)",
@@ -289,6 +339,23 @@ const m = "push";
 console.log("before");
 console.log(arr[m](3));`,
     fence: { text: /a keyed read of a member a dynamic value inherits from its prototype .*S015\) \[SC1090/, stdout: "before\n" },
+  },
+  {
+    id: "GH133-TS-07 a TypeScript method call of a JavaScript arrow keeps the arrow's lexical this",
+    files: {
+      "lib.js": `export function mk() {
+  const obj = JSON.parse('{"tag":"T"}');
+  obj.ar = () => typeof this;
+  obj.label = function () { const xs = JSON.parse("[1,2]"); return xs.map((x) => this.tag).join(","); };
+  obj.inner = function () { const r = JSON.parse("[]"); r.push(() => this === obj); return r[0](); };
+  return obj;
+}
+`,
+    },
+    src: `import { mk } from "./lib.js";
+const m: any = mk();
+const k = "ar";
+console.log(m.ar(), m[k](), m.label(), m.inner());`,
   },
   {
     id: "GH133-TS-05 a typed function array is unaffected",

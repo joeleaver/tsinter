@@ -12,7 +12,7 @@ import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, 
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
-import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
+import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
 import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
@@ -1847,6 +1847,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
     const isAsync = L.asyncInitFiles.has(sf);
     const ctx = newFnCtx(false, null, null, VOID);
     ctx.isAsync = isAsync;
+    if (isJsSourceFile(sf)) ctx.lexThisOk = true; // GH #133 review: FnCtx.lexThis
     L.fnStack.push(ctx);
     try {
       const loc0: SrcLoc = { file: sf.fileName, start: 0, end: 0 };
@@ -2075,6 +2076,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         at++;
       }
       const loc: SrcLoc = { file: sf.fileName, start: 0, end: 0 };
+      if (ctx.lexThis) body.unshift(lexThisEntry(ctx.lexThis, loc));
       return {
         name,
         params: [],

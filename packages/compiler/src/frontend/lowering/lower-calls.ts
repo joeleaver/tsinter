@@ -9,7 +9,7 @@ import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam,
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
-import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, newFnCtx, nodeThrowExpr } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
@@ -6186,6 +6186,64 @@ const inliningPredicates = new Set<ts.Symbol>();
    * object-literal shorthand method to a module-level function and yields
    * the `closure` expression creating it. */
   export function lowerLambda(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
+    // GH #133 review: a JavaScript ARROW's `this` is lexical — the `this`
+    // of the code that CREATES it, fixed then. Where no binding is in
+    // scope (the creator is a plain function or the module, whose `this`
+    // is the ambient receiver dyn.this reads), the creator reads its
+    // receiver into a hidden local as the arrow is created, and the
+    // arrow's `this` reads that local through the ordinary capture
+    // machinery — so no call made later (a helper invoking it, an element
+    // or method call through it, a plain-call bracket) can change it.
+    // A creator whose body assembly supports it (FnCtx.lexThisOk: lambdas,
+    // declarations, module inits) reads its receiver ONCE, at entry, into
+    // `%lexthis` — its own `this` reads resolve there too; any other
+    // creator reads it as each arrow is created.
+    if (ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile()) && arrowReadsThis(node) && L.resolveThis() === null) {
+      if (L.ctx.lexThisOk) {
+        L.ctx.lexThis ??= L.declareHiddenLocal("%lexthis", DYN);
+        L.ctx.scopes[0]!.set(THIS_BINDING, L.ctx.lexThis);
+        return lowerLambdaInner(L, node, opts);
+      }
+      const scope = L.ctx.scopes[L.ctx.scopes.length - 1]!;
+      const lexThis = L.declareHiddenLocal("%lexthis", DYN);
+      scope.set(THIS_BINDING, lexThis);
+      let closure: IrExpr;
+      try {
+        closure = lowerLambdaInner(L, node, opts);
+      } finally {
+        scope.delete(THIS_BINDING);
+      }
+      const loc = locOf(node);
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "varDecl", localId: lexThis.id, init: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, loc }],
+        result: closure,
+        type: closure.type,
+        loc,
+      };
+    }
+    return lowerLambdaInner(L, node, opts);
+  }
+
+/** Does this arrow read `this` — its own body or a nested arrow's (nested
+ * functions, methods and classes have their own)? */
+function arrowReadsThis(fn: ts.ArrowFunction): boolean {
+  let found = false;
+  ts.walkPreorder(fn.body, (n) => {
+    if (n.kind === ts.SyntaxKind.ThisKeyword) {
+      found = true;
+      return "stop";
+    }
+    if (ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) || ts.isAccessor(n) ||
+        ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+      return "skip";
+    }
+    return undefined;
+  });
+  return found;
+}
+
+function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
     const loc = locOf(node);
     const { shapes, funcType } = L.lambdaSignature(node);
     // A lambda IS a value: the exact-arity rule applies at birth. The
@@ -6230,6 +6288,7 @@ const inliningPredicates = new Set<ts.Symbol>();
       : L.bodyReturnType(isAsync, funcType.ret);
 
     const fnCtx = newFnCtx(true, selfSymbol, funcType, bodyReturn);
+    if (!ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile())) fnCtx.lexThisOk = true;
     fnCtx.isAsync = isAsync;
     if (isGenerator && funcType.ret.kind === "generator") {
       fnCtx.generator = { yieldT: funcType.ret.yieldT, nextT: funcType.ret.nextT };
@@ -6307,7 +6366,7 @@ const inliningPredicates = new Set<ts.Symbol>();
                 ];
         }
       }
-      body = [...prologue, ...body];
+      body = [...(fnCtx.lexThis ? [lexThisEntry(fnCtx.lexThis, loc)] : []), ...prologue, ...body];
       // Bare-expression bodies never pass through lowerStmts, so the
       // lib-boundary chokepoint runs here (idempotent for block bodies,
       // whose statements were already walked). A fence poisons the
@@ -8496,6 +8555,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
       ? L.genBodyReturnType(sig.returnType)
       : L.bodyReturnType(sig.isAsync === true, sig.returnType);
     const ctx = newFnCtx(false, null, null, bodyReturn);
+    if (isJsSourceFile(decl.getSourceFile())) ctx.lexThisOk = true; // GH #133 review: FnCtx.lexThis
     ctx.isAsync = sig.isAsync === true;
     if (sig.generator !== undefined) ctx.generator = sig.generator;
     const diagsBefore = L.diags.length;
@@ -8515,6 +8575,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
         L.unsupported("SC1090", decl, "function declarations whose block body the frontend cannot locate");
       }
       const body = [...prologue, ...scopeEntryFences(L, decl), ...L.lowerStmts(bodyBlock.statements)];
+      if (ctx.lexThis) body.unshift(lexThisEntry(ctx.lexThis, locOf(decl)));
       appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(decl));
       const fn: IrFunction = {
         name: sig.name,
@@ -9741,7 +9802,7 @@ function v8Render(n: ts.Expression, top = false): string | null {
     const o = v8Render(n.expression);
     if (o === null) return null;
     const k = n.argumentExpression;
-    if (ts.isStringLiteral(k)) return /[\\]/.test(k.getText()) ? null : `${o}.${k.text}`;
+    if (ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k)) return /[\\]/.test(k.getText()) ? null : `${o}.${k.text}`;
     const kr = v8Render(k);
     return kr === null ? null : `${o}[${kr}]`;
   }
@@ -9766,7 +9827,8 @@ function v8Render(n: ts.Expression, top = false): string | null {
       return v === null ? null : String(-Number(v));
     }
     const op = n.operator === ts.SyntaxKind.MinusToken ? "-" : n.operator === ts.SyntaxKind.ExclamationToken ? "!"
-      : n.operator === ts.SyntaxKind.TildeToken ? "~" : null;
+      : n.operator === ts.SyntaxKind.TildeToken ? "~" : n.operator === ts.SyntaxKind.PlusToken ? "+"
+      : n.operator === ts.SyntaxKind.PlusPlusToken ? "++" : n.operator === ts.SyntaxKind.MinusMinusToken ? "--" : null;
     const o = op === null ? null : v8Render(n.operand);
     return o === null ? null : `(${op}${o})`;
   }
@@ -9774,9 +9836,15 @@ function v8Render(n: ts.Expression, top = false): string | null {
     const o = v8Render(n.operand);
     return o === null ? null : `(${o}${n.operator === ts.SyntaxKind.PlusPlusToken ? "++" : "--"})`;
   }
-  if (ts.isTypeOfExpression(n)) {
+  if (ts.isTypeOfExpression(n) || ts.isVoidExpression(n)) {
     const o = v8Render(n.expression);
-    return o === null ? null : `(typeof ${o})`;
+    return o === null ? null : `(${ts.isTypeOfExpression(n) ? "typeof" : "void"} ${o})`;
+  }
+  if (ts.isTemplateExpression(n)) {
+    // V8 prints a template's substitutions run together (`a[`x${i}y${a}z`]`
+    // reads `a[ia]`).
+    const parts = n.templateSpans.map((s) => v8Render(s.expression));
+    return parts.some((p) => p === null) ? null : parts.join("");
   }
   return null;
 }

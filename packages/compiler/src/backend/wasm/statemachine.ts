@@ -1882,7 +1882,14 @@ export class FunctionLowering {
     // touched yet at this point in the pass): any `dyn.this` libCall
     // anywhere in a suspendable function's body — async or generator —
     // declines before any transformation runs.
-    if (anyNode(fn.body, (rec) => rec["kind"] === "libCall" && rec["fn"] === "dyn.this")) {
+    // One read IS safe: a function's own entry read of its receiver for
+    // its arrows' lexical `this` (GH #133 review, the frontend's
+    // lexThisEntry — `%lexthis` as the body's first statement), which runs
+    // before the first suspension point, inside the caller's bracket.
+    const entry = fn.body[0] as unknown as Record<string, unknown> | undefined;
+    const entryRead = entry !== undefined && entry["kind"] === "varDecl" &&
+      typeof entry["localId"] === "string" && (entry["localId"] as string).startsWith("%lexthis.");
+    if (anyNode(entryRead ? fn.body.slice(1) : fn.body, (rec) => rec["kind"] === "libCall" && rec["fn"] === "dyn.this")) {
       this.decline("libCall:dyn.this:suspending");
     }
     // The initializer wrapper writes both caches by ASSIGNING the module

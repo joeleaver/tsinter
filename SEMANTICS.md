@@ -3162,7 +3162,22 @@ dispatch, `apply`/`call`, an element call) read THAT call's receiver where
 Node's strict-mode plain call reads `undefined` (`a[0]()` over
 `[function () { return who(); }]` printed "bound"; GH133-JS-11). A plain
 call through a TYPED function value (`const g = who; g()` where `g` keeps a
-function type) still reads the enclosing receiver.
+function type) still reads the enclosing receiver. A JavaScript ARROW's
+`this` is now lexical, as in Node: where its creator has no `this` binding
+of its own (a plain function or the module), the creator's ambient
+receiver is read when the arrow is CREATED and the arrow keeps it, so a
+later call through a helper, an object member, an array element or a
+method call (`o.cb()`, `r[0]()`, a TypeScript `m.obj.ar()` over a
+JavaScript arrow) no longer changes it — before, the arrow read whatever
+receiver was ambient when it RAN (`() => typeof this` handed to a helper
+from a method printed `undefined`, called as `r[0]()` it saw `r`;
+GH133-JS-12..14, GH133-TS-07). A plain `function` nested in another
+JavaScript function or method no longer captures that function's `this`
+binding: it has its own, as in Node (GH133-JS-13). Still different: a SLOPPY-mode plain
+function called plainly sees `this` as `undefined` where Node passes
+`globalThis` (`function f() { return typeof this }; f()` prints
+`undefined`, Node `object`); strict-mode code, which most modules are, is
+unaffected.
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
@@ -3401,7 +3416,7 @@ different, each as before:
   on main;
 - the c and llvm lanes are unchanged.
 **Tested by:** `packages/compiler/test/wasm-gh133-element-call.test.ts`
-(GH133-JS-01..10, GH133-TS-01..06, both lanes) and A3-MCALL-09.
+(GH133-JS-01..15, GH133-TS-01..07, both lanes) and A3-MCALL-09.
 
 **Amendment (unit F1): an island RegExp value.** A RegExp crossing into
 `any` (the boundary's `new RegExp(re.source, re.flags)` over a regex
