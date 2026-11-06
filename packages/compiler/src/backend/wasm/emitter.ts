@@ -1953,18 +1953,24 @@ function rejectionHandledReachable(mod: WModule): boolean {
   return found;
 }
 
-export function emitWasmModule(mod: IrModule): Uint8Array {
+/** The program's source texts while a module is emitted (emitWasmModule's
+ * `sourceTexts`): what a backend-built fence reads its line from. */
+let fenceSourceTexts: ReadonlyMap<string, string> | null = null;
+
+export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, string>): Uint8Array {
   // The resumable lowering shares the sink: a function it declines names
   // itself in the same census the walk feeds, and on this path throws out
   // of the pass exactly like a construct the walk refuses would.
   const refuse: Refuse = (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
   };
+  fenceSourceTexts = sourceTexts ?? null;
   try {
     const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
     asm.run();
     return asm.finish();
   } finally {
+    fenceSourceTexts = null;
     setFlatCrossing(null);
     setCharsType(null);
   }
@@ -2712,6 +2718,17 @@ const NUM_PROTO_METHOD_ARITY: ReadonlyMap<string, number> = new Map([
  * function-valued too, Node-measured on every kind's chain: `typeof
  * (5).__defineGetter__` is "function", same for string/boolean/array/
  * object receivers). */
+/** The names the runtime builds a plain `Error` under (GH #135), `Error`
+ * first. */
+const RUNTIME_PLAIN_ERROR_NAMES = ["Error", "URIError", "ReferenceError", "EvalError", "AggregateError", "AssertionError"];
+
+/** A JavaScript source's location (the frontend's isJsSourceFileName):
+ * where SEMANTICS.md S015's own-members answer is kept (U1b) and the
+ * TypeScript-only fences (U1a) stay off. */
+function isJsSourceLoc(loc: SrcLoc | undefined): boolean {
+  return loc !== undefined && /\.(js|mjs|cjs|jsx)$/.test(loc.file);
+}
+
 const OBJECT_PROTO_MEMBERS: ReadonlySet<string> = new Set([
   "hasOwnProperty",
   "isPrototypeOf",
@@ -3380,7 +3397,11 @@ class Assembler {
             (rec["kind"] === "jsOp" &&
               (rec["op"] === "getProp" || rec["op"] === "callMethod" || rec["op"] === "optCallMethod") &&
               rec["name"] === "constructor") ||
-            (rec["kind"] === "dynInvoke" && rec["method"] === "constructor"),
+            (rec["kind"] === "dynInvoke" && rec["method"] === "constructor") ||
+            // GH #135: a checked-dynamic `x.constructor` read.
+            (rec["kind"] === "dynKeyGet" &&
+              (rec["key"] as { kind?: string; value?: unknown } | undefined)?.kind === "strLit" &&
+              (rec["key"] as { value?: unknown }).value === "constructor"),
         ) &&
         this.irNodeReachable(mod, crossing((t) => t.kind === "bytes" || (t.kind === "union" && unionHasBytes(t.unionId))));
       this.urlDynLive = this.irNodeReachable(mod, (rec) => {
@@ -20360,9 +20381,18 @@ class Assembler {
             this.close();
             code.localGet(o);
             code.localGet(v);
-            code.structSet(this.exc().errT, slot);
+            // GH #135: a name write keeps the built name it would erase.
+            if (slot === ERR_NAME) code.call(this.errNameWriteHelper());
+            else code.structSet(this.exc().errT, slot);
             this.releaseScratch(this.strRef, v);
             this.releaseScratch(errRef, o);
+            return;
+          }
+          if (slot === ERR_NAME) {
+            // GH #135: the name the error was built with outlives a rename.
+            this.walkExpr(s.obj);
+            this.walkExpr(s.value);
+            code.call(this.errNameWriteHelper());
             return;
           }
           this.walkExpr(s.obj);
@@ -28404,6 +28434,12 @@ class Assembler {
        * checks come free; the check here is for the throw inside. */
       case "dynKeyGet": {
         this.walkExpr(e.value);
+        if (e.key.kind === "strLit" && e.key.value === "constructor") {
+          // GH #135: the class of an error, a primitive or an array.
+          code.call(this.ctorGetHelper(this.ctorKeepsUndefined(e.loc), e.optional === true, e.loc));
+          this.emitPendingCheck();
+          return;
+        }
         this.walkExpr(e.key);
         code.i32Const(e.optional === true ? 1 : 0);
         code.call(this.dyn.keyGet());
@@ -28753,8 +28789,14 @@ class Assembler {
         // GH #133: an element call (`recvThis`) keeps its read's receiver
         // for `this` (jsOp callFn's own rule).
         const recvT = e.recvThis === true ? this.acquireScratch(dynRef) : -1;
+        const ctorCallee = e.callee;
         if (recvT >= 0) this.emitKeyedReadKeepRecv(e.callee, recvT);
-        else this.walkExpr(e.callee);
+        else if (ctorCallee.kind === "dynKeyGet" && ctorCallee.key.kind === "strLit" && ctorCallee.key.value === "constructor") {
+          // GH #135: `x.constructor(...)` — the miss is a named fence.
+          this.walkExpr(ctorCallee.value);
+          code.call(this.ctorGetHelper(this.ctorKeepsUndefined(ctorCallee.loc), ctorCallee.optional === true, ctorCallee.loc, true));
+          this.emitPendingCheck();
+        } else this.walkExpr(e.callee);
         code.localSet(d);
         code.f64Const(0);
         code.call(this.vecs.newLen(this.dynVecInfo()));
@@ -31002,13 +31044,13 @@ class Assembler {
               });
               code.else_();
               code.localGet(r);
-              this.emitDynGetProp(code, name);
+              this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc), e.loc);
               this.close();
               this.releaseScratch(dynRef, r);
               this.emitPendingCheck();
               return;
             }
-            this.emitDynGetProp(code, name);
+            this.emitDynGetProp(code, name, this.ctorKeepsUndefined(e.loc), e.loc);
             this.emitPendingCheck();
             return;
           }
@@ -36249,63 +36291,417 @@ class Assembler {
    * — so a placeholder can never coincidentally `===` a real function
    * either (zz6c's own probe). */
   private nativeMethodPlaceholderFns = new Map<string, number>();
-  private errCtorGetFn: number | null = null;
-  /** `e.constructor` on a dynamic value: an ERROR (the %error encoding —
-   * a caught or thrown error, the unit-H view-write and hole errors among
-   * them) answers a function value NAMED like its constructor, so
-   * `e.constructor.name` reads "TypeError" as in Node; calling it is a
-   * named refusal (callFn's SIG -2). Every other value reads as before. */
-  private errCtorGetHelper(): number {
-    if (this.errCtorGetFn !== null) return this.errCtorGetFn;
+  private ctorGetFns = new Map<string, number>();
+  private ctorPlaceholderFns = new Map<string, number>();
+  /** GH #135: `x.constructor` read off a dynamic value, `(d) -> dyn`. The
+   * keyed read comes first (an own or chain member, a typed array's
+   * constructor, a nullish receiver's TypeError — or, `optional`, its
+   * undefined); when it answers `undefined`:
+   * - an ERROR (the %error encoding, S021) answers its CLASS, read off the
+   *   error's own vt interval — the builtin (`TypeError`) or the user
+   *   class (`class Deep extends AppError`, NamedEvaluation's name), never
+   *   its `name` member (an assigned `e.name` does not rename the class);
+   * - a number, string, boolean or array answers Number, String, Boolean
+   *   or Array (those kinds have no other prototype on this tier).
+   * Each answer is ONE interned function value per class, so two errors
+   * of one class read `===` constructors; it carries the class's `name`
+   * and `length`, and calling it is a named fence (callFn's SIG -2). The
+   * builtin itself is not a value here (`e.constructor === TypeError`
+   * meets that named fence). Anything else keeps the read's `undefined`
+   * (`keepUndefined`: SEMANTICS.md S015's body, a JavaScript source by its
+   * U1b amendment) or ends at a named fence (a TypeScript source in the
+   * one dynamic world, U1a's amendment), where Node answers the inherited
+   * constructor. */
+  /** Whether a `constructor` read at `loc` keeps S015's own-members
+   * `undefined` on a miss (a JavaScript source, or a program that kept the
+   * checked-dynamic world) rather than U1a's fence (a TypeScript source in
+   * the one dynamic world). */
+  private ctorKeepsUndefined(loc: SrcLoc | undefined): boolean {
+    return this.mod.sharedDynamic !== true || isJsSourceLoc(loc);
+  }
+
+  private ctorGetHelper(keepUndefined: boolean, optional: boolean, loc: SrcLoc | undefined, callee = false): number {
+    // A fence names its site, so a helper is per site.
+    const at = this.fenceSiteTag(loc);
+    const key = `${callee ? "call" : keepUndefined ? "undef" : "fence"}:${optional ? 1 : 0}${at}`;
+    const hit = this.ctorGetFns.get(key);
+    if (hit !== undefined) return hit;
     const dynRef = this.dyn.dynRef();
-    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), "%w.jsval.getProp:constructor:err");
-    this.errCtorGetFn = idx;
+    const dynT = this.dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), `%w.dyn.getConstructor:${this.ctorGetFns.size}`);
+    this.ctorGetFns.set(key, idx);
     const w = this.newWalker(1);
     const c = w.c;
-    const nm = this.wlocal(w, dynRef);
+    const r = this.wlocal(w, dynRef);
+    const k = this.wlocal(w, I32);
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const er = this.wlocal(w, errRef);
+    const pre = this.wlocal(w, I32);
+    const fence = (text: string): void => {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, text), `SC1090${at}`);
+      c.refNull(dynT);
+      c.return_();
+    };
+    c.localGet(0);
+    this.pushStrLitInto(c, "constructor");
+    c.i32Const(optional ? 1 : 0);
+    c.call(this.dyn.keyGet());
+    c.localTee(r);
+    // A null answer is a pending exception (the nullish receiver's
+    // TypeError, a throwing getter): the caller's pending check owns it.
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(r);
+    c.return_();
+    c.end();
+    c.localGet(r);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Ne();
+    c.ifVoid();
+    c.localGet(r);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localTee(k);
+    // An object that HAS a `constructor` member holding undefined (own or
+    // on its chain — `e.constructor = undefined`) answers it.
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    this.dyn.objPayload(c, (x) => x.localGet(0));
+    this.pushStrLitInto(c, "constructor");
+    c.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(r);
+    c.return_();
+    c.end();
+    c.end();
+    const answer = (kind: number, name: string): void => {
+      c.localGet(k);
+      c.i32Const(kind);
+      c.i32Eq();
+      c.ifVoid();
+      c.call(this.ctorPlaceholderHelper(name, name, 1, false));
+      c.return_();
+      c.end();
+    };
+    answer(DK.NUM, "Number");
+    answer(DK.STR, "String");
+    answer(DK.BOOL, "Boolean");
+    answer(DK.ARR, "Array");
     c.localGet(0);
     c.call(this.dyn.isError());
     c.ifVoid();
     c.localGet(0);
-    this.pushStrLitInto(c, "name");
-    c.i32Const(0);
-    c.call(this.dyn.keyGet());
-    c.localSet(nm);
-    this.dyn.boxFn(
-      c,
-      (x) => x.localGet(0),
-      (x) => x.refNull(this.dyn.thunkSig()),
-      -2,
-      (x) => {
-        x.localGet(nm);
-        x.call(this.dyn.toStr());
-      },
-      1,
-    );
-    c.return_();
+    c.call(this.dyn.toError());
+    c.localTee(er);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(er);
+    c.structGet(exc.errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.localSet(pre);
+    for (const meta of this.classes.errorClasses()) {
+      const rt = RUNTIME_ERROR_CLASSES.get(meta.def.name);
+      const jsName = rt !== undefined ? rt.lib : meta.def.jsName;
+      if (jsName === undefined) continue;
+      c.localGet(pre);
+      c.i32Const(meta.pre);
+      c.i32Eq();
+      c.ifVoid();
+      if (meta.def.name === "%Error") {
+        this.emitPlainErrorCtor(c, er);
+      } else if (meta.def.staticNameOrLength === true) {
+        fence("reading 'constructor' of an error whose class declares a static 'name' or 'length' (Node answers the class with them; this tier does not model them — SEMANTICS.md S015)");
+      } else {
+        c.call(this.ctorPlaceholderHelper(meta.def.name, jsName, rt !== undefined ? (rt.lib === "DOMException" ? 0 : 1) : this.ctorLength(meta.def.name), rt === undefined));
+        c.return_();
+      }
+      c.end();
+    }
     c.end();
-    c.localGet(0);
-    this.emitDynGetPropFenced(c, "constructor");
+    // An error this tier cannot place (a marker-carrying object, S025).
+    fence("reading 'constructor' of an error this tier cannot attribute to a class (SEMANTICS.md S015)");
+    c.end();
+    if (callee) {
+      // The callee of `x.constructor(...)`: Node calls the inherited
+      // constructor (`JSON.parse("{}").constructor()` builds an object),
+      // where the miss would throw "is not a function".
+      c.localGet(k);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.localGet(k);
+      c.i32Const(DK.NULL);
+      c.i32Ne();
+      c.i32And();
+      c.ifVoid();
+      fence("calling a constructor read from a dynamic value (`x.constructor(...)`) is not supported yet on the wasm lane");
+      c.end();
+    } else if (!keepUndefined) {
+      c.localGet(k);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.localGet(k);
+      c.i32Const(DK.NULL);
+      c.i32Ne();
+      c.i32And();
+      c.ifVoid();
+      fence("reading 'constructor' of a dynamic value other than an error, a number, a string, a boolean or an array (Node answers the inherited constructor; this tier does not model it — SEMANTICS.md S015)");
+      c.end();
+    }
+    c.localGet(r);
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }
 
-  /** emitDynGetProp's own route for `name` (no constructor special case). */
-  private emitDynGetPropFenced(code: Code, name: string): void {
-    const needsProtoFence =
-      NUM_PROTO_METHOD_ARITY.has(name) ||
-      OBJECT_PROTO_MEMBERS.has(name) ||
-      ARRAY_PROTO_MEMBERS.has(name) ||
-      STRING_PROTO_MEMBERS.has(name) ||
-      BOOLEAN_PROTO_MEMBERS.has(name) ||
-      FUNCTION_PROTO_MEMBERS.has(name);
-    if (needsProtoFence) {
-      code.call(this.protoFenceGetPropHelper(name));
-    } else {
-      this.pushStrLitInto(code, name);
-      code.i32Const(0);
-      code.call(this.dyn.keyGet());
+  /** The runtime builds several of Node's error classes as a plain `Error`
+   * carrying the class's name (URIError, ReferenceError, AggregateError,
+   * AssertionError, EvalError): an `%Error`'s constructor is read off the
+   * name it was BUILT with (errOrigNameHelper — a rename never moves it);
+   * any other name answers Error. (An `e.name` assigned through a dynamic
+   * value writes the dynamic copy, never the slot.) */
+  private emitPlainErrorCtor(c: Code, er: number): void {
+    const named = (name: string, arity: number, isClass: boolean): void => {
+      c.localGet(er);
+      c.call(this.errOrigNameHelper());
+      this.pushStrLitInto(c, name);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      c.call(this.ctorPlaceholderHelper(`%Error:${name}`, name, arity, isClass));
+      c.return_();
+      c.end();
+    };
+    c.localGet(er);
+    c.call(this.errOrigNameHelper());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    named("URIError", 1, false);
+    named("ReferenceError", 1, false);
+    named("EvalError", 1, false);
+    named("AggregateError", 2, false);
+    // node:assert's AssertionError is a JavaScript class in Node.
+    named("AssertionError", 1, true);
+    c.end();
+    // `Error`, a rename of one (errNameWriteHelper records only what could
+    // change the answer), or a host error carrying another name (S015).
+    c.call(this.ctorPlaceholderHelper("%Error:Error", "Error", 1, false));
+    c.return_();
+  }
+
+  /* GH #135: the name a plain Error was BUILT with. The runtime builds
+   * URIError, ReferenceError, EvalError, AggregateError and AssertionError
+   * as a plain Error carrying that name, so the name slot is the class —
+   * until a statically typed write (`err.name = "X"`, the only writer of
+   * the slot) renames it. That write records the slot's previous value
+   * here first, once per error and only when the rename could change the
+   * answer (errNameWriteHelper), in a linked list keyed by identity like
+   * dyn.ts's error-box cache. Entries are never removed: SEMANTICS.md S015
+   * registers the cost. */
+  private errOrigType: number | null = null;
+  private errOrigHead: number | null = null;
+  private errOrigT(): number {
+    if (this.errOrigType !== null) return this.errOrigType;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const strRef = this.strRef;
+    this.errOrigType = this.mb.selfStructType("err:origName", (self) => [
+      { storage: errRef, mutable: false },
+      { storage: strRef, mutable: false },
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: false },
+    ]);
+    return this.errOrigType;
+  }
+  private errOrigHeadGlobal(): number {
+    if (this.errOrigHead !== null) return this.errOrigHead;
+    const t = this.errOrigT();
+    this.errOrigHead = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(t);
+    });
+    return this.errOrigHead;
+  }
+  /** Local `n` = the entry for error 0, or null (a linear scan). */
+  private emitErrOrigFind(c: Code, n: number): void {
+    const t = this.errOrigT();
+    c.globalGet(this.errOrigHeadGlobal());
+    c.localSet(n);
+    c.block();
+    c.loop();
+    c.localGet(n);
+    c.refIsNull();
+    c.brIf(1);
+    c.localGet(n);
+    c.structGet(t, 0);
+    c.localGet(0);
+    c.refEq();
+    c.brIf(1);
+    c.localGet(n);
+    c.structGet(t, 2);
+    c.localSet(n);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+  private errNameWriteFn: number | null = null;
+  /** `(err, name) -> ()`: a statically typed `err.name = name`. Before the
+   * write, a plain Error's first rename that could change its answer is
+   * recorded: the old name is one of the five runtime names (URIError,
+   * ReferenceError, EvalError, AggregateError, AssertionError), or the new
+   * one is one of those six with Error. The common rename (`Error` to
+   * `ValidationError`) records nothing: an unrecorded name outside the six
+   * answers Error anyway. */
+  private errNameWriteHelper(): number {
+    if (this.errNameWriteFn !== null) return this.errNameWriteFn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const t = this.errOrigT();
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef], []), "%w.err.writeName");
+    this.errNameWriteFn = idx;
+    const w = this.newWalker(2);
+    const c = w.c;
+    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
+    const old = this.wlocal(w, this.strRef);
+    const plain = this.classes.meta("%Error");
+    const inNames = (push: () => void, names: string[]): void => {
+      names.forEach((nm, i) => {
+        push();
+        this.pushStrLitInto(c, nm);
+        c.call(this.strEqHelper());
+        if (i > 0) c.i32Or();
+      });
+    };
+    if (plain !== undefined) {
+      c.localGet(0);
+      c.structGet(exc.errT, 0);
+      c.structGet(this.classes.ci(), CI_PRE);
+      c.i32Const(plain.pre);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(exc.errT, ERR_NAME);
+      c.localTee(old);
+      c.refIsNull();
+      c.i32Eqz();
+      c.localGet(1);
+      c.refIsNull();
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      inNames(() => c.localGet(old), RUNTIME_PLAIN_ERROR_NAMES.slice(1));
+      inNames(() => c.localGet(1), RUNTIME_PLAIN_ERROR_NAMES);
+      c.i32Or();
+      c.ifVoid();
+      this.emitErrOrigFind(c, n);
+      c.localGet(n);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(old);
+      c.globalGet(this.errOrigHeadGlobal());
+      c.structNew(t);
+      c.globalSet(this.errOrigHeadGlobal());
+      c.end();
+      c.end();
+      c.end();
+      c.end();
     }
+    c.localGet(0);
+    c.localGet(1);
+    c.structSet(exc.errT, ERR_NAME);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+  private errOrigNameFn: number | null = null;
+  /** `(err) -> str`: the name error 0 was built with. */
+  private errOrigNameHelper(): number {
+    if (this.errOrigNameFn !== null) return this.errOrigNameFn;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const t = this.errOrigT();
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.origName");
+    this.errOrigNameFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
+    this.emitErrOrigFind(c, n);
+    c.localGet(n);
+    c.refIsNull();
+    c.ifResult(this.strRef);
+    c.localGet(0);
+    c.structGet(this.exc().errT, ERR_NAME);
+    c.else_();
+    c.localGet(n);
+    c.structGet(t, 1);
+    c.end();
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  /** ` at <file>:<line>` for a fence's code tag, the form the frontend's
+   * located fences carry (lowerer.ts locateRuntimeFences), from the
+   * frontend's source texts (emitWasmModule's `sourceTexts`); "" without
+   * them. */
+  private fenceSiteTag(loc: SrcLoc | undefined): string {
+    if (loc === undefined) return "";
+    const text = fenceSourceTexts?.get(loc.file);
+    if (text === undefined) return "";
+    let line = 1;
+    for (let i = 0; i < loc.start && i < text.length; i++) if (text.charCodeAt(i) === 10) line++;
+    return ` at ${loc.file}:${line}`;
+  }
+
+  /** A user error class's constructor `length`: its declared parameter
+   * count (SEMANTICS.md S020's approximation of a function's `length`). */
+  private ctorLength(className: string): number {
+    if (this.classes.meta(className)?.def.implicitCtor === true) return 0;
+    const fn = this.funcByName.get(`%${className}.constructor`) ?? this.mod.functions.find((f) => f.name === `%${className}.constructor`);
+    return fn === undefined ? 0 : Math.max(0, fn.params.length - 1);
+  }
+
+  /** The interned function value `ctorGetHelper` answers for one class:
+   * built once (a global), its own name string as FN_CLOS so strictEq's
+   * FN_CLOS identity tells two classes apart (the placeholder discipline
+   * above), SIG -2 so a call is callFn's named fence — SIG -3 for a class
+   * Node defines in JavaScript (a user class, AssertionError), which
+   * util.inspect renders `[class X extends Y]` in Node: inspecting one is
+   * a named fence too. */
+  private ctorPlaceholderHelper(key: string, name: string, arity: number, isClass: boolean): number {
+    const hit = this.ctorPlaceholderFns.get(key);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const g = this.mb.addGlobal(dynRef, true, (w) => {
+      w.u8(0xd0); // ref.null $dyn
+      w.sleb(dynT);
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [dynRef]), `%w.dyn.ctorValue:${key}`);
+    this.ctorPlaceholderFns.set(key, idx);
+    const w = this.newWalker(0);
+    const c = w.c;
+    const nameLocal = this.wlocal(w, this.strRef);
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.pushStrLitInto(c, name);
+    c.localSet(nameLocal);
+    this.dyn.boxFn(
+      c,
+      (x) => x.localGet(nameLocal),
+      (x) => x.refNull(this.dyn.thunkSig()),
+      isClass ? -3 : -2,
+      (x) => x.localGet(nameLocal),
+      arity,
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
   }
 
   private nativeMethodPlaceholderHelper(name: string, arity: number): number {
@@ -36400,9 +36796,9 @@ class Assembler {
    * possibly-drifting copy of the fence-table list. May throw
    * (a nullish receiver, or the fence itself) — the caller owns the
    * pending check. */
-  private emitDynGetProp(code: Code, name: string): void {
+  private emitDynGetProp(code: Code, name: string, keepUndefined = false, loc?: SrcLoc): void {
     if (name === "constructor") {
-      code.call(this.errCtorGetHelper());
+      code.call(this.ctorGetHelper(keepUndefined, false, loc));
       return;
     }
     const needsProtoFence =
@@ -36845,7 +37241,7 @@ class Assembler {
         // one jsOp:getProp itself uses) — a real prototype method (e.g.
         // `const {toString} = v`) must read the real function, not
         // `keyGet`'s own-properties-only undefined.
-        this.emitDynGetProp(c, prop.key.value);
+        this.emitDynGetProp(c, prop.key.value, this.ctorKeepsUndefined(loc), loc);
       } else {
         // A COMPUTED key (extra or call-shaped): ToPropertyKey reduces
         // to ToString here — this representation has no Symbol kind, so
@@ -37313,6 +37709,11 @@ class Assembler {
     if (read.kind === "dynKeyGet" && read.optional !== true) {
       this.walkExpr(read.value);
       code.localTee(recv);
+      if (read.key.kind === "strLit" && read.key.value === "constructor") {
+        code.call(this.ctorGetHelper(this.ctorKeepsUndefined(read.loc), false, read.loc, true));
+        this.emitPendingCheck();
+        return;
+      }
       this.walkExpr(read.key);
       code.i32Const(0);
       code.call(this.dyn.keyGet());

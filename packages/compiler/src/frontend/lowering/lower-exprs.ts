@@ -1948,6 +1948,17 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         const state = lowerStreamStateProperty(L, expr);
         if (state) return state;
       }
+      // GH #135: `arguments.constructor` is Object in Node; this tier's
+      // `arguments` is an array (SEMANTICS.md S081), whose constructor
+      // would answer Array — refused by name rather than answered wrong.
+      if (
+        expr.name.text === "constructor" &&
+        ts.isIdentifier(expr.expression) &&
+        expr.expression.text === "arguments" &&
+        (L.checker.getSymbolAtLocation(expr.expression)?.declarations ?? []).length === 0
+      ) {
+        L.unsupported("SC1090", expr, "reading 'constructor' of a function's 'arguments' object (Node answers Object; this tier's arguments is an array, SEMANTICS.md S081)");
+      }
       if (L.isIslandExpr(expr.expression)) {
         const receiver = L.lowerExpr(expr.expression);
         // The checker said 'any' but the VALUE lives in the checked-dynamic tree (`this`
@@ -8771,6 +8782,9 @@ function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
   // body; U1b parity): the fence is U1a's TypeScript amendment.
   if (isJsSourceFileName(e.loc.file)) return e;
   if (e.key.kind === "strLit" && !INHERITED_NAMES.has(e.key.value)) return e;
+  // GH #135: a literal `constructor` read answers in the backend (an
+  // error's class, a primitive's or an array's; the S015 fence otherwise).
+  if (e.key.kind === "strLit" && e.key.value === "constructor") return e;
   const loc = e.loc;
   const call: IrExpr = {
     kind: "call",

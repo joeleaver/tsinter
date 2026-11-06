@@ -660,6 +660,22 @@ export const EMITTER_API_MEMBERS: ReadonlySet<string> = new Set([
     return null;
   }
 
+/** GH #135: does the class declare a STATIC `name` or `length` member? */
+function declaresStaticNameOrLength(decl: ts.ClassLikeDeclaration): boolean {
+  return (decl.members as ts.NodeArray<ts.ClassElement>).some((m: ts.ClassElement) => {
+    const nm = (m as { name?: ts.PropertyName }).name;
+    if (nm === undefined) return false;
+    // `name`, `"name"`, `["name"]` (a computed string-literal key).
+    const text = ts.isIdentifier(nm) || ts.isStringLiteralLike(nm)
+      ? nm.text
+      : ts.isComputedPropertyName(nm) && ts.isStringLiteralLike(nm.expression)
+        ? nm.expression.text
+        : undefined;
+    if (text !== "name" && text !== "length") return false;
+    return ts.canHaveModifiers(m) && (ts.getModifiers(m) ?? []).some((x) => x.kind === ts.SyntaxKind.StaticKeyword);
+  });
+}
+
 export function collectClassShape(L: Lowerer, decl: ts.ClassDeclaration): void {
     const symbol = L.collectDeferring(
       () => declSymbolOf(L, decl),
@@ -2242,6 +2258,8 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // answer for class expressions ("" when truly anonymous). An
           // INSTANTIATION prints its family's name — JS has one `Box`.
           jsName: jsNameOverride ?? decl.name?.text ?? "",
+          ...(declaresStaticNameOrLength(decl) ? { staticNameOrLength: true as const } : {}),
+          ...(ctor === null ? { implicitCtor: true as const } : {}),
           ...(base ? { base: base.def.name } : {}),
           // Layout order: the base chain's fields as an IDENTICAL prefix,
           // then this class's own — what makes an upcast a reinterpret.

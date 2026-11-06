@@ -124,6 +124,7 @@ import {
   ENTRY_KEY,
   ENTRY_VALUE,
   FN_CLOS,
+  FN_SIG,
   OBJ_ENTRIES,
   OBJ_LEN,
   OBJ_PROTO,
@@ -3715,6 +3716,18 @@ export class InspectBuilder {
       this.kindArm(c, K, [DK.FUNC], () => {
         // %o: Node lists length, name, arguments, caller and prototype.
         this.hiddenFence(c, "a function value");
+        // GH #135: a class Node defines in JavaScript, read as a dynamic
+        // value's constructor (SIG -3) — Node renders `[class X extends
+        // Y]`, which the stand-in cannot.
+        dyn.fnPayload(c, (x) => x.localGet(D));
+        c.structGet(dyn.fnT(), FN_SIG);
+        c.i32Const(-3);
+        c.i32Eq();
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, "inspecting a class read as a dynamic value's constructor (Node renders '[class …]') is not supported yet"));
+        c.refNull(strT);
+        c.return_();
+        c.end();
         // NAME: keyGet's OWN precedence (tables, THEN FN_NAME's built-in
         // fallback — a null FN_NAME already reads back as "" through
         // that path: C's `name && name[0]`, ported once, in keyGet, not

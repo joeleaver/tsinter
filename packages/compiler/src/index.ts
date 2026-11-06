@@ -782,7 +782,7 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
           : `${opts.outPath.replace(/\.exe$/i, "")}.wasm`;
     let bytes: Uint8Array;
     try {
-      bytes = emitWasmModule(lowered.module!);
+      bytes = emitWasmModule(lowered.module!, sourceTexts);
     } catch (err) {
       if (err instanceof EngineFormatError) {
         // The island engine artifact a module needs failed its integrity
