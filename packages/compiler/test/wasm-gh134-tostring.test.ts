@@ -188,6 +188,50 @@ const w = mk();
 const d = Object.create(w);
 console.log(d.toString(), String(d), \`\${d}\`, d + "");`,
   },
+  {
+    id: "GH134-JS-11 a bare console argument inspects an object with its own toString (it never calls it)",
+    entry: "main.js",
+    src: `const o = JSON.parse('{"a":1}');
+o.toString = () => "custom";
+const th = JSON.parse("{}");
+th.toString = () => { throw new Error("never"); };
+const np = Object.create(null); np.toString = () => "NP";
+console.log(o);
+console.error("err:", o, th);
+console.log("x", th, np);
+console.log("%s|", o, th);`,
+  },
+  {
+    id: "GH134-JS-12 --dynamic: a bare console argument over an Object.create link inspects",
+    entry: "main.js",
+    dynamic: true,
+    src: `'use strict';
+/** @returns {*} */
+function mk() {
+  return { n: 2, toString() { return "P"; } };
+}
+const o = Object.create(mk());
+o.n = 3;
+console.log(o);
+console.log("x", o);
+console.log("%s", o);`,
+  },
+  {
+    id: "GH134-JS-13 a cyclic array converts with V8's join-stack guard",
+    entry: "main.js",
+    src: `const c = JSON.parse("[1,2]");
+c.push(c);
+console.log(c.join("-"), String(c), \`\${c}\`, c + "", c.toString());
+const a = JSON.parse("[1]");
+const b = JSON.parse("[2]");
+a.push(b);
+b.push(a);
+console.log(String(a), a.join(";"), String(b));
+const d = JSON.parse("[[3]]");
+const twice = JSON.parse("[]");
+twice.push(d, d);
+console.log(String(twice), twice.join("|"));`,
+  },
   // ── TypeScript sources ──────────────────────────────────────────────
   {
     id: "GH134-TS-01 an any object's own toString (the issue's TS repro)",
@@ -375,6 +419,46 @@ try {
     src: `const o: any = JSON.parse("{}");
 o.toString = () => "12";
 console.log(Number(o), +o, o * 1, Math.max(o, 3));`,
+  },
+  {
+    id: "GH134-TS-18 bare console.log / console.error arguments inspect; a throwing toString is never called",
+    src: `const o: any = { a: 1 };
+o.toString = () => "custom";
+console.log(o);
+console.error("err:", o);
+const r: Record<string, any> = JSON.parse('{"k":2}');
+r.toString = () => { throw new Error("nope"); };
+console.log("before");
+console.log(r);
+console.log("x", r, [r]);
+console.log("after");`,
+  },
+  {
+    id: "GH134-TS-19 a compound += onto a string field converts an any operand valueOf-first",
+    src: `const a: any = JSON.parse("{}");
+a.valueOf = () => 1;
+a.toString = () => "A";
+class C { s = "c"; }
+const c = new C();
+c.s += a;
+const r = { s: "r" };
+r.s += a;
+let l = "l";
+l += a;
+console.log(c.s, r.s, l, "x" + a, \`\${a}\`);`,
+  },
+  {
+    id: "GH134-JS-14 util.format's %s over a getter-defined toString stops at its fence",
+    entry: "main.js",
+    src: `'use strict';
+/** @returns {*} */
+function mk() {
+  return { get toString() { return () => "G"; } };
+}
+const g = mk();
+console.log("before", String(g));
+console.log("%s", g);`,
+    fence: { text: /util.format's %s over an object whose toString is a getter is not supported yet/, stdout: "before G\n" },
   },
 ];
 

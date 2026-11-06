@@ -8312,7 +8312,9 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
  * `o + ""` calls an own `valueOf` before `toString`, where `String(o)`
  * calls `toString` first). */
 export function ensureConcatString(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
-  if (e.type.kind === "dyn") return { kind: "toString", operand: e, hint: "default", type: STRING, loc: e.loc };
+  // One world (U1a/U1b): an island value is the same dynamic value.
+  const d = e.type.kind === "jsval" && L.sharedDynamic ? asDynOperand(e) : e;
+  if (d.type.kind === "dyn") return { kind: "toString", operand: d, hint: "default", type: STRING, loc: e.loc };
   return ensureString(L, e, node);
 }
 

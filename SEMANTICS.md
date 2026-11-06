@@ -898,11 +898,14 @@ each called with `this` = the object and no arguments:
   `toString` / `String()` element by element and its separator, a
   computed property key `m[o]`, the default `sort()` order, a relational
   operand after its own ToPrimitive, `String(e)` / `` `${e}` `` of a
-  thrown dynamic value, `toLocaleString`, and util.format's `%s`, which
-  String()s an object whose `toString` is a function and inspects every
-  other object, as Node's hasBuiltInToString decides): `toString` first,
-  then `valueOf`.
-- **Default hint** (`o + ""`, `"" + o`, `s += o`, `o + 1` on an `any`):
+  thrown dynamic value, `toLocaleString`, and util.format's `%s`
+  SPECIFIER, which String()s an object whose `toString` is a function and
+  inspects every other object, as Node's hasBuiltInToString decides — a
+  bare console argument and a format string's rest arguments always
+  inspect and never call the member, as in Node): `toString` first, then
+  `valueOf`.
+- **Default hint** (`o + ""`, `"" + o`, `s += o`, a field's `c.s += o`,
+  `o + 1` on an `any`):
   `valueOf` first, then `toString`. An array operand's elements convert
   inside its own ToPrimitive, before the other operand's (`arr + b` calls
   the elements' `toString` before `b.valueOf`).
@@ -917,7 +920,10 @@ each called with `this` = the object and no arguments:
   string; a non-callable member throws V8's "`o.toString` is not a
   function"; with no member, the kind's own answer is unchanged.
 An object with no such member keeps the inherited answers this entry's
-body describes ("[object Object]", an array's join, an Error's text).
+body describes ("[object Object]", an array's join, an Error's text). An
+array met again while its own conversion or `join` runs renders "" (V8's
+join-stack cycle guard: `c.push(c); c.join("-")` is `1-2-`), where this
+tier used to overflow the stack.
 **What still refuses, by name, at run time (SC1090):** a conversion site
 that converts through the runtime's total helper (`dyn.ts` toStr) —
 `parseFloat(o)`, the host-API ToString sites (header names, DOMException
@@ -931,14 +937,17 @@ encoding is all the lowering keeps); and an own member answering a
 non-string through the method call stops at "an own toString member that
 answers a non-string value, called as a method, is not supported yet"
 (the call's IR type is string; `String(o)` and `` `${o}` `` convert such
-an answer exactly). Two shapes stay out of reach and refuse at compile
+an answer exactly); and `%s` over an object whose `toString` is a getter
+stops at "util.format's %s over an object whose toString is a getter is
+not supported yet" (Node runs the getter to decide between String() and
+inspect). Two shapes stay out of reach and refuse at compile
 time as before: a STATIC class or record type declaring `toString` that
 `String()` converts (SC2011), and a symbol-keyed `Symbol.toPrimitive`
 member (the symbol-keyed write fence). In JavaScript sources the
 arithmetic operators keep the checked-number stance (`o * 2` over a
 JSON.parse'd object is the SC1100 "expected number" fence), unchanged.
 **Tested by:** `packages/compiler/test/wasm-gh134-tostring.test.ts`
-(GH134-JS-01..10, GH134-TS-01..17), both lanes.
+(GH134-JS-01..14, GH134-TS-01..19), both lanes.
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 

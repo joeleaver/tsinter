@@ -4803,6 +4803,16 @@ export class DynBuilder {
       this.arm(c, K, [DK.ARR], () => {
         this.deps.lit(c, "");
         c.localSet(OUT);
+        // V8's join-stack cycle guard (GH #134 review): an array already
+        // being converted renders "". Nothing below returns early (its
+        // fences trap), so the one joinLeave at the end balances it.
+        c.localGet(0);
+        c.call(this.joinEnter());
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(OUT);
+        c.return_();
+        c.end();
         this.arrPayload(c, (x) => x.localGet(0));
         c.localSet(A);
         this.arrLen(c, (x) => x.localGet(A));
@@ -4856,6 +4866,7 @@ export class DynBuilder {
         c.br(0);
         c.end();
         c.end();
+        c.call(this.joinLeave());
         c.localGet(OUT);
       });
       this.arm(c, K, [DK.OBJ], () => {
@@ -5098,12 +5109,93 @@ export class DynBuilder {
     c.end();
   }
 
+  private joinStackG: number | null = null;
+
+  /** The arrays whose ToString / join is running, innermost last — V8's
+   * join stack (CycleProtectedArrayJoin): an array met again while its own
+   * join runs renders "" instead of recursing (GH #134 review). */
+  private joinStack(): number {
+    this.joinStackG ??= this.mb.addGlobal(this.arrRef(), true, (w) => {
+      w.u8(0xd0); // ref.null
+      w.sleb(this.deps.arrVec().struct);
+    });
+    return this.joinStackG;
+  }
+
+  /** %w.dyn.joinEnter(arr) → i32: 0 when the array is already being
+   * joined (the caller answers ""), else 1 with it pushed — the caller
+   * then calls joinLeave on every way out. */
+  joinEnter(): number {
+    return this.cached("joinEnter", [this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      const S = 1;
+      const I = 2;
+      const N = 3;
+      const g = this.joinStack();
+      c.globalGet(g);
+      c.refIsNull();
+      c.ifVoid();
+      this.pushNewArr(c);
+      c.globalSet(g);
+      c.end();
+      c.globalGet(g);
+      c.localSet(S);
+      this.arrLen(c, (x) => x.localGet(S));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(S), (x) => x.localGet(I));
+      c.structGet(this.dynT(), DYN_REF);
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refEq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(S);
+      c.localGet(0);
+      c.call(this.arrPush());
+      c.i32Const(1);
+      this.mb.setBody(idx, [this.arrRef(), I32, I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.joinLeave() — pops joinEnter's push. */
+  joinLeave(): number {
+    return this.cached("joinLeave", [], [], (idx) => {
+      const c = new Code();
+      const v = this.deps.arrVec();
+      const g = this.joinStack();
+      c.globalGet(g);
+      c.globalGet(g);
+      c.structGet(v.struct, VEC_LEN);
+      c.i32Const(1);
+      c.i32Sub();
+      c.structSet(v.struct, VEC_LEN);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   /** %w.dyn.fmtSUser(d) → i32 (GH #134): does util.format's `%s` String()
    * this value rather than inspect it — an object whose `toString`, own
    * or inherited through an A2 link, is a function (Node's
    * hasBuiltInToString answers false: the member is not a built-in
-   * prototype's). An accessor member counts (Node reads it; toStrUser
-   * calls its getter). Every other value answers 0. */
+   * prototype's). An accessor member refuses by name (Node runs the
+   * getter to decide). Every other value answers 0. */
   fmtSUser(): number {
     return this.cached("fmtSUser", [this.dynRef()], [I32], (idx) => {
       const dynT = this.dynT();
@@ -5126,15 +5218,20 @@ export class DynBuilder {
       c.i32Const(0);
       c.return_();
       c.end();
+      if (this.accessorsLive) {
+        // Node's hasBuiltInToString reads the member — a getter runs,
+        // and its answer decides. Not modelled: refuse by name.
+        c.localGet(M);
+        this.isAccessorCell(c);
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, "util.format's %s over an object whose toString is a getter is not supported yet"));
+        c.unreachable();
+        c.end();
+      }
       c.localGet(M);
       c.structGet(dynT, DYN_KIND);
       c.i32Const(DK.FUNC);
       c.i32Eq();
-      if (this.accessorsLive) {
-        c.localGet(M);
-        this.isAccessorCell(c);
-        c.i32Or();
-      }
       this.mb.setBody(idx, [this.dynRef()], c.bytes());
     });
   }
@@ -5358,6 +5455,15 @@ export class DynBuilder {
       this.arm(c, K, [DK.ARR], () => {
         this.deps.lit(c, "");
         c.localSet(OUT);
+        // V8's join-stack cycle guard: an array already being converted
+        // renders "".
+        c.localGet(0);
+        c.call(this.joinEnter());
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(OUT);
+        c.return_();
+        c.end();
         this.arrPayload(c, (x) => x.localGet(0));
         c.localSet(A);
         this.arrLen(c, (x) => x.localGet(A));
@@ -5397,6 +5503,7 @@ export class DynBuilder {
         c.localTee(S);
         c.refIsNull();
         c.ifVoid();
+        c.call(this.joinLeave());
         c.refNull(this.deps.strType());
         c.return_();
         c.end();
@@ -5412,6 +5519,7 @@ export class DynBuilder {
         c.br(0);
         c.end();
         c.end();
+        c.call(this.joinLeave());
         c.localGet(OUT);
       });
       c.localGet(0);
@@ -11231,6 +11339,15 @@ export class DynBuilder {
                 c.end();
                 this.deps.lit(c, "");
                 c.localSet(MSG);
+                // V8's join-stack cycle guard (GH #134 review): a join of
+                // an array already being joined answers "".
+                c.localGet(0);
+                c.call(this.joinEnter());
+                c.i32Eqz();
+                c.ifVoid();
+                this.boxStr(c, (x) => x.localGet(MSG));
+                c.return_();
+                c.end();
                 c.i32Const(0);
                 c.localSet(I);
                 forLoop(
@@ -11264,7 +11381,12 @@ export class DynBuilder {
                     c.localGet(E);
                     c.call(this.toStrUser());
                     c.localSet(R2S);
-                    bailIfPending();
+                    c.globalGet(this.deps.excKind());
+                    c.ifVoid();
+                    c.call(this.joinLeave());
+                    c.refNull(dynT);
+                    c.return_();
+                    c.end();
                     c.localGet(MSG);
                     c.localGet(R2S);
                     c.call(concat);
@@ -11272,6 +11394,7 @@ export class DynBuilder {
                     c.end();
                   },
                 );
+                c.call(this.joinLeave());
                 this.boxStr(c, (x) => x.localGet(MSG));
                 return;
               }

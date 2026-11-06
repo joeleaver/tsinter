@@ -23436,8 +23436,9 @@ class Assembler {
           // All three can throw: a PROMISE anywhere in the tree fences
           // loudly (S030), which is why they are may-throw seeded and why
           // the site checks the cell.
-          if (e.fn === "insp.dynS") {
-            // GH #134: Node's %s String()s an object whose toString is
+          if (e.fn === "insp.dynS" && e.fmtS === true) {
+            // GH #134: Node's %s (the fmtS flag; a plain console argument
+            // always inspects) String()s an object whose toString is
             // not a built-in prototype's (hasBuiltInToString) — its own
             // conversion runs (toStrUser, a throw propagates); every
             // other value inspects.
@@ -23464,7 +23465,7 @@ class Assembler {
             return;
           }
           for (const a of e.args) this.walkExpr(a);
-          code.call(this.insp.dyn());
+          code.call(e.fn === "insp.dynS" ? this.insp.dynS() : this.insp.dyn());
           this.emitPendingCheck();
           return;
         }

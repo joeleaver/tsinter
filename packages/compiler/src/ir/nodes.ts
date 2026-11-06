@@ -5244,8 +5244,12 @@ export type IrExpr =
    * string payloads formatted like Node's messages) — backends must consult
    * the may-throw seed set (MAY_THROW_LIB_FNS) in their analysis and emit
    * pending checks; process.* members never throw. `process.exit` flushes
-   * stdout and terminates the process without running exit handlers. */
-  | { kind: "libCall"; fn: IrLibFn; args: IrExpr[]; type: IrType; loc: SrcLoc }
+   * stdout and terminates the process without running exit handlers.
+   * `fmtS` (GH #134, insp.dynS only): the call is util.format's `%s`
+   * specifier, which String()s an object with a user-defined toString;
+   * a plain console argument (no flag) always inspects. Backends without
+   * the object protocol may ignore it. */
+  | { kind: "libCall"; fn: IrLibFn; args: IrExpr[]; fmtS?: true; type: IrType; loc: SrcLoc }
   /** `JSON.stringify(v)` — type-DIRECTED serialization: `value`'s static IR
    * type must be JSON-safe (f64/string/bool/record/array/union of those,
    * recursively — validated), and backends emit one serializer per type used
