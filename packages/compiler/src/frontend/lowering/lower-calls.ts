@@ -4802,9 +4802,12 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // JS ignores extra toString arguments on the other kinds, and so
     // does the runtime dispatch).
     if (access.name.text === "toString" && call.arguments.length <= 1) {
+      // "" when the call has NO argument (GH #134: an own toString member
+      // is called with the call's arguments, so the backends tell the two
+      // apart; for a Buffer "" is the utf8 default).
       const enc = call.arguments[0]
         ? bufEncoding(L, "toString", call.arguments[0])
-        : "utf8";
+        : "";
       // The source spelling rides along for the ONE receiver whose
       // prototype lacks toString: a null-prototype dictionary throws
       // Node's "<spelling> is not a function" at runtime.

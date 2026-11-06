@@ -1,7 +1,7 @@
 /* Cheap whole-module may-throw analysis (see computeMayThrow). Pure function
  * of the IR module; the emitter consults the result to place unwind checks. */
 import type { IrArrIntrinsicMethod, IrBytesIntrinsicMethod, IrLibFn, IrModule } from "../../ir/nodes.js";
-import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS, moduleHasJsvalValues } from "../../ir/nodes.js";
+import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS, moduleHasDynValues, moduleHasJsvalValues } from "../../ir/nodes.js";
 
 /** S119 (a) on the WasmGC lanes: a receiver a member read need not test
  * for the slot's undefined. `this`, a value built right there, a guard
@@ -73,8 +73,9 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
   const asyncFns = new Set(mod.functions.filter((fn) => fn.async).map((fn) => fn.name));
   // Board #195: String(e) over a catch binding runs the island engine's
   // ToString on a thrown island value, which can throw — only in a module
-  // that holds island values.
-  const caughtToStrThrows = moduleHasJsvalValues(mod);
+  // that holds island values — or, GH #134, a thrown dynamic object's own
+  // toString / valueOf member, in a module that holds dynamic values.
+  const caughtToStrThrows = moduleHasJsvalValues(mod) || moduleHasDynValues(mod);
   // Generator functions follow the async exclusion: CALLING one only
   // allocates the suspended fiber (nothing runs, nothing can throw) — a
   // body throw surfaces at genResume, which seeds unconditionally below.
@@ -219,6 +220,9 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
         case "toString": {
           const ot = (rec["operand"] as { type?: { kind?: string } }).type?.kind;
           if (caughtToStrThrows && ot === "caught") f.throws = true;
+          // GH #134: String(u) / `${u}` over a dynamic value calls its
+          // toString / valueOf member, whose throw propagates.
+          if (ot === "dyn") f.throws = true;
           break;
         }
         case "jsOp":

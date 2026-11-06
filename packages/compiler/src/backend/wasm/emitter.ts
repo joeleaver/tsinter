@@ -10763,12 +10763,41 @@ class Assembler {
       c.f64Const(CANONICAL_NAN);
       c.return_();
       c.end();
+      // GH #134: a null-prototype object with neither member inherits
+      // none — Node's TypeError, catchable.
+      this.emitNullProtoNoPrim(c, D, (x) => x.f64Const(CANONICAL_NAN));
     }
     c.end();
     c.localGet(D);
     c.call(this.jsToNumberHelper());
     this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
     return idx;
+  }
+
+  /** GH #134: with no `toString` member found on the dyn in local `d`, a
+   * NULL-PROTOTYPE object inherits no conversion at all — Node's
+   * catchable "Cannot convert object to primitive value": set it and
+   * return `onPending`'s value from the enclosing function. Nothing in a
+   * module that cannot build one. */
+  private emitNullProtoNoPrim(c: Code, d: number, onPending: (c: Code) => void): void {
+    if (!this.nullProtoLive) return;
+    const dyn = this.dyn;
+    c.localGet(d);
+    c.structGet(dyn.dynT(), DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    dyn.objPayload(c, (x) => x.localGet(d));
+    c.structGet(dyn.objT(), OBJ_PROTO);
+    dyn.protoIsNull(c);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifVoid();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot convert object to primitive value"), null);
+    onPending(c);
+    c.return_();
+    c.end();
   }
 
   /** Local `m` = the member `name` OrdinaryToPrimitive consults on the
@@ -10844,6 +10873,7 @@ class Assembler {
     const K = 1;
     const M = 2;
     const R = 3;
+    const S = 4;
     const vec = this.dynVecInfo();
     /** Calls the own member in M (a FUNC) with D as `this`: a throw
      * returns null (pending), a primitive answer is returned. */
@@ -10910,10 +10940,12 @@ class Assembler {
       c.end();
       c.end();
       getOwn("toString");
-      // no own toString: the inherited one answers a primitive
+      // no own toString: the inherited one answers a primitive — except
+      // on a null-prototype object, which inherits none (GH #134)
       c.localGet(M);
       c.refIsNull();
       c.ifVoid();
+      this.emitNullProtoNoPrim(c, D, (x) => x.refNull(dynT));
       c.localGet(D);
       c.return_();
       c.end();
@@ -10926,8 +10958,26 @@ class Assembler {
       c.return_();
     }
     c.end();
+    // GH #134: an array's ToPrimitive is Array.prototype.toString (the
+    // inherited valueOf answers the array itself), its elements' own
+    // conversions running here — before the other operand's.
+    c.localGet(K);
+    c.i32Const(DK.ARR);
+    c.i32Eq();
+    c.ifVoid();
     c.localGet(D);
-    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
+    c.call(dyn.toStrUser());
+    c.localTee(S);
+    c.refIsNull();
+    c.ifVoid();
+    c.refNull(dynT);
+    c.return_();
+    c.end();
+    dyn.boxStr(c, (x) => x.localGet(S));
+    c.return_();
+    c.end();
+    c.localGet(D);
+    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef(), this.strRef], c.bytes());
     return idx;
   }
 
@@ -22321,11 +22371,23 @@ class Assembler {
           return;
         }
         if (k === "dyn") {
-          // String(u) over a checked-dynamic value — the C emitter's sc_ds
-          // walker, which is NOT typeof's table and not the `u.toString()`
-          // method spelling (see dyn.ts's toStr).
+          // String(u) / `${u}` over a checked-dynamic value — the C
+          // emitter's sc_ds walker, which is NOT typeof's table and not
+          // the `u.toString()` method spelling (see dyn.ts's toStr), with
+          // GH #134's object protocol: a `toString` / `valueOf` member is
+          // called (dyn.ts toStrUser), its throw propagates.
           this.walkExpr(e.operand);
-          code.call(this.dyn.toStr());
+          if (e.hint === "default") {
+            // The `+` operator's operand: ToPrimitive with the default
+            // hint (valueOf first) — whose answer is a primitive, or an
+            // object with no toString member to call — then ToString.
+            code.call(this.dynToPrimNumFn());
+            this.emitPendingCheck();
+            code.call(this.dyn.toStr());
+            return;
+          }
+          code.call(this.dyn.toStrUser());
+          this.emitPendingCheck();
           return;
         }
         if (k === "caught") {
@@ -22426,7 +22488,9 @@ class Assembler {
             code.localGet(c);
             code.structGet(exc.caughtT, 2);
             code.refCast(this.dyn.dynT());
-            code.call(this.dyn.toStr());
+            // GH #134: its own toString / valueOf member runs, and its
+            // throw propagates (the pending check below).
+            code.call(this.dyn.toStrUser());
             code.else_();
             this.pushStrLit("[object Object]");
             this.close();
@@ -22437,6 +22501,7 @@ class Assembler {
           this.close();
           this.releaseScratch(I32, kind);
           this.releaseScratch(this.caughtRef(), c);
+          if (this.dynValuesLive) this.emitPendingCheck();
           return;
         }
         if (k === "record") {
@@ -23371,8 +23436,35 @@ class Assembler {
           // All three can throw: a PROMISE anywhere in the tree fences
           // loudly (S030), which is why they are may-throw seeded and why
           // the site checks the cell.
+          if (e.fn === "insp.dynS") {
+            // GH #134: Node's %s String()s an object whose toString is
+            // not a built-in prototype's (hasBuiltInToString) — its own
+            // conversion runs (toStrUser, a throw propagates); every
+            // other value inspects.
+            const vT = this.dyn.dynRef();
+            const v = this.acquireScratch(vT);
+            const depth = this.acquireScratch(F64);
+            this.walkExpr(e.args[0]!);
+            code.localSet(v);
+            this.walkExpr(e.args[1]!);
+            code.localSet(depth);
+            code.localGet(v);
+            code.call(this.dyn.fmtSUser());
+            this.openIfResult(this.strRef);
+            code.localGet(v);
+            code.call(this.dyn.toStrUser());
+            code.else_();
+            code.localGet(v);
+            code.localGet(depth);
+            code.call(this.insp.dynS());
+            this.close();
+            this.releaseScratch(F64, depth);
+            this.releaseScratch(vT, v);
+            this.emitPendingCheck();
+            return;
+          }
           for (const a of e.args) this.walkExpr(a);
-          code.call(e.fn === "insp.dynS" ? this.insp.dynS() : this.insp.dyn());
+          code.call(this.insp.dyn());
           this.emitPendingCheck();
           return;
         }
@@ -23972,6 +24064,30 @@ class Assembler {
           const recv = this.acquireScratch(recvT);
           this.walkExpr(e.args[0]!);
           code.localSet(recv);
+          // GH #134: a `toString` member to find on an object or function
+          // (own, or inherited through an A2 link) is the one called, with
+          // `this` = the receiver (dyn.ts toStrMember). Its STRING answer
+          // is the result; anything else comes back as the receiver and
+          // takes the kind dispatch below. The encoding literal is ""
+          // when the call has no argument (lower-calls.ts).
+          const member = this.acquireScratch(recvT);
+          code.localGet(recv);
+          if (e.args[2] === undefined) this.pushStrLit("toString");
+          else this.walkExpr(e.args[2]);
+          code.i32Const(encArg.value === "" ? 0 : 1);
+          code.call(this.dyn.toStrMember());
+          code.localSet(member);
+          this.emitPendingCheck();
+          code.localGet(member);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.STR);
+          code.i32Eq();
+          this.openIfResult(this.strRef);
+          code.localGet(member);
+          code.structGet(this.dyn.dynT(), DYN_REF);
+          emitFlatCast(code, this.strType);
+          code.else_();
+          this.releaseScratch(recvT, member);
           if (this.nullProtoLive) {
             // The spelling evaluates with the call (a literal).
             const spell = this.acquireScratch(this.strRef);
@@ -24012,10 +24128,14 @@ class Assembler {
           code.i32Eq();
           this.openIfResult(this.strRef);
           this.dyn.bytesPayloadBytes(code, (c) => c.localGet(recv));
-          code.call(this.bytesB.toStrHelper(encArg.value));
+          code.call(this.bytesB.toStrHelper(encArg.value === "" ? "utf8" : encArg.value));
           code.else_();
+          // An array's toString is its join, over each element's own
+          // conversion (GH #134); no other kind left here runs user code.
           code.localGet(recv);
-          code.call(this.dyn.toStr());
+          code.call(this.dyn.toStrUser());
+          this.emitPendingCheck();
+          this.close();
           this.close();
           this.releaseScratch(recvT, recv);
           return;
@@ -30815,11 +30935,12 @@ class Assembler {
             return;
           }
           case "toStr": {
-            // `String(u)` over the dyn tree — total, never throws (no
-            // user toString ever runs: OBJ is the static "[object
-            // Object]" husk, ARR is Array.prototype.toString's join).
+            // `String(u)` over the dyn tree, with GH #134's object
+            // protocol: a `toString` / `valueOf` member is called (dyn.ts
+            // toStrUser), its throw propagates.
             this.walkExpr(e.args[0]!);
-            code.call(this.dyn.toStr());
+            code.call(this.dyn.toStrUser());
+            this.emitPendingCheck();
             return;
           }
           case "getProp": {
@@ -37230,10 +37351,12 @@ class Assembler {
     code.structGet(dynT, DYN_REF);
     emitFlatCast(code, this.strType);
     code.else_();
+    // ToPropertyKey: an object key's own toString runs (GH #134).
     code.localGet(d);
-    code.call(this.dyn.toStr());
+    code.call(this.dyn.toStrUser());
     this.close();
     this.releaseScratch(dynRef, d);
+    this.emitPendingCheck();
   }
 
   /** JS-exact switch: the discriminant evaluates once into a scratch; the

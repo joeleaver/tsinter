@@ -22,7 +22,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -5376,7 +5376,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       };
       value = L.coerceInto(expr, wrapped, target.type);
     } else if (compound === "+" && target.type.kind === "string") {
-      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: L.ensureString(r, expr.right), type: STRING, loc }));
+      value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: ensureConcatString(L, r, expr.right), type: STRING, loc }));
     } else if (target.type.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op: compound, left: read, right: rhs, type: F64, loc };
     } else if (

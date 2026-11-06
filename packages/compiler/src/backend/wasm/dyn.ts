@@ -155,6 +155,13 @@ export const DK = {
   JSVAL: 11,
 } as const;
 
+/** GH #134: the named run-time refusal the TOTAL ToString helper (toStr)
+ * meets at an object or function with a `toString` member, own or
+ * inherited: converting through it runs user code, which only the
+ * catchable toStrUser does. */
+export const OWN_TOSTRING_REFUSAL =
+  "converting an object with its own toString member to a string at this site is not supported yet";
+
 /** `$dyn`'s field indices. */
 export const DYN_KIND = 0;
 export const DYN_NUM = 1;
@@ -4857,7 +4864,22 @@ export class DynBuilder {
         // message"), not "[object Object]". Every other object takes the
         // default text.
         this.objPayload(c, (x) => x.localGet(0));
-        c.localTee(O);
+        c.localSet(O);
+        // GH #134: an object with a `toString` member of its own (or on
+        // its prototype chain) converts through it, which runs user code
+        // and may throw: toStrUser's job. A site that converts through
+        // this total helper instead refuses by name rather than answer
+        // the inherited "[object Object]".
+        c.localGet(O);
+        this.deps.lit(c, "toString");
+        c.call(this.protoLinkLive || this.accessorsLive ? this.memberLookup() : this.objGet());
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, OWN_TOSTRING_REFUSAL));
+        c.unreachable();
+        c.end();
+        c.localGet(O);
         this.deps.lit(c, "%error");
         c.call(this.objGet());
         c.refIsNull();
@@ -4935,6 +4957,17 @@ export class DynBuilder {
       // simply absent (and its space kept) when the value is anonymous.
       // SEMANTICS.md S019.
       this.arm(c, K, [DK.FUNC], () => {
+        // GH #134: a function's own `toString` property (the OBJ arm's
+        // refusal, for the same reason).
+        c.localGet(0);
+        this.deps.lit(c, "toString");
+        c.call(this.fnOwnGet());
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, OWN_TOSTRING_REFUSAL));
+        c.unreachable();
+        c.end();
         this.deps.lit(c, "function ");
         this.fnPayload(c, (x) => x.localGet(0));
         c.structGet(this.fnT(), FN_NAME);
@@ -5027,6 +5060,365 @@ export class DynBuilder {
           this.bytesPayloadRef(),
           this.deps.bytesRefU8(),
         ],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** Local `m` = the member `name` OrdinaryToPrimitive consults on the
+   * object or function in local `d`, or null when there is none to find
+   * (the inherited Object.prototype / Function.prototype member then
+   * answers): an object's own member, else its A2 prototype chain's, with
+   * an accessor read through its getter (`this` = the object; a getter
+   * throw returns `onPending`'s value from the enclosing function); a
+   * function's own property. The emitter's emitPrimMemberGet, here so
+   * toStrUser can share it. */
+  primMemberInto(c: Code, d: number, m: number, name: string, onPending: (c: Code) => void): void {
+    const dynT = this.dynT();
+    c.localGet(d);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(d);
+    this.deps.lit(c, name);
+    c.call(this.fnOwnGet());
+    c.localSet(m);
+    c.else_();
+    this.objPayload(c, (x) => x.localGet(d));
+    this.deps.lit(c, name);
+    c.call(this.protoLinkLive || this.accessorsLive ? this.memberLookup() : this.objGet());
+    c.localSet(m);
+    c.localGet(m);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    this.resolveCellInto(c, d, m, onPending);
+    c.end();
+    c.end();
+  }
+
+  /** %w.dyn.fmtSUser(d) → i32 (GH #134): does util.format's `%s` String()
+   * this value rather than inspect it — an object whose `toString`, own
+   * or inherited through an A2 link, is a function (Node's
+   * hasBuiltInToString answers false: the member is not a built-in
+   * prototype's). An accessor member counts (Node reads it; toStrUser
+   * calls its getter). Every other value answers 0. */
+  fmtSUser(): number {
+    return this.cached("fmtSUser", [this.dynRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const M = 1;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(0));
+      this.deps.lit(c, "toString");
+      c.call(this.protoLinkLive || this.accessorsLive ? this.memberLookup() : this.objGet());
+      c.localTee(M);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      if (this.accessorsLive) {
+        c.localGet(M);
+        this.isAccessorCell(c);
+        c.i32Or();
+      }
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.toStrMember(recv, what, hasArg) → dyn (GH #134): the
+   * member rung of the method call `recv.toString()` (the emitter's
+   * dyn.toString). An object or function with a `toString` member to
+   * find, own or inherited, calls it with `this` = recv and answers its
+   * STRING result; a member that is not callable throws Node's "<what> is
+   * not a function". Null with the exception pending on a throw. With no
+   * member to find (or a receiver of another kind) the receiver itself
+   * comes back, and the caller's kind dispatch answers — a STRING
+   * receiver's own text is that answer. Two shapes refuse by name: an
+   * explicit argument (the call site's encoding, which the member would
+   * receive) and a member answering a non-string (the call's IR type is
+   * string). */
+  toStrMember(): number {
+    return this.cached("toStrMember", [this.dynRef(), this.deps.strRef(), I32], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const vec = this.deps.arrVec();
+      const c = new Code();
+      const K = 3;
+      const M = 4;
+      const R = 5;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(K);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.localGet(K);
+      c.i32Const(DK.FUNC);
+      c.i32Ne();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      this.primMemberInto(c, 0, M, "toString", (x) => x.refNull(dynT));
+      c.localGet(M);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Ne();
+      c.ifVoid();
+      c.localGet(1);
+      c.call(this.notFn());
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(2);
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "calling an object's own toString member with an argument is not supported yet"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.call(this.thisPush());
+      c.localGet(M);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.arrayNewDefault(vec.bufType);
+      c.structNew(vec.struct);
+      this.deps.lit(c, "toString");
+      c.call(this.callFn());
+      c.localSet(R);
+      c.call(this.thisPop());
+      c.localGet(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Ne();
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "an own toString member that answers a non-string value, called as a method, is not supported yet"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      this.mb.setBody(idx, [I32, this.dynRef(), this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.toStrUser(d) → ToString(d), or null with the exception
+   * pending (GH #134). `String(u)`, `${u}`, a dynamic array's join and
+   * the concatenation operators convert through this: an object or a
+   * function runs OrdinaryToPrimitive with the STRING hint over its
+   * members, own or inherited through an A2 prototype link — a callable
+   * `toString` is called with the value as `this`, then `valueOf`; the
+   * first primitive answer converts, a throw propagates, and neither
+   * answering a primitive is Node's "Cannot convert object to primitive
+   * value" TypeError. With no `toString` member to find, the inherited
+   * Object.prototype / Function.prototype member answers, which is toStr.
+   * An array is Array.prototype.toString — join(",") — over this same
+   * conversion of each element (a null or undefined element renders
+   * empty). Every other kind runs no user code and is toStr. */
+  toStrUser(): number {
+    return this.cached("toStrUser", [this.dynRef()], [this.deps.strRef()], (idx) => {
+      const dynT = this.dynT();
+      const concat = this.deps.concat();
+      const vec = this.deps.arrVec();
+      const c = new Code();
+      const K = 1;
+      const M = 2;
+      const R = 3;
+      const OUT = 4;
+      const A = 5;
+      const N = 6;
+      const I = 7;
+      const E = 8;
+      const S = 9;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.typedArm(c, 0, K, () => {
+        c.localGet(0);
+        c.call(this.toStr());
+      });
+      /** Calls the FUNC member in M with the value as `this` and no
+       * arguments: a throw returns null; a primitive answer returns its
+       * text. An object answer falls through. */
+      const callM = (name: string): void => {
+        c.localGet(0);
+        c.call(this.thisPush());
+        c.localGet(M);
+        c.i32Const(0);
+        c.i32Const(0);
+        c.arrayNewDefault(vec.bufType);
+        c.structNew(vec.struct);
+        this.deps.lit(c, name);
+        c.call(this.callFn());
+        c.localSet(R);
+        c.call(this.thisPop());
+        c.localGet(R);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(this.deps.strType());
+        c.return_();
+        c.end();
+        // NULL BOOL NUM STR UNDEF
+        c.localGet(R);
+        c.structGet(dynT, DYN_KIND);
+        c.localTee(K);
+        c.i32Const(DK.STR);
+        c.i32LeU();
+        c.localGet(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(R);
+        c.call(this.toStr());
+        c.return_();
+        c.end();
+      };
+      const mIsFunc = (): void => {
+        c.localGet(M);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+      };
+      const onPending = (x: Code): void => x.refNull(this.deps.strType());
+      this.arm(c, K, [DK.OBJ, DK.FUNC], () => {
+        this.primMemberInto(c, 0, M, "toString", onPending);
+        c.localGet(M);
+        c.refIsNull();
+        c.ifVoid();
+        // No toString to find: the inherited one, which runs no user
+        // code — except on a null-prototype object, which inherits
+        // nothing and goes on to valueOf.
+        if (this.deps.nullProtoToStr !== undefined) {
+          c.localGet(K);
+          c.i32Const(DK.OBJ);
+          c.i32Eq();
+          c.ifResult(I32);
+          this.objPayload(c, (x) => x.localGet(0));
+          c.structGet(this.objT(), OBJ_PROTO);
+          this.protoIsNull(c);
+          c.else_();
+          c.i32Const(0);
+          c.end();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(0);
+          c.call(this.toStr());
+          c.return_();
+          c.end();
+        } else {
+          c.localGet(0);
+          c.call(this.toStr());
+          c.return_();
+        }
+        c.else_();
+        mIsFunc();
+        c.ifVoid();
+        callM("toString");
+        c.end();
+        c.end();
+        this.primMemberInto(c, 0, M, "valueOf", onPending);
+        c.localGet(M);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        mIsFunc();
+        c.ifVoid();
+        callM("valueOf");
+        c.end();
+        c.end();
+        // The inherited valueOf answers the object itself.
+        this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Cannot convert object to primitive value"));
+        c.refNull(this.deps.strType());
+      });
+      this.arm(c, K, [DK.ARR], () => {
+        this.deps.lit(c, "");
+        c.localSet(OUT);
+        this.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(A);
+        this.arrLen(c, (x) => x.localGet(A));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Const(0);
+        c.i32Ne();
+        c.ifVoid();
+        c.localGet(OUT);
+        this.deps.lit(c, ",");
+        c.call(concat);
+        c.localSet(OUT);
+        c.end();
+        this.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+        c.localTee(E);
+        c.structGet(dynT, DYN_KIND);
+        c.localSet(K);
+        c.localGet(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(K);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(E);
+        c.call(idx);
+        c.localTee(S);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(this.deps.strType());
+        c.return_();
+        c.end();
+        c.localGet(OUT);
+        c.localGet(S);
+        c.call(concat);
+        c.localSet(OUT);
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(OUT);
+      });
+      c.localGet(0);
+      c.call(this.toStr());
+      this.mb.setBody(
+        idx,
+        [I32, this.dynRef(), this.dynRef(), this.deps.strRef(), this.arrRef(), I32, I32, this.dynRef(), this.deps.strRef()],
         c.bytes(),
       );
     });
@@ -9713,6 +10105,8 @@ export class DynBuilder {
       const FY = 6;
       const XI = 7;
       const YI = 8;
+      const SX = 9;
+      const SY = 10;
       c.localGet(0);
       c.refIsNull();
       c.i32Eqz();
@@ -9758,13 +10152,30 @@ export class DynBuilder {
       emitNumberCompareDefault(c, FX, FY, XI, YI, this.deps.arraySort().smiCompare(), () => this.deps.f64ToStr(), () => this.deps.strCmpU16());
       c.return_();
       c.end();
+      // GH #134: each element's own conversion (x first, as V8's
+      // SortCompareDefault); a member's throw answers 0 with the
+      // exception pending, which the sort tests.
       c.localGet(1);
-      c.call(this.toStr());
+      c.call(this.toStrUser());
+      c.localTee(SX);
+      c.refIsNull();
+      c.ifVoid();
+      c.f64Const(0);
+      c.return_();
+      c.end();
       c.localGet(2);
-      c.call(this.toStr());
+      c.call(this.toStrUser());
+      c.localTee(SY);
+      c.refIsNull();
+      c.ifVoid();
+      c.f64Const(0);
+      c.return_();
+      c.end();
+      c.localGet(SX);
+      c.localGet(SY);
       c.call(this.deps.strCmpU16());
       c.f64ConvertI32S();
-      this.mb.setBody(idx, [this.arrRef(), this.dynRef(), F64, F64, I32, I32], c.bytes());
+      this.mb.setBody(idx, [this.arrRef(), this.dynRef(), F64, F64, I32, I32, this.deps.strRef(), this.deps.strRef()], c.bytes());
     });
   }
 
@@ -9890,6 +10301,7 @@ export class DynBuilder {
         const J = 17;
         const B = 18;
         const A2 = 19;
+        const R2S = 20;
 
         /** Argument `i` as JS sees it: the value, or `undefined` past the
          * end — C's `argc > i ? args[i] : scr_dyn_undefined()`. */
@@ -10021,9 +10433,46 @@ export class DynBuilder {
             this.boxBool(c, (x) => x.i32Const(0));
             return;
           }
+          if (method === "toLocaleString") {
+            // GH #134: Object.prototype.toLocaleString is
+            // `this.toString()`, the member's own answer (any value) when
+            // there is a toString member to find.
+            this.primMemberInto(c, 0, M, "toString", (x) => x.refNull(dynT));
+            c.localGet(M);
+            c.refIsNull();
+            c.i32Eqz();
+            c.ifVoid();
+            c.localGet(M);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.FUNC);
+            c.i32Eq();
+            c.i32Eqz();
+            c.ifVoid();
+            // V8's typed "<rendering> is not a function" is not built here.
+            this.deps.fence(c, (x) => this.deps.lit(x, "toLocaleString over an object whose toString member is not a function is not supported yet"));
+            c.refNull(dynT);
+            c.return_();
+            c.end();
+            c.localGet(0);
+            c.call(this.thisPush());
+            c.localGet(M);
+            c.i32Const(0);
+            c.i32Const(0);
+            c.arrayNewDefault(this.deps.arrVec().bufType);
+            c.structNew(this.deps.arrVec().struct);
+            this.deps.lit(c, "toString");
+            c.call(this.callFn());
+            c.localSet(R);
+            c.call(this.thisPop());
+            c.localGet(R);
+            c.return_();
+            c.end();
+          }
           if (method === "toLocaleString" || method === "toString") {
             // OBJ only (OBJPROTO_METHODS' doc): this.toString(), which on
-            // the tree is the ToString conversion.
+            // the tree is the ToString conversion (no toString member to
+            // find here — invoke's own-member rung and the block above
+            // answer that).
             c.localGet(0);
             c.call(this.toStr());
             c.localSet(S);
@@ -10775,8 +11224,9 @@ export class DynBuilder {
                 c.i32Ne();
                 c.ifVoid();
                 c.localGet(M);
-                c.call(this.toStr());
+                c.call(this.toStrUser());
                 c.localSet(S);
+                bailIfPending();
                 c.end();
                 c.end();
                 this.deps.lit(c, "");
@@ -10809,9 +11259,14 @@ export class DynBuilder {
                     c.i32Or();
                     c.i32Eqz();
                     c.ifVoid();
-                    c.localGet(MSG);
+                    // GH #134: the element's own conversion (a toString /
+                    // valueOf member is called; its throw propagates).
                     c.localGet(E);
-                    c.call(this.toStr());
+                    c.call(this.toStrUser());
+                    c.localSet(R2S);
+                    bailIfPending();
+                    c.localGet(MSG);
+                    c.localGet(R2S);
                     c.call(concat);
                     c.localSet(MSG);
                     c.end();
@@ -12242,6 +12697,7 @@ export class DynBuilder {
             I32, // J
             I32, // B
             this.arrRef(), // A2
+            this.deps.strRef(), // R2S
           ],
           c.bytes(),
         );

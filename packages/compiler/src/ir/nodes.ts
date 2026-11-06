@@ -4380,8 +4380,13 @@ export type IrExpr =
   /** f64|bool → string, JS-exact (Number::toString / "true"/"false").
    * Union operands dispatch through the per-union ToString helper (arms
    * fenced to unit/string/f64/bool by the frontend); a CAUGHT operand is
-   * `String(e)` over the exception snapshot (scr_caught_to_string). */
-  | { kind: "toString"; operand: IrExpr; type: IrType; loc: SrcLoc }
+   * `String(e)` over the exception snapshot (scr_caught_to_string).
+   * `hint: "default"` (GH #134, dyn operands only): the `+` operator's
+   * conversion — ToPrimitive with the DEFAULT hint (`valueOf` before
+   * `toString`), then ToString — where a bare node is `String(u)` /
+   * `${u}`, the STRING hint (`toString` first). Backends without the
+   * object protocol may ignore it. */
+  | { kind: "toString"; operand: IrExpr; hint?: "default"; type: IrType; loc: SrcLoc }
   /** Lazily-branched conditional: exactly one arm evaluates. */
   | { kind: "ternary"; cond: IrExpr; then: IrExpr; else_: IrExpr; type: IrType; loc: SrcLoc }
   /** Nullish coalescing `a ?? b` — `logical`'s lazily-branched shape with
