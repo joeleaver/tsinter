@@ -2115,16 +2115,16 @@ export class DynBuilder {
         c.refIsNull();
         c.ifResult(dynRef);
         {
-          // An error's constructor read off a dynamic value (SIG -2, the
-          // emitter's errCtorGetHelper): a name-carrying stand-in, not
-          // callable here.
+          // A constructor read off a dynamic value (SIG -2, the emitter's
+          // ctorGetHelper — an error's class, Number, String, Boolean,
+          // Array): a name-carrying stand-in, not callable here.
           this.fnPayload(c, (x) => x.localGet(0));
           c.structGet(fnT, FN_SIG);
           c.i32Const(-2);
           c.i32Eq();
           c.ifVoid();
           this.deps.fence(c, (x) =>
-            this.deps.lit(x, "calling an error's constructor read from a dynamic value is not supported yet on the wasm lane"));
+            this.deps.lit(x, "calling a constructor read from a dynamic value (`x.constructor`) is not supported yet on the wasm lane"));
           c.refNull(dynT);
           c.return_();
           c.end();
@@ -10516,6 +10516,40 @@ export class DynBuilder {
           c.end();
           throwNotFn();
           c.return_();
+        }
+
+        // GH #135: `x.constructor(...)` where the receiver owns no
+        // `constructor` member calls the INHERITED constructor in Node
+        // (`e.constructor("m")` builds another TypeError, `(5).constructor`
+        // is Number) — not modeled, so a named fence rather than the own
+        // member arms' "is not a function". An own member (and a typed
+        // array, whose arm below fences already) is called as before.
+        if (method === "constructor") {
+          c.localGet(K);
+          c.i32Const(DK.BYTES);
+          c.i32Ne();
+          c.ifVoid();
+          c.localGet(0);
+          this.deps.lit(c, "constructor");
+          c.i32Const(0);
+          c.call(this.keyGet());
+          c.localTee(M);
+          c.refIsNull();
+          c.ifVoid();
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          c.localGet(M);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.UNDEF);
+          c.i32Eq();
+          c.ifVoid();
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "calling a constructor read from a dynamic value (`x.constructor(...)`) is not supported yet on the wasm lane"));
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          c.end();
         }
 
         // OBJ: the OWN member calls — own properties shadow prototypes in

@@ -280,6 +280,13 @@ export class ClassBuilder {
     return meta !== undefined && this.rootKind(meta) === "error";
   }
 
+  /** Every errT-shaped class of the program (the builtin error classes and
+   * the user classes rooted in one), in preorder — what an error's `vt`
+   * interval can name (GH #135: `e.constructor` read off a dynamic error). */
+  errorClasses(): LlClassMeta[] {
+    return [...this.metaMap.values()].filter((m) => this.rootKind(m) === "error").sort((a, b) => a.pre - b.pre);
+  }
+
   /** Is this class emitter-rooted (the gate-lift family — %EventEmitter
    * itself or a user subclass)? The allocation site's own question: an
    * emitter-rooted struct carries the two injected prefix fields (registry,

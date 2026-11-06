@@ -949,6 +949,41 @@ JSON.parse'd object is the SC1100 "expected number" fence), unchanged.
 **Tested by:** `packages/compiler/test/wasm-gh134-tostring.test.ts`
 (GH134-JS-01..14, GH134-TS-01..19), both lanes.
 
+**Amendment (GH #135, wasm and wasm-native): `x.constructor` answers for
+errors, primitives and arrays.** A dot read of `constructor` (or the
+literal keyed spelling in a JavaScript source) on a dynamic value whose
+own and chain members do not answer it reads the inherited constructor
+where this tier knows it: a caught or crossed error (S021's encoding)
+answers its CLASS — the builtin (`TypeError`, `RangeError`, `SyntaxError`,
+`Error`, `DOMException`) or the user class it was built from (`class Deep
+extends AppError {}` answers `Deep`), never its `name` member, so an
+assigned `e.name` does not rename it — and a number, string, boolean or
+array answers `Number`, `String`, `Boolean` or `Array`. Each answer is one
+function value per class (two TypeErrors' constructors are `===`; a
+TypeError's and a RangeError's are not) carrying the class's `name` and a
+`length` (1 for the builtins, 0 for DOMException; a user class's is its
+constructor's declared parameter count, S020's approximation — an
+implicit derived constructor counts its base's, where Node answers 0),
+and `String()` of it is S019's native-code form (a user class: Node
+prints its source). What it cannot do is loud: calling it
+(`e.constructor("m")`, `x.constructor(...)` with no own member) ends the
+program at a named fence (S122), comparing it with the builtin
+(`e.constructor === TypeError`) meets the builtin-as-a-value fence (a
+compile-time refusal in a TypeScript source), and in a TypeScript source
+of the one dynamic world any other receiver's miss (a plain object, a
+function, a promise) ends at the fence "reading 'constructor' of a
+dynamic value other than an error, a number, a string, a boolean or an
+array", where Node answers `Object` and the rest. Two reads keep this
+entry's silent `undefined`: a JavaScript source (or a program that kept
+the checked-dynamic world) reading `constructor` off any other receiver,
+and a JavaScript keyed read whose key is computed (`e[k]` with `k =
+"constructor"`); the TypeScript keyed forms take U1a's keyed fence. (A
+thrown object, array or `null` LITERAL in a JavaScript source reaches the
+catch as S022's empty object, so its `constructor` reads `undefined`
+there too — S022's divergence, not this one.) **Tested by:**
+`packages/compiler/test/wasm-gh135-error-constructor.test.ts` (wasm and
+wasm-native, JavaScript and TypeScript, against Node).
+
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
 The checked-dynamic tree stores objects as an own-entry table and arrays
@@ -1402,6 +1437,18 @@ still serialize the members.
 **Tested by:** the DCALS-07 row in `tests/harness/wasm-differential.test.ts`
 (the hidden `stack` included) and `wasm-emitter.test.ts`'s "S021
 amendment" row; the assigned-`name` residue is measured, not pinned.
+
+**Amendment (GH #135): an error reached as a dynamic value has no
+`stack`.** The encoding carries no `stack` member (S027: there are no
+frames to put in one), so `e.stack` on a caught error in a JavaScript
+source or through `catch (e: any)` / `unknown` reads `undefined`, `typeof
+e.stack` is `"undefined"` and `"stack" in e` is false, where Node answers
+a string beginning `Name: message` followed by its frames (a statically
+typed `err.stack` refuses at compile time, SC2020). An assigned `stack`
+reads back as assigned. `name`, `message`, `instanceof` and (S015's
+GH #135 amendment) `constructor` answer as in Node. **Tested by:**
+measured with the GH #135 rows (`typeof e.stack`), not pinned — a row
+observing it would fail against Node by construction.
 
 ## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
 

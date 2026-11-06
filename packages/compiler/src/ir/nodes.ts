@@ -820,8 +820,9 @@ export interface IrModule {
   /** Unit U1a: the program took the one dynamic world (a TypeScript program
    * on the WasmGC lanes — `any`/`unknown`/`object` are one island value);
    * absent when it kept the checked-dynamic world (a program with a
-   * JavaScript source, every other lane). Informational: no backend reads
-   * it; tests and tools observe which world a build took. */
+   * JavaScript source, every other lane). Mostly informational (tests and
+   * tools observe which world a build took); the wasm backend reads it for
+   * one choice, the miss of a dynamic `x.constructor` read (GH #135). */
   sharedDynamic?: true;
 }
 
