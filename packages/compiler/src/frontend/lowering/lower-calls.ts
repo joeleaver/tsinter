@@ -5,11 +5,11 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
-import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, newFnCtx, nodeThrowExpr } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
@@ -3568,15 +3568,24 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // `this` was undefined and `a["push"](x)` threw). A literal key is the
     // method name, so the call takes the property-access forms exactly. A
     // COMPUTED key (`o[k](...)`) has no method-call form with a runtime
-    // name and keeps the plain call below (the member read, then a call
-    // with `this` undefined — SEMANTICS.md S043's A3 amendment): the
-    // dispatch tables real programs write (`fns[i](3)` over an `any[]`,
-    // `table[k](1)` over a `Record<string, any>`, corpus 2600's
-    // `catchWarning[warning.name](warning)`) call arrows and plain
-    // functions that never read `this`.
+    // name: it takes the ELEMENT call below (GH #133 — the member read,
+    // then the call with `this` bound to the receiver: SEMANTICS.md S043's
+    // GH #133 amendment; it was called with `this` undefined).
+    //
+    // GH #133: an INDEX key (`handlers[0](4)`, `a["0"]()`) names an
+    // element, not a method — the method-call forms would look "0" up as a
+    // method name (an array has none: "handlers[0] is not a function"). In
+    // the one world it takes the element call below too; the
+    // checked-dynamic world's dynInvoke/callMethod forms answer it through
+    // the invoke ladder's index arm (dyn.ts).
     const elemKeyNode = ts.isElementAccessExpression(expr.expression) ? expr.expression.argumentExpression : null;
+    const indexKey = elemKeyNode !== null && L.sharedDynamic &&
+      (ts.isNumericLiteral(elemKeyNode) ||
+        ((ts.isStringLiteral(elemKeyNode) || ts.isNoSubstitutionTemplateLiteral(elemKeyNode)) && /^(0|[1-9][0-9]*)$/.test(elemKeyNode.text))) &&
+      (L.isIslandExpr(expr.expression) || probeLower(L, (expr.expression as ts.ElementAccessExpression).expression)?.type.kind === "dyn");
     if (
       elemKeyNode !== null &&
+      !indexKey &&
       (ts.isStringLiteral(elemKeyNode) || ts.isNoSubstitutionTemplateLiteral(elemKeyNode) || ts.isNumericLiteral(elemKeyNode)) &&
       ts.isElementAccessExpression(expr.expression) &&
       !expr.expression.questionDotToken &&
@@ -3653,6 +3662,15 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         }
       }
       const callee = L.lowerExpr(expr.expression);
+      // GH #133: an ELEMENT callee (`fns[i](2)`, `handlers[0](4)`,
+      // `o[k](1)`) is a method call in JavaScript — the keyed read, then
+      // the arguments, then the call with `this` bound to the read's
+      // receiver (SEMANTICS.md S043's GH #133 amendment). `recvThis` asks
+      // the backend for that binding: the receiver evaluates once, inside
+      // the read, and the backend keeps it for the call. Only the bare
+      // keyed reads carry it (the validator checks the shape); `a?.[k]()`
+      // and `a[k]?.()` keep their own lowerings.
+      const { recvThis, elemSpelling } = elementCallOf(expr, callee);
       // A checker-`any` callee that LOWERED checked-dynamic (a dyn member
       // chain's stored function): the checked-dynamic tree's own call — dynCall reads and
       // calls the stored member with Node's is-not-a-function TypeError
@@ -3667,12 +3685,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           if (spreadServed) return spreadServed;
         }
         const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-        const calleeName = ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
-          ? expr.expression.getText()
-          : ts.isIdentifier(expr.expression)
-            ? expr.expression.text
-            : "value";
-        return { kind: "dynCall", callee, calleeName, args, type: DYN, loc };
+        const calleeName = elemSpelling !== undefined ? elemSpelling
+          : ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
+            ? expr.expression.getText()
+            : ts.isIdentifier(expr.expression)
+              ? expr.expression.text
+              : "value";
+        return { kind: "dynCall", callee, calleeName, args, ...(recvThis ? { recvThis: true as const } : {}), type: DYN, loc };
       }
       // `fn(...args)` — a TRAILING spread into an island call: the
       // engine's own spread application (jsOp callSpread — the leading
@@ -3705,9 +3724,14 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // calleeName rule): a member read's source text, an identifier's name.
       const callee0 = ts.isParenthesizedExpression(expr.expression) ? null : expr.expression;
       const spelling = callee0 === null ? undefined
+        : elemSpelling !== undefined ? elemSpelling
         : ts.isPropertyAccessExpression(callee0) || ts.isElementAccessExpression(callee0) ? callee0.getText()
         : ts.isIdentifier(callee0) ? callee0.text : undefined;
-      const result: IrExpr = { kind: "jsOp", op: "callFn", ...(spelling !== undefined ? { spelling } : {}), args: [callee, ...args], type: JSVAL, loc };
+      const result: IrExpr = {
+        kind: "jsOp", op: "callFn", ...(spelling !== undefined ? { spelling } : {}),
+        ...(recvThis ? { recvThis: true as const } : {}),
+        args: [callee, ...args], type: JSVAL, loc,
+      };
       return islandPrimitiveExit(L, expr, result);
     }
 
@@ -4482,12 +4506,15 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         L.unsupported("SC1090", expr, "spread arguments in calls through 'unknown' values");
       }
       const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-      const calleeName = ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
-        ? expr.expression.getText()
-        : ts.isIdentifier(expr.expression)
-          ? expr.expression.text
-          : "value";
-      return { kind: "dynCall", callee, calleeName, args, type: DYN, loc };
+      // GH #133: an element callee binds `this` to its receiver.
+      const { recvThis, elemSpelling } = elementCallOf(expr, callee);
+      const calleeName = elemSpelling !== undefined ? elemSpelling
+        : ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)
+          ? expr.expression.getText()
+          : ts.isIdentifier(expr.expression)
+            ? expr.expression.text
+            : "value";
+      return { kind: "dynCall", callee, calleeName, args, ...(recvThis ? { recvThis: true as const } : {}), type: DYN, loc };
     }
     if (callee.type.kind !== "func") {
       L.badType(expr.expression, L.typeOf(expr.expression));
@@ -6159,6 +6186,64 @@ const inliningPredicates = new Set<ts.Symbol>();
    * object-literal shorthand method to a module-level function and yields
    * the `closure` expression creating it. */
   export function lowerLambda(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
+    // GH #133 review: a JavaScript ARROW's `this` is lexical — the `this`
+    // of the code that CREATES it, fixed then. Where no binding is in
+    // scope (the creator is a plain function or the module, whose `this`
+    // is the ambient receiver dyn.this reads), the creator reads its
+    // receiver into a hidden local as the arrow is created, and the
+    // arrow's `this` reads that local through the ordinary capture
+    // machinery — so no call made later (a helper invoking it, an element
+    // or method call through it, a plain-call bracket) can change it.
+    // A creator whose body assembly supports it (FnCtx.lexThisOk: lambdas,
+    // declarations, module inits) reads its receiver ONCE, at entry, into
+    // `%lexthis` — its own `this` reads resolve there too; any other
+    // creator reads it as each arrow is created.
+    if (ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile()) && arrowReadsThis(node) && L.resolveThis() === null) {
+      if (L.ctx.lexThisOk) {
+        L.ctx.lexThis ??= L.declareHiddenLocal("%lexthis", DYN);
+        L.ctx.scopes[0]!.set(THIS_BINDING, L.ctx.lexThis);
+        return lowerLambdaInner(L, node, opts);
+      }
+      const scope = L.ctx.scopes[L.ctx.scopes.length - 1]!;
+      const lexThis = L.declareHiddenLocal("%lexthis", DYN);
+      scope.set(THIS_BINDING, lexThis);
+      let closure: IrExpr;
+      try {
+        closure = lowerLambdaInner(L, node, opts);
+      } finally {
+        scope.delete(THIS_BINDING);
+      }
+      const loc = locOf(node);
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "varDecl", localId: lexThis.id, init: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, loc }],
+        result: closure,
+        type: closure.type,
+        loc,
+      };
+    }
+    return lowerLambdaInner(L, node, opts);
+  }
+
+/** Does this arrow read `this` — its own body or a nested arrow's (nested
+ * functions, methods and classes have their own)? */
+function arrowReadsThis(fn: ts.ArrowFunction): boolean {
+  let found = false;
+  ts.walkPreorder(fn.body, (n) => {
+    if (n.kind === ts.SyntaxKind.ThisKeyword) {
+      found = true;
+      return "stop";
+    }
+    if (ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) || ts.isAccessor(n) ||
+        ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+      return "skip";
+    }
+    return undefined;
+  });
+  return found;
+}
+
+function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
     const loc = locOf(node);
     const { shapes, funcType } = L.lambdaSignature(node);
     // A lambda IS a value: the exact-arity rule applies at birth. The
@@ -6203,6 +6288,7 @@ const inliningPredicates = new Set<ts.Symbol>();
       : L.bodyReturnType(isAsync, funcType.ret);
 
     const fnCtx = newFnCtx(true, selfSymbol, funcType, bodyReturn);
+    if (!ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile())) fnCtx.lexThisOk = true;
     fnCtx.isAsync = isAsync;
     if (isGenerator && funcType.ret.kind === "generator") {
       fnCtx.generator = { yieldT: funcType.ret.yieldT, nextT: funcType.ret.nextT };
@@ -6280,7 +6366,7 @@ const inliningPredicates = new Set<ts.Symbol>();
                 ];
         }
       }
-      body = [...prologue, ...body];
+      body = [...(fnCtx.lexThis ? [lexThisEntry(fnCtx.lexThis, loc)] : []), ...prologue, ...body];
       // Bare-expression bodies never pass through lowerStmts, so the
       // lib-boundary chokepoint runs here (idempotent for block bodies,
       // whose statements were already walked). A fence poisons the
@@ -8469,6 +8555,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
       ? L.genBodyReturnType(sig.returnType)
       : L.bodyReturnType(sig.isAsync === true, sig.returnType);
     const ctx = newFnCtx(false, null, null, bodyReturn);
+    if (isJsSourceFile(decl.getSourceFile())) ctx.lexThisOk = true; // GH #133 review: FnCtx.lexThis
     ctx.isAsync = sig.isAsync === true;
     if (sig.generator !== undefined) ctx.generator = sig.generator;
     const diagsBefore = L.diags.length;
@@ -8488,6 +8575,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
         L.unsupported("SC1090", decl, "function declarations whose block body the frontend cannot locate");
       }
       const body = [...prologue, ...scopeEntryFences(L, decl), ...L.lowerStmts(bodyBlock.statements)];
+      if (ctx.lexThis) body.unshift(lexThisEntry(ctx.lexThis, locOf(decl)));
       appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(decl));
       const fn: IrFunction = {
         name: sig.name,
@@ -9668,6 +9756,97 @@ export function v8SpreadSpelling(text: string): string {
     }
   }
   return out;
+}
+
+/** GH #133: whether a call through `callee` (the lowered callee of
+ * `expr`) is an ELEMENT call that binds `this` to the keyed read's
+ * receiver — a bare `o[k](...)` (no optional token, no spread argument)
+ * whose callee lowered to a plain keyed read — and the callee's V8
+ * spelling for "<x> is not a function" when the callee is an element
+ * access at all. */
+function elementCallOf(expr: ts.CallExpression, callee: IrExpr): { recvThis: boolean; elemSpelling: string | undefined } {
+  const elemRead = ts.isElementAccessExpression(expr.expression) && !expr.expression.questionDotToken && !expr.questionDotToken;
+  const recvThis = elemRead && !expr.arguments.some((a) => ts.isSpreadElement(a)) && keyedReadRecv(callee) !== null;
+  const elemSpelling = elemRead ? v8CalleeSpelling(expr.expression as ts.ElementAccessExpression) : undefined;
+  return { recvThis, elemSpelling };
+}
+
+/** GH #133: an element callee as V8's CallPrinter spells it in
+ * "<callee> is not a function" — v8SpreadSpelling's forms first, then the
+ * computed keys it does not render, from the AST: a key that is an
+ * operator expression prints parenthesized (`a[(i + 7)]`, `a[((i * 2) + 1)]`,
+ * `a[(-i)]`, `a[(typeof k)]`, `a[(i++)]`), a string literal inside one
+ * double-quoted (`a[("x" + i)]`), a call `f(...)` (all measured on Node).
+ * A shape neither renders keeps its source text, as before. */
+function v8CalleeSpelling(callee: ts.ElementAccessExpression): string {
+  return v8SpreadSpelling(callee.getText()) || v8Render(callee, true) || callee.getText();
+}
+
+function v8Render(n: ts.Expression, top = false): string | null {
+  if (ts.isParenthesizedExpression(n)) return v8Render(n.expression, top);
+  if (ts.isIdentifier(n)) return n.text;
+  if (n.kind === ts.SyntaxKind.ThisKeyword || n.kind === ts.SyntaxKind.TrueKeyword ||
+      n.kind === ts.SyntaxKind.FalseKeyword || n.kind === ts.SyntaxKind.NullKeyword) return n.getText();
+  if (ts.isNumericLiteral(n)) {
+    const v = Number(n.text.replace(/_/g, ""));
+    return Number.isNaN(v) ? null : String(v);
+  }
+  if (ts.isStringLiteral(n)) return /[^\x20-\x7e]|["\\]/.test(n.text) ? null : `"${n.text}"`;
+  if (ts.isPropertyAccessExpression(n)) {
+    if (n.questionDotToken) return null;
+    const o = v8Render(n.expression);
+    return o === null ? null : `${o}.${n.name.text}`;
+  }
+  if (ts.isElementAccessExpression(n)) {
+    if (n.questionDotToken) return null;
+    const o = v8Render(n.expression);
+    if (o === null) return null;
+    const k = n.argumentExpression;
+    if (ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k)) return /[\\]/.test(k.getText()) ? null : `${o}.${k.text}`;
+    const kr = v8Render(k);
+    return kr === null ? null : `${o}[${kr}]`;
+  }
+  if (ts.isCallExpression(n)) {
+    if (n.questionDotToken) return null;
+    const c = v8Render(n.expression);
+    return c === null ? null : `${c}(...)`;
+  }
+  if (top) return null;
+  if (ts.isBinaryExpression(n)) {
+    const op = n.operatorToken.getText();
+    // Assignments print as their target (`a[i = 1]` reads `a[i]`): not rendered.
+    if (/=$/.test(op) && !["==", "===", "!=", "!==", "<=", ">="].includes(op)) return null;
+    const l = v8Render(n.left);
+    const r = v8Render(n.right);
+    return l === null || r === null ? null : `(${l} ${op} ${r})`;
+  }
+  if (ts.isPrefixUnaryExpression(n)) {
+    // `-1` is the literal -1 to V8's parser.
+    if (n.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(n.operand)) {
+      const v = v8Render(n.operand);
+      return v === null ? null : String(-Number(v));
+    }
+    const op = n.operator === ts.SyntaxKind.MinusToken ? "-" : n.operator === ts.SyntaxKind.ExclamationToken ? "!"
+      : n.operator === ts.SyntaxKind.TildeToken ? "~" : n.operator === ts.SyntaxKind.PlusToken ? "+"
+      : n.operator === ts.SyntaxKind.PlusPlusToken ? "++" : n.operator === ts.SyntaxKind.MinusMinusToken ? "--" : null;
+    const o = op === null ? null : v8Render(n.operand);
+    return o === null ? null : `(${op}${o})`;
+  }
+  if (ts.isPostfixUnaryExpression(n)) {
+    const o = v8Render(n.operand);
+    return o === null ? null : `(${o}${n.operator === ts.SyntaxKind.PlusPlusToken ? "++" : "--"})`;
+  }
+  if (ts.isTypeOfExpression(n) || ts.isVoidExpression(n)) {
+    const o = v8Render(n.expression);
+    return o === null ? null : `(${ts.isTypeOfExpression(n) ? "typeof" : "void"} ${o})`;
+  }
+  if (ts.isTemplateExpression(n)) {
+    // V8 prints a template's substitutions run together (`a[`x${i}y${a}z`]`
+    // reads `a[ia]`).
+    const parts = n.templateSpans.map((s) => v8Render(s.expression));
+    return parts.some((p) => p === null) ? null : parts.join("");
+  }
+  return null;
 }
 
 /** The index of the `)` closing the `(` at `open`, skipping string

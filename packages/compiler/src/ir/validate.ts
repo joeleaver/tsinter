@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
+import { arrayOf, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -3190,6 +3190,9 @@ function validateFunction(
         checkExpr(e.callee);
         expectType(e.callee, DYN, "dynCall callee");
         if (e.type.kind !== "dyn") err(`dynCall must be dyn-typed, got ${e.type.kind}`, e.loc);
+        if (e.recvThis !== undefined && (keyedReadRecv(e.callee) === null || e.spreads !== undefined)) {
+          err("dynCall recvThis requires a keyed-read callee and no spreads", e.loc);
+        }
         for (const a of e.args) {
           checkExpr(a);
           if (a.type.kind !== "dyn") err(`dynCall argument of kind ${a.type.kind} (must be dyn)`, e.loc);
@@ -4906,6 +4909,12 @@ function validateFunction(
         }
         if (e.spelling !== undefined && e.op !== "callMethod" && e.op !== "callFn") {
           err(`jsOp ${e.op} forbids a callee spelling (callMethod and callFn only)`, e.loc);
+        }
+        if (e.recvThis !== undefined) {
+          const callee = e.args[0];
+          if (e.op !== "callFn" || callee === undefined || keyedReadRecv(callee) === null) {
+            err(`jsOp ${e.op} recvThis requires callFn over a keyed-read callee`, e.loc);
+          }
         }
         const arity: Record<string, number | null> = {
           add: 2, sub: 2, mul: 2, div: 2, mod: 2, pow: 2,

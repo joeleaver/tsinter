@@ -1024,7 +1024,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         return;
       }
       case "dynCall":
-        if (opaqueCalls && (r["args"] as IrExpr[]).some(passesDyn)) noteDynWrite(null);
+        // An element call (GH #133, `recvThis`) hands its receiver on too.
+        if (opaqueCalls && ((r["args"] as IrExpr[]).some(passesDyn) || r["recvThis"] === true)) noteDynWrite(null);
         return;
       case "dynScalarEq":
         if (isDynType((r["left"] as IrExpr).type) && isDynType((r["right"] as IrExpr).type)) {
@@ -1079,7 +1080,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
             for (const a of args.slice(1)) if (isDynType(a.type) && passesJs(a)) noteDynWrite(a);
           }
         } else if (op === "setProp" || op === "setIdx" || op === "callMethod" || op === "optCallMethod" || op === "defineGetter") noteDynWrite(null);
-        else if (JS_WRITING_OPS.has(op) && args.slice(1).some(passesJs)) noteDynWrite(null);
+        else if (JS_WRITING_OPS.has(op) && (args.slice(1).some(passesJs) || r["recvThis"] === true)) noteDynWrite(null);
         if (op === "eq" || op === "neq") {
           dynIdentity = true;
           dynIdentityOps.push(null);

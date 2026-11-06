@@ -4927,8 +4927,13 @@ export type IrExpr =
    * catchably — `what` is the spread expression's source spelling, which
    * the nullish text spells), evaluated and flattened left-to-right (JS's
    * ArgumentListEvaluation). The emitters build one fresh argument array
-   * and apply through it. */
-  | { kind: "dynCall"; callee: IrExpr; calleeName: string; args: IrExpr[]; spreads?: { arg: number; what: string }[]; type: IrType; loc: SrcLoc }
+   * and apply through it.
+   *
+   * `recvThis` (GH #133, the element call `fns[i](2)`): the callee is a
+   * keyed read (`keyedReadRecv`) and the call runs with `this` bound to
+   * that read's receiver, which evaluates once (the validator checks the
+   * shape). */
+  | { kind: "dynCall"; callee: IrExpr; calleeName: string; args: IrExpr[]; spreads?: { arg: number; what: string }[]; recvThis?: true; type: IrType; loc: SrcLoc }
   /** Prototype-method DISPATCH on a dyn receiver — `recv.m(...)` where `m`
    * is a name a dyn-representable prototype declares (Array/String/
    * Function shared names: push, slice, join, forEach, map, apply, ...),
@@ -5297,6 +5302,11 @@ export type IrExpr =
        * has no rendered form (the backend then names the method, or the
        * callee binding). */
       spelling?: string;
+      /** callFn only (GH #133, the element call `handlers[0](4)`): the
+       * callee (args[0]) is a keyed read (`keyedReadRecv`) and the call
+       * runs with `this` bound to that read's receiver, which evaluates
+       * once (the validator checks the shape). */
+      recvThis?: true;
       args: IrExpr[];
       type: IrType;
       loc: SrcLoc;
@@ -5424,6 +5434,18 @@ export type IrJsOp =
 
 /** Result-type rule for each island op (the validator enforces it; the
  * frontend constructs nodes with exactly these). */
+/** GH #133: the receiver of a KEYED READ an element call (`o[k](...)`,
+ * `recvThis`) binds `this` to — a jsOp getIdx, a plain (non-optional)
+ * dynKeyGet, or the one-world TypeScript read through the interned
+ * `%idx.inherited.<n>(o, k)` helper (S015's U1a fence) — or null for any
+ * other callee. */
+export function keyedReadRecv(e: IrExpr): IrExpr | null {
+  if (e.kind === "jsOp" && e.op === "getIdx" && e.args.length === 2) return e.args[0]!;
+  if (e.kind === "dynKeyGet" && e.optional !== true) return e.value;
+  if (e.kind === "call" && /^%idx\.inherited\.\d+$/.test(e.callee) && e.args.length === 2) return e.args[0]!;
+  return null;
+}
+
 export function jsOpResultKind(op: IrJsOp): "jsval" | "bool" | "string" | "void" {
   switch (op) {
     case "add": case "sub": case "mul": case "div": case "mod": case "pow":

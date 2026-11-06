@@ -220,6 +220,19 @@ export interface FnCtx {
    * hoist): the statement loop skips the source statement when it arrives.
    * Per context for the same reason as hoistedVars. */
   hoistedFnDecls: Set<ts.FunctionDeclaration>;
+  /** GH #133 review: a JavaScript function (or module init) whose arrows
+   * read `this` — `lexThis` is the hidden local holding its own receiver,
+   * read once at entry (the body's first statement, `lexThisEntry`), which
+   * the arrows capture. `lexThisOk` marks the contexts whose body assembly
+   * prepends that statement. */
+  lexThisOk?: true;
+  lexThis?: IrLocal;
+}
+
+/** GH #133 review: the entry read of a function's lexical receiver (see
+ * FnCtx.lexThis) — `varDecl %lexthis.<n> = dyn.this`. */
+export function lexThisEntry(local: IrLocal, loc: SrcLoc): IrStmt {
+  return { kind: "varDecl", localId: local.id, init: { kind: "libCall", fn: "dyn.this", args: [], type: local.type, loc }, loc };
 }
 
 export function newFnCtx(
@@ -7857,7 +7870,15 @@ export class Lowerer {
    * through arrows (function expressions/declarations reset `this` in JS;
    * their bodies never see an enclosing method's binding). */
   resolveThis(): IrLocal | null {
-    return this.resolveKey(THIS_BINDING);
+    // A JavaScript plain function (FnCtx.lexThisOk) owns its `this`: the
+    // search never passes it (GH #133 review — a nested `function` must
+    // not capture an enclosing method's or function's binding).
+    for (let d = this.fnStack.length - 1; d >= 0; d--) {
+      const c = this.fnStack[d]!;
+      if (this.bindingIn(c, THIS_BINDING)) return this.resolveKey(THIS_BINDING);
+      if (c.lexThisOk) return null;
+    }
+    return null;
   }
 
   /** READ-ONLY twin of resolveLocal for PROBES (isIslandExpr): answers

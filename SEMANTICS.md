@@ -3151,7 +3151,45 @@ in Node (`wasm-u1-shared-dynamic` U1B-THIS-01). A `--dynamic` program with a
 JavaScript source keeps the checked-dynamic world (S014's U1b amendment) and
 this entry with it. **Tested by:** the wasm emitter unit
 test's `dyn.this` pins and `packages/compiler/test/wasm-island-a.test.ts`
-(A3-MCALL-09, the computed-key form).
+(A3-MCALL-09, the computed-key form). Since GH #133 an element call
+(`o[k]()`, `a[0]()`) binds `this` to its receiver on the wasm and
+wasm-native lanes, in either world (S043's GH #133 amendment). With it,
+a plain call brackets the ambient receiver with `undefined` — a direct
+call of a JavaScript function whose body reads `this`, and, in a program
+that has such a function, every plain call through a dynamic function
+value: before, `who()` called from inside a bracketed call (a modeled
+dispatch, `apply`/`call`, an element call) read THAT call's receiver where
+Node's strict-mode plain call reads `undefined` (`a[0]()` over
+`[function () { return who(); }]` printed "bound"; GH133-JS-11). A plain
+call through a TYPED function value (`const g = who; g()` where `g` keeps a
+function type) still reads the enclosing receiver. A JavaScript ARROW's
+`this` is now lexical, as in Node: where its creator has no `this` binding
+of its own (a plain function or the module), the creator's ambient
+receiver is read when the arrow is CREATED and the arrow keeps it, so a
+later call through a helper, an object member, an array element or a
+method call (`o.cb()`, `r[0]()`, a TypeScript `m.obj.ar()` over a
+JavaScript arrow) no longer changes it — before, the arrow read whatever
+receiver was ambient when it RAN (`() => typeof this` handed to a helper
+from a method printed `undefined`, called as `r[0]()` it saw `r`;
+GH133-JS-12..14, GH133-TS-07). A plain `function` nested in another
+JavaScript function or method no longer captures that function's `this`
+binding at compile time: its `this` is the receiver of the call that runs
+it (GH133-JS-13, an element call). That is only as good as the call's
+binding, so the typed-function-value residual above applies to a nested
+function called plainly: `function inner() { return (() => this ===
+outer)(); } return inner();` inside a method prints `true` (the method's
+receiver), Node `false`. An async function's arrows read its receiver at
+entry, before the first await (GH133-JS-18). A GENERATOR (or async
+generator) that reads `this`, itself or through an arrow, stays refused by
+name (SC3001, `libCall:dyn.this:suspending`): its body first runs at the
+first `next()`, under that caller's receiver (GH133-JS-16/17). Still
+different: a SLOPPY-mode plain function called plainly sees `this` as
+`undefined` where Node passes `globalThis` (`function f() { return typeof
+this }; f()` prints `undefined`, Node `object`); strict-mode code, which
+most modules are, is unaffected. And a CommonJS module's top-level `this`
+(and an arrow's created there) reads `undefined` where Node gives
+`module.exports` (`typeof this` at a CommonJS top level is `"undefined"`,
+Node `"object"`); an ES module's is `undefined` in both.
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
@@ -3329,7 +3367,9 @@ as V8 does (`o.zz`, `o.v` for `o["v"]`, `o[16]` for `o[0x10]`,
 `o.list[0]` for `o["list"][0]`), where the wasm tier named only the
 method; a callee V8's rendering does not cover keeps the method name.
 Three shapes still differ:
-- **A computed key** (`o[k](...)`, `fns[i](3)`, `table[k](1)`) keeps the
+- **A computed key** (`o[k](...)`, `fns[i](3)`, `table[k](1)`) — on the
+  wasm and wasm-native lanes retired by the GH #133 amendment below,
+  except for spread arguments — keeps the
   plain call it always lowered to, on every lane and every receiver: the
   member is read, then called with `this` undefined, where Node calls it
   with `this` = `o`. Arrows and functions that never read `this` (the
@@ -3355,6 +3395,40 @@ threw "is not a function" — and an own or inherited `toString` member is
 still the one called.
 **Tested by:** A3-MCALL-01..09, A3-TOSTR-01 and A3-RENDER-01/02 in
 `packages/compiler/test/wasm-island-a.test.ts`.
+
+**Amendment (GH #133, wasm and wasm-native): an element call is a method
+call.** A call whose callee is an element access on a dynamic value —
+`handlers[0](4)`, `fns[i](2)`, `o[k](1)`, `a["0"]()`, in TypeScript and
+JavaScript sources and in a `--dynamic` JavaScript program's
+checked-dynamic world — reads the element with the receiver's own keyed
+read (array index, string key), evaluates the arguments, and calls it with
+`this` bound to the receiver, as Node does. Two things changed. A literal
+INDEX key (`handlers[0](4)`, `cfg.list[0](9, 4)`) used to be looked up as
+a method NAME, so every such call threw a catchable "handlers[0] is not a
+function" where Node calls the element — a silent wrong answer that no
+entry registered, now fixed. And the computed-key bullet above no longer
+holds on these lanes: `this` is the receiver (`a[i]()` over `[function ()
+{ return this.length }]` prints the array's length; A3-MCALL-09 now prints
+Node's `7 7 7`). A non-callable element throws V8's catchable
+"<callee> is not a function", the callee spelled as V8's CallPrinter
+spells it for the computed keys it renders (`a[(i + 7)]`, `a[(k + "x")]`,
+`a[f(...)]`, `a[(-i)]`, `a[-1]`, `"abc"[i]`); a key shape neither this
+rendering nor A3's covers keeps its source text, as before. Still
+different, each as before:
+- spread arguments (`a[i](...xs)`) keep the plain call, `this` undefined;
+- the optional forms `a?.[k]()` and `a[k]?.()` keep their own lowerings
+  (a JavaScript source fences them by name: SC1100/SC1090);
+- a computed key naming an INHERITED member (`arr[m](3)` with `m` =
+  `"push"`) reads S015's answer: in a JavaScript source the own-only
+  `undefined`, so the call throws "arr[m] is not a function" where Node
+  calls `push`; in a TypeScript program S015's U1a fence;
+- a symbol key on a dynamic object fences by name (SC1090), and in a
+  `--dynamic` JavaScript program a computed index read of an island array
+  fences by name (SC1090, "element access on non-array values") — both as
+  on main;
+- the c and llvm lanes are unchanged.
+**Tested by:** `packages/compiler/test/wasm-gh133-element-call.test.ts`
+(GH133-JS-01..18, GH133-TS-01..07, both lanes) and A3-MCALL-09.
 
 **Amendment (unit F1): an island RegExp value.** A RegExp crossing into
 `any` (the boundary's `new RegExp(re.source, re.flags)` over a regex
