@@ -664,8 +664,14 @@ export const EMITTER_API_MEMBERS: ReadonlySet<string> = new Set([
 function declaresStaticNameOrLength(decl: ts.ClassLikeDeclaration): boolean {
   return (decl.members as ts.NodeArray<ts.ClassElement>).some((m: ts.ClassElement) => {
     const nm = (m as { name?: ts.PropertyName }).name;
-    if (nm === undefined || !(ts.isIdentifier(nm) || ts.isStringLiteral(nm))) return false;
-    if (nm.text !== "name" && nm.text !== "length") return false;
+    if (nm === undefined) return false;
+    // `name`, `"name"`, `["name"]` (a computed string-literal key).
+    const text = ts.isIdentifier(nm) || ts.isStringLiteralLike(nm)
+      ? nm.text
+      : ts.isComputedPropertyName(nm) && ts.isStringLiteralLike(nm.expression)
+        ? nm.expression.text
+        : undefined;
+    if (text !== "name" && text !== "length") return false;
     return ts.canHaveModifiers(m) && (ts.getModifiers(m) ?? []).some((x) => x.kind === ts.SyntaxKind.StaticKeyword);
   });
 }

@@ -78,7 +78,6 @@ import {
   REF_TRUTHY_KINDS,
   keyedReadRecv,
 } from "../../ir/nodes.js";
-import { readFileSync } from "node:fs";
 import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import {
@@ -1954,18 +1953,24 @@ function rejectionHandledReachable(mod: WModule): boolean {
   return found;
 }
 
-export function emitWasmModule(mod: IrModule): Uint8Array {
+/** The program's source texts while a module is emitted (emitWasmModule's
+ * `sourceTexts`): what a backend-built fence reads its line from. */
+let fenceSourceTexts: ReadonlyMap<string, string> | null = null;
+
+export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, string>): Uint8Array {
   // The resumable lowering shares the sink: a function it declines names
   // itself in the same census the walk feeds, and on this path throws out
   // of the pass exactly like a construct the walk refuses would.
   const refuse: Refuse = (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
   };
+  fenceSourceTexts = sourceTexts ?? null;
   try {
     const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
     asm.run();
     return asm.finish();
   } finally {
+    fenceSourceTexts = null;
     setFlatCrossing(null);
     setCharsType(null);
   }
@@ -20370,10 +20375,27 @@ class Assembler {
             this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`), null);
             code.call(this.reportUncaughtHelper());
             this.close();
+            if (slot === ERR_NAME) {
+              code.localGet(o);
+              code.call(this.errRenameRecordHelper());
+            }
             code.localGet(o);
             code.localGet(v);
             code.structSet(this.exc().errT, slot);
             this.releaseScratch(this.strRef, v);
+            this.releaseScratch(errRef, o);
+            return;
+          }
+          if (slot === ERR_NAME) {
+            // GH #135: the name the error was built with outlives a rename.
+            const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+            const o = this.acquireScratch(errRef);
+            this.walkExpr(s.obj);
+            code.localTee(o);
+            code.call(this.errRenameRecordHelper());
+            code.localGet(o);
+            this.walkExpr(s.value);
+            code.structSet(this.exc().errT, slot);
             this.releaseScratch(errRef, o);
             return;
           }
@@ -36444,16 +36466,14 @@ class Assembler {
 
   /** The runtime builds several of Node's error classes as a plain `Error`
    * carrying the class's name (URIError, ReferenceError, AggregateError,
-   * AssertionError, EvalError): an `%Error`'s constructor is read off its
-   * name slot — `Error`, or one of those names while nothing in the
-   * program assigns the `name` of a statically typed `Error` (which writes
-   * the slot); anything else is a named fence. (An `e.name` assigned
-   * through a dynamic value writes the dynamic copy, never the slot.) */
+   * AssertionError, EvalError): an `%Error`'s constructor is read off the
+   * name it was BUILT with (errOrigNameHelper — a rename never moves it);
+   * any other name is a named fence. (An `e.name` assigned through a
+   * dynamic value writes the dynamic copy, never the slot.) */
   private emitPlainErrorCtor(c: Code, er: number, fence: (text: string) => void): void {
-    const exc = this.exc();
     const named = (name: string, arity: number, isClass: boolean): void => {
       c.localGet(er);
-      c.structGet(exc.errT, ERR_NAME);
+      c.call(this.errOrigNameHelper());
       this.pushStrLitInto(c, name);
       c.call(this.strEqHelper());
       c.ifVoid();
@@ -36462,49 +36482,130 @@ class Assembler {
       c.end();
     };
     c.localGet(er);
-    c.structGet(exc.errT, ERR_NAME);
+    c.call(this.errOrigNameHelper());
     c.refIsNull();
     c.i32Eqz();
     c.ifVoid();
     named("Error", 1, false);
-    if (!this.plainErrorNameWritten()) {
-      named("URIError", 1, false);
-      named("ReferenceError", 1, false);
-      named("EvalError", 1, false);
-      named("AggregateError", 2, false);
-      // node:assert's AssertionError is a JavaScript class in Node.
-      named("AssertionError", 1, true);
-    }
+    named("URIError", 1, false);
+    named("ReferenceError", 1, false);
+    named("EvalError", 1, false);
+    named("AggregateError", 2, false);
+    // node:assert's AssertionError is a JavaScript class in Node.
+    named("AssertionError", 1, true);
     c.end();
-    fence("reading 'constructor' of an Error whose name was assigned or that the runtime built under another name (Node answers its own constructor; this tier keeps only the name — SEMANTICS.md S015)");
+    fence("reading 'constructor' of an Error the runtime built under a name this tier does not attribute to a class (Node answers its own constructor; this tier keeps only the name — SEMANTICS.md S015)");
   }
 
-  private plainErrorNameWrittenMemo: boolean | null = null;
-  /** Does the program assign `name` on a statically typed `Error`? */
-  private plainErrorNameWritten(): boolean {
-    this.plainErrorNameWrittenMemo ??= this.irNodeReachable(
-      this.mod,
-      (rec) => rec["kind"] === "fieldSet" && rec["className"] === "%Error" && rec["field"] === "name",
-    );
-    return this.plainErrorNameWrittenMemo;
+  /* GH #135: the name a plain Error was BUILT with. The runtime builds
+   * URIError, ReferenceError, EvalError, AggregateError and AssertionError
+   * as a plain Error carrying that name, so the name slot is the class —
+   * until a statically typed write (`err.name = "X"`, the only writer of
+   * the slot) renames it. That write records the slot's previous value
+   * here first, once per error (a linked list keyed by identity, like
+   * dyn.ts's error-box cache), so the class survives any rename. */
+  private errOrigType: number | null = null;
+  private errOrigHead: number | null = null;
+  private errOrigT(): number {
+    if (this.errOrigType !== null) return this.errOrigType;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const strRef = this.strRef;
+    this.errOrigType = this.mb.selfStructType("err:origName", (self) => [
+      { storage: errRef, mutable: false },
+      { storage: strRef, mutable: false },
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: false },
+    ]);
+    return this.errOrigType;
+  }
+  private errOrigHeadGlobal(): number {
+    if (this.errOrigHead !== null) return this.errOrigHead;
+    const t = this.errOrigT();
+    this.errOrigHead = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(t);
+    });
+    return this.errOrigHead;
+  }
+  /** Local `n` = the entry for error 0, or null (a linear scan). */
+  private emitErrOrigFind(c: Code, n: number): void {
+    const t = this.errOrigT();
+    c.globalGet(this.errOrigHeadGlobal());
+    c.localSet(n);
+    c.block();
+    c.loop();
+    c.localGet(n);
+    c.refIsNull();
+    c.brIf(1);
+    c.localGet(n);
+    c.structGet(t, 0);
+    c.localGet(0);
+    c.refEq();
+    c.brIf(1);
+    c.localGet(n);
+    c.structGet(t, 2);
+    c.localSet(n);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+  private errRenameRecordFn: number | null = null;
+  /** `(err) -> ()`: before a static `name` write, remember the slot. */
+  private errRenameRecordHelper(): number {
+    if (this.errRenameRecordFn !== null) return this.errRenameRecordFn;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const t = this.errOrigT();
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], []), "%w.err.recordOrigName");
+    this.errRenameRecordFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
+    this.emitErrOrigFind(c, n);
+    c.localGet(n);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(0);
+    c.localGet(0);
+    c.structGet(this.exc().errT, ERR_NAME);
+    c.globalGet(this.errOrigHeadGlobal());
+    c.structNew(t);
+    c.globalSet(this.errOrigHeadGlobal());
+    c.end();
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+  private errOrigNameFn: number | null = null;
+  /** `(err) -> str`: the name error 0 was built with. */
+  private errOrigNameHelper(): number {
+    if (this.errOrigNameFn !== null) return this.errOrigNameFn;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const t = this.errOrigT();
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.origName");
+    this.errOrigNameFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
+    this.emitErrOrigFind(c, n);
+    c.localGet(n);
+    c.refIsNull();
+    c.ifResult(this.strRef);
+    c.localGet(0);
+    c.structGet(this.exc().errT, ERR_NAME);
+    c.else_();
+    c.localGet(n);
+    c.structGet(t, 1);
+    c.end();
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
   }
 
-  private fenceSiteFiles = new Map<string, string | null>();
   /** ` at <file>:<line>` for a fence's code tag, the form the frontend's
-   * located fences carry (lowerer.ts locateRuntimeFences); "" when the
-   * source cannot be read. */
+   * located fences carry (lowerer.ts locateRuntimeFences), from the
+   * frontend's source texts (emitWasmModule's `sourceTexts`); "" without
+   * them. */
   private fenceSiteTag(loc: SrcLoc | undefined): string {
     if (loc === undefined) return "";
-    let text = this.fenceSiteFiles.get(loc.file);
-    if (text === undefined) {
-      try {
-        text = readFileSync(loc.file, "utf8");
-      } catch {
-        text = null;
-      }
-      this.fenceSiteFiles.set(loc.file, text);
-    }
-    if (text === null) return "";
+    const text = fenceSourceTexts?.get(loc.file);
+    if (text === undefined) return "";
     let line = 1;
     for (let i = 0; i < loc.start && i < text.length; i++) if (text.charCodeAt(i) === 10) line++;
     return ` at ${loc.file}:${line}`;

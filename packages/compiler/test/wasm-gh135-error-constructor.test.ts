@@ -210,6 +210,19 @@ try { throw new Named("n"); } catch (e) { console.log("before"); console.log(e.c
     fence: { text: /reading 'constructor' of an error whose class declares a static 'name' or 'length' .*\[SC1090 at .*main\.js:2\]/, stdout: "before\n" },
   },
   {
+    id: "GH135-JS-18b a class with a computed static name stops at its named fence",
+    entry: "main.js",
+    src: `class Named extends Error { static ["name"] = "Other"; }
+try { throw new Named("n"); } catch (e) { console.log("before"); console.log(e.constructor.name); }`,
+    fence: { text: /reading 'constructor' of an error whose class declares a static 'name' or 'length'/, stdout: "before\n" },
+  },
+  {
+    id: "GH135-TS-15 a class with a computed static length stops at its named fence",
+    src: `class Sized extends Error { static ["length"] = 9; }
+try { throw new Sized("n"); } catch (e: any) { console.log("before"); console.log(e.constructor.length); }`,
+    fence: { text: /reading 'constructor' of an error whose class declares a static 'name' or 'length' .*\[SC1090 at .*main\.ts:2\]/, stdout: "before\n" },
+  },
+  {
     id: "GH135-JS-19 arguments.constructor stops at its named fence (this tier's arguments is an array)",
     entry: "main.js",
     src: `function f() { console.log("before", arguments.length); return arguments.constructor.name; }
@@ -313,11 +326,34 @@ try { assert.strictEqual(1, 2); } catch (e: any) { console.log(e.name, e.constru
 try { throw new Error("plain"); } catch (e: any) { e.name = "Renamed"; console.log(e.name, e.constructor.name); }`,
   },
   {
-    id: "GH135-TS-11 a statically renamed plain Error stops at its named fence",
+    id: "GH135-TS-11 a statically renamed plain Error keeps its class",
     src: `const err = new Error("x");
 err.name = "Custom";
-try { throw err; } catch (e: any) { console.log("before", e.name); console.log(e.constructor.name); }`,
-    fence: { text: /reading 'constructor' of an Error whose name was assigned or that the runtime built under another name .*S015/, stdout: "before Custom\n" },
+try { throw err; } catch (e: any) { console.log(e.name, e.constructor.name); }
+const err2 = new Error("y");
+err2.name = "URIError";
+err2.name = "AssertionError";
+try { throw err2; } catch (e: any) { console.log(e.name, e.constructor.name); }`,
+  },
+  {
+    id: "GH135-TS-13 a URIError renamed through its static type keeps its class, even renamed to Error",
+    src: `try { decodeURIComponent("%"); } catch (e) {
+  if (e instanceof Error) e.name = "Error";
+  try { throw e; } catch (x: any) { console.log(x.name, x.constructor.name); }
+}
+try { decodeURIComponent("%"); } catch (e) {
+  if (e instanceof Error) { e.name = "Other"; e.name = "Error"; e.name = "Third"; }
+  try { throw e; } catch (x: any) { console.log(x.name, x.constructor.name); }
+}`,
+  },
+  {
+    id: "GH135-TS-14 an unrelated typed rename does not change another error's class",
+    src: `import assert from "node:assert";
+const v = new Error("bad");
+v.name = "ValidationError";
+try { assert.strictEqual(1, 2); } catch (e: any) { console.log(e.name, e.constructor.name); }
+try { decodeURIComponent("%"); } catch (e: any) { console.log(e.name, e.constructor.name); }
+try { throw v; } catch (e: any) { console.log(e.name, e.constructor.name); }`,
   },
   {
     id: "GH135-TS-12 an assigned constructor member answers, undefined included",

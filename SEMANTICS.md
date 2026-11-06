@@ -963,14 +963,14 @@ the inherited constructor where this tier knows it:
   user class (`class Deep extends AppError {}` answers `Deep`). The
   runtime builds URIError, ReferenceError, EvalError, AggregateError and
   node:assert's AssertionError as a plain `Error` carrying that name, so a
-  plain `Error` answers by its name slot. That slot is `Error`, or one of
-  those five names when nothing in the program assigns `name` on a
-  statically typed `Error` (that assignment writes the slot). Any other
-  slot value ends the program at a named fence (S122): a host error
-  carrying another name, an `Error` renamed through its static type
-  (`err.name = "Custom"`, where Node answers `Error`), or every one of the
-  five once the program contains such an assignment. A user class that
-  declares a static `name` or `length` fences too (Node answers them);
+  plain `Error` answers by the name it was BUILT with: `Error` or one of
+  those five. A rename never moves it (a write through the static type,
+  `err.name = "Custom"`, records the built name first), so a renamed
+  `Error` still answers `Error` and a URIError renamed to `"Error"` still
+  answers `URIError`. A plain `Error` built under any other name (a host
+  error carrying one) ends the program at a named fence (S122). A user
+  class that declares a static `name` or `length` (`static name`,
+  `static ["name"]`) fences too (Node answers them);
 - a number, string, boolean or array answers `Number`, `String`, `Boolean`
   or `Array`. A function's `arguments` is an array here (S081), so
   `arguments.constructor` (Node: `Object`) refuses by name.
