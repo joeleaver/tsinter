@@ -49,9 +49,13 @@ async function both(src: string): Promise<{ node: Out; native: Out }> {
     if (!res.ok) throw new Error(res.diagnostics.map((d) => d.message).join("\n"));
     const nodeDir = mkdtempSync(join(dir, "node-"));
     const nativeDir = mkdtempSync(join(dir, "native-"));
-    // no core files: a signal death would otherwise spend seconds dumping
-    const node = await exec("/bin/sh", ["-c", 'ulimit -c 0; exec "$0" "$1"', process.execPath, file], nodeDir);
-    const native = await exec("/bin/sh", ["-c", 'ulimit -c 0; exec "$0"', res.binaryPath], nativeDir);
+    // No core dumps: a signal death would otherwise spend seconds (on WSL, a 64 GB crash file)
+    // dumping. The limit is 1, not 0: when core_pattern is a pipe (WSL, apport, systemd-coredump)
+    // the kernel ignores a limit of 0 and skips the dump only at exactly 1. A file pattern skips
+    // any limit under a page. Fall back to 0 where the hard limit is 0.
+    const NOCORE = "ulimit -c 1 2>/dev/null || ulimit -c 0;";
+    const node = await exec("/bin/sh", ["-c", `${NOCORE} exec "$0" "$1"`, process.execPath, file], nodeDir);
+    const native = await exec("/bin/sh", ["-c", `${NOCORE} exec "$0"`, res.binaryPath], nativeDir);
     return { node, native };
   } finally {
     rmSync(dir, { recursive: true, force: true });
