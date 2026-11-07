@@ -6748,6 +6748,36 @@ export class Lowerer {
    * (SC2002 for record shapes, SC2003 for unions). Every slot-directed
    * lowering goes through here (via lowerExprExpecting) or calls this
    * directly when the expression was already lowered. */
+  /** GH #138: does `node` evaluate to a Buffer whatever flows through the
+   * program? A call of the global Buffer's factories (`Buffer.from`,
+   * `alloc`, `allocUnsafe`, `allocUnsafeSlow`, `concat`, `copyBytesFrom`),
+   * a `subarray` / `slice` of a provable Buffer, or a `const` whose
+   * initializer is one. Static types never count: `b: Buffer` can hold a
+   * Uint8Array that arrived through `any` or a cast. */
+  provablyBuffer(node: ts.Expression, depth: number): boolean {
+    if (depth > 8) return false;
+    let n: ts.Expression = node;
+    while (ts.isParenthesizedExpression(n)) n = n.expression;
+    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) {
+      const callee = n.expression;
+      const m = callee.name.text;
+      if (["from", "alloc", "allocUnsafe", "allocUnsafeSlow", "concat", "copyBytesFrom"].includes(m) && this.isStdlibGlobal(callee.expression, "Buffer")) return true;
+      if ((m === "subarray" || m === "slice") && this.provablyBuffer(callee.expression, depth + 1)) return true;
+      return false;
+    }
+    if (ts.isIdentifier(n)) {
+      const sym = this.resolveValueSymbol(n);
+      const d = sym !== null ? this.checker.valueDeclarationOf(sym) : undefined;
+      if (
+        d !== undefined && ts.isVariableDeclaration(d) && d.initializer !== undefined && ts.isIdentifier(d.name) &&
+        (ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) !== 0
+      ) {
+        return this.provablyBuffer(d.initializer, depth + 1);
+      }
+    }
+    return false;
+  }
+
   coerceInto(node: ts.Node, expr: IrExpr, expected: IrType): IrExpr {
     let e = this.coerceToExpected(expr, expected);
     // Unit H (SEMANTICS.md S115): an island value leaving into typed
@@ -6822,16 +6852,15 @@ export class Lowerer {
       const name = jsFuncNameOf(node);
       if (name !== null) e = { ...e, fnName: name };
     }
-    // GH #138: a value the CHECKER types as a Buffer enters a dynamic
-    // position as one (the BYTES payload's Buffer flag): `constructor`,
-    // util.inspect, String() and JSON.stringify answer Buffer's. bytes<u8>
-    // is one IR type for Buffer and Uint8Array, so only this crossing's
-    // own node can tell (SEMANTICS.md S037's GH #138 amendment).
-    if ((e.kind === "dynFrom" || e.kind === "jsMarshal") && e.value.type.kind === "bytes" && e.value.type.elem === "u8" && ts.isExpression(node)) {
-      const tname = this.checker.typeToString(this.checker.getBaseTypeOfLiteralType(this.typeOf(node)));
-      if (tname === "Buffer" || tname === "NonSharedBuffer" || tname.startsWith("Buffer<") || tname.startsWith("NonSharedBuffer<")) {
-        e = { ...e, isBuffer: true };
-      }
+    // GH #138: a value this crossing's own expression PROVES is a Buffer
+    // (provablyBuffer) enters a dynamic position as one (the BYTES payload's
+    // Buffer flag): `constructor`, util.inspect, String() and JSON.stringify
+    // answer Buffer's. bytes<u8> is one IR type for Buffer and Uint8Array,
+    // and a static `Buffer` type is no proof (an `any` or a cast can carry a
+    // Uint8Array there), so everything else keeps the unflagged crossing
+    // (SEMANTICS.md S037's GH #138 amendment).
+    if ((e.kind === "dynFrom" || e.kind === "jsMarshal") && e.value.type.kind === "bytes" && e.value.type.elem === "u8" && ts.isExpression(node) && this.provablyBuffer(node, 0)) {
+      e = { ...e, isBuffer: true };
     }
     // A union the plain re-tag declined (stranded NON-unit arms): when the
     // node's CHECKER type proves those arms away, they trap instead — the

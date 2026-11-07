@@ -1,22 +1,27 @@
 /* GH #138: a Buffer held in a dynamic value answers as a Buffer. A value
- * TypeScript types as `Buffer` that crosses into `any` / `unknown` carries
- * the BYTES payload's Buffer flag, so `constructor` (named Buffer, length
- * 3), util.inspect / console.log (`<Buffer 61>`), String() and
- * JSON.stringify answer as Node's (SEMANTICS.md S037's GH #138
- * amendment). A Buffer nested in a composite that crosses keeps S037's
- * Uint8Array answer; those rows pin it beside Node's. Every other row
+ * whose crossing expression PROVES it is a Buffer (Buffer.from / alloc /
+ * concat, a subarray or slice of one, a const holding one) carries the
+ * BYTES payload's Buffer flag into `any` / `unknown`, so `constructor`
+ * (named Buffer, length 3), util.inspect / console.log (`<Buffer 61>`),
+ * String() and JSON.stringify answer as Node's (SEMANTICS.md S037's GH #138
+ * amendment). A static `Buffer` type alone is no proof — a Uint8Array can
+ * arrive there through `any` or a cast — so such a crossing keeps the
+ * Uint8Array answer, Node-exact for the Uint8Array and S037's registered
+ * divergence for a real Buffer; those rows pin it beside Node's. Every other row
  * equals Node (spawned at test time), on the wasm lane and, in the second
  * describe, on the wasm-native lane. */
 import { execFile, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 const run = promisify(execFile);
+const islandShim = pathToFileURL(join(import.meta.dirname, "../../../tests/harness/island-shim.mjs")).href;
 const scratch = mkdtempSync(join(tmpdir(), "tsinter-gh138-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
@@ -33,6 +38,9 @@ interface Row {
   entry?: string;
   /** Build with --dynamic (the engine). */
   dynamic?: true;
+  /** Node runs with the corpus island shim (`__island_eval` as an indirect
+   * eval, tests/harness/island-shim.mjs); implies --dynamic. */
+  island?: true;
   /** Ends at a run-time fence whose message matches, after printing
    * exactly `stdout` (a prefix of Node's). */
   fence?: { text: RegExp; stdout: string };
@@ -81,11 +89,36 @@ console.log(sa.constructor.name, sa.length);`,
 const arr: any[] = [b];
 console.log(arr[0].constructor.name);
 const o: any = { b };
-console.log(o.b.constructor.name);
+console.log(o.b.constructor.name);`,
+    pin: { tier: "Uint8Array\nUint8Array\n", node: "Buffer\nBuffer\n" },
+  },
+  {
+    id: "GH138-TS-05 a Uint8Array typed as Buffer (through any or a cast) stays a Uint8Array",
+    src: `function show(b: Buffer): void { const a: any = b; console.log(a.constructor.name, a); }
+const raw: any = new Uint8Array([104, 105]);
+show(raw);
+show(new TextEncoder().encode("hi") as Buffer);
+const v: unknown = new Uint8Array([3]) as unknown as Buffer;
+console.log(String(v), JSON.stringify(v));`,
+  },
+  {
+    id: "GH138-TS-06 a subarray or slice of a provable Buffer, and a const holding one (whatever its declared type), cross as Buffers",
+    src: `const b = Buffer.from("hi");
+const c: any = b;
+console.log(c.constructor.name, c);
+const d: any = b.subarray(0, 1);
+console.log(d.constructor.name, d);
+const e: any = Buffer.concat([b, b]).slice(1);
+console.log(e.constructor.name, e, String(e));
 const typed: Uint8Array = Buffer.from("t");
 const ta: any = typed;
 console.log(ta.constructor.name);`,
-    pin: { tier: "Uint8Array\nUint8Array\nUint8Array\n", node: "Buffer\nBuffer\nBuffer\n" },
+  },
+  {
+    id: "GH138-TS-07 (S037) a real Buffer reaching any through a Buffer-typed parameter answers Uint8Array",
+    src: `function show(b: Buffer): void { const a: any = b; console.log(a.constructor.name); }
+show(Buffer.from("x"));`,
+    pin: { tier: "Uint8Array\n", node: "Buffer\n" },
   },
   {
     id: "GH138-JS-01 a JavaScript source's Buffer constructor read stops at its named fence",
@@ -105,8 +138,8 @@ function write(row: Row, backend: string): string {
   return entry;
 }
 
-function nodeRun(file: string): Out {
-  const r = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
+function nodeRun(file: string, island: boolean): Out {
+  const r = spawnSync(process.execPath, [...(island ? ["--import", islandShim] : []), "--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
   return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
 }
 
@@ -125,9 +158,9 @@ async function nativeRun(path: string): Promise<Out> {
 async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(row, backend);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic ? { dynamic: true } : {}) });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic || row.island ? { dynamic: true } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
-  const node = nodeRun(entry);
+  const node = nodeRun(entry, row.island === true);
   expect(node.exitCode).toBe(0);
   if (row.fence !== undefined) {
     const got: Out = backend === "wasm"

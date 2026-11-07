@@ -1379,12 +1379,19 @@ members are named by their key.** ES SetFunctionName names a method
 or arrow defined as a property value (`{ f: function () {} }`, `{ "q-r":
 () => 0 }`, through parentheses) by its key, and a named function
 expression (`{ h: function named() {} }`) by its own name. Where such a
-literal is built as a dynamic value (an `any`-typed literal, a literal
-passed straight into an `any` parameter, a JavaScript source's literal
-handed on), and where a JavaScript source reads `o.h.name` /
-`o["q-r"].name` of a literal whose member it can resolve, the box now
-carries that name, so `f.name`, `[Function: m]` under util.inspect and the
-error texts answer as Node's. A STATIC record value that crosses later as
+literal, with identifier, string or plain decimal keys only, is built as a
+dynamic value (an `any`-typed literal, a literal passed straight into an
+`any` parameter, a JavaScript source's literal handed on), and where a
+JavaScript source reads `o.h.name` / `o["q-r"].name` of a literal member
+it can resolve, the box now carries that name, so `f.name`, `[Function: m]`
+under util.inspect and the error texts answer as Node's. Not covered, and
+still answering this entry's empty name (`[Function (anonymous)]`): every
+member of a literal that has a COMPUTED key (`{ m() {}, [k]: () => 7 }`)
+and the computed member itself, and a member of a NESTED literal read
+through its parent (`{ inner: { deep() {} } }`, then `o.inner.deep.name`
+reads `""`). A JavaScript `o.h.name` answers the member's definition even
+after `o.h = function other() {}` reassigned it, where Node answers
+`other` — this entry's alias case. A STATIC record value that crosses later as
 a whole (`const r = { run() {} }; take(r)`) names each function member by
 its field's key: exact for a method or an anonymous function defined
 there, but a named function expression or a function stored from elsewhere
@@ -2929,19 +2936,25 @@ Node-exact dynamic-value row (R42b). The entry count is unchanged.
 **Amendment (INC-29 U1): `slice()` through a dynamic value follows the flag exactly.** On the wasm lane a checked-dynamic `slice()` of bytes (built in node:net modules — S087 (i)) is `Buffer.prototype.slice`, a VIEW, when the payload carries the Buffer flag (a `'data'` chunk), and `TypedArray.prototype.slice`, a COPY, when it does not. A `Buffer` that crossed the generic path carries no flag (this entry), so it slices as the Uint8Array it reads as everywhere else on the far side: a copy, where Node's Buffer slice is a view — a write through the slice is not seen in the source, nor the reverse (`pass({ b: Buffer.from("abcd") }).b.slice(1, 3)[0] = 65` leaves the source's byte 98 here; Node reads 65). A Buffer passed directly (`pass(Buffer.from("abcd"))`) carries the flag since GH #138 (below) and slices as a view, as in Node. Board #25 (the provenance marker) retires this with the rest of the entry. **Tested by:** N1-REG-03 (`tests/harness/wasm-differential.test.ts`), with Node's answer in a comment beside it, and the corpus program 2640 (a slice that is only read, the same on both).
 
 
-**Amendment (GH #138, wasm and wasm-native): a crossing the checker types
-as a Buffer carries the flag.** Where a value enters a dynamic position
-directly and TypeScript types that expression as `Buffer` (`const b: any =
-Buffer.from("a")`, `f(buf)` into an `any` or `unknown` parameter, `let x:
-unknown = buf`, `Buffer.concat(...)` into `any`), the crossing sets the
-BYTES payload's Buffer flag, so `b.constructor` (named `Buffer`, length 3,
-`===` across reads), `util.inspect`/`console.log` (`<Buffer 61>`),
-`String()` and `JSON.stringify` answer as Node's. The rest of this entry
-still holds, now naming `constructor.name` among the surfaces: a Buffer
-reaching a dynamic value under another static type (typed `Uint8Array`)
-or NESTED in a composite that crosses (an array literal's element, an
-object literal's or record's field — `const o: any = { b }`, `[b]` into
-`any[]`) carries no flag and answers `Uint8Array` on every one of them. A
+**Amendment (GH #138, wasm and wasm-native): a crossing whose expression
+proves a Buffer carries the flag.** Where a value enters a dynamic
+position directly and the crossing's own expression PROVES it is a Buffer
+— a call of the global `Buffer.from`, `alloc`, `allocUnsafe`,
+`allocUnsafeSlow`, `concat` or `copyBytesFrom`, a `subarray` / `slice` of
+such a value, or a `const` initialized with one (`const b: any =
+Buffer.from("a")`, `f(Buffer.alloc(2))` into an `any` or `unknown`
+parameter, `const s = Buffer.from("q"); let x: unknown = s`) — the crossing
+sets the BYTES payload's Buffer flag, so `b.constructor` (named `Buffer`,
+length 3, `===` across reads), `util.inspect`/`console.log` (`<Buffer
+61>`), `String()` and `JSON.stringify` answer as Node's. A static `Buffer`
+TYPE is not proof (a Uint8Array reaches a `b: Buffer` parameter through
+`any` or a cast, and stays a Uint8Array, as in Node). The rest of this
+entry still holds, now naming `constructor.name` among the surfaces: a
+real Buffer whose crossing expression proves nothing (a `Buffer`-typed
+parameter, a `let`, a function's result, a field read), and one NESTED in
+a composite that crosses (an array literal's element, an object literal's
+or record's field — `const o: any = { b }`, `[b]` into `any[]`), carries
+no flag and answers `Uint8Array` on every one of them. A
 JavaScript source's static `b.constructor` refuses by name (SC2020 at run
 time), and `instanceof Buffer` / `Buffer.isBuffer` over `any` refuse at
 compile time, unchanged. **Tested by:** `packages/compiler/test/wasm-gh138-buffer-ctor.test.ts`

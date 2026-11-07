@@ -10,12 +10,14 @@ import { execFile, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 const run = promisify(execFile);
+const islandShim = pathToFileURL(join(import.meta.dirname, "../../../tests/harness/island-shim.mjs")).href;
 const scratch = mkdtempSync(join(tmpdir(), "tsinter-gh139-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
@@ -32,6 +34,9 @@ interface Row {
   entry?: string;
   /** Build with --dynamic (the engine). */
   dynamic?: true;
+  /** Node runs with the corpus island shim (`__island_eval` as an indirect
+   * eval, tests/harness/island-shim.mjs); implies --dynamic. */
+  island?: true;
   /** Ends at a run-time fence whose message matches, after printing
    * exactly `stdout` (a prefix of Node's). */
   fence?: { text: RegExp; stdout: string };
@@ -101,8 +106,8 @@ function write(row: Row, backend: string): string {
   return entry;
 }
 
-function nodeRun(file: string): Out {
-  const r = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
+function nodeRun(file: string, island: boolean): Out {
+  const r = spawnSync(process.execPath, [...(island ? ["--import", islandShim] : []), "--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
   return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
 }
 
@@ -121,9 +126,9 @@ async function nativeRun(path: string): Promise<Out> {
 async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(row, backend);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic ? { dynamic: true } : {}) });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.dynamic || row.island ? { dynamic: true } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
-  const node = nodeRun(entry);
+  const node = nodeRun(entry, row.island === true);
   expect(node.exitCode).toBe(0);
   if (row.fence !== undefined) {
     const got: Out = backend === "wasm"
