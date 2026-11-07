@@ -6055,6 +6055,27 @@ export class DynBuilder {
         // through its getter (`this` = the receiver, wherever on the
         // chain the getter lives).
         this.arm(c, K, [DK.OBJ], () => {
+          // GH #137: an encoding's marker reads as the plain `true` (its
+          // link stays inside the encoding).
+          c.localGet(1);
+          c.arrayLen();
+          c.i32Const(6);
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(1);
+          this.deps.lit(c, "%error");
+          c.call(this.deps.strEq());
+          c.ifVoid();
+          this.objPayload(c, (x) => x.localGet(0));
+          c.call(this.errLinkOf());
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.globalGet(this.boolGlobal(true));
+          c.return_();
+          c.end();
+          c.end();
+          c.end();
           // GH #137: an error's encoding reads `name` / `message` off the
           // error itself (errWriteThrough keeps the two in step): a typed
           // write lands there without touching the encoding.
@@ -9197,6 +9218,20 @@ export class DynBuilder {
    * class subtypes (emitter.ts's errFields), and this cache is not part of
    * an error's shape. */
 
+  private errLinkType: number | null = null;
+  /** `$errLink` — the marker's payload: the error, and the encoding it
+   * marks (GH #137). */
+  errLinkT(): number {
+    if (this.errLinkType !== null) return this.errLinkType;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.errT() };
+    const objRef = this.objRef();
+    this.errLinkType = this.mb.openStructType("dyn:errLink", [
+      { storage: errRef, mutable: false },
+      { storage: objRef, mutable: false },
+    ]);
+    return this.errLinkType;
+  }
+
   private errDynType: number | null = null;
   private errDynHeadGlobal: number | null = null;
 
@@ -9287,13 +9322,17 @@ export class DynBuilder {
         // The marker's VALUE is unobservable through any surface but the
         // keyed read; C stores `true` and so does this.
         // GH #137: the marker is `true` to every reader, and its unused
-        // ref field carries the error itself — the encoding's O(1) link
-        // back (errLinkOf), which user data (`{"%error": true}` from
-        // JSON.parse, S025) can never spell.
+        // ref field carries `{ error, owner }` — the encoding's O(1) link
+        // back (errLinkOf). The link answers only for the object it was
+        // built in, so a copy of the marker (`c[k] = e[k]` over the keys)
+        // and user data (`{"%error": true}` from JSON.parse, S025) never
+        // reach the error.
         put("%error", () => {
           c.i32Const(DK.BOOL);
           c.f64Const(1);
           c.localGet(0);
+          c.localGet(O);
+          c.structNew(this.errLinkT());
           c.structNew(this.dynT());
         });
         const strSlot = (slot: number): void => {
@@ -9464,6 +9503,7 @@ export class DynBuilder {
       const c = new Code();
       const E = 1;
       const V = 2;
+      const K = 3;
       c.localGet(0);
       c.structGet(objT, OBJ_LEN);
       c.i32Eqz();
@@ -9501,17 +9541,30 @@ export class DynBuilder {
       c.refNull(errT);
       c.return_();
       c.end();
+      // The link answers only inside the object it was built in.
+      const linkT = this.errLinkT();
       c.localGet(V);
       c.structGet(this.dynT(), DYN_REF);
-      c.refTest(errT);
+      c.refTest(linkT);
+      c.i32Eqz();
+      c.ifVoid();
+      c.refNull(errT);
+      c.return_();
+      c.end();
+      c.localGet(V);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(linkT);
+      c.localTee(K);
+      c.structGet(linkT, 1);
+      c.localGet(0);
+      c.refEq();
       c.ifResult({ kind: "ref", nullable: true, typeIndex: errT });
-      c.localGet(V);
-      c.structGet(this.dynT(), DYN_REF);
-      c.refCast(errT);
+      c.localGet(K);
+      c.structGet(linkT, 0);
       c.else_();
       c.refNull(errT);
       c.end();
-      this.mb.setBody(idx, [this.entryRef(), this.dynRef()], c.bytes());
+      this.mb.setBody(idx, [this.entryRef(), this.dynRef(), { kind: "ref", nullable: true, typeIndex: linkT }], c.bytes());
     });
   }
 

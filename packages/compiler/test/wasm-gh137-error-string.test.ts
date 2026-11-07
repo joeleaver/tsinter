@@ -141,6 +141,30 @@ const o = JSON.parse('{"%error":1}');
 console.log(o, [o]);`,
   },
   {
+    id: "GH137-JS-15 a key-by-key copy of a caught error is not the error: writing it leaves the original alone",
+    entry: "main.js",
+    src: `function copy(src) { const o = JSON.parse("{}"); for (const k of Object.keys(src)) o[k] = src[k]; return o; }
+try { throw new TypeError("m"); } catch (e) {
+  const c = copy(e);
+  c.name = "Copied";
+  c.message = "cm";
+  console.log(e.name, e.message, String(e), \`\${e}\`, c.name, c.message);
+  e.stack = "";
+  console.log(e);
+}`,
+  },
+  {
+    id: "GH137-JS-16 copying the marker onto another object does not reach the error",
+    entry: "main.js",
+    src: `try { throw new TypeError("m"); } catch (e) {
+  const o = JSON.parse("{}");
+  o["%error"] = e["%error"];
+  o.name = "Forged";
+  o.message = "fm";
+  console.log(e.name, e.message, String(e), o.name);
+}`,
+  },
+  {
     id: "GH137-JS-10 an error whose name prints empty stops at its named fence when inspected",
     entry: "main.js",
     src: `try { throw new TypeError("t"); } catch (e) { e.stack = ""; e.name = ""; console.log("before", String(e)); console.log(e); }`,
@@ -284,6 +308,19 @@ const big: any = JSON.parse("{}");
 for (let i = 0; i < 2000; i++) big["k" + i] = i;
 for (let i = 0; i < 2000; i++) { big.name = "a"; big.message = "b"; }
 console.log(last, seen.length, seen[5999].message, big.name, Date.now() - t0 < 3000);`,
+  },
+  {
+    id: "GH137-TS-12 a key-by-key copy of an error held in any is not the error",
+    src: `function main(): void {
+  const e = new TypeError("m");
+  const a: any = e;
+  const c: any = {};
+  for (const k of Object.keys(a)) c[k] = a[k];
+  c.message = "copy";
+  c.name = "C";
+  console.log(e.message, e.name, String(e), String(a), c.message);
+}
+main();`,
   },
 ];
 

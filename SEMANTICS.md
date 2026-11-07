@@ -1772,9 +1772,14 @@ not marker-confusable.** The real encoding's marker carries its error
 `{"%error":true,"name":"A","message":"b"}` prints the object, as Node
 does, and never the error bracket form. Reads of its `name` / `message`
 are the object's own. `instanceof Error`, `String()` and JSON.stringify
-still read the marker's presence, as above. Overwriting a real error's
-marker (`e["%error"] = "user"`) cuts that link: the value then converts
-and prints from its own members. **Tested by:** GH137-JS-14 in
+still read the marker's presence, as above. The link answers only inside
+the object it was built in: a key-by-key copy of a caught error, or
+`o["%error"] = e["%error"]`, gives an object that S025 calls an error by
+its marker but that never reaches the original, so writing its `name` or
+`message` leaves the error alone, as in Node. Reading the marker
+(`e["%error"]`) gives the plain `true`. Overwriting a real error's marker
+(`e["%error"] = "user"`) cuts that link: the value then converts and
+prints from its own members. **Tested by:** GH137-JS-14..16 and GH137-TS-12 in
 `packages/compiler/test/wasm-gh137-error-string.test.ts`.
 
 **Rationale:** inherited — the C runtime uses the same marker and
