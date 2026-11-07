@@ -4286,6 +4286,254 @@ class Assembler {
     return idx;
   }
 
+  private errClassNameFn: number | null = null;
+  /** GH #137: `(err) -> str | null` — the JS name of the class an error was
+   * built from (what Node's inspect calls its constructor): the builtin, a
+   * plain Error's built name (errOrigNameHelper; outside the runtime's six,
+   * Error), a user class's NamedEvaluation name. NULL where this tier
+   * cannot say (a class with a static `name`, a DOMException, an error
+   * outside the program's class graph). */
+  private errClassNameHelper(): number {
+    if (this.errClassNameFn !== null) return this.errClassNameFn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.className");
+    this.errClassNameFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const pre = this.wlocal(w, I32);
+    const on = this.wlocal(w, this.strRef);
+    c.localGet(0);
+    c.structGet(exc.errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.localSet(pre);
+    for (const meta of this.classes.errorClasses()) {
+      const rt = RUNTIME_ERROR_CLASSES.get(meta.def.name);
+      const jsName = rt !== undefined ? rt.lib : meta.def.jsName;
+      if (jsName === undefined || meta.def.staticNameOrLength === true || jsName === "DOMException") continue;
+      c.localGet(pre);
+      c.i32Const(meta.pre);
+      c.i32Eq();
+      c.ifVoid();
+      if (meta.def.name === "%Error") {
+        c.localGet(0);
+        c.call(this.errOrigNameHelper());
+        c.localTee(on);
+        c.refIsNull();
+        c.ifVoid();
+        this.pushStrLitInto(c, "Error");
+        c.return_();
+        c.end();
+        for (const nm of RUNTIME_PLAIN_ERROR_NAMES) {
+          c.localGet(on);
+          this.pushStrLitInto(c, nm);
+          c.call(this.strEqHelper());
+          c.ifVoid();
+          this.pushStrLitInto(c, nm);
+          c.return_();
+          c.end();
+        }
+        this.pushStrLitInto(c, "Error");
+      } else {
+        this.pushStrLitInto(c, jsName);
+      }
+      c.return_();
+      c.end();
+    }
+    c.refNull(this.strType);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  private errDynCtorNameFn: number | null = null;
+  /** GH #137: `(box) -> str` — the class name of an error held in a
+   * dynamic value (errClassNameHelper), a named fence where it has none. */
+  private errDynCtorNameHelper(): number {
+    if (this.errDynCtorNameFn !== null) return this.errDynCtorNameFn;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [this.strRef]), "%w.err.dynClassName");
+    this.errDynCtorNameFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const er = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: this.exc().errT });
+    const nm = this.wlocal(w, this.strRef);
+    c.localGet(0);
+    c.call(this.dyn.toError());
+    c.localTee(er);
+    c.refIsNull();
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "inspecting an error held in a dynamic value whose class this tier cannot name is not supported yet"), null);
+    c.end();
+    c.localGet(er);
+    c.call(this.errClassNameHelper());
+    c.localTee(nm);
+    c.refIsNull();
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "inspecting an error held in a dynamic value whose class this tier cannot name (a DOMException, a class with a static 'name') is not supported yet"), null);
+    c.end();
+    c.localGet(nm);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  private errInspectHeadFn: number | null = null;
+  /** GH #137: `(box) -> str` — the header util.inspect prints for an error
+   * held in a dynamic value, before `: message`: Error.prototype.toString's
+   * name side, rewritten by Node's improveStack (lib/internal/util/
+   * inspect.js) when the `name` ends in "Error" and differs from the
+   * constructor's: the constructor alone when it contains the name
+   * (`class AppError extends Error {}` → `AppError`), else
+   * `Constructor [name]` (`TypeError [MyError]`). A constructor this tier
+   * cannot name is a named fence. */
+  private errInspectHeadHelper(): number {
+    if (this.errInspectHeadFn !== null) return this.errInspectHeadFn;
+    const dynRef = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [this.strRef]), "%w.err.inspectHead");
+    this.errInspectHeadFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const hs = this.wlocal(w, this.strRef);
+    const fname = this.wlocal(w, this.strRef);
+    const ctor = this.wlocal(w, this.strRef);
+    const er = this.wlocal(w, errRef);
+    const m = this.wlocal(w, dynRef);
+    const fence = (text: string): void => {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, text), null);
+      c.refNull(this.strType);
+      c.return_();
+    };
+    this.dyn.objPayload(c, (x) => x.localGet(0));
+    c.call(this.dyn.errNamePart());
+    c.localSet(hs);
+    // formatError's own `name`: String(err.name), "Error" when nullish.
+    this.dyn.objPayload(c, (x) => x.localGet(0));
+    this.pushStrLitInto(c, "name");
+    c.call(this.dyn.objGet());
+    c.localTee(m);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.localGet(m);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.NULL);
+    c.i32Eq();
+    c.i32Or();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "Error");
+    c.else_();
+    c.localGet(hs);
+    c.end();
+    c.localSet(fname);
+    // The rewrite applies only when the printed header IS that name
+    // (stack.startsWith(name)) and the name ends in "Error".
+    c.localGet(hs);
+    c.localGet(fname);
+    c.call(this.strEqHelper());
+    c.localGet(fname);
+    this.pushStrLitInto(c, "Error");
+    c.call(this.strs.endsWith());
+    c.i32And();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(hs);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    c.call(this.dyn.toError());
+    c.localTee(er);
+    c.refIsNull();
+    c.ifVoid();
+    fence("inspecting an error held in a dynamic value whose class this tier cannot name is not supported yet");
+    c.end();
+    c.localGet(er);
+    c.call(this.errClassNameHelper());
+    c.localTee(ctor);
+    c.refIsNull();
+    c.ifVoid();
+    fence("inspecting an error held in a dynamic value whose class this tier cannot name (a DOMException, a class with a static 'name') is not supported yet");
+    c.end();
+    c.localGet(ctor);
+    c.localGet(fname);
+    c.call(this.strEqHelper());
+    c.ifVoid();
+    c.localGet(hs);
+    c.return_();
+    c.end();
+    c.localGet(ctor);
+    c.localGet(fname);
+    c.f64Const(0);
+    c.call(this.strs.indexOf());
+    c.f64Const(-1);
+    c.f64Ne();
+    c.ifResult(this.strRef);
+    c.localGet(ctor);
+    c.else_();
+    c.localGet(ctor);
+    this.pushStrLitInto(c, " [");
+    c.call(this.concatHelper());
+    c.localGet(fname);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, "]");
+    c.call(this.concatHelper());
+    c.end();
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  private errToStrLiveFns = new Map<string, number>();
+  /** GH #137: an error's text where it may also live as a dynamic value.
+   * Its `name` and `message` slots are current (dyn.errWriteThrough), so
+   * the slots answer — unless its encoding was given an own `toString`
+   * (dyn.errExtraGlobal says whether any encoding was given a member
+   * beyond the two; until then nothing is looked up). Then String(e) of
+   * the catch binding (`caught`) converts through it (GH #134's protocol;
+   * it may throw), and a typed String(e) / e.toString() (`typed`, sites
+   * that do not throw) is a named fence. */
+  private errToStrLiveHelper(mode: "caught" | "typed"): number {
+    const hit = this.errToStrLiveFns.get(mode);
+    if (hit !== undefined) return hit;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), `%w.err.toStrLive:${mode}`);
+    this.errToStrLiveFns.set(mode, idx);
+    const w = this.newWalker(1);
+    const c = w.c;
+    const b = this.wlocal(w, dynRef);
+    c.globalGet(this.dyn.errExtraGlobal());
+    c.ifVoid();
+    c.localGet(0);
+    c.call(this.dyn.errBoxOf());
+    c.localTee(b);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    this.dyn.objPayload(c, (x) => x.localGet(b));
+    this.pushStrLitInto(c, "toString");
+    c.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    if (mode === "caught") {
+      c.localGet(b);
+      c.call(this.dyn.toStrUser());
+      c.return_();
+    } else {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "converting a typed error whose dynamic value has its own 'toString' is not supported yet"), null);
+      c.refNull(this.strType);
+      c.return_();
+    }
+    c.end();
+    c.end();
+    c.end();
+    c.localGet(0);
+    c.call(this.errToStrHelper());
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
   /** A builtin error class's interval global — errT's `vt` operand. */
   private pushErrVt(className: string): void {
     this.fn.code.globalGet(this.classes.vtGlobal(className));
@@ -10484,6 +10732,17 @@ class Assembler {
               cause: (c: Code, slot: number) => this.emitDomexCauseInto(c, slot),
               head: () => this.domexInspHeadHelper(),
               pending: (c: Code) => c.call(this.reportUncaughtHelper()),
+            },
+          }
+        : {}),
+      ...(this.dynValuesLive && this.classes.meta("%Error") !== undefined
+        ? {
+            errDyn: {
+              head: () => this.errInspectHeadHelper(),
+              ctorName: () => this.errDynCtorNameHelper(),
+              vt: (c: Code) => c.globalGet(this.classes.vtGlobal("%Error")),
+              strEq: () => this.strEqHelper(),
+              concat: () => this.concatHelper(),
             },
           }
         : {}),
@@ -22493,7 +22752,8 @@ class Assembler {
           code.localGet(c);
           code.structGet(exc.caughtT, 2);
           code.refCast(exc.errT);
-          code.call(this.errToStrHelper());
+          if (this.dynValuesLive) code.call(this.errToStrLiveHelper("caught"));
+          else code.call(this.errToStrHelper());
           code.else_();
           // A thrown DYNAMIC value converts through dyn toStr — its
           // array, number and string texts, a null-prototype object's
@@ -23646,7 +23906,8 @@ class Assembler {
         }
         if (e.fn === "error.toString") {
           this.walkExpr(e.args[0]!);
-          code.call(this.errToStrHelper());
+          // GH #137: an own toString given through a dynamic value.
+          code.call(this.dynValuesLive ? this.errToStrLiveHelper("typed") : this.errToStrHelper());
           return;
         }
         // DOMException (INC-27 U5): the constructor, and the three reads
@@ -36627,6 +36888,7 @@ class Assembler {
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }
+
   private errOrigNameFn: number | null = null;
   /** `(err) -> str`: the name error 0 was built with. */
   private errOrigNameHelper(): number {
