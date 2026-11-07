@@ -99,14 +99,12 @@ const ROWS: Row[] = [
     src: "type Narrow = { b: number; a?: number };\nconst base: Narrow = { b: 1 };\nconst n: Narrow = { ...base, a: 3 };\nconst m: Narrow = { ...base };\nconsole.log(n, m, Object.keys(n), JSON.stringify(m));",
   },
   {
-    id: "GH148-13 the review's repro: an any source spread into a narrower slot, printed, refuses",
+    id: "GH148-13 the review's repro: an any source spread into a narrower const, printed, keeps every key (unit U2: the binding is the dynamic object, SEMANTICS.md S128 (b))",
     src: "type Narrow = { b: number; a?: number };\nconst x: any = { b: 1, c: 2 };\nconst n: Narrow = { ...x };\nconsole.log(n);",
-    refused: DYN_COPY,
   },
   {
-    id: "GH148-14 a JSON.parse source spread, serialized, refuses",
+    id: "GH148-14 a JSON.parse source spread into a narrower const, serialized, keeps every key (unit U2)",
     src: "type Narrow = { b: number; a?: number };\nconst n: Narrow = { ...JSON.parse(\"{\\\"b\\\":1,\\\"c\\\":2}\") };\nconsole.log(JSON.stringify(n));",
-    refused: DYN_COPY,
   },
   {
     id: "GH148-15 an any source spread returned and printed refuses",
@@ -128,9 +126,8 @@ const ROWS: Row[] = [
     src: "type Narrow = { b: number; a?: number };\nconst x: any = JSON.parse(\"{\\\"b\\\":1,\\\"c\\\":2}\");\nconst n: Narrow = { ...x, a: 3 };\nconsole.log(n.b, n.a);\nfunction mk(y: any): Narrow { return { ...y }; }\nconsole.log(mk(x).b);\nconst d: any = { ...x, a: 3 };\nconst m: Record<string, number> = { ...x };\nconst o = { ...x, a: 4 };\nconsole.log(d, m, o);",
   },
   {
-    id: "GH148-19 an any source spread into a union-typed slot (Narrow | undefined), printed, refuses",
+    id: "GH148-19 an any source spread into a union-typed const (Narrow | undefined), printed, keeps every key (unit U2)",
     src: "type Narrow = { b: number; a?: number };\nconst x: any = JSON.parse(\"{\\\"b\\\":1,\\\"c\\\":2}\");\nconst n: Narrow | undefined = { ...x };\nconsole.log(n);",
-    refused: DYN_COPY,
   },
   {
     id: "GH148-19b an any source spread returned as Narrow | string, printed, refuses",
@@ -143,9 +140,8 @@ const ROWS: Row[] = [
     refused: DYN_COPY,
   },
   {
-    id: "GH148-21 an any source spread in an && / || arm, printed, refuses",
+    id: "GH148-21 an any source spread in an && / || arm of a const, printed, keeps every key (unit U2)",
     src: "type Narrow = { b: number; a?: number };\nconst x: any = JSON.parse(\"{\\\"b\\\":1,\\\"c\\\":2}\");\nconst flag = process.argv.length > 0;\nconst n: Narrow = (flag && { ...x }) || { b: 0 };\nconsole.log(n);",
-    refused: DYN_COPY,
   },
   {
     id: "GH148-22 JavaScript: a spread returned through a JSDoc @returns record type, printed, refuses",

@@ -296,13 +296,12 @@ console.log(c);`,
     diverges: { entry: "SEMANTICS.md S091 (GH #132 (d) amendment)", node: "{ a: 1, w: undefined }\n", stdout: "{ a: 1 }\n" },
   },
   {
-    id: "GH132-24 the registered residue: a dynamic object holding undefined, checked into the record type",
+    id: "GH132-24 a dynamic object holding undefined, cast to the record type: the cast binding is the object itself (unit U2, SEMANTICS.md S128), so the key stays",
     src: `type R = { a: number; w?: number };
 const d: any = JSON.parse('{"a":1}');
 d.w = undefined;
 const r = d as R;
 console.log(r, Object.keys(r));`,
-    diverges: { entry: "SEMANTICS.md S091 (GH #132 (d) amendment)", node: "{ a: 1, w: undefined } [ 'a', 'w' ]\n", stdout: "{ a: 1 } [ 'a' ]\n" },
   },
   {
     id: "GH132-25 the review's k10: a property-chain spread, with an explicit undefined, and a method spreading this.r after a late write",

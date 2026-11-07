@@ -1,6 +1,8 @@
 # Dynamic values on the WasmGC lanes — design study
 
-Status: design only, nothing built. Written 2026-11-03 against main `72cfa8fd`.
+Status: written 2026-11-03 against main `72cfa8fd`. Built since: U0
+(`2570365b`), U1a (`40350319`), U1b (`cbd34df1`), U2a + U2b (one unit,
+2026-11-06 — see §4.3's "As built" note; SEMANTICS.md S128).
 Scope: the `wasm` and `wasm-native` lanes. The c and llvm lanes are ungated and
 retire at N4 (AGENTS.md), so nothing here is constrained by them.
 
@@ -315,6 +317,92 @@ fresh-copy arm. Without U2b, fresh casts of parsed JSON would read through dynam
 objects, ~30× slower (§5). Until U2b lands, fresh casts keep today's eager copy and
 its fatal mismatch.
 
+**As built (U2a + U2b, 2026-11-06; `frontend/lowering/dyn-arm.ts`, SEMANTICS.md
+S128).** Where the design above was underspecified, these are the calls made:
+
+- **No per-use branch for non-fresh values.** The design's `T~` slot holds "either
+  typed or dynamic, decided at run time", with steps 1 (view) and 3 (dynamic) both
+  run-time choices. As built, a non-fresh value's slot is *always* the dynamic arm,
+  views included: a view reached through dynamic operations is still its static
+  value (S115 (a)'s accessors, token identity), so step 1's unwrap would only be a
+  speed-up, and dropping it removes every per-use branch for non-fresh slots. The
+  typed arm exists only for U2b's fresh values.
+- **The dynamic arm is "type the expression `any`".** A slot on the arm is a
+  `jsval` binding (`dyn` in a JavaScript source, S014's U1b storage rule), and
+  `Lowerer.typeOf` answers `any` for every expression rooted at it (the binding, a
+  member/element read, a method call, `+`/`&&`/`||`/`??`/`?:` over one — the
+  answers TypeScript gives over `any`). Every lowering that consults the checker —
+  §7 item 1's folds included (presence tests, `?.`/`!` elision, `Array.isArray`,
+  `instanceof`, narrowing) — therefore takes U1's dynamic path and asks the value
+  at run time. Leaves check where they must enter typed storage through the
+  ordinary `coerceInto` exits (§7 item 2: "check only where a value enters typed
+  storage" is exactly the set of coercions into non-`any` IR types).
+- **Which slots: decided by S125 (c), in further lowering passes.** A first pass
+  lowers as U1 did; the width-copy pass records every judged exit at a contained
+  slot it refused (and, separately, the ones it accepted); `lowerToIr` lowers the
+  program again with those slots on the arm, until no new one appears. Accepted
+  copies take the arm too, but only if the program still compiles (else the pass
+  that built wins) — so U2 is never worse than U1's copies, and a program with no
+  dynamic exit lowers byte-for-byte as before. (Accepted copies in JavaScript
+  sources stay copies; a JavaScript member call over a dynamic value now binds
+  `this` — GH #145, S042's amendment — which the arm relies on.) After the
+  second review the fitting copies also reject an absent optional key (it would
+  print as `key: undefined`).
+- **Parameters.** A function literal handed to dynamic code: its refused parameter
+  becomes a `jsval` parameter in the next pass (this replaces S115 (d)'s callback
+  refusal). A plain function called directly: S125 (a)'s per-call-site instance
+  with the parameter bound to `any` (`widthSpecializedCall`). Unannotated callback
+  parameters of a method called on an arm value take what the receiver holds.
+  Returns, constructors, methods, generic functions and calls through a function
+  value are not contained (refused as before, loudly).
+- **U2b's two arms are compiled by continuation, not per use.** At the first
+  statement of the binding's list that names it, the rest of the list lowers twice
+  behind one flag test (once with the binding resolving to the typed copy, once to
+  the dynamic value). A module-scope binding splits the same way in every function
+  body that names it, and its dynamic global is re-pointed at the typed copy's view
+  once the copy exists, so code that took the dynamic arm before the value was
+  known (a closure made during module init) shares the copy. Bounded: two
+  speculative bindings deep; lists holding function/class/`var` declarations, labels
+  or `yield`, exported bindings and reads from class field initializers keep the
+  eager copy (a failed split retries without speculation).
+- **The exact-fit test (`jsFits`, emitter `dynFitsHelper`).** Plain OBJ with
+  exactly the declared keys in the typed record's printed order (`dynFieldOrder`),
+  leaves of the declared kind (an `undefined` leaf does not fit), unions: the arm
+  the checked copy would pick must fit, index-signature records never fit (the
+  typed form's key order is not the object's in general), no view anywhere.
+- **Review fixes (U2 review, 2026-11-06).** (1) No silent width copy anywhere U2
+  is in play: a copy taken *from* an arm value, the judged copy left at a slot
+  whose arm did not build, and the eager copy of a speculative binding whose
+  arms did not build all go through a lenient exact-fit test (`jsFits` with
+  `lenient`: no undeclared key, the type's order, declared kinds; a missing key
+  is S119's undefined) and stop by name otherwise. (2) An operator over an arm
+  operand whose TypeScript result type is primitive (`"n=" + v.a`, `v.a < 1`)
+  exits to it; `switch` over all-literal cases and an `Error` message run on the
+  arm; unannotated callbacks of an arm value's methods take and return dynamic
+  values. (3) Code size: a split duplicates only the statements from the first
+  read of the binding through the last (extended over bindings they declare that
+  are read later), and a region that reads a second speculative binding, is too
+  deep, cannot be lowered twice, or is over the function's budget (the size of
+  its first region) lowers once on the dynamic arm. Measured on the review's
+  probes: 150 functions with one fresh cast each, 139 KB before U2, 398 KB with
+  U2 (two arms are inherently ~2.9× here: the dynamic code is ~2.2× the typed);
+  two local casts plus a module one per function, 180 KB before U2, 2.1 MB at the
+  first U2 build, 449 KB now (compile 4.8 s → 1.3 s).
+- **Key order (GH #132, 2026-11-10).** With records keeping their own key order
+  (an order slot off the declared-order fast path), the lenient fit also takes an
+  absent *optional* key (the copy keeps the absence, and a later write puts the
+  key last, as in Node) and refuses an optional key held as `undefined` (Node's
+  own key, which the copy would drop). Everything a declaration builds out of an
+  arm value stays on the arm or is guarded: `{ ...v }` is `any` to TypeScript and
+  builds the dynamic object; the bindings of a `const`/`let` destructuring of
+  `v` (members, a rest object) join the arm; and a module global so built takes
+  only the guarded copy, never S115 (d)'s fresh copy, which lists keys in the
+  type's order. The speculative arm's own test (U2b) stays exact: a parse missing
+  an optional key takes the dynamic arm.
+- **Not built (still refused or copied):** fields and elements (J4), returns of
+  plain functions, generic functions, constructors and methods taking an arm
+  value, `switch`/for-in over the arm (U6/U3 — the accepted copy stays there).
+
 ### 4.4 Identity
 
 - A view and its static value are one value (tokens; unchanged).
@@ -413,6 +501,19 @@ dynamic data, it pays:
   allocated per number read, and the check. This is why U2b keeps fresh JSON casts
   on the typed arm, and why U8 (shapes, inline caches, unboxed numeric reads) is
   needed before npm code is benchmarked against Node.
+
+**Measured after U2 (2026-11-06, wasm lane, the same 2,000,000-read loop over
+1,000 four-key records, host wall clock per run including instantiation, min of 7,
+one noisy laptop):** typed array built in code 0.6–1.1 ms; a fresh `JSON.parse(text)
+as P[]` that fits exactly (U2b's typed arm, parse + exact-fit test + copy included)
+2.0–2.5 ms, against 1.3–1.9 ms for the eager copy before U2b; the same cast over
+records with one undeclared key (U2b's dynamic arm, Node's keys) 43–45 ms, where the
+eager copy took 1.7–2.1 ms and dropped the key (S009); a non-fresh value on U2a's
+dynamic arm 44–47 ms (it was refused before U2a); plain JavaScript over the parsed
+value 42–62 ms; a TypeScript `any` binding 67–101 ms. Node: 4–10 ms for every variant.
+So the typed hot path is unchanged, a fitting parse pays one linear check, and the
+dynamic arm runs at the existing dynamic-object speed (~20–40× typed), which is U8's
+budget to close.
 
 **Code size.**
 - Part (A) pulls the island helper set into every module that uses `unknown` or JS

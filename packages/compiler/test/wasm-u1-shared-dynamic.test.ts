@@ -352,41 +352,37 @@ console.log(xs[0] === shared);`,
     refused: { code: "SC1090", s125: true },
   },
   {
-    id: "U1-EXIT-07 a copy found by includes in a dynamic array refuses",
+    id: "U1-EXIT-07 a binding found by includes in a dynamic array is the dynamic value (unit U2a: the dynamic arm)",
     src: `type P = { n: number };
 const shared: any = { n: 1 };
 function get(): unknown { return shared; }
 const p = get() as P;
 const arr: any[] = [shared];
 console.log(arr.includes(p));`,
-    refused: { code: "SC1090", s125: true },
   },
   {
-    id: "U1-EXIT-08 a copy searched by indexOf refuses",
+    id: "U1-EXIT-08 a binding searched by indexOf is the dynamic value (U2a)",
     src: `type P = { n: number };
 const shared: any = { n: 1 };
 function get(): unknown { return shared; }
 const p = get() as P;
 console.log([shared].indexOf(p));`,
-    refused: { code: "SC1090", s125: true },
   },
   {
-    id: "U1-EXIT-09 a copy re-entering unknown and compared refuses",
+    id: "U1-EXIT-09 a binding re-entering unknown and compared is the dynamic value (U2a)",
     src: `type P = { n: number };
 const shared: any = { n: 1 };
 function get(): unknown { return shared; }
 const p = get() as P;
 const u: unknown = p;
 console.log(u === shared);`,
-    refused: { code: "SC1090", s125: true },
   },
   {
-    id: "U1-EXIT-10 a write through an index-signature part of a copy refuses (gate S1)",
+    id: "U1-EXIT-10 a write through an index-signature binding reaches the dynamic value (U2a; gate S1)",
     src: `const o: any = { m: { a: [1] } };
 const m: Record<string, number[]> = o.m;
 m["a"]!.push(2);
 console.log(o.m.a.length);`,
-    refused: { code: "SC1090", s125: true },
   },
   {
     id: "U1-EXIT-04 a copy into a field nobody writes runs",
@@ -411,10 +407,9 @@ data.forEach((o: { a: number }) => { data.push(1); console.log(o.a); });
 console.log(data.length);`,
   },
   {
-    id: "U1-EXIT-12 an array mutator reaching an array inside the parameter's copy refuses",
+    id: "U1-EXIT-12 a typed callback parameter holds the dynamic argument itself (U2a)",
     src: `const data: any = JSON.parse('[{"a":[1]}]');
 data.forEach((o: { a: number[] }) => { data[0].a.push(2); console.log(o.a.length); });`,
-    refused: { code: "SC1090", s125: true },
   },
   // ── S042: TypeScript cannot reach the unbound listener `this` ───────
   {
