@@ -5571,25 +5571,23 @@ export class DynBuilder {
       c.localGet(0);
       c.call(this.errMsgPart());
       c.localSet(MS);
-      // A Node internal error (a string `code` starting "ERR_") renders
-      // through NodeError's own toString: `Name [CODE]: message` — the
-      // rule errToStrHelper applies to the error's stamped code slot.
+      // A Node internal error renders through NodeError's own toString:
+      // `Name [CODE]: message` — keyed, as errToStrHelper keys it, on the
+      // error's STAMPED code slot ("ERR_…"), never on a `code` member a
+      // program wrote (Error.prototype.toString ignores those).
       c.localGet(0);
-      this.deps.lit(c, "code");
-      c.call(this.objGet());
+      c.call(this.errLinkOf());
       c.localTee(CM);
       c.refIsNull();
       c.i32Eqz();
       c.ifVoid();
       c.localGet(CM);
-      c.structGet(this.dynT(), DYN_KIND);
-      c.i32Const(DK.STR);
-      c.i32Eq();
-      c.ifVoid();
-      c.localGet(CM);
-      c.structGet(this.dynT(), DYN_REF);
-      emitFlatCast(c, this.deps.strType());
+      c.structGet(this.deps.errT(), this.deps.errCode());
       c.localTee(CS);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(CS);
       c.arrayLen();
       c.i32Const(4);
       c.i32GeU();
@@ -5639,7 +5637,7 @@ export class DynBuilder {
       c.call(this.deps.concat());
       c.localGet(MS);
       c.call(this.deps.concat());
-      this.mb.setBody(idx, [this.deps.strRef(), this.deps.strRef(), this.dynRef(), this.deps.strRef(), I32], c.bytes());
+      this.mb.setBody(idx, [this.deps.strRef(), this.deps.strRef(), { kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef(), I32], c.bytes());
     });
   }
 
@@ -5651,6 +5649,18 @@ export class DynBuilder {
       const dynT = this.dynT();
       const c = new Code();
       const M = 1;
+      c.localGet(0);
+      this.deps.lit(c, key);
+      c.call(this.errLiveMember());
+      c.localTee(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(M);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.deps.strType());
+      c.return_();
+      c.end();
       c.localGet(0);
       this.deps.lit(c, key);
       c.call(this.objGet());
@@ -5694,38 +5704,103 @@ export class DynBuilder {
     return this.cached("errMsgPart", [this.objRef()], [this.deps.strRef()], this.errPart("message", "", (c) => this.deps.lit(c, "")));
   }
 
-  /** %w.dyn.errWriteThrough(d, key, v): after `d[key] = v` on an object,
-   * when `d` is an error's encoding (S021) and `key` is `name` or
-   * `message` holding a string, the error's own slot takes it too — the
-   * error and its encoding are one JS value, so a typed read of the error
-   * (`(e as Error).name`, its `toString()`, the uncaught report) sees a
-   * dynamic write (GH #137). A non-string value leaves the slot as it was
-   * (the slot holds strings only: SEMANTICS.md S021). */
+  /** %w.dyn.objPutW(obj, key, v): objPut, then — when `obj` is an
+   * error's encoding (errLinkOf, constant time) — errWriteThrough. Every
+   * writer of an object's members from user code goes through here: a
+   * keyed or dot write, Object.assign's copies. */
+  objPutW(): number {
+    return this.cached("objPutW", [this.objRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const c = new Code();
+      const L = 3;
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.objPut());
+      c.localGet(0);
+      c.call(this.errLinkOf());
+      c.localTee(L);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(L);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.errWriteThrough());
+      c.end();
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
+  }
+
+  private errExtraG: number | null = null;
+  /** GH #137: set once any error's encoding is given a member beyond
+   * `name` / `message` (an own `toString`, say). Until then String(e) of
+   * a typed error answers from its slots without looking for its
+   * encoding (errExtraWritten), which is what keeps that conversion
+   * constant time. */
+  errExtraGlobal(): number {
+    this.errExtraG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.errExtraG;
+  }
+
+  /** %w.dyn.errWriteThrough(e, key, v): after `enc[key] = v` on the
+   * encoding of error `e` (GH #137). The error and its encoding are one
+   * JS value, so `name` / `message` holding a string write the error's
+   * slot as well — every typed reader (`(e as Error).name`, its
+   * `toString()`, the uncaught report) sees it, and every dynamic reader
+   * of those two members reads the slot (keyGet, errNamePart, errMsgPart).
+   * A non-string `name` or `message` cannot live in the slot and is a
+   * named fence. Any other key marks errExtraGlobal. */
   errWriteThrough(): number {
-    return this.cached("errWriteThrough", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+    return this.cached("errWriteThrough", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef(), this.dynRef()], [], (idx) => {
       const dynT = this.dynT();
       const errT = this.deps.errT();
       const c = new Code();
-      const E = 3;
-      c.localGet(2);
-      c.structGet(dynT, DYN_KIND);
-      c.i32Const(DK.STR);
-      c.i32Ne();
-      c.ifVoid();
-      c.return_();
-      c.end();
-      this.objPayload(c, (x) => x.localGet(0));
-      this.deps.lit(c, "%error");
-      c.call(this.objGet());
-      c.refIsNull();
-      c.ifVoid();
-      c.return_();
-      c.end();
+      for (const [key, slot] of [["name", this.deps.errName()], ["message", this.deps.errMessage()]] as const) {
+        c.localGet(1);
+        this.deps.lit(c, key);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        c.localGet(2);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.STR);
+        c.i32Ne();
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, `assigning a non-string '${key}' to an error held in a dynamic value is not supported yet`));
+        c.return_();
+        c.end();
+        c.localGet(0);
+        c.localGet(2);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.deps.strType());
+        c.structSet(errT, slot);
+        c.return_();
+        c.end();
+      }
+      c.i32Const(1);
+      c.globalSet(this.errExtraGlobal());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errLiveMember(obj, key) → when `obj` is an error's encoding
+   * and `key` is `name` or `message`, that slot of the error as a STR box
+   * ("" for an empty slot); NULL otherwise (GH #137). */
+  errLiveMember(): number {
+    return this.cached("errLiveMember", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const errT = this.deps.errT();
+      const c = new Code();
+      const L = 2;
+      const S = 3;
       c.localGet(0);
-      c.call(this.toError());
-      c.localTee(E);
+      c.call(this.errLinkOf());
+      c.localTee(L);
       c.refIsNull();
       c.ifVoid();
+      c.refNull(this.dynT());
       c.return_();
       c.end();
       for (const [key, slot] of [["name", this.deps.errName()], ["message", this.deps.errMessage()]] as const) {
@@ -5733,42 +5808,22 @@ export class DynBuilder {
         this.deps.lit(c, key);
         c.call(this.deps.strEq());
         c.ifVoid();
-        c.localGet(E);
-        c.localGet(2);
-        c.structGet(dynT, DYN_REF);
-        emitFlatCast(c, this.deps.strType());
-        c.structSet(errT, slot);
+        this.boxStr(c, (x) => {
+          x.localGet(L);
+          x.structGet(errT, slot);
+          x.localTee(S);
+          x.refIsNull();
+          x.ifResult(this.deps.strRef());
+          this.deps.lit(x, "");
+          x.else_();
+          x.localGet(S);
+          x.end();
+        });
+        c.return_();
         c.end();
       }
-      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: errT }], c.bytes());
-    });
-  }
-
-  /** %w.dyn.errSlotWrite(e, slot-key, s): a typed `e.name = s` /
-   * `e.message = s` reaching the error's encoding, when one was built —
-   * the other direction of errWriteThrough (GH #137). */
-  errEncodingWrite(key: "name" | "message"): number {
-    return this.cached(`errEncodingWrite:${key}`, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef()], [], (idx) => {
-      const c = new Code();
-      const B = 2;
-      c.localGet(0);
-      c.call(this.errBoxOf());
-      c.localTee(B);
-      c.refIsNull();
-      c.ifVoid();
-      c.return_();
-      c.end();
-      this.objPayload(c, (x) => x.localGet(B));
-      this.deps.lit(c, key);
-      c.localGet(1);
-      c.refIsNull();
-      c.ifResult(this.dynRef());
-      c.globalGet(this.undefinedGlobal());
-      c.else_();
-      this.boxStr(c, (x) => x.localGet(1));
-      c.end();
-      c.call(this.objPut());
-      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+      c.refNull(this.dynT());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: errT }, this.deps.strRef()], c.bytes());
     });
   }
 
@@ -6000,6 +6055,30 @@ export class DynBuilder {
         // through its getter (`this` = the receiver, wherever on the
         // chain the getter lives).
         this.arm(c, K, [DK.OBJ], () => {
+          // GH #137: an error's encoding reads `name` / `message` off the
+          // error itself (errWriteThrough keeps the two in step): a typed
+          // write lands there without touching the encoding.
+          c.localGet(1);
+          c.arrayLen();
+          c.i32Const(4);
+          c.i32Eq();
+          c.localGet(1);
+          c.arrayLen();
+          c.i32Const(7);
+          c.i32Eq();
+          c.i32Or();
+          c.ifVoid();
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.errLiveMember());
+          c.localTee(M);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(M);
+          c.return_();
+          c.end();
+          c.end();
           if (this.regexLive) {
             // Unit F1: an island RegExp's own accessors and fenced
             // prototype functions come first.
@@ -6514,25 +6593,8 @@ export class DynBuilder {
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
         c.localGet(2);
-        c.call(this.objPut());
-        // GH #137: a `name` / `message` write on an error's encoding
-        // writes through to the error itself (errWriteThrough); the
-        // length test keeps every other write to one compare.
-        c.localGet(1);
-        c.arrayLen();
-        c.i32Const(4);
-        c.i32Eq();
-        c.localGet(1);
-        c.arrayLen();
-        c.i32Const(7);
-        c.i32Eq();
-        c.i32Or();
-        c.ifVoid();
-        c.localGet(0);
-        c.localGet(1);
-        c.localGet(2);
-        c.call(this.errWriteThrough());
-        c.end();
+        // GH #137: through to the error when the object is its encoding.
+        c.call(this.objPutW());
       });
       // An ARR takes index writes and FALLS THROUGH on any other key —
       // the one arm that is not a full dispatch, so `arm` cannot spell it.
@@ -7986,14 +8048,14 @@ export class DynBuilder {
           c.localGet(E);
           c.structGet(entryT, ENTRY_KEY);
           c.localGet(SV);
-          c.call(this.objPut());
+          c.call(this.objPutW()); // GH #137: through to an error
         } else {
           c.localGet(O);
           c.localGet(E);
           c.structGet(entryT, ENTRY_KEY);
           c.localGet(E);
           c.structGet(entryT, ENTRY_VALUE);
-          c.call(this.objPut());
+          c.call(this.objPutW()); // GH #137: through to an error
         }
         c.localGet(I);
         c.i32Const(1);
@@ -8043,7 +8105,7 @@ export class DynBuilder {
           (x) => this.arrPayload(x, (y) => y.localGet(P)),
           (x) => x.i32Const(1),
         );
-        c.call(this.objPut());
+        c.call(this.objPutW()); // GH #137: through to an error
         c.localGet(I);
         c.i32Const(1);
         c.i32Add();
@@ -9224,7 +9286,16 @@ export class DynBuilder {
         };
         // The marker's VALUE is unobservable through any surface but the
         // keyed read; C stores `true` and so does this.
-        put("%error", () => c.globalGet(this.boolGlobal(true)));
+        // GH #137: the marker is `true` to every reader, and its unused
+        // ref field carries the error itself — the encoding's O(1) link
+        // back (errLinkOf), which user data (`{"%error": true}` from
+        // JSON.parse, S025) can never spell.
+        put("%error", () => {
+          c.i32Const(DK.BOOL);
+          c.f64Const(1);
+          c.localGet(0);
+          c.structNew(this.dynT());
+        });
         const strSlot = (slot: number): void => {
           this.boxStr(c, (x) => {
             x.localGet(0);
@@ -9327,10 +9398,31 @@ export class DynBuilder {
       [this.dynRef()],
       [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }],
       (idx) => {
+        // GH #137: the encoding's marker carries the error (fromError), so
+        // a real encoding is a read. Anything else that reached the cache
+        // (a parsed object carrying the marker, narrowed to an Error once:
+        // S025) is found by the scan, as before.
+        const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.errT() };
         const entryT = this.errDynT();
         const head = this.errDynHead();
         const c = new Code();
         const N = 1;
+        const L = 2;
+        c.localGet(0);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.i32Const(DK.OBJ);
+        c.i32Eq();
+        c.ifVoid();
+        this.objPayload(c, (x) => x.localGet(0));
+        c.call(this.errLinkOf());
+        c.localTee(L);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(L);
+        c.return_();
+        c.end();
+        c.end();
         c.globalGet(head);
         c.localSet(N);
         c.block();
@@ -9354,9 +9446,73 @@ export class DynBuilder {
         c.end();
         c.end();
         c.refNull(this.deps.errT());
-        this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
+        this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }, errRef], c.bytes());
       },
     );
+  }
+
+  /** %w.dyn.errLinkOf(obj) → the error an encoding was built from, or NULL
+   * for any other object (GH #137): the marker is the encoding's FIRST
+   * entry (fromError puts it first, and an entry never moves) and its ref
+   * field holds the error. Constant time — one entry read and one key
+   * compare — so a write to any object can afford to ask. */
+  errLinkOf(): number {
+    return this.cached("errLinkOf", [this.objRef()], [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], (idx) => {
+      const objT = this.objT();
+      const entryT = this.entryT();
+      const errT = this.deps.errT();
+      const c = new Code();
+      const E = 1;
+      const V = 2;
+      c.localGet(0);
+      c.structGet(objT, OBJ_LEN);
+      c.i32Eqz();
+      c.ifVoid();
+      c.refNull(errT);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(objT, OBJ_ENTRIES);
+      c.i32Const(0);
+      c.arrayGet(this.entriesArrayType());
+      c.localTee(E);
+      c.structGet(entryT, ENTRY_KEY);
+      c.arrayLen();
+      c.i32Const(6);
+      c.i32Ne();
+      c.ifVoid();
+      c.refNull(errT);
+      c.return_();
+      c.end();
+      c.localGet(E);
+      c.structGet(entryT, ENTRY_KEY);
+      this.deps.lit(c, "%error");
+      c.call(this.deps.strEq());
+      c.i32Eqz();
+      c.ifVoid();
+      c.refNull(errT);
+      c.return_();
+      c.end();
+      c.localGet(E);
+      c.structGet(entryT, ENTRY_VALUE);
+      c.localTee(V);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(errT);
+      c.return_();
+      c.end();
+      c.localGet(V);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refTest(errT);
+      c.ifResult({ kind: "ref", nullable: true, typeIndex: errT });
+      c.localGet(V);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(errT);
+      c.else_();
+      c.refNull(errT);
+      c.end();
+      this.mb.setBody(idx, [this.entryRef(), this.dynRef()], c.bytes());
+    });
   }
 
   /* ── P4: dyn.defineProps's OWN identity-keyed side table ──────────────

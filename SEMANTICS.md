@@ -1486,26 +1486,44 @@ observing it would fail against Node by construction.
 
 **Amendment (GH #137, wasm and wasm-native): the error and its encoding
 are one value for `name` and `message`.** The snapshot described above no
-longer holds for those two members. A typed write (`(e as Error).name =
-"X"`, `e.message = m` on an `Error`-typed binding, `this.name = …` in a
-user error class) also writes the encoding when one was built. A dynamic
-write of a string (`e.name = "Custom"` in a JavaScript source or through
-`any`) also writes the error's own slot. So every reader sees the write:
-`String(e)`, a template, `+`, `e.toString()`, util.format, the dynamic
-reads, a typed read and the uncaught report. The conversions follow
-Error.prototype.toString exactly: a `name` holding undefined is
-`"Error"`, any other non-string is its ToString (`e.name = 5` gives `5:
-m`), a `message` holding undefined is `""`, and an empty side drops the
-`": "`. What still differs: the error's slots hold strings only, so a
-dynamic write of a NON-string `name` or `message` is not seen by a typed
-read of the error (`(e as Error).name` keeps the previous string, where
-Node answers the number); every conversion still reads it. A string
-`code` starting `ERR_` converts the way Node's internal errors do, `Name
-[CODE]: message`, the rule the error's stamped slot already followed.
-**Tested by:**
-`packages/compiler/test/wasm-gh137-error-string.test.ts` (GH137-JS-01..04,
-GH137-TS-01..03, TS-05, TS-06; wasm and wasm-native) and the wasm emitter
-unit test's S021 row.
+longer holds for those two members. The encoding's marker carries the
+error itself, so the encoding knows its error in constant time. Reads and
+writes go through it as follows:
+
+- Every dynamic read of `name` / `message` (a dot or keyed read,
+  `String`, a template, `+`, `e.toString()`, util.format and util.inspect
+  of the dynamic value) reads the error's own slot. A typed write
+  (`(e as Error).name = "X"`, `e.message = m`, `this.name = …` in a user
+  error class) is seen by all of them.
+- A dynamic write of a string, whether a dot or keyed write or
+  Object.assign, writes the error's slot too. A typed read, String() of
+  the catch binding, `e.toString()` on an `Error`-typed binding and the
+  uncaught report all see it.
+
+Conversions follow Error.prototype.toString: an empty side drops the
+`": "`. A `code` member a program writes is ignored, as in Node. Only an
+error whose code slot the runtime stamped with `ERR_…` (`Buffer.alloc(-1)`,
+`qs.escape`) converts the way Node's internal errors do, `Name [CODE]:
+message`.
+
+Three cases still part from Node:
+
+- The slots hold strings, so a dynamic write of a non-string `name` or
+  `message` (`e.name = 5`, `e.name = undefined`) ends the program at a
+  named fence (S122). Node stores the value and prints `5: m` or
+  `Error: m`.
+- A typed `String(e)` or `e.toString()` of an error whose dynamic value
+  was given its own `toString` ends at a named fence. Node calls that
+  member; String() of the catch binding calls it, as before.
+- `Object.values`, `Object.entries` and `for…of` over the encoding's
+  entries read the entries themselves. After a typed write they show the
+  previous `name` / `message`, where Node shows the new ones. Object.keys
+  and keyed reads are exact.
+
+**Tested by:** `packages/compiler/test/wasm-gh137-error-string.test.ts`
+(GH137-JS-01..04, JS-03b, JS-03c, JS-09, GH137-TS-01..03, TS-05..11, wasm
+and wasm-native; TS-11 pins the constant-time writes) and the wasm
+emitter unit test's S021 row.
 
 ## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
 
@@ -1747,6 +1765,17 @@ Node prints all four keys, and a caught error given `e["%error"] = "user"`
 prints `{}` where Node prints `{"%error":"user"}`. In a module that cannot
 build the encoding, stringify prints every key, as before. **Tested by:**
 measured (the review probes), not pinned.
+
+**Amendment (GH #137): util.inspect and the `name` / `message` link are
+not marker-confusable.** The real encoding's marker carries its error
+(S021's GH #137 amendment), so console.log / util.inspect of a parsed
+`{"%error":true,"name":"A","message":"b"}` prints the object, as Node
+does, and never the error bracket form. Reads of its `name` / `message`
+are the object's own. `instanceof Error`, `String()` and JSON.stringify
+still read the marker's presence, as above. Overwriting a real error's
+marker (`e["%error"] = "user"`) cuts that link: the value then converts
+and prints from its own members. **Tested by:** GH137-JS-14 in
+`packages/compiler/test/wasm-gh137-error-string.test.ts`.
 
 **Rationale:** inherited — the C runtime uses the same marker and
 reproduces every line above, verified by running it. The marker cannot

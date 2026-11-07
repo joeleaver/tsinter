@@ -4378,10 +4378,12 @@ export class InspectBuilder {
         }
         if (this.deps.errDyn !== undefined) {
           // GH #137: an error held in a dynamic value prints as one
-          // (S027's stackless bracket form), not as its encoding.
+          // (S027's stackless bracket form), not as its encoding. The test
+          // is the encoding's link to its error (errLinkOf), which user
+          // data cannot spell: a parsed `{"%error": true}` prints as the
+          // object it is.
           c.localGet(O);
-          this.deps.lit(c, "%error");
-          c.call(dyn.objGet());
+          c.call(dyn.errLinkOf());
           c.refIsNull();
           c.i32Eqz();
           c.ifVoid();

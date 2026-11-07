@@ -4258,13 +4258,13 @@ class Assembler {
       c.call(out.stage);
       c.else_();
       c.localGet(E);
-      c.call(this.dynValuesLive ? this.errToStrLiveHelper(false) : this.errToStrHelper());
+      c.call(this.errToStrHelper());
       c.call(out.stage);
       c.end();
     } else {
       c.globalGet(exc.refG);
       c.refCast(exc.errT);
-      c.call(this.dynValuesLive ? this.errToStrLiveHelper(false) : this.errToStrHelper());
+      c.call(this.errToStrHelper());
       c.call(out.stage);
     }
     c.else_();
@@ -4483,41 +4483,53 @@ class Assembler {
     return idx;
   }
 
-  private errToStrLiveFns = new Map<boolean, number>();
+  private errToStrLiveFns = new Map<string, number>();
   /** GH #137: an error's text where it may also live as a dynamic value.
-   * Once it crossed (S021's encoding), its `name` and `message` are the
-   * box's — a dynamic write (`e.name = "Custom"` in a JavaScript source,
-   * or through `any`) lands there, not in the error's slots — so the text
-   * is the box's: through its own `toString` member when `userToStr`
-   * (String(e), GH #134's protocol; it may throw), else Error.prototype
-   * .toString over its members (the uncaught report, which runs no user
-   * code). An error that never crossed renders from its slots. */
-  private errToStrLiveHelper(userToStr: boolean): number {
-    const hit = this.errToStrLiveFns.get(userToStr);
+   * Its `name` and `message` slots are current (dyn.errWriteThrough), so
+   * the slots answer — unless its encoding was given an own `toString`
+   * (dyn.errExtraGlobal says whether any encoding was given a member
+   * beyond the two; until then nothing is looked up). Then String(e) of
+   * the catch binding (`caught`) converts through it (GH #134's protocol;
+   * it may throw), and a typed String(e) / e.toString() (`typed`, sites
+   * that do not throw) is a named fence. */
+  private errToStrLiveHelper(mode: "caught" | "typed"): number {
+    const hit = this.errToStrLiveFns.get(mode);
     if (hit !== undefined) return hit;
     const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
     const dynRef = this.dyn.dynRef();
-    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), `%w.err.toStrLive:${userToStr ? "user" : "plain"}`);
-    this.errToStrLiveFns.set(userToStr, idx);
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), `%w.err.toStrLive:${mode}`);
+    this.errToStrLiveFns.set(mode, idx);
     const w = this.newWalker(1);
     const c = w.c;
     const b = this.wlocal(w, dynRef);
+    c.globalGet(this.dyn.errExtraGlobal());
+    c.ifVoid();
     c.localGet(0);
     c.call(this.dyn.errBoxOf());
     c.localTee(b);
     c.refIsNull();
-    c.ifResult(this.strRef);
-    c.localGet(0);
-    c.call(this.errToStrHelper());
-    c.else_();
-    if (userToStr) {
+    c.i32Eqz();
+    c.ifVoid();
+    this.dyn.objPayload(c, (x) => x.localGet(b));
+    this.pushStrLitInto(c, "toString");
+    c.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    if (mode === "caught") {
       c.localGet(b);
       c.call(this.dyn.toStrUser());
+      c.return_();
     } else {
-      this.dyn.objPayload(c, (x) => x.localGet(b));
-      c.call(this.dyn.errStr());
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "converting a typed error whose dynamic value has its own 'toString' is not supported yet"), null);
+      c.refNull(this.strType);
+      c.return_();
     }
     c.end();
+    c.end();
+    c.end();
+    c.localGet(0);
+    c.call(this.errToStrHelper());
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }
@@ -20630,18 +20642,16 @@ class Assembler {
             code.localGet(v);
             // GH #135: a name write keeps the built name it would erase.
             if (slot === ERR_NAME) code.call(this.errNameWriteHelper());
-            else if (slot === ERR_MESSAGE && this.dynValuesLive) code.call(this.errMsgWriteHelper());
             else code.structSet(this.exc().errT, slot);
             this.releaseScratch(this.strRef, v);
             this.releaseScratch(errRef, o);
             return;
           }
-          if (slot === ERR_NAME || (slot === ERR_MESSAGE && this.dynValuesLive)) {
-            // GH #135: the name the error was built with outlives a rename;
-            // GH #137: the write reaches the error's dynamic encoding too.
+          if (slot === ERR_NAME) {
+            // GH #135: the name the error was built with outlives a rename.
             this.walkExpr(s.obj);
             this.walkExpr(s.value);
-            code.call(slot === ERR_NAME ? this.errNameWriteHelper() : this.errMsgWriteHelper());
+            code.call(this.errNameWriteHelper());
             return;
           }
           this.walkExpr(s.obj);
@@ -20651,25 +20661,6 @@ class Assembler {
         }
         const field = this.classField(s.className, s.field, s.loc);
         if (field === null) return;
-        if (this.dynValuesLive && (s.field === "name" || s.field === "message") && this.classes.errorRooted(s.className)) {
-          // GH #137: a user error class's name / message write reaches the
-          // error's dynamic encoding too (errMsgWriteHelper's sibling).
-          const errRef: ValType = { kind: "ref", nullable: true, typeIndex: field.info.struct };
-          const o = this.acquireScratch(errRef);
-          const v = this.acquireScratch(this.strRef);
-          this.walkExpr(s.obj);
-          code.localTee(o);
-          if (this.nodesLive) this.walkValue(s.value);
-          else this.walkExpr(s.value);
-          code.localTee(v);
-          code.structSet(field.info.struct, field.index);
-          code.localGet(o);
-          code.localGet(v);
-          code.call(this.dyn.errEncodingWrite(s.field));
-          this.releaseScratch(this.strRef, v);
-          this.releaseScratch(errRef, o);
-          return;
-        }
         this.walkExpr(s.obj);
         // A class field holds a string VALUE (`this.buf += x` stays a node).
         if (this.nodesLive) this.walkValue(s.value);
@@ -22761,7 +22752,7 @@ class Assembler {
           code.localGet(c);
           code.structGet(exc.caughtT, 2);
           code.refCast(exc.errT);
-          if (this.dynValuesLive) code.call(this.errToStrLiveHelper(true));
+          if (this.dynValuesLive) code.call(this.errToStrLiveHelper("caught"));
           else code.call(this.errToStrHelper());
           code.else_();
           // A thrown DYNAMIC value converts through dyn toStr — its
@@ -23915,7 +23906,8 @@ class Assembler {
         }
         if (e.fn === "error.toString") {
           this.walkExpr(e.args[0]!);
-          code.call(this.errToStrHelper());
+          // GH #137: an own toString given through a dynamic value.
+          code.call(this.dynValuesLive ? this.errToStrLiveHelper("typed") : this.errToStrHelper());
           return;
         }
         // DOMException (INC-27 U5): the constructor, and the three reads
@@ -36893,36 +36885,10 @@ class Assembler {
     c.localGet(0);
     c.localGet(1);
     c.structSet(exc.errT, ERR_NAME);
-    if (this.dynValuesLive) {
-      // GH #137: the error's dynamic encoding, when built, is the same
-      // JS value: it reads the new name too.
-      c.localGet(0);
-      c.localGet(1);
-      c.call(this.dyn.errEncodingWrite("name"));
-    }
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }
 
-  private errMsgWriteFn: number | null = null;
-  /** `(err, message) -> ()`: a statically typed `err.message = m`, which
-   * the error's dynamic encoding reads too (GH #137). */
-  private errMsgWriteHelper(): number {
-    if (this.errMsgWriteFn !== null) return this.errMsgWriteFn;
-    const exc = this.exc();
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
-    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef], []), "%w.err.writeMessage");
-    this.errMsgWriteFn = idx;
-    const c = new Code();
-    c.localGet(0);
-    c.localGet(1);
-    c.structSet(exc.errT, ERR_MESSAGE);
-    c.localGet(0);
-    c.localGet(1);
-    c.call(this.dyn.errEncodingWrite("message"));
-    this.mb.setBody(idx, [], c.bytes());
-    return idx;
-  }
   private errOrigNameFn: number | null = null;
   /** `(err) -> str`: the name error 0 was built with. */
   private errOrigNameHelper(): number {

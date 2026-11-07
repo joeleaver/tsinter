@@ -70,10 +70,20 @@ try { throw new TypeError("t"); } catch (e) { e.message = "M2"; console.log(Stri
     id: "GH137-JS-03 Error.prototype.toString's rules over the renamed members",
     entry: "main.js",
     src: `try { throw new Error("t"); } catch (e) { e.name = ""; console.log(JSON.stringify(String(e))); e.message = ""; console.log(JSON.stringify(String(e))); }
-try { throw new Error("t"); } catch (e) { e.name = undefined; console.log(String(e)); e.message = undefined; console.log(JSON.stringify(String(e))); }
-try { throw new Error("t"); } catch (e) { e.name = null; console.log(String(e)); }
-try { throw new Error("t"); } catch (e) { e.name = 5; e.message = true; console.log(String(e)); }
-try { throw new RangeError("r"); } catch (e) { e.name = "A"; e.message = ""; console.log(String(e), \`[\${e}]\`); }`,
+try { throw new RangeError("r"); } catch (e) { e.name = "A"; e.message = ""; console.log(String(e), \`[\${e}]\`); }
+try { throw new Error("t"); } catch (e) { e.message = "two\\nlines"; console.log(String(e)); }`,
+  },
+  {
+    id: "GH137-JS-03b a non-string name assigned to a caught error stops at its named fence",
+    entry: "main.js",
+    src: `try { throw new Error("t"); } catch (e) { console.log("before"); e.name = undefined; console.log(String(e)); }`,
+    fence: { text: /assigning a non-string 'name' to an error held in a dynamic value is not supported yet/, stdout: "before\n" },
+  },
+  {
+    id: "GH137-JS-03c a non-string message assigned to a caught error stops at its named fence",
+    entry: "main.js",
+    src: `try { throw new Error("t"); } catch (e) { console.log("before"); e.message = 5; console.log(String(e)); }`,
+    fence: { text: /assigning a non-string 'message' to an error held in a dynamic value is not supported yet/, stdout: "before\n" },
   },
   {
     id: "GH137-JS-04 an own toString member is what the conversions call",
@@ -117,10 +127,18 @@ try { throw new TypeError("t"); } catch (e) { e.stack = ""; e.name = "Custom"; c
     fence: { text: /inspecting an error held in a dynamic value with own properties beyond name, message and code is not supported yet/, stdout: "before TypeError: t\n" },
   },
   {
-    id: "GH137-JS-09 an error whose name is not a string stops at its named fence when inspected",
+    id: "GH137-JS-09 a code member a program writes does not make an error print as Node's internal errors do",
     entry: "main.js",
-    src: `try { throw new TypeError("t"); } catch (e) { e.stack = ""; e.name = 5; console.log("before", String(e)); console.log(e); }`,
-    fence: { text: /inspecting an error held in a dynamic value whose 'name' is not a string is not supported yet/, stdout: "before 5: t\n" },
+    src: `const nul = JSON.parse("null");
+try { nul.x; } catch (e) { e.code = "ERR_X"; console.log(String(e), e.toString(), \`\${e}\`, "" + e); }
+try { throw new TypeError("t"); } catch (e) { e.code = "ERR_Y"; e.stack = ""; console.log(e); }`,
+  },
+  {
+    id: "GH137-JS-14 an object spelling the error marker is an ordinary object to inspect",
+    entry: "main.js",
+    src: `console.log(JSON.parse('{"%error":true,"name":"A","message":"b"}'));
+const o = JSON.parse('{"%error":1}');
+console.log(o, [o]);`,
   },
   {
     id: "GH137-JS-10 an error whose name prints empty stops at its named fence when inspected",
@@ -210,6 +228,62 @@ function run(): string {
   }
 }
 console.log(run());`,
+  },
+  {
+    id: "GH137-TS-07 a code member a program writes is ignored by every conversion; a stamped one is Node's",
+    src: `const e = new Error("m");
+const a: any = e;
+a.code = "ERR_X";
+console.log(String(e), String(a), \`\${a}\`, e.toString(), "" + a);
+try { Buffer.alloc(-1); } catch (x: any) { console.log(String(x), \`\${x}\`, x.toString()); }`,
+  },
+  {
+    id: "GH137-TS-08 Object.assign onto an error held in any writes the error",
+    src: `const e = new TypeError("m");
+const a: any = e;
+Object.assign(a, { message: "assigned", name: "AN" });
+console.log(e.message, e.name, String(e), String(a), a.name, e.toString());
+const t = new RangeError("r");
+const b: any = t;
+t.name = "Typed";
+t.message = "TM";
+console.log(b.name, b.message, String(b), \`\${b}\`);
+for (const k of ["name", "message"]) console.log(b[k]);`,
+  },
+  {
+    id: "GH137-TS-09 a non-string name written through any stops at its named fence",
+    src: `const e = new TypeError("m");
+const a: any = e;
+console.log("before");
+a.name = 5;
+console.log(String(e));`,
+    fence: { text: /assigning a non-string 'name' to an error held in a dynamic value is not supported yet/, stdout: "before\n" },
+  },
+  {
+    id: "GH137-TS-10 a typed conversion of an error given its own toString through any stops at its named fence",
+    src: `const e = new TypeError("m");
+const a: any = e;
+a.toString = () => "mine";
+console.log(String(a));
+console.log("before");
+console.log(String(e));`,
+    fence: { text: /converting a typed error whose dynamic value has its own 'toString' is not supported yet/, stdout: "mine\nbefore\n" },
+  },
+  {
+    id: "GH137-TS-11 typed name / message writes stay constant time with thousands of crossed errors",
+    src: `const kept: Error[] = [];
+const seen: any[] = [];
+for (let i = 0; i < 6000; i++) { const e = new Error("c" + i); const u: any = e; seen.push(u); kept.push(e); }
+const t0 = Date.now();
+const e = new Error("m");
+let last = "";
+for (let i = 0; i < 300000; i++) { e.name = "N" + (i % 7); e.message = "M"; last = String(e); }
+const c = kept[5999]!;
+for (let i = 0; i < 300000; i++) { c.message = "x" + (i % 5); }
+const big: any = JSON.parse("{}");
+for (let i = 0; i < 2000; i++) big["k" + i] = i;
+for (let i = 0; i < 2000; i++) { big.name = "a"; big.message = "b"; }
+console.log(last, seen.length, seen[5999].message, big.name, Date.now() - t0 < 3000);`,
   },
 ];
 
