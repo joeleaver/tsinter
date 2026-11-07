@@ -63,6 +63,9 @@ export interface FetchDeps {
   /** class:fetchCause — errT's fields then `cause` (errRef). */
   causeT: () => number;
   vtGlobal: (className: string) => number;
+  /** GH #141: push the vt of a plain Error rebuilt from the host's name in
+   * local `nameLocal` (emitter.ts emitPlainErrVtByName, foreign tags). */
+  plainErrVtByName: (c: Code, nameLocal: number) => void;
   /** Push the i32 preorder position of the error the caller pushes. */
   errPre: (c: Code, pushErr: () => void) => void;
   setCellError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void, code: string | null) => void;
@@ -578,7 +581,8 @@ export class FetchBuilder {
           $.ret($.new_(this.deps.errT(), $.g(this.deps.vtGlobal(`%${cls}`)), $.l(0), $.l(1), $.l(CODE))),
         );
       }
-      $.do($.new_(this.deps.errT(), $.g(this.deps.vtGlobal("%Error")), $.l(0), $.l(1), $.l(CODE)));
+      // GH #141: an Error carrying the host's name is tagged by it.
+      $.do($.new_(this.deps.errT(), $.raw((c) => this.deps.plainErrVtByName(c, 0)), $.l(0), $.l(1), $.l(CODE)));
     });
   }
 

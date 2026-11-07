@@ -1516,7 +1516,15 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
     const lowered = argNodes.map((n) => ({ node: n, value: valueOf.get(n)! }));
     if (lowered.length > 1) {
       // A runtime format string (board #237): Node's scan runs at run time.
-      const runtime = lowerRuntimeFormat(L, lowered, "format", loc);
+      // GH #139: an island ('any') value scans and prints through the
+      // checked-dynamic renderer, as console's arguments do (the jsval→dyn
+      // crossing wraps BY REFERENCE), so an `any` format string formats.
+      const scanned = lowered.map((a) =>
+        a.value.type.kind === "jsval"
+          ? { node: a.node, value: { kind: "dynFromJsval", value: a.value, type: DYN, loc: a.value.loc } as IrExpr }
+          : a,
+      );
+      const runtime = lowerRuntimeFormat(L, scanned, "format", loc);
       if (runtime !== null) return afterArgs(bound.stmts, runtime, loc);
     }
     // No substitutions possible: every argument joins with spaces.

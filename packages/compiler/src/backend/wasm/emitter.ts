@@ -2718,9 +2718,16 @@ const NUM_PROTO_METHOD_ARITY: ReadonlyMap<string, number> = new Map([
  * function-valued too, Node-measured on every kind's chain: `typeof
  * (5).__defineGetter__` is "function", same for string/boolean/array/
  * object receivers). */
-/** The names the runtime builds a plain `Error` under (GH #135), `Error`
- * first. */
-const RUNTIME_PLAIN_ERROR_NAMES = ["Error", "URIError", "ReferenceError", "EvalError", "AggregateError", "AssertionError"];
+/** GH #141: the names the runtime builds a plain `%Error` under, each
+ * stamped with its own class tag of %Error's vt (errVtGlobal), so
+ * `constructor` answers the class it was BUILT as, whatever its `name`
+ * later says. */
+const RUNTIME_PLAIN_ERROR_TAGS = ["URIError", "ReferenceError", "EvalError", "AggregateError", "AssertionError"];
+/** GH #141: the class tag of a plain Error REBUILT from a name and message
+ * alone — a host's (S098 (c)), the embedded engine's, or a marker-carrying
+ * object's (S025) — under a name the tier cannot attribute to a class:
+ * `constructor` and inspect's class name stop by name there. */
+const FOREIGN_ERROR_TAG = "%foreign";
 
 /** A JavaScript source's location (the frontend's isJsSourceFileName):
  * where SEMANTICS.md S015's own-members answer is kept (U1b) and the
@@ -3706,7 +3713,7 @@ class Assembler {
     codeLit: string | null,
   ): void {
     const exc = this.exc();
-    c.globalGet(this.classes.vtGlobal(className));
+    c.globalGet(this.errVtGlobal(className, name));
     this.pushStrLitInto(c, name);
     pushMessage(c);
     if (codeLit !== null) this.pushStrLitInto(c, codeLit);
@@ -3738,7 +3745,7 @@ class Assembler {
    * "P3-E-2" as a citation form is withdrawn). */
   private emitSetCellErrorCoded(c: Code, className: string, name: string, pushMessage: (c: Code) => void, pushCode: (c: Code) => void): void {
     const exc = this.exc();
-    c.globalGet(this.classes.vtGlobal(className));
+    c.globalGet(this.errVtGlobal(className, name));
     this.pushStrLitInto(c, name);
     pushMessage(c);
     pushCode(c);
@@ -4289,10 +4296,11 @@ class Assembler {
   private errClassNameFn: number | null = null;
   /** GH #137: `(err) -> str | null` — the JS name of the class an error was
    * built from (what Node's inspect calls its constructor): the builtin, a
-   * plain Error's built name (errOrigNameHelper; outside the runtime's six,
-   * Error), a user class's NamedEvaluation name. NULL where this tier
-   * cannot say (a class with a static `name`, a DOMException, an error
-   * outside the program's class graph). */
+   * plain Error's built class (its class tag, GH #141: one of the runtime's
+   * five, else Error), a user class's NamedEvaluation name. NULL where this
+   * tier cannot say (a class with a static `name`, a DOMException, an error
+   * rebuilt from a foreign name, an error outside the program's class
+   * graph). */
   private errClassNameHelper(): number {
     if (this.errClassNameFn !== null) return this.errClassNameFn;
     const exc = this.exc();
@@ -4302,7 +4310,6 @@ class Assembler {
     const w = this.newWalker(1);
     const c = w.c;
     const pre = this.wlocal(w, I32);
-    const on = this.wlocal(w, this.strRef);
     c.localGet(0);
     c.structGet(exc.errT, 0);
     c.structGet(this.classes.ci(), CI_PRE);
@@ -4316,23 +4323,19 @@ class Assembler {
       c.i32Eq();
       c.ifVoid();
       if (meta.def.name === "%Error") {
-        c.localGet(0);
-        c.call(this.errOrigNameHelper());
-        c.localTee(on);
-        c.refIsNull();
-        c.ifVoid();
-        this.pushStrLitInto(c, "Error");
-        c.return_();
-        c.end();
-        for (const nm of RUNTIME_PLAIN_ERROR_NAMES) {
-          c.localGet(on);
-          this.pushStrLitInto(c, nm);
-          c.call(this.strEqHelper());
+        // GH #141: the class tag the runtime built it under.
+        for (const nm of RUNTIME_PLAIN_ERROR_TAGS) {
+          this.emitErrHasTag(c, 0, nm);
           c.ifVoid();
           this.pushStrLitInto(c, nm);
           c.return_();
           c.end();
         }
+        this.emitErrHasTag(c, 0, FOREIGN_ERROR_TAG);
+        c.ifVoid();
+        c.refNull(this.strType);
+        c.return_();
+        c.end();
         this.pushStrLitInto(c, "Error");
       } else {
         this.pushStrLitInto(c, jsName);
@@ -4648,6 +4651,7 @@ class Assembler {
       errT: () => this.exc().errT,
       causeT: () => this.fetchCauseT(),
       vtGlobal: (className) => this.classes.vtGlobal(className),
+      plainErrVtByName: (c, nameLocal) => this.emitPlainErrVtByName(c, nameLocal, "foreign"),
       errPre: (c, pushErr) => {
         pushErr();
         c.structGet(this.exc().errT, 0);
@@ -5044,8 +5048,10 @@ class Assembler {
     strMember("message", M);
     strMember("code", CD);
     // The class by name, then the builtin default name for a nameless one.
+    // GH #141: a plain Error rebuilt from a marker-carrying object carries
+    // the foreign tag (its `constructor` is not Error's in Node).
     const build = (className: string, lib: string): void => {
-      c.globalGet(this.classes.vtGlobal(className));
+      c.globalGet(className === "%Error" ? this.classes.vtAliasGlobal("%Error", FOREIGN_ERROR_TAG) : this.classes.vtGlobal(className));
       c.localGet(N);
       c.refIsNull();
       c.ifResult(this.strRef);
@@ -5285,8 +5291,9 @@ class Assembler {
     const c = new Code();
     const N = 1;
     const R = 2;
-    const build = (className: string, pushName: () => void): void => {
-      c.globalGet(this.classes.vtGlobal(className));
+    const build = (className: string, pushName: () => void, pushVt?: () => void): void => {
+      if (pushVt !== undefined) pushVt();
+      else c.globalGet(this.classes.vtGlobal(className));
       pushName();
       c.localGet(0);
       c.structGet(exc.errT, ERR_MESSAGE);
@@ -5324,7 +5331,8 @@ class Assembler {
     nameIs("URIError");
     c.i32Or();
     c.ifVoid();
-    build("%Error", () => c.localGet(N));
+    // GH #141: the clone is built as that class (its class tag).
+    build("%Error", () => c.localGet(N), () => this.emitPlainErrVtByName(c, N, "plain"));
     c.else_();
     build("%Error", () => this.pushStrLitInto(c, "Error"));
     c.end();
@@ -8416,7 +8424,9 @@ class Assembler {
     c.end();
     c.call(e.outDone);
     const named = (cls: string): void => {
-      c.globalGet(this.classes.vtGlobal(cls));
+      // GH #141: a plain Error rebuilt from the engine's name: tagged by it.
+      if (cls === "%Error") this.emitPlainErrVtByName(c, A, "foreign");
+      else c.globalGet(this.classes.vtGlobal(cls));
       c.localGet(A);
       c.localGet(B);
       c.localGet(CODE);
@@ -8688,7 +8698,7 @@ class Assembler {
         // own errors, e.g. ERR_STREAM_PUSH_AFTER_EOF, which route through
         // destroy rather than throwing at the push() call site).
         const exc = this.exc();
-        c.globalGet(this.classes.vtGlobal(className));
+        c.globalGet(this.errVtGlobal(className, name));
         this.pushStrLitInto(c, name);
         pushMessage(c);
         if (codeLit !== null) this.pushStrLitInto(c, codeLit);
@@ -11804,7 +11814,7 @@ class Assembler {
       errType: () => this.exc().errT,
       newError: (c, className, name, pushMessage, pushCode) => {
         const exc = this.exc();
-        c.globalGet(this.classes.vtGlobal(className));
+        c.globalGet(this.errVtGlobal(className, name));
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
@@ -11889,7 +11899,7 @@ class Assembler {
       excKind: () => this.exc().kindG,
       errType: () => this.exc().errT,
       newError: (c, className, name, pushMessage, pushCode) => {
-        c.globalGet(this.classes.vtGlobal(className));
+        c.globalGet(this.errVtGlobal(className, name));
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
@@ -12183,7 +12193,7 @@ class Assembler {
       excKind: () => this.exc().kindG,
       errType: () => this.exc().errT,
       newError: (c, className, name, pushMessage, pushCode) => {
-        c.globalGet(this.classes.vtGlobal(className));
+        c.globalGet(this.errVtGlobal(className, name));
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
@@ -13848,7 +13858,7 @@ class Assembler {
       errType: () => this.exc().errT,
       newError: (c, className, name, pushMessage, pushCode) => {
         const exc = this.exc();
-        c.globalGet(this.classes.vtGlobal(className));
+        c.globalGet(this.errVtGlobal(className, name));
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
@@ -16978,7 +16988,18 @@ class Assembler {
           this.pushStrLitInto(c, f.name);
           c.localGet(0);
           c.structGet(info.struct, slot);
-          c.call(inner);
+          if (f.type.kind === "func") {
+            // GH #140: a function member boxes under its KEY — ES
+            // SetFunctionName's answer for a method or an anonymous
+            // function defined there (SEMANTICS.md S020's GH #140
+            // amendment: one stored from elsewhere keeps the key too).
+            const box = this.dynFnBox(f.type, loc);
+            if (box === null) return false;
+            this.pushStrLitInto(c, f.name);
+            c.refNull(this.strType);
+            c.i32Const(0);
+            c.call(box);
+          } else c.call(inner);
           c.call(dyn.objPut());
           if (absentTag >= 0 || plain) c.end();
         }
@@ -20640,18 +20661,9 @@ class Assembler {
             this.close();
             code.localGet(o);
             code.localGet(v);
-            // GH #135: a name write keeps the built name it would erase.
-            if (slot === ERR_NAME) code.call(this.errNameWriteHelper());
-            else code.structSet(this.exc().errT, slot);
+            code.structSet(this.exc().errT, slot);
             this.releaseScratch(this.strRef, v);
             this.releaseScratch(errRef, o);
-            return;
-          }
-          if (slot === ERR_NAME) {
-            // GH #135: the name the error was built with outlives a rename.
-            this.walkExpr(s.obj);
-            this.walkExpr(s.value);
-            code.call(this.errNameWriteHelper());
             return;
           }
           this.walkExpr(s.obj);
@@ -28544,6 +28556,10 @@ class Assembler {
             // error instance — and, for bytes<u8> specifically, an ALIAS
             // rather than a copy (SEMANTICS.md S014's registered
             // exception; emitDynFromBody's own case has the full story).
+            if (e.isBuffer === true && vt.kind === "bytes" && vt.elem === "u8") {
+              this.emitBufferDynBox(e.value);
+              return;
+            }
             const h = this.dynFromHelper(vt, e.loc);
             if (h === null) {
               code.unreachable();
@@ -31154,6 +31170,10 @@ class Assembler {
             // island boundary is not a distinct boundary in Node at all
             // (no corpus program can pin the alias-vs-copy choice here,
             // same S014 argument: doing so would already fail on native).
+            if (e.isBuffer === true && vt.elem === "u8") {
+              this.emitBufferDynBox(e.value);
+              return;
+            }
             const h = this.dynFromHelper(vt, e.loc);
             if (h === null) {
               code.unreachable();
@@ -34869,6 +34889,25 @@ class Assembler {
     this.releaseScratch(dynRefT, ARGSDYN);
   }
 
+  /** GH #138: box the bytes<u8> value `value` evaluates to as a dynamic
+   * Buffer (the BYTES payload's Buffer flag set) — a crossing whose node
+   * the checker types as a Buffer (SEMANTICS.md S037's GH #138 amendment).
+   * The bytes are aliased, as every bytes crossing is (S014). */
+  private emitBufferDynBox(value: WExpr): void {
+    const code = this.fn.code;
+    const bref = this.acquireScratch(this.bytesB.bytesRef());
+    this.walkExpr(value);
+    code.localSet(bref);
+    this.dyn.boxBytes(code, (x) =>
+      this.dyn.pushNewBytesPayload(
+        x,
+        (y) => y.localGet(bref),
+        (y) => y.i32Const(1),
+      ),
+    );
+    this.releaseScratch(this.bytesB.bytesRef(), bref);
+  }
+
   /** INC-26 P3 (design §2.7's own "construct, don't cell-write" shape,
    * L6): `emitSetCellError`'s FIRST HALF, verbatim, MINUS the pending-
    * exception cell writes — builds a %Error-class instance VALUE and
@@ -36687,7 +36726,7 @@ class Assembler {
       c.i32Eq();
       c.ifVoid();
       if (meta.def.name === "%Error") {
-        this.emitPlainErrorCtor(c, er);
+        this.emitPlainErrorCtor(c, er, fence);
       } else if (meta.def.staticNameOrLength === true) {
         fence("reading 'constructor' of an error whose class declares a static 'name' or 'length' (Node answers the class with them; this tier does not model them — SEMANTICS.md S015)");
       } else {
@@ -36734,184 +36773,84 @@ class Assembler {
   /** The runtime builds several of Node's error classes as a plain `Error`
    * carrying the class's name (URIError, ReferenceError, AggregateError,
    * AssertionError, EvalError): an `%Error`'s constructor is read off the
-   * name it was BUILT with (errOrigNameHelper — a rename never moves it);
-   * any other name answers Error. (An `e.name` assigned through a dynamic
-   * value writes the dynamic copy, never the slot.) */
-  private emitPlainErrorCtor(c: Code, er: number): void {
+   * class tag it was BUILT with (GH #141, errVtGlobal) — a rename never
+   * moves it. An untagged plain Error answers Error; one rebuilt from a
+   * foreign name (a host's, the engine's, a marker-carrying object's)
+   * stops by name. */
+  private emitPlainErrorCtor(c: Code, er: number, fence: (text: string) => void): void {
     const named = (name: string, arity: number, isClass: boolean): void => {
-      c.localGet(er);
-      c.call(this.errOrigNameHelper());
-      this.pushStrLitInto(c, name);
-      c.call(this.strEqHelper());
+      this.emitErrHasTag(c, er, name);
       c.ifVoid();
       c.call(this.ctorPlaceholderHelper(`%Error:${name}`, name, arity, isClass));
       c.return_();
       c.end();
     };
-    c.localGet(er);
-    c.call(this.errOrigNameHelper());
-    c.refIsNull();
-    c.i32Eqz();
-    c.ifVoid();
     named("URIError", 1, false);
     named("ReferenceError", 1, false);
     named("EvalError", 1, false);
     named("AggregateError", 2, false);
     // node:assert's AssertionError is a JavaScript class in Node.
     named("AssertionError", 1, true);
+    this.emitErrHasTag(c, er, FOREIGN_ERROR_TAG);
+    c.ifVoid();
+    fence("reading 'constructor' of an error rebuilt from a host's, the embedded engine's or a marker-carrying object's name and message (Node answers the original's class; this tier does not know it — SEMANTICS.md S015)");
     c.end();
-    // `Error`, a rename of one (errNameWriteHelper records only what could
-    // change the answer), or a host error carrying another name (S015).
     c.call(this.ctorPlaceholderHelper("%Error:Error", "Error", 1, false));
     c.return_();
   }
 
-  /* GH #135: the name a plain Error was BUILT with. The runtime builds
-   * URIError, ReferenceError, EvalError, AggregateError and AssertionError
-   * as a plain Error carrying that name, so the name slot is the class —
-   * until a statically typed write (`err.name = "X"`, the only writer of
-   * the slot) renames it. That write records the slot's previous value
-   * here first, once per error and only when the rename could change the
-   * answer (errNameWriteHelper), in a linked list keyed by identity like
-   * dyn.ts's error-box cache. Entries are never removed: SEMANTICS.md S015
-   * registers the cost. */
-  private errOrigType: number | null = null;
-  private errOrigHead: number | null = null;
-  private errOrigT(): number {
-    if (this.errOrigType !== null) return this.errOrigType;
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-    const strRef = this.strRef;
-    this.errOrigType = this.mb.selfStructType("err:origName", (self) => [
-      { storage: errRef, mutable: false },
-      { storage: strRef, mutable: false },
-      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: false },
-    ]);
-    return this.errOrigType;
-  }
-  private errOrigHeadGlobal(): number {
-    if (this.errOrigHead !== null) return this.errOrigHead;
-    const t = this.errOrigT();
-    this.errOrigHead = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
-      w.u8(0xd0);
-      w.sleb(t);
-    });
-    return this.errOrigHead;
-  }
-  /** Local `n` = the entry for error 0, or null (a linear scan). */
-  private emitErrOrigFind(c: Code, n: number): void {
-    const t = this.errOrigT();
-    c.globalGet(this.errOrigHeadGlobal());
-    c.localSet(n);
-    c.block();
-    c.loop();
-    c.localGet(n);
-    c.refIsNull();
-    c.brIf(1);
-    c.localGet(n);
-    c.structGet(t, 0);
-    c.localGet(0);
-    c.refEq();
-    c.brIf(1);
-    c.localGet(n);
-    c.structGet(t, 2);
-    c.localSet(n);
-    c.br(0);
-    c.end();
-    c.end();
-  }
-  private errNameWriteFn: number | null = null;
-  /** `(err, name) -> ()`: a statically typed `err.name = name`. Before the
-   * write, a plain Error's first rename that could change its answer is
-   * recorded: the old name is one of the five runtime names (URIError,
-   * ReferenceError, EvalError, AggregateError, AssertionError), or the new
-   * one is one of those six with Error. The common rename (`Error` to
-   * `ValidationError`) records nothing: an unrecorded name outside the six
-   * answers Error anyway. */
-  private errNameWriteHelper(): number {
-    if (this.errNameWriteFn !== null) return this.errNameWriteFn;
-    const exc = this.exc();
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
-    const t = this.errOrigT();
-    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef], []), "%w.err.writeName");
-    this.errNameWriteFn = idx;
-    const w = this.newWalker(2);
-    const c = w.c;
-    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
-    const old = this.wlocal(w, this.strRef);
-    const plain = this.classes.meta("%Error");
-    const inNames = (push: () => void, names: string[]): void => {
-      names.forEach((nm, i) => {
-        push();
-        this.pushStrLitInto(c, nm);
-        c.call(this.strEqHelper());
-        if (i > 0) c.i32Or();
-      });
-    };
-    if (plain !== undefined) {
-      c.localGet(0);
-      c.structGet(exc.errT, 0);
-      c.structGet(this.classes.ci(), CI_PRE);
-      c.i32Const(plain.pre);
-      c.i32Eq();
-      c.ifVoid();
-      c.localGet(0);
-      c.structGet(exc.errT, ERR_NAME);
-      c.localTee(old);
-      c.refIsNull();
-      c.i32Eqz();
-      c.localGet(1);
-      c.refIsNull();
-      c.i32Eqz();
-      c.i32And();
-      c.ifVoid();
-      inNames(() => c.localGet(old), RUNTIME_PLAIN_ERROR_NAMES.slice(1));
-      inNames(() => c.localGet(1), RUNTIME_PLAIN_ERROR_NAMES);
-      c.i32Or();
-      c.ifVoid();
-      this.emitErrOrigFind(c, n);
-      c.localGet(n);
-      c.refIsNull();
-      c.ifVoid();
-      c.localGet(0);
-      c.localGet(old);
-      c.globalGet(this.errOrigHeadGlobal());
-      c.structNew(t);
-      c.globalSet(this.errOrigHeadGlobal());
-      c.end();
-      c.end();
-      c.end();
-      c.end();
-    }
-    c.localGet(0);
-    c.localGet(1);
-    c.structSet(exc.errT, ERR_NAME);
-    this.mb.setBody(idx, w.locals, c.bytes());
-    return idx;
+  /** GH #141: the vt a builtin error of `className` built under `name` is
+   * stamped with — %Error's class tag for the five names the runtime
+   * builds a plain Error under (RUNTIME_PLAIN_ERROR_TAGS), the class's own
+   * vt otherwise. */
+  private errVtGlobal(className: string, name: string): number {
+    if (className === "%Error" && RUNTIME_PLAIN_ERROR_TAGS.includes(name)) return this.classes.vtAliasGlobal("%Error", name);
+    return this.classes.vtGlobal(className);
   }
 
-  private errOrigNameFn: number | null = null;
-  /** `(err) -> str`: the name error 0 was built with. */
-  private errOrigNameHelper(): number {
-    if (this.errOrigNameFn !== null) return this.errOrigNameFn;
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-    const t = this.errOrigT();
-    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.origName");
-    this.errOrigNameFn = idx;
-    const w = this.newWalker(1);
-    const c = w.c;
-    const n = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: t });
-    this.emitErrOrigFind(c, n);
-    c.localGet(n);
+  /** GH #141: push the vt of a plain Error the runtime REBUILDS from a name
+   * it reads at run time (local `nameLocal`, a string; a null reads as
+   * Error): untagged for "Error", the class tag for the runtime's five,
+   * and the foreign tag for any other name — unless `others` is "plain",
+   * where any other name is an untagged Error (a name the tier itself
+   * gave: structuredClone's clone). */
+  private emitPlainErrVtByName(c: Code, nameLocal: number, others: "foreign" | "plain"): void {
+    const vtRef = this.classes.ciRef();
+    c.localGet(nameLocal);
     c.refIsNull();
-    c.ifResult(this.strRef);
-    c.localGet(0);
-    c.structGet(this.exc().errT, ERR_NAME);
+    c.localGet(nameLocal);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(0);
     c.else_();
-    c.localGet(n);
-    c.structGet(t, 1);
+    c.localGet(nameLocal);
+    this.pushStrLitInto(c, "Error");
+    c.call(this.strEqHelper());
     c.end();
-    this.mb.setBody(idx, w.locals, c.bytes());
-    return idx;
+    c.i32Or();
+    c.ifResult(vtRef);
+    c.globalGet(this.classes.vtGlobal("%Error"));
+    c.else_();
+    for (const nm of RUNTIME_PLAIN_ERROR_TAGS) {
+      c.localGet(nameLocal);
+      this.pushStrLitInto(c, nm);
+      c.call(this.strEqHelper());
+      c.ifResult(vtRef);
+      c.globalGet(this.classes.vtAliasGlobal("%Error", nm));
+      c.else_();
+    }
+    c.globalGet(others === "foreign" ? this.classes.vtAliasGlobal("%Error", FOREIGN_ERROR_TAG) : this.classes.vtGlobal("%Error"));
+    for (let i = 0; i < RUNTIME_PLAIN_ERROR_TAGS.length; i++) c.end();
+    c.end();
+  }
+
+  /** GH #141: push whether error local `er` carries %Error's class tag
+   * `tag` (its vt IS that tag's global). */
+  private emitErrHasTag(c: Code, er: number, tag: string): void {
+    c.localGet(er);
+    c.structGet(this.exc().errT, 0);
+    c.globalGet(this.classes.vtAliasGlobal("%Error", tag));
+    c.refEq();
   }
 
   /** ` at <file>:<line>` for a fence's code tag, the form the frontend's

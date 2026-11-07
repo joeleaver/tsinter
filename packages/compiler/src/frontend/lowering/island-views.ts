@@ -148,6 +148,16 @@ function liftOut(L: Lowerer, e: IrExpr, loc: SrcLoc): IrExpr {
   return L.jsvalLiftExpr(e, loc);
 }
 
+/** A record field's island value: liftOut, with a function member boxed
+ * under its KEY (GH #140 — ES SetFunctionName's answer for a method or an
+ * anonymous function defined there; SEMANTICS.md S020's GH #140
+ * amendment: one stored from elsewhere answers the key too). */
+function liftField(L: Lowerer, e: IrExpr, key: string, loc: SrcLoc): IrExpr {
+  const out = liftOut(L, e, loc);
+  if (L.sharedDynamic && e.type.kind === "func" && out.kind === "jsMarshal" && out.fnName === undefined) return { ...out, fnName: key };
+  return out;
+}
+
 /** The interned VIEW factory for static type `t` (an array, a tuple or a
  * record): `%view.<n>(x: t): jsval`. */
 export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false): string {
@@ -379,7 +389,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
     const getBody: IrStmt[] = fields.map((f) => ({
       kind: "if",
       cond: { kind: "strEq", negated: false, left: k, right: str(f.name, loc), type: BOOL, loc },
-      then: [{ kind: "return", value: liftOut(L, { kind: "recordGet", obj: x(), shapeId: shape.id, field: f.name, type: f.type, loc }, loc), loc }],
+      then: [{ kind: "return", value: liftField(L, { kind: "recordGet", obj: x(), shapeId: shape.id, field: f.name, type: f.type, loc }, f.name, loc), loc }],
       else_: null,
       loc,
     }));

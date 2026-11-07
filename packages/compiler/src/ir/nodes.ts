@@ -4949,8 +4949,9 @@ export type IrExpr =
    * module that calls structuredClone): a function value's source text,
    * which Node's DataCloneError quotes. `fnProto`: a function value whose
    * kind is known — 1 it owns `prototype`, 2 it does not (arrows, methods,
-   * async functions). */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: 1 | 2; type: IrType; loc: SrcLoc }
+   * async functions). `isBuffer` (GH #138): a bytes<u8> value the checker
+   * types as a Buffer — the BYTES payload's Buffer flag (SEMANTICS.md S037). */
+  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: 1 | 2; isBuffer?: true; type: IrType; loc: SrcLoc }
   /** Island value → dyn conversion (`type` is always dyn; the operand
    * is always jsval): the jsval→dyn crossing — an 'any'-typed engine
    * value flowing into an 'unknown'/'object'/JS-residue slot wraps BY
@@ -5341,7 +5342,7 @@ export type IrExpr =
    * type-directed JSON serializer and the engine's JSON parser; the
    * aliasing divergence is documented in SEMANTICS.md). Result is an
    * owned (+1) jsval; the operand is borrowed. Never throws. */
-  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; type: IrType; loc: SrcLoc }
+  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; /** GH #138: a bytes<u8> value the checker types as a Buffer (dynFrom's `isBuffer`). */ isBuffer?: true; type: IrType; loc: SrcLoc }
   /** An operation on island values (--dynamic builds only), executed by
    * the embedded engine with JS-exact semantics (coercions come from
    * pinned prelude closures, not C reimplementations). `args` are

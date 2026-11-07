@@ -882,14 +882,34 @@ export function jsFuncNameOf(node: ts.Node): string | null {
   if (ts.isPropertyAccessExpression(n)) return n.name.text;
   if ((ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)) && n.name) return n.name.text;
   if (ts.isFunctionExpression(n) || ts.isArrowFunction(n)) {
-    const p = n.parent;
-    if (p && ts.isVariableDeclaration(p) && p.initializer === n && ts.isIdentifier(p.name)) {
+    // NamedEvaluation looks through parentheses: `f: (function () {})`.
+    let p: ts.Node | undefined = n.parent;
+    let child: ts.Node = n;
+    while (p && ts.isParenthesizedExpression(p)) {
+      child = p;
+      p = p.parent;
+    }
+    if (p && ts.isVariableDeclaration(p) && p.initializer === child && ts.isIdentifier(p.name)) {
       return p.name.text;
     }
-    if (p && ts.isPropertyAssignment(p) && p.initializer === n && ts.isIdentifier(p.name)) {
-      return p.name.text;
-    }
+    if (p && ts.isPropertyAssignment(p) && p.initializer === child) return objLitKeyName(p.name);
   }
+  // GH #140: an object-literal member names its function by its KEY (ES
+  // SetFunctionName): a method (`{ m() {} }`, async and generator ones
+  // included), and a property whose value is an anonymous function or
+  // arrow (`{ f: function () {} }`, `{ "q-r": () => 0 }`); a named
+  // function expression keeps its own name, an identifier its reference's.
+  if (ts.isMethodDeclaration(n) && n.parent && ts.isObjectLiteralExpression(n.parent)) return objLitKeyName(n.name);
+  if (ts.isPropertyAssignment(n)) return jsFuncNameOf(n.initializer);
+  return null;
+}
+
+/** An object-literal key's string where the source spells it: an
+ * identifier, a string literal, or a plain decimal number (its canonical
+ * ToString); null for a computed key or another numeric spelling. */
+function objLitKeyName(name: ts.PropertyName): string | null {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text;
+  if (ts.isNumericLiteral(name) && /^(0|[1-9][0-9]*)$/.test(name.text)) return String(Number(name.text));
   return null;
 }
 
@@ -916,6 +936,22 @@ export function esFuncNameOf(L: Lowerer, node: ts.Node): string | null {
       while (ts.isParenthesizedExpression(init)) init = init.expression;
       if (ts.isFunctionExpression(init) && init.name) return init.name.text;
       if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return d.name.text;
+    }
+  }
+  // GH #140: a member read (`o.h`, `o["q-r"]`) of an object literal's
+  // function member answers the member's definition (its key, or a named
+  // function expression's own name) — what Node fixed at definition.
+  const keyNode = ts.isPropertyAccessExpression(n)
+    ? n.name
+    : ts.isElementAccessExpression(n) && (ts.isStringLiteral(n.argumentExpression) || ts.isNumericLiteral(n.argumentExpression))
+      ? n.argumentExpression
+      : null;
+  if (keyNode !== null) {
+    const sym = L.checker.getSymbolAtLocation(keyNode);
+    const d = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (d !== undefined && (ts.isPropertyAssignment(d) || ts.isMethodDeclaration(d)) && d.parent && ts.isObjectLiteralExpression(d.parent)) {
+      const own = jsFuncNameOf(d);
+      if (own !== null) return own;
     }
   }
   return jsFuncNameOf(n);
@@ -6785,6 +6821,17 @@ export class Lowerer {
     if (e.kind === "dynFrom" && e.value.type.kind === "func" && e.fnName === undefined) {
       const name = jsFuncNameOf(node);
       if (name !== null) e = { ...e, fnName: name };
+    }
+    // GH #138: a value the CHECKER types as a Buffer enters a dynamic
+    // position as one (the BYTES payload's Buffer flag): `constructor`,
+    // util.inspect, String() and JSON.stringify answer Buffer's. bytes<u8>
+    // is one IR type for Buffer and Uint8Array, so only this crossing's
+    // own node can tell (SEMANTICS.md S037's GH #138 amendment).
+    if ((e.kind === "dynFrom" || e.kind === "jsMarshal") && e.value.type.kind === "bytes" && e.value.type.elem === "u8" && ts.isExpression(node)) {
+      const tname = this.checker.typeToString(this.checker.getBaseTypeOfLiteralType(this.typeOf(node)));
+      if (tname === "Buffer" || tname === "NonSharedBuffer" || tname.startsWith("Buffer<") || tname.startsWith("NonSharedBuffer<")) {
+        e = { ...e, isBuffer: true };
+      }
     }
     // A union the plain re-tag declined (stranded NON-unit arms): when the
     // node's CHECKER type proves those arms away, they trap instead — the
