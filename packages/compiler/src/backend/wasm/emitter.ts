@@ -58,6 +58,7 @@ import {
   type IrLocal,
   type IrModule,
   type IrRecordShape,
+  recordOrderFields,
   type IrType,
   type IrUnionDef,
   type SrcLoc,
@@ -2084,6 +2085,20 @@ interface RecordInfo {
   struct: number;
   fieldIndex: Map<string, number>;
   overflow: MapInfo | null;
+  /** GH #132: the own-key ORDER slot (IR recordOrder / recordOrderSet) —
+   * a nullable string[] past the fields (and the overflow), present on
+   * the shapes recordOrderSlot names; null otherwise. */
+  order: number | null;
+}
+
+/** GH #132: the shapes whose records carry an own-key order slot — a
+ * plain declared record with an optional field (only an optional field can
+ * gain its key late or hold an explicit undefined). Its index: past the
+ * fields and the overflow. */
+function recordOrderSlot(shape: IrRecordShape): number | null {
+  if (shape.tuple === true || shape.indexValue !== undefined || shape.id.startsWith(FRAME_SHAPE_PREFIX)) return null;
+  if (!shape.fields.some((f) => f.optional === true && f.internal !== true)) return null;
+  return shape.fields.length; // the order vector; the high-water mark at +1
 }
 
 /* Exception-cell kind tags (the wasm tier's ScrExcKind): 0 = nothing
@@ -6900,6 +6915,7 @@ class Assembler {
         overflow = this.overflowInfoFor(shape, undefined, true);
         fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
       }
+      if (recordOrderSlot(shape) !== null) fields.push({ storage: this.mapTypeSoft(arrayOf(IR_F64)), mutable: true }, { storage: F64, mutable: true });
       built.push({ id, fields, overflow });
     }
     for (const { id, fields } of built) {
@@ -6939,6 +6955,7 @@ class Assembler {
         struct: this.recordReserved.get(id)!,
         fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])),
         overflow,
+        order: recordOrderSlot(shape),
       });
       this.recordReserved.delete(id);
     }
@@ -6959,6 +6976,71 @@ class Assembler {
     return this.mapInfoFor(synthetic, loc, soft);
   }
 
+  /** GH #132: a record key walk in a helper whose local 0 is the record:
+   * `fast()` emits the declared-order walk; a record carrying an own-key
+   * order (IR recordOrder — presence flags, then field numbers) instead
+   * runs `one(f)` per stored field number, in order, through a br_table
+   * on the number (recordOrderFields numbering). */
+  private emitOrderedRecordWalk(
+    c: Code,
+    w: WalkerCtx,
+    info: RecordInfo,
+    shape: IrRecordShape,
+    loc: SrcLoc | undefined,
+    fast: () => boolean,
+    one: (f: IrRecordShape["fields"][number]) => boolean,
+  ): boolean {
+    if (info.order === null) return fast();
+    const vec = this.vecInfoFor({ kind: "array", elem: { kind: "f64" } }, loc);
+    if (vec === null) return false;
+    const fields = recordOrderFields(shape);
+    const nf = fields.length;
+    const keys = this.wlocal(w, this.vecs.vecRef(vec));
+    const k = this.wlocal(w, I32);
+    const n = this.wlocal(w, I32);
+    c.localGet(0);
+    c.structGet(info.struct, info.order);
+    c.localTee(keys);
+    c.refIsNull();
+    c.ifVoid();
+    if (!fast()) return false;
+    c.else_();
+    c.localGet(keys);
+    c.structGet(vec.struct, 0);
+    c.localSet(n);
+    c.i32Const(nf);
+    c.localSet(k);
+    c.block();
+    c.loop();
+    c.localGet(k);
+    c.localGet(n);
+    c.i32GeS();
+    c.brIf(1);
+    c.block(); // $next
+    for (let j = 0; j < nf; j++) c.block();
+    c.localGet(keys);
+    c.structGet(vec.struct, 1);
+    c.localGet(k);
+    this.vecs.emitElemRead(c, vec);
+    c.i32TruncF64S();
+    c.brTable(fields.map((_, j) => j), nf);
+    for (let j = 0; j < nf; j++) {
+      c.end();
+      if (!one(fields[j]!)) return false;
+      c.br(nf - 1 - j);
+    }
+    c.end(); // $next
+    c.localGet(k);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(k);
+    c.br(0);
+    c.end();
+    c.end();
+    c.end();
+    return true;
+  }
+
   private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): RecordInfo | null {
     const cached = this.recordInfos.get(shapeId);
     if (cached !== undefined) {
@@ -6975,7 +7057,7 @@ class Assembler {
     if (reserved !== undefined) {
       const shape = this.recordShapes.get(shapeId);
       if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
-      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow: null };
+      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow: null, order: recordOrderSlot(shape) };
     }
     const shape = this.recordShapes.get(shapeId);
     if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
@@ -6998,6 +7080,7 @@ class Assembler {
       overflow = this.overflowInfoFor(shape, undefined, true);
       fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
     }
+    if (recordOrderSlot(shape) !== null) fields.push({ storage: this.mapTypeSoft(arrayOf(IR_F64)), mutable: true }, { storage: F64, mutable: true });
     this.recordInFlight.delete(shapeId);
     // A self-recursive shape poisoned its own cache entry while its
     // fields mapped — keep the refusal, never the placeholder struct.
@@ -7027,7 +7110,7 @@ class Assembler {
     const struct = shapeId.startsWith(FRAME_SHAPE_PREFIX)
       ? this.mb.subStructType(`frame:${shapeId}`, fields, this.frameBaseType())
       : this.mb.structType(fields);
-    const made: RecordInfo = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow };
+    const made: RecordInfo = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow, order: recordOrderSlot(shape) };
     this.recordInfos.set(shapeId, made);
     return made;
   }
@@ -16944,6 +17027,9 @@ class Assembler {
         c.localSet(o);
         // Keys insert in DECLARED order: a dyn object's insertion order is
         // observable (Object.keys, for-in, JSON), so it must be JS's.
+        // GH #132: a record off the fast path inserts its own keys in its
+        // own order (IR recordOrder), each present whatever it holds.
+        const dynFast = (): boolean => {
         for (const f of this.dynFieldOrder(shape)) {
           const inner = this.dynFromHelper(f.type, loc);
           const slot = info.fieldIndex.get(f.name);
@@ -16982,6 +17068,21 @@ class Assembler {
           c.call(dyn.objPut());
           if (absentTag >= 0 || plain) c.end();
         }
+        return true;
+        };
+        const dynOne = (f: IrRecordShape["fields"][number]): boolean => {
+          const inner = this.dynFromHelper(f.type, loc);
+          const slot = info.fieldIndex.get(f.name);
+          if (inner === null || slot === undefined) return false;
+          c.localGet(o);
+          this.pushStrLitInto(c, f.name);
+          c.localGet(0);
+          c.structGet(info.struct, slot);
+          c.call(inner);
+          c.call(dyn.objPut());
+          return true;
+        };
+        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, dynFast, dynOne)) return false;
         if (info.overflow !== null) {
           // The overflow TAIL: unlike dynCheck/dynMatch's width-CAPTURE
           // loops (which scan a SOURCE dyn object's raw storage order),
@@ -17507,7 +17608,10 @@ class Assembler {
         c.call(json.jbPuts());
         c.i32Const(1);
         c.localSet(first);
-        for (const f of fields) {
+        // GH #132: a record off the fast path writes its fields in its own
+        // key order (IR recordOrder) — the same per-field emission, picked
+        // by field number for each stored key.
+        const jsonOne = (f: (typeof fields)[number]): boolean => {
           const inner = this.jsonWriteHelper(f.type, loc);
           const slot = info.fieldIndex.get(f.name);
           if (inner === null || slot === undefined) return false;
@@ -17545,7 +17649,10 @@ class Assembler {
           c.structGet(info.struct, slot);
           c.call(inner);
           if (udrop || utag >= 0) c.end();
-        }
+                  return true;
+        };
+        const jsonFast = (): boolean => fields.every((f) => jsonOne(f));
+        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, jsonFast, jsonOne)) return false;
         if (info.overflow !== null) {
           // OVERFLOW entries in JS own-key order, after every declared
           // field (nodes.ts's IrRecordShape.indexValue doc: "JSON
@@ -20589,6 +20696,23 @@ class Assembler {
         return;
       }
 
+      case "recordOrderSet": {
+        // GH #132: a shape with no order slot never leaves the fast path.
+        const info = this.recordInfo(s.shapeId, s.loc, false);
+        if (info === null) return;
+        if (info.order === null) {
+          this.walkExpr(s.obj);
+          code.drop();
+          this.walkExpr(s.value);
+          code.drop();
+          return;
+        }
+        this.walkExpr(s.obj);
+        this.walkExpr(s.value);
+        code.structSet(info.struct, info.order + (s.hi === true ? 1 : 0));
+        return;
+      }
+
       case "recordKeyDelete": {
         const objT = s.obj.type;
         if (objT.kind !== "record") throw new Error("recordKeyDelete on a non-record receiver");
@@ -21363,6 +21487,7 @@ class Assembler {
       case "recordSet":
       case "recordKeySet":
       case "recordKeyDelete":
+      case "recordOrderSet":
       case "break":
       case "continue":
       case "throw":
@@ -22581,6 +22706,25 @@ class Assembler {
         this.walkExpr(e.obj);
         this.walkExpr(e.key);
         code.call(helper);
+        return;
+      }
+
+      case "recordOrder": {
+        // GH #132: the order slot, or the fast path's undefined (null).
+        const info = this.recordInfo(e.shapeId, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        if (info.order === null) {
+          this.walkExpr(e.obj);
+          code.drop();
+          if (e.hi === true) code.f64Const(0);
+          else this.emitSlotUndef(e.type, e.loc);
+          return;
+        }
+        this.walkExpr(e.obj);
+        code.structGet(info.struct, info.order + (e.hi === true ? 1 : 0));
         return;
       }
 

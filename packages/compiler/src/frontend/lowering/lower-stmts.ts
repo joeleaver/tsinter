@@ -4,6 +4,7 @@
  * finally-crossing fence), and blocked-binding poisoning. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
+import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js";
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
@@ -22,7 +23,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
+import { orderedRecordWrite, abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
@@ -2784,7 +2785,9 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       const read: IrExpr = { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: srcField.name, spreadCopy: true, type: srcField.type, loc };
       return { name: f.name, value: L.coerceInto(el, read, f.type) };
     });
-    return { kind: "recordLit", fields, type: restT, loc };
+    // GH #132: the rest object takes the source's remaining keys in the
+    // source's own order.
+    return orderNoteCopy(L, { kind: "recordLit", fields, type: restT, loc }, restT.shapeId, srcRef(), srcType.shapeId, loc);
   }
 
 /** The fresh record for `{ a, ...rest }` over a CLASS-INSTANCE source:
@@ -4428,7 +4431,20 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
       if (field) {
         const absent = L.wrappedUndefined(field.type, loc);
         if (absent) {
-          return { kind: "recordSet", obj, shapeId: obj.type.shapeId, field: field.name, value: absent, loc };
+          const write: IrStmt = { kind: "recordSet", obj, shapeId: obj.type.shapeId, field: field.name, value: absent, loc };
+          // GH #132: a record keeping its own order drops the key from it.
+          if (orderedShape(L, obj.type.shapeId) === null) return write;
+          const t = L.declareHiddenLocal("%del", obj.type);
+          const read: IrExpr = { kind: "varRef", localId: t.id, type: obj.type, loc };
+          return {
+            kind: "block",
+            body: [
+              { kind: "varDecl", localId: t.id, init: obj, loc },
+              { ...write, obj: read },
+              ...orderNoteDelete(L, read, obj.type.shapeId, field.name, loc),
+            ],
+            loc,
+          };
         }
       }
       if (shape?.indexValue) {
@@ -6058,7 +6074,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           undefined,
           shape.declaredOrder?.filter((n) => !consumed.has(n)),
         );
-        const packed: IrExpr = {
+        const packed: IrExpr = orderNoteCopy(L, {
           kind: "recordLit",
           fields: remaining.map((f) => ({
             name: f.name,
@@ -6066,7 +6082,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           })),
           type: { kind: "record", shapeId: restShapeId },
           loc: locOf(prop),
-        };
+        }, restShapeId, { kind: "varRef", localId: tmp.id, type: srcType, loc: locOf(prop) }, srcType.shapeId, locOf(prop)); // GH #132
         if (!ts.isIdentifier(restTo)) {
           // `({ a, ...box.rest } = src)` — the rest packs identically and
           // lands through the property/element write machinery.
@@ -6275,14 +6291,15 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             const recv = L.declareHiddenLocal("%dtRecv", obj.type);
             out.push({ kind: "varDecl", localId: recv.id, init: obj, loc });
             const value = L.coerceInto(blame, valueOf(field.type), field.type);
-            out.push({
+            // GH #132: the write keeps the record's own key order Node's.
+            out.push(orderedRecordWrite(L, {
               kind: "recordSet",
               obj: { kind: "varRef", localId: recv.id, type: obj.type, loc },
               shapeId: recvT.shapeId,
               field: field.name,
               value,
               loc,
-            });
+            }, false));
             return;
           }
         }

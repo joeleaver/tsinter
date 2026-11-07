@@ -7008,6 +7008,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         return t;
       }
       case "slotUndef":
+      case "recordOrder":
       case "isUndef":
       case "arrHasUndef":
         // Unit U: undefSlots modules exist only on the WasmGC lanes

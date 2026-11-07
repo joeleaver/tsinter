@@ -644,6 +644,9 @@ export function emitStmt(E: CEmitter, s: IrStmt): void {
       case "tryCatch":
         E.emitTryCatch(s);
         break;
+      case "recordOrderSet":
+        // GH #132: an undefSlots-only statement (the WasmGC lanes).
+        throw new Error("recordOrderSet reached a native backend (undefSlots is a WasmGC-lane module flag)");
       default: {
         const _exhaustive: never = s;
         void _exhaustive;

@@ -42,6 +42,7 @@ import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { afterArgs, evaluateArgsFirst, plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable, undefElse } from "./lower-exprs.js";
+import { orderFields, orderedFieldStmts } from "./record-order.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -611,16 +612,47 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
         }
         body.push({ kind: "if", cond: { kind: "unary", op: "!", operand: anyPresent, type: BOOL, loc }, then: [ret(str("{}", loc))], else_: null, loc });
       }
-      body.push(depthGate("[Object]"), ...begin());
+      const putOf = (fname: string, ft: IrType): IrStmt => entry(
+        concatAll([str(`${inspectKey(fname)}: `, loc), child(ft, get(fname, ft))], loc),
+        boolLit(false, loc),
+      );
+      const fastPuts: IrStmt[] = [];
       for (const fname of shown) {
         const ft = byName.get(fname)!;
-        const put = entry(
-          concatAll([str(`${inspectKey(fname)}: `, loc), child(ft, get(fname, ft))], loc),
-          boolLit(false, loc),
-        );
+        const put = putOf(fname, ft);
         const has = presentOf(fname, ft);
-        body.push(has === null ? put : { kind: "if", cond: has, then: [put], else_: null, loc });
+        fastPuts.push(has === null ? put : { kind: "if", cond: has, then: [put], else_: null, loc });
       }
+      // GH #132: off the fast path the record's own order decides.
+      const ordered = orderedFieldStmts(L, v(), t.shapeId, fastPuts, (f) => [putOf(f.name, f.type)], (name, type) => {
+        const id = `${name.slice(1)}.0`;
+        if (!locals.some((l) => l.id === id)) locals.push({ id, name: name.slice(1), type, mutable: true });
+        return id;
+      }, loc);
+      if (ordered !== fastPuts) {
+        const ordRead: IrExpr = { kind: "recordOrder", obj: v(), shapeId: t.shapeId, type: arrayOf(F64), loc };
+        // The fast path's every-key-absent test asks the S091 rule, which
+        // an ordered record does not follow.
+        const first = body[0];
+        if (first !== undefined && first.kind === "if") {
+          body[0] = { ...first, cond: { kind: "logical", op: "&&", left: { kind: "isUndef", operand: ordRead, type: BOOL, loc }, right: first.cond, type: BOOL, loc } };
+        }
+        // An ordered record with no key is Node's `{}` too.
+        body.unshift({
+          kind: "if",
+          cond: {
+            kind: "logical", op: "&&",
+            left: { kind: "unary", op: "!", operand: { kind: "isUndef", operand: { kind: "recordOrder", obj: v(), shapeId: t.shapeId, type: arrayOf(F64), loc }, type: BOOL, loc }, type: BOOL, loc },
+            right: { kind: "bin", op: "===", left: { kind: "arrIntrinsic", method: "length", receiver: { kind: "recordOrder", obj: v(), shapeId: t.shapeId, type: arrayOf(F64), loc }, args: [], type: F64, loc }, right: { kind: "numLit", value: orderFields(L.shapes.get(t.shapeId)!).length, type: F64, loc }, type: BOOL, loc },
+            type: BOOL,
+            loc,
+          },
+          then: [ret(str("{}", loc))],
+          else_: null,
+          loc,
+        });
+      }
+      body.push(depthGate("[Object]"), ...begin(), ...ordered);
       body.push(ret(end(str("", loc), str("{", loc), str("}", loc), false, boolLit(false, loc))));
       break;
     }

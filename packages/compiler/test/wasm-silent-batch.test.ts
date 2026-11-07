@@ -194,18 +194,16 @@ test("T230A PRESENCE: a widened literal's phantom optional members: inspect, and
   expect(exitCode).toBe(0);
 });
 
-test("T091A PRESENCE: S091 (a): an optional field explicitly set to undefined", async () => {
-  // Node v24 prints "{ a: 1, w: undefined } [ 'a', 'w' ] true\n" — the registered divergence (SEMANTICS.md S091).
+test("T091A PRESENCE: S091 (a), retired by GH #132: an optional field explicitly set to undefined is an own key", async () => {
   const { stdout, stderr, exitCode } = await runRow("T091A", "const p: { a: number; w?: number } = { a: 1, w: undefined };\nconsole.log(p, Object.keys(p), \"w\" in p);", "ts");
-  expect(stdout).toBe("{ a: 1, w: undefined } [ 'a' ] false\n");
+  expect(stdout).toBe("{ a: 1, w: undefined } [ 'a', 'w' ] true\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("T091B PRESENCE: S091 (b): a required field shares its shape with an identical optional one", async () => {
-  // Node v24 prints "a,w a\n" — the registered divergence (SEMANTICS.md S091).
+test("T091B PRESENCE: S091 (b), retired by GH #132: a required field sharing its shape with an identical optional one", async () => {
   const { stdout, stderr, exitCode } = await runRow("T091B", "const e: { a: number; w: number | undefined } = { a: 1, w: undefined };\nconst o: { a: number; w?: number } = { a: 2 };\nconsole.log(Object.keys(e).join(\",\"), Object.keys(o).join(\",\"));", "ts");
-  expect(stdout).toBe("a a\n");
+  expect(stdout).toBe("a,w a\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

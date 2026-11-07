@@ -3135,6 +3135,14 @@ function validateFunction(
         }
         break;
       }
+      case "recordOrder": {
+        checkExpr(e.obj);
+        if (!undefSlots) err("recordOrder outside an undefSlots module", e.loc);
+        if (!records.get(e.shapeId)) err(`recordOrder on undeclared shape "${e.shapeId}"`, e.loc);
+        expectType(e.obj, { kind: "record", shapeId: e.shapeId }, "recordOrder receiver");
+        if (e.hi === true ? e.type.kind !== "f64" : e.type.kind !== "array" || e.type.elem.kind !== "f64") err("recordOrder must be number[] (number with hi)", e.loc);
+        break;
+      }
       case "recordOvfKeys": {
         checkExpr(e.obj);
         const shape = records.get(e.shapeId);
@@ -5184,6 +5192,15 @@ function validateFunction(
           expectType(s.obj, { kind: "record", shapeId: s.shapeId }, "recordSet receiver");
           expectType(s.value, field.type, `recordSet ${s.shapeId}.${s.field}`);
         }
+        break;
+      }
+      case "recordOrderSet": {
+        checkExpr(s.obj);
+        checkExpr(s.value);
+        if (!undefSlots) err("recordOrderSet outside an undefSlots module", s.loc);
+        if (!records.get(s.shapeId)) err(`recordOrderSet on undeclared shape "${s.shapeId}"`, s.loc);
+        expectType(s.obj, { kind: "record", shapeId: s.shapeId }, "recordOrderSet receiver");
+        expectType(s.value, s.hi === true ? { kind: "f64" } : { kind: "array", elem: { kind: "f64" } }, "recordOrderSet value");
         break;
       }
       case "recordKeyDelete": {

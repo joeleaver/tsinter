@@ -108,6 +108,7 @@ import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
+import { orderNoteCopy } from "./record-order.js";
 import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
@@ -4820,6 +4821,7 @@ export class Lowerer {
     const fromT: IrType = { kind: "record", shapeId: fromId };
     const toT: IrType = { kind: "record", shapeId: toId };
     const r: IrExpr = { kind: "varRef", localId: "r.0", type: fromT, loc };
+    const copyLit = (lit: IrExpr): IrExpr => orderNoteCopy(this, lit, toId, r, fromId, loc); // GH #132
     this.liftedFns.push({
       name,
       params: [{ localId: "r.0", name: "r", type: fromT }],
@@ -4828,7 +4830,7 @@ export class Lowerer {
       body: [
         {
           kind: "return",
-          value: {
+          value: copyLit({
             kind: "recordLit",
             fields: to.fields.map((f) => {
               const lift = plan.get(f.name)!;
@@ -4857,7 +4859,7 @@ export class Lowerer {
             }),
             type: toT,
             loc,
-          },
+          }),
           loc,
         },
       ],

@@ -1154,6 +1154,26 @@ export function shapeHasReservedFields(shape: IrRecordShape): boolean {
   return shape.fields.some((f) => isReservedField(shape, f.name));
 }
 
+/** An integer-index key ("0", "17"): JS orders those ascending ahead of
+ * every other own key, whenever each was created. */
+export function isArrayIndexKey(name: string): boolean {
+  return /^(0|[1-9][0-9]*)$/.test(name) && Number(name) < 4294967295;
+}
+
+/** GH #132: a record shape's own-key fields as the ORDER slot numbers
+ * them (IR recordOrder): integer-index keys ascending, then the rest in
+ * declared order — Node's own-key order for keys created in declared
+ * order. Index i of this list is field number i in an order vector. */
+export function recordOrderFields(shape: IrRecordShape): IrRecordShape["fields"] {
+  const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
+  const visible = order
+    .filter((n) => !isReservedField(shape, n))
+    .map((n) => shape.fields.find((f) => f.name === n))
+    .filter((f): f is IrRecordShape["fields"][number] => f !== undefined);
+  const ints = visible.filter((f) => isArrayIndexKey(f.name)).sort((a, b) => Number(a.name) - Number(b.name));
+  return [...ints, ...visible.filter((f) => !isArrayIndexKey(f.name))];
+}
+
 /** True when the shape carries at least one accessor slot (see
  * accessorSlotProp) — the predicate behind every enumeration-surface
  * fence. */
@@ -1352,6 +1372,11 @@ export type IrStmt =
    * Deleting an absent key is a no-op, like JS. Evaluation order: obj,
    * key; both borrowed. Never throws. */
   | { kind: "recordKeyDelete"; obj: IrExpr; shapeId: string; key: IrExpr; loc: SrcLoc }
+  /** GH #132: store a record's own-key ORDER vector (see recordOrder), or
+   * with `hi` its fast-path high-water mark (an f64). `undefSlots` modules
+   * only; a shape the backend gives no order slot (no optional field)
+   * evaluates and drops the value. Borrowed operands; never throws. */
+  | { kind: "recordOrderSet"; obj: IrExpr; shapeId: string; value: IrExpr; hi?: true; loc: SrcLoc }
   /** Unlabeled: `break` binds to the innermost enclosing loop OR switch
    * (labeled BLOCK targets are skipped); `continue` to the innermost
    * enclosing loop, skipping any switches in between (validated). With
@@ -5137,6 +5162,16 @@ export type IrExpr =
    * listed (they never live in the overflow map — the lowering prepends
    * them from the shape). Never throws. */
   | { kind: "recordOvfKeys"; obj: IrExpr; shapeId: string; type: IrType; loc: SrcLoc }
+  /** GH #132: a record's own-key ORDER, as V8 keeps it — a number[] laid
+   * out as one presence flag per field of recordOrderFields(shape) (1 =
+   * own key) followed by the field numbers of its own keys in creation
+   * order — or the array slot's undefined while the record is on the
+   * FAST PATH, whose own keys are the declared order filtered by the
+   * SEMANTICS.md S091 key rule (lowering/record-order.ts). With `hi`, the
+   * fast path's high-water mark instead (f64: 0 unknown, else 2 + the
+   * highest field number holding a non-index key, or 1 for none).
+   * `undefSlots` modules only. Borrowed; never throws. */
+  | { kind: "recordOrder"; obj: IrExpr; shapeId: string; hi?: true; type: IrType; loc: SrcLoc }
   /** Union construction: wrap an arm value into a fresh tagged box (the
    * frontend inserts these wherever a `B` flows into an `A | B` slot).
    * `tag` is the arm's index in the union's canonical arm list; `value` has

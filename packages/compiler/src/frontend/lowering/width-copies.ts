@@ -90,6 +90,10 @@ const PASS_THROUGH = /^%(undef\.(fence|recv|iter)|in\.undefrecv)\./;
  * name), key listing and key tests (which show own keys only). */
 const PRINT_HELPER = /^%(util\.|assert\.)/;
 const KEYS_HELPER = /^%(obj\.(keys|values|entries|hasOwn)\.|rec\.haskey\.|in\.)/;
+/** GH #132's own-key order bookkeeping (record-order.ts): it reads its
+ * records' fields and keys to keep a record's order — part of the write
+ * or the copy it rides, never an observation of its own. */
+const ORDER_HELPER = /^%ord\.\d+$/;
 /** Node kinds whose operands are only read: printed (console), rendered
  * (`[object Object]`), serialized, or copied into a dynamic value. */
 const PRINT_KINDS = new Set(["intrinsic", "toString", "strConcat"]);
@@ -471,6 +475,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   const useOf = (parent: Record<string, unknown>, key: string): Use => {
     const pk = parent["kind"] as string;
     switch (pk) {
+      // GH #132: the own-key order slot is bookkeeping, not a field.
+      case "recordOrder":
+        return "read";
       case "recordGet":
         return key === "obj" && !parent["spreadCopy"] ? "read" : "other";
       // An index-signature read: a key observation, and — when the value
@@ -506,6 +513,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         }
         if (PRINT_HELPER.test(callee)) return "print";
         if (KEYS_HELPER.test(callee)) return "keys";
+        if (ORDER_HELPER.test(callee)) return "read";
         return "other";
       }
       default:
@@ -875,6 +883,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           noteWrite(tkey(args[0].type));
           kids = ["args"];
         } else if (transparentCallee(callee)) kids = ["args"];
+        else if (ORDER_HELPER.test(callee)) kids = ["args"]; // bookkeeping: lets nothing go, observes nothing
         else if (PRINT_HELPER.test(callee) || KEYS_HELPER.test(callee)) rest = "r";
         break;
       }
@@ -907,6 +916,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "recordKeySet":
       case "recordKeyDelete":
         if (!building) noteWrite(`record:${r["shapeId"] as string}:*`);
+        break;
+      case "recordOrderSet":
+        // GH #132: an order note never writes alone — every one rides a
+        // field write (noted above) or builds a fresh literal's record.
+        kids = ["obj", "value"];
+        break;
+      case "recordOrder":
+        // GH #132: reading the order slot reads nothing of the record's
+        // fields and lets nothing go.
+        kids = ["obj"];
         break;
       case "fieldSet":
       case "fieldIncDec":
