@@ -4973,6 +4973,15 @@ function validateFunction(
         }
         break;
       }
+      case "jsFits": {
+        checkExpr(e.value);
+        expectType(e.value, JSVAL, "jsFits operand");
+        expectType(e, BOOL, "jsFits result");
+        if (!canExitIslandToType(e.target, (id) => records.get(id), (id) => unions.get(id))) {
+          err(`jsFits to non-extractable type ${e.target.kind}`, e.loc);
+        }
+        break;
+      }
       case "jsUnview": {
         checkExpr(e.value);
         expectType(e.value, JSVAL, "jsUnview operand");

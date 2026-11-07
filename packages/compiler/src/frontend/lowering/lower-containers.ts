@@ -1266,7 +1266,7 @@ function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
       const absent: IrStmt[] = L.undefSlots
         ? [
             { kind: "exprStmt", expr: { kind: "arrayLit", elems: [], holes: true, type: outT, loc }, loc },
-            push(outT, { kind: "slotUndef", type: fnRet, loc }),
+            push(outT, fnRet.kind === "jsval" ? { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc } : fnRet.kind === "dyn" ? dynUndefinedExpr(loc) : { kind: "slotUndef", type: fnRet, loc }),
           ]
         : [{ kind: "runtimeFence", code: "SC1090", message: "Array.prototype.map over an array its callback shrank (Node leaves a hole in the result)", loc }];
       body = [

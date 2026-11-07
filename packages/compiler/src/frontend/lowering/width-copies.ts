@@ -52,6 +52,9 @@
 import { typeKey, type IrExpr, type IrFunction, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import type { Lowerer } from "./lowerer.js";
+import * as ts from "../ts7/adapter.js";
+import { dynArmKey } from "./dyn-arm.js";
+import { isJsSourceFileName } from "../shared.js";
 
 /** The interned width helpers: each builds a NEW value of its return type
  * from its one argument. */
@@ -85,7 +88,7 @@ const PURE_LIB = /^(math|num|number|string|str|insp|json|path|date|sym|buffer|by
  * with a program value that may be (or hold) a function. */
 const RUNTIME_KINDS = new Set(["dynCall", "dynInvoke", "jsMarshal", "jsExit", "jsView", "jsUnview", "jsBridgePromise", "ffiCall", "newPromise", "promiseWithResolvers", "dynFrom", "dynCheck"]);
 /** Pass-through checks: they answer their argument unchanged. */
-const PASS_THROUGH = /^%(undef\.(fence|recv|iter)|in\.undefrecv)\./;
+const PASS_THROUGH = /^%(undef\.(fence|recv|iter)|in\.undefrecv|u2\.exact)\./;
 /** Helpers that only read: printing and formatting (which shows a class's
  * name), key listing and key tests (which show own keys only). */
 const PRINT_HELPER = /^%(util\.|assert\.)/;
@@ -2814,8 +2817,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     /** A program function boxed into a dynamic value: each composite
      * parameter receives a copy of the dynamic argument, and a composite
      * result goes back as a copy. */
-    const judgeBoxedFn = (name: string): { why: string; what: string } | null => {
+    const judgeBoxedFn = (name: string): { why: string; what: string; param?: string } | null => {
       const f = byName.get(name)!;
+      // The function literal's source parameters (U2a: a refused one takes
+      // the dynamic arm in the next pass).
+      const srcParams = L.dynArmFnParams.get(name);
       for (const p of f.params) {
         const refs = refsOf(p.type).refs;
         if (refs.length === 0) continue;
@@ -2824,9 +2830,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const reachFns = callReach(name);
         const transient = !reachFns.suspends && db !== null && !db.uses.includes("other");
         const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
-        if (typedSideWritten(ps, p.type, null)) return { why: COPY_WRITTEN, what };
-        if (anyIdentity(refs)) return { why: COPY_IDENTITY, what };
-        if (dynWritten(null, transient ? reachFns.fns : null, null, null, null, refs)) return { why: DYN_WRITE_FROM, what };
+        const sp = srcParams?.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
+        const param = sp !== undefined ? `param:${dynArmKey(sp)}` : undefined;
+        const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
+        if (typedSideWritten(ps, p.type, null)) return out(COPY_WRITTEN);
+        if (anyIdentity(refs)) return out(COPY_IDENTITY);
+        if (dynWritten(null, transient ? reachFns.fns : null, null, null, null, refs)) return out(DYN_WRITE_FROM);
       }
       const rrefs = refsOf(f.returnType).refs;
       if (rrefs.length > 0) {
@@ -2852,7 +2861,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     };
 
     const reportedDyn = new Set<string>();
-    const judgedFns = new Map<string, { why: string; what: string } | null>();
+    let armParam: string | null = null;
+    const judgedFns = new Map<string, { why: string; what: string; param?: string } | null>();
     if (dynIdentity) for (const k of islandEntered) identity.add(k);
     judgingDyn = true;
     for (const s of dynSites) {
@@ -2913,8 +2923,19 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           for (const name of boxed.fns) {
             if (!judgedFns.has(name)) judgedFns.set(name, judgeBoxedFn(name));
             const j = judgedFns.get(name);
+            if (!j) {
+              // Accepted: its composite parameters still try the arm (U2a).
+              const f = byName.get(name);
+              const srcParams = L.dynArmFnParams.get(name);
+              for (const p of f?.params ?? []) {
+                if (refsOf(p.type).refs.length === 0) continue;
+                const sp = srcParams?.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
+                if (sp !== undefined && !isJsSourceFileName(sp.getSourceFile().fileName)) L.dynArmSoft.add(`param:${dynArmKey(sp)}`);
+              }
+            }
             if (j) {
               why = j.why;
+              armParam = j.param ?? null;
               feature = `a function crossing into a dynamic value, ${j.what}`;
               hint = "leave the parameter dynamic ('unknown' or 'any') or return a fresh value, so dynamic code and the function share one object";
               break;
@@ -2933,7 +2954,23 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           }
         }
       }
-      if (!why) continue;
+      if (!why) {
+        // An accepted copy at a contained slot: the next pass tries the
+        // dynamic arm (Node's sharing, Node's keys), falling back to it.
+        // (TypeScript sources only: a JavaScript source keeps U1b's
+        // checked-dynamic storage wherever its program builds.)
+        const k = s.dir === "out" ? L.dynArmExitNodes.get(s.node as object) : undefined;
+        if (k !== undefined && !isJsSourceFileName(k.replace(/:\d+:\d+$/, ""))) L.dynArmSoft.add(k);
+        continue;
+      }
+      // Unit U2a (dyn-arm.ts): a refused crossing at a contained slot
+      // takes the dynamic arm in the next pass.
+      if (s.dir === "out") {
+        const k = L.dynArmExitNodes.get(s.node as object);
+        if (k !== undefined) L.dynArmRetry.add(k);
+      }
+      if (armParam !== null) L.dynArmRetry.add(armParam);
+      armParam = null;
       const at = `${s.loc.file}:${s.loc.start}`;
       if (reportedDyn.has(at)) continue;
       reportedDyn.add(at);

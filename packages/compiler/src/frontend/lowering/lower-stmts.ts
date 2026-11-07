@@ -7,6 +7,7 @@ import type { Lowerer } from "./lowerer.js";
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
+import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
 import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf } from "./surfaces.js";
@@ -128,13 +129,23 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
       for (let i = 0; i < stmts.length; i++) {
         const stmt = stmts[i]!;
         entry.index = i;
+        // Unit U2b (dyn-arm.ts): the first statement naming a speculative
+        // binding lowers the statements that read it on both arms.
+        if (L.specBindings.size > 0) {
+          const split = lowerSpecSplit(L, stmts, i);
+          if (split !== null) {
+            out.push(split.stmt);
+            i += split.consumed - 1;
+            continue;
+          }
+        }
         if (!L.suppressStats) {
           L.stats.statementsTotal++;
           if (sf !== undefined) L.bumpFileStat(sf.fileName, "total");
         }
         const diagsBefore = L.diags.length;
         try {
-          const lowered = L.lowerStmt(stmt);
+          const lowered = lowerSpecDecl(L, stmt, stmts, i) ?? L.lowerStmt(stmt);
           // The lib-boundary chokepoint (lib-boundary.ts): checked-dynamic
           // arguments that reached builtin-call slots without the checked
           // coercion get their dynCheck here, and the uncoercible ones
@@ -226,6 +237,17 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
       }
     } finally {
       L.activeStmtLists.pop();
+      // A speculative binding lives as long as its declaring list.
+      if (L.specBindings.size > 0) {
+        for (const [sym, s] of L.specBindings) if (s.owner === stmts) L.specBindings.delete(sym);
+      }
+      if (L.armTransient.size > 0) {
+        for (const [sym, owner] of L.armTransient) {
+          if (owner !== stmts) continue;
+          L.armTransient.delete(sym);
+          L.dynArmSyms.delete(sym);
+        }
+      }
     }
     return out;
   }
@@ -4039,12 +4061,59 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     return out;
   }
 
+  /** lowerSwitch's dynamic-arm discriminant (see there), or null when the
+   * cases are not all string or all number literals. */
+  function armSwitchDisc(L: Lowerer, stmt: ts.SwitchStatement, disc: IrExpr): IrExpr | null {
+    const cases = stmt.caseBlock.clauses.filter((c): c is ts.CaseClause => ts.isCaseClause(c));
+    if (cases.length === 0) return null;
+    const lit = (e: ts.Expression): ts.Expression => (ts.isParenthesizedExpression(e) ? lit(e.expression) : e);
+    const strs = cases.every((c) => ts.isStringLiteral(lit(c.expression)) || ts.isNoSubstitutionTemplateLiteral(lit(c.expression)));
+    const nums = cases.every((c) => ts.isNumericLiteral(lit(c.expression)));
+    if (!strs && !nums) return null;
+    const loc = disc.loc;
+    const tmp = L.declareHiddenLocal("%armswitch", DYN);
+    const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
+    let sentinel: IrExpr;
+    if (strs) {
+      const taken = new Set(cases.map((c) => (lit(c.expression) as ts.StringLiteral).text));
+      let s = "\u0000%no-case";
+      while (taken.has(s)) s += "\u0000";
+      sentinel = { kind: "strLit", value: s, type: STRING, loc };
+    } else {
+      // A number no case spells (the IR carries no NaN literal).
+      const taken = new Set(cases.map((c) => Number((lit(c.expression) as ts.NumericLiteral).text.replace(/_/g, ""))));
+      let n = 0.5;
+      while (taken.has(n)) n += 1;
+      sentinel = { kind: "numLit", value: n, type: F64, loc };
+    }
+    const t: IrType = strs ? STRING : F64;
+    return {
+      kind: "seqExpr",
+      stmts: [{ kind: "varDecl", localId: tmp.id, init: { kind: "dynFromJsval", value: disc, type: DYN, loc }, loc }],
+      result: {
+        kind: "ternary",
+        cond: { kind: "dynTest", test: strs ? "string" : "number", value: ref(), type: BOOL, loc },
+        then: { kind: "dynCheck", value: ref(), type: t, loc },
+        else_: sentinel,
+        type: t,
+        loc,
+      },
+      type: t,
+      loc,
+    };
+  }
+
   export function lowerSwitch(L: Lowerer, stmt: ts.SwitchStatement): IrStmt {
     // Labels consume HERE, before any nested statement can see them; the
     // union desugar drops them (its if/else chain has no switch-end label
     // point — labeled jumps naming this switch fence at the jump).
     const labels = L.takeLabels();
-    const disc = L.lowerExpr(stmt.expression);
+    let disc = L.lowerExpr(stmt.expression);
+    // Unit U2 (SEMANTICS.md S128): a discriminant on the dynamic arm whose
+    // cases are all string (or all number) literals switches on that typed
+    // value; a value of another kind takes a sentinel no case equals (Node's
+    // `===` matches none of them), so the default runs.
+    if (L.dynArmActive && disc.type.kind === "jsval") disc = armSwitchDisc(L, stmt, disc) ?? disc;
     const dk = disc.type.kind;
     if (dk === "dyn") {
       L.unsupported("SC1100", stmt.expression, "switch statements on 'unknown' values");

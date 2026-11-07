@@ -5396,6 +5396,15 @@ export type IrExpr =
    * static value (same typeKey) answers that static value itself (+1); any
    * other value throws the catchable named TypeError carrying `what`. */
   | { kind: "jsUnview"; value: IrExpr; typeKey: string; what: string; type: IrType; loc: SrcLoc }
+  /** Unit U2b (docs/design/dynamic-values.md §4.3 step 2): does the island
+   * value `value` fit the typed composite `target` EXACTLY — every record
+   * holding exactly its type's keys, in the order the typed record lists
+   * them, every value of the declared kind — so that a typed copy of it
+   * cannot be told from it? `type` is bool. Never throws, never copies.
+   * `lenient`: declared keys may be missing (S119 holds them as undefined,
+   * printed as Node prints the missing key); no undeclared key, order kept.
+   * WasmGC lanes only. */
+  | { kind: "jsFits"; value: IrExpr; target: IrType; type: IrType; lenient?: true; loc: SrcLoc }
   /** Island → static PROMISE bridge (--dynamic builds only): `value` is a
    * jsval whose declared type is Promise<T> (a package call's promise —
    * it lives in the engine); the result is a fresh pending static promise

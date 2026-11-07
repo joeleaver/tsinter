@@ -141,6 +141,14 @@ async function runCFull(id: string, src: string): Promise<{ stdout: string; stde
  * judges every exit as a checked copy and refuses the observable ones. */
 const EXIT_REFUSED = /^SC1090:(an '(any|unknown)' value flowing into a typed .*\(SEMANTICS\.md S115\)|(a dynamic \('unknown', 'any' or 'object'\) value checked into|a function crossing into a dynamic value,) .*it would be a COPY where JavaScript shares the object, and .*\(SEMANTICS\.md S125\))/m;
 
+/** A unit-U2 row: the WasmGC lanes' dynamic arm (the c lane keeps its
+ * refusal, SEMANTICS.md S128). */
+async function armRow(id: string, src: string): Promise<string> {
+  const w = await runRow(`${id}-w`, src);
+  expect(w.exitCode).toBe(0);
+  return w.stdout;
+}
+
 async function bothRow(id: string, src: string): Promise<string> {
   const w = await runRow(`${id}-w`, src);
   expect(w.exitCode).toBe(0);
@@ -292,17 +300,10 @@ const EXIT_ROWS: [string, string][] = [
   ["H-EXIT-02 a02-return-exit", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction get(): string[] { return o.list; }\nconst r = get(); r.push(\"b\");\nconsole.log(o.list.length, r.length);"],
   ["H-EXIT-03 a05-map-value", "// @dynamic\nconst o: any = { list: [\"a\"] };\nconst m = new Map<string, string[]>();\nm.set(\"k\", o.list);\nm.get(\"k\")!.push(\"z\");\nconsole.log(o.list.length);"],
   ["H-EXIT-04 a09-generator", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction* g(): Generator<string[]> { yield o.list; }\nfor (const x of g()) x.push(\"z\");\nconsole.log(o.list.length);"],
-  ["H-EXIT-05 a13-param-chain", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction b(y: string[]) { y.push(\"z\"); }\nfunction a(x: string[]) { b(x); }\na(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-06 a15-ctor-param", "// @dynamic\nconst o: any = { list: [\"a\"] };\nclass R { constructor(xs: string[]) { xs.push(\"z\"); } }\nnew R(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-07 a16-method", "// @dynamic\nconst o: any = { list: [\"a\"] };\nclass S { add(xs: string[]) { xs.push(\"z\"); } }\nnew S().add(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-08 a17-callback", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction apply(f: (x: string[]) => void, v: any) { f(v); }\napply((x: string[]) => { x.push(\"z\"); }, o.list);\nconsole.log(o.list.length);"],
-  ["H-EXIT-09 a25-element-exit", "// @dynamic\nconst o: any = { rows: [[1]] };\nconst rows: number[][] = o.rows;\nrows[0].push(2);\nconsole.log(o.rows[0].length);"],
-  ["H-EXIT-10 a26-for-of-exit", "// @dynamic\nconst o: any = { rows: [[1], [2]] };\nfor (const r of o.rows as number[][]) r.push(9);\nconsole.log(o.rows[0].length);"],
-  ["H-EXIT-11 a27-record-exit-field-write", "// @dynamic\ninterface P { x: number }\nconst o: any = { p: { x: 1 } };\nconst p: P = o.p;\np.x = 2;\nconsole.log(o.p.x);"],
   ["H-EXIT-13 a31-param-reassign-alias", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction f(xs: string[]) { let y: string[] = []; y = xs; y.push(\"q\"); }\nf(o.list);\nconsole.log(o.list.length);"],
-  ["H-EXIT-14 fn07c-elem-alias", "// @dynamic\nconst o: any = { items: [{ n: 1 }] };\nconst items: { n: number }[] = o.items;\nconst first = items[0];\nfirst.n = 5;\nconsole.log(`${o.items[0].n}`);"],
-  ["H-EXIT-15 fn07e-record-index", "// @dynamic\nconst o: any = { m: { a: [1] } };\nconst m: Record<string, number[]> = o.m;\nm[\"a\"].push(2);\nconsole.log(`${o.m.a.length}`);"],
-  ["H-EXIT-16 board #259's own shape", "// @dynamic\nconst log: any = { lines: [] };\nfunction note(out: string[], s: string): void { out.push(s); }\nnote(log.lines, \"a\");\nconsole.log(log.lines.length);"],
 ];
 
 for (const [name, src] of EXIT_ROWS) {
@@ -324,16 +325,33 @@ test("H-EXIT-19 an 'as' cast is an exit too — unit U1a: a judged copy nothing 
   expect(await bothRow("H-EXIT-19", "// @dynamic\nconst o: any = { rows: [1] };\nconst r = o.rows as number[];\nconsole.log(r.length);")).toBe("1\n");
 });
 
-test("H-EXIT-12 a29-length-write refuses by name — unit U1a: the exit is a judged copy now, and the typed array's length write is the refusal (no typed-array length write on any lane, before or after U1a)", async () => {
-  const d = await refuseRow("H-EXIT-12", "// @dynamic\nconst o: any = { list: [1,2,3] };\nconst t: number[] = o.list;\nt.length = 0;\nconsole.log(o.list.length);");
-  expect(d).toMatch(/^SC1090:assignment to non-variables are not supported yet/m);
+test("H-EXIT-12 a29-length-write — unit U2a: the binding is the dynamic value (the dynamic arm), so its length write is Node's", async () => {
+  expect(await armRow("H-EXIT-12", "// @dynamic\nconst o: any = { list: [1,2,3] };\nconst t: number[] = o.list;\nt.length = 0;\nconsole.log(o.list.length);")).toBe("0\n");
 });
 
-test("H-EXIT-20 a typed-composite callback parameter dynamic code passes data into refuses by name (Joe's ruling, STRICT)", async () => {
-  const d1 = await refuseRow("H-EXIT-20", "// @dynamic\nconst cb: any = (xs: number[]) => xs.length;\nconsole.log(cb([1, 2]));");
-  expect(d1).toBe("SC1090:a function called from dynamic code with a typed 'number[]' parameter 'xs': each call would COPY the dynamic argument into typed storage, where the caller's object could change under it or carry more than the type declares (SEMANTICS.md S115) — type the parameter 'any' so it shares the caller's value, or copy explicitly inside the function with [...x] / { ...x }");
-  const d2 = await refuseRow("H-EXIT-20b", "// @dynamic\nconst api: any = { each(f: any) { return f({ name: \"a\" }); } };\nconsole.log(api.each((o: { name: string }) => o.name));");
-  expect(d2).toContain("parameter 'o': each call would COPY the dynamic argument into typed storage");
+// Unit U2a (SEMANTICS.md S128): an exit into a contained slot — a
+// `const`/`let` binding, a cast used in place, a direct call's parameter —
+// takes the dynamic arm where S125 (c) refused the copy: the slot is the
+// dynamic value, shared as in Node. Expected output measured on Node v24.18.1.
+const ARM_ROWS: [string, string, string][] = [
+  ["H-EXIT-09 a25-element-exit", "// @dynamic\nconst o: any = { rows: [[1]] };\nconst rows: number[][] = o.rows;\nrows[0].push(2);\nconsole.log(o.rows[0].length);", "2\n"],
+  ["H-EXIT-10 a26-for-of-exit", "// @dynamic\nconst o: any = { rows: [[1], [2]] };\nfor (const r of o.rows as number[][]) r.push(9);\nconsole.log(o.rows[0].length);", "2\n"],
+  ["H-EXIT-11 a27-record-exit-field-write", "// @dynamic\ninterface P { x: number }\nconst o: any = { p: { x: 1 } };\nconst p: P = o.p;\np.x = 2;\nconsole.log(o.p.x);", "2\n"],
+  ["H-EXIT-14 fn07c-elem-alias", "// @dynamic\nconst o: any = { items: [{ n: 1 }] };\nconst items: { n: number }[] = o.items;\nconst first = items[0];\nfirst.n = 5;\nconsole.log(`${o.items[0].n}`);", "5\n"],
+  ["H-EXIT-15 fn07e-record-index", "// @dynamic\nconst o: any = { m: { a: [1] } };\nconst m: Record<string, number[]> = o.m;\nm[\"a\"].push(2);\nconsole.log(`${o.m.a.length}`);", "2\n"],
+  ["H-EXIT-05 a13-param-chain", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction b(y: string[]) { y.push(\"z\"); }\nfunction a(x: string[]) { b(x); }\na(o.list);\nconsole.log(o.list.length);", "2\n"],
+  ["H-EXIT-16 board #259's own shape", "// @dynamic\nconst log: any = { lines: [] };\nfunction note(out: string[], s: string): void { out.push(s); }\nnote(log.lines, \"a\");\nconsole.log(log.lines.length);", "1\n"],
+];
+
+for (const [name, src, want] of ARM_ROWS) {
+  test(`${name} — unit U2a: the contained slot is the dynamic value, matching Node`, async () => {
+    expect(await armRow(name.split(" ")[0]!, src)).toBe(want);
+  });
+}
+
+test("H-EXIT-20 a typed-composite callback parameter dynamic code passes data into — unit U2a: the parameter holds the caller's value itself (the dynamic arm), matching Node", async () => {
+  expect(await armRow("H-EXIT-20", "// @dynamic\nconst cb: any = (xs: number[]) => xs.length;\nconsole.log(cb([1, 2]));")).toBe("2\n");
+  expect(await armRow("H-EXIT-20b", "// @dynamic\nconst api: any = { each(f: any) { return f({ name: \"a\" }); } };\nconsole.log(api.each((o: { name: string }) => o.name));")).toBe("a\n");
 });
 
 test("H-EXIT-20c the explicit copy inside an `any` callback is the working spelling", async () => {
@@ -368,39 +386,32 @@ test("H-HOST-01e a typed result handed to dynamic code shares its parts (s11b-ho
   expect(await bothRow("H-HOST-01e", "// @dynamic\ninterface P { n: number }\nconst ps: P[] = [{ n: 1 }];\nconst lib: any = { run(f: any) { const r = f(); r[0].n = 9; return r; } };\nlib.run(() => ps.map((p) => p));\nconsole.log(ps[0].n);")).toBe("9\n");
 });
 
-test("H-FRESH-02a freshness is proven by provenance, not spelling: s02-custom-map.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02a", "// @dynamic\nconst shared = [1, 2];\nconst coll: any = { map(_f: any) { return shared; } };\nconst t: number[] = coll.map((x: any) => x);\nt[0] = 99;\nconsole.log(shared[0], t[0]);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02a freshness is proven by provenance, not spelling: s02-custom-map.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02a", "// @dynamic\nconst shared = [1, 2];\nconst coll: any = { map(_f: any) { return shared; } };\nconst t: number[] = coll.map((x: any) => x);\nt[0] = 99;\nconsole.log(shared[0], t[0]);")).toBe("99 99\n");
 });
 
-test("H-FRESH-02b freshness is proven by provenance, not spelling: s04-fnvar-reassigned.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02b", "// @dynamic\nconst shared: any = [1];\nlet mk = (): any => JSON.parse(\"[1]\");\nmk = () => shared;\nconst t: number[] = mk();\nt.push(2);\nconsole.log(shared.length, t.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02b freshness is proven by provenance, not spelling: s04-fnvar-reassigned.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02b", "// @dynamic\nconst shared: any = [1];\nlet mk = (): any => JSON.parse(\"[1]\");\nmk = () => shared;\nconst t: number[] = mk();\nt.push(2);\nconsole.log(shared.length, t.length);")).toBe("2 2\n");
 });
 
-test("H-FRESH-02c freshness is proven by provenance, not spelling: s05-virtual.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02c", "// @dynamic\nconst shared: any = [1];\nclass A { get(): any { return JSON.parse(\"[1]\"); } }\nclass B extends A { get(): any { return shared; } }\nconst a: A = new B();\nconst t: number[] = a.get();\nt.push(2);\nconsole.log(shared.length, t.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02c freshness is proven by provenance, not spelling: s05-virtual.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02c", "// @dynamic\nconst shared: any = [1];\nclass A { get(): any { return JSON.parse(\"[1]\"); } }\nclass B extends A { get(): any { return shared; } }\nconst a: A = new B();\nconst t: number[] = a.get();\nt.push(2);\nconsole.log(shared.length, t.length);")).toBe("2 2\n");
 });
 
-test("H-FRESH-02d freshness is proven by provenance, not spelling: s16-objmethod-reassigned.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02d", "// @dynamic\nconst shared: any = [1];\nconst o = { make: (): any => JSON.parse(\"[1]\") };\no.make = () => shared;\nconst t: number[] = o.make();\nt.push(2);\nconsole.log(shared.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02d freshness is proven by provenance, not spelling: s16-objmethod-reassigned.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02d", "// @dynamic\nconst shared: any = [1];\nconst o = { make: (): any => JSON.parse(\"[1]\") };\no.make = () => shared;\nconst t: number[] = o.make();\nt.push(2);\nconsole.log(shared.length);")).toBe("2\n");
 });
 
-test("H-FRESH-02e freshness is proven by provenance, not spelling: s21b-user-response.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02e", "// @dynamic\nexport {};\nconst shared: any = { list: [1] };\nclass Response { async json(): Promise<any> { return shared; } }\nasync function main() {\n  const r = new Response();\n  const v: { list: number[] } = await r.json();\n  v.list.push(2);\n  console.log(shared.list.length);\n}\nmain();");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02e freshness is proven by provenance, not spelling: s21b-user-response.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02e", "// @dynamic\nexport {};\nconst shared: any = { list: [1] };\nclass Response { async json(): Promise<any> { return shared; } }\nasync function main() {\n  const r = new Response();\n  const v: { list: number[] } = await r.json();\n  v.list.push(2);\n  console.log(shared.list.length);\n}\nmain();")).toBe("2\n");
 });
 
-test("H-FRESH-02f freshness is proven by provenance, not spelling: s27b-json-shadow.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02f", "// @dynamic\nexport {};\nconst shared: any = [1];\nconst JSON = { parse(_s: string): any { return shared; } };\nconst t: number[] = JSON.parse(\"[1]\");\nt.push(2);\nconsole.log(shared.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02f freshness is proven by provenance, not spelling: s27b-json-shadow.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02f", "// @dynamic\nexport {};\nconst shared: any = [1];\nconst JSON = { parse(_s: string): any { return shared; } };\nconst t: number[] = JSON.parse(\"[1]\");\nt.push(2);\nconsole.log(shared.length);")).toBe("2\n");
 });
 
-test("H-FRESH-02g freshness is proven by provenance, not spelling: s12-custom-sort.ts refuses by name", async () => {
-  const d = await refuseRow("H-FRESH-02g", "// @dynamic\nconst shared = [3, 1];\nconst fresh: any = { sort() { return shared; } };\nconst t: number[] = fresh.sort();\nt[0] = 0;\nconsole.log(shared[0]);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-FRESH-02g freshness is proven by provenance, not spelling: s12-custom-sort.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-FRESH-02g", "// @dynamic\nconst shared = [3, 1];\nconst fresh: any = { sort() { return shared; } };\nconst t: number[] = fresh.sort();\nt[0] = 0;\nconsole.log(shared[0]);")).toBe("0\n");
 });
 
 test("H-FRESH-03a the copy-out idioms compile as checked fresh copies (f01-config-spread.ts)", async () => {
@@ -427,9 +438,8 @@ test("H-FRESH-03f a typed-composite-element spread — unit U1a: its judged copy
   expect(await bothRow("H-FRESH-03f", "// @dynamic\nconst o: any = JSON.parse('{\"a\":[1]}');\nconst r: { a: number[] } = { ...o };\nconsole.log(r.a.length);")).toBe("1\n");
 });
 
-test("H-UNK-01a an 'unknown' value leaving into typed storage follows S115 (d): u01-unknown-cast.ts refuses by name", async () => {
-  const d = await refuseRow("H-UNK-01a", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nconst t = u as number[];\nt.push(2);\nconsole.log(src.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-UNK-01a an 'unknown' value leaving into typed storage follows S115 (d): u01-unknown-cast.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-UNK-01a", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nconst t = u as number[];\nt.push(2);\nconsole.log(src.length);")).toBe("2\n");
 });
 
 test("H-UNK-01b an 'unknown' value leaving into typed storage follows S115 (d): u04-unknown-param.ts refuses by name", async () => {
@@ -437,14 +447,12 @@ test("H-UNK-01b an 'unknown' value leaving into typed storage follows S115 (d): 
   expect(d).toMatch(EXIT_REFUSED);
 });
 
-test("H-UNK-01c an 'unknown' value leaving into typed storage follows S115 (d): u05-unknown-guard.ts refuses by name", async () => {
-  const d = await refuseRow("H-UNK-01c", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nif (Array.isArray(u)) {\n  const t: number[] = u as number[];\n  t.push(2);\n}\nconsole.log(src.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-UNK-01c an 'unknown' value leaving into typed storage follows S115 (d): u05-unknown-guard.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-UNK-01c", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nif (Array.isArray(u)) {\n  const t: number[] = u as number[];\n  t.push(2);\n}\nconsole.log(src.length);")).toBe("2\n");
 });
 
-test("H-UNK-01d an 'unknown' value leaving into typed storage follows S115 (d): s10-objassign.ts refuses by name", async () => {
-  const d = await refuseRow("H-UNK-01d", "// @dynamic\nconst src: any = { a: [1] };\nconst t: { a: number[] } = Object.assign({}, src);\nt.a.push(2);\nconsole.log(src.a.length);");
-  expect(d).toMatch(EXIT_REFUSED);
+test("H-UNK-01d an 'unknown' value leaving into typed storage follows S115 (d): s10-objassign.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
+  expect(await armRow("H-UNK-01d", "// @dynamic\nconst src: any = { a: [1] };\nconst t: { a: number[] } = Object.assign({}, src);\nt.a.push(2);\nconsole.log(src.a.length);")).toBe("2\n");
 });
 
 test("H-UNK-01e a typed value crossing into 'unknown' is its view (l03-unknown-lift)", async () => {

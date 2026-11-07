@@ -234,7 +234,8 @@ f(rs); console.log(rs[0].n);`,
 const w = JSON.parse('{"a":1,"note":"x"}') as R;
 const n: { a: number } = w;
 console.log(n, Object.keys(n));`,
-    refused: 1,
+    // Unit U2: `n` takes the dynamic arm, which holds `w` (its typed arm: the
+    // view) — Node's keys, no copy (SEMANTICS.md S128).
   },
   {
     id: "record-literal-into-class-instanceof",

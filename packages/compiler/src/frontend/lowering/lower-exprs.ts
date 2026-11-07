@@ -13,6 +13,7 @@ import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReaso
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, dynUndefinedExpr, jsFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { armCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, unsupportedModuleFeatureOf } from "../shared.js";
@@ -1321,6 +1322,16 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // every non-import= binding — see lower-namespaces.ts).
       fenceEarlyAliasUse(L, expr, expr);
       const g = L.globalOf(expr);
+      // Unit U2b (dyn-arm.ts): a module-scope speculative binding read
+      // where no split fixed its arm — the next pass binds it eagerly.
+      if (g && L.specBindings.size > 0) {
+        const sym = L.resolveValueSymbol(expr);
+        const spec = sym ? L.specBindings.get(sym) : undefined;
+        if (spec !== undefined && spec.owner === null && !L.specFixed.has(sym!)) {
+          L.specRetry.add(spec.key);
+          L.unsupported("SC1090", expr, "a speculative typed binding read outside its split (internal: retried without speculation)");
+        }
+      }
       if (g) {
         // A global typed by a class that never REGISTERED (its collection
         // fenced): the initializing assignment never lowered, so the read
@@ -8633,6 +8644,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
         );
       }
       if (L.copiesOnCrossing(target)) {
+        // Unit U2a (dyn-arm.ts): a cast S125 (c) refused is the dynamic
+        // value itself — the dynamic arm.
+        if (isDynArmSite(L, expr) || armCast(L, expr)) return inner;
         // Unit H (SEMANTICS.md S115): typed storage takes an island value
         // only as a copy of a FRESH one.
         if (exitIsConsumedCopy(L, expr, target)) {
@@ -8642,8 +8656,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           return { kind: "jsUnview", value: inner, typeKey: typeKey(target), what: unviewWhat(L, target), type: target, loc: locOf(expr) };
         }
         if (!exitIsFresh(L, expr.expression, target)) {
-          // S115 (d)'s U1a amendment: a judged copy, wherever it lands.
-          if (L.sharedDynamic) return judgedExit(inner, target, locOf(expr));
+          // S115 (d)'s U1a amendment: a judged copy, wherever it lands —
+          // or, where S125 (c) refuses it, the dynamic arm (U2a).
+          if (L.sharedDynamic) return L.noteDynArmExit(judgedExit(inner, target, locOf(expr)), expr);
           L.pushDiag(s115Diag(locOf(expr), exitRefusal(L, target)));
           throw new PoisonError();
         }
@@ -8658,6 +8673,8 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
     // `as any` / `as unknown` on the one-world lanes (jsval targets): the
     // same value under the island type — erasure (design §4.1, probe c1).
     if (target.kind === "jsval") return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
+    // Unit U2a (dyn-arm.ts): a cast S125 (c) refused is the dynamic value.
+    if (L.copiesOnCrossing(target) && isDynArmSite(L, expr)) return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
     return lowerDynCastTo(L, expr, inner, target);
   }
 

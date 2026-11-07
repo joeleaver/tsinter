@@ -18063,6 +18063,339 @@ class Assembler {
     }
   }
 
+  /** %w.dyn.fits:<typeKey> — unit U2b's EXACT matcher (jsFits): 1 iff the
+   * dyn value has exactly `t`'s shape — every record exactly its type's
+   * keys in the order the typed record lists them (dynFieldOrder), every
+   * leaf of the declared kind, every union the arm the checked copy would
+   * pick, no view anywhere — so the checked copy (dynCheckHelper) builds a
+   * typed value nothing can tell from it. Never throws. */
+  private dynFitsHelper(t: IrType, loc: SrcLoc | undefined, lenient = false): number | null {
+    const key = `${lenient ? "L" : "E"}${typeKey(t)}`;
+    const hit = this.dynFitsFns.get(key);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [I32]), `%w.dyn.fits:${key}`);
+    this.dynFitsFns.set(key, idx);
+    const w = this.newWalker(1);
+    if (!this.emitDynFitsBody(w, t, loc, lenient)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  private readonly dynFitsFns = new Map<string, number>();
+
+  private emitDynFitsBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined, lenient: boolean): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const fail0 = (): void => {
+      c.i32Const(0);
+      c.return_();
+    };
+    // A view (a typed value shared into dynamic code) is never copied.
+    const noView = (): void => {
+      if (!dyn.viewsLive) return;
+      dyn.isView(c, (x) => x.localGet(0));
+      c.ifVoid();
+      fail0();
+      c.end();
+    };
+    switch (t.kind) {
+      case "f64":
+        this.emitKindIs(c, DK.NUM);
+        return true;
+      case "string":
+        this.emitKindIs(c, DK.STR);
+        return true;
+      case "bool":
+        this.emitKindIs(c, DK.BOOL);
+        return true;
+      case "nullT":
+        this.emitKindIs(c, DK.NULL);
+        return true;
+      case "undefinedT":
+        this.emitKindIs(c, DK.UNDEF);
+        return true;
+      case "dyn":
+      case "jsval":
+        // Shared by reference into the typed value: anything but an
+        // accessor cell (which a typed slot would hold as the cell).
+        this.emitKindIs(c, DK.JSVAL);
+        c.i32Eqz();
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        if (shape === undefined) return false;
+        if (shape.tuple) {
+          const fields = this.tupleFieldOrder(shape);
+          this.emitKindIs(c, DK.ARR);
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+          noView();
+          const a = this.wlocal(w, dyn.arrRef());
+          dyn.arrPayload(c, (x) => x.localGet(0));
+          c.localSet(a);
+          dyn.arrLen(c, (x) => x.localGet(a));
+          c.i32Const(fields.length);
+          c.i32Ne();
+          c.ifVoid();
+          fail0();
+          c.end();
+          for (let i = 0; i < fields.length; i++) {
+            const inner = this.dynFitsHelper(fields[i]!.type, loc, lenient);
+            if (inner === null) return false;
+            dyn.arrAt(c, (x) => x.localGet(a), (x) => x.i32Const(i));
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+          }
+          c.i32Const(1);
+          return true;
+        }
+        // Index signatures: the typed form's key order is not the
+        // object's own in general — the dynamic arm keeps the object.
+        if (shape.indexValue !== undefined) {
+          // A pure index-signature record (no declared field): the checked
+          // copy keeps every key in insertion order (S031), so under the
+          // lenient test it fits when every value fits the signature.
+          if (lenient && shape.fields.length === 0) {
+            const iv = this.dynFitsHelper(shape.indexValue, loc, true);
+            if (iv === null) return false;
+            this.emitKindIs(c, DK.OBJ);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            noView();
+            const o = this.wlocal(w, dyn.objRef());
+            const i = this.wlocal(w, I32);
+            const n = this.wlocal(w, I32);
+            c.localGet(0);
+            c.structGet(dyn.dynT(), DYN_REF);
+            c.refCast(dyn.objT());
+            c.localTee(o);
+            c.structGet(dyn.objT(), OBJ_PROTO);
+            c.i32Const(0);
+            c.i32Ne();
+            c.ifVoid();
+            fail0();
+            c.end();
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_LEN);
+            c.localSet(n);
+            c.i32Const(0);
+            c.localSet(i);
+            c.block();
+            c.loop();
+            c.localGet(i);
+            c.localGet(n);
+            c.i32GeU();
+            c.brIf(1);
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_ENTRIES);
+            c.localGet(i);
+            c.arrayGet(dyn.entriesArrayType());
+            c.structGet(dyn.entryT(), ENTRY_VALUE);
+            c.call(iv);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            c.localGet(i);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(i);
+            c.br(0);
+            c.end();
+            c.end();
+            c.i32Const(1);
+            return true;
+          }
+          c.i32Const(0);
+          return true;
+        }
+        const fields = this.dynFieldOrder(shape);
+        this.emitKindIs(c, DK.OBJ);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        noView();
+        const o = this.wlocal(w, dyn.objRef());
+        const e = this.wlocal(w, dyn.entryRef());
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(dyn.objT());
+        c.localTee(o);
+        // A plain object (no null prototype, no Map/Weak stand-in).
+        c.structGet(dyn.objT(), OBJ_PROTO);
+        c.i32Const(0);
+        c.i32Ne();
+        c.ifVoid();
+        fail0();
+        c.end();
+        if (lenient) {
+          // The fallback's test (S128 (a2)/(a3)/(b)): no key the type does
+          // not declare and the declared order kept; a REQUIRED plain-typed
+          // key may be missing (the checked copy marks it missing, S119 (i),
+          // and it prints as Node prints the absent key), an optional or
+          // undefined-armed one may not.
+          const k = this.wlocal(w, I32);
+          const n = this.wlocal(w, I32);
+          c.localGet(o);
+          c.structGet(dyn.objT(), OBJ_LEN);
+          c.localSet(n);
+          c.i32Const(0);
+          c.localSet(k);
+          for (const f of fields) {
+            const inner = this.dynFitsHelper(f.type, loc, true);
+            if (inner === null) return false;
+            const mustBePresent = this.undefinedArmTag2(f.type) >= 0;
+            c.localGet(k);
+            c.localGet(n);
+            c.i32LtU();
+            c.ifVoid();
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_ENTRIES);
+            c.localGet(k);
+            c.arrayGet(dyn.entriesArrayType());
+            c.localTee(e);
+            c.structGet(dyn.entryT(), ENTRY_KEY);
+            this.pushStrLitInto(c, f.name);
+            c.call(this.strEqHelper());
+            c.ifVoid();
+            c.localGet(e);
+            c.structGet(dyn.entryT(), ENTRY_VALUE);
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            c.localGet(k);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(k);
+            // An undefined-armed (optional-flavored) field's absent key
+            // would be built as that arm and printed as `key: undefined`:
+            // it must be present.
+            if (mustBePresent) {
+              c.else_();
+              fail0();
+            }
+            c.end();
+            if (mustBePresent) {
+              c.else_();
+              fail0();
+            }
+            c.end();
+          }
+          c.localGet(k);
+          c.localGet(n);
+          c.i32Eq();
+          return true;
+        }
+        c.localGet(o);
+        c.structGet(dyn.objT(), OBJ_LEN);
+        c.i32Const(fields.length);
+        c.i32Ne();
+        c.ifVoid();
+        fail0();
+        c.end();
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i]!;
+          const inner = this.dynFitsHelper(f.type, loc);
+          if (inner === null) return false;
+          c.localGet(o);
+          c.structGet(dyn.objT(), OBJ_ENTRIES);
+          c.i32Const(i);
+          c.arrayGet(dyn.entriesArrayType());
+          c.localTee(e);
+          c.structGet(dyn.entryT(), ENTRY_KEY);
+          this.pushStrLitInto(c, f.name);
+          c.call(this.strEqHelper());
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+          c.localGet(e);
+          c.structGet(dyn.entryT(), ENTRY_VALUE);
+          c.call(inner);
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+        }
+        c.i32Const(1);
+        return true;
+      }
+      case "array": {
+        const inner = this.dynFitsHelper(t.elem, loc, lenient);
+        if (inner === null) return false;
+        this.emitKindIs(c, DK.ARR);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        noView();
+        const a = this.wlocal(w, dyn.arrRef());
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        dyn.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(a);
+        dyn.arrLen(c, (x) => x.localGet(a));
+        c.localSet(n);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(a), (x) => x.localGet(i));
+        c.call(inner);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        return true;
+      }
+      case "union": {
+        // The arm the checked copy picks (its first width-tolerant
+        // match, dynCheckHelper's union arm) must fit exactly.
+        const def = this.unionDef(t.unionId);
+        for (const arm of def.arms) {
+          const match = this.dynMatchHelper(arm, loc);
+          const fits = this.dynFitsHelper(arm, loc, lenient);
+          if (match === null || fits === null) return false;
+          c.localGet(0);
+          c.call(match);
+          c.ifVoid();
+          c.localGet(0);
+          c.call(fits);
+          c.return_();
+          c.end();
+        }
+        c.i32Const(0);
+        return true;
+      }
+      default:
+        // Every other target keeps the dynamic arm.
+        c.i32Const(0);
+        return true;
+    }
+  }
+
   /** A shape's fields in the order the CHECK and MATCH walkers visit
    * them: positional for a tuple, CANONICAL (the sorted list that IS the
    * shape's identity) otherwise. See `dynFieldOrder` for why the two
@@ -32829,6 +33162,18 @@ class Assembler {
           () => this.pushStrLit(e.label),
           e.fns.map((f) => () => this.walkExpr(f)),
         );
+        return;
+      }
+      case "jsFits": {
+        // Unit U2b: the exact-shape test in front of a speculative copy.
+        const h = this.dynFitsHelper(e.target, e.loc, e.lenient === true);
+        if (h === null) {
+          this.refuse(`expr:${e.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.call(h);
         return;
       }
       case "jsUnview": {

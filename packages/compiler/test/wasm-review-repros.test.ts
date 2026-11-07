@@ -53,8 +53,6 @@ async function nativeRun(id: string, file: string, dynamic = false): Promise<Out
 }
 
 const SC1100 = (t: string): string => `tsinter: unsupported: ${t} [SC1100]\n`;
-const BOTH_KEYS =
-  "tsinter: unsupported: telling a missing record key from a field holding an explicit undefined, in a program that has both, is not supported yet (SEMANTICS.md S119 (i)) [SC1090]\n";
 const PLUS_NAN = (line: number): RegExp => new RegExp(`^tsinter: unsupported: .*\\[SC1090 at <ROW>:${line}\\]\\n$`);
 
 interface Row {
@@ -256,7 +254,9 @@ const v = { ...w };
 console.log(Object.keys(v), "note" in v);`,
   },
   {
-    // both in one program: the slot cannot tell them apart, so it is loud
+    // both in one program: unit U2 (SEMANTICS.md S128) — `u` does not fit its
+    // cast exactly (a key is missing), so it is the parsed object itself, and
+    // no typed slot has to tell the two undefineds apart: Node's output
     id: "a2-i-both-fence",
     ext: "ts",
     src: `interface U { id: number; note: string }
@@ -265,10 +265,6 @@ const u = JSON.parse('{"id":1}') as U;
 const w: U = { id: 2, note: xs[3] };
 console.log(u.note, w.note);
 try { console.log(Object.keys(w)); } catch { console.log("caught"); }`,
-    fence: {
-      stdout: "undefined undefined\n",
-      stderr: "tsinter: unsupported: telling a missing record key from a field holding an explicit undefined, in a program that has both, is not supported yet (SEMANTICS.md S119 (i)) [SC1090]\n",
-    },
   },
   {
     // S119 (g): a plain-typed undefined crossing into structuredClone
@@ -281,13 +277,12 @@ const ss: string[] = [];
 console.log(structuredClone({ s: ss[0] }).s);`,
   },
   {
-    // still fatal: a wrong-TYPE value, and null where a plain slot cannot
-    // hold it (the owner's call, re-review item 4)
+    // unit U2 (SEMANTICS.md S128 (b)): a wrong-TYPE parsed value no longer
+    // ends the program at the cast — it is the parsed object, printed as is
     id: "a2-wrong-type-stays",
     ext: "ts",
     src: `interface U { id: number }
 try { const u = JSON.parse('{"id":"x"}') as U; console.log("ok", u.id); } catch { console.log("caught"); }`,
-    fence: { stdout: "", stderr: SC1100("expected number at $.id, got string") },
   },
   {
     // S119 (e), retired: a re-tag of a union holding undefined used to trap bare
@@ -1040,7 +1035,8 @@ const other = JSON.parse('{"a":1}') as R;
 const d: any = { a: 1, note: undefined };
 const w = d as R;
 console.log(Object.keys(w), "note" in w, w, other.a);`,
-    fence: { stdout: "", stderr: BOTH_KEYS },
+    // unit U2 (SEMANTICS.md S128): `w` and `other` are the dynamic objects
+    // themselves — Node's output, no fence
   },
   {
     id: "r4-s23-write-back",
@@ -1053,7 +1049,8 @@ const u2 = JSON.parse('{"a":1}') as R;
 const xs: string[] = [];
 u2.note = xs[3];
 console.log(Object.keys(u2), u2);`,
-    fence: { stdout: "{ a: 1, note: 'x' } [ 'a', 'note' ]\n", stderr: BOTH_KEYS },
+    // unit U2 (SEMANTICS.md S128): both parses are their dynamic objects —
+    // Node's output, no fence
   },
   {
     // a crossing into --dynamic code: a view of a record with a missing key
@@ -1253,7 +1250,9 @@ try {
   label = "invalid config";
 }
 console.log(label);`,
-    fence: { stdout: "", stderr: SC1100("expected number at $.port, got string") },
+    // unit U2 (SEMANTICS.md S128 (a1)): the check moved to the typed leaf
+    // `const p: number = c.port`, still a fence (no path at a leaf)
+    fence: { stdout: "", stderr: SC1100("expected number, got string") },
   },
   {
     id: "q-narrow",

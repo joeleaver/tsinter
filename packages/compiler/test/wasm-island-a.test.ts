@@ -306,13 +306,15 @@ test("A2-REF-03 a getter written before a data member refuses at compile time (i
   expect(diags.some((d) => d.startsWith("SC3001:") && d.includes("(jsOp:defineGetter-order)"))).toBe(true);
 });
 
-test("A2-REF-04 a typed conversion of an object carrying an island getter: the typed callback parameter that would take it is refused at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
+test("A2-REF-04 a typed conversion of an object carrying an island getter: unit U2a — the typed callback parameter holds the object itself and reads its getter, as Node (SEMANTICS.md S128)", async () => {
   const src =
     '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nconst api: any = { each(f: any) { return f(o); } };\nconsole.log("before");\nconsole.log(api.each((r: { n: number; g: number }) => r.n + r.g));';
   // Node: before, then 3. Before unit H the conversion refused at run
   // time (the getter could not be read by the typed conversion); the
   // typed parameter is now a compile-time refusal on every lane.
-  await expect(build("A2-REF-04", src, "ts")).rejects.toThrow(/SC1090|a function called from dynamic code with a typed/);
+  const r = await runRow("A2-REF-04", src, "ts");
+  expect(r.stdout).toBe("before\n3\n");
+  expect(r.exitCode).toBe(0);
 });
 
 test("A2-REF-05 Object.assign onto an island getter throws Node's TypeError (GH #86 review: Node throws there too); deep equality over a linked object then ends the program", async () => {
@@ -368,13 +370,15 @@ test("A2-TAG-02 a non-callable island tag names itself", async () => {
   expect(exitCode).toBe(0);
 });
 
-test("A2-REF-06 a typed conversion of an object carrying an island getter: the typed callback parameter that would take it is refused at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
+test("A2-REF-06 a typed conversion of an object carrying an island getter: unit U2a — the typed callback parameter holds the object itself and reads its getter, as Node (SEMANTICS.md S128)", async () => {
   const src =
     '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nconst api: any = { each(f: any) { return f(o); } };\nconsole.log("before");\nconsole.log(api.each((r: { [k: string]: number }) => r["n"]! + r["g"]!));';
   // Node: before, then 3. Before unit H the conversion refused at run
   // time (the getter could not be read by the typed conversion); the
   // typed parameter is now a compile-time refusal on every lane.
-  await expect(build("A2-REF-06", src, "ts")).rejects.toThrow(/SC1090|a function called from dynamic code with a typed/);
+  const r = await runRow("A2-REF-06", src, "ts");
+  expect(r.stdout).toBe("before\n3\n");
+  expect(r.exitCode).toBe(0);
 });
 
 // ============================================================
