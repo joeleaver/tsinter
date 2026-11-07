@@ -50,12 +50,15 @@ async function both(src: string): Promise<{ node: Out; native: Out }> {
     const nodeDir = mkdtempSync(join(dir, "node-"));
     const nativeDir = mkdtempSync(join(dir, "native-"));
     // No core dumps: a signal death would otherwise spend seconds (on WSL, a 64 GB crash file)
-    // dumping. The limit is 1, not 0: when core_pattern is a pipe (WSL, apport, systemd-coredump)
-    // the kernel ignores a limit of 0 and skips the dump only at exactly 1. A file pattern skips
-    // any limit under a page. Fall back to 0 where the hard limit is 0.
-    const NOCORE = "ulimit -c 1 2>/dev/null || ulimit -c 0;";
-    const node = await exec("/bin/sh", ["-c", `${NOCORE} exec "$0" "$1"`, process.execPath, file], nodeDir);
-    const native = await exec("/bin/sh", ["-c", `${NOCORE} exec "$0"`, res.binaryPath], nativeDir);
+    // dumping. The limit must be exactly 1 BYTE: when core_pattern is a pipe (WSL, apport,
+    // systemd-coredump) the kernel ignores a limit of 0 and skips the dump only at 1; a file
+    // pattern skips anything under a page. `ulimit -c` counts 512-byte blocks and cannot say
+    // 1 byte, so prlimit (util-linux) sets it and execs the program. Without prlimit, 0 still
+    // stops file-pattern dumps.
+    const NOCORE = (args: string) =>
+      `if command -v prlimit >/dev/null 2>&1; then exec prlimit --core=1 -- ${args}; else ulimit -c 0; exec ${args}; fi`;
+    const node = await exec("/bin/sh", ["-c", NOCORE('"$0" "$1"'), process.execPath, file], nodeDir);
+    const native = await exec("/bin/sh", ["-c", NOCORE('"$0"'), res.binaryPath], nativeDir);
     return { node, native };
   } finally {
     rmSync(dir, { recursive: true, force: true });
