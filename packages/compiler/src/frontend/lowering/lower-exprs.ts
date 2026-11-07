@@ -1228,7 +1228,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         regexp: "object", generator: "object", classval: "function",
         undefinedT: "undefined", nullT: "object",
       };
-      const folded = FOLD[operand.type.kind];
+      // GH #142: a function-with-properties hybrid (`(() => T) & { a }`,
+      // types.ts's chalk shape) is a record carrying its callable in the
+      // reserved `%call` slot — but the JS value is the function.
+      const folded = L.hybridCallUnwrap(operand) !== operand ? "function" : FOLD[operand.type.kind];
       if (folded && mayHoldSlotUndef(L, operand)) {
         // Unit U (SEMANTICS.md S119): a plain-typed value may still hold
         // undefined on the WasmGC lanes — ask it at run time.
@@ -1252,7 +1255,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // the pure read, the trust-the-checker bet lowerUnitComparison makes).
       if (operand.type.kind === "union" && pureReemittable(operand)) {
         const def = L.unions.get(operand.type.unionId);
-        const answers = def?.arms.map(typeofAnswer);
+        const answers = def?.arms.map((a) => typeofAnswer(L, a));
         if (def && answers && answers.every((s): s is string => s !== null)) {
           const groups = new Map<string, number[]>();
           answers.forEach((s, i) => groups.set(s, [...(groups.get(s) ?? []), i]));
@@ -9891,8 +9894,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * "undefined", `typeof null` is "object" — JS's oldest wart, preserved
    * exactly); every ref kind is a JS object ("object"), func arms would be
    * "function" (unions never carry them — defensive), and the jsval/dyn/
-   * caught/void/union kinds cannot appear as arms. */
-  function typeofAnswer(arm: IrType): string | null {
+   * caught/void/union kinds cannot appear as arms. A function-with-
+   * properties hybrid record (its `%call` slot, GH #142) is "function". */
+  function typeofAnswer(L: Lowerer, arm: IrType): string | null {
+    if (arm.kind === "record" && L.shapes.get(arm.shapeId)?.fields.some((f) => f.name === "%call" && f.internal === true && f.type.kind === "func")) return "function";
     switch (arm.kind) {
       case "f64": return "number";
       case "string": return "string";
@@ -9994,7 +9999,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       const mapped = L.mapTypeOf(valT);
       if (mapped?.kind !== "union") continue;
       const def = L.unions.get(mapped.unionId);
-      const answers = def?.arms.map(typeofAnswer);
+      const answers = def?.arms.map((a) => typeofAnswer(L, a));
       if (!def || !answers || !answers.every((s): s is string => s !== null)) continue;
       const tags = answers.flatMap((s, i) => (s === b.text ? [i] : []));
       if (tags.length !== 1) continue;
@@ -10038,7 +10043,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       if (value.type.kind !== "union") continue; // defensive: an already-narrowed use
       const unionId = value.type.unionId;
       const def = L.unions.get(unionId);
-      const answers = def?.arms.map(typeofAnswer);
+      const answers = def?.arms.map((a) => typeofAnswer(L, a));
       if (!def || !answers || !answers.every((s): s is string => s !== null)) continue;
       const tags = answers.flatMap((s, i) => (s === b.text ? [i] : []));
       if (tags.length === 0 || tags.length === def.arms.length) {

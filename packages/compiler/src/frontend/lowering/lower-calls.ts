@@ -706,7 +706,10 @@ export interface GenericInstance {
    * in every case — signature 16), and those bodies end without a terminal
    * statement of their own. The trap satisfies the must-return rule as the
    * dead code it is; it can only fire if the checker's proof was violated,
-   * which would be a lowering bug — hence the please-report wording. */
+   * which would be a lowering bug — hence the please-report wording. On
+   * the WasmGC lanes (undefSlots) the completion returns the slot's
+   * undefined instead: there the proof can also fail on a lying value
+   * (GH #126), and Node's function answers undefined. */
   export function appendImplicitUndefinedReturn(L: Lowerer, body: IrStmt[],
     bodyReturn: IrType, loc: SrcLoc,): void {
     if (bodyReturn.kind === "void") return;
@@ -733,6 +736,15 @@ export interface GenericInstance {
         return;
       }
       // no undefined arm: the trap below stands in, exactly like non-unions
+    }
+    // GH #126 (SEMANTICS.md S119): on the WasmGC lanes every plain slot has
+    // an undefined, so a body the checker proved always returns but that
+    // completes anyway — an exhaustive switch over a discriminant a checked
+    // dynamic value lied about (`JSON.parse('{"kind":"c"}') as S`) — answers
+    // undefined, as Node's function does, instead of the trap.
+    if (L.undefSlots && bodyReturn.kind !== "caught" && bodyReturn.kind !== "jsval" && !isUnitType(bodyReturn)) {
+      body.push({ kind: "return", value: { kind: "slotUndef", type: bodyReturn, loc }, loc });
+      return;
     }
     body.push({
       kind: "runtimeFence",

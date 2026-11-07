@@ -954,6 +954,57 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           loc,
         };
       }
+      // GH #127: a union-typed value throws AS ITS ARM. The exception cell
+      // records the thrown value's kind from its static type, so a union
+      // thrown whole rode the generic ref arm and every catch read it back
+      // as an object. A switch on the tag throws each arm with the arm's
+      // own static type: a number, string or boolean arm fills the cell's
+      // scalar kinds, an Error arm its class kind, a unit arm the dynamic
+      // undefined / null — exactly what throwing that value directly does.
+      if (value.type.kind === "union") {
+        const def = L.unions.get(value.type.unionId);
+        if (def !== undefined) {
+          const loc = locOf(stmt);
+          const ut = value.type;
+          const t = L.declareHiddenLocal("%thrown", ut);
+          const read = (): IrExpr => ({ kind: "varRef", localId: t.id, type: ut, loc });
+          const throwArm = (tag: number): IrStmt => {
+            const arm = def.arms[tag]!;
+            if (isUnitType(arm)) {
+              return {
+                kind: "throw",
+                value: { kind: "dynFrom", value: { kind: "unitLit", unit: arm.kind === "nullT" ? "null" : "undefined", type: arm, loc }, type: DYN, loc },
+                loc,
+              };
+            }
+            return { kind: "throw", value: { kind: "unionNarrow", unionId: ut.unionId, tag, value: read(), type: arm, loc }, loc };
+          };
+          let chain: IrStmt = throwArm(def.arms.length - 1);
+          for (let tag = def.arms.length - 2; tag >= 0; tag--) {
+            chain = {
+              kind: "if",
+              cond: { kind: "unionIsTag", unionId: ut.unionId, tag, negated: false, value: read(), type: BOOL, loc },
+              then: [throwArm(tag)],
+              else_: [chain],
+              loc,
+            };
+          }
+          // Unit U (SEMANTICS.md S119): the union may hold its slot's
+          // undefined (an array hole, a fall-off return), which is none of
+          // its arms — it throws the dynamic undefined, as Node throws
+          // undefined.
+          if (L.undefSlots) {
+            chain = {
+              kind: "if",
+              cond: { kind: "isUndef", operand: read(), type: BOOL, loc },
+              then: [{ kind: "throw", value: dynUndefinedExpr(loc), loc }],
+              else_: [chain],
+              loc,
+            };
+          }
+          return { kind: "block", body: [{ kind: "varDecl", localId: t.id, init: value, loc }, chain], loc };
+        }
+      }
       return { kind: "throw", value, loc: locOf(stmt) };
     }
     if (ts.isTryStatement(stmt)) return L.lowerTry(stmt);

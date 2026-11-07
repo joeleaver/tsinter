@@ -6,7 +6,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, UNDEFINED_T, URL_T, VOID, arrayOf, isSupportedMapKey, isUnitType, typeEquals } from "../../ir/nodes.js";
-import { MAX_GENERIC_INSTANCES, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
+import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
@@ -4145,6 +4145,10 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
       const block = blockBodyOf(fnLike);
       if (!block) L.unsupported("SC1090", fnLike, "methods whose block body the frontend cannot locate");
       const body = [...declared.prologue, ...L.lowerStmts(block.statements)];
+      // GH #126: a body the checker proved always returns can still complete
+      // when a value lied about its type (an exhaustive switch over a bad
+      // discriminant) — the plain functions' completion, for methods too.
+      if (genCh === null) appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(fnLike));
       const fn: IrFunction = {
         name: `%${className}.${mName}`,
         params,
@@ -4208,6 +4212,7 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
       block.forEachChild(checkThis);
       const declared = L.declareParams(entry.member.parameters, entry.params);
       const body = [...declared.prologue, ...L.lowerStmts(block.statements)];
+      if (entry.member.asteriskToken === undefined) appendImplicitUndefinedReturn(L, body, bodyReturn, locOf(entry.member));
       const fn: IrFunction = {
         name: `%${info.def.name}.static:${name}`,
         params: declared.params,
