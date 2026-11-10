@@ -99,6 +99,12 @@ Campaigns go to nico-top: `/home/joe/dev/tsinter-tools/nico.sh "$PWD" -- node to
   predicates for findings already registered in SEMANTICS.md or filed on
   GitHub; matching buckets are marked so.
 
+The fuzzer lives outside every workspace package (`pnpm-workspace.yaml`
+lists `packages/*`; each package publishes only its own `files`), outside
+every tsconfig's `rootDir`, and has no `*.test.ts`, so vitest never picks
+it up. `tools/fuzz/check-repo.sh` re-checks that (lint, tsc of compiler and
+CLI, vitest's file list, `npm pack --dry-run` of each package, `dist/`).
+
 A divergence is only a bug if SEMANTICS.md doesn't register it: check each
 new bucket there (and in open issues) before filing, then add a `known.mjs`
 entry for it.
