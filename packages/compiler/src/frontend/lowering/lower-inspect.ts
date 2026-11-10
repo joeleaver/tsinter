@@ -42,7 +42,7 @@ import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { afterArgs, evaluateArgsFirst, plainFieldPresent, holeFenceStmt, isUndefExpr, mayHoldSlotUndef, pureReemittable, undefElse } from "./lower-exprs.js";
-import { orderFields, orderedFieldStmts } from "./record-order.js";
+import { orderFields, orderedFieldStmts, orderedShape } from "./record-order.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 
@@ -586,11 +586,21 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
       // Object.keys' declared order (SEMANTICS.md 36's stance).
       const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
       const byName = new Map(shape.fields.map((f) => [f.name, f.type] as const));
+      const byField = new Map(shape.fields.map((f) => [f.name, f] as const));
       // Boards #178/#230: a units-only OPTIONAL field (a widened literal's
       // phantom `b?: undefined`) holding undefined renders nothing
       // (L.markPresence decides once the shape's flags are final); every
       // other field renders whatever it holds (SEMANTICS.md S091).
+      // GH #132 / S091 (d): a shape that keeps its own key order tracks every
+      // explicit undefined (record-order.ts), so its fast path prints by the
+      // key rule — an optional field holding undefined has no key there.
+      const keyRule = orderedShape(L, t.shapeId) !== null;
       const presence = (fname: string, ft: IrType): IrExpr | null => {
+        if (keyRule && (byField.get(fname)?.optional === true)) {
+          if (ft.kind === "dyn") return { kind: "unary", op: "!", operand: { kind: "dynTest", test: "undefined", value: get(fname, ft), type: BOOL, loc }, type: BOOL, loc };
+          if (ft.kind === "jsval") return { kind: "unary", op: "!", operand: { kind: "dynTest", test: "undefined", value: { kind: "dynFromJsval", value: get(fname, ft), type: DYN, loc }, type: BOOL, loc }, type: BOOL, loc };
+          if (!isUnitType(ft)) return isUndefExpr(get(fname, ft), true, loc);
+        }
         const utag = ft.kind === "union" ? L.armTag(ft.unionId, UNDEFINED_T) : -1;
         if (utag < 0 || ft.kind !== "union") return null;
         if (!(L.unions.get(ft.unionId)?.arms ?? []).every((a) => isUnitType(a))) return null;

@@ -179,10 +179,10 @@ test("T178B PRESENCE: an optional field left out is no own key; written, it is",
   expect(exitCode).toBe(0);
 });
 
-test("T091D PRESENCE: S091 (d): a left-out optional field, and one a checked conversion found missing, print as holding undefined", async () => {
-  // Node v24 prints "{ a: 1 }\n{ b: 1 }\n" — the registered divergence (SEMANTICS.md S091).
+test("T091D PRESENCE: S091 (d): a left-out optional field prints as Node does (GH #132); a required one a checked conversion found missing still prints undefined", async () => {
+  // Node v24 prints "{ a: 1 }\n{ b: 1 }\n" — the second line is the registered divergence (SEMANTICS.md S091 (c)/(d)).
   const { stdout, stderr, exitCode } = await runRow("T091D", "const o: { a: number; w?: number } = { a: 1 };\nconsole.log(o);\ntype A = { a: number | undefined; b: number };\nconst x: A = JSON.parse('{\"b\":1}') as A;\nconsole.log(x);", "ts");
-  expect(stdout).toBe("{ a: 1, w: undefined }\n{ a: undefined, b: 1 }\n");
+  expect(stdout).toBe("{ a: 1 }\n{ a: undefined, b: 1 }\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

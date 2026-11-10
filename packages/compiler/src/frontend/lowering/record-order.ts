@@ -96,6 +96,7 @@ const getF = (o: IrExpr, shapeId: string, f: Field, loc: SrcLoc): IrExpr => ({ k
  * an always-present (required) field. */
 function fastPresent(f: Field, o: IrExpr, shapeId: string, loc: SrcLoc): IrExpr | null {
   if (f.optional !== true) return null;
+  if (!testable(f.type)) return { kind: "boolLit", value: false, type: BOOL, loc };
   return not(undefTest(getF(o, shapeId, f, loc), loc), loc);
 }
 
@@ -346,15 +347,17 @@ export function orderNoteLiteral(L: Lowerer, lit: IrExpr, shapeId: string, names
  * always takes that order (a spread copies anyway). Spread sources are
  * records (`shapeId`, a pure read); a source key the result shape lacks
  * drops, the spread's width rule. */
-export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts: ({ name: string } | { spread: IrExpr; shapeId: string })[], loc: SrcLoc, fastSkip = false): IrExpr {
+export type SpreadPart = { name: string } | { spread: IrExpr; shapeId: string; snap?: true };
+
+export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts: SpreadPart[], loc: SrcLoc, fastSkip = false, risky: string[] = []): IrExpr {
   const shape = orderedShape(L, shapeId);
   if (shape === null) return lit;
   const fields = orderFields(shape);
   const n = fields.length;
   const recT: IrType = { kind: "record", shapeId };
-  const spreads = parts.filter((x): x is { spread: IrExpr; shapeId: string } => "spread" in x);
-  const params = [{ id: "t.0", type: recT }, ...spreads.map((x, k) => ({ id: `s${k}.0`, type: { kind: "record", shapeId: x.shapeId } as IrType }))];
-  const key = `ord.spr:${shapeId}:${parts.map((x) => ("name" in x ? x.name : `...${x.shapeId}`)).join(",")}${fastSkip ? ":skip" : ""}`;
+  const spreads = parts.filter((x): x is { spread: IrExpr; shapeId: string; snap?: true } => "spread" in x);
+  const params = [{ id: "t.0", type: recT }, ...spreads.map((x, k) => ({ id: `s${k}.0`, type: x.snap === true ? NUMS : { kind: "record", shapeId: x.shapeId } as IrType }))];
+  const key = `ord.spr:${shapeId}:${parts.map((x) => ("name" in x ? x.name : `...${x.snap === true ? "#" : ""}${x.shapeId}`)).join(",")}${fastSkip ? `:skip:${risky.join(",")}` : ""}`;
   const helper = lift(L, key, params,
     [{ id: "a.0", type: NUMS }, { id: "ks.0", type: NUMS }, { id: "k.0", type: F64 }, { id: "v.0", type: F64 }, { id: "c.0", type: F64 }, { id: "j.0", type: F64 }], recT, loc, () => {
       const t = ref("t.0", recT, loc);
@@ -367,9 +370,17 @@ export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts:
       if (fastSkip) {
         // every source on the fast path: the copy's fast path already
         // answers its keys in Node's order
+        // (a copy's sources are records, never snapshots)
         const anyOrdered = spreads
           .map((x, k) => (orderedShape(L, x.shapeId) === null ? null : not(isUndef(ordOf(ref(`s${k}.0`, params[k + 1]!.type, loc), x.shapeId, loc), loc), loc)))
           .filter((e): e is IrExpr => e !== null);
+        // a source field holding undefined that the copy makes optional:
+        // only an order keeps its key
+        for (const name of risky) {
+          const srcShape = L.shapes.get(spreads[0]!.shapeId)!;
+          const sf = srcShape.fields.find((f) => f.name === name);
+          if (sf !== undefined && testable(sf.type)) anyOrdered.push(undefTest(getF(ref("s0.0", params[1]!.type, loc), spreads[0]!.shapeId, sf, loc), loc));
+        }
         if (anyOrdered.length === 0) return [ret(t, loc)];
         body.push(ifThen(not(anyOrdered.reduce((x, y) => or(x, y, loc)), loc), [ret(t, loc)], loc));
       }
@@ -384,12 +395,17 @@ export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts:
         const srcShape = L.shapes.get(part.shapeId)!;
         const srcFields = orderFields(srcShape);
         const src = ref(`s${sj}.0`, params[sj + 1]!.type, loc);
-        const srcOrdered = orderedShape(L, part.shapeId) !== null;
-        // the source's keys: its order, or the fast path's materialized
+        const srcOrdered = part.snap === true || orderedShape(L, part.shapeId) !== null;
+        // the source's keys: the snapshot taken at the spread, its order, or
+        // the fast path's materialized
         if (srcOrdered) {
           body.push(
-            assign("ks.0", ordOf(src, part.shapeId, loc), loc),
-            ifThen(isUndef(ks, loc), [assign("ks.0", { kind: "call", callee: materializeHelper(L, srcShape, loc), args: [src], type: NUMS, loc }, loc)], loc),
+            ...(part.snap === true
+              ? [assign("ks.0", src, loc)]
+              : [
+                  assign("ks.0", ordOf(src, part.shapeId, loc), loc),
+                  ifThen(isUndef(ks, loc), [assign("ks.0", { kind: "call", callee: materializeHelper(L, srcShape, loc), args: [src], type: NUMS, loc }, loc)], loc),
+                ]),
             assign("k.0", num(srcFields.length, loc), loc),
             whileLoop(bin("<", k, arrLen(ks, loc), loc), [
               assign("v.0", at(ks, k, loc), loc),
@@ -417,6 +433,48 @@ export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts:
   return { kind: "call", callee: helper, args: [lit, ...spreads.map((x) => x.spread)], type: recT, loc };
 }
 
+/** The order snapshots spreads take at their own position (the spread's
+ * AST node → the hidden local holding it), read by the literal's order note
+ * (lower-exprs.ts withLiteralOrder): Node reads a spread source's own keys
+ * where the spread stands, so a later property that deletes, adds or clears
+ * one of them must not change the result. */
+export const spreadSnapshots = new WeakMap<object, { snap: IrExpr; shapeId: string }>();
+
+/** `%ord.<n>(o) -> number[]`: a copy of `o`'s own keys as an order vector —
+ * its stored order, or the fast path's materialized (any record shape). */
+function snapshotHelper(L: Lowerer, shape: IrRecordShape, loc: SrcLoc): string {
+  const recT: IrType = { kind: "record", shapeId: shape.id };
+  const n = orderFields(shape).length;
+  return lift(L, `ord.snap:${shape.id}`, [{ id: "o.0", type: recT }], [{ id: "a.0", type: NUMS }], NUMS, loc, () => {
+    const o = ref("o.0", recT, loc);
+    const a = ref("a.0", NUMS, loc);
+    const mat: IrExpr = { kind: "call", callee: materializeHelper(L, shape, loc), args: [o], type: NUMS, loc };
+    if (orderedShape(L, shape.id) === null) return [ret(mat, loc)];
+    void n;
+    return [
+      decl("a.0", ordOf(o, shape.id, loc), loc),
+      ifThen(not(isUndef(a, loc), loc), [ret({ kind: "arrIntrinsic", method: "slice", receiver: a, args: [num(0, loc)], type: NUMS, loc }, loc)], loc),
+      ret(mat, loc),
+    ];
+  });
+}
+
+/** The recordLit entry that snapshots spread source `src` (a pure read of
+ * shape `srcShapeId`) at the spread's own position, for a literal of
+ * ordered shape `resultShapeId`: a dropped entry assigning the snapshot to
+ * a hidden local, recorded under `node` for the literal's order note. Null
+ * when the result keeps no order. */
+export function spreadSnapshotEntry(L: Lowerer, node: object, src: IrExpr, srcShapeId: string, resultShapeId: string, loc: SrcLoc): { name: string; value: IrExpr; drop: true } | null {
+  if (orderedShape(L, resultShapeId) === null) return null;
+  const srcShape = L.shapes.get(srcShapeId);
+  if (!srcShape || srcShape.tuple === true || srcShape.indexValue !== undefined) return null;
+  const t = L.declareHiddenLocal("%ordsnap", NUMS);
+  t.mutable = true; // assigned by the dropped entry, in place
+  const snap: IrExpr = { kind: "call", callee: snapshotHelper(L, srcShape, loc), args: [src], type: NUMS, loc };
+  spreadSnapshots.set(node, { snap: ref(t.id, NUMS, loc), shapeId: srcShapeId });
+  return { name: `%ordsnap.${t.id}`, value: { kind: "assignExpr", localId: t.id, value: snap, type: NUMS, loc } as IrExpr, drop: true };
+}
+
 /** A width copy (`%rec.width`) of a record of shape `fromId` (`src`, a
  * pure read) into a fresh record of shape `toId` (`copy`): Node shares the
  * object, so the copy must answer the source's own keys in the source's
@@ -434,9 +492,13 @@ export function orderNoteCopy(L: Lowerer, copy: IrExpr, toId: string, src: IrExp
   const shared = sf.map((f) => tf.findIndex((g) => g.name === f.name)).filter((i) => i >= 0);
   const sameOrder = shared.every((v, k) => k === 0 || v > shared[k - 1]!);
   const leftOutDyn = tf.some((f) => f.optional === true && (f.type.kind === "dyn" || f.type.kind === "jsval") && !sf.some((g) => g.name === f.name));
+  // A source field the source always has as a key (required) but whose
+  // value may be undefined, landing in a field the copy makes optional: the
+  // copy's fast path would drop that key.
+  const risky = sf.filter((f) => f.optional !== true && testable(f.type) && tf.find((g) => g.name === f.name)?.optional === true).map((f) => f.name);
   const compatible = sameOrder && !leftOutDyn;
-  if (compatible && orderedShape(L, fromId) === null) return copy;
-  return orderNoteSpread(L, copy, toId, [{ spread: src, shapeId: fromId }], loc, compatible);
+  if (compatible && orderedShape(L, fromId) === null && risky.length === 0) return copy;
+  return orderNoteSpread(L, copy, toId, [{ spread: src, shapeId: fromId }], loc, compatible, risky);
 }
 
 /** A balanced dispatch on field number `v` (an f64 read) over 0..n-1:

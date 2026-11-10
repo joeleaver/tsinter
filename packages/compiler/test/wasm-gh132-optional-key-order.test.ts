@@ -258,6 +258,93 @@ console.log(b, Object.keys(rest), rest);`,
     })(),
   },
   {
+    id: "GH132-21 spreads of record-typed sources that are not bindings: a property, this, a cast, a non-null assertion",
+    src: `type R = { b: number; xx?: number };
+const r0: R = { b: 1 };
+r0.xx = undefined;
+const holder = { r: r0 };
+console.log(Object.keys({ ...holder.r }), Object.keys({ ...holder.r, xx: undefined }));
+class Box { r: R = { b: 2 }; keys(): string[] { const c: R = { ...this.r, xx: undefined }; return Object.keys(c); } }
+console.log(new Box().keys());
+const any0: R = { b: 3 };
+any0.xx = undefined;
+const viaCast: R = { ...(any0 as R) };
+console.log(Object.keys(viaCast));
+const viaBang: R = { ...any0! };
+const viaBang2: R = { ...any0!, xx: 1 };
+console.log(Object.keys(viaBang), JSON.stringify(viaBang), Object.keys(viaBang2));`,
+  },
+  {
+    id: "GH132-22 a left-out optional field no longer prints as undefined (S091 (d) closed)",
+    src: `type R = { a: number; w?: number };
+const o: R = { a: 1 };
+console.log(o);
+const list: R[] = [{ a: 1, w: undefined }, { a: 2 }];
+console.log(list);
+type T = { a?: number; b: number; c?: number };
+const t3: T = { b: 1, c: 9 };
+console.log(t3, Object.keys(t3));
+const x: T = JSON.parse('{"b":1}') as T;
+console.log(x);`,
+  },
+  {
+    id: "GH132-23 the registered residue: an explicit undefined that arrives by a checked conversion of dynamic data",
+    src: `type R = { a: number; w?: number };
+const o: R = { a: 1, w: undefined };
+const c: R = structuredClone(o);
+console.log(c);`,
+    diverges: { entry: "SEMANTICS.md S091 (GH #132 (d) amendment)", node: "{ a: 1, w: undefined }\n", stdout: "{ a: 1 }\n" },
+  },
+  {
+    id: "GH132-24 the registered residue: a dynamic object holding undefined, checked into the record type",
+    src: `type R = { a: number; w?: number };
+const d: any = JSON.parse('{"a":1}');
+d.w = undefined;
+const r = d as R;
+console.log(r, Object.keys(r));`,
+    diverges: { entry: "SEMANTICS.md S091 (GH #132 (d) amendment)", node: "{ a: 1, w: undefined } [ 'a', 'w' ]\n", stdout: "{ a: 1 } [ 'a' ]\n" },
+  },
+  {
+    id: "GH132-25 the review's k10: a property-chain spread, with an explicit undefined, and a method spreading this.r after a late write",
+    src: `type R = { xx?: number; b: number };
+const src: R = { b: 2, xx: undefined };
+const holder = { r: src };
+const s: R = { ...holder.r };
+console.log(s, Object.keys(s), "xx" in s);
+const t: R = { ...holder.r, xx: undefined };
+console.log(t, Object.keys(t));
+class C { r: R = { b: 1 }; copy(): R { this.r.xx = 3; return { ...this.r }; } }
+console.log(JSON.stringify(new C().copy()));`,
+  },
+  {
+    id: "GH132-26 the review's r14: a later property deletes the spread source's key",
+    src: "type R = { xx?: number; yy?: number; b: number };\nconst src: R = { b: 2 };\nsrc.xx = 4;\nfunction mut(): number { delete src.xx; return 5; }\nconst s: R = { ...src, b: mut() };\nconsole.log(s, Object.keys(s), JSON.stringify(s));",
+  },
+  {
+    id: "GH132-27 the review's r15: a later property adds a key to the spread source",
+    src: "type R = { xx?: number; yy?: number; b: number };\nconst src: R = { b: 2 };\nsrc.xx = 4;\nfunction mut(): number { src.yy = 1; return 5; }\nconst s: R = { ...src, b: mut() };\nconsole.log(s, Object.keys(s), \"yy\" in s, JSON.stringify(s));",
+  },
+  {
+    id: "GH132-28 the review's r16: a later property sets undefined on the spread source",
+    src: "type R = { xx?: number; yy?: number; b: number };\nconst src: R = { b: 2, yy: 1 };\nfunction mut(): number { src.xx = undefined; return 5; }\nconst s: R = { ...src, b: mut() };\nconsole.log(s, Object.keys(s), \"xx\" in s);",
+  },
+  {
+    id: "GH132-29 the review's r17: a comma expression deletes the spread source's key",
+    src: "type R = { xx?: number; yy?: number; b: number };\nconst src: R = { b: 2, xx: 1, yy: 1 };\nconst s: R = { ...src, b: (delete src.xx, 5) };\nconsole.log(s, Object.keys(s));",
+  },
+  {
+    id: "GH132-30 the review's r04: a property-chain source, its key deleted by a later property",
+    src: "type R = { xx?: number; b: number };\nconst src: R = { b: 2 };\nsrc.xx = 4;\nconst other: R = { b: 9, xx: undefined };\nconst holder = { r: src };\nconst s: R = { ...holder.r, b: (delete holder.r.xx, 1) };\nconsole.log(s, Object.keys(s), JSON.stringify(s));",
+  },
+  {
+    id: "GH132-31 the review's r09: a property-chain source, its key deleted by a later call",
+    src: "type R = { xx?: number; yy?: number; b: number };\nconst src: R = { b: 2 };\nsrc.xx = 4;\nconst holder = { r: src };\nfunction mut(): number { delete holder.r.xx; return 5; }\nconst s: R = { ...holder.r, b: mut() };\nconsole.log(s, Object.keys(s));",
+  },
+  {
+    id: "GH132-32 the review's e04: a rest copy lands a required source field holding undefined in an optional field",
+    src: "type Src = { a: number; w: number | undefined; c: number };\nconst s: Src = { a: 1, w: undefined, c: 2 };\nconst { c, ...rest } = s;\nconsole.log(rest, Object.keys(rest));\ntype R = { a: number; w?: number };\nconst unrelated: R = { a: 0 };\nconsole.log(unrelated);",
+  },
+  {
     id: "GH132-09 dynamic code rewriting a key the record already has runs",
     src: `type R = { x?: number; b: number };
 const o: R = { x: 1, b: 2 };

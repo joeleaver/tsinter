@@ -7,7 +7,7 @@
 import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
-import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape } from "./record-order.js";
+import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
@@ -6745,6 +6745,16 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
             laterNames.add(propNameText(L, later.name));
           }
         }
+        // GH #132: the source's own keys as they are HERE, before a later
+        // property can delete, add or clear one (a literal of an ordered
+        // shape only).
+        {
+          const sobj = srcLowered ?? L.lowerExpr(srcNode);
+          if (sobj.type.kind === "record" && pureReemittable(sobj)) {
+            const entry = spreadSnapshotEntry(L, prop, sobj, sobj.type.shapeId, shape.id, locOf(prop));
+            if (entry !== null) fields.push(entry);
+          }
+        }
         for (const f of srcShape.fields) {
           if (laterNames.has(f.name)) continue;
           const targetType = fieldTypes.get(f.name);
@@ -7037,8 +7047,9 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       type = { kind: "record", shapeId: narrowedId };
       shape = L.shapes.get(narrowedId)!;
     }
-    if (fields.filter((f) => !f.overflow).length !== shape.fields.length) {
-      const provided = new Set(fields.filter((f) => !f.overflow).map((f) => f.name));
+    // (a dropped entry — GH #132's spread order snapshot — is no field)
+    if (fields.filter((f) => !f.overflow && f.drop !== true).length !== shape.fields.length) {
+      const provided = new Set(fields.filter((f) => !f.overflow && f.drop !== true).map((f) => f.name));
       for (const f of shape.fields) {
         if (provided.has(f.name)) continue;
         // 'unknown' fields complete with the dyn undefined — the absent
@@ -12425,7 +12436,7 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
   const maybeUndef: string[] = [];
   // Spread contributors (a record-typed binding): their own keys enter in
   // THEIR order, at their position.
-  const parts: ({ name: string } | { spread: IrExpr; shapeId: string })[] = [];
+  const parts: SpreadPart[] = [];
   const litValues = lowered.kind === "recordLit" ? new Map(lowered.fields.map((f) => [f.name, f.value] as const)) : null;
   // May this spelled value be undefined at run time? (Fresh values cannot.)
   const mayBeUndef = (name: string): boolean => {
@@ -12439,12 +12450,11 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
   for (const p of expr.properties) {
     let name: string | null = null;
     if (ts.isSpreadAssignment(p)) {
-      const st = ts.isIdentifier(p.expression) ? L.mapTypeOf(L.typeOf(p.expression)) : null;
-      const srcShape = st?.kind === "record" ? L.shapes.get(st.shapeId) : undefined;
-      if (!srcShape || srcShape.tuple === true || srcShape.indexValue !== undefined) return lowered;
-      const read = L.lowerExpr(p.expression);
-      if (read.kind !== "varRef" || read.type.kind !== "record") return lowered;
-      parts.push({ spread: read, shapeId: read.type.shapeId });
+      // The source's own keys, as the spread itself snapshotted them at its
+      // own position (lowerObjectLiteral's spread arm).
+      const found = spreadSnapshots.get(p);
+      if (found === undefined) return lowered;
+      parts.push({ spread: found.snap, shapeId: found.shapeId, snap: true });
       continue;
     }
     if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name))) {
