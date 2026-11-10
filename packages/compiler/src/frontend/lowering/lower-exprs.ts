@@ -7,6 +7,7 @@
 import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
+import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
@@ -1897,7 +1898,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       return L.lowerCall(expr);
     }
     if (ts.isArrayLiteralExpression(expr)) return L.lowerArrayLiteral(expr);
-    if (ts.isObjectLiteralExpression(expr)) return L.lowerObjectLiteral(expr);
+    if (ts.isObjectLiteralExpression(expr)) return withLiteralOrder(L, expr, L.lowerObjectLiteral(expr));
     if (ts.isElementAccessExpression(expr)) return L.lowerElementAccess(expr);
     if (ts.isConditionalExpression(expr)) return lowerTernary(L, expr);
 
@@ -6744,6 +6745,16 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
             laterNames.add(propNameText(L, later.name));
           }
         }
+        // GH #132: the source's own keys as they are HERE, before a later
+        // property can delete, add or clear one (a literal of an ordered
+        // shape only).
+        {
+          const sobj = srcLowered ?? L.lowerExpr(srcNode);
+          if (sobj.type.kind === "record" && pureReemittable(sobj)) {
+            const entry = spreadSnapshotEntry(L, prop, sobj, sobj.type.shapeId, shape.id, locOf(prop));
+            if (entry !== null) fields.push(entry);
+          }
+        }
         for (const f of srcShape.fields) {
           if (laterNames.has(f.name)) continue;
           const targetType = fieldTypes.get(f.name);
@@ -7036,8 +7047,9 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       type = { kind: "record", shapeId: narrowedId };
       shape = L.shapes.get(narrowedId)!;
     }
-    if (fields.filter((f) => !f.overflow).length !== shape.fields.length) {
-      const provided = new Set(fields.filter((f) => !f.overflow).map((f) => f.name));
+    // (a dropped entry — GH #132's spread order snapshot — is no field)
+    if (fields.filter((f) => !f.overflow && f.drop !== true).length !== shape.fields.length) {
+      const provided = new Set(fields.filter((f) => !f.overflow && f.drop !== true).map((f) => f.name));
       for (const f of shape.fields) {
         if (provided.has(f.name)) continue;
         // 'unknown' fields complete with the dyn undefined — the absent
@@ -8173,7 +8185,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
           if (field) {
             const obj = L.lowerExpr(target.expression);
             const value = L.lowerExprExpecting(expr.right, field.type);
-            return { kind: "recordSet", obj, shapeId: receiverIr.shapeId, field: litKey, value, loc: locOf(expr) };
+            return orderedRecordWrite(L, { kind: "recordSet", obj, shapeId: receiverIr.shapeId, field: litKey, value, loc: locOf(expr) }, false);
           }
         }
         if (!shape.indexValue) {
@@ -11126,11 +11138,18 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         // The read goes through the guard itself, so a computed receiver
         // (`"k" in get()`) is evaluated exactly once.
         const read: IrExpr = { kind: "recordGet", obj: inGuard, shapeId: recv.type.shapeId, field: key, type: field.type, loc };
-        const present = L.markPresence(
+        const marked = L.markPresence(
           { kind: "unionIsTag", unionId: field.type.unionId, tag: L.armTag(field.type.unionId, UNDEFINED_T), negated: true, value: read, type: BOOL, loc },
           recv.type.shapeId,
           key,
         );
+        // GH #132: off the fast path the record's own order answers (a
+        // re-readable receiver only; the guard above evaluates it first).
+        const present = field.optional !== true || !pureReemittable(recv)
+          ? marked
+          : inGuard === recv
+            ? orderedPresence(L, recv, recv.type.shapeId, key, marked, loc)
+            : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: inGuard, loc }], result: orderedPresence(L, recv, recv.type.shapeId, key, marked, loc), type: BOOL, loc } as IrExpr;
         // S015 (lead ruling): an absent optional field named like an
         // Object.prototype member — Node finds the inherited one.
         return OBJECT_PROTO_NAMES.has(key) ? { kind: "logical", op: "||", left: present, right: protoInFenceExpr(L, null, loc), type: BOOL, loc } : present;
@@ -12395,10 +12414,89 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
         loc,
       };
     }
-    return undefWriteGuard(L, target.container === "class"
-      ? { kind: "fieldSet", obj: target.obj, className: target.className, field: target.field, value, loc }
-      : { kind: "recordSet", obj: target.obj, shapeId: target.shapeId, field: target.field, value, loc });
+    if (target.container !== "class") {
+      return orderedRecordWrite(L, { kind: "recordSet", obj: target.obj, shapeId: target.shapeId, field: target.field, value, loc }, true);
+    }
+    return undefWriteGuard(L, { kind: "fieldSet", obj: target.obj, className: target.className, field: target.field, value, loc });
   }
+
+/** GH #132: an object literal of a shape that keeps its own order. Node
+ * gives every spelled key its place in spelling order, an undefined value
+ * included; record-order.ts decides when the record must carry that order
+ * (a spelling out of declared order, a spelled optional field holding
+ * undefined at run time, a left-out optional dynamic field, any spread).
+ * Plain property lists and spreads of record-typed bindings only — a
+ * method, accessor or computed name leaves the literal as it was. */
+function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered: IrExpr): IrExpr {
+  if (lowered.type.kind !== "record") return lowered;
+  const shapeId = lowered.type.shapeId;
+  const shape = orderedShape(L, shapeId);
+  if (shape === null) return lowered;
+  const names: string[] = [];
+  const maybeUndef: string[] = [];
+  // Spread contributors (a record-typed binding): their own keys enter in
+  // THEIR order, at their position.
+  const parts: SpreadPart[] = [];
+  const litValues = lowered.kind === "recordLit" ? new Map(lowered.fields.map((f) => [f.name, f.value] as const)) : null;
+  // May this spelled value be undefined at run time? (Fresh values cannot.)
+  const mayBeUndef = (name: string): boolean => {
+    const v = litValues?.get(name);
+    if (v === undefined) return true;
+    const t = v.type;
+    if (isUnitType(t) || t.kind === "dyn" || t.kind === "jsval") return true;
+    if (t.kind === "union") return L.armTag(t.unionId, UNDEFINED_T) >= 0 || mayHoldSlotUndef(L, v);
+    return mayHoldSlotUndef(L, v);
+  };
+  for (const p of expr.properties) {
+    let name: string | null = null;
+    if (ts.isSpreadAssignment(p)) {
+      // The source's own keys, as the spread itself snapshotted them at its
+      // own position (lowerObjectLiteral's spread arm).
+      const found = spreadSnapshots.get(p);
+      if (found === undefined) return lowered;
+      parts.push({ spread: found.snap, shapeId: found.shapeId, snap: true });
+      continue;
+    }
+    if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name))) {
+      name = p.name.text;
+    } else if (ts.isShorthandPropertyAssignment(p)) {
+      name = ts.isIdentifier(p.name) ? p.name.text : null;
+    }
+    if (name === null) return lowered;
+    names.push(name);
+    parts.push({ name });
+    if (shape.fields.find((f) => f.name === name)?.optional === true && mayBeUndef(name)) maybeUndef.push(name);
+  }
+  if (parts.some((x) => "spread" in x)) return orderNoteSpread(L, lowered, shapeId, parts, lowered.loc);
+  return orderNoteLiteral(L, lowered, shapeId, names, maybeUndef, lowered.loc);
+}
+
+/** GH #132: a record field write that keeps the record's own-key order
+ * Node's (record-order.ts) — the write itself, preceded by the order note
+ * when the field is optional on an ordered shape. `receiverGuard` wraps it
+ * in Unit U's undefined-receiver throw (the dot spelling's). */
+export function orderedRecordWrite(L: Lowerer, write: IrStmt & { kind: "recordSet" }, receiverGuard: boolean): IrStmt {
+  const wrap = (w: IrStmt): IrStmt => (receiverGuard ? undefWriteGuard(L, w) : w);
+  const shape = orderedShape(L, write.shapeId);
+  if (shape === null || shape.fields.find((f) => f.name === write.field)?.optional !== true) return wrap(write);
+  const loc = write.loc;
+  const stmts: IrStmt[] = [];
+  const once = (e: IrExpr): IrExpr => {
+    if (pureReemittable(e)) return e;
+    const t = L.declareHiddenLocal("%ordw", e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const o = once(write.obj);
+  const value = once(write.value);
+  const note = orderNoteWrite(L, o, write.shapeId, write.field, value, loc);
+  if (note.length > 0) {
+    // A receiver holding undefined throws in the write itself, below.
+    stmts.push(...(mayHoldSlotUndef(L, o) ? [{ kind: "if", cond: isUndefExpr(o, true, loc), then: note, else_: null, loc } as IrStmt] : note));
+  }
+  stmts.push(wrap({ ...write, obj: o, value }));
+  return { kind: "block", body: stmts, loc };
+}
 
 /** Unit U (SEMANTICS.md S119 (a)): a write through a receiver that may hold
  * its slot's undefined throws Node's catchable `Cannot set properties of

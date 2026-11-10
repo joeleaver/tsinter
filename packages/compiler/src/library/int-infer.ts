@@ -888,6 +888,11 @@ class FnAnalyzer {
         this.evalExpr(s.key, env);
         clearPathFacts(env);
         return env;
+      case "recordOrderSet":
+        this.evalExpr(s.obj, env);
+        this.evalExpr(s.value, env);
+        clearPathFacts(env);
+        return env;
       case "return": {
         if (s.value !== null) {
           const v = this.evalExpr(s.value, env);

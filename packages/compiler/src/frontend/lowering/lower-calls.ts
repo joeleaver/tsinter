@@ -19,7 +19,8 @@ import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
-import { afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
+import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
+import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -7486,6 +7487,12 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: resultT, loc }, loc },
       ];
       const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
+      const fast: IrStmt[] = [];
+      const pushName = (name: string): IrStmt => ({
+        kind: "exprStmt",
+        expr: { kind: "arrIntrinsic", method: "push", receiver: outRef, args: [{ kind: "strLit", value: name, type: STRING, loc }], type: F64, loc },
+        loc,
+      });
       for (const name of order) {
         const f = shape.fields.find((x) => x.name === name)!;
         const pushStmt: IrStmt = {
@@ -7505,7 +7512,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         // undefined; a required one always is — L.markPresence, board
         // #178).
         const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
-        body.push(
+        fast.push(
           utag >= 0 && f.type.kind === "union"
             ? {
                 kind: "if",
@@ -7529,6 +7536,13 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             : guardPlainField(L, { kind: "recordGet", obj: ref, shapeId: argIr.shapeId, field: f.name, type: f.type, loc }, pushStmt, loc),
         );
       }
+      // GH #132: off the fast path the record's own order decides.
+      const extra: IrLocal[] = [];
+      body.push(...orderedFieldStmts(L, ref, argIr.shapeId, fast, (f) => [pushName(f.name)], (name, type) => {
+        const id = `${name.slice(1)}.0`;
+        extra.push({ id, name: name.slice(1), type, mutable: true });
+        return id;
+      }, loc));
       body.push({ kind: "return", value: outRef, loc });
       L.arrHofHelpers.set(key, helper);
       L.liftedFns.push({
@@ -7538,6 +7552,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         locals: [
           { id: "r.0", name: "r", type: argIr, mutable: true },
           { id: "out.0", name: "out", type: resultT, mutable: false },
+          ...extra,
         ],
         body,
         loc,
@@ -7583,7 +7598,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       body.push({
         kind: "if",
         cond: { kind: "strEq", negated: false, left: kRef, right: { kind: "strLit", value: f.name, type: STRING, loc }, type: BOOL, loc },
-        then: [{ kind: "return", value: answer, loc }],
+        // GH #132: off the fast path the record's own order answers.
+        then: [{ kind: "return", value: f.optional === true ? orderedPresence(L, rRef, shapeId, f.name, answer, loc) : answer, loc }],
         else_: null,
         loc,
       });
@@ -7623,17 +7639,27 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const tRef: IrExpr = { kind: "varRef", localId: "t.0", type: tT, loc };
     const sRef: IrExpr = { kind: "varRef", localId: "s.0", type: sT, loc };
     const body: IrStmt[] = [];
-    for (const f of sShape.fields) {
+    const fast: IrStmt[] = [];
+    const extra: IrLocal[] = [];
+    // GH #132: the copy writes the source's keys in the SOURCE's key order
+    // (declared order on the fast path), each write keeping the target's
+    // own order Node's.
+    const srcOrdered = orderedShape(L, srcShapeId) !== null;
+    const copyOf = (f: { name: string; type: IrType }): IrStmt => {
       const get: IrExpr = { kind: "recordGet", obj: sRef, shapeId: srcShapeId, field: f.name, spreadCopy: true, type: f.type, loc };
-      const set: IrStmt = { kind: "recordSet", obj: tRef, shapeId: targetShapeId, field: f.name, value: get, loc };
+      return orderedRecordWrite(L, { kind: "recordSet", obj: tRef, shapeId: targetShapeId, field: f.name, value: get, loc }, false);
+    };
+    for (const f of srcOrdered ? declaredFields(sShape) : sShape.fields) {
+      const get: IrExpr = { kind: "recordGet", obj: sRef, shapeId: srcShapeId, field: f.name, spreadCopy: true, type: f.type, loc };
+      const set: IrStmt = copyOf(f);
       const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
       // S119 (i): a missing key copies nothing.
       const plainPresent = utag >= 0 ? null : plainFieldPresent(L, get, loc);
       if (plainPresent !== null) {
-        body.push({ kind: "if", cond: plainPresent, then: [set], else_: null, loc });
+        fast.push({ kind: "if", cond: plainPresent, then: [set], else_: null, loc });
         continue;
       }
-      body.push(
+      fast.push(
         utag >= 0 && f.type.kind === "union"
           ? {
               kind: "if",
@@ -7649,6 +7675,11 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
           : set,
       );
     }
+    body.push(...orderedFieldStmts(L, sRef, srcShapeId, fast, (f) => [copyOf(f)], (name, type) => {
+      const id = `${name.slice(1)}.0`;
+      extra.push({ id, name: name.slice(1), type, mutable: true });
+      return id;
+    }, loc));
     body.push({ kind: "return", value: tRef, loc });
     L.liftedFns.push({
       name: helper,
@@ -7660,6 +7691,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       locals: [
         { id: "t.0", name: "t", type: tT, mutable: true },
         { id: "s.0", name: "s", type: sT, mutable: true },
+        ...extra,
       ],
       body,
       loc,
@@ -8393,6 +8425,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: resultT, loc }, loc },
       ];
       const outRef: IrExpr = { kind: "varRef", localId: "out.0", type: resultT, loc };
+      const fast: IrStmt[] = [];
+      const slowOf = new Map<string, IrStmt[]>();
       for (const name of order) {
         const f = shape.fields.find((x) => x.name === name)!;
         const raw: IrExpr = { kind: "recordGet", obj: ref, shapeId: argIr.shapeId, field: f.name, type: f.type, loc };
@@ -8484,6 +8518,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         // key — its value is pushed as undefined in the else branch, which
         // the required flag enables once the shape's flags are final.
         let elseUndef: IrStmt[] | null = null;
+        let undefPush: IrStmt | null = null;
         if (guardUndefTag !== null && valueT) {
           const undefLit: IrExpr = { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc };
           const undefElem =
@@ -8501,20 +8536,29 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
                     type: tupleT!,
                     loc,
                   };
+            undefPush = {
+              kind: "exprStmt",
+              expr: { kind: "arrIntrinsic", method: "push", receiver: outRef, args: [undefPushed], type: F64, loc },
+              loc,
+            };
             elseUndef = [{
               kind: "if",
               cond: L.requiredFieldFlag(argIr.shapeId, f.name, loc),
-              then: [{
-                kind: "exprStmt",
-                expr: { kind: "arrIntrinsic", method: "push", receiver: outRef, args: [undefPushed], type: F64, loc },
-                loc,
-              }],
+              then: [undefPush],
               else_: null,
               loc,
             }];
           }
         }
-        body.push(
+        // GH #132: off the fast path a listed key is present, holding
+        // undefined or not.
+        slowOf.set(
+          f.name,
+          guardUndefTag !== null && f.type.kind === "union"
+            ? [{ kind: "if", cond: { kind: "unionIsTag", unionId: f.type.unionId, tag: guardUndefTag, negated: true, value: raw, type: BOOL, loc }, then: [pushStmt], else_: undefPush === null ? null : [undefPush], loc }]
+            : [pushStmt],
+        );
+        fast.push(
           guardUndefTag !== null && f.type.kind === "union"
             ? {
                 kind: "if",
@@ -8526,6 +8570,12 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             : guardPlainField(L, raw, pushStmt, loc),
         );
       }
+      const extra: IrLocal[] = [];
+      body.push(...orderedFieldStmts(L, ref, argIr.shapeId, fast, (f) => slowOf.get(f.name) ?? [], (name, type) => {
+        const id = `${name.slice(1)}.0`;
+        extra.push({ id, name: name.slice(1), type, mutable: true });
+        return id;
+      }, loc));
       body.push({ kind: "return", value: outRef, loc });
       L.arrHofHelpers.set(key, helper);
       L.liftedFns.push({
@@ -8535,6 +8585,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         locals: [
           { id: "r.0", name: "r", type: recT, mutable: true },
           { id: "out.0", name: "out", type: resultT, mutable: false },
+          ...extra,
         ],
         body,
         loc,

@@ -21,7 +21,8 @@
  * lane). Inside a view's own set accessor an island value entering a
  * nested typed slot must BE a view of that slot's type (jsUnview — it
  * unwraps, no copy) or the write throws a named TypeError. */
-import { isUndefExpr, plainFieldPresent } from "./lower-exprs.js";
+import { isUndefExpr, orderedRecordWrite, plainFieldPresent } from "./lower-exprs.js";
+import { orderedFieldStmts } from "./record-order.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFileName } from "../shared.js";
@@ -302,6 +303,12 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
     // keys(): the own keys in declaration order (an optional field holding
     // undefined is not an own key — S091), then the overflow's.
     const keysBody: IrStmt[] = [{ kind: "varDecl", localId: "o.0", init: { kind: "jsOp", op: "arrLit", args: [], type: JSVAL, loc }, loc }];
+    const fastKeys: IrStmt[] = [];
+    const pushKey = (name: string): IrStmt => ({
+      kind: "exprStmt",
+      expr: { kind: "jsOp", op: "callMethod", name: "push", args: [ref("o.0", outT, loc), { kind: "jsMarshal", value: str(name, loc), type: JSVAL, loc }], type: JSVAL, loc },
+      loc,
+    });
     for (const f of fields) {
       const push: IrStmt = {
         kind: "exprStmt",
@@ -311,7 +318,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
       const ft = f.type;
       const undefTag = ft.kind === "union" ? (L.unions.get(ft.unionId)?.arms ?? []).findIndex((a) => a.kind === "undefinedT") : -1;
       if (f.optional && ft.kind === "union" && undefTag >= 0) {
-        keysBody.push({
+        fastKeys.push({
           kind: "if",
           cond: {
             kind: "unionIsTag", unionId: ft.unionId, tag: undefTag, negated: true,
@@ -324,9 +331,16 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
       } else {
         // S119 (i): a missing key is no own key of the view either.
         const present = plainFieldPresent(L, { kind: "recordGet", obj: x(), shapeId: shape.id, field: f.name, type: ft, loc }, loc);
-        keysBody.push(present === null ? push : { kind: "if", cond: present, then: [push], else_: null, loc });
+        fastKeys.push(present === null ? push : { kind: "if", cond: present, then: [push], else_: null, loc });
       }
     }
+    // GH #132: off the fast path the record's own order decides.
+    const ordLocals: { id: string; type: IrType }[] = [];
+    keysBody.push(...orderedFieldStmts(L, x(), shape.id, fastKeys, (f) => [pushKey(f.name)], (name, type) => {
+      const id = `${name.slice(1)}.0`;
+      ordLocals.push({ id, type });
+      return id;
+    }, loc));
     const ksT = arrayOf(STRING);
     if (shape.indexValue) {
       keysBody.push(
@@ -358,7 +372,7 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
       suffix: "keys",
       params: [],
       ret: JSVAL,
-      locals: [{ id: "o.0", type: JSVAL }, ...(shape.indexValue ? [{ id: "ks.0", type: ksT }, { id: "j.0", type: F64 }] : [])],
+      locals: [{ id: "o.0", type: JSVAL }, ...ordLocals, ...(shape.indexValue ? [{ id: "ks.0", type: ksT }, { id: "j.0", type: F64 }] : [])],
       body: keysBody,
     });
     // An overflow key test: the loop over the overflow keys (no declared
@@ -415,7 +429,8 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
         then: [
           ...conv.stmts,
           { kind: "varDecl", localId: `c.${j}`, init: conv.value, loc },
-          { kind: "recordSet", obj: x(), shapeId: shape.id, field: f.name, value: ref(`c.${j}`, f.type, loc), loc },
+          // GH #132: a dynamic write keeps the record's own order Node's.
+          orderedRecordWrite(L, { kind: "recordSet", obj: x(), shapeId: shape.id, field: f.name, value: ref(`c.${j}`, f.type, loc), loc }, false),
           { kind: "return", value: null, loc },
         ],
         else_: null,

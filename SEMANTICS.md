@@ -3371,6 +3371,46 @@ value-first render for a generator result IN A MODULE WITH NO COMPETING
 SHAPE — deliberately not attempting to pin the race itself, which is
 what this entry registers instead.
 
+**Amendment (GH #132): one record's keys follow their creation order, on the wasm and wasm-native lanes.**
+A record whose shape is a plain declared record with an optional field (no tuple, no index signature)
+carries an own-key ORDER once its keys stop being created in the shape's order
+(`frontend/lowering/record-order.ts`): every key surface — Object.keys / values / entries, for-in, `in`,
+Object.hasOwn, JSON.stringify, util.inspect / console.log, object spread, Object.assign, a width copy into
+another record type, rest destructuring and the shared dynamic view — then answers its keys in Node's
+creation order (integer-index keys ascending first, as V8 does). So `type R = { xx?: number; b: number };
+const o: R = { b: 2 }; o.xx = 4` renders Node's `{"b":2,"xx":4}`; a deleted key leaves the order and a
+refilled one is appended; an object literal spelling its keys out of declared order (`const q: R = { b:
+2, xx: 3 }`) keeps its spelling; a spread, a copy or a rest object takes its source's order. A record whose
+keys are created in declared order stays on the FAST PATH and answers by this entry's shape order, which
+is then Node's.
+
+**What stays, precisely:**
+- two different SHAPES' records are unaffected by each other, but a record built by a CHECKED CONVERSION
+  from a dynamic value (`JSON.parse(s) as T`, a JavaScript value entering a typed slot, the `structuredClone`
+  round trip) takes the declared order whatever the source's key order (`JSON.parse('{"b":1,"a":2}') as {
+  a?: number; b: number }` answers `[ 'a', 'b' ]`, Node `[ 'b', 'a' ]`);
+- index-signature records keep S031's declared-then-overflow order, including a late declared optional key
+  (`{ xx?: number; b: number; [k: string]: number | undefined }` with `o.xx = 4` after `{ b: 2 }` answers
+  `xx` first);
+- spreads: when the result's shape keeps an order, it takes the source's own keys in the source's own
+  order, as they stand at the spread's position (a later property that deletes, adds or clears a source
+  key does not change the result) — for every record-typed source the spread accepts: a binding, a
+  property chain such as `{ ...holder.r }` or `{ ...this.r }`, and one under a cast, `!` or parentheses.
+  What keeps S123's shape order is a spread whose RESULT keeps no order (a shape with no optional field,
+  or an index-signature record), or whose source is an index-signature record. A computed source (`{
+  ...f() }`, `{ ...arr[0] }`) and a conditional spread are refused by the spread itself (SC1090), so they
+  cannot answer wrongly;
+- the c and llvm lanes keep the shape order everywhere.
+
+**Cost:** two slots per record of such a shape (a nullable number[] and an f64 high-water mark); a write
+that fills an optional field calls one helper per SHAPE (it compares the field's number with the
+high-water mark — constant time); a write updating a field that holds a value pays one slot read and two
+undefined tests; a key surface one null test. A record off the fast path keeps one number[] (a presence
+flag per field, then the field numbers of its keys in creation order): presence is one read, a new key one
+push, and each surface dispatches on the field number in log n compares (br_table in the JSON writer and
+the dynamic conversion). Code grows linearly in the field count. **Tested by:**
+`packages/compiler/test/wasm-gh132-optional-key-order.test.ts` (wasm and wasm-native).
+
 ## S042 — Bare `this` in a dyn-called plain function binds only through the MODELED dispatch set *(inherited; newly observable on the wasm tier)*
 
 The ambient-receiver bracket — the stack `dyn.this` reads (C:
@@ -7633,22 +7673,56 @@ is exact for every program that does not write `undefined` into a field that is 
 widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
 cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.
 
-**Amendment (GH #143, U1a's live views): on the wasm and wasm-native lanes the dynamic crossing reads
-by the KEY rule.** Since U1a (and U1b for JavaScript sources) a record entering `any`/`unknown` is not
-converted but shared as a live view (S115), and the view answers its own keys — and through them
-printing, `in`, `Object.keys`/`hasOwn`, JSON and every dynamic reader — by the key surfaces' rule above:
-an optional field holding `undefined` has no key. The second rule's "the conversion to a checked-dynamic
-value" clause no longer applies to the `any`/`unknown` crossing on these lanes (a class instance or a record
-with accessors does not cross there at all — both refuse with SC1090); it still describes the c and llvm
-lanes' conversion. Two cells move: (a) now reaches the view too — `const o: {
-x?: number; b: number } = { x: undefined, b: 2 }; const aq: any = o; console.log(aq, "x" in aq)` prints `{
-b: 2 } false` where Node prints `{ x: undefined, b: 2 } true` (the GH #143 repro); and (d) no longer
-applies through the view — an optional field the program left out prints `{ b: 2 }` through `any`, as
-Node does. Printing the record directly keeps the printing rule (`{ x: undefined, b: 2 }`, Node's). The
-rationale is the entry's own: the slot cannot tell left-out from explicitly-undefined, and the left-out
-field is the common case at a dynamic boundary. **Tested by:**
-`packages/compiler/test/wasm-gh143-optional-undefined-any.test.ts` (the repro pinned with Node's answer
-beside it, the Node-exact cells around it; wasm and wasm-native).
+**Amendment (GH #132 and GH #143): a plain declared record keeps its own keys, so (a) and (b) close on the
+wasm and wasm-native lanes.** A record whose shape has an optional field (no index signature, no tuple)
+carries an own-key ORDER once a write or a literal would part it from the rules above
+(`frontend/lowering/record-order.ts`, S041's GH #132 amendment): an explicit `undefined` stored into an
+optional field — written, spelled in an object literal (decided at run time, so `{ a: 1, w: arr[5] }`
+counts), spelled after a spread, or written by dynamic code through the shared view — keeps its key;
+`delete` removes it; and from then on that record's own keys are exactly its stored ones at every key
+surface. So (a) answers Node's `{ a: 1, w: undefined } [ 'a', 'w' ] true` — and the GH #143 repro, through
+`any`, Node's `{ x: undefined, b: 2 } true` — and (b)'s `{ a: number; w: number | undefined } = { a: 1,
+w: undefined }` answers Node's `a,w`. An optional `unknown`/`any` field counts too (its undefined is the
+dynamic undefined): a literal leaving one out gives the record an order, since the slot cannot hold its
+absence. On these lanes the shared view of a record (U1a, U1b) is that same record, so the crossing into
+`any` answers by the KEY rule; the second rule's "conversion to a checked-dynamic value" no longer applies
+to that crossing (a class instance or a record with accessors does not cross there at all — both refuse
+with SC1090), and still describes the c and llvm lanes.
+
+**What stays, precisely (wasm and wasm-native):**
+- (c) unchanged, for literals AND writes: a field required in its own type but undefined-armed, of a shape
+  a checked conversion builds, becomes optional only after the program was lowered, so neither the literal
+  `{ a: undefined, b: 2 }` nor the write `z.a = undefined` gives it a key (`[ 'b' ]`, Node `[ 'a', 'b' ]`);
+- (d) closes for printing these records (Joe, 2026-11-10): every explicit undefined the program writes,
+  spells or copies (a spread, a rest object, a width copy — a source field holding undefined, required or
+  not, that lands in an optional field) gives the record an order, so printing on the fast path uses the
+  KEY rule and `const o: { a: number; w?: number } = { a: 1 }; console.log(o)` prints Node's `{ a: 1 }`.
+  THREE cells remain:
+  1. the accepted cost: an explicit undefined that arrives through a checked conversion of dynamic data —
+     a `structuredClone` round trip, a dynamic object holding `undefined` checked into the record type
+     (never `JSON.parse`, which cannot produce one) — leaves the record on the fast path, so it neither
+     prints nor is an own key: `structuredClone({ a: 1, w: undefined } as R)` prints `{ a: 1 }` where Node
+     prints `{ a: 1, w: undefined }`;
+  2. the dynamic conversion, where one still happens, keeps this entry's printing rule for a record on
+     the fast path: `querystring.stringify` of `{ a: "1" }` typed `{ a: string; w?: string }` gives
+     `a=1&w=` where Node gives `a=1`;
+  3. a field REQUIRED in its own type but undefined-armed, of a shape a checked conversion builds, still
+     prints `undefined` when the source lacked it (the (c) mechanism: `{ a: undefined, b: 1 }` where Node
+     prints `{ b: 1 }`);
+- a record built by a checked conversion from a dynamic value keeps the rules above (a source key holding
+  undefined is no own key; S041's amendment lists its order);
+- on the fast path an optional `unknown`/`any` field counts as an own key whatever it holds (the key
+  surfaces do not test the dynamic undefined) — reachable only through a record a checked conversion
+  built, since a literal or a write that leaves such a field undefined gives the record an order;
+- `in` over a receiver that is not a re-readable read (`"w" in get()`) answers by the key rule, so an
+  explicit undefined there answers `false`;
+- index-signature records keep every cell of this entry;
+- the c and llvm lanes keep every cell.
+
+**Tested by:** `packages/compiler/test/wasm-gh132-optional-key-order.test.ts` and
+`wasm-gh143-optional-undefined-any.test.ts` (Node-differential, wasm and wasm-native);
+`wasm-silent-batch.test.ts`'s T091A and T091B pin Node's answers, T091D Node's answer for (d) and the
+remaining required-field cell; GH132-23 pins the `structuredClone` cell with Node's answer beside it.
 
 ## S092 — node:diagnostics_channel and AsyncLocalStorage on the wasm lane: ReflectApply's TypeError text is rendered for primitives, plain objects, arrays, Uint8Arrays, promises and errors only, tracePromise fences a non-promise without subscribers and a non-promise thenable, setImmediate as a function value answers undefined and calls its callback with `this` undefined, and channels are never collected *(wasm lane only)*
 
@@ -9847,6 +9921,12 @@ of its shape, so the merged order would need a reshape at the literal.
 Registered so the divergence is honest until that is built; it has no test
 that pins it as desired. **Tested by:** nothing pins this order; the review
 rows avoid it.
+
+*Amendment (GH #132):* on the wasm and wasm-native lanes a spread whose
+result is a plain declared record with an optional field takes the
+contributors' keys in contribution order (S041's GH #132 amendment), so this
+entry holds there only for index-signature results and sources; the c and
+llvm lanes keep it whole.
 
 ## S124 — Code of an import cycle that reads a `var` binding, an enum or a JSON module's default before its module ran ends the program by name, where Node reads `undefined` *(every lane)*
 

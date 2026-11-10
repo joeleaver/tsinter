@@ -3746,6 +3746,9 @@ class LlEmitter {
       case "tryCatch":
         this.emitTryCatch(s);
         break;
+      case "recordOrderSet":
+        // GH #132: an undefSlots-only statement (the WasmGC lanes).
+        throw new LlvmUnsupportedError("stmt:recordOrderSet", s.loc);
       default: {
         // Statement coverage is now total (bytesSet closed the set) —
         // keep the loud refusal for any future IR statement kind.
@@ -6809,6 +6812,7 @@ class LlEmitter {
         return this.own({ name: c, type: e.type });
       }
       case "slotUndef":
+      case "recordOrder":
       case "isUndef":
       case "arrHasUndef":
         // Unit U: undefSlots modules exist only on the WasmGC lanes

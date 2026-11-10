@@ -1,13 +1,10 @@
-/* GH #143: an optional record field shared into `any`. A record shared
- * with dynamic code is a live view whose keys follow S091's key rule: an
- * optional field holding undefined has no key. That is Node's answer for a
- * field the program left out, and S091 (a)'s registered divergence for one
- * it set to undefined explicitly (the issue's repro, pinned with Node's
- * answer beside it). Printing the record directly keeps the explicit
- * undefined, as Node does.
+/* GH #143: an optional record field shared into `any`. Since GH #132 a
+ * record keeps its own keys (record-order.ts): an optional field set to
+ * undefined explicitly keeps its key, through the shared view too, while
+ * one the program left out has none — Node's answers both.
  *
- * Every other row equals Node (spawned at test time), on the wasm lane
- * and, in the second describe, on the wasm-native lane. */
+ * Every row equals Node (spawned at test time), on the wasm lane and, in
+ * the second describe, on the wasm-native lane. */
 import { execFile, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,12 +39,11 @@ interface Row {
 
 const ROWS: Row[] = [
   {
-    id: "GH143-01 the issue's repro: an optional field set to undefined, shared into any (S091 (a))",
+    id: "GH143-01 the issue's repro: an optional field set to undefined keeps its key through any, as in Node",
     src: `type R = { x?: number; b: number };
 const o: R = { x: undefined, b: 2 };
 const aq: any = o;
 console.log(aq, "x" in aq);`,
-    diverges: { entry: "SEMANTICS.md S091 (a)", node: "{ x: undefined, b: 2 } true\n", stdout: "{ b: 2 } false\n" },
   },
   {
     id: "GH143-02 an optional field left out has no key through the view, as in Node",
