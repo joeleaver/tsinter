@@ -5791,6 +5791,16 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
  * later contributor overrides — while the field-copy desugar assumes pure
  * reads it may drop or reorder. Getter-call counts would silently diverge,
  * so accessor-carrying sources fence by name. */
+/** GH #148: a spread source key the literal's shape has no slot for — the
+ * object Node builds keeps it, so the literal refuses instead of dropping it. */
+function refuseSpreadDrop(L: Lowerer, prop: ts.Node, name: string, target: IrType): never {
+  return L.unsupported(
+    "SC1090",
+    prop,
+    `object spread of a key ('${name}') the literal's type '${L.fmt(target)}' has no slot for (Node's object keeps the key; give the literal a type that lists it)`,
+  );
+}
+
 function fenceAccessorSpreadSource(L: Lowerer, prop: ts.Node, srcShape: IrRecordShape | undefined): void {
   if (srcShape && shapeHasAccessorSlots(srcShape)) {
     L.unsupported(
@@ -6089,8 +6099,9 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     // reachable through type assertions and satisfies (fresh-literal
     // excess-property checks reject the direct spelling): the context
     // cannot hold the value, so the literal builds at its OWN type and the
-    // slot's width coercion narrows it (divergence 36's copy stance — the
-    // extra fields drop in the copy). The probe is against the CHECKER's
+    // slot's width coercion narrows it (a width COPY, which S125 (b)
+    // judges: refused by name where its missing keys could be observed).
+    // The probe is against the CHECKER's
     // contextual type, not the mapped shape: a property the contextual
     // type carries but the shape dropped (settled value/reason,
     // generic-callable members) belongs to the drop paths below, and
@@ -6104,7 +6115,22 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
           return members.some((m) => L.checker.getPropertyOfType(m, name) !== undefined);
         };
         const extraOf = (text: string): boolean => !names.has(text) && !ctxHasProp(text);
-        const extra = expr.properties.some((p) => {
+        // GH #148: a SPREAD source's keys count too — `const n: Narrow =
+        // { ...wide, a: 3 }` (spreads escape tsc's excess-property check)
+        // has every key of `wide` in Node, so the literal builds at its
+        // own type and the slot holds a width COPY, which S125 (b) judges:
+        // a copy the program could tell from the original by its keys
+        // refuses by name instead of dropping them silently.
+        // The literal's OWN type is tsc's spread type (a class source's
+        // methods already left out, a conditional spread's key included).
+        const spreadExtra = (): boolean => {
+          const own = L.typeOf(expr);
+          const members = own.isUnionType() ? own.getTypes() : [own];
+          return members.some((m) =>
+            (m.flags & ts.TypeFlags.Object) !== 0 &&
+            L.checker.getPropertiesOfType(m).some((s) => extraOf(s.name)));
+        };
+        const extra = (expr.properties.some(ts.isSpreadAssignment) && spreadExtra()) || expr.properties.some((p) => {
           if (ts.isSpreadAssignment(p) || !p.name) return false;
           if (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) return extraOf(p.name.text);
           if (ts.isNumericLiteral(p.name)) return extraOf(String(Number(p.name.text)));
@@ -6601,9 +6627,9 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
           for (const f of srcShape.fields) {
             if (laterNames.has(f.name)) continue;
             const targetType = fieldTypes.get(f.name);
-            // No slot on the target shape: the copy DROPS the field
-            // (divergence 36's stance, same as the plain-record spread).
-            if (!targetType) continue;
+            // No slot on the target shape: refused, as in the plain-record
+            // spread below (GH #148).
+            if (!targetType) refuseSpreadDrop(L, prop, f.name, type);
             if (conditionalNames.has(f.name)) {
               L.unsupported(
                 "SC1090",
@@ -6758,12 +6784,12 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         for (const f of srcShape.fields) {
           if (laterNames.has(f.name)) continue;
           const targetType = fieldTypes.get(f.name);
-          // A source field with NO slot on the target shape: the copy
-          // DROPS it — a spread of a wider record into a narrower literal
-          // is width subtyping in spread clothing, divergence 36's stance
-          // (Node's object would keep the key); the read is pure, so
-          // skipping evaluates nothing.
-          if (!targetType) continue;
+          // A source field with NO slot on the target shape. A context
+          // lacking the key builds the literal at its own type (above), so
+          // this is a shape that dropped a key its checker type keeps:
+          // Node's object would have the key, and dropping it silently
+          // would be a wrong answer (GH #148) — refused by name.
+          if (!targetType) refuseSpreadDrop(L, prop, f.name, type);
           const lift = typeEquals(f.type, targetType)
             ? null
             : L.widthLiftPlan(f.type, targetType);

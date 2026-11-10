@@ -9102,7 +9102,8 @@ leaving into typed storage follows (d)). So:
   `JSON.parse` into a record type) keeps the record type's declared
   fields in declaration order — keys the type does not declare are
   dropped and key order is the type's (S009's width-tolerant
-  conversion), and a value that does not fit throws the checked
+  conversion; for `{ ...x }` itself, refused by name since GH #148 where
+  the dropped keys could be observed — S125's GH #148 amendment), and a value that does not fit throws the checked
   conversion's `expected <T> at <path>, got <kind>` TypeError where Node
   runs on (the TypeScript lie); array copies (`[...x]`) keep every
   element in order and are exact. A `for (... of x)` subject counts as
@@ -10236,3 +10237,40 @@ typed library result such as `s.split(" ").filter(Boolean)`) holds that
 result as the island view of a value nothing else holds, so a `return {
 flags }` through a JSDoc record type copies a value no one can reach.
 **Tested by:** the JS corpus on the wasm lanes (1643 among them).
+
+*GH #148 amendment (every lane; tested on wasm and wasm-native).* An object
+literal whose spread brings a key the literal's annotated (contextual) type
+lacks — `const n: Narrow = { ...wide, a: 3 }`, a conditional spread's key,
+in a binding, a return, an argument, an element or a field — has every key
+in Node: spreads escape tsc's excess-property check. Until #148 the literal
+was built at the annotation's shape and the extra keys DROPPED silently. It
+is now built at its own type (tsc's spread type), and the slot holds a
+width copy that (b) judges like any other: printing, JSON, key listings, a
+later spread or a crossing into `unknown` of the copy refuses by name
+(SC1090, "… prints, serializes, lists the keys of or tests the class of the
+copy …"), and a program that only reads the slot's fields runs, exact. The
+"Spreads … are not affected" sentence above means a spread's own result; a
+spread result narrowed into a smaller type is this copy. Known cost: (b)'s
+binding analysis counts a field write through the copy as a use that may
+print, so `const n: Narrow = { ...wide }; n.b = 7` refuses although no run
+could tell (it never accepts one that could). A spread key that has no slot
+on the literal's shape for any other reason refuses by name too ("object
+spread of a key … the literal's type … has no slot for"). A spread of a
+DYNAMIC source (`{ ...x }` over `any`, `{ ...JSON.parse(s) }`, a cast
+`unknown`) into a declared record type without an index signature may
+carry any key, and the record keeps only the type's fields (S115's
+width-tolerant record copy): the same judgment applies — the program
+refuses by name ("an object spread of a dynamic value into '…': the record
+keeps only the type's own fields …") where a printer, JSON, a key listing
+or an `in` could see the copy's keys (through its own binding, or for any
+value of the type when it has none), and runs where only the type's
+fields are read. The judgment follows the spread through a `?:`, `&&` or
+`||` arm, into a union's record arms (`Narrow | undefined`), and through
+JavaScript's JSDoc-typed parameters and results. A dynamic, `any` or
+index-signature target keeps every key. Known cost, as in (b): a use the
+binding analysis does not follow counts as one that may print, so a
+union-typed binding read only through `n?.b` refuses. A JavaScript
+spread bound to an unannotated local first (`const r = { ...o }; return
+r` through a JSDoc record result) is S115's width-tolerant copy, not this
+judgment. **Tested by:**
+`packages/compiler/test/wasm-gh148-spread-width.test.ts`.

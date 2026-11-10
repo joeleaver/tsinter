@@ -8875,8 +8875,51 @@ export class Lowerer {
       if ((!this.engine || this.sharedDynamic) && expr.expression.text === "Uint8Array") {
         const bytesT = this.mapTypeOf(this.typeOf(expr));
         if (bytesT?.kind === "bytes") {
-          const src: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: bytesT, loc };
-          return { kind: "bytesNew", source: src, type: bytesT, loc };
+          // GH #149: a JavaScript source's argument may already be a
+          // checked-dynamic value (a parameter, `[s.length]`), not a jsval.
+          // Node's common argument forms answer as Node: a length, an
+          // array of numbers (ToUint8 per element), a typed array (a copy)
+          // and undefined or null (empty); anything else (a string, a
+          // boolean, an array-like object) stops at the checked
+          // extraction's named fence.
+          const asDyn: IrExpr = arg.type.kind === "dyn" ? arg : { kind: "dynFromJsval", value: arg, type: DYN, loc };
+          const tmp = this.declareHiddenLocal("%u8src", DYN);
+          const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
+          const numArr: IrType = { kind: "array", elem: F64 };
+          const fromNum: IrExpr = { kind: "bytesNew", source: { kind: "dynCheck", value: ref(), type: F64, loc }, type: bytesT, loc };
+          const fromArr: IrExpr = { kind: "bytesNew", source: { kind: "dynCheck", value: ref(), type: numArr, loc }, type: bytesT, loc };
+          const fromBytes: IrExpr = { kind: "bytesNew", source: { kind: "dynCheck", value: ref(), type: bytesT, loc }, type: bytesT, loc };
+          return {
+            kind: "seqExpr",
+            stmts: [{ kind: "varDecl", localId: tmp.id, init: asDyn, loc }],
+            result: {
+              kind: "ternary",
+              cond: { kind: "dynTest", test: "number", value: ref(), type: BOOL, loc },
+              then: fromNum,
+              else_: {
+                kind: "ternary",
+                cond: { kind: "dynTest", test: "array", value: ref(), type: BOOL, loc },
+                then: fromArr,
+                // undefined and null build an empty array, as Node's
+                // ToIndex answers 0 (the bytes check below would let the
+                // dynamic undefined through as a null reference).
+                else_: {
+                  kind: "ternary",
+                  cond: { kind: "dynTest", test: "nullish", value: ref(), type: BOOL, loc },
+                  then: { kind: "bytesNew", source: null, type: bytesT, loc },
+                  else_: fromBytes,
+                  type: bytesT,
+                  loc,
+                },
+                type: bytesT,
+                loc,
+              },
+              type: bytesT,
+              loc,
+            },
+            type: bytesT,
+            loc,
+          };
         }
       }
       return { kind: "jsOp", op: "construct", args: [ctor, arg], type: JSVAL, loc };
