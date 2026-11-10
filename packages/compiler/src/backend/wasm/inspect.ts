@@ -212,6 +212,13 @@ export interface InspectDeps {
   errName: () => number;
   errMessage: () => number;
   errCode: () => number;
+  /** GH #147: `(err) -> str` — the header Node prints before `: message`
+   * (improveStack over the `name` slot; "" prints `[message]`), and
+   * `(err) -> str` — its constructor's name, what Node names an error
+   * with extra properties beyond the depth budget. Each is a named fence
+   * where this tier cannot name the class. */
+  errHead: () => number;
+  errCtor: () => number;
   /** The dyn representation — the walker's whole vocabulary (kinds, the
    * ARR/OBJ/FUNC payload accessors, and `objWalk` for key ORDER). */
   dyn: () => DynBuilder;
@@ -3518,22 +3525,20 @@ export class InspectBuilder {
       c.return_();
       c.end();
       c.localGet(D);
+      // GH #147: a header that prints empty is Node's `[message]`, which
+      // errorRaw renders.
       c.call(dx.head());
-      c.localTee(H);
-      c.arrayLen();
-      c.i32Eqz();
-      c.ifVoid();
-      fence("inspecting an error held in a dynamic value whose name prints empty is not supported yet");
-      c.end();
+      c.localSet(H);
       dx.vt(c);
       c.localGet(H);
       c.localGet(O);
       c.call(dyn.errMsgPart());
       c.localGet(CODE);
+      c.refNull(-0x13); // errT's encoding slot (GH #146): none
       c.structNew(errT);
       c.localGet(RECURSE);
       c.localGet(DEPTH);
-      c.call(this.error());
+      c.call(this.errorRaw());
       this.mb.setBody(
         idx,
         [dyn.objRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, dyn.arrRef(), this.deps.strRef(), dyn.dynRef(), this.deps.strRef(), this.deps.strRef(), this.errRef()],
@@ -3542,9 +3547,23 @@ export class InspectBuilder {
     });
   }
 
-  /** `%w.insp.error(e, recurse, depth)` → the error's rendering. */
+  /** `%w.insp.error(e, recurse, depth)` → the error's rendering. GH #147:
+   * its header is Node's (improveStack over Error.prototype.toString's
+   * name side: deps.errHead), and beyond the depth budget an error with a
+   * code names its constructor (deps.errCtor), as Node's getCtxName does. */
   error(): number {
-    return this.cached("error", [this.errRef(), F64, F64], [this.deps.strRef()], (idx) => {
+    return this.errorImpl(false);
+  }
+
+  /** `%w.insp.errorRaw(e, recurse, depth)` → error()'s rendering with the
+   * `name` slot printed as the header as it stands: dynError's stand-in,
+   * whose slot already holds the header improveStack gave. */
+  private errorRaw(): number {
+    return this.errorImpl(true);
+  }
+
+  private errorImpl(raw: boolean): number {
+    return this.cached(raw ? "errorRaw" : "error", [this.errRef(), F64, F64], [this.deps.strRef()], (idx) => {
       const errT = this.deps.errT();
       const c = new Code();
       const E = 0;
@@ -3560,6 +3579,17 @@ export class InspectBuilder {
       const dx = this.deps.domex;
       const D = 9;
       const HC = 10;
+      const HD = dx !== undefined ? 11 : 9;
+      // GH #147: a non-DOMException's header (raw: the slot as it stands)
+      // and its beyond-depth name (its constructor's).
+      const nameOf = (which: "head" | "ctor"): void => {
+        c.localGet(E);
+        if (raw) {
+          c.structGet(errT, this.deps.errName());
+        } else {
+          c.call(which === "head" ? this.deps.errHead() : this.deps.errCtor());
+        }
+      };
       c.localGet(E);
       c.structGet(errT, this.deps.errCode());
       c.localSet(CODE);
@@ -3601,12 +3631,10 @@ export class InspectBuilder {
         c.ifResult(this.deps.strRef());
         this.deps.lit(c, "DOMException");
         c.else_();
-        c.localGet(E);
-        c.structGet(errT, this.deps.errName());
+        nameOf("ctor");
         c.end();
       } else {
-        c.localGet(E);
-        c.structGet(errT, this.deps.errName());
+        nameOf("ctor");
       }
       c.call(this.ibPuts());
       c.i32Const(0x5d); // ']'
@@ -3631,13 +3659,12 @@ export class InspectBuilder {
         c.structGet(errT, this.deps.errName());
         c.call(dx.head());
         c.else_();
-        c.localGet(E);
-        c.structGet(errT, this.deps.errName());
+        nameOf("head");
         c.end();
       } else {
-        c.localGet(E);
-        c.structGet(errT, this.deps.errName());
+        nameOf("head");
       }
+      c.localTee(HD);
       c.call(this.ibPuts());
       c.localGet(E);
       c.structGet(errT, this.deps.errMessage());
@@ -3645,8 +3672,13 @@ export class InspectBuilder {
       c.localGet(M);
       c.arrayLen();
       c.ifVoid();
+      // Error.prototype.toString: an empty header drops the ": " (`[m]`).
+      c.localGet(HD);
+      c.arrayLen();
+      c.ifVoid();
       this.deps.lit(c, ": ");
       c.call(this.ibPuts());
+      c.end();
       c.i32Const(0);
       c.localSet(I);
       c.block();
@@ -3760,8 +3792,8 @@ export class InspectBuilder {
       this.mb.setBody(
         idx,
         dx !== undefined
-          ? [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), I32, I32]
-          : [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef()],
+          ? [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), I32, I32, this.deps.strRef()]
+          : [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), this.deps.strRef()],
         c.bytes(),
       );
     });
