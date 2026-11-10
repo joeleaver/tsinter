@@ -963,23 +963,26 @@ the inherited constructor where this tier knows it:
   user class (`class Deep extends AppError {}` answers `Deep`). The
   runtime builds URIError, ReferenceError, EvalError, AggregateError and
   node:assert's AssertionError as a plain `Error` carrying that name, so a
-  plain `Error` answers by the name it was BUILT with: `Error` or one of
-  those five. A rename never moves it (a write through the static type,
-  `err.name = "Custom"`, records the built name first), so a renamed
-  `Error` still answers `Error` and a URIError renamed to `"Error"` still
-  answers `URIError`. A plain `Error` built under any other name answers
-  `Error`: that is a host error the runtime rebuilt carrying the host's
-  name (S098 (c): fetch's failures, say), where Node may answer another
-  class (an `AbortError` is a DOMException there). To keep the built name,
-  a rename that could change the answer (of an error built under one of
-  the five names, or to one of the six) records the old name in a table
-  keyed by the error, once per error. The table is never pruned, so each
-  such renamed error stays alive and every later record or `constructor`
-  read of a plain `Error` scans it: renaming many runtime-built URIErrors
-  (or renaming many errors to `"URIError"`) in a long-running loop costs
-  time per rename and memory per error, where Node's cost is nil. The
-  common rename (`err.name = "ValidationError"` on an `Error`) records
-  nothing. A user
+  plain `Error` answers by the class it was BUILT as: `Error` or one of
+  those five. *(GH #141:)* each of the five is stamped at construction
+  with its own class tag (a distinct copy of `Error`'s vtable — the same
+  interval and methods, so `instanceof`, dispatch and every other surface
+  see a plain `Error`), and the answer reads the tag, never the `name`. A
+  rename through any path (the static type, a dynamic value,
+  `Object.assign`) therefore never moves it: a renamed `Error` answers
+  `Error` and a URIError renamed to `"Error"` answers `URIError`, at no
+  cost per rename and with nothing kept alive. A plain `Error` the runtime
+  REBUILDS from a name and message alone under any other name than
+  `Error` — a host's error (S098 (c): fetch's failures), the embedded
+  engine's, or an object carrying the `%error` marker (S025) — carries a
+  foreign tag, and its `constructor` stops at the fence "reading
+  'constructor' of an error rebuilt from a host's, the embedded engine's
+  or a marker-carrying object's name and message", where Node answers
+  the original's class (an `AbortError` is a DOMException there); so does
+  inspect's class name for one (S027's GH #137 header rule). A host's or
+  the engine's error rebuilt under the name `Error` answers `Error`
+  (Node's system errors are plain Errors), and so does an engine-side
+  subclass that kept that name, where Node answers the subclass. A user
   class that declares a static `name` or `length` (`static name`,
   `static ["name"]`) fences too (Node answers them);
 - a number, string, boolean or array answers `Number`, `String`, `Boolean`
@@ -1369,6 +1372,35 @@ the S014 argument, since no corpus program can pin any of it: one whose
 output observed the divergence would fail the differential on every lane
 by construction.
 
+
+**Amendment (GH #140, wasm and wasm-native): an object literal's function
+members are named by their key.** ES SetFunctionName names a method
+(`{ m() {} }`, async and generator methods too) and an anonymous function
+or arrow defined as a property value (`{ f: function () {} }`, `{ "q-r":
+() => 0 }`, through parentheses) by its key, and a named function
+expression (`{ h: function named() {} }`) by its own name. Where such a
+literal, with identifier, string or plain decimal keys only, is built as a
+dynamic value (an `any`-typed literal, a literal passed straight into an
+`any` parameter, a JavaScript source's literal handed on), and where a
+JavaScript source reads `o.h.name` / `o["q-r"].name` of a literal member
+it can resolve, the box now carries that name, so `f.name`, `[Function: m]`
+under util.inspect and the error texts answer as Node's. Not covered, and
+still answering this entry's empty name (`[Function (anonymous)]`): every
+member of a literal that has a COMPUTED key (`{ m() {}, [k]: () => 7 }`)
+and the computed member itself, and a member of a NESTED literal read
+through its parent (`{ inner: { deep() {} } }`, then `o.inner.deep.name`
+reads `""`). A JavaScript `o.h.name` answers the member's definition even
+after `o.h = function other() {}` reassigned it, where Node answers
+`other` — this entry's alias case. A STATIC record value that crosses later as
+a whole (`const r = { run() {} }; take(r)`) names each function member by
+its field's key: exact for a method or an anonymous function defined
+there, but a named function expression or a function stored from elsewhere
+(`{ h: function named() {} }`, `{ cb: handler }`) answers the key where
+Node answers `named` / `handler` — the alias case above. Tuple and array
+elements stay anonymous, as in Node. **Tested by:**
+`packages/compiler/test/wasm-gh140-method-names.test.ts` (both lanes,
+against Node; the record-alias row pins this tier's answer with Node's
+beside it).
 ## S021 — A caught Error crossing into `unknown` becomes an object whose members ENUMERATE *(inherited)*
 
 The checked-dynamic tree has no notion of a non-enumerable property, so
@@ -2901,8 +2933,35 @@ cannot say "Uint8Array". Board #206 owns the fix;
 `wasm-dynsmalls-u5.test.ts` pins this tier's answer (row R42c) beside the
 Node-exact dynamic-value row (R42b). The entry count is unchanged.
 
-**Amendment (INC-29 U1): `slice()` through a dynamic value follows the flag exactly.** On the wasm lane a checked-dynamic `slice()` of bytes (built in node:net modules — S087 (i)) is `Buffer.prototype.slice`, a VIEW, when the payload carries the Buffer flag (a `'data'` chunk), and `TypedArray.prototype.slice`, a COPY, when it does not. A `Buffer` that crossed the generic path carries no flag (this entry), so it slices as the Uint8Array it reads as everywhere else on the far side: a copy, where Node's Buffer slice is a view — a write through the slice is not seen in the source, nor the reverse (`pass(Buffer.from("abcd")).slice(1, 3)[0] = 65` leaves the source's byte 98 here; Node reads 65). Board #25 (the provenance marker) retires this with the rest of the entry. **Tested by:** N1-REG-03 (`tests/harness/wasm-differential.test.ts`), with Node's answer in a comment beside it, and the corpus program 2640 (a slice that is only read, the same on both).
+**Amendment (INC-29 U1): `slice()` through a dynamic value follows the flag exactly.** On the wasm lane a checked-dynamic `slice()` of bytes (built in node:net modules — S087 (i)) is `Buffer.prototype.slice`, a VIEW, when the payload carries the Buffer flag (a `'data'` chunk), and `TypedArray.prototype.slice`, a COPY, when it does not. A `Buffer` that crossed the generic path carries no flag (this entry), so it slices as the Uint8Array it reads as everywhere else on the far side: a copy, where Node's Buffer slice is a view — a write through the slice is not seen in the source, nor the reverse (`pass({ b: Buffer.from("abcd") }).b.slice(1, 3)[0] = 65` leaves the source's byte 98 here; Node reads 65). A Buffer passed directly (`pass(Buffer.from("abcd"))`) carries the flag since GH #138 (below) and slices as a view, as in Node. Board #25 (the provenance marker) retires this with the rest of the entry. **Tested by:** N1-REG-03 (`tests/harness/wasm-differential.test.ts`), with Node's answer in a comment beside it, and the corpus program 2640 (a slice that is only read, the same on both).
 
+
+**Amendment (GH #138, wasm and wasm-native): a crossing whose expression
+proves a Buffer carries the flag.** Where a value enters a dynamic
+position directly and the crossing's own expression PROVES it is a Buffer
+— a call of the global `Buffer.from`, `alloc`, `allocUnsafe`,
+`allocUnsafeSlow`, `concat` or `copyBytesFrom`, a `subarray` / `slice` of
+such a value, or a `const` initialized with one (`const b: any =
+Buffer.from("a")`, `f(Buffer.alloc(2))` into an `any` or `unknown`
+parameter, `const s = Buffer.from("q"); let x: unknown = s`) — the crossing
+sets the BYTES payload's Buffer flag, so `b.constructor` (named `Buffer`,
+length 3, `===` across reads), `util.inspect`/`console.log` (`<Buffer
+61>`), `String()` and `JSON.stringify` answer as Node's. A static `Buffer`
+TYPE is not proof (a Uint8Array reaches a `b: Buffer` parameter through
+`any` or a cast, and stays a Uint8Array, as in Node). The rest of this
+entry still holds, now naming `constructor.name` among the surfaces: a
+real Buffer whose crossing expression proves nothing (a `Buffer`-typed
+parameter, a `let`, a function's result, a field read), and one NESTED in
+a composite that crosses (an array literal's element, an object literal's
+or record's field — `const o: any = { b }`, `[b]` into `any[]`), carries
+no flag and answers `Uint8Array` on every one of them. A
+JavaScript source's static `b.constructor` refuses by name (SC2020 at run
+time), and `instanceof Buffer` / `Buffer.isBuffer` over `any` refuse at
+compile time, unchanged. **Tested by:** `packages/compiler/test/wasm-gh138-buffer-ctor.test.ts`
+(both lanes, against Node; the nested-composite rows pin this tier's
+`Uint8Array` with Node's answer beside them), and N1-REG-03
+(`tests/harness/wasm-differential.test.ts`: a directly passed Buffer
+slices as a view, a nested one as a copy).
 ## S038 — A `Buffer | string`-shaped union's `.toString()` treats the bytes arm as Buffer UNCONDITIONALLY, even when the runtime value is a plain `Uint8Array` *(wasm tier, shared with the LLVM and C lanes)*
 
 Node's `.toString()`/`String(x)` on a bytes value depends on the ACTUAL

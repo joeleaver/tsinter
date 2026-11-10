@@ -12,7 +12,7 @@ import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField,
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, dynUndefinedExpr, jsFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, unsupportedModuleFeatureOf } from "../shared.js";
@@ -2357,7 +2357,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           probed?.type.kind === "func" &&
           canBoxFuncIntoDyn(probed.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))
         ) {
-          const fnName = jsFuncNameOf(expr.expression);
+          const fnName = esFuncNameOf(L, expr.expression);
           const boxed: IrExpr = {
             kind: "dynFrom",
             value: probed,

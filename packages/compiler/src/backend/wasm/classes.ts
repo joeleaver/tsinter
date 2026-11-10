@@ -195,8 +195,14 @@ export class ClassBuilder {
     if (!meta.hierarchy) {
       throw new Error(`wasm emitter bug: interval global for standalone class ${className}`);
     }
+    const index = this.newCiGlobal(meta);
+    this.ciGlobals.set(className, index);
+    return index;
+  }
+
+  private newCiGlobal(meta: LlClassMeta): number {
     const ci = this.ci();
-    const index = this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: ci }, false, (w) => {
+    return this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: ci }, false, (w) => {
       // Operands in field order: CI_PRE then CI_POST.
       w.u8(0x41); // i32.const pre
       w.sleb(meta.pre);
@@ -206,8 +212,6 @@ export class ClassBuilder {
       w.uleb(0x00);
       w.uleb(ci);
     });
-    this.ciGlobals.set(className, index);
-    return index;
   }
 
   ref(info: ClassInfo): ValType {
@@ -355,6 +359,33 @@ export class ClassBuilder {
     if (meta === undefined) throw new Error(`wasm emitter bug: vtable for unknown class ${className}`);
     if (!meta.hierarchy) throw new Error(`wasm emitter bug: vtable for standalone class ${className}`);
     if (meta.root.slots.length === 0) return this.ciGlobal(className);
+    const index = this.newVtGlobal(meta);
+    this.vtGlobals.set(className, index);
+    return index;
+  }
+
+  private readonly vtAliases = new Map<string, number>();
+
+  /** GH #141: a CLASS TAG — a second, distinct immortal global holding
+   * exactly `className`'s vt (the same interval, the same slots), so an
+   * instance stamped with it is that class in every respect (instanceof,
+   * dispatch, casts all read the interval or the slots), while `ref.eq`
+   * against the tag tells how the runtime BUILT it. One global per
+   * (class, tag). The runtime builds URIError, ReferenceError, EvalError,
+   * AggregateError and AssertionError as a plain `%Error`; each is
+   * stamped with its own tag of %Error's vt (emitter.ts errVtGlobal). */
+  vtAliasGlobal(className: string, tag: string): number {
+    const key = `${className}#${tag}`;
+    const hit = this.vtAliases.get(key);
+    if (hit !== undefined) return hit;
+    const meta = this.metaMap.get(className);
+    if (meta === undefined || !meta.hierarchy) throw new Error(`wasm emitter bug: class tag for ${className}`);
+    const index = meta.root.slots.length === 0 ? this.newCiGlobal(meta) : this.newVtGlobal(meta);
+    this.vtAliases.set(key, index);
+    return index;
+  }
+
+  private newVtGlobal(meta: LlClassMeta): number {
     const vtt = this.vttType(meta.root);
     const entries = vtEntriesFor(meta).map(({ slot, impl }) => ({
       fn: impl === null ? null : this.deps.slotEntry(slot, impl),
@@ -379,7 +410,6 @@ export class ClassBuilder {
       w.uleb(0x00);
       w.uleb(vtt);
     });
-    this.vtGlobals.set(className, index);
     return index;
   }
 
