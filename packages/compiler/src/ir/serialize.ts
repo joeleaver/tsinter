@@ -1,7 +1,7 @@
 /* IR ↔ JSON. The IR is plain JSON-safe data by construction; the value of
- * this module is the version fence and the finiteness assertion (numLit
- * holds a JS number — NaN/Infinity literals cannot appear in source, but
- * a frontend bug producing one must not silently become `null` in JSON).
+ * this module is the version fence and the non-finite sentinels (numLit
+ * holds a JS number — NaN, ±Infinity and -0 must not silently become
+ * `null` or `0` in JSON).
  */
 import type { IrModule } from "./nodes.js";
 
@@ -10,10 +10,11 @@ export const IR_VERSION = 3 as const;
 export function serializeModule(mod: IrModule): string {
   return JSON.stringify(mod, (_key, value) => {
     if (typeof value === "number" && !Number.isFinite(value)) {
-      // ±Infinity numLits are real (the global `Infinity`); JSON cannot
-      // spell them, so they ride a sentinel object no other IR value can
-      // be (numbers never serialize as objects). NaN stays a bug.
-      if (Number.isNaN(value)) throw new Error("IR contains NaN; refusing to serialize");
+      // ±Infinity and NaN numLits are real (the globals `Infinity` and
+      // `NaN`, the lowerer's own NaN answers — GH #136); JSON cannot spell
+      // them, so they ride a sentinel object no other IR value can be
+      // (numbers never serialize as objects).
+      if (Number.isNaN(value)) return { $nonfinite: "nan" };
       return { $nonfinite: value > 0 ? "inf" : "-inf" };
     }
     // JSON.stringify(-0) prints "0", silently losing the sign a numLit's
@@ -30,7 +31,7 @@ export function deserializeModule(json: string): IrModule {
   const mod = JSON.parse(json, (_key, value: unknown) => {
     if (typeof value === "object" && value !== null && "$nonfinite" in value) {
       const tag = (value as { $nonfinite: string }).$nonfinite;
-      return tag === "inf" ? Infinity : tag === "-0" ? -0 : -Infinity;
+      return tag === "inf" ? Infinity : tag === "-0" ? -0 : tag === "nan" ? NaN : -Infinity;
     }
     return value;
   }) as IrModule;

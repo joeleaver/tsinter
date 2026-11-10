@@ -49,7 +49,7 @@
  *   constructor hands `this` away (a call, a closure capturing it). It
  *   over-refuses; it never
  *   under-refuses. */
-import { typeKey, type IrExpr, type IrFunction, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { typeKey, type IrExpr, type IrFunction, type IrRecordShape, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import type { Lowerer } from "./lowerer.js";
 
@@ -182,6 +182,64 @@ interface DynSite extends Site {
   node: IrExpr;
 }
 
+/** GH #148 (review): the island spread literals (`{ ...x }` over a dynamic
+ * source: the `objSpread` op) a dynamic value `v` may be — itself, or an
+ * arm of a `?:`, `&&` or `||` over it, through retypings and a sequence's
+ * result. */
+function spreadsIn(v: unknown, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  const r = v as Record<string, unknown> | null;
+  if (r === null || typeof r !== "object") return out;
+  switch (r["kind"]) {
+    case "jsOp":
+      if (r["op"] === "objSpread") out.push(r);
+      return out;
+    case "ternary":
+      spreadsIn(r["then"], out);
+      return spreadsIn(r["else_"], out);
+    case "logical":
+      spreadsIn(r["left"], out);
+      return spreadsIn(r["right"], out);
+    case "dynFromJsval":
+    case "jsMarshal":
+      return spreadsIn(r["value"], out);
+    case "seqExpr":
+      return spreadsIn(r["result"], out);
+    default:
+      return out;
+  }
+}
+
+/** The closed record shapes a typed exit lands in: the type itself, or a
+ * union's record arms; an index-signature or tuple shape keeps every key. */
+function closedRecordArms(L: Lowerer, t: IrType): { t: IrType; shape: IrRecordShape }[] {
+  const arms = t.kind === "union" ? (L.unions.get(t.unionId)?.arms ?? []) : [t];
+  const out: { t: IrType; shape: IrRecordShape }[] = [];
+  for (const a of arms) {
+    if (a.kind !== "record") continue;
+    const sh = L.shapes.get(a.shapeId);
+    if (sh !== undefined && sh.indexValue === undefined && !sh.tuple) out.push({ t: a, shape: sh });
+  }
+  return out;
+}
+
+/** GH #148 (review): may the island spread literal `v` carry an own key
+ * that record shape `fields` has no field for? A literal part's keys are
+ * known; any other spread source's are not. */
+function spreadMayCarryExtra(v: unknown, fields: Set<string>): boolean {
+  const r = v as Record<string, unknown>;
+  if (r["kind"] === "jsOp" && r["op"] === "objSpread") return (r["args"] as unknown[]).some((a) => spreadMayCarryExtra(a, fields));
+  if (r["kind"] === "jsOp" && r["op"] === "objLit") {
+    const args = r["args"] as Record<string, unknown>[];
+    for (let i = 0; i < args.length; i += 2) {
+      const k = args[i]!;
+      const lit = k["kind"] === "jsMarshal" ? (k["value"] as Record<string, unknown>) : k;
+      if (lit["kind"] !== "strLit" || !fields.has(lit["value"] as string)) return true;
+    }
+    return false;
+  }
+  return true;
+}
+
 /** Does a function body hold a dynamic crossing of a composite or a
  * function value? (The pass's cheap entry test.) */
 function hasDynCrossing(n: unknown): boolean {
@@ -192,6 +250,7 @@ function hasDynCrossing(n: unknown): boolean {
     const t = (r["kind"] === "dynFrom" ? (r["value"] as IrExpr).type : (r["type"] as IrType)).kind;
     if (t !== "f64" && t !== "string" && t !== "bool" && t !== "dyn" && t !== "jsval" && t !== "undefinedT" && t !== "nullT" && t !== "bytes") return true;
   }
+  if (r["kind"] === "jsExit" && spreadsIn(r["value"]).length > 0) return true;
   for (const key of Object.keys(r)) {
     if (key === "type" || key === "loc") continue;
     if (hasDynCrossing(r[key])) return true;
@@ -345,6 +404,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * reference, every dynCheck into one, and every typed function boxed
    * into a dynamic value. */
   const dynSites: DynSite[] = [];
+  /** GH #148 (review): island spread literals (`{ ...x }` over a dynamic
+   * source) checked into a declared record shape that may lack some of
+   * their keys — the record keeps only its own fields. */
+  const spreadExits: { t: IrType; arms: IrType[]; loc: SrcLoc; dest: Site["dest"] }[] = [];
   /** Writes to dynamic values: where, and the receiver when one is known. */
   const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[]; method?: string }[] = [];
   const noteDynWrite = (recv: IrExpr | null, method?: string): void => {
@@ -492,6 +555,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "unionDisc":
       case "unionIsTag":
       case "forOf":
+      // A typed-array construction copies its source's numbers (GH #149).
+      case "bytesNew":
         return "read";
       case "arrIntrinsic":
         return key === "receiver" && SPINE_READS.has(parent["method"] as string) ? "read" : "other";
@@ -979,6 +1044,21 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     }
   };
   /** Dynamic crossings and dynamic writes at node `r` (S125 (c)). */
+  /** GH #148 (review): a typed exit (jsExit, dynCheck) of an island spread
+   * literal — directly or through a `?:`/`&&`/`||` arm — into a closed
+   * record type, or a union with one, that may lack some of its keys. */
+  function noteSpreadExit(r: Record<string, unknown>, parent: Record<string, unknown> | null, pkey: string, loc: SrcLoc): void {
+    const spreads = spreadsIn(r["value"]);
+    if (spreads.length === 0) return;
+    const t = r["type"] as IrType;
+    const arms = closedRecordArms(L, t);
+    if (arms.length === 0) return;
+    const extra = arms.some((a) => {
+      const fields = new Set(a.shape.fields.map((f) => f.name));
+      return spreads.some((s) => spreadMayCarryExtra(s, fields));
+    });
+    if (extra) spreadExits.push({ t, arms: arms.map((a) => a.t), loc, dest: destOf(parent, pkey, r) });
+  }
   function noteDynNode(r: Record<string, unknown>, parent: Record<string, unknown> | null, pkey: string): void {
     const loc = r["loc"] as SrcLoc;
     // A variadic callback's adapter (restFuncAdapter) calls the boxed
@@ -987,6 +1067,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // the scalar positions; any other use refuses by name).
     if (/^%fn\.adapt\.\d+\.impl$/.test(curFn) && (isAdapterCall(r) || (parent !== null && pkey === "args" && isAdapterCall(parent)))) return;
     switch (r["kind"]) {
+      case "jsExit":
+        noteSpreadExit(r, parent, pkey, loc);
+        return;
       case "call": {
         const callee = r["callee"] as string;
         const a0 = (r["args"] as IrExpr[])[0];
@@ -1013,6 +1096,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         return;
       }
       case "dynCheck": {
+        noteSpreadExit(r, parent, pkey, loc);
         const t = r["type"] as IrType;
         const { refs, fns } = refsOf(t);
         if (refs.length === 0 && fns.length === 0) return;
@@ -1764,6 +1848,30 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         s.loc,
         `a '${L.fmt(top.from)}' value where '${L.fmt(top.to)}' is expected${nested}: the slot would hold a COPY where JavaScript shares the object, and ${reason} (SEMANTICS.md S125)`,
         `give the slot the value's own type ('${L.fmt(top.from)}'), or make the function generic over it (<T extends ${L.fmt(top.to)}>(x: T) keeps the object)`,
+      ),
+    );
+  }
+  // GH #148 (review): `{ ...x }` over a dynamic source into a declared
+  // record shape keeps only the shape's fields, where Node's object keeps
+  // every key: judged like a (b) copy by its keys alone (the literal is
+  // fresh, so writes and identity cannot tell). Its own binding's uses when
+  // it has one; otherwise any printer or key listing reaching the type.
+  for (const s of spreadExits) {
+    const db = s.dest === null ? null : destBinding({ callee: "%dyn.spread", arg: undefined, loc: s.loc, where: "", top: 0, dest: s.dest });
+    const types = [s.t, ...s.arms];
+    const observed = db !== null
+      ? db.uses.some((u) => u === "print" || u === "keys" || u === "other") || types.some((t) => foldedKeys.has(tkey(t)) || foldedClass.has(tkey(t)))
+      : types.some((t) => reach.has(tkey(t)) || foldedKeys.has(tkey(t)));
+    if (!observed) continue;
+    const at = `${s.loc.file}:${s.loc.start}`;
+    if (reported.has(at)) continue;
+    reported.add(at);
+    L.pushDiag(
+      unsupportedDiag(
+        "SC1090",
+        s.loc,
+        `an object spread of a dynamic value into '${L.fmt(s.t)}': the record keeps only the type's own fields where JavaScript's object keeps every key the source has, and ${KEYS} (SEMANTICS.md S125)`,
+        `give the slot a dynamic type ('any' or 'unknown') to keep every key, or copy the fields you need explicitly ({ b: x.b })`,
       ),
     );
   }

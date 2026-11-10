@@ -48,7 +48,7 @@ test("validator rejects type mismatches and bad references", () => {
   ]);
 });
 
-test("serializer round-trips ±Infinity and refuses NaN", () => {
+test("serializer round-trips ±Infinity and NaN", () => {
   const mod = structuredClone(fibModule);
   const fn = mod.functions[0]!;
   const stmt = fn.body[0]!;
@@ -73,7 +73,15 @@ test("serializer round-trips ±Infinity and refuses NaN", () => {
   if (stmt.kind === "if" && stmt.cond.kind === "bin" && stmt.cond.right.kind === "numLit") {
     stmt.cond.right.value = NaN;
   }
-  expect(() => serializeModule(mod)).toThrow(/NaN/);
+  // GH #136: NaN numLits are real (the global `NaN`, a switch over a
+  // number), so they round-trip like ±Infinity.
+  const back3 = deserializeModule(serializeModule(mod));
+  const stmt4 = back3.functions[0]!.body[0]!;
+  if (stmt4.kind === "if" && stmt4.cond.kind === "bin" && stmt4.cond.right.kind === "numLit") {
+    expect(stmt4.cond.right.value).toBeNaN();
+  } else {
+    throw new Error("round-trip lost the statement shape");
+  }
 });
 
 test("deserializer enforces IR version", () => {
