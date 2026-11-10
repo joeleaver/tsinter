@@ -21,6 +21,14 @@ export const KNOWN = [
     test: (b) => div(b) && (nat(b) === "order" || nat(b) === "missing") && has(b, "parse()") && (has(b, "as") || has(b, "any")),
   },
   {
+    id: "S041 amendment (a structuredClone round trip takes the declared order)",
+    test: (b) => div(b) && nat(b) === "order" && has(b, "structuredClone()"),
+  },
+  {
+    id: "S018 ('<x> is not a function' names the callee's source text, or 'value')",
+    test: (b) => div(b) && / is not a function/.test(b.res.diff?.node ?? "") && / is not a function/.test(b.res.diff?.got ?? ""),
+  },
+  {
     id: "S123 / GH #106 (an object spread's keys take the shape's order)",
     test: (b) => div(b) && nat(b) === "order" && has(b, "obj-spread"),
   },
