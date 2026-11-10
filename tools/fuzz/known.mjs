@@ -14,7 +14,7 @@ const has = (b, ...fs) => fs.every((f) => b.feats.includes(f));
 export const KNOWN = [
   {
     id: "S041 (record shapes render their declared order; GH #132's amendment covers shapes with an optional field)",
-    test: (b) => div(b) && nat(b) === "order" && !has(b, "parse()") && !has(b, "obj-spread") && !has(b, "any") && !/\?:/.test(b.source),
+    test: (b) => div(b) && nat(b) === "order" && !has(b, "parse()") && !has(b, "obj-spread") && !/\?:/.test(b.source),
   },
   {
     id: "S041 amendment + S115 (a checked conversion from a dynamic value takes the declared order and drops undeclared keys)",
@@ -33,8 +33,38 @@ export const KNOWN = [
     test: (b) => div(b) && nat(b) === "order" && has(b, "obj-spread"),
   },
   {
+    // Since af11881e such a spread refuses by name; kept for older trees.
     id: "GH #148 (a spread into a narrower annotated type drops the extra keys)",
     test: (b) => div(b) && nat(b) === "missing" && has(b, "obj-spread") && /const \w+: N\d+ = \{ \.\.\./.test(b.source),
+  },
+  // Filed from the first nico-top campaign (seeds 100000..106799, 2026-11-10).
+  {
+    id: "GH #155 (throw undefined / throw null: SC9001 bare unitLit outside a unionWrap)",
+    test: (b) => b.res.cls === "crash" && b.res.kind === "ice" && /bare unitLit '(undefined|null)'/.test(b.res.msg ?? ""),
+  },
+  {
+    id: "GH #156 (an async function inspects as [Function: …], Node [AsyncFunction: …])",
+    test: (b) => div(b) && /\[AsyncFunction/.test(b.res.diff?.node ?? "") && !/\[AsyncFunction/.test(b.res.diff?.got ?? ""),
+  },
+  {
+    id: "GH #157 (Object.assign({}, rec) drops an explicit-undefined optional field and the record's own order)",
+    test: (b) => div(b) && b.lang !== "js" && (nat(b) === "missing" || nat(b) === "order") && /Object\.assign\(\{\}, /.test(b.source) && /\?:/.test(b.source),
+  },
+  {
+    id: "GH #158 (keys a literal holds beyond its declared type are lost under keys/values/structuredClone)",
+    test: (b) => div(b) && b.lang !== "js" && (nat(b) === "missing" || nat(b) === "value") && /(interface \w+ \{\s*\}|type \w+ = \{\s*\};)/.test(b.source),
+  },
+  {
+    id: "GH #159 (JS: a key added by assignment is lost in spread/print/JSON)",
+    test: (b) => div(b) && b.lang === "js" && nat(b) === "missing" && /^\s*\w+(\.\w+|\["[^"]*"\]) = (?!undefined)/m.test(b.source) && !/: undefined/.test(b.source),
+  },
+  {
+    id: "GH #160 (JS: a property explicitly holding undefined is lost as an own key)",
+    test: (b) => div(b) && b.lang === "js" && (nat(b) === "missing" || nat(b) === "value") && /(: undefined|= undefined;)/.test(b.source),
+  },
+  {
+    id: "GH #161 (JS: delete of a key holding undefined leaves the key)",
+    test: (b) => div(b) && b.lang === "js" && nat(b) === "extra" && has(b, "delete"),
   },
   {
     id: "S022 (a non-Error object payload crossing into unknown becomes an empty object)",
