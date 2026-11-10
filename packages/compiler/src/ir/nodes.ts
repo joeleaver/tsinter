@@ -394,6 +394,11 @@ export const NULL_T: IrType = { kind: "nullT" };
  * exist only inside unions: a unit-armed union instance is tag-only, so
  * wrapping allocates no payload, narrowing to a unit arm produces no value
  * (the frontend never emits it), and releasing has nothing to release. */
+/** GH #156: `dynFrom.fnProto`'s kind bits, beside its 1 / 2 prototype
+ * answer (the low two bits): an async function, a generator. */
+export const FN_PROTO_ASYNC = 4;
+export const FN_PROTO_GENERATOR = 8;
+
 export function isUnitType(t: IrType): boolean {
   return t.kind === "undefinedT" || t.kind === "nullT";
 }
@@ -4974,9 +4979,10 @@ export type IrExpr =
    * module that calls structuredClone): a function value's source text,
    * which Node's DataCloneError quotes. `fnProto`: a function value whose
    * kind is known — 1 it owns `prototype`, 2 it does not (arrows, methods,
-   * async functions). `isBuffer` (GH #138): a bytes<u8> value the checker
+   * async functions) — or'd with GH #156's kind bits FN_PROTO_ASYNC /
+   * FN_PROTO_GENERATOR (inspect's `[AsyncFunction: f]` header). `isBuffer` (GH #138): a bytes<u8> value the checker
    * types as a Buffer — the BYTES payload's Buffer flag (SEMANTICS.md S037). */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: 1 | 2; isBuffer?: true; type: IrType; loc: SrcLoc }
+  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: number; isBuffer?: true; type: IrType; loc: SrcLoc }
   /** Island value → dyn conversion (`type` is always dyn; the operand
    * is always jsval): the jsval→dyn crossing — an 'any'-typed engine
    * value flowing into an 'unknown'/'object'/JS-residue slot wraps BY

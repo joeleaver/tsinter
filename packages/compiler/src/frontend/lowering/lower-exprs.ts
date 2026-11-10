@@ -12619,7 +12619,14 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     // value IS the rejection payload (the thrown-dyn representation, so
     // identity survives to catch/unhandledRejection observers), and the
     // result is promise<dyn> when no context names a concrete one.
-    const reason = L.lowerExpr(reasonNode);
+    let reason = L.lowerExpr(reasonNode);
+    // GH #155: an undefined / null reason rejects with the dynamic
+    // undefined / null — what `throw undefined` in an async function
+    // settles with (a non-literal operand runs for its effects first).
+    if (isUnitType(reason.type)) {
+      const unit: IrExpr = { kind: "dynFrom", value: { kind: "unitLit", unit: reason.type.kind === "nullT" ? "null" : "undefined", type: reason.type, loc }, type: DYN, loc };
+      reason = reason.kind === "unitLit" ? unit : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: reason, loc }], result: unit, type: DYN, loc };
+    }
     if (reason.type.kind === "dyn") {
       // The result only ever REJECTS, so the inner type is unobservable:
       // adopt the context's promise type when one names it, else the

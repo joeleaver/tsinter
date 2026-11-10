@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -3503,20 +3503,26 @@ export class Lowerer {
   private stampCloneFunctionSources(functions: IrFunction[]): void {
     const clones = JSON.stringify(functions, (k, v) => (k === "loc" ? undefined : v)).includes('"dyn.structuredClone"');
     const byName = new Map(functions.map((f) => [f.name, f]));
-    // the function-like nodes of a file, by start: does each own `prototype`
-    const kinds = new Map<string, Map<number, 1 | 2>>();
-    const kindsOf = (file: string): Map<number, 1 | 2> => {
+    // the function-like nodes of a file, by start: does each own
+    // `prototype` (1 yes, 2 no), plus GH #156's kind bits — FN_PROTO_ASYNC
+    // and FN_PROTO_GENERATOR, what inspect's `[AsyncFunction: f]` /
+    // `[GeneratorFunction: f]` / `[AsyncGeneratorFunction: f]` header reads
+    const kinds = new Map<string, Map<number, number>>();
+    const kindsOf = (file: string): Map<number, number> => {
       const hit = kinds.get(file);
       if (hit !== undefined) return hit;
-      const m = new Map<number, 1 | 2>();
+      const m = new Map<number, number>();
       kinds.set(file, m);
       const sf = this.program.getSourceFile(file);
       if (sf === undefined) return m;
       ts.walkPreorder(sf, (n) => {
-        if (ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) m.set(n.getStart(sf), 2);
-        else if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) {
-          const async = /^(export\s+(default\s+)?)?async\b/.test(n.getText(sf));
-          m.set(n.getStart(sf), async && n.asteriskToken === undefined ? 2 : 1);
+        if (ts.isArrowFunction(n) || ts.isMethodDeclaration(n) || ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) {
+          const async = (ts.getModifiers(n) ?? []).some((x) => x.kind === ts.SyntaxKind.AsyncKeyword);
+          const gen = !ts.isArrowFunction(n) && n.asteriskToken !== undefined;
+          // Node: ordinary functions and every generator own `prototype`;
+          // arrows, methods and async functions do not.
+          const proto = gen || (!async && !ts.isArrowFunction(n) && !ts.isMethodDeclaration(n)) ? 1 : 2;
+          m.set(n.getStart(sf), proto | (async ? FN_PROTO_ASYNC : 0) | (gen ? FN_PROTO_GENERATOR : 0));
         }
         return undefined;
       });
@@ -3552,7 +3558,7 @@ export class Lowerer {
         for (const item of n) visit(item);
         return;
       }
-      const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: 1 | 2 };
+      const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: number };
       if (rec.kind === "dynFrom" && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
         const fnName = rec.value.kind === "closure" ? rec.value.fnName : boundFn.get(rec.value.localId as string);
         const loc = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;

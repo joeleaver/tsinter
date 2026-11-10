@@ -4213,6 +4213,86 @@ class Assembler {
    * `reportUncaughtHelper`, which is now just this render plus the drain
    * call plus the trap. Does not touch the drain — the caller decides
    * whether one is needed first. Returns (unlike reportUncaughtHelper). */
+  private renderUncaughtRefFunc: number | null = null;
+  /** `%w.err.renderUncaughtRef(anyref)` — GH #155: stages the text of an
+   * uncaught EXC_REF payload. A dynamic primitive renders as its String()
+   * (undefined, null, a boolean, a number, a string raw — the scalar arms'
+   * own spellings); anything else stays S007's "[object]". Its body is
+   * built LATE (after every function is walked): only then is it known
+   * whether the module boxes dynamic values at all, and a module that
+   * never does cannot hold one in the cell. */
+  private renderUncaughtRefHelper(): number {
+    if (this.renderUncaughtRefFunc !== null) return this.renderUncaughtRefFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([ANY_REF], []), "%w.err.renderUncaughtRef");
+    this.renderUncaughtRefFunc = idx;
+    const build = (): void => {
+      const out = this.ensureHelpers();
+      const c = new Code();
+      const lit = (s: string): void => {
+        this.pushStrLitInto(c, s);
+        c.call(out.stage);
+      };
+      if (this.dynField === null) {
+        lit("[object]");
+        this.mb.setBody(idx, [], c.bytes());
+        return;
+      }
+      const dyn = this.dynField;
+      const dynT = dyn.dynT();
+      const D = 1;
+      const K = 2;
+      c.localGet(0);
+      c.refTest(dynT);
+      c.ifVoid();
+      c.localGet(0);
+      c.refCast(dynT);
+      c.localSet(D);
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      const arm = (k: number, body: () => void): void => {
+        c.localGet(K);
+        c.i32Const(k);
+        c.i32Eq();
+        c.ifVoid();
+        body();
+        c.return_();
+        c.end();
+      };
+      arm(DK.UNDEF, () => lit("undefined"));
+      arm(DK.NULL, () => lit("null"));
+      arm(DK.BOOL, () => {
+        c.localGet(D);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifVoid();
+        lit("true");
+        c.else_();
+        lit("false");
+        c.end();
+      });
+      arm(DK.NUM, () => {
+        c.localGet(D);
+        c.structGet(dynT, DYN_NUM);
+        c.call(this.f64ToStrHelper());
+        c.call(out.stage);
+      });
+      arm(DK.STR, () => {
+        c.localGet(D);
+        c.structGet(dynT, DYN_REF);
+        emitFlatCast(c, this.strType);
+        c.call(out.stage);
+      });
+      c.end();
+      lit("[object]");
+      this.mb.setBody(idx, [dyn.dynRef(), I32], c.bytes());
+    };
+    if (this.lateBuildsDone) build();
+    else this.lateBuilds.push(build);
+    return idx;
+  }
+
   private renderUncaughtHelper(): number {
     if (this.renderUncaughtFunc !== null) return this.renderUncaughtFunc;
     const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.err.renderUncaught");
@@ -4310,8 +4390,19 @@ class Assembler {
     c.call(out.stage);
     c.end();
     c.else_();
+    c.localGet(K);
+    c.i32Const(EXC_REF);
+    c.i32Eq();
+    c.ifVoid();
+    // GH #155: a dynamic value rides the ref arm (`throw undefined`,
+    // `throw null`, a thrown JSON.parse result): its primitives render as
+    // the other arms render theirs.
+    c.globalGet(exc.refG);
+    c.call(this.renderUncaughtRefHelper());
+    c.else_();
     this.pushStrLitInto(c, "[object]");
     c.call(out.stage);
+    c.end();
     c.end(); // closes EXC_OBJ's ifVoid [E]
     c.end(); // closes EXC_STR's ifVoid [D]
     c.end(); // closes EXC_BOOL's ifVoid [B]
@@ -6118,6 +6209,7 @@ class Assembler {
     // INC-29 U2: bodies built last (http.ts's drain: its checkpoint must
     // see every queue the module ended up with).
     for (let i = 0; i < this.lateBuilds.length; i++) this.lateBuilds[i]!();
+    this.lateBuildsDone = true;
     this.emitStatus();
     this.mb.exportMemory(EXPORT_MEMORY);
   }
@@ -14019,6 +14111,9 @@ class Assembler {
 
   /** Bodies built after the walk (registerLate). */
   private readonly lateBuilds: (() => void)[] = [];
+  /** Set once `run` has drained `lateBuilds`: a body registered after that
+   * builds at once. */
+  private lateBuildsDone = false;
 
   private httpField: HttpBuilder | null = null;
 

@@ -1059,6 +1059,14 @@ function parseInspectOptions(L: Lowerer, node: ts.Expression | undefined, recurs
   return depth;
 }
 
+/** GH #156: the constructor name Node's inspect header spells for a
+ * function literal or declaration — its kind. */
+function fnKindWord(fn: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction): string {
+  const async = (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+  const gen = !ts.isArrowFunction(fn) && fn.asteriskToken !== undefined;
+  return `${async ? "Async" : ""}${gen ? "Generator" : ""}Function`;
+}
+
 /** `util.inspect(fn)` / `util.inspect(Cls)` over a DIRECT identifier
  * naming a declared function or class: the name is compile-time truth,
  * so `[Function: name]` / `[class X extends Y]` bake as literals. Null
@@ -1082,7 +1090,7 @@ function directCallableInspect(L: Lowerer, node: ts.Expression, loc: SrcLoc): Ir
   const decl = L.checker.declarationsOf(sym)[0];
   if (!decl) return null;
   if (ts.isFunctionDeclaration(decl) && decl.name) {
-    return str(`[Function: ${decl.name.text}]`, loc);
+    return str(`[${fnKindWord(decl)}: ${decl.name.text}]`, loc);
   }
   if (
     ts.isVariableDeclaration(decl) &&
@@ -1093,7 +1101,7 @@ function directCallableInspect(L: Lowerer, node: ts.Expression, loc: SrcLoc): Ir
     // JS name inference: the binding names the function value — unless
     // the function expression carries its OWN name, which wins.
     const own = ts.isFunctionExpression(decl.initializer) ? decl.initializer.name?.text : undefined;
-    return str(`[Function: ${own ?? decl.name.text}]`, loc);
+    return str(`[${fnKindWord(decl.initializer)}: ${own ?? decl.name.text}]`, loc);
   }
   return null;
 }
@@ -1117,7 +1125,8 @@ function lowerInspectCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrE
   }
   if (ts.isArrowFunction(valueNode) || ts.isFunctionExpression(valueNode)) {
     parseInspectOptions(L, expr.arguments[1], false);
-    return str(valueNode.kind === ts.SyntaxKind.FunctionExpression && (valueNode as ts.FunctionExpression).name ? `[Function: ${(valueNode as ts.FunctionExpression).name!.text}]` : "[Function (anonymous)]", loc);
+    const word = fnKindWord(valueNode);
+    return str(valueNode.kind === ts.SyntaxKind.FunctionExpression && (valueNode as ts.FunctionExpression).name ? `[${word}: ${(valueNode as ts.FunctionExpression).name!.text}]` : `[${word} (anonymous)]`, loc);
   }
   const value = L.lowerExpr(valueNode);
   if (value.type.kind === "bytes") {
