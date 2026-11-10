@@ -344,7 +344,8 @@ export interface DynDeps {
    * brings its low half along). The ITERATION surfaces walk code POINTS,
    * unlike the keyed read's code units. */
   strCpAt: () => number;
-  /** The builtin error struct (`class:err`): `{ vt, name, message, %code }`.
+  /** The builtin error struct (`class:err`): `{ vt, name, message, %code,
+   * encoding }` (GH #146: errBox).
    * The `%error` encoding reads name/message/%code out of it, and a user
    * `extends Error` class SUBTYPES it, so one parameter type takes every
    * error this tier can build. */
@@ -354,6 +355,10 @@ export interface DynDeps {
   errName: () => number;
   errMessage: () => number;
   errCode: () => number;
+  /** GH #146: errT's mutable eqref slot holding the error's `%error`
+   * encoding once it has crossed (null until then) — fromError's O(1)
+   * identity. */
+  errBox: () => number;
   /** Fill the exception cell with a fresh error of `className` (its `name`
    * is the JS-visible spelling), message built at runtime. The plain-Error
    * twin of `throwTypeError`: the invoke surface's "not supported yet"
@@ -5832,34 +5837,12 @@ export class DynBuilder {
    * caught error reads the members a dynamic write changed). */
   errBoxOf(): number {
     return this.cached("errBoxOf", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [this.dynRef()], (idx) => {
-      const entryT = this.errDynT();
-      const head = this.errDynHead();
+      // GH #146: the error's own slot (fromError).
       const c = new Code();
-      const N = 1;
-      c.globalGet(head);
-      c.localSet(N);
-      c.block();
-      c.loop();
-      c.localGet(N);
-      c.refIsNull();
-      c.brIf(1);
-      c.localGet(N);
-      c.structGet(entryT, 0);
       c.localGet(0);
-      c.refEq();
-      c.ifVoid();
-      c.localGet(N);
-      c.structGet(entryT, 1);
-      c.return_();
-      c.end();
-      c.localGet(N);
-      c.structGet(entryT, 2);
-      c.localSet(N);
-      c.br(0);
-      c.end();
-      c.end();
-      c.refNull(this.dynT());
-      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
+      c.structGet(this.deps.errT(), this.deps.errBox());
+      c.refCastNull(this.dynT());
+      this.mb.setBody(idx, [], c.bytes());
     });
   }
 
@@ -9205,18 +9188,21 @@ export class DynBuilder {
    * Both producers (`caughtToDyn` and the error-rooted `dynFrom`) build it
    * HERE, through one cache, because JS identity says the same error is
    * one value however often it crosses: `scr_dyn_from_error`'s
-   * `scr_errdyn_cache` answered that natively and this is the same
-   * algorithm — a linear scan, an entry per error, alive for the process.
-   * Without it `x === y` over two crossings of one error would answer
-   * false where BOTH Node and the C lane answer true, which is the
-   * cross-lane disagreement S014's rationale rules out.
+   * `scr_errdyn_cache` answered that natively. Without it `x === y` over
+   * two crossings of one error would answer false where BOTH Node and the
+   * C lane answer true, which is the cross-lane disagreement S014's
+   * rationale rules out.
    *
-   * The cache is a LIST, not C's growable array, purely because a list
-   * needs no growth arithmetic; it asks the identical question by the
-   * identical scan. It deliberately does not live on `errT` — appending a
-   * slot there would land inside the field prefix a user `extends Error`
-   * class subtypes (emitter.ts's errFields), and this cache is not part of
-   * an error's shape. */
+   * GH #146: the answer lives ON the error — errT's encoding slot
+   * (deps.errBox, emitter.ts ERR_BOX), written by the first crossing — so
+   * a crossing is constant time and the encoding lives as long as its
+   * error. (It used to be C's algorithm, a linear scan of a process-long
+   * list with an entry per error, which made a loop of fresh crossings
+   * quadratic.) A user `extends Error` class carries the slot in errT's
+   * prefix; its own fields start past it (classes.ts plan). The list
+   * remains for the one pairing the slot cannot answer backwards: an
+   * ALIEN `%error` object's rebuilt error (errCachePut), found from the
+   * object by toError's scan. */
 
   private errLinkType: number | null = null;
   /** `$errLink` — the marker's payload: the error, and the encoding it
@@ -9280,35 +9266,23 @@ export class DynBuilder {
       [this.dynRef()],
       (idx) => {
         const errT = this.deps.errT();
-        const entryT = this.errDynT();
-        const head = this.errDynHead();
         const c = new Code();
-        const N = 1;
+        const B = 1;
         const O = 2;
         const D = 3;
         const S = 4;
-        // The scan: this error's box if it has one already.
-        c.globalGet(head);
-        c.localSet(N);
-        c.block();
-        c.loop();
-        c.localGet(N);
-        c.refIsNull();
-        c.brIf(1);
-        c.localGet(N);
-        c.structGet(entryT, 0);
+        // GH #146: this error's box if it has one already — its own slot,
+        // constant time (the list scan this replaces made a loop of fresh
+        // crossings quadratic).
         c.localGet(0);
-        c.refEq();
+        c.structGet(errT, this.deps.errBox());
+        c.localTee(B);
+        c.refIsNull();
+        c.i32Eqz();
         c.ifVoid();
-        c.localGet(N);
-        c.structGet(entryT, 1);
+        c.localGet(B);
+        c.refCast(this.dynT());
         c.return_();
-        c.end();
-        c.localGet(N);
-        c.structGet(entryT, 2);
-        c.localSet(N);
-        c.br(0);
-        c.end();
         c.end();
         // A first crossing builds the encoding.
         this.pushNewObj(c, false);
@@ -9369,14 +9343,12 @@ export class DynBuilder {
         // Publish before answering, so the next crossing finds it.
         c.localGet(0);
         c.localGet(D);
-        c.globalGet(head);
-        c.structNew(entryT);
-        c.globalSet(head);
+        c.structSet(errT, this.deps.errBox());
         c.localGet(D);
         this.mb.setBody(
           idx,
           [
-            { kind: "ref", nullable: true, typeIndex: entryT },
+            { kind: "ref", nullable: true, typeIndex: EQ_HEAP },
             this.objRef(),
             this.dynRef(),
             this.deps.strRef(),
@@ -9391,7 +9363,8 @@ export class DynBuilder {
    * of the identity cache fromError and toError scan (INC-27 U5): the
    * rebuilt error of an ALIEN `%error` object (the emitter's
    * errFromDynHelper, C's scr_errdyn_put) so its next crossing answers
-   * the same box. */
+   * the same box. GH #146: the error's own slot answers fromError, and
+   * the list (now holding these alien pairs only) answers toError. */
   errCachePut(): number {
     return this.cached(
       "errCachePut",
@@ -9401,6 +9374,9 @@ export class DynBuilder {
         const entryT = this.errDynT();
         const head = this.errDynHead();
         const c = new Code();
+        c.localGet(0);
+        c.localGet(1);
+        c.structSet(this.deps.errT(), this.deps.errBox());
         c.localGet(0);
         c.localGet(1);
         c.globalGet(head);
@@ -9418,19 +9394,10 @@ export class DynBuilder {
    * so a truthy-and-`isError()` argument needs to unbox back to the
    * SAME real instance, not a reconstruction — Node's own `cb(existingErr)`
    * observably preserves identity, e.g. a later `err === original`
-   * check). Only `caughtToDyn`/the error-rooted `dynFrom` ever mint the
-   * `$errDyn` cache entries `fromError()` builds (its own header), and
-   * BOTH of those run at the boxing call site whenever a real errRef
-   * crosses INTO dyn — including the ordinary case this phase's own
-   * adapters produce it: the user's `cb(new Error(...))` argument is a
-   * concrete `%Error`-typed expression at the CALL site (inside their
-   * own dyn-boundary closure), so the frontend's normal `dynFrom` lowering
-   * already boxes it via `fromError()` before it ever reaches `arrPush` —
-   * meaning the cache entry this scan needs already exists by construction,
-   * not something this method has to create. The SAME linear scan
-   * `fromError()` runs, comparing the OTHER field (dynRef here, errRef
-   * there) — mirrored, not reimplemented independently, so a future
-   * change to the entry shape only has one scan pattern to keep in sync. */
+   * check). A real encoding (fromError's) answers through its marker's
+   * link (GH #137), constant time; the scan below finds only the alien
+   * pairs errCachePut enters (GH #146: fromError no longer lists its
+   * own). */
   toError(): number {
     return this.cached(
       "toError",

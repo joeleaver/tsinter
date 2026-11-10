@@ -95,6 +95,10 @@ export const FETCH_CLASS_NAMES: readonly (readonly [number, string])[] = [
   [TAG_ARRAYBUFFER, "ArrayBuffer"],
 ];
 
+/** The abstract `eq` heap type: errT's encoding slot (emitter.ts ERR_BOX,
+ * GH #146) starts null in every error built here. */
+const EQ_HEAP = -0x13;
+
 /* The import's ops (abi.ts). */
 const OP_START = 1;
 const OP_ABORT = 2;
@@ -564,7 +568,7 @@ export class FetchBuilder {
 
   /** A builtin error value of `className`, message `msg`, no code. */
   private newErr($: A, className: string, name: string, msg: X): X {
-    return $.new_(this.deps.errT(), $.g(this.deps.vtGlobal(className)), this.lit($, name), msg, $.nul(this.deps.strType()));
+    return $.new_(this.deps.errT(), $.g(this.deps.vtGlobal(className)), this.lit($, name), msg, $.nul(this.deps.strType()), $.nul(EQ_HEAP));
   }
 
   /* ── the error a host answers ──────────────────────────────────────── */
@@ -578,11 +582,11 @@ export class FetchBuilder {
       $.put(CODE, $.sel(this.strRef, $.eq($.alen($.l(2)), $.i(0)), $.nul(this.deps.strType()), $.l(2)));
       for (const cls of ["TypeError", "RangeError", "SyntaxError"]) {
         $.if(this.streq($, $.l(0), this.lit($, cls)), () =>
-          $.ret($.new_(this.deps.errT(), $.g(this.deps.vtGlobal(`%${cls}`)), $.l(0), $.l(1), $.l(CODE))),
+          $.ret($.new_(this.deps.errT(), $.g(this.deps.vtGlobal(`%${cls}`)), $.l(0), $.l(1), $.l(CODE), $.nul(EQ_HEAP))),
         );
       }
       // GH #141: an Error carrying the host's name is tagged by it.
-      $.do($.new_(this.deps.errT(), $.raw((c) => this.deps.plainErrVtByName(c, 0)), $.l(0), $.l(1), $.l(CODE)));
+      $.do($.new_(this.deps.errT(), $.raw((c) => this.deps.plainErrVtByName(c, 0)), $.l(0), $.l(1), $.l(CODE), $.nul(EQ_HEAP)));
     });
   }
 
@@ -619,7 +623,7 @@ export class FetchBuilder {
       // of the cause (class:fetchCause subtypes the builtin error).
       $.put(TOP, $.call(this.errByNameFn(), $.l(NAME), $.l(MSG), $.anew(this.deps.strType(), $.i(0))));
       const ET = this.deps.errT();
-      $.do($.new_(this.deps.causeT(), $.get(ET, 0, $.l(TOP)), $.get(ET, 1, $.l(TOP)), $.get(ET, 2, $.l(TOP)), $.get(ET, 3, $.l(TOP)), $.l(CAUSE)));
+      $.do($.new_(this.deps.causeT(), $.get(ET, 0, $.l(TOP)), $.get(ET, 1, $.l(TOP)), $.get(ET, 2, $.l(TOP)), $.get(ET, 3, $.l(TOP)), $.nul(EQ_HEAP), $.l(CAUSE)));
     });
   }
 

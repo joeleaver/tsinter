@@ -93,6 +93,12 @@ export const VTT_SLOT0 = 2;
 export const CLASSOBJ_CTOR = 2;
 export const CLASSOBJ_NAME = 3;
 
+/** %Error's IR fields (name, message, %code): the first flattened fields of
+ * every error-rooted class, errT's slots 1..3. errT's slots past them
+ * (GH #146: the encoding slot) are emitter-owned, placed after these, and
+ * seeded null at every allocation (emitter.ts emitAlloc). */
+export const ERR_IR_FIELDS = 3;
+
 /** One emitted class's wasm shape. */
 export interface ClassInfo {
   meta: LlClassMeta;
@@ -571,18 +577,21 @@ export class ClassBuilder {
     const streamRooted = kind === "stream";
     const prefixCount = (meta.hierarchy ? 1 : 0) + (emitterRooted ? 2 : 0) + (streamRooted ? 1 : 0);
     const fieldBase = prefixCount;
-    const info: ClassInfo = {
-      meta,
-      struct,
-      fieldIndex: new Map(meta.def.fields.map((f, i) => [f.name, fieldBase + i])),
-      fieldType: new Map(meta.def.fields.map((f) => [f.name, f.type])),
-    };
-    this.infos.set(name, info);
     // An error-rooted class SUBTYPES errT, so its first three flattened
     // fields — %Error's name/message/%code — are errT's own declarations
     // verbatim. Re-mapping them would spell `%code` mutable and break the
-    // subtype match; past the prefix the ordinary map takes over.
-    const errPrefix = this.rootKind(meta) === "error" ? this.deps.errStruct().fields : null;
+    // subtype match; past the prefix the ordinary map takes over. errT's
+    // slots past those three (GH #146: the encoding slot) are not IR
+    // fields: the class's own fields start after them (`errSkip`).
+    const errPrefix = kind === "error" ? this.deps.errStruct().fields : null;
+    const errSkip = errPrefix === null ? 0 : errPrefix.length - 1 - ERR_IR_FIELDS;
+    const info: ClassInfo = {
+      meta,
+      struct,
+      fieldIndex: new Map(meta.def.fields.map((f, i) => [f.name, fieldBase + i + (i >= ERR_IR_FIELDS ? errSkip : 0)])),
+      fieldType: new Map(meta.def.fields.map((f) => [f.name, f.type])),
+    };
+    this.infos.set(name, info);
     const fields: FieldType[] = [];
     if (meta.hierarchy) fields.push({ storage: this.ciRef(), mutable: false });
     if (emitterRooted) {
@@ -593,8 +602,10 @@ export class ClassBuilder {
       fields.push({ storage: this.deps.streamStateRef(), mutable: true });
     }
     meta.def.fields.forEach((f, i) => {
-      fields.push(errPrefix?.[i + 1] ?? { storage: this.deps.softType(f.type), mutable: true });
+      if (errPrefix !== null && i === ERR_IR_FIELDS) fields.push(...errPrefix.slice(1 + ERR_IR_FIELDS));
+      fields.push((i < ERR_IR_FIELDS ? errPrefix?.[i + 1] : undefined) ?? { storage: this.deps.softType(f.type), mutable: true });
     });
+    if (errPrefix !== null && meta.def.fields.length === ERR_IR_FIELDS) fields.push(...errPrefix.slice(1 + ERR_IR_FIELDS));
     this.mb.defineType(struct, {
       kind: "struct",
       fields,

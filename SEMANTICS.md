@@ -1504,6 +1504,15 @@ still serialize the members.
 (the hidden `stack` included) and `wasm-emitter.test.ts`'s "S021
 amendment" row; the assigned-`name` residue is measured, not pinned.
 
+**Note (GH #146, wasm and wasm-native; no observable change): the
+identity cache is now a slot on the error.** The encoding an error's
+first crossing builds is kept in the error itself, so every later
+crossing finds it in constant time and the encoding lives exactly as long
+as its error. The per-error list scan it replaces (C's
+`scr_errdyn_cache` algorithm) made a loop of fresh crossings quadratic.
+Identity (`===` over two crossings) answers as before. **Tested by:**
+`packages/compiler/test/wasm-gh146-error-crossing-time.test.ts`.
+
 **Amendment (GH #135): an error reached as a dynamic value has no
 `stack`.** The encoding carries no `stack` member (S027: there are no
 frames to put in one), so `e.stack` on a caught error in a JavaScript
@@ -1990,7 +1999,7 @@ prints `[MyType [TypeError]: m]`; a TypeError renamed `MyError` prints
 `[TypeError [MyError]: t]`). Node prints these properties, and they end
 the program at a named fence (S122) here: any own member beyond `name`,
 `message` and a string `code`; a non-string `name` (Node: `[5
-[TypeError]: t]`); a name that prints empty (Node: `[t]`); an own
+[TypeError]: t]`); an own
 `stack` other than `""`; a `cause` or `errors` member; and an error
 whose class this tier cannot name (a class declaring a static `name`). A
 DOMException renders through the static rules above (`[DOMException
@@ -2000,6 +2009,31 @@ an own member beyond its name, message, code and cause fences. Node prints the e
 runtime-built AggregateError prints without Node's `[errors]` key.
 **Tested by:** `packages/compiler/test/wasm-gh137-error-string.test.ts`
 (GH137-JS-05..12, GH137-TS-01, TS-04; wasm and wasm-native).
+
+**Amendment (GH #147, wasm and wasm-native): a statically typed error
+prints Node's header too.** The rendering above printed a typed error's
+`name` as it stood, so a TypeError renamed `MyError` printed `[MyError:
+t]` where Node prints `[TypeError [MyError]: t]`, and a URIError renamed
+`Error` printed `[Error: URI malformed]` where Node prints `[URIError: URI
+malformed]`. Typed and dynamic errors now share one implementation of the
+improveStack rule above, over the class the error was built as (S015's
+GH #141 class tags: a plain Error the runtime built as a URIError
+answers URIError). The paragraph's "only the BUILTIN classes reach this
+rendering" still holds for the static path (inspecting a user error
+subclass stays fenced in the frontend). Two corrections ride along, both
+to Node's answer: a name that prints empty renders the message alone
+(`[t]`; both paths — the dynamic path's fence for it is gone), and beyond
+the depth budget an error with a `code` collapses to its CONSTRUCTOR's
+name, as the dynamic path already did (`{ a: { b: { e: [RangeError] } }
+}` for a RangeError renamed `MyError`, where this printed `[MyError]`).
+Where the rule needs the constructor and this tier cannot name it (a
+plain Error rebuilt from a host's or the embedded engine's name: S015,
+S098 (c)), the program ends at a named fence instead of printing a guess:
+`inspecting an error renamed to a name ending in 'Error' whose class this
+tier cannot name ...`, and `inspecting an error with a code beyond the
+depth limit whose class this tier cannot name ...`. **Tested by:**
+`packages/compiler/test/wasm-gh147-error-inspect-header.test.ts`
+(GH147-TS-01..05, GH147-JS-01) and GH137-JS-10; wasm and wasm-native.
 
 ## S028 — Grid-grouping DISPLAY WIDTH uses Node's non-ICU tables, un-normalized *(wasm tier)*
 

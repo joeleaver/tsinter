@@ -87,6 +87,7 @@ import {
   CLASSOBJ_CTOR,
   CLASSOBJ_NAME,
   CLASS_VT,
+  ERR_IR_FIELDS,
   VTT_SLOT0,
   ClassBuilder,
   type ClassInfo,
@@ -2124,6 +2125,16 @@ const EXC_GENRET = 6;
 const ERR_NAME = 1;
 const ERR_MESSAGE = 2;
 const ERR_CODE = 3;
+/* GH #146: the error's own `%error` encoding once it has crossed into a
+ * dynamic value (eqref, null until then) — dyn.fromError's O(1) identity.
+ * Not an IR field: a user `extends Error` class's own fields start past it
+ * (classes.ts plan), and every `struct.new` of errT seeds it null. */
+const ERR_BOX = 4;
+/** errT's subtypes' own fields, past errT's five: class:domex's hasCause
+ * and cause, class:fetchCause's cause. */
+const DOMEX_HAS_CAUSE = 5;
+const DOMEX_CAUSE = 6;
+const FETCH_CAUSE = 5;
 
 /** INC-27 U5: the named run-time refusal a null-prototype object meets at
  * every ToString (String(), a template, `+` with a string, join, a
@@ -3576,11 +3587,14 @@ class Assembler {
       // name/message/%code). Hence OPEN rather than final. `name` and
       // `message` are MUTABLE — Node's are plain writable fields and the
       // IR's class def declares them so; vt and %code are stamped once.
+      // GH #146: then the encoding slot (ERR_BOX), written once by the
+      // error's first crossing into a dynamic value.
       const errFields: FieldType[] = [
         { storage: this.classes.ciRef(), mutable: false },
         { storage: strRef, mutable: true },
         { storage: strRef, mutable: true },
         { storage: strRef, mutable: false },
+        { storage: EQ_REF, mutable: true },
       ];
       const errT = this.mb.openStructType("class:err", errFields);
       const kindG = this.mb.addGlobal(I32, true, (w) => {
@@ -3733,6 +3747,7 @@ class Assembler {
     pushMessage(c);
     if (codeLit !== null) this.pushStrLitInto(c, codeLit);
     else c.refNull(this.strType);
+    c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
     c.structNew(exc.errT);
     c.globalSet(exc.refG);
     // The class is known exactly here, so the cell's interval position is
@@ -3764,6 +3779,7 @@ class Assembler {
     this.pushStrLitInto(c, name);
     pushMessage(c);
     pushCode(c);
+    c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
     c.structNew(exc.errT);
     c.globalSet(exc.refG);
     const meta = this.classes.meta(className);
@@ -4402,27 +4418,19 @@ class Assembler {
    * constructor's: the constructor alone when it contains the name
    * (`class AppError extends Error {}` → `AppError`), else
    * `Constructor [name]` (`TypeError [MyError]`). A constructor this tier
-   * cannot name is a named fence. */
+   * cannot name is a named fence (errImproveHeadHelper, shared with the
+   * typed path, GH #147). */
   private errInspectHeadHelper(): number {
     if (this.errInspectHeadFn !== null) return this.errInspectHeadFn;
     const dynRef = this.dyn.dynRef();
     const dynT = this.dyn.dynT();
-    const exc = this.exc();
-    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
     const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [this.strRef]), "%w.err.inspectHead");
     this.errInspectHeadFn = idx;
     const w = this.newWalker(1);
     const c = w.c;
     const hs = this.wlocal(w, this.strRef);
     const fname = this.wlocal(w, this.strRef);
-    const ctor = this.wlocal(w, this.strRef);
-    const er = this.wlocal(w, errRef);
     const m = this.wlocal(w, dynRef);
-    const fence = (text: string): void => {
-      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, text), null);
-      c.refNull(this.strType);
-      c.return_();
-    };
     this.dyn.objPayload(c, (x) => x.localGet(0));
     c.call(this.dyn.errNamePart());
     c.localSet(hs);
@@ -4445,43 +4453,82 @@ class Assembler {
     c.localGet(hs);
     c.end();
     c.localSet(fname);
-    // The rewrite applies only when the printed header IS that name
-    // (stack.startsWith(name)) and the name ends in "Error".
+    c.localGet(0);
+    c.call(this.dyn.toError());
     c.localGet(hs);
     c.localGet(fname);
+    c.call(this.errImproveHeadHelper("dyn"));
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  private errImproveHeadFns = new Map<string, number>();
+  /** GH #137, #147: `(err | null, header, name) -> str` — Node's
+   * improveStack (lib/internal/util/inspect.js) over an error's printed
+   * header (Error.prototype.toString's name side) and its `name`: when
+   * the header IS the name (stack.startsWith(name)) and the name ends in
+   * "Error" and differs from the constructor's, the constructor alone
+   * when it contains the name (`class AppError extends Error {}` →
+   * `AppError`), else `Constructor [name]` (`TypeError [MyError]`). Where
+   * the rule fires and this tier cannot name the constructor (no error,
+   * errClassNameHelper's null), a named fence; `where` picks its words
+   * (an error held in a dynamic value, or a typed one). */
+  private errImproveHeadHelper(where: "dyn" | "typed"): number {
+    const hit = this.errImproveHeadFns.get(where);
+    if (hit !== undefined) return hit;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef, this.strRef], [this.strRef]), `%w.err.improveHead:${where}`);
+    this.errImproveHeadFns.set(where, idx);
+    const w = this.newWalker(3);
+    const c = w.c;
+    const ER = 0;
+    const HS = 1;
+    const FNAME = 2;
+    const ctor = this.wlocal(w, this.strRef);
+    const fence = (text: string): void => {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, text), null);
+      c.refNull(this.strType);
+      c.return_();
+    };
+    // The rewrite applies only when the printed header IS that name
+    // (stack.startsWith(name)) and the name ends in "Error".
+    c.localGet(HS);
+    c.localGet(FNAME);
     c.call(this.strEqHelper());
-    c.localGet(fname);
+    c.localGet(FNAME);
     this.pushStrLitInto(c, "Error");
     c.call(this.strs.endsWith());
     c.i32And();
     c.i32Eqz();
     c.ifVoid();
-    c.localGet(hs);
+    c.localGet(HS);
     c.return_();
     c.end();
-    c.localGet(0);
-    c.call(this.dyn.toError());
-    c.localTee(er);
+    c.localGet(ER);
     c.refIsNull();
     c.ifVoid();
     fence("inspecting an error held in a dynamic value whose class this tier cannot name is not supported yet");
     c.end();
-    c.localGet(er);
+    c.localGet(ER);
     c.call(this.errClassNameHelper());
     c.localTee(ctor);
     c.refIsNull();
     c.ifVoid();
-    fence("inspecting an error held in a dynamic value whose class this tier cannot name (a DOMException, a class with a static 'name') is not supported yet");
+    fence(
+      where === "dyn"
+        ? "inspecting an error held in a dynamic value whose class this tier cannot name (a DOMException, a class with a static 'name') is not supported yet"
+        : "inspecting an error renamed to a name ending in 'Error' whose class this tier cannot name (one rebuilt from a host's or the embedded engine's name and message, a class with a static 'name') is not supported yet",
+    );
     c.end();
     c.localGet(ctor);
-    c.localGet(fname);
+    c.localGet(FNAME);
     c.call(this.strEqHelper());
     c.ifVoid();
-    c.localGet(hs);
+    c.localGet(HS);
     c.return_();
     c.end();
     c.localGet(ctor);
-    c.localGet(fname);
+    c.localGet(FNAME);
     c.f64Const(0);
     c.call(this.strs.indexOf());
     c.f64Const(-1);
@@ -4492,11 +4539,57 @@ class Assembler {
     c.localGet(ctor);
     this.pushStrLitInto(c, " [");
     c.call(this.concatHelper());
-    c.localGet(fname);
+    c.localGet(FNAME);
     c.call(this.concatHelper());
     this.pushStrLitInto(c, "]");
     c.call(this.concatHelper());
     c.end();
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  private errTypedHeadFn: number | null = null;
+  /** GH #147: `(err) -> str` — the header util.inspect prints for an error
+   * before `: message` (inspect.ts error()): its `name` slot, which is
+   * Error.prototype.toString's name side for a string name ("" prints
+   * `[message]`), under Node's improveStack rule (errImproveHeadHelper). */
+  private errTypedHeadHelper(): number {
+    if (this.errTypedHeadFn !== null) return this.errTypedHeadFn;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.typedHead");
+    this.errTypedHeadFn = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.localGet(0);
+    c.structGet(this.exc().errT, ERR_NAME);
+    c.localGet(0);
+    c.structGet(this.exc().errT, ERR_NAME);
+    c.call(this.errImproveHeadHelper("typed"));
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private errTypedCtorFn: number | null = null;
+  /** GH #147: `(err) -> str` — the constructor's name Node prints for an
+   * error with extra properties beyond the depth budget (getCtxName:
+   * `[TypeError]` for a renamed TypeError with a code), a named fence
+   * where this tier cannot name the class. */
+  private errTypedCtorHelper(): number {
+    if (this.errTypedCtorFn !== null) return this.errTypedCtorFn;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [this.strRef]), "%w.err.typedCtor");
+    this.errTypedCtorFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const nm = this.wlocal(w, this.strRef);
+    c.localGet(0);
+    c.call(this.errClassNameHelper());
+    c.localTee(nm);
+    c.refIsNull();
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "inspecting an error with a code beyond the depth limit whose class this tier cannot name (one rebuilt from a host's or the embedded engine's name and message, a class with a static 'name') is not supported yet"), null);
+    c.end();
+    c.localGet(nm);
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
   }
@@ -4612,8 +4705,8 @@ class Assembler {
 
   private fetchCauseType: number | null = null;
 
-  /** `class:fetchCause` (#227) — errT's four fields, then the host's
-   * `cause` (an error, field 4): fetch's "fetch failed" TypeError and the
+  /** `class:fetchCause` (#227) — errT's five fields, then the host's
+   * `cause` (an error, field 5: FETCH_CAUSE): fetch's "fetch failed" TypeError and the
    * request-construction errors that carry one. */
   private fetchCauseT(): number {
     if (this.fetchCauseType !== null) return this.fetchCauseType;
@@ -4686,11 +4779,11 @@ class Assembler {
     return this.fetchField;
   }
 
-  /** `class:domex` — errT's four fields, then `hasCause` (i32, the
+  /** `class:domex` — errT's five fields, then `hasCause` (i32, the
    * PRESENCE of the options bag's own `cause` member: an explicit
    * `cause: undefined` counts) and `cause` (the value, the undefined
    * singleton when absent). Both immutable: Node's `cause` is fixed at
-   * construction. Field indices 4 and 5. */
+   * construction. Field indices 5 and 6 (DOMEX_HAS_CAUSE, DOMEX_CAUSE). */
   private domexT(): number {
     if (this.domexType !== null) return this.domexType;
     const exc = this.exc();
@@ -4926,6 +5019,7 @@ class Assembler {
     c.localGet(NAME);
     c.localGet(MSG);
     c.refNull(this.strType);
+    c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
     c.localGet(HC);
     c.localGet(CAUSE);
     c.structNew(domexT);
@@ -4977,7 +5071,7 @@ class Assembler {
     c.ifResult(I32);
     c.localGet(slot);
     c.refCast(domexT);
-    c.structGet(domexT, 4);
+    c.structGet(domexT, DOMEX_HAS_CAUSE);
     c.else_();
     c.i32Const(0);
     c.end();
@@ -4992,7 +5086,7 @@ class Assembler {
     c.ifResult(this.dyn.dynRef());
     c.localGet(slot);
     c.refCast(domexT);
-    c.structGet(domexT, 5);
+    c.structGet(domexT, DOMEX_CAUSE);
     c.else_();
     c.globalGet(this.dyn.undefinedGlobal());
     c.end();
@@ -5082,6 +5176,7 @@ class Assembler {
       c.localGet(M);
       c.end();
       c.localGet(CD);
+      c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
       c.structNew(exc.errT);
       c.localSet(E);
     };
@@ -5313,6 +5408,7 @@ class Assembler {
       c.localGet(0);
       c.structGet(exc.errT, ERR_MESSAGE);
       c.refNull(this.strType);
+      c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
       c.structNew(exc.errT);
       c.localSet(R);
     };
@@ -8513,6 +8609,7 @@ class Assembler {
       c.localGet(A);
       c.localGet(B);
       c.localGet(CODE);
+      c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
       c.structNew(exc.errT);
       c.globalSet(exc.refG);
       const meta = this.classes.meta(cls);
@@ -8786,6 +8883,7 @@ class Assembler {
         pushMessage(c);
         if (codeLit !== null) this.pushStrLitInto(c, codeLit);
         else c.refNull(this.strType);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(exc.errT);
       },
       setUncaughtError: (c, pushErr) => {
@@ -10597,6 +10695,7 @@ class Assembler {
       errName: () => ERR_NAME,
       errMessage: () => ERR_MESSAGE,
       errCode: () => ERR_CODE,
+      errBox: () => ERR_BOX,
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
       fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
@@ -10655,7 +10754,7 @@ class Assembler {
                 this.pushStrLitInto(c, "cause");
                 c.localGet(errLocal);
                 c.refCast(causeT);
-                c.structGet(causeT, 4);
+                c.structGet(causeT, FETCH_CAUSE);
                 c.call(this.dynField!.fromError());
                 c.call(this.dynField!.objPut());
                 c.end();
@@ -10792,6 +10891,8 @@ class Assembler {
       errName: () => ERR_NAME,
       errMessage: () => ERR_MESSAGE,
       errCode: () => ERR_CODE,
+      errHead: () => this.errTypedHeadHelper(),
+      errCtor: () => this.errTypedCtorHelper(),
       dyn: () => this.dyn,
       inspF64: () => this.inspF64Helper(),
       throwError: (c, className, name, pushMessage) =>
@@ -11810,6 +11911,7 @@ class Assembler {
         this.pushStrLitInto(c, "Error");
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(exc.errT);
       },
       errRef: () => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT }),
@@ -11901,6 +12003,7 @@ class Assembler {
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(exc.errT);
       },
       throwStack: (c) => {
@@ -11986,6 +12089,7 @@ class Assembler {
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(this.exc().errT);
       },
       throwStack: (c) => this.emitThrowStackTop(c),
@@ -12280,6 +12384,7 @@ class Assembler {
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(this.exc().errT);
       },
       throwStack: (c) => this.emitThrowStackTop(c),
@@ -13945,6 +14050,7 @@ class Assembler {
         this.pushStrLitInto(c, name);
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(exc.errT);
       },
       throwStack: (c) => {
@@ -16508,6 +16614,7 @@ class Assembler {
         this.pushStrLitInto(c, "Error");
         pushMessage(c);
         pushCode(c);
+        c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
         c.structNew(exc.errT);
       },
       voidClos: () => this.closPairFor([], []),
@@ -19601,7 +19708,14 @@ class Assembler {
       // exactly like the emitter registry just above.
       c.refNull(this.streamStateType());
     }
-    for (const f of info.meta.def.fields) this.emitFieldSeed(c, f.type);
+    // GH #146: an error-rooted class carries errT's encoding slot right
+    // after %Error's IR fields (classes.ts plan), null until it crosses.
+    const errRooted = this.classes.errorRooted(className);
+    info.meta.def.fields.forEach((f, i) => {
+      if (errRooted && i === ERR_IR_FIELDS) c.refNull(EQ_HEAP);
+      this.emitFieldSeed(c, f.type);
+    });
+    if (errRooted && info.meta.def.fields.length === ERR_IR_FIELDS) c.refNull(EQ_HEAP);
     c.structNew(info.struct);
   }
 
@@ -20798,8 +20912,12 @@ class Assembler {
         const field = this.classField(s.className, s.field, s.loc);
         if (field === null) return;
         this.walkExpr(s.obj);
-        // A class field holds a string VALUE (`this.buf += x` stays a node).
-        if (this.nodesLive) this.walkValue(s.value);
+        // A class field holds a string VALUE (`this.buf += x` stays a node)
+        // — except an error-rooted class's `name` and `message`, which are
+        // errT's own flat-string slots (GH #144: a node there was an
+        // invalid module).
+        const errSlot = this.classes.errorRooted(s.className) && (s.field === "name" || s.field === "message");
+        if (this.nodesLive && !errSlot) this.walkValue(s.value);
         else this.walkExpr(s.value);
         code.structSet(field.info.struct, field.index);
         return;
@@ -24009,6 +24127,7 @@ class Assembler {
           this.pushStrLit(rec.lib);
           this.walkExpr(e.args[0]!);
           code.refNull(this.strType);
+          code.refNull(EQ_HEAP); // ERR_BOX (GH #146)
           code.structNew(this.exc().errT);
           return;
         }
@@ -24375,6 +24494,7 @@ class Assembler {
           code.localGet(src);
           code.structGet(exc.errT, ERR_MESSAGE);
           code.refNull(this.strType);
+          code.refNull(EQ_HEAP); // ERR_BOX (GH #146)
           code.structNew(exc.errT);
           this.releaseScratch(errRef, src);
           return;
@@ -35068,6 +35188,7 @@ class Assembler {
     pushName(code);
     pushMessage(code);
     pushCode(code);
+    code.refNull(EQ_HEAP); // ERR_BOX (GH #146)
     code.structNew(exc.errT);
   }
 

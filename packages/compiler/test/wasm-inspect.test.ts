@@ -70,6 +70,19 @@ async function buildHelpers(): Promise<Helpers> {
   ]);
   const errRef: ValType = { kind: "ref", nullable: true, typeIndex: errT };
   let f2s: number | null = null;
+  // GH #147: the header and the beyond-depth constructor name. This
+  // harness has no class graph, so its errors are builtins whose name is
+  // their constructor's: both answer the name slot, the form the rows pin.
+  let nameSlotFn: number | null = null;
+  const nameSlot = (): number => {
+    if (nameSlotFn !== null) return nameSlotFn;
+    nameSlotFn = mb.declareFunc(mb.funcType([errRef], [strRef]), "%test.err.nameSlot");
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(errT, 1);
+    mb.setBody(nameSlotFn, [], c.bytes());
+    return nameSlotFn;
+  };
   const insp = new InspectBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
@@ -77,6 +90,8 @@ async function buildHelpers(): Promise<Helpers> {
     errName: () => 1,
     errMessage: () => 2,
     errCode: () => 3,
+    errHead: nameSlot,
+    errCtor: nameSlot,
     lit: (c, s) => {
       // pushStrLitInto's encoding: UTF-16LE units into the module blob.
       const units = new Uint8Array(s.length * 2);

@@ -165,10 +165,9 @@ try { throw new TypeError("m"); } catch (e) {
 }`,
   },
   {
-    id: "GH137-JS-10 an error whose name prints empty stops at its named fence when inspected",
+    id: "GH137-JS-10 an error whose name prints empty inspects as its message alone (GH #147: was a fence)",
     entry: "main.js",
-    src: `try { throw new TypeError("t"); } catch (e) { e.stack = ""; e.name = ""; console.log("before", String(e)); console.log(e); }`,
-    fence: { text: /inspecting an error held in a dynamic value whose name prints empty is not supported yet/, stdout: "before t\n" },
+    src: `try { throw new TypeError("t"); } catch (e) { e.stack = ""; e.name = ""; console.log("before", String(e)); console.log(e); e.message = ""; console.log(e); }`,
   },
   {
     id: "GH137-JS-11 an error with its own stack stops at its named fence when inspected",
