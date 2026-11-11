@@ -1,0 +1,6 @@
+completion       exit=0    stdout= 259953B eee050a2c498a7ce  stderr= 17017B e808ac0919c6550e
+config-get       exit=1    stdout=      0B e3b0c44298fc1c14  stderr=   398B 6ac2a329457bddee
+config-help      exit=0    stdout=   1936B f0b95e5545752364  stderr=   245B 8a46f2cf2e437b2c
+help             exit=0    stdout=   7666B 797f324617f47958  stderr=   245B 8a46f2cf2e437b2c
+unknown          exit=1    stdout=      0B e3b0c44298fc1c14  stderr=   388B c49eb34aa200baff
+version          exit=0    stdout=     19B 90838a587b8e46f1  stderr=   245B 8a46f2cf2e437b2c

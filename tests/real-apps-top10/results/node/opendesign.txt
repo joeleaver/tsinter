@@ -1,0 +1,6 @@
+direction-bad    exit=1    stdout=      0B e3b0c44298fc1c14  stderr=    76B 0058df87fdd9224c
+direction-one    exit=0    stdout=   1383B d4a6797e4f2d9f41  stderr=     0B e3b0c44298fc1c14
+directions-json  exit=0    stdout=    386B 7aebf2c4824153b8  stderr=     0B e3b0c44298fc1c14
+directions       exit=0    stdout=    289B a8608e385816207f  stderr=     0B e3b0c44298fc1c14
+help             exit=0    stdout=   6130B f26793ecbef75ca9  stderr=     0B e3b0c44298fc1c14
+unknown          exit=2    stdout=   6130B f26793ecbef75ca9  stderr=    26B 9077888b541d04c9

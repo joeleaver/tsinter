@@ -1,0 +1,5 @@
+build-missing    exit=1    stdout=    106B 4148d13e20c9cb0d  stderr=     0B e3b0c44298fc1c14
+build            exit=0    stdout=      0B e3b0c44298fc1c14  stderr=   103B d01d93d2d92bb182
+help             exit=0    stdout=   1368B b85e1399b071f4ca  stderr=     0B e3b0c44298fc1c14
+info             exit=0    stdout=   2891B d2d74644ddc993d2  stderr=     0B e3b0c44298fc1c14
+version          exit=0    stdout=      7B f45fd77ab9833c00  stderr=     0B e3b0c44298fc1c14

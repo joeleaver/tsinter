@@ -1,0 +1,56 @@
+## rea: 13 root sites (13 reached, cascades included)
+     12 module:builtin     e.g. D SC1010 src/application/JsonAuthenticationHeadroom.ts:2 import { getHeapStatistics } from "node:v8"; -- the 'node:v8' module (it observes V8 engine internals — heap statistics and snapshots, GC and CPU profiles, se
+      1 tsc:missing-dep    e.g. D SC0001 src/frida/FridaInstrumentationManager.ts:8 FridaMessage, -- Module '"frida"' has no exported member 'FridaMessage'. Did you mean to use 'import FridaMessage from "frida"'
+## deepseek: 41 root sites (41 reached, cascades included)
+     28 tsc:missing-dep    e.g. D SC0001 apps/cli/src/dump-config-schema.ts:9 import { generateConfigSchema, type ConfigSchemaDump } from '@deepseek-ai/dsh-ap -- Cannot find module '@deepseek-ai/dsh-app-boot' or its corresponding type declarations.
+      9 tsc:knock-on       e.g. D SC0001 apps/cli/src/dump-config.ts:56 const layers: ConfigDumpLayer[] = loaded.layers.map(layer => ({ -- Parameter 'layer' implicitly has an 'any' type.
+      4 driver:tsc:missing-dep e.g. D SC0001 apps/cli/src/bin.ts:9 import { getDshRuntimeVersion, loadLayeredEnv, StartupError } from '@deepseek-ai -- Cannot find module '@deepseek-ai/dsh-app-boot' or its corresponding type declarations.
+## opencode: 31 root sites (35 reached, cascades included)
+     12 stdlib:js          e.g. D SC2020 packages/patchmark/src/html.ts:97 const blockHtmlCache = new WeakMap<BlockKind, { gfm: boolean; html: string }>() -- 'WeakMap<BlockKind, { gfm: boolean; html: string; }>' is part of the standard library types but has no scriptc
+      7 dep-edge           e.g. D SC2013 packages/util/src/bom.ts:34 export const readFile = Effect.fn("Bom.readFile")(function* (fs: FSUtil.Interfac -- values from the 'effect' package run in the embedded dynamic engine, which this build does not include
+      3 types:shape        e.g. D SC1090 packages/patchmark/src/html.ts:33 out += renderAlt(node.children) -- reading 'children' on a union-typed value (every arm must be an object/record with a same-typed field 'childre
+      2 driver:dep-edge    e.g. D SC2013 packages/util/.top10/opencode-main.ts:6 import { Result } from "effect"; -- importing 'effect' requires the embedded dynamic engine, which this build does not include — the package's imp
+      2 driver:generic:fn  e.g. D SC1090 packages/util/.top10/opencode-main.ts:43 if (Result.isFailure(r)) { -- calls of the generic method 'isFailure' with no defining object literal (the declaration is signature-only — o
+      2 driver:dyn:receiver e.g. D SC1090 packages/util/.top10/opencode-main.ts:105 const f = s.append(REPLY.slice(i, i + 17)); -- method calls like 's.append' is not supported yet
+      1 dyn:receiver       e.g. D SC1090 packages/patchmark/src/html.ts:128 let html = hit?.gfm === gfm ? hit[key] : undefined -- dynamic keyed reads of '{ gfm: boolean; loose: string | undefined; tight: string | undefined }' (the declared 
+      1 write:untyped      e.g. D SC1090 packages/patchmark/src/html.ts:132 entry[key] = html -- dynamic keyed writes to records without an index signature (declared fields of ONE shared type dispatch by key
+      1 driver:write:untyped e.g. D SC1090 packages/util/.top10/opencode-main.ts:118 process.exitCode = 2; -- assignment to non-variables are not supported yet
+## vue: 205 root sites (205 reached, cascades included)
+    162 tsc:missing-dep    e.g. D SC0001 packages/server-renderer/src/directives/model.ts:1 import { looseEqual, looseIndexOf } from 'shared/util' -- Cannot find module 'shared/util' or its corresponding type declarations.
+     19 tsc:dom            e.g. D SC0001 src/platforms/web/runtime-with-compiler.ts:22 el?: string | Element, -- Cannot find name 'Element'.
+     18 tsc:ambient        e.g. D SC0001 src/platforms/web/compiler/directives/model.ts:24 if (__DEV__) { -- Cannot find name '__DEV__'.
+      6 tsc:knock-on       e.g. D SC0001 src/platforms/web/runtime-with-compiler.ts:61 // @ts-expect-error -- Unused '@ts-expect-error' directive.
+## n8n: 170 root sites (170 reached, cascades included)
+    108 tsc:knock-on       e.g. D SC0001 packages/workflow/src/common/find-ai-root-node-names.ts:23 for (const group of outputs) { -- 'outputs' is of type 'unknown'.
+     61 tsc:missing-dep    e.g. D SC0001 packages/workflow/src/common/find-ai-root-node-names.ts:1 import { isUnknownArray } from '@n8n/utils/is-unknown-array'; -- Cannot find module '@n8n/utils/is-unknown-array' or its corresponding type declarations.
+      1 tsc:dom            e.g. D SC0001 packages/workflow/src/extensions/expression-extension.ts:140 typeof window !== 'object' ? 'global' : 'window', -- Cannot find name 'window'.
+## shadcn: 41 root sites (41 reached, cascades included)
+     30 driver:tsc:missing-dep e.g. D SC0001 packages/shadcn/src/index.ts:2 import { add } from "@/src/commands/add" -- Cannot find module '@/src/commands/add' or its corresponding type declarations.
+      8 tsc:missing-dep    e.g. D SC0001 packages/shadcn/src/utils/registry-api.ts:1 import { handleError } from "@/src/utils/handle-error" -- Cannot find module '@/src/utils/handle-error' or its corresponding type declarations.
+      2 tsc:knock-on       e.g. D SC0001 packages/shadcn/src/utils/registry-api.ts:46 const paths = tree.map((item) => `styles/${style}/${item.name}.json`) -- Parameter 'item' implicitly has an 'any' type.
+      1 driver:module:builtin e.g. D SC1010 packages/shadcn/src/index.ts:18 import packageJson from "../package.json" -- the '../package.json' import (Node refuses its import attributes: Module "file:///home/tsinter/.cache/tsinter-
+## pi: 30 root sites (30 reached, cascades included)
+     14 tsc:knock-on       e.g. D SC0001 packages/agent/src/agent-loop.ts:202 reasoning: -- Object literal may only specify known properties, and 'reasoning' does not exist in type 'AgentLoopConfig'.
+      6 driver:tsc:knock-on e.g. D SC0001 packages/agent/.top10/pi-main.ts:31 msg.content.forEach((c, i) => { -- Parameter 'c' implicitly has an 'any' type.
+      6 tsc:missing-dep    e.g. D SC0001 packages/agent/src/agent-loop.ts:20 } from "@earendil-works/pi-ai"; -- Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+      4 driver:tsc:missing-dep e.g. D SC0001 packages/agent/.top10/pi-main.ts:6 import { createAssistantMessageEventStream, type AssistantMessage, type Message, -- Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+## paperclip: 9 root sites (9 reached, cascades included)
+      6 module:builtin     e.g. D SC1010 cli/src/client/mcp-auth.ts:4 import { DatabaseSync } from "node:sqlite"; -- the 'node:sqlite' module (it wraps the SQLite library bundled into the node executable, and scriptc binaries b
+      3 tsc:dom            e.g. D SC0001 cli/src/client/http.ts:95 body: body as unknown as BodyInit, -- Cannot find name 'BodyInit'.
+## opendesign: 961 root sites (961 reached, cascades included)
+    637 tsc:missing-dep    e.g. D SC0001 apps/daemon/src/agent-companion-setup.ts:7 import { createPackageManagerInvocation } from '@open-design/platform'; -- Cannot find module '@open-design/platform' or its corresponding type declarations.
+    319 tsc:knock-on       e.g. D SC0001 apps/daemon/src/agent-protocol/codex-app-server/thread-cleanup.ts:111 const root = snapshot.find(entry => entry.pid === child.pid -- Parameter 'entry' implicitly has an 'any' type.
+      4 driver:tsc:missing-dep e.g. D SC1010 apps/daemon/src/cli.ts:22 import { SidecarFactory } from '@open-design/sidecar'; -- the '@open-design/sidecar' package (nothing installed resolves it) is not supported yet
+      1 module:builtin     e.g. D SC1010 apps/daemon/src/services/daemon-health.ts:35 import v8 from 'node:v8'; -- the 'node:v8' module (it observes V8 engine internals — heap statistics and snapshots, GC and CPU profiles, se
+
+## census (projects blocked, root sites) — driver sites excluded
+   7 proj    903 sites  tsc:missing-dep    unresolved import (dependency or generated file absent; survey artifac  {'opendesign': 637, 'vue': 162, 'n8n': 61, 'deepseek': 28, 'shadcn': 8, 'pi': 6, 'rea': 1}
+   6 proj    458 sites  tsc:knock-on       type errors downstream of an unresolved import or lost ambient types (  {'opendesign': 319, 'n8n': 108, 'pi': 14, 'deepseek': 9, 'vue': 6, 'shadcn': 2}
+   3 proj     23 sites  tsc:dom            browser globals: no DOM lib (document, window, HTMLElement, fetch type  {'vue': 19, 'paperclip': 3, 'n8n': 1}
+   3 proj     19 sites  module:builtin     Node builtin module with no support (SC1010, node:* import fences)  {'rea': 12, 'paperclip': 6, 'opendesign': 1}
+   1 proj     18 sites  tsc:ambient        name not found: usually an ambient .d.ts the tsconfig includes, which   {'vue': 18}
+   1 proj     12 sites  stdlib:js          ECMAScript stdlib member with no lowering (reverse, splice/3, substr,   {'opencode': 12}
+   1 proj      7 sites  dep-edge           import of an npm package that is not compiled statically  {'opencode': 7}
+   1 proj      3 sites  types:shape        types with no static representation: unions with fields, intersections  {'opencode': 3}
+   1 proj      1 sites  dyn:receiver       method calls, member reads, for-in, switch, spread on any/unknown rece  {'opencode': 1}
+   1 proj      1 sites  write:untyped      writes through untyped or nested receivers: o.a.b = v, o[k] = v, o.n++  {'opencode': 1}

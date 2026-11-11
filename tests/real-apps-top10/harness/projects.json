@@ -1,0 +1,107 @@
+{
+ "_comment": "The 10 selected projects (see ../README.md for the selection walk). sha = the default-branch head on 2026-11-10; tarball = codeload's tar.gz of that commit; its sha256 is recorded in ../results/downloads.txt and fetch.py checks every later fetch against it. pm = the install command family; filter = pnpm workspace filter (install only the target's closure).",
+ "projects": [
+  {
+   "name": "rea",
+   "repo": "morluto/rea",
+   "rank": 2,
+   "sha": "fe791ff159c85b10d281d8874f29202bd3517e25",
+   "pm": "npm",
+   "installFlags": [
+    "--engine-strict=false"
+   ],
+   "note": "engines node ^24.22.1 with engine-strict=true in .npmrc; the oracle is v24.18.1, so the engine check is overridden at install"
+  },
+  {
+   "name": "openclaw",
+   "repo": "openclaw/openclaw",
+   "rank": 3,
+   "sha": "798669dba8225af180e438e0b4fadcfdac42318d",
+   "pm": "pnpm@12.15.0",
+   "filter": [
+    "openclaw..."
+   ]
+  },
+  {
+   "name": "deepseek",
+   "repo": "deepseek-ai/deepseek-harness",
+   "rank": 5,
+   "sha": "fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159",
+   "pm": "pnpm@11.28.5",
+   "filter": [
+    "@deepseek-ai/dsh..."
+   ]
+  },
+  {
+   "name": "opencode",
+   "repo": "anomalyco/opencode",
+   "rank": 6,
+   "sha": "028ce1c6e1991c9bd4411798e85d9464fb40ce0e",
+   "pm": "bun@1.4.4"
+  },
+  {
+   "name": "vue",
+   "repo": "vuejs/vue",
+   "rank": 7,
+   "sha": "9e88707940088cb1f4cd7dd210c9168a50dc347c",
+   "pm": "pnpm@8.9.2"
+  },
+  {
+   "name": "n8n",
+   "repo": "n8n-io/n8n",
+   "rank": 8,
+   "sha": "28f60cebe5d5303e13867c2afe15d44b35b9e9d7",
+   "pm": "pnpm@12.4.2",
+   "filter": [
+    "n8n-workflow..."
+   ]
+  },
+  {
+   "name": "shadcn",
+   "repo": "shadcn-ui/ui",
+   "rank": 16,
+   "sha": "8ab27715521cbd4f87ae6886cd989cbb678f6de7",
+   "pm": "pnpm@10.33.4",
+   "filter": [
+    "shadcn..."
+   ]
+  },
+  {
+   "name": "pi",
+   "repo": "earendil-works/pi",
+   "rank": 18,
+   "sha": "7f5b609d1c299bd2038b4732d782e703c9bbc513",
+   "pm": "npm"
+  },
+  {
+   "name": "paperclip",
+   "repo": "paperclipai/paperclip",
+   "rank": 22,
+   "sha": "a3b34a9d88adea6ed91967de9e981555d4277c0c",
+   "pm": "pnpm@9.15.4",
+   "filter": [
+    "paperclipai..."
+   ]
+  },
+  {
+   "name": "opendesign",
+   "repo": "nexu-io/open-design",
+   "rank": 24,
+   "sha": "b4ec310921f49ae512de1f0a1f3a4e7ce3d05f2f",
+   "pm": "pnpm@10.33.2",
+   "filter": [
+    "@open-design/daemon..."
+   ]
+  }
+ ],
+ "skippedAfterFetch": [
+  {
+   "name": "gemini",
+   "repo": "google-gemini/gemini-cli",
+   "rank": 23,
+   "sha": "e5d88fb2c036ce7e0c27131469cd963221b9d9e7",
+   "pm": "npm",
+   "reason": "every Node package imports packages/core/src/generated/git-commit.js, which only the build (scripts/generate-git-commit-info.js) writes: no part runs from unmodified source"
+  }
+ ]
+}

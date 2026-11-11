@@ -1,0 +1,5 @@
+default-config   exit=0    stdout=  45079B ee514ee87b4f03f0  stderr=     0B e3b0c44298fc1c14
+help             exit=0    stdout=   1820B 1622bf1e4dbf97d7  stderr=     0B e3b0c44298fc1c14
+no-profile       exit=1    stdout=      0B e3b0c44298fc1c14  stderr=    36B 75db4fa941b6b57d
+schema           exit=1    stdout= 913053B 71e3ebeb9bf62a61  stderr=   912B fa0f1a6c3c80002a
+version          exit=0    stdout=     11B d319b8eb5b28c59d  stderr=     0B e3b0c44298fc1c14

@@ -1,0 +1,4 @@
+badpatch         exit=0    stdout=    657B e52dea2ec49c83f5  stderr=     0B e3b0c44298fc1c14
+markdown         exit=0    stdout=   1413B 6e184abeecd0051b  stderr=     0B e3b0c44298fc1c14
+patch            exit=0    stdout=    568B 813c4c32ebaa9c30  stderr=     0B e3b0c44298fc1c14
+usage            exit=2    stdout=      0B e3b0c44298fc1c14  stderr=    48B dfa3c8e05420b44a

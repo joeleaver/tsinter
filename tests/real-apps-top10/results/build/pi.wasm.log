@@ -1,0 +1,30 @@
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":595,"end":618} Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":668,"end":695} Cannot find module '@earendil-works/pi-schema' or its corresponding type declarations.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":2194,"end":2195} Parameter 'c' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":2197,"end":2198} Parameter 'i' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":3077,"end":3081} Object literal may only specify known properties, and 'name' does not exist in type 'AgentTool<any, { words: number; }>'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":3535,"end":3539} Object literal may only specify known properties, and 'name' does not exist in type 'AgentTool<any, { result: number; }>'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":3813,"end":3814} Parameter 'a' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":3816,"end":3817} Parameter 'b' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":410,"end":433} Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":5733,"end":5742} Object literal may only specify known properties, and 'reasoning' does not exist in type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":5813,"end":5822} Property 'reasoning' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":6892,"end":6901} Property 'reasoning' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":7108,"end":7117} Object literal may only specify known properties, and 'reasoning' does not exist in type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":7183,"end":7192} Property 'reasoning' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":7947,"end":7948} Parameter 'c' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":13365,"end":13371} Property 'apiKey' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":13543,"end":13551} Property 'identity' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":13728,"end":13737} Property 'reasoning' does not exist on type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":17001,"end":17002} Parameter 'c' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":17081,"end":17083} Parameter 'tc' implicitly has an 'any' type.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":17124,"end":17128} Property 'name' does not exist on type 'AgentTool<any, any>'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":22789,"end":22793} Property 'name' does not exist on type 'AgentTool<any, any>'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent.ts","start":272,"end":295} Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent.ts","start":15606,"end":15615} Object literal may only specify known properties, and 'reasoning' does not exist in type 'AgentLoopConfig'.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/types.ts","start":236,"end":259} Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+SC0001 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/types.ts","start":289,"end":316} Cannot find module '@earendil-works/pi-schema' or its corresponding type declarations.
+SC1010 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent-loop.ts","start":122,"end":434} the '@earendil-works/pi-ai' package (nothing installed resolves it) is not supported yet
+SC1010 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/src/agent.ts","start":0,"end":296} the '@earendil-works/pi-ai' package (nothing installed resolves it) is not supported yet
+SC1010 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":496,"end":619} the '@earendil-works/pi-ai' package (nothing installed resolves it) is not supported yet
+SC1010 {"file":"/home/tsinter/.cache/tsinter-dl/top10/src/pi/packages/agent/.top10/pi-main.ts","start":620,"end":696} the '@earendil-works/pi-schema' package (nothing installed resolves it) is not supported yet

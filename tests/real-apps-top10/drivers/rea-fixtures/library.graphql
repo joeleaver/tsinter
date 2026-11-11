@@ -1,0 +1,41 @@
+"""A small library API (top10 fixture)."""
+type Query {
+  book(id: ID!): Book
+  books(first: Int = 10, after: String, genre: Genre): BookConnection!
+  author(name: String!): Author
+}
+
+type Mutation {
+  addBook(input: AddBookInput!): Book!
+  removeBook(id: ID!): Boolean!
+}
+
+type Book {
+  id: ID!
+  title: String!
+  author: Author!
+  genre: Genre
+  pages: Int
+}
+
+type Author {
+  name: String!
+  books: [Book!]!
+}
+
+type BookConnection {
+  edges: [Book!]!
+  cursor: String
+}
+
+enum Genre {
+  FICTION
+  SCIENCE
+  HISTORY
+}
+
+input AddBookInput {
+  title: String!
+  authorName: String!
+  genre: Genre
+}

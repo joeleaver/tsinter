@@ -1,0 +1,6 @@
+== /home/tsinter/.cache/tsinter-dl/top10/res/deepseek/wasm 1 9s
+  default-config MISSING                                           t node=1.729 lane=?
+  help           MISSING                                           t node=1.631 lane=?
+  no-profile     MISSING                                           t node=1.530 lane=?
+  schema         MISSING                                           t node=11.549 lane=?
+  version        MISSING                                           t node=1.581 lane=?

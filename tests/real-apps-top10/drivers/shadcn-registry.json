@@ -1,0 +1,33 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry.json",
+  "name": "top10",
+  "homepage": "https://example.invalid",
+  "items": [
+    {
+      "name": "utils",
+      "type": "registry:lib",
+      "dependencies": ["clsx", "tailwind-merge"],
+      "files": [{ "path": "lib/utils.ts", "type": "registry:lib" }]
+    },
+    {
+      "name": "button",
+      "type": "registry:ui",
+      "dependencies": ["@radix-ui/react-slot"],
+      "registryDependencies": ["utils"],
+      "files": [{ "path": "registry/new-york-v4/ui/button.tsx", "type": "registry:ui" }]
+    },
+    {
+      "name": "alert",
+      "type": "registry:ui",
+      "files": [{ "path": "registry/new-york-v4/ui/alert.tsx", "type": "registry:ui" }]
+    },
+    {
+      "name": "card",
+      "type": "registry:ui",
+      "title": "Card",
+      "description": "A card with header, content and footer.",
+      "files": [{ "path": "registry/new-york-v4/ui/card.tsx", "type": "registry:ui" }],
+      "cssVars": { "light": { "card": "oklch(1 0 0)" }, "dark": { "card": "oklch(0.205 0 0)" } }
+    }
+  ]
+}

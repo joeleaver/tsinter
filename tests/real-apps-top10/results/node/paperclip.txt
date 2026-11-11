@@ -1,0 +1,5 @@
+env              exit=0    stdout=   5111B f376e73d5c187d34  stderr=     0B e3b0c44298fc1c14
+help             exit=0    stdout=   7531B 87010950cd0b2c16  stderr=     0B e3b0c44298fc1c14
+issue-help       exit=0    stdout=   5778B 06f45b7fa58997c3  stderr=     0B e3b0c44298fc1c14
+unknown          exit=1    stdout=      0B e3b0c44298fc1c14  stderr=    36B d029ec5daf7fcc15
+version          exit=0    stdout=      6B 79e3f22ca37c7fdf  stderr=     0B e3b0c44298fc1c14

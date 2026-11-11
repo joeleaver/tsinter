@@ -1,0 +1,173 @@
+{
+ "_comment": "The selection walk (Joe's rulings, 2026-11-10) over candidates-2026-11-10.json: GitHub search `language:TypeScript stars:>3000 fork:false archived:false`, sort=stars, fetched with read-only `gh api` on 2026-11-10 (the survey's 2026-11-02 copy had the same order through rank 24, with older star counts). Ranks in order; the walk stopped at the 10th pick. Stars as fetched.",
+ "walk": [
+  {
+   "rank": 1,
+   "repo": "freeCodeCamp/freeCodeCamp",
+   "stars": 458946,
+   "verdict": "skip",
+   "reason": "learning platform: a Gatsby browser front-end plus curriculum content; its one Node service (api/) is a MongoDB-backed server that cannot start without the database"
+  },
+  {
+   "rank": 2,
+   "repo": "morluto/rea",
+   "stars": 449815,
+   "verdict": "pick",
+   "target": ". (the rea CLI, src/cli.ts)"
+  },
+  {
+   "rank": 3,
+   "repo": "openclaw/openclaw",
+   "stars": 394297,
+   "verdict": "pick",
+   "target": ". (the openclaw CLI, src/entry.ts)"
+  },
+  {
+   "rank": 4,
+   "repo": "nilbuild/developer-roadmap",
+   "stars": 371756,
+   "verdict": "skip",
+   "reason": "content site (roadmaps, guides) built as an Astro/React browser front-end"
+  },
+  {
+   "rank": 5,
+   "repo": "deepseek-ai/deepseek-harness",
+   "stars": 278167,
+   "verdict": "pick",
+   "target": "apps/cli (the dsh launcher CLI)"
+  },
+  {
+   "rank": 6,
+   "repo": "anomalyco/opencode",
+   "stars": 225897,
+   "verdict": "pick",
+   "target": "packages/util (patch engine) + packages/patchmark (markdown streaming); the CLI entry needs Bun or opencode's vite build (Solid JSX, .txt text imports), so the workload drives the two engine packages its tools and session view use"
+  },
+  {
+   "rank": 7,
+   "repo": "vuejs/vue",
+   "stars": 212622,
+   "verdict": "pick",
+   "target": "Vue 2.7 template compiler + server renderer (src/, packages/server-renderer); a framework with a Node SSR path, not a component library (judgment call, see README)"
+  },
+  {
+   "rank": 8,
+   "repo": "n8n-io/n8n",
+   "stars": 210019,
+   "verdict": "pick",
+   "target": "packages/workflow (n8n-workflow); the n8n server needs a database driver whose native build is an install script"
+  },
+  {
+   "rank": 9,
+   "repo": "firecrawl/firecrawl",
+   "stars": 200506,
+   "verdict": "skip",
+   "reason": "the Node part is a scraping API server that needs Redis, Postgres and a Playwright browser service to start; the JS SDK is a network client with no offline function"
+  },
+  {
+   "rank": 10,
+   "repo": "microsoft/vscode",
+   "stars": 195271,
+   "verdict": "skip",
+   "reason": "Electron/browser editor; its CLI is Rust"
+  },
+  {
+   "rank": 11,
+   "repo": "anthropics/claude-code",
+   "stars": 155202,
+   "verdict": "skip",
+   "reason": "the repo holds plugins, examples and docs, not the CLI's source"
+  },
+  {
+   "rank": 12,
+   "repo": "iptv-org/iptv",
+   "stars": 143750,
+   "verdict": "skip",
+   "reason": "content repo (playlists); its TS scripts only regenerate that content"
+  },
+  {
+   "rank": 13,
+   "repo": "yangshun/tech-interview-handbook",
+   "stars": 143250,
+   "verdict": "skip",
+   "reason": "content/docs (a Docusaurus site)"
+  },
+  {
+   "rank": 14,
+   "repo": "garrytan/gstack",
+   "stars": 141098,
+   "verdict": "skip",
+   "reason": "Bun-only (engines: bun; tools compile to Bun binaries); the product is Claude Code skills (markdown) plus a Playwright browser daemon"
+  },
+  {
+   "rank": 15,
+   "repo": "excalidraw/excalidraw",
+   "stars": 135457,
+   "verdict": "skip",
+   "reason": "browser front-end (whiteboard)"
+  },
+  {
+   "rank": 16,
+   "repo": "shadcn-ui/ui",
+   "stars": 127845,
+   "verdict": "pick",
+   "target": "packages/shadcn (the shadcn CLI), run against the repo's own apps/v4 project; the rest of the monorepo is React components and docs"
+  },
+  {
+   "rank": 17,
+   "repo": "stablyai/orca",
+   "stars": 121385,
+   "verdict": "skip",
+   "reason": "Electron app; its CLI (out/cli) is a client of the running desktop app"
+  },
+  {
+   "rank": 18,
+   "repo": "earendil-works/pi",
+   "stars": 121245,
+   "verdict": "pick",
+   "target": "packages/agent (pi-agent-core, the agent loop); the coding-agent CLI needs model data that only its network generate step writes (packages/ai/src/providers/data/*.json)"
+  },
+  {
+   "rank": 19,
+   "repo": "immich-app/immich",
+   "stars": 118735,
+   "verdict": "skip",
+   "reason": "the server needs Postgres and Redis, the CLI is a client of that server, the rest is a web front-end and mobile app"
+  },
+  {
+   "rank": 20,
+   "repo": "thedotmack/claude-mem",
+   "stars": 115791,
+   "verdict": "skip",
+   "reason": "its worker service and storage need Bun (bun:sqlite in src/services, src/storage)"
+  },
+  {
+   "rank": 21,
+   "repo": "supabase/supabase",
+   "stars": 114757,
+   "verdict": "skip",
+   "reason": "Studio (Next.js browser front-end) and docs; the platform's services live in other repos"
+  },
+  {
+   "rank": 22,
+   "repo": "paperclipai/paperclip",
+   "stars": 112925,
+   "verdict": "pick",
+   "target": "cli (the paperclipai CLI)"
+  },
+  {
+   "rank": 23,
+   "repo": "google-gemini/gemini-cli",
+   "stars": 108766,
+   "verdict": "skip (after fetch)",
+   "reason": "every Node package imports packages/core/src/generated/git-commit.js, which only the build (scripts/generate-git-commit-info.js) writes, so no part runs from unmodified source; fetched and verified (sha256 in results/downloads.txt), then dropped"
+  },
+  {
+   "rank": 24,
+   "repo": "nexu-io/open-design",
+   "stars": 107031,
+   "verdict": "pick",
+   "target": "apps/daemon (the od CLI); the rest is a web front-end and an Electron shell"
+  }
+ ]
+}
