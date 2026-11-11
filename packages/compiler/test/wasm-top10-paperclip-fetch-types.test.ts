@@ -2,7 +2,7 @@
  * A project whose tsconfig names no `lib` gets its target's full lib,
  * DOM included, so these resolve under its own tsc; scriptc's lowering
  * program declares them as the members of the program's RequestInit
- * (ambient/scriptc-overrides.d.ts). Type-only: the rows check that the names resolve
+ * (ambient/scriptc-fetch-init.d.ts). Type-only: the rows check that the names resolve
  * and code typed through them builds and runs as Node does, with and
  * without @types/node. */
 import { describe, test } from "vitest";

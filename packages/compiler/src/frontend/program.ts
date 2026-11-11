@@ -52,8 +52,10 @@ import {
   tscPassthroughDiag,
   unsupportedDiag,
 } from "../diagnostics/diagnostic.js";
-import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm, workspaceSourceEntry } from "./resolve.js";
+import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
+import { clearDevResolveCaches, devResolve } from "./dev-resolve.js";
+import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
@@ -66,6 +68,7 @@ import {
   canonicalBuiltinModule,
   clearWorkspacePackages,
   fallbackDtsPath,
+  fetchInitDtsPath,
   isJsSourceFileName,
   isNodeTypesPath,
   isRelativeSpecifier,
@@ -146,7 +149,16 @@ function jsoncSyntaxError(text: string): string | null {
 function adoptProjectConfig7(
   host: ts.Ts7Host,
   entryPath: string,
-): { configFile: string | null; options: ts.Ts7CompilerOptions; diags: ScrDiagnostic[]; syntheticDefaults?: boolean } {
+): {
+  configFile: string | null;
+  options: ts.Ts7CompilerOptions;
+  diags: ScrDiagnostic[];
+  syntheticDefaults?: boolean;
+  /** Declaration files the project's include/files list names (S130). */
+  includedDts?: string[];
+  /** The project's non-ECMAScript lib files (S130), adopted with @types/node. */
+  projectLibs?: string[];
+} {
   const configFile = ts.findConfigFile(dirname(entryPath), ts.sys.fileExists) ?? null;
   if (!configFile) {
     return { configFile, options: { ...BASE_OPTIONS, ...FORCED_OPTIONS }, diags: [] };
@@ -168,7 +180,62 @@ function adoptProjectConfig7(
     diags.push(strictNullChecksFloorDiag(configFile));
     adopted["strictNullChecks"] = true;
   }
-  return { configFile, options: { ...BASE_OPTIONS, ...adopted, ...FORCED_OPTIONS }, diags, syntheticDefaults: syntheticDefaultsOf7(parsed.options) };
+  // The project's TYPE surface (SEMANTICS.md S130): its non-ES lib files
+  // (dom, webworker, ... — the es2025 floor stays forced), its explicit
+  // "types" packages, and the declaration files its include/files list
+  // brings in (a global.d.ts declaring build-time defines). Types only:
+  // every value they declare still meets the lowering's provenance fences.
+  const forced: ts.Ts7CompilerOptions = { ...FORCED_OPTIONS };
+  const projectTypes = parsed.options["types"];
+  if (Array.isArray(projectTypes)) {
+    forced.types = projectTypes.filter((t): t is string => typeof t === "string" && t !== "node");
+  }
+  const includedDts = parsed.fileNames
+    .map((f) => resolve(f))
+    .filter((f) => /\.d\.(m|c)?ts$/.test(f) && !isNodeModulesPath(f) && projectDtsRuntimeSibling(f) === null);
+  return {
+    configFile,
+    options: { ...BASE_OPTIONS, ...adopted, ...forced },
+    diags,
+    syntheticDefaults: syntheticDefaultsOf7(parsed.options),
+    includedDts,
+    projectLibs: adoptedLibsOf(parsed.options["lib"]),
+  };
+}
+
+/** The project's lib entries scriptc adopts: every non-ECMAScript lib
+ * (dom, dom.iterable, webworker, scripthost, decorators, ...) in the
+ * "lib.<name>.d.ts" spelling. ECMAScript levels (es5 … esnext and their
+ * sub-libs) are not adopted: the es2025 floor is scriptc's own surface.
+ * Only an EXPLICIT lib list adopts: tsc's implicit default (the target's
+ * full lib, DOM included) is not, because lib.dom then declares the web
+ * globals ahead of @types/node and their fences' attribution moves. */
+function adoptedLibsOf(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const name = entry.toLowerCase().replace(/^lib\./, "").replace(/\.d\.ts$/, "");
+    if (/^es(\d+|next)(\.|$)/.test(name)) continue;
+    const spelled = `lib.${name}.d.ts`;
+    if (!out.includes(spelled)) out.push(spelled);
+  }
+  return out;
+}
+
+/** SC1010 at every import site of a dev-runner specifier the checker's one
+ * resolution per specifier cannot express (dev-graph.ts conflicts). */
+function devConflictDiags(conflicts: readonly DevGraphConflict[]): ScrDiagnostic[] {
+  const out: ScrDiagnostic[] = [];
+  const show = (a: string | null): string => (a === null ? "nothing" : a === "node" ? "Node's own resolution" : a);
+  for (const c of conflicts) {
+    const answers = [...new Set(c.sites.map((s) => show(s.answer)))];
+    const feature =
+      `the '${c.spec}' import (its importers resolve it to different modules — ${answers.join(", ")} — ` +
+      `through their own tsconfig "paths" or workspace source; the checker takes one module per specifier, SEMANTICS.md S130)`;
+    for (const s of c.sites) out.push(unsupportedDiag("SC1010", { file: s.file, start: s.start, end: s.end }, feature));
+  }
+  return out;
 }
 
 /** Whether the PROJECT's own compiler options let a default import bind a
@@ -274,6 +341,13 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // .d.ts-internal errors. Fence discipline never depended on it: the
   // lowerer checks provenance and forms at every use site.
   let options: ts.Ts7CompilerOptions = nodeTypes ? { ...config.options, skipLibCheck: true } : { ...config.options };
+  // The project's non-ES libs (S130) join the es2025 floor only beside
+  // @types/node, which is written to coexist with them; scriptc's own
+  // fallback declarations (console, process, URL, ...) redeclare what
+  // lib.dom declares, so without @types/node the project's DOM names stay
+  // undeclared and their uses fail the type check by name.
+  const projectLibs = config.projectLibs ?? [];
+  if (nodeTypes && projectLibs.length > 0) options.lib = [...(options.lib ?? []), ...projectLibs];
   // --npm-static: opted-in packages' shipped JS must be TYPE-INCLUDED (not
   // just resolved) — without maxNodeModuleJsDepth, node_modules JS types as
   // an implicit-any module (TS7016) and nothing infers. Only flagged
@@ -284,9 +358,19 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // source files the preflight resolver answers — the checker types the
   // driver against the package's real TypeScript, not its shipped .d.ts.
   const paths = provenancePaths();
-  if (paths !== null) options = { ...options, paths };
-  const coreRoots = [entryPath, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
-  const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
+  // Dev-runner resolution (SEMANTICS.md S130): every specifier the source
+  // graph resolves through a tsconfig "paths" alias or a workspace
+  // package's source twin becomes an exact "paths" entry, so the checker
+  // lands on the file preflight answers; a specifier exact entries cannot
+  // express refuses by name at its import sites.
+  const includedDts = config.includedDts ?? [];
+  const dev = scanDevGraph([entryPath, ...includedDts]);
+  const configDiags = [...config.diags, ...devConflictDiags(dev.conflicts)];
+  if (paths !== null || Object.keys(dev.paths).length > 0) options = { ...options, paths: { ...dev.paths, ...(paths ?? {}) } };
+  const coreRoots = [entryPath, ...includedDts, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
+  // lib.dom's fetch init names, unless an adopted dom lib declares them.
+  const hasDom = (options.lib ?? []).some((l) => /^(lib\.)?dom(\.d\.ts)?$/i.test(l));
+  const program = ts.createProgram([...coreRoots, overridesDtsPath(), ...(hasDom ? [] : [fetchInitDtsPath()])], options, host);
   if (config.syntheticDefaults !== undefined) syntheticDefaultsByProgram.set(program, config.syntheticDefaults);
   const entry = program.getSourceFile(entryPath);
   if (!entry) {
@@ -298,7 +382,7 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
     program,
     entry,
     moduleOrder: [],
-    configDiags: config.diags,
+    configDiags,
     projectWorld: () => (projectWorld ??= ts.createProgram(coreRoots, options, host)),
     disposeAll: () => {
       projectWorld?.dispose();
@@ -333,6 +417,9 @@ export function loadProgram(
   // Non-opted workspace packages register lazily as preflight's own
   // resolver discovers their import edges.
   clearWorkspacePackages();
+  // Dev-runner resolution reads tsconfig and package.json files: one
+  // load's view (fixtures change between loads in long-lived processes).
+  clearDevResolveCaches();
   for (const pkg of opts?.npmStatic ?? []) {
     const probe = resolveBareModule(entryPath, pkg);
     if (probe?.workspaceDir !== undefined) registerWorkspacePackage(probe.packageName, probe.workspaceDir);
@@ -1386,6 +1473,9 @@ function resolveNpmImport7(
   // its attested source compiles as program modules (resolveProjectImport
   // answers the entry), so no island embed and no .d.ts type surface.
   if (provenanceEntryFor(specifier) !== null) return null;
+  // A dev-runner answer (SEMANTICS.md S130) is a program module, never an
+  // npm import: resolveProjectImport answers it.
+  if (devResolve(fromFileName, specifier, kind) !== null) return null;
   const resolved = resolveBareModule(fromFileName, specifier, undefined, kind);
   if (!resolved) return null;
   if (!isNodeModulesPath(resolved.typesFile)) {
@@ -1397,10 +1487,6 @@ function resolveNpmImport7(
     // (shared.ts) recognizes the package's real files. Anything else
     // whose answer left node_modules stays refused.
     if (resolved.workspaceDir === undefined) return null;
-    // A workspace package whose runtime entry is TypeScript source is the
-    // program's own source (resolve.ts workspaceSourceEntry): program
-    // modules, not an npm import.
-    if (workspaceSourceEntry(fromFileName, specifier, kind) !== null) return null;
     registerWorkspacePackage(resolved.packageName, resolved.workspaceDir);
   }
   return {
@@ -1572,10 +1658,11 @@ function preflight7(load: LoadResult): {
       const key = `${dirname(fromFile)} ${spec}`;
       if (probed.has(key)) return;
       probed.add(key);
+      // A dev-runner answer is program source (S130), not workspace npm
+      // surface: its package must not register.
+      if (devResolve(fromFile, spec) !== null) return;
       const r = resolveBareModule(fromFile, spec);
-      if (r !== null && r.workspaceDir !== undefined && workspaceSourceEntry(fromFile, spec) === null) {
-        registerWorkspacePackage(r.packageName, r.workspaceDir);
-      }
+      if (r !== null && r.workspaceDir !== undefined) registerWorkspacePackage(r.packageName, r.workspaceDir);
     };
     for (const sf of program.getSourceFiles()) {
       if (sf.isDeclarationFile || sf.fileName.endsWith(".json")) continue;
@@ -2835,6 +2922,7 @@ export {
   builtinDefaultImportModule,
   canonicalBuiltinModule,
   fallbackDtsPath,
+  fetchInitDtsPath,
   isNodeTypesPath,
   npmPackageNameOf,
   overridesDtsPath,

@@ -32,6 +32,13 @@ export function overridesDtsPath(): string {
   return tsgoPath(require.resolve("@tsinter/compiler/scriptc-overrides.d.ts"));
 }
 
+/** Path of the shipped lib.dom fetch init names (BodyInit, HeadersInit):
+ * part of the LOWERING program only, and only when its lib has no dom
+ * (an adopted `dom` declares them itself, SEMANTICS.md S130). */
+export function fetchInitDtsPath(): string {
+  return tsgoPath(require.resolve("@tsinter/compiler/scriptc-fetch-init.d.ts"));
+}
+
 /** Path of the shipped FALLBACK declarations (console, process, node:fs) —
  * part of the program only when the target project has no @types/node.
  * With @types/node, the project's real Node types stand in and this file
@@ -252,7 +259,9 @@ export function npmPackageNameOf(file: string): string | null {
 /* The compiler-options split (documented in SEMANTICS.md; the enum-valued
  * FORCED knobs are spelled per world — each lane owns its enum objects):
  * ADOPTED knobs change which programs typecheck; FORCED knobs change
- * semantics scriptc depends on; strictNullChecks is a FLOOR. */
+ * semantics scriptc depends on; strictNullChecks is a FLOOR. The project's
+ * type surface (non-ES lib, types, included .d.ts) and its "paths" are
+ * adopted separately — SEMANTICS.md S130 lists what is and is not. */
 export const ADOPTED_OPTIONS = [
   "strict",
   "noImplicitAny",

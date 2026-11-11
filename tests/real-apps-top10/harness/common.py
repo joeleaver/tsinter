@@ -13,7 +13,9 @@ REPO = os.path.abspath(os.path.join(TOP, "..", ".."))
 WORK = os.path.expanduser("~/.cache/tsinter-dl/top10")
 DL = os.path.join(WORK, "dl")
 SRC = os.path.join(WORK, "src")
-RES = os.path.join(WORK, "res")
+# SURVEY_TOP10_RES: a separate results dir (nico.sh passes SURVEY_* through), so two worktrees measuring at once
+# do not overwrite each other's WORK/res
+RES = os.environ.get("SURVEY_TOP10_RES") or os.path.join(WORK, "res")
 NODE = shutil.which("node") or "node"
 CLI = os.path.join(REPO, "packages", "cli", "dist", "main.js")
 DRIVERS = os.path.join(TOP, "drivers")

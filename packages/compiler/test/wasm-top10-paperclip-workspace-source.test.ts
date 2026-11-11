@@ -6,7 +6,7 @@
  * node_modules, so type stripping applies); they are the program's own
  * source, and they now compile as program modules instead of being
  * classified as npm packages bound for the embedded engine
- * (resolve.ts workspaceSourceEntry). Every row runs under Node and on both
+ * (dev-resolve.ts, SEMANTICS.md S130 rule 0). Every row runs under Node and on both
  * WasmGC lanes. */
 import { describe, test } from "vitest";
 import { checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";

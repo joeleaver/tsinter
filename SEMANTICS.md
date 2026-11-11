@@ -10628,3 +10628,114 @@ where Node never executes the read.
 top-10 past-gate census) and the same idiom across TypeScript code.
 **Tested by:** `packages/compiler/test/wasm-top10-rea-never-arm.test.ts`
 (wasm and wasm-native, against Node).
+
+## S130 — A multi-package project resolves the way its dev runner resolves it: tsconfig `paths`, and a workspace package's source in place of its unbuilt output, where plain Node refuses the import *(every lane)*
+
+**The oracle for a multi-package project** (Joe, 2026-11-10). A real
+TypeScript project with workspace packages or tsconfig path aliases is not
+written for plain Node: its workspace packages' `package.json`
+`main`/`exports`/`types` name a `dist/` (or `lib/`, `out/`, `build/`) that
+only the project's build writes, and its sources import through tsconfig
+`paths`. Plain Node refuses such a program at startup. The project's own dev
+runner (tsx, vite-node, vitest, ts-node) runs it, and that is how the Node
+oracle runs it: Node with the dev-runner loader
+`tests/real-apps-top10/harness/node-src-loader.mjs`. For these programs the
+oracle is Node running the source under that loader, and tsinter resolves
+identically. `packages/compiler/src/frontend/dev-resolve.ts` is the loader's
+resolve hook rule for rule; the two change together.
+
+**The rules.** Whenever Node resolves an import to an existing file, that
+file wins. A built workspace package keeps its `dist/` and stays an npm
+import. When Node's answer is a workspace package's own TypeScript source
+(its `exports` or `main` name `src/*.ts`; realpath outside every
+`node_modules`), the loader transpiles it as a project file, so the package
+compiles as program modules. That is rule 0; paperclip step 2 introduced it
+as `workspaceSourceEntry`, and it is now one resolver with the rest. Rules 1
+and 2 apply only where plain Node's own resolution fails:
+1. A bare specifier (or `#` import) from a project file, meaning one outside
+   `node_modules`: the importing file's nearest `tsconfig.json` `paths`
+   (`extends` chains followed; targets relative to the `baseUrl` of the
+   config that sets `paths` or `baseUrl`, else to that config's directory).
+   Entries are tried in object order and the first target that names a file
+   wins. A target names a file as the file itself, its TypeScript twin for a
+   `.js`-family extension, the path with `.ts`/`.tsx`/`.mts`/`.cts`/`.js`/
+   `.mjs` added, or a directory's `index`.
+2. A bare specifier Node resolved to a missing file whose realpath lies
+   outside every `node_modules` (a workspace package, symlinked or not). The
+   path under its `dist|lib|out|build` segment maps to the source twin:
+   `src/<rest>` or `<rest>`, with up to two leading build-flavor directories
+   dropped and `.js`/`.d.ts` mapped to `.ts`. Failing that, the path's own
+   TypeScript twin is used. Node's error message decides which path is
+   mapped (Node 24, probed): the `exports` or deep-import target, or an
+   unbuilt `main` for both syntaxes. With no `main` and no `exports`, ESM
+   names `<package>/index.js`, while CommonJS names only the specifier, so
+   nothing maps for it.
+A dev-runner answer is a program module, compiled like a relative import,
+never an npm import or island code. Relative specifiers keep S126. A program
+whose imports plain Node resolves is unaffected. A program Node refuses at
+startup now runs where a rule answers; where none answers, Node's refusal
+stands.
+
+**The checker.** tsgo has one module resolution per program, so before the
+program is created the source graph is walked from the entry (dev-graph.ts).
+Every dev-runner specifier becomes an exact tsconfig `paths` entry with an
+absolute target. A specifier that exact entries cannot express refuses by
+name (SC1010, "its importers resolve it to different modules") at each of
+its import sites. That happens when two importers resolve it to different
+files (two packages each mapping `@/*` to their own directory) or when one
+importer resolves it through a rule and another through Node or not at all.
+The checker would otherwise type one importer against the wrong module.
+
+**The project's tsconfig.** The entry's nearest `tsconfig.json`
+contributes these:
+- the strictness family and the import-interop knobs, as before
+  (`ADOPTED_OPTIONS`, shared.ts), with the `strictNullChecks` floor;
+- `paths`/`baseUrl` (with `extends`), through rule 1 for each importing
+  file's own nearest tsconfig, never handed raw to the checker;
+- `lib`, when the tsconfig lists one: its non-ECMAScript entries (`dom`, `dom.iterable`, `webworker`,
+  `scripthost`, `decorators`, …) join the forced `es2025` floor. This needs
+  `@types/node`, which is written to coexist with them. scriptc's fallback
+  declarations redeclare `console`, `URL` and the rest, so without
+  `@types/node` the DOM names stay undeclared and fail the type check by
+  name. With `dom` adopted, scriptc's own `BodyInit`/`HeadersInit`
+  (ambient/scriptc-fetch-init.d.ts) stand down for lib.dom's;
+- `types`: the explicit list (`node` stays the existing `@types/node`
+  logic);
+- the declaration files (`.d.ts`, `.d.mts`, `.d.cts`) that `include` and
+  `files` name outside `node_modules`, for example a `global.d.ts` that
+  declares build-time defines. A declaration twin with a runtime sibling
+  stays hidden (projectDtsRuntimeSibling).
+
+These are types only. Every value they declare still meets the lowering's
+provenance fences.
+
+**Not adopted** (they change emit semantics or scriptc's fixed world):
+`target`, `module`, `moduleResolution`, the ECMAScript `lib` levels (the
+`es2025` floor stays), `jsx*`, `experimentalDecorators`,
+`emitDecoratorMetadata`, `useDefineForClassFields`, `verbatimModuleSyntax`,
+`isolatedModules`, `allowJs`/`checkJs`, `resolveJsonModule`,
+`allowImportingTsExtensions`, `customConditions`, `rootDirs`, `typeRoots`,
+`references`, the emit options, and the non-declaration files of `include`
+(only the import graph from the entry compiles). The loader's load-side
+rules are not part of this entry: its transpile options, JSON imports
+without `with { type: "json" }`, and `require` inside an ES module keep
+their existing stories. One of them can diverge, and it is out of this
+entry: the loader honors an explicit `useDefineForClassFields: false`, and
+tsinter does not read that option.
+
+**Known limits, both shared with the loader:**
+- Rule 2's pattern takes the first `dist|lib|out|build` segment of the
+  absolute path, so a workspace package that lives under a directory with
+  one of those names does not map.
+- `lib`, `types` and `include` come from the entry's tsconfig only, not
+  from each workspace package's.
+- tsc's implicit default lib (the target's full lib, which includes DOM)
+  is not adopted when the tsconfig names no `lib`. lib.dom would then
+  declare the web globals ahead of `@types/node`, and their fences would
+  be attributed to lib.dom. A program that uses DOM type names without
+  listing `dom` fails the type check by name.
+
+**Tested by:** `packages/compiler/test/dev-resolve.test.ts`. Its resolver
+rows pin the rules, and its run rows run each fixture under the loader and
+on the wasm lane and require one output. The top-10 trial
+(`tests/real-apps-top10/`) measures the effect.

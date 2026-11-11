@@ -18,6 +18,12 @@ const TS5_ISLANDS = [
   // BEFORE the 7.0.2 program reads the file — a text→text parser island
   // beside cjs-lexer.ts (only strings cross its boundary).
   "packages/compiler/src/frontend/npm-static-rewrite.ts",
+  // Dev-runner resolution (SEMANTICS.md S130): tsconfig JSONC read with
+  // the same 5.9.3 reader the oracle's loader uses (strings only), and the
+  // source-graph scan that runs BEFORE the 7.0.2 program exists (the
+  // checker's exact "paths" come out of it).
+  "packages/compiler/src/frontend/dev-resolve.ts",
+  "packages/compiler/src/frontend/dev-graph.ts",
 ];
 
 const ts5Fence = {

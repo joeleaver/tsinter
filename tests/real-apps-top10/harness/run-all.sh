@@ -6,7 +6,7 @@
 #   nico.sh <worktree> -- bash tests/real-apps-top10/harness/run-all.sh [project...]
 # Results: ~/.cache/tsinter-dl/top10/res/<project>/{node,node2,wasm,wn}/, .../determinism.txt, .../cmp.txt
 H=$(cd "$(dirname "$0")" && pwd)
-RES=$HOME/.cache/tsinter-dl/top10/res
+RES=${SURVEY_TOP10_RES:-$HOME/.cache/tsinter-dl/top10/res}
 projects=("$@")
 [ ${#projects[@]} -eq 0 ] && mapfile -t projects < <(python3 -I -c "import json; print('\n'.join(json.load(open('$H/workloads.json'))))")
 for p in "${projects[@]}"; do
