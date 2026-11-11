@@ -555,6 +555,8 @@ export function resolveProjectImport(
   // program modules instead of island-embedding its published dist.
   const provenance = provenanceEntryFor(specifier);
   if (provenance !== null) return provenance;
+  const workspaceSource = workspaceSourceEntry(fromFile, specifier, kind);
+  if (workspaceSource !== null) return workspaceSource;
   const pkgDir = nearestPkgDir(dirname(resolve(fromFile)));
   if (pkgDir === null) return null;
   const pkg = scopePkgJsonOf(pkgDir) as (PkgJson & { imports?: unknown; exports?: unknown; type?: string }) | null;
@@ -588,6 +590,44 @@ export function resolveProjectImport(
   if (target === null) return null;
   const path = join(pkgDir, target);
   return loadAsFile(path) ?? (isFile(path) ? path : null);
+}
+
+/** A WORKSPACE SOURCE import: a bare specifier naming a workspace-linked
+ * package (its node_modules entry a symlink whose realpath escapes every
+ * node_modules: the monorepo-internal install) whose RUNTIME entry, Node's
+ * own exports/main answer under the importing syntax's conditions, is
+ * TypeScript source (paperclip's `"exports": { ".": "./src/index.ts" }`).
+ * Node runs that very file (type stripping applies: its realpath is outside
+ * node_modules), so the package is the program author's own source, and it
+ * compiles as program modules: resolveProjectImport answers the file here
+ * and resolveNpmImport answers null (no island, no npm attribution). Only
+ * when the checker's types answer is the same file: a package whose
+ * "types" condition names a separate declaration keeps the npm path.
+ * Returns the absolute source path, or null. */
+export function workspaceSourceEntry(
+  fromFile: string,
+  specifier: string,
+  kind: "import" | "require" = "import",
+): string | null {
+  if (specifier.startsWith("#") || specifier.startsWith("node:") || specifier.startsWith(".")) return null;
+  const r = resolveBareModule(fromFile, specifier, undefined, kind);
+  if (r === null || r.workspaceDir === undefined || isNodeModulesPath(r.typesFile)) return null;
+  if (!/\.(ts|tsx|mts|cts)$/.test(r.typesFile) || /\.d\.(ts|mts|cts)$/.test(r.typesFile)) return null;
+  const pkg = pkgJsonOf(r.workspaceDir) as (PkgJson & { exports?: unknown; main?: unknown }) | null;
+  if (pkg === null) return null;
+  const pkgName = packagePrefixOf(specifier);
+  const rest = specifier.slice(pkgName.length).replace(/^\//, "");
+  const subpath = rest === "" ? "." : `./${rest}`;
+  let target: string | null = null;
+  if (pkg.exports !== undefined) {
+    target = resolveExportsTypes(pkg.exports, subpath, kind === "require" ? JS_ONLY_REQUIRE_CONDITIONS : JS_ONLY_CONDITIONS);
+  } else if (subpath === "." && typeof pkg.main === "string") {
+    target = pkg.main;
+  }
+  if (target === null) return null;
+  const file = join(r.workspaceDir, target);
+  if (!isFile(file)) return null;
+  return realpathOr(file) === realpathOr(r.typesFile) ? r.typesFile : null;
 }
 
 /* 5.9.3 with allowJs resolves node_modules in TWO FULL PASSES (probed): the

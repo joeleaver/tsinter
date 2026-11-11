@@ -52,7 +52,7 @@ import {
   tscPassthroughDiag,
   unsupportedDiag,
 } from "../diagnostics/diagnostic.js";
-import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
+import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm, workspaceSourceEntry } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
@@ -1397,6 +1397,10 @@ function resolveNpmImport7(
     // (shared.ts) recognizes the package's real files. Anything else
     // whose answer left node_modules stays refused.
     if (resolved.workspaceDir === undefined) return null;
+    // A workspace package whose runtime entry is TypeScript source is the
+    // program's own source (resolve.ts workspaceSourceEntry): program
+    // modules, not an npm import.
+    if (workspaceSourceEntry(fromFileName, specifier, kind) !== null) return null;
     registerWorkspacePackage(resolved.packageName, resolved.workspaceDir);
   }
   return {
@@ -1569,7 +1573,9 @@ function preflight7(load: LoadResult): {
       if (probed.has(key)) return;
       probed.add(key);
       const r = resolveBareModule(fromFile, spec);
-      if (r !== null && r.workspaceDir !== undefined) registerWorkspacePackage(r.packageName, r.workspaceDir);
+      if (r !== null && r.workspaceDir !== undefined && workspaceSourceEntry(fromFile, spec) === null) {
+        registerWorkspacePackage(r.packageName, r.workspaceDir);
+      }
     };
     for (const sf of program.getSourceFiles()) {
       if (sf.isDeclarationFile || sf.fileName.endsWith(".json")) continue;

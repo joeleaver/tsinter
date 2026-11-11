@@ -30,6 +30,9 @@ export interface Row {
   files: Record<string, string>;
   /** Default true: link the vendored @types/node into the project. */
   nodeTypes?: boolean;
+  /** link path → target (relative to the link's directory), e.g. a
+   * workspace member's node_modules symlink. */
+  links?: Record<string, string>;
 }
 
 export function scratchDir(tag: string): string {
@@ -47,7 +50,11 @@ function write(scratch: string, row: Row, backend: string): string {
   for (const [name, src] of Object.entries(row.files)) {
     mkdirSync(join(dir, name, ".."), { recursive: true });
     writeFileSync(join(dir, name), src + "\n");
-    if (name.startsWith("main.")) entry = join(dir, name);
+    if (/(^|\/)main\.[cm]?[jt]s$/.test(name)) entry = join(dir, name);
+  }
+  for (const [link, target] of Object.entries(row.links ?? {})) {
+    mkdirSync(join(dir, link, ".."), { recursive: true });
+    symlinkSync(target, join(dir, link));
   }
   return entry;
 }
