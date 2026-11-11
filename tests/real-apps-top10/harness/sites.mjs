@@ -73,3 +73,6 @@ for (const [kind, list] of [["D", coverage.diagnostics ?? []], ["F", coverage.ru
   }
 }
 process.stdout.write(JSON.stringify(out, null, 1));
+// --npm-static's per-package verdicts (static, or fallback with its reason), on stderr: the dep-edge census
+// needs the reason a dependency is not compiled statically
+if (coverage.npmStatic) process.stderr.write("NPMSTATIC " + JSON.stringify(coverage.npmStatic) + "\n");

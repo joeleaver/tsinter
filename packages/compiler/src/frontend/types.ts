@@ -749,6 +749,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   const widened = checker.getBaseTypeOfLiteralType(type);
   const flags = widened.flags;
+  // An uninhabited record on its own (S135): what TypeScript narrows a
+  // `Result<never, E>` to in a branch that never runs (`if (r.ok)`). Its
+  // union dropped the arm, so there is no representation to read through:
+  // a use refuses by name instead of reading a record of the other arm.
+  if (flags & ts.TypeFlags.Object && isUninhabitedRecordArm(widened, checker)) return null;
 
   if (flags & ts.TypeFlags.Number) return F64;
   if (flags & ts.TypeFlags.String) return STRING;
@@ -2371,6 +2376,14 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
           byKey.set(typeKey(NULL_T), NULL_T);
           continue;
         }
+        // An UNINHABITED record arm — a required field of type `never`,
+        // the `Result<never, E>` spelling of the ok/err helper idiom
+        // (`ok = <T>(v: T): Result<T, never>`) — holds no value, so it
+        // gets no arm: the union is its inhabited arms (SEMANTICS.md S135).
+        // Mapping it would give the field the dead-read placeholder (f64),
+        // and the helper's result would no longer re-tag into the
+        // caller's `Result<T, E>`.
+        if (isUninhabitedRecordArm(part, ctx.checker)) continue;
         const mapped = mapType(part, ctx);
         // A jsval PART absorbs the union: `GeneratedFile | undefined` (a
         // package-declared arm) is one island handle — the engine's
@@ -2475,6 +2488,20 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     }
   }
   return null;
+}
+
+/** A union PART that no value inhabits: a plain object type (a type
+ * literal or interface — never a class, whose instances exist whatever
+ * their field types say) with a REQUIRED property typed `never`. An
+ * optional `never` property is the absent-field spelling and stays
+ * inhabited (S135). */
+function isUninhabitedRecordArm(part: ts.Type, checker: TypeMapperCtx["checker"]): boolean {
+  if ((part.flags & ts.TypeFlags.Object) === 0) return false;
+  const sym = part.getSymbol();
+  if (sym !== undefined && (sym.flags & ts.SymbolFlags.Class) !== 0) return false;
+  return checker.getPropertiesOfType(part).some(
+    (p) => (p.flags & ts.SymbolFlags.Optional) === 0 && (checker.getTypeOfSymbol(p).flags & ts.TypeFlags.Never) !== 0,
+  );
 }
 
 /** The narrowed-type-parameter recognizer behind mapType's early return:

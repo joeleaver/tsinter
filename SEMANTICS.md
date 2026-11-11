@@ -10592,3 +10592,39 @@ and open-design import `node:v8`, `node:sqlite`, `node:readline/promises`
 and `node:process` in modules their workloads load but never call into).
 **Tested by:** `packages/compiler/test/wasm-r2-builtin-at-use.test.ts`
 (wasm and wasm-native, against Node; and the export table against Node).
+
+## S135 — A union arm no value inhabits gets no arm: `Result<never, E>` is its error record *(every lane; tested on wasm and wasm-native)*
+
+TypeScript keeps an object arm whose REQUIRED property is typed `never`
+(`{ readonly ok: true; readonly value: never }`, the ok arm of
+`Result<never, E>` that the ok/err helper idiom returns from
+`err = <E>(error: E): Result<never, E>`). No value has that type, so in
+Node the helper's result is always the other arm. Before this entry such
+an arm mapped with `never`'s dead-read placeholder (an f64 field), the
+helper's result became a two-arm union of its own, and returning it into
+the caller's `Result<T, E>` refused (SC2003: union arms must match).
+
+Now a union PART that is a plain object type (a type literal or an
+interface, never a class) with a required `never`-typed property is
+dropped when the union maps: the union is its inhabited arms, and a
+union left with one arm is that arm (`Result<never, E>` maps to the
+`{ ok: false; error: E }` record, which re-tags into `Result<T, E>`). An
+OPTIONAL `never` property (`r?: never`, the absent-field spelling) stays
+inhabited and keeps its arm. A class arm keeps its arm (instances exist
+whatever their field types say).
+
+**Divergence:** none for values TypeScript types honestly. A value that
+reaches such a slot only through a type lie (an `any` holding
+`{ ok: true, value: 1 }` where `Result<never, E>` is declared) is a
+dynamic value, and S128 governs it: in a contained slot it is the value
+itself (Node's behavior), and where it must enter typed storage it is
+checked and stops by name if it does not fit. An uninhabited record
+standing ALONE (what TypeScript narrows a `Result<never, E>` to in an
+`if (r.ok)` branch that never runs) has no representation: a use of it,
+such as reading `r.value` there, refuses at compile time by name (SC1090),
+where Node never executes the read.
+
+**Rationale:** rea's `domain/result.ts` helpers (514 SC2003 sites in the
+top-10 past-gate census) and the same idiom across TypeScript code.
+**Tested by:** `packages/compiler/test/wasm-top10-rea-never-arm.test.ts`
+(wasm and wasm-native, against Node).
