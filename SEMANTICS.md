@@ -10502,3 +10502,93 @@ to Node and the (a1) fences, on wasm and wasm-native), the converted rows
 of `wasm-any-array-shared.test.ts` (H-EXIT, H-FRESH-02, H-UNK),
 `wasm-dyn-copies.test.ts` and `wasm-u1-shared-dynamic.test.ts`. Measured
 against Node v24.18.1.
+
+## S129 — An import of a Node builtin this build does not serve binds stubs: the program runs until it first touches one, and stops there by name *(every lane; tested on wasm and wasm-native)*
+
+Node loads every builtin it ships; a compiled binary serves only the
+supported ones (`SUPPORTED_BUILTIN_MODULES`). Until R2 any import of the
+others (the `module:builtin` family: `node:v8`, `node:sqlite`,
+`node:inspector`, `node:readline/promises`, named imports of
+`node:process`, `node:vm`, `node:stream/web`, ...) refused the BUILD at the
+import line (SC1010), even when the program never used it — real CLIs
+import `node:v8` at the top of modules for a heap check their ordinary
+commands never reach. Now the import compiles and its bindings are STUBS:
+default, named and namespace imports (with the project's @types/node
+adopted, so the checker knows the module), named re-exports `export { x }
+from "node:v8"`, a `require` binding or a bare `require` in JavaScript in
+either spelling (`require("v8")` loads the builtin, as in Node, never
+"Cannot find module" — the `try { require("v8") } catch {}` probe answers
+that it is there), and createRequire's `require("vm")` in statement
+position.
+
+- (a) A program that imports such a module and never touches a binding
+  runs as Node does, byte for byte.
+- (b) The first evaluation that touches a stub — a call, `new`, a member
+  read, the binding as a value (an argument, a stored function, a
+  shorthand property `{ v8 }`, createRequire's `require("v8")` as a value),
+  a re-exported binding read in its importer — ends the program with
+  S122's run-time fence: everything printed so far, then `tsinter:
+  unsupported: the 'node:v8' module (<why>) is not supported yet [SC1010
+  at <file>:<line>]` on stderr, exit 1, where Node goes on. Where the
+  touching expression's type maps, the fence is that expression (an
+  untaken `?:` arm, an unevaluated `&&` operand or a default parameter
+  never used costs nothing); otherwise it is the innermost statement
+  holding the touch, which stops BEFORE that statement's other effects
+  (`console.log("x", v8.getHeapStatistics())` prints nothing of its own).
+  In a JavaScript module, a shorthand property of a namespace or default
+  binding at the top level is the module table's alias: the stop comes
+  where the member is READ, and names the shorthand's line.
+- (c) Types the module declares (`HeapInfo`, `DatabaseSync`, the
+  readline/promises `Interface`, `typeof import("node:v8")`) are DYNAMIC
+  slots, like `unknown`'s: a class field `db: DatabaseSync | null = null`,
+  a parameter or result typed by them, compile; no stub value ever reaches
+  them, since producing one is a touch. Their members read off such a
+  value that does exist (a program's own object typed `HeapInfo`) read
+  dynamically; a use of one that has no lowering (a spread `{ ...h }`)
+  stops the run there under its own refusal's text (SC2020/SC2009, not the
+  module's), as a deferred fence. Still refused, loudly: a JavaScript
+  object literal whose
+  module-table getter for a namespace shorthand precedes a data member
+  (`{ v8, serialize }` at a module's top: SC3001, the existing getter-order
+  refusal); createRequire's `require("v8")` bound as a value stops at the
+  require itself, where Node stops only at a use.
+- (d) Exports Node's module does not have without flags (vm's
+  `SourceTextModule`, `SyntheticModule`, `Module`, which need
+  `--experimental-vm-modules`), from a table generated from Node v24.18.1
+  (`packages/compiler/test/gen-stub-builtin-exports.mjs`; node:process's
+  row is the plain `node file` launch's, since its namespace mirrors the
+  live process object, whose keys vary by launch):
+  - a NAMED IMPORT of one is Node's link-time refusal: the program throws
+    the uncaught `SyntaxError: The requested module 'node:vm' does not
+    provide an export named 'SourceTextModule'` before any module runs, so
+    stdout (empty) and the exit code (1) match Node; stderr carries that
+    message in the tier's uncaught-error form, not Node's
+    `file:line`/source-line/caret/stack report (S007);
+  - `typeof` of one — a CommonJS destructuring `const { SourceTextModule }
+    = require("vm")` or a member read off the module object
+    (`vm.SourceTextModule`) — is `"undefined"`, as in Node (the
+    feature-detection pattern); any other use of it is a touch (b).
+  `typeof` of an export the module does have is a touch too where it is
+  not decided by the declared type alone.
+- (e) Builtins whose LOAD Node makes observable keep the compile-time
+  refusal at the import, since skipping the load would be silent:
+  `punycode` (DEP0040), `sys` (DEP0025) and `_stream_wrap` (DEP0125) print
+  a DeprecationWarning, `wasi` an ExperimentalWarning, and loading
+  `domain`, or `repl` (which loads domain), switches
+  `EventEmitter.usingDomains` on (measured on Node v24.18.1). Star and
+  namespace re-exports of a builtin keep SC1014. Without @types/node an
+  ESM import of an unserved module is a type error (SC0001), and the SC1010
+  refusal stays beside it.
+- (f) Implemented, not stubbed: `import process from "node:process"` is
+  the global `process` object, exactly as Node's module is
+  (`module.exports === process`), so it lowers as `process` — the import
+  twin of `const process = require("node:process")`. Named imports and the
+  namespace form of `node:process` are stubs.
+
+**Rationale:** the refusal stays loud and names the module, but moves from
+where the module is imported to where it is used, which is where Node
+would first depend on it (Joe's top-10 priority, unit R2: rea, paperclip
+and open-design import `node:v8`, `node:sqlite`, `node:readline/promises`
+and `node:process` in modules their workloads load but never call into).
+**Tested by:** `packages/compiler/test/wasm-r2-builtin-at-use.test.ts`
+(wasm and wasm-native, against Node; and the export table against Node).

@@ -2,8 +2,10 @@
  * program-collection pass (signatures, classes, globals — reachability
  * seeds), npm/JSON import collection, per-file %init functions, %main, and
  * the module artifacts (globals, embedded npm tables) the IR module carries. */
+import { isBuiltin } from "node:module";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
+import { onlyStubTouches } from "./stub-builtins.js";
 import { dirname as dirnamePath, resolve as resolvePath } from "node:path";
 import { NpmGraphBuilder, packageNameOfPath, probeNodeImportRefusal, probeNodeRequireRefusal } from "../npm.js";
 import { isNpmStaticPackage } from "../npm-static.js";
@@ -524,6 +526,7 @@ export interface FileParts {
           cr !== null &&
           spec !== null &&
           canonicalBuiltinModule(spec) === null &&
+          !isBuiltin(spec) &&
           !isRelativeSpecifier(spec) &&
           !spec.startsWith("/") &&
           !spec.startsWith("#") &&
@@ -806,7 +809,14 @@ export interface FileParts {
  * runtimeFence trap there, and every use site cascades to its own trap.
  * TypeScript files keep eager collection reports. */
 function deferJsCollectionDiags(L: Lowerer, sf: ts.SourceFile, diagsBefore: number): void {
-  if (!isJsSourceFile(sf)) return;
+  if (!isJsSourceFile(sf)) {
+    // R2 (SEMANTICS.md S129): a TypeScript collection failure made only
+    // of stub-builtin touches (a module-level `const s =
+    // getHeapStatistics()` whose global's type a stub declares) defers
+    // like a JS one — the statement re-fails at init into its fence.
+    if (onlyStubTouches(L, L.diags.slice(diagsBefore))) L.runtimeFences.push(...L.diags.splice(diagsBefore));
+    return;
+  }
   const captured = L.diags.splice(diagsBefore);
   const ice = captured.filter((d) => d.code === "SC9001");
   if (ice.length > 0) L.diags.push(...ice);

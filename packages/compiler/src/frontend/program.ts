@@ -57,6 +57,7 @@ import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
+import { STUB_BUILTIN_EXPORTS } from "./stub-builtin-exports.js";
 import { nodePackageTypeOf } from "./node-conditions.js";
 import {
   ADOPTED_OPTIONS,
@@ -73,6 +74,7 @@ import {
   JS_RELAXED_TSC_CODES,
   overridesDtsPath,
   registerWorkspacePackage,
+  stubBuiltinModuleOf,
   SUPPORTED_NODE_MODULES,
   unsupportedModuleFeatureOf,
   workspacePackageOfPath,
@@ -1921,8 +1923,10 @@ function preflight7(load: LoadResult): {
           // builtin directly — per-member support stays the lowering's
           // per-site business. Star and namespace re-exports and package
           // specifiers keep the fence.
+          // R2 (S129): the same for a builtin whose bindings are stubs —
+          // the importers' uses chase the alias to the stub and fence there.
           if (
-            canonicalBuiltinModule(fromSpec) !== null &&
+            (canonicalBuiltinModule(fromSpec) !== null || (stubBuiltinModuleOf(fromSpec) !== null && program.getTypeChecker().getSymbolAtLocation(stmt.moduleSpecifier) !== undefined)) &&
             stmt.exportClause !== undefined &&
             ts.isNamedExports(stmt.exportClause)
           ) {
@@ -1939,6 +1943,10 @@ function preflight7(load: LoadResult): {
           // through the alias chain. Star re-exports and unresolvable
           // specifiers keep the fence (no member list to bind / nothing
           // installed to load).
+          if (stubBuiltinModuleOf(fromSpec) !== null && program.getTypeChecker().getSymbolAtLocation(stmt.moduleSpecifier) !== undefined) {
+            diags.push(unsupportedDiag("SC1014", locOf7(stmt), "star and namespace re-exports of builtin modules"));
+            continue;
+          }
           const reNpm = !fromSpec.startsWith("#") ? resolveNpmImport7(sf.fileName, fromSpec) : null;
           // An opted-in package reached through its CJS-first wrapper
           // substitution re-exports only what the wrapper serves.
@@ -2018,6 +2026,17 @@ function preflight7(load: LoadResult): {
       const spec = specNode.text;
       const isRelative = isRelativeSpecifier(spec);
       const isBare = !isRelative && !ambientModules.has(spec);
+      // R2 (SEMANTICS.md S129): an unsupported builtin whose load Node
+      // does not make observable imports as STUBS — no module edge, no
+      // clause fences; the lowering stops the program at the first
+      // statement that touches a binding (its named run-time fence).
+      // Only where the checker knows the module (@types/node adopted):
+      // in the fallback-declarations world the import is a type error
+      // anyway, and the SC1010 fence beside it says why.
+      if (!isRelative && stubBuiltinModuleOf(spec) !== null && program.getTypeChecker().getSymbolAtLocation(specNode) !== undefined) {
+        attributeRefusal(stmt, spec, null);
+        continue;
+      }
       // --npm-static: an opted-in package importing node:module admits
       // for PROGRAM code (per-member fences, divergence 370) but marks
       // the PACKAGE an offender — createRequire's static story covers
@@ -2347,8 +2366,11 @@ function preflight7(load: LoadResult): {
               dep = npmStaticProgramDep(program, npmReq.packageName, npmReq.typesFile);
               if (dep === null) continue; // offender recorded — the fallback loop reloads
             } else {
+              // R2 (S129): a require of a stub builtin binds stubs (or, bare,
+              // loads nothing observable) — its uses fence per statement.
               if (
                 canonicalBuiltinModule(req.spec) === null &&
+                stubBuiltinModuleOf(req.spec) === null &&
                 !processModuleAliasRequire7(req.spec, req.decl)
               ) {
                 // A binding-less require of a package NOTHING resolves:
@@ -2424,7 +2446,7 @@ function preflight7(load: LoadResult): {
               if (nDep !== null) deps.push({ dep: nDep });
               continue;
             }
-            if (canonicalBuiltinModule(spec) === null && !processModuleAliasRequire7(spec, null)) {
+            if (canonicalBuiltinModule(spec) === null && stubBuiltinModuleOf(spec) === null && !processModuleAliasRequire7(spec, null)) {
               // Binding-less by construction — same require-site throw
               // channel as the statement-level form above.
               if (probeNodeRequireRefusal(sf.fileName, spec) === null) {
@@ -2610,7 +2632,10 @@ function cjsNamedImportLinkCheck(
     const dep = resolveEdge(from, spec, "require");
     return dep !== null && isCjsJsFile7(dep) ? dep : null;
   };
-  const visible = (dep: ts.SourceFile, name: string): boolean =>
+  const visible = (dep: ts.SourceFile | string, name: string): boolean =>
+    // R2 (SEMANTICS.md S129): a stub builtin links against the export names
+    // Node's own namespace for it has (generated from the oracle).
+    typeof dep === "string" ? (STUB_BUILTIN_EXPORTS[dep]?.includes(name) ?? true) :
     // `default` is the module.exports binding itself — always provided; a
     // JSON module provides nothing else.
     dep.fileName.endsWith(".json") ? name === "default" :
@@ -2647,12 +2672,14 @@ function cjsNamedImportLinkCheck(
   };
   // The link-checked targets: CommonJS modules (their lexer-built facade)
   // and JSON modules (a default export only).
-  const linkDepOf = (sf: ts.SourceFile, spec: string): ts.SourceFile | null => {
+  const linkDepOf = (sf: ts.SourceFile, spec: string): ts.SourceFile | string | null => {
+    const stub = stubBuiltinModuleOf(spec);
+    if (stub !== null) return Object.hasOwn(STUB_BUILTIN_EXPORTS, stub) ? stub : null;
     const dep = resolveEdge(sf, spec);
     return dep !== null && (isCjsJsFile7(dep) || dep.fileName.endsWith(".json")) ? dep : null;
   };
   const firstInvisibleOf = (sf: ts.SourceFile): BadCjsImport | null => {
-    const entries: { local: string; exportName: string; nameNode: ts.Node; spec: string; dep: ts.SourceFile }[] = [];
+    const entries: { local: string; exportName: string; nameNode: ts.Node; spec: string; dep: ts.SourceFile | string }[] = [];
     for (const stmt of sf.statements) {
       if (!ts.isImportDeclaration(stmt) || stmt.moduleSpecifier === undefined || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
       const clause = stmt.importClause;
@@ -2722,7 +2749,15 @@ function cjsNamedImportLinkCheck(
   for (const sf of moduleOrder) {
     if (!isNodeEsmFile7(sf) || visited.has(sf)) continue;
     const b = firstInvisibleOf(sf);
-    if (b !== null) {
+    if (b !== null && stubBuiltinModuleOf(b.spec) !== null) {
+      diags.push(
+        unsupportedDiag(
+          "SC1013",
+          locOf7(b.nameNode),
+          `a named import of '${b.exportName}', which the '${b.spec}' module does not export, reached through require() of an ES module (Node throws its SyntaxError mid-evaluation at that require)`,
+        ),
+      );
+    } else if (b !== null) {
       diags.push(
         unsupportedDiag(
           "SC1013",
@@ -2797,6 +2832,7 @@ export {
   isNodeTypesPath,
   npmPackageNameOf,
   overridesDtsPath,
+  stubBuiltinModuleOf,
   SUPPORTED_BUILTIN_MODULES,
   workspacePackageOfPath,
 } from "./shared.js";

@@ -105,8 +105,8 @@ test("import fences no longer stop analysis: percentage plus module blockers", a
   // every use of its bindings carry the same message); the rest of the
   // program still counts. Lives in the node-types fixture: builtin
   // specifiers only RESOLVE (typecheck) with @types/node adopted — the
-  // fallback world turns them into tsc errors, which stay fatal. The same
-  // file must FAIL a build (compile() keeps preflight fatal).
+  // fallback world turns them into tsc errors, which stay fatal. Since R2
+  // (SEMANTICS.md S129) v8 imports as stubs: the use is a deferred fence.
   await expect(
     report(join(repoRoot, "tests/fixtures/node-types/import-fences.ts")),
   ).toMatchFileSnapshot("__snapshots__/coverage-import-fences.txt");

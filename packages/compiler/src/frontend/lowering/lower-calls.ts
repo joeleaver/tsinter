@@ -32,6 +32,7 @@ import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { lowerVoidTernaryStatement } from "./lower-stmts.js";
+import { onlyStubTouches } from "./stub-builtins.js";
 
 /** How a parameter participates in CALL-SITE COMPLETION (the frontend
  * completes every call to the one full signature, so the IR and backends
@@ -6487,7 +6488,7 @@ function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpres
       // lowerStmts; probe mode (diagSink) keeps the poison.
       if (!(e instanceof PoisonError)) throw e;
       if (
-        !isJsSourceFile(node.getSourceFile()) ||
+        (!isJsSourceFile(node.getSourceFile()) && !onlyStubTouches(L, L.diags.slice(diagsBefore))) ||
         L.diagSink !== null ||
         L.diags.length <= diagsBefore ||
         L.diags.slice(diagsBefore).some((d) => d.code === "SC9001")

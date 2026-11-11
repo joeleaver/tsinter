@@ -10,6 +10,7 @@ import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, Ir
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
+import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
 import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf } from "./surfaces.js";
 import { isProvenanceSourceFile } from "../provenance-registry.js";
@@ -22,12 +23,12 @@ import type { ClassInfo, ClassIteratorInfo } from "./lower-classes.js";
 import { genericIfaceBindingKeepsClass } from "./lower-classes.js";
 import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from "./lower-stream.js";
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
-import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
+import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, createRequireSpecOf } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
 import { orderedRecordWrite, abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
-import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
+import { canonicalBuiltinModule, isRelativeSpecifier, stubBuiltinModuleOf } from "../shared.js";
 import { probeNodeRequireRefusal } from "../npm.js";
 import { lowerExecCompanionDecl, lowerRegexLastIndexIncDec, lowerRegexLastIndexWrite } from "./lower-regex.js";
 
@@ -205,7 +206,13 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
           // the statement never runs (Node parity: the construct never
           // executed) or it reports exactly what the compile fence would
           // have said.
-          if (deferFences && L.diagSink === null) {
+          // R2 (SEMANTICS.md S129): a statement whose only diagnostics
+          // are stub-builtin touches defers in TypeScript too — the
+          // program runs until it reaches the statement, which stops it
+          // by name.
+          const stubOnly = !deferFences && L.diagSink === null && onlyStubTouches(L, L.diags.slice(diagsBefore));
+          if (stubOnly) for (const sym of declaredSymbolsOf(L, stmt)) L.stubBlocked.add(sym);
+          if ((deferFences || stubOnly) && L.diagSink === null) {
             const captured = L.diags.splice(diagsBefore);
             if (captured.some((d) => d.code === "SC9001")) {
               L.diags.push(...captured); // ICEs stay compile errors
@@ -3583,10 +3590,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // poisons, still declare the local when its type is representable, so
     // later references to this name don't produce cascading errors.
     let init: IrExpr;
+    const initDiagsBefore = L.diags.length;
     try {
       init = L.lowerExpr(decl.initializer);
     } catch (e) {
-      if (e instanceof PoisonError) {
+      // R2 (S129): no salvage after a stub touch — the binding's uses are
+      // the SC2004 cascade, which defers with the touch's fence.
+      if (e instanceof PoisonError && !onlyStubTouches(L, L.diags.slice(initDiagsBefore))) {
         const salvaged = L.mapTypeOf(L.typeOf(decl.name));
         if (salvaged && salvaged.kind !== "void") {
           L.declareLocal(decl.name, decl.name.text, salvaged, isLet);
@@ -4978,6 +4988,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         expr,
         "require() outside the module's top level (move it to the top of the file)",
       );
+    }
+    // R2 (SEMANTICS.md S129): a statement-position `require("v8")` through
+    // a createRequire binding loads a stub builtin — nothing observable.
+    if (
+      ts.isCallExpression(expr) &&
+      ts.isIdentifier(expr.expression) &&
+      createRequireCalleeFileOf(L, expr.expression) !== null
+    ) {
+      const spec = createRequireSpecOf(L, expr)?.spec ?? null;
+      if (spec !== null && stubBuiltinModuleOf(spec) !== null) return { kind: "block", body: [], loc: locOf(expr) };
     }
     if (topLevelJs && ts.isExpressionStatement(stmtNode)) {
       const cjs = cjsExportAssignmentOf(stmtNode);

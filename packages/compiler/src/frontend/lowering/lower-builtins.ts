@@ -9,7 +9,8 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { PoisonError, dynUndefinedExpr, ladderFenceExpr, nodeThrowExpr, own } from "./lowerer.js";
 import { canonicalBuiltinModule, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
-import { isRelativeSpecifier } from "../shared.js";
+import { isRelativeSpecifier, stubBuiltinModuleOf } from "../shared.js";
+import { stubTouch } from "./stub-builtins.js";
 import { probeNodeRequireRefusal } from "../npm.js";
 import { isNpmStaticPackage } from "../npm-static.js";
 import { invalidJsonModuleDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
@@ -313,6 +314,9 @@ import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTRE
       );
     }
     const spec = cr.spec;
+    // R2 (SEMANTICS.md S129): a stub builtin's module object as a value is
+    // a touch (statement position loads nothing — lowerExprStatement).
+    if (stubBuiltinModuleOf(spec) !== null) stubTouch(L, call, spec);
     if (canonicalBuiltinModule(spec) !== null) {
       L.unsupported(
         "SC1090",

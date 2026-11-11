@@ -281,7 +281,7 @@ export function renderCoverage(input: CoverageInput, opts: { color?: boolean; so
     const grouped = groupBlockers(fences);
     const widestF = Math.max(...grouped.map((b) => b.what.length));
     out.push(
-      `  ${c(YELLOW, "deferred to runtime")}   ${fences.length} site${fences.length === 1 ? "" : "s"} ${c(DIM, "(JS statements that throw their fence if executed)")}`,
+      `  ${c(YELLOW, "deferred to runtime")}   ${fences.length} site${fences.length === 1 ? "" : "s"} ${c(DIM, "(statements that stop at their named fence if executed: JS constructs, stub builtins — SEMANTICS.md S122, S129)")}`,
     );
     for (const b of grouped) {
       out.push(

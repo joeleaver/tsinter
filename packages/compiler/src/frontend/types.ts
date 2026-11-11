@@ -4,6 +4,7 @@ import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isS
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
 import { accessorSlotProp, shapeFieldCopy } from "../ir/nodes.js";
+import { stubDeclaredModuleOfType } from "./stub-types.js";
 // typeKey moved to ir/nodes.ts (the backend needs it too, for per-type
 // helper interning); re-exported here so frontend call sites keep their
 // import path.
@@ -699,6 +700,14 @@ function classExprNeverRegisters(decl: ts.ClassLikeDeclaration): boolean {
 
 function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   const { checker, unions, classNamer, resolveTypeParam } = ctx;
+  // R2 (SEMANTICS.md S129): a type a STUB builtin declares (HeapInfo,
+  // DatabaseSync, the module namespace) has no compiled representation —
+  // its values only come out of a stub touch, which ends the program — so
+  // its slots are dynamic, like `unknown`'s: a declaration, field or
+  // parameter of it compiles, and nothing ever stores a stub value there.
+  if (type.flags & ts.TypeFlags.Object && stubDeclaredModuleOfType(checker, type) !== null) {
+    return ctx.sharedDynamic === true ? JSVAL : DYN;
+  }
   if (resolveTypeParam && type.flags & ts.TypeFlags.TypeParameter) {
     const bound = resolveTypeParam(type);
     if (bound) {

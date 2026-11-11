@@ -86,6 +86,7 @@
  * re-export hops).
  */
 import { readFileSync, realpathSync } from "node:fs";
+import { isBuiltin } from "node:module";
 import { dirname, extname, join, resolve } from "node:path";
 import ts from "typescript5";
 import { cjsLexedExportsOf } from "./cjs-lexer.js";
@@ -668,7 +669,10 @@ export function probeNodeRequireRefusal(
   if (
     specifier.startsWith("./") || specifier.startsWith("../") ||
     specifier.startsWith("/") || specifier.startsWith("#") ||
-    specifier.startsWith("node:")
+    specifier.startsWith("node:") ||
+    // Node's require answers a builtin name before any node_modules lookup
+    // (`require("v8")` loads the builtin, never "Cannot find module").
+    isBuiltin(specifier)
   ) {
     return null;
   }
