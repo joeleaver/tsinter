@@ -109,6 +109,12 @@ export interface ClassInfo {
   fieldIndex: Map<string, number>;
   /** Field name → its IR type, the honest gate at every access site. */
   fieldType: Map<string, IrType>;
+  /** Object keys (docs/design/object-keys.md): the identity-hash slot's
+   * index — right after `vt` on a user-rooted class in a module with
+   * identity-keyed containers (inherited by every subclass: the slot is
+   * part of the repeated prefix); undefined otherwise (error-rooted
+   * classes hash through errT's own ERR_IDH). */
+  idh?: number;
 }
 
 export interface ClassDeps {
@@ -151,6 +157,8 @@ export interface ClassDeps {
    * only spells its type. Stage B, %Readable only — Writable/Duplex/
    * Transform/PassThrough stay `class:extends-runtime` (see `rootKind`). */
   streamStateRef: () => ValType;
+  /** Object keys: user-rooted classes carry the identity-hash slot. */
+  idSlot?: boolean;
 }
 
 export class ClassBuilder {
@@ -575,7 +583,8 @@ export class ClassBuilder {
     const kind = this.rootKind(meta);
     const emitterRooted = kind === "emitter" || kind === "stream";
     const streamRooted = kind === "stream";
-    const prefixCount = (meta.hierarchy ? 1 : 0) + (emitterRooted ? 2 : 0) + (streamRooted ? 1 : 0);
+    const userIdh = this.deps.idSlot === true && kind === "user";
+    const prefixCount = (meta.hierarchy ? 1 : 0) + (userIdh ? 1 : 0) + (emitterRooted ? 2 : 0) + (streamRooted ? 1 : 0);
     const fieldBase = prefixCount;
     // An error-rooted class SUBTYPES errT, so its first three flattened
     // fields — %Error's name/message/%code — are errT's own declarations
@@ -590,10 +599,12 @@ export class ClassBuilder {
       struct,
       fieldIndex: new Map(meta.def.fields.map((f, i) => [f.name, fieldBase + i + (i >= ERR_IR_FIELDS ? errSkip : 0)])),
       fieldType: new Map(meta.def.fields.map((f) => [f.name, f.type])),
+      ...(userIdh ? { idh: meta.hierarchy ? 1 : 0 } : {}),
     };
     this.infos.set(name, info);
     const fields: FieldType[] = [];
     if (meta.hierarchy) fields.push({ storage: this.ciRef(), mutable: false });
+    if (userIdh) fields.push({ storage: I32, mutable: true });
     if (emitterRooted) {
       fields.push({ storage: this.deps.emitterRegRef(), mutable: true });
       fields.push({ storage: this.deps.softType(STRING), mutable: false });

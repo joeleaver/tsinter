@@ -24,8 +24,8 @@
  * one buffer type, one helper family per distinct element type, interned.
  * The emitter injects what element formatting needs (strEq for string
  * equality, f64ToStr and literal pushing for join). */
-import { Code } from "./code.js";
-import { F64, I32, ModuleBuilder, type StorageType, type ValType } from "./module.js";
+import { addZeroTailType, Code } from "./code.js";
+import { F64, I32, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import { emitFlat } from "./strings.js";
 import { MAX_STRING_LENGTH } from "./ropes.js";
 import { UNDEF_BOOL, UNDEF_F64_BITS } from "./undef.js";
@@ -73,6 +73,9 @@ export interface VecDeps {
   /** Unit U: the reserved-tag union instance (unions.ts), a union vector's
    * hole — every union observer reads it as undefined. */
   unionUndefGlobal?: () => number;
+  /** Object keys (docs/design/object-keys.md): vectors carry the
+   * identity-hash slot (VEC_IDH). */
+  idSlot?: boolean;
 }
 
 /** How elements compare (===/SameValueZero) and format (join). */
@@ -96,6 +99,8 @@ export interface VecInfo {
 // layout as an undocumented assumption (review MINOR-2).
 export const LEN = 0;
 export const BUF = 1;
+/** The identity-hash slot, in a module with identity-keyed containers. */
+export const VEC_IDH = 2;
 
 export class VecBuilder {
   private readonly infos = new Map<string, VecInfo>();
@@ -111,10 +116,17 @@ export class VecBuilder {
     const existing = this.infos.get(key);
     if (existing !== undefined) return existing;
     const bufType = this.mb.arrayType(storage, true);
-    const struct = this.mb.structType([
+    const fields: FieldType[] = [
       { storage: I32, mutable: true },
       { storage: { kind: "ref", nullable: false, typeIndex: bufType }, mutable: true },
-    ]);
+      // Object keys: the identity-hash slot (VEC_IDH), zeroed at every
+      // struct.new by code.ts's zero-tail rule.
+      ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true }] : []),
+    ];
+    // Interned apart (module.ts idSlotStructType) so the zero tail rewrites
+    // no other struct.new of an identical layout.
+    const struct = this.deps.idSlot === true ? this.mb.idSlotStructType(fields) : this.mb.structType(fields);
+    if (this.deps.idSlot === true) addZeroTailType(struct);
     const made: VecInfo = {
       key,
       struct,

@@ -62,6 +62,8 @@ export interface FetchDeps {
   errT: () => number;
   /** class:fetchCause — errT's fields then `cause` (errRef). */
   causeT: () => number;
+  /** errT carries the object-keys identity-hash slot (emitter ERR_IDH). */
+  errIdh?: boolean;
   vtGlobal: (className: string) => number;
   /** GH #141: push the vt of a plain Error rebuilt from the host's name in
    * local `nameLocal` (emitter.ts emitPlainErrVtByName, foreign tags). */
@@ -623,7 +625,7 @@ export class FetchBuilder {
       // of the cause (class:fetchCause subtypes the builtin error).
       $.put(TOP, $.call(this.errByNameFn(), $.l(NAME), $.l(MSG), $.anew(this.deps.strType(), $.i(0))));
       const ET = this.deps.errT();
-      $.do($.new_(this.deps.causeT(), $.get(ET, 0, $.l(TOP)), $.get(ET, 1, $.l(TOP)), $.get(ET, 2, $.l(TOP)), $.get(ET, 3, $.l(TOP)), $.nul(EQ_HEAP), $.l(CAUSE)));
+      $.do($.new_(this.deps.causeT(), $.get(ET, 0, $.l(TOP)), $.get(ET, 1, $.l(TOP)), $.get(ET, 2, $.l(TOP)), $.get(ET, 3, $.l(TOP)), $.nul(EQ_HEAP), ...(this.deps.errIdh === true ? [$.i(0)] : []), $.l(CAUSE)));
     });
   }
 

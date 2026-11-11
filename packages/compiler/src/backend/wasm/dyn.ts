@@ -135,7 +135,7 @@ import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
-import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 
 /** ScrDynKind's numeric values (scr_runtime.h), shared verbatim with
  * `backend/llvm/dyn.ts`'s `DK` and the C runtime. A CROSS-LANE CONTRACT —
@@ -233,6 +233,9 @@ export const VIEW_F3 = 6;
 export const OBJ_LEN = 0;
 export const OBJ_ENTRIES = 1;
 export const OBJ_PROTO = 2;
+/** Object keys: the identity-hash slot, in a module with identity-keyed
+ * containers (DynDeps.idSlot). */
+export const OBJ_IDH = 3;
 
 export const OBJ_PROTO_PLAIN = 0;
 export const OBJ_PROTO_NULL = 1;
@@ -302,6 +305,9 @@ export interface DynHandleDeps {
 }
 
 export interface DynDeps {
+  /** Object keys (docs/design/object-keys.md): `$dynObj` carries the
+   * identity-hash slot (OBJ_IDH). */
+  idSlot?: boolean;
   /** INC-29 U1: see DynHandleDeps. */
   handle?: DynHandleDeps;
   /** INC-29 U1: Buffer / Uint8Array `slice` and `at` on a dyn BYTES value
@@ -711,6 +717,7 @@ export class DynBuilder {
       { storage: I32, mutable: true },
       { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
       { storage: I32, mutable: false },
+      ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
     ]);
     return this.objType;
   }
@@ -737,6 +744,7 @@ export class DynBuilder {
     c.i32Const(0);
     c.refNull(this.entriesArrayType());
     c.i32Const(typeof proto === "number" ? proto : proto ? OBJ_PROTO_NULL : OBJ_PROTO_PLAIN);
+    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
     c.structNew(this.objT());
   }
 
@@ -1432,6 +1440,7 @@ export class DynBuilder {
         { storage: I32, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
         { storage: I32, mutable: false },
+        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
         { storage: this.dynRef(), mutable: false },
       ],
       objT,
@@ -1445,6 +1454,7 @@ export class DynBuilder {
     c.i32Const(0);
     c.refNull(this.entriesArrayType());
     c.i32Const(OBJ_PROTO_PLAIN);
+    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
     pushProto(c);
     c.structNew(this.objLinkedT());
   }
@@ -1484,7 +1494,7 @@ export class DynBuilder {
       c.ifResult(this.dynRef());
       c.localGet(0);
       c.refCast(this.objLinkedT());
-      c.structGet(this.objLinkedT(), 3);
+      c.structGet(this.objLinkedT(), this.deps.idSlot === true ? 4 : 3);
       c.else_();
       c.refNull(this.dynT());
       c.end();

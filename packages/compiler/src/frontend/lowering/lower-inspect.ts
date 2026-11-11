@@ -672,7 +672,14 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
     case "map":
     case "set": {
       const isMap = t.kind === "map";
-      const mi = (method: string, args: IrExpr[], type: IrType): IrExpr =>
+      // A WeakMap / WeakSet never lists its entries (Node's own answer,
+      // whatever it holds — docs/design/object-keys.md).
+      if (t.weak === true) {
+        const wname = isMap ? "WeakMap" : "WeakSet";
+        body = [depthGate(`[${wname}]`), ret(str(`${wname} { <items unknown> }`, loc))];
+        break;
+      }
+      const mi =(method: string, args: IrExpr[], type: IrType): IrExpr =>
         isMap
           ? ({ kind: "mapIntrinsic", method: method as "size", receiver: v(), args, type, loc } as IrExpr)
           : ({ kind: "setIntrinsic", method: method as "size", receiver: v(), args, type, loc } as IrExpr);

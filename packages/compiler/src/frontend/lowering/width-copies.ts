@@ -985,12 +985,30 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         if (!r["spreadCopy"]) kids = ["obj"];
         else rest = "r";
         break;
+      case "mapNew":
+      case "setNew": {
+        const ct = r["type"] as IrType;
+        const kt = ct.kind === "map" ? ct.key : ct.kind === "set" ? ct.elem : undefined;
+        if (kt !== undefined && isComposite(kt)) {
+          identity.add(tkey(kt));
+          if (kt.kind === "union") for (const a of L.unions.get(kt.unionId)?.arms ?? []) identity.add(tkey(a));
+        }
+        break;
+      }
       case "mapIntrinsic":
       case "setIntrinsic": {
         // A Map's values and a Set's elements are stored and handed back
         // as they are; set/add/delete/clear write the container itself.
         const m = r["method"] as string;
         if ((m === "set" || m === "add" || m === "delete" || m === "clear") && !building) noteWrite(tkey((r["receiver"] as IrExpr).type));
+        // Object keys (docs/design/object-keys.md): a composite key is
+        // compared by identity — a copy would be a different key.
+        const ct = (r["receiver"] as IrExpr).type;
+        const kt = ct.kind === "map" ? ct.key : ct.kind === "set" ? ct.elem : undefined;
+        if (kt !== undefined && isComposite(kt)) {
+          identity.add(tkey(kt));
+          if (kt.kind === "union") for (const a of L.unions.get(kt.unionId)?.arms ?? []) identity.add(tkey(a));
+        }
         kids = ["receiver", "args"];
         break;
       }

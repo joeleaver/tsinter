@@ -42,6 +42,30 @@ function guardChars(typeIndex: number): void {
   }
 }
 
+/** Object keys (docs/design/object-keys.md): the struct types whose LAST
+ * field is the lazily assigned identity-hash slot (`idh`, i32, starts 0)
+ * — vectors and errT in a module with identity-keyed containers. Every
+ * `struct.new` of one pushes the slot's zero here, so no allocation site
+ * spells it. Set by the emitter for the length of one emission, like
+ * `charsType`. */
+let zeroTail: Set<number> = new Set();
+
+export function resetZeroTailTypes(): void {
+  zeroTail = new Set();
+}
+
+/** Installs `s`, answering the set it replaces (a nested module build —
+ * regex-engine-module.ts — runs with its own, empty). */
+export function swapZeroTailTypes(s: Set<number>): Set<number> {
+  const old = zeroTail;
+  zeroTail = s;
+  return old;
+}
+
+export function addZeroTailType(t: number): void {
+  zeroTail.add(t);
+}
+
 /** The engine's memory (memory 0 of an engine-carrying module). */
 export const ENGINE_MEMORY = 0;
 
@@ -634,6 +658,10 @@ export class Code {
     this.w.u8(0xd4);
   }
   structNew(typeIndex: number): void {
+    if (zeroTail.has(typeIndex)) {
+      this.w.u8(0x41); // i32.const 0 — the identity-hash slot (zeroTail)
+      this.w.sleb(0);
+    }
     this.w.u8(0xfb);
     this.w.uleb(0x00);
     this.w.uleb(typeIndex);

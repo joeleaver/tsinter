@@ -270,6 +270,17 @@ export class ModuleBuilder {
     return this.internType(key, { kind: "struct", fields });
   }
 
+  /** structType, interned apart from every plain structType request: the
+   * object-keys identity-hash structs (records, vectors), whose type index
+   * code.ts's zero tail rewrites struct.new for. Sharing an index with an
+   * internal struct of the same layout would hand that struct an extra
+   * operand (an invalid module). Identical layouts canonicalize to one
+   * runtime type either way, so nothing else changes. */
+  idSlotStructType(fields: FieldType[]): number {
+    const key = `idslot|s:${fields.map((f) => `${storageKey(f.storage)}:${f.mutable ? "m" : "c"}`).join(",")}`;
+    return this.internType(key, { kind: "struct", fields });
+  }
+
   /** A struct SUBTYPE of `superIdx` (width subtyping — the closure envs).
    * Not interned by shape: two different capture sets may share a field
    * layout yet stay distinct declarations; callers key by meaning. */

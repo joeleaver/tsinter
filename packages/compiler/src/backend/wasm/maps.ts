@@ -102,7 +102,19 @@ import { F64, I32, ModuleBuilder, type FieldType, type StorageType, type ValType
 /** "ref" (INC-29 U2): a handle key compared by reference identity — a
  * net.Server in a Set (SameValueZero for objects). It has no identity
  * number to hash, so every key lands in one bucket: correct, linear. */
-export type MapKeyKind = "f64" | "str" | "sym" | "ref";
+/** "custom" (object keys, docs/design/object-keys.md): equality, hash and
+ * the stored-key normalization are emitter helpers (MapKeyFns) — booleans,
+ * object identity keys with their identity hash, unions, dynamic values. */
+export type MapKeyKind = "f64" | "str" | "sym" | "ref" | "custom";
+
+/** A custom key kind's helpers: `hash` (key) -> i32, consistent with `eq`
+ * (key, key) -> i32 (SameValueZero); `norm` (key) -> key, applied before
+ * a NEW key is stored (-0 to +0 inside a union or a dynamic number). */
+export interface MapKeyFns {
+  hash: number;
+  eq: number;
+  norm?: number;
+}
 /** How the VALUE is represented — f64/bool unpacked, everything else
  * (string, record, array, union, object, promise, classval, map, set,
  * dyn — anything mapType hands back as a ref) is one "ref" bucket: unlike
@@ -114,6 +126,8 @@ export type MapValKind = "f64" | "bool" | "ref";
 export interface MapInfo {
   key: string;
   keyKind: MapKeyKind;
+  /** Resolved on first use — never while a type is being planned. */
+  keyFns?: () => MapKeyFns;
   valKind: MapValKind;
   keyVal: ValType;
   valVal: ValType;
@@ -156,6 +170,13 @@ const LIVE = 6;
 const BUCKETS = 7;
 
 const EMPTY = -1;
+/** The map struct's identity-hash slot (MapBuilder.idSlot). */
+export const MAP_IDH = 8;
+
+function memoKeyFns(f: () => MapKeyFns): () => MapKeyFns {
+  let got: MapKeyFns | null = null;
+  return () => (got ??= f());
+}
 /** An odd 64-bit multiplicative-hash constant (splitmix64/Fibonacci-hashing
  * family) — mixes an f64's bit pattern into well-distributed high bits,
  * taken via a 32-bit right shift. The exact constant is unobservable (see
@@ -173,6 +194,9 @@ export class MapBuilder {
   constructor(
     private readonly mb: ModuleBuilder,
     private readonly deps: MapDeps,
+    /** The module has identity-keyed containers: map structs carry the
+     * identity-hash slot (MAP_IDH). */
+    readonly idSlot = false,
   ) {}
 
   /** The map types for one (key, value) representation, interned. Callers
@@ -188,6 +212,7 @@ export class MapBuilder {
     valKind: MapValKind,
     valVal: ValType,
     valStorage: StorageType,
+    keyFns?: () => MapKeyFns,
   ): MapInfo {
     const existing = this.infos.get(key);
     if (existing !== undefined) return existing;
@@ -204,11 +229,15 @@ export class MapBuilder {
       { storage: { kind: "ref", nullable: false, typeIndex: valsBufType }, mutable: true },
       { storage: { kind: "ref", nullable: false, typeIndex: liveBufType }, mutable: true },
       { storage: { kind: "ref", nullable: false, typeIndex: bucketsBufType }, mutable: true },
+      // Object keys: the identity-hash slot (MAP_IDH) when the module has
+      // identity-keyed containers — a Map/Set can itself be a key.
+      ...(this.idSlot ? [{ storage: I32, mutable: true } as FieldType] : []),
     ];
     const struct = this.mb.structType(fields);
     const made: MapInfo = {
       key,
       keyKind,
+      ...(keyKind === "custom" ? { keyFns: memoKeyFns(keyFns!) } : {}),
       valKind,
       keyVal,
       valVal,
@@ -355,6 +384,11 @@ export class MapBuilder {
       c.i32Const(0);
       return;
     }
+    if (m.keyKind === "custom") {
+      c.localGet(KL);
+      c.call(m.keyFns!().hash);
+      return;
+    }
     const rest: never = m.keyKind;
     throw new Error(`emitHashKey: unhandled key kind ${rest as string}`);
   }
@@ -415,6 +449,12 @@ export class MapBuilder {
       c.refEq();
       return;
     }
+    if (m.keyKind === "custom") {
+      c.localGet(A);
+      c.localGet(B);
+      c.call(m.keyFns!().eq);
+      return;
+    }
     const rest: never = m.keyKind;
     throw new Error(`emitKeyEq: unhandled key kind ${rest as string}`);
   }
@@ -436,8 +476,10 @@ export class MapBuilder {
    * value") — the same exhaustiveness class emitHashKey/emitKeyEq's own
    * `const rest: never` chains enforce, in the shape that suits a
    * boolean answer rather than an emitted arm. */
-  private isRefKeyKind(k: MapKeyKind): boolean {
+  private isRefKeyKind(k: MapKeyKind, m?: MapInfo): boolean {
     switch (k) {
+      case "custom":
+        return m!.keyVal.kind === "ref";
       case "str":
         return true;
       case "sym":
@@ -462,6 +504,8 @@ export class MapBuilder {
    * silently get the wrong trio. */
   private hashNeedsF64Scratch(k: MapKeyKind): boolean {
     switch (k) {
+      case "custom":
+        return false;
       case "f64":
         return true;
       case "str":
@@ -491,6 +535,7 @@ export class MapBuilder {
       c.arrayNewDefault(m.liveBufType);
       c.i32Const(0);
       c.arrayNewDefault(m.bucketsBufType);
+      if (this.idSlot) c.i32Const(0);
       c.structNew(m.struct);
       this.mb.setBody(idx, [], c.bytes());
       return idx;
@@ -1065,6 +1110,11 @@ export class MapBuilder {
         c.localSet(K);
         c.end();
       }
+      if (m.keyKind === "custom" && m.keyFns!().norm !== undefined) {
+        c.localGet(K);
+        c.call(m.keyFns!().norm!);
+        c.localSet(K);
+      }
 
       c.localGet(M);
       c.localGet(K);
@@ -1295,7 +1345,7 @@ export class MapBuilder {
       c.i32Const(1);
       c.i32Sub();
       c.structSet(m.struct, NLIVE);
-      if (this.isRefKeyKind(m.keyKind)) {
+      if (this.isRefKeyKind(m.keyKind, m)) {
         c.localGet(M);
         c.structGet(m.struct, KEYS);
         c.localGet(E);
@@ -1366,7 +1416,7 @@ export class MapBuilder {
       c.localGet(I);
       c.i32Const(0);
       c.arraySet(m.liveBufType);
-      if (this.isRefKeyKind(m.keyKind)) {
+      if (this.isRefKeyKind(m.keyKind, m)) {
         c.localGet(M);
         c.structGet(m.struct, KEYS);
         c.localGet(I);
@@ -1675,9 +1725,10 @@ export class MapBuilder {
       c.localGet(SRC);
       c.structGet(vecStruct, BUF);
       c.localGet(I);
-      c.arrayGet(vecBufType);
+      if (m.keyKind === "custom" && m.keyVal.kind === "i32") c.arrayGetU(vecBufType); // a boolean[] seed packs i8
+      else c.arrayGet(vecBufType);
       // (unit U, SEMANTICS.md S119: an undefined string element is a key)
-      if (this.isRefKeyKind(m.keyKind) && m.keyKind !== "str") c.refAsNonNull();
+      if (this.isRefKeyKind(m.keyKind, m) && m.keyKind !== "str" && m.keyKind !== "custom") c.refAsNonNull();
       // A string[] seed holds string VALUES; the key store is flat.
       if (m.keyKind === "str") emitFlat(c, this.deps.strType());
       c.f64Const(0);
