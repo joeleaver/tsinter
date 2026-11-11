@@ -10,6 +10,7 @@ import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
+import { armRooted, dynArmParam, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
@@ -189,6 +190,12 @@ export interface GenericInstance {
     // contextual type spelled.
     if (ts.isIdentifier(param.name) && L.jsvalParamOverrides.has(param)) {
       return { type: JSVAL, mode: param.questionToken ? "omittable" : "required" };
+    }
+    // Unit U2a (dyn-arm.ts): a function literal's parameter on the dynamic
+    // arm holds the dynamic argument itself.
+    if (ts.isIdentifier(param.name) && !param.dotDotDotToken && !param.initializer && dynArmParam(L, param)) {
+      // (A JavaScript source's in checked-dynamic storage: S014's U1b amendment.)
+      return { type: isJsSourceFile(param.getSourceFile()) ? DYN : JSVAL, mode: param.questionToken ? "omittable" : "required" };
     }
     if (ts.isIdentifier(param.name) && L.dynParamOverrides.has(param)) {
       return { type: DYN, mode: param.questionToken ? "omittable" : "required" };
@@ -2082,6 +2089,18 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
   decl.parameters.forEach((param, i) => {
     const arg = expr.arguments[i];
     const shape = sig.params[i]!;
+    // Unit U2a (dyn-arm.ts): a dynamic-arm argument into a typed composite
+    // parameter — the instance's parameter holds the dynamic value itself
+    // (S125 (a)'s vehicle, the argument's own type being `any`).
+    if (arg && L.dynArmActive && shape.mode === "required" && L.copiesOnCrossing(shape.type) && (armRooted(L, arg) || isDynArmSite(L, stripParens(arg))) &&
+        ts.isIdentifier(param.name) && !param.dotDotDotToken && !param.questionToken && !param.initializer && !isThisParameter(param)) {
+      const psym = L.checker.getSymbolAtLocation(param.name);
+      if (psym) {
+        bindings.set(psym, L.checker.getAnyType());
+        shapes[i] = { type: JSVAL, mode: "required" };
+      }
+      return;
+    }
     if (!arg || shape.type.kind !== "record" || shape.mode !== "required") return;
     if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.questionToken || param.initializer) return;
     if (isThisParameter(param)) return;
@@ -2979,7 +2998,55 @@ export function lowerFfiCall(L: Lowerer, expr: ts.CallExpression): IrExpr | null
     };
   }
 
+/** Calls whose dynamic-arm callback scope is open (lowerCall). */
+const armCallScoped = new WeakSet<ts.CallExpression>();
+
 export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
+    // Unit U2a (dyn-arm.ts): a method called on a dynamic-arm receiver hands
+    // its callbacks whatever the receiver holds, whatever the receiver's
+    // declared type said — an unannotated callback parameter binds that
+    // value itself (on the dynamic arm) while the call lowers.
+    if (L.dynArmActive && !armCallScoped.has(expr) && ts.isPropertyAccessExpression(expr.expression) && armRooted(L, expr.expression.expression)) {
+      const params: ts.ParameterDeclaration[] = [];
+      // ...and an unannotated callback's result is the dynamic value its
+      // body computes (`(a, b) => a + b` over mistyped elements).
+      const rets: ts.Node[] = [];
+      for (const a0 of expr.arguments) {
+        let a = a0;
+        while (ts.isParenthesizedExpression(a)) a = a.expression;
+        if (!ts.isArrowFunction(a) && !ts.isFunctionExpression(a)) continue;
+        let any = false;
+        for (const p of a.parameters) {
+          if (!ts.isIdentifier(p.name) || p.type || p.initializer || p.dotDotDotToken) continue;
+          const s = L.checker.getSymbolAtLocation(p.name);
+          if (s === undefined || L.dynArmSyms.has(s) || L.jsvalParamOverrides.has(p)) continue;
+          params.push(p);
+          any = true;
+        }
+        const plain = a.type === undefined && a.asteriskToken === undefined &&
+          !(a.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) ?? false);
+        if (any && plain && !L.lambdaRetOverrides.has(a)) {
+          const sig = L.checker.getCallSignatures(L.checker.getTypeAtLocation(a))[0];
+          const rt = sig !== undefined ? L.mapTypeOf(L.checker.getReturnTypeOfSignature(sig)) : null;
+          if (rt !== null && (rt.kind === "f64" || rt.kind === "string" || rt.kind === "bool")) rets.push(a);
+        }
+      }
+      if (params.length > 0) {
+        armCallScoped.add(expr);
+        const syms = params.map((p) => L.checker.getSymbolAtLocation(p.name)!);
+        for (const p of params) L.jsvalParamOverrides.add(p);
+        for (const s of syms) L.dynArmSyms.add(s);
+        for (const r of rets) L.lambdaRetOverrides.set(r, JSVAL);
+        try {
+          return lowerCall(L, expr);
+        } finally {
+          for (const p of params) L.jsvalParamOverrides.delete(p);
+          for (const s of syms) L.dynArmSyms.delete(s);
+          for (const r of rets) L.lambdaRetOverrides.delete(r);
+          armCallScoped.delete(expr);
+        }
+      }
+    }
     const loc = locOf(expr);
 
     // A call whose chain ROOTS at an ambient-undefined name (`declare
@@ -4895,7 +4962,9 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     if (L.sharedDynamic && !isJsSourceFile(call.getSourceFile())) {
       return { kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc };
     }
-    return { kind: "dynCall", callee: member, calleeName: access.getText(), args, type: DYN, loc };
+    // A JavaScript source binds `this` too, through the element-call form
+    // (GH #133's recvThis; GH #145, the U2 review): S042's JS residue retires.
+    return { kind: "dynCall", callee: member, calleeName: access.getText(), args, ...(L.sharedDynamic ? { recvThis: true as const } : {}), type: DYN, loc };
   }
 
 /** Prototype method names of the checked-dynamic tree-representable kinds (String, Array,
@@ -6277,6 +6346,7 @@ function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpres
       !ts.isArrowFunction(node) && node.name && ts.isIdentifier(node.name) ? node.name : null;
     const baseName = nameIdent ? nameIdent.text : "";
     const fnName = `%fn${L.lambdaCounter++}${baseName ? `_${baseName}` : ""}`;
+    if (L.sharedDynamic) L.dynArmFnParams.set(fnName, node.parameters);
     // Named function expressions/declarations can self-reference by name; an
     // object-literal method's name is a PROPERTY, not a binding — no self.
     // A reassigned nested declaration (selfBinding false) reads its name
@@ -9695,7 +9765,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
             L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
           }
           const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-          return { kind: "dynCall", callee, calleeName: access.getText(), args, type: DYN, loc: locOf(call) };
+          return { kind: "dynCall", callee, calleeName: access.getText(), args, ...(L.sharedDynamic && isJsSourceFile(call.getSourceFile()) && keyedReadRecv(callee) !== null ? { recvThis: true as const } : {}), type: DYN, loc: locOf(call) };
         }
       }
       return null;
@@ -9832,7 +9902,12 @@ export function v8SpreadSpelling(text: string): string {
  * access at all. */
 function elementCallOf(expr: ts.CallExpression, callee: IrExpr): { recvThis: boolean; elemSpelling: string | undefined } {
   const elemRead = ts.isElementAccessExpression(expr.expression) && !expr.expression.questionDotToken && !expr.questionDotToken;
-  const recvThis = elemRead && !expr.arguments.some((a) => ts.isSpreadElement(a)) && keyedReadRecv(callee) !== null;
+  // A JavaScript member call `o.m()` over a checked-dynamic receiver binds
+  // `this` the same way (S042's JS residue, GH #145; unit U2 review).
+  const memberRead = ts.isPropertyAccessExpression(expr.expression) && !expr.expression.questionDotToken && !expr.questionDotToken &&
+    isJsSourceFile(expr.getSourceFile());
+  const recvThis = (elemRead || memberRead) && !expr.arguments.some((a) => ts.isSpreadElement(a)) && keyedReadRecv(callee) !== null;
+
   const elemSpelling = elemRead ? v8CalleeSpelling(expr.expression as ts.ElementAccessExpression) : undefined;
   return { recvThis, elemSpelling };
 }

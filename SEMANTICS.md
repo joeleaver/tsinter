@@ -310,6 +310,15 @@ checked read, a missing required key, an island exit and a typed parameter
 all let it through; only a value of the wrong type — and `null` where the
 slot has no null to carry — fences. The c and llvm lanes keep the check.*
 
+*Unit U2 amendment (wasm and wasm-native): a cast of a dynamic value to a
+typed composite whose result stays in a contained slot (a `const`/`let`
+binding, the cast's own use in place, a direct call's parameter) no
+longer validates eagerly: the slot is the dynamic value, checked only
+where a value must enter typed storage, and a fresh value is a typed copy
+only when it has exactly the type's shape (SEMANTICS.md S128). The width
+tolerance below (a record copy keeps only its type's declared fields)
+applies only where a copy is still made.*
+
 `e as C` on a catch binding is a RUNTIME check: a payload that is an
 instance of `C` passes through, and anything else throws a catchable
 `TypeError` reading `caught value is not an instance of <C> (checked cast)`.
@@ -3589,6 +3598,23 @@ most modules are, is unaffected. And a CommonJS module's top-level `this`
 (and an arrow's created there) reads `undefined` where Node gives
 `module.exports` (`typeof this` at a CommonJS top level is `"undefined"`,
 Node `"object"`); an ES module's is `undefined` in both.
+
+
+*GH #145 / unit U2 review amendment (wasm and wasm-native).* A JavaScript
+member call `o.m(...)` over a checked-dynamic value now binds `this` to
+`o`, through the element-call form GH #133 introduced (`recvThis`): a
+program function stored on the object (`o.inc = function () { this.n++ }`)
+reads its receiver as in Node, called directly, through an alias, through a
+cast to `any`, or on a value in a typed slot (S128). The residue below no
+longer applies to such calls on these lanes. Every other call — through a
+function value, an IIFE, a `function` callback a builtin runs, a plain call
+of a function declaration — still runs its callee with `this` undefined,
+never the receiver of a method call around it (in sloppy mode Node passes
+`globalThis` there: the residue below). An `async` function's body starts
+with its own invocation's receiver: the object of a member call, or
+undefined for a plain call, never the receiver of the running caller.
+**Tested by:**
+`packages/compiler/test/wasm-u2-maybe-dynamic.test.ts` (U2R2-JS-01..03, U2R3-THIS-01..02, U2R4-ASYNC-01..05).
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
@@ -7760,7 +7786,10 @@ with SC1090), and still describes the c and llvm lanes.
      a `structuredClone` round trip, a dynamic object holding `undefined` checked into the record type
      (never `JSON.parse`, which cannot produce one) — leaves the record on the fast path, so it neither
      prints nor is an own key: `structuredClone({ a: 1, w: undefined } as R)` prints `{ a: 1 }` where Node
-     prints `{ a: 1, w: undefined }`;
+     prints `{ a: 1, w: undefined }`. On the WasmGC lanes a contained slot (S128: a `const`/`let`, a cast)
+     takes no conversion — it holds the dynamic object itself, so `const r = d as R` prints Node's
+     answer — and S128 (a2)'s copies out of such a slot refuse an optional key held as `undefined` by
+     name; the cell remains for the other conversions (a return, a field, an element);
   2. the dynamic conversion, where one still happens, keeps this entry's printing rule for a record on
      the fast path: `querystring.stringify` of `{ a: "1" }` typed `{ a: string; w?: string }` gives
      `a=1&w=` where Node gives `a=1`;
@@ -8976,6 +9005,17 @@ an implicit-any JavaScript parameter still cross as the copy S014
 describes, judged by S125 (c). **Tested by:** the JS corpus on the wasm
 lanes (every program main passes), `packages/compiler/test/wasm-island-a.test.ts`
 and `wasm-dynsmalls-u5.test.ts` (the `--dynamic` JS rows).
+
+**Amendment (unit U2, wasm and wasm-native).** (d)'s exits narrow
+further: a dynamic value entering a CONTAINED slot (a `const`/`let`
+binding, a cast used in place, a typed parameter of a function literal
+dynamic code calls — (d)'s callback-parameter refusal included — or a
+direct call's parameter) is no copy at all: the slot holds the dynamic
+value (S128 (a)). A fresh value bound by a `const` is a typed copy only
+when it has exactly the type's shape, else the dynamic value too (S128
+(b)) — (d)'s width-tolerant record copy and its fatal mismatch remain
+only where S128 lists them. Fields, elements and returns keep (d) as the
+U1a amendment says.
 
 Joe's ruling D2 as approved 2026-10-26 (follow-up unit H, boards
 #259/#268). Node has one object on both sides of every assignment; this
@@ -10291,7 +10331,12 @@ value of the type when it has none), and runs where only the type's
 fields are read. The judgment follows the spread through a `?:`, `&&` or
 `||` arm, into a union's record arms (`Narrow | undefined`), and through
 JavaScript's JSDoc-typed parameters and results. A dynamic, `any` or
-index-signature target keeps every key. Known cost, as in (b): a use the
+index-signature target keeps every key. On the WasmGC lanes a `const`
+binding of such a spread (it is a fresh dynamic value) is unit U2's
+speculative binding (S128 (b)): it is the dynamic object unless the value
+has exactly the type's shape, so it keeps every key and runs as in Node,
+and the binding's own re-pointing at its typed copy's view is no observer
+for this judgment (any other crossing of the copy into dynamic code is). Known cost, as in (b): a use the
 binding analysis does not follow counts as one that may print, so a
 union-typed binding read only through `n?.b` refuses (a field write
 through the copy, `r.a = 5`, is not such a use here: it runs). A typed
@@ -10302,3 +10347,158 @@ spread bound to an unannotated local first (`const r = { ...o }; return
 r` through a JSDoc record result) is S115's width-tolerant copy, not this
 judgment. **Tested by:**
 `packages/compiler/test/wasm-gh148-spread-width.test.ts`.
+
+*Unit U2 amendment (wasm and wasm-native).* A copy (c) refuses at a
+CONTAINED slot — a `const`/`let` binding, a cast used in place, a typed
+parameter of a function literal handed to dynamic code, or a parameter of
+a plain function the value is passed to directly — is no longer a refusal:
+the slot takes S128's dynamic arm and holds the dynamic value itself. The
+copies (c) accepted at those slots take the arm too, except in a program
+the arm does not compile (then the judged copy stays, of S128 (a2)'s fitting
+shape only — no silent width copy). (c) still
+judges, and still refuses, the copies the arm never replaces: a dynamic
+value stored into a typed field or element, returned from a typed
+function, handed to a constructor, a method, a generic function or a call
+through a function value, and the typed values that cross into a dynamic
+slot by copy. **Tested by:** `packages/compiler/test/wasm-dyn-copies.test.ts`
+and `wasm-u1-shared-dynamic.test.ts` (the rows that refused before U2 now
+equal Node), `wasm-u2-maybe-dynamic.test.ts`.
+
+## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
+
+Docs: `docs/design/dynamic-values.md` §4.3 (unit U2; Joe's rulings J1,
+J2 (a) and J4). Implementation: `frontend/lowering/dyn-arm.ts`.
+
+**(a) The dynamic arm (U2a).** TypeScript lets a dynamic value (`any`,
+`unknown`, `object`, a JavaScript inference residue) into a typed
+composite slot (an array, tuple or record type, or a union carrying one)
+by a cast or an assignment. In Node the slot then holds that very object,
+whatever its shape. On these lanes the CONTAINED slots do the same:
+
+- a `const` or `let` binding (a local or a module global),
+- a cast used in place (`(u as number[]).push(2)`),
+- the typed parameter of a function literal dynamic code calls
+  (`data.forEach((o: { a: number }) => { o.a = 2; })`, a callback stored
+  into a dynamic object),
+- a parameter of a plain function declaration the value is passed to
+  directly (`grow(p)`), through S125 (a)'s per-call-site instance with the
+  parameter typed by the argument's own type, `any`;
+- and, inside them, an unannotated callback parameter of a method called
+  on such a value (`xs.map((x) => typeof x)` hands `x` whatever the array
+  holds).
+
+The slot holds the dynamic value, shared (`===` is identity, writes from
+either side are one object, printing and keys are the object's own), and
+every use of it — and of a member, element or method result read off it —
+is the dynamic operation the same expression takes on an `any`: the slot's
+declared type is not trusted. (Before U2 such a slot held a checked copy:
+S115 (d)'s U1a amendment, refused by S125 (c) wherever the copy was
+observable.) The parts from Node:
+
+- **(a1) A value of the wrong kind is checked only where it must enter
+  typed storage, and there it ends the program** (S122's fence, with the
+  checked conversion's text `expected <T> at <path>, got <kind>`, SC1100)
+  where Node runs on with the mis-typed value: a typed local or parameter
+  (`const k: number = p.n` over a string `n`), a typed field or element, a
+  typed function's result, a typed callback parameter of a function that
+  is not a literal, the member of a compound assignment or `++`/`--`
+  (`p.n += 1` checks `p.n` is a number), an annotated or module-scope
+  binding initialized from an expression over the arm (`const r1: string =
+  p.s + 1`, or a module-scope `const r1 = p.s + 1`, over a number `p.s`; an
+  unannotated block-scoped local takes the dynamic value instead), and an
+  operand of a lowering that needs a typed value. Everything that accepts any value runs on the
+  dynamic value unchecked: `typeof`, `===`/`!==`, truthiness, `??`, `?.`,
+  `in`, template literals, `String(...)`, `+` (a string when either side is
+  one), the arithmetic and comparison operators (their results are
+  JavaScript's own number and boolean), printing, `JSON.stringify`, passing
+  to `any`, an `Error` message, a `switch` whose cases are all string (or
+  all number) literals, member reads, writes and method calls, and the
+  parameters and results of unannotated callbacks handed to a method of
+  the value.
+- **(a2) Never a silent copy.** Fields and elements never take the arm
+  (decision J4), nor do returns, constructor, method and generic-function
+  parameters, or calls through a function value: a non-fresh dynamic value
+  bound for one is S125 (c)'s judged copy, refused where the program could
+  tell it from the original by a write or an identity test. A copy taken
+  FROM a value on the arm (into an element, a field, an assignment, a
+  module-scope alias, a typed result) copies only a value of its type's
+  shape — no key the type does not declare, the type's key order, every
+  present value of its declared kind, and every key present except a
+  REQUIRED one of plain number, string or boolean type, which the copy
+  marks missing and S119 (i) prints as Node prints the absent key, and an
+  OPTIONAL one, whose absence the copy keeps (S091's key rule, GH #132:
+  a later write of the key puts it last, as in Node); an absent
+  union-typed, record, array or tuple key would print as `key: undefined`,
+  and an optional key the object holds with the value `undefined` is an
+  own key Node keeps and the copy would drop, so neither fits —
+  and ends the program by name otherwise (SC1100, "a dynamic value held in a typed
+  slot ... copied into typed storage it does not fit exactly"), where Node
+  shares the object. The same holds for what a declaration builds out of
+  a value on the arm: a spread of it (`{ ...v }`) is the dynamic object,
+  in the value's own key order, as TypeScript types it `any`; the
+  bindings a `const`/`let` destructuring of it binds (members, a rest
+  object) join the arm for as long as their block lowers; and a module
+  global so built (whose slot stays typed) takes only (a2)'s fitting copy,
+  never S115 (d)'s copy of a fresh value, which would list the keys in the
+  type's order.
+- **(a3) Where the arm does not build.** A contained slot whose copy
+  S125 (c) accepted takes the arm too, unless the program then fails to
+  compile (a construct the dynamic operations do not have yet: for-in over
+  the value, `new Map(Object.entries(...))`, `Object.is` over it, a
+  number's `toString(radix)`); then the slot keeps the judged copy, but a
+  copy of (a2)'s fitting shape only: any other value ends the program by
+  name (SC1100, "... in a slot whose uses this build cannot compile on the
+  dynamic arm yet") instead of becoming S009's width-tolerant copy.
+- **(a4) In a JavaScript source** a method called on a value on the arm —
+  directly, through a cast to `any`, an alias, an element or `.call` —
+  binds `this` to the receiver, as in Node (S042's JavaScript residue is
+  retired on these lanes: its GH #145 amendment).
+
+**(b) The speculative typed arm (U2b).** A `const` binding of a FRESH
+dynamic value (S115 (d)'s provenance rules: `JSON.parse(text)`,
+`structuredClone`, `await response.json()`, literals, ...) cast or
+annotated to a typed composite `T` — in a function body, a nested block
+or module scope — is tested once, where it is bound, against `T`'s EXACT
+shape: every record holds exactly its type's keys in the order the typed
+record lists them, every leaf is of its declared kind, every union is the
+arm the checked conversion picks, nothing is shared from typed code. If
+it fits, the binding holds a typed copy (nothing else holds the value, and
+a copy of exactly its shape cannot be told from it), at typed speed; if
+not, the binding takes (a)'s dynamic arm. So a parsed value that does not
+fit its cast no longer ends the program at the cast — the program's own
+validation (`typeof v.id !== "string"`) runs as in Node, and only (a1)'s
+typed leaves check — and a parsed object with keys the type does not
+declare keeps them (printing, `JSON.stringify` and `Object.keys` answer
+Node's), where S009's width tolerance dropped them. Both arms are
+compiled: the statements of the binding's list from the first that names
+it through the last that names it (or names a binding they declare) lower
+once per arm behind one test; for a module-scope binding, likewise in
+every function body that names it. A module-scope binding read before its
+value is known takes the dynamic arm and, once the typed copy is made,
+shares it through the copy's live view (S115 (a)). A region that cannot or
+should not be lowered twice — it reads a second speculative binding, it
+holds a function, class or `var` declaration (a module's own `var`s are
+fine), a label or a `yield`, the binding is two speculative bindings deep,
+or the function's duplication budget (the size of its first such region)
+is spent — lowers once, on the dynamic arm: exact, at dynamic speed. A
+binding whose uses do not compile at all on the dynamic arm (for-in and
+the other (a3) constructs, a read from a class field initializer or a
+parameter default, an exported binding, a block outside a function's or
+module's statement lists, a closure that reaches it before its
+declaration) keeps the eager checked copy, of (a2)'s fitting shape only:
+any other value ends the program at the binding, by name (SC1100, "a
+parsed value that does not have exactly its cast's shape ..."), never a
+width copy. On the typed arm the value is typed storage: a write through
+an `any` that does not fit its type (adding a key, `(cfg as any).extra =
+1`) ends the program at S115 (b)'s fence, where on the dynamic arm it
+would run.
+
+**Rationale:** Joe's rulings J1 and J2 (a) (dynamic-values.md §8): Node
+shares, so the slot shares; typed storage cannot hold a value of the wrong
+kind, so the check moves to the one place a typed value is needed, and the
+common case (data that matches its declared type) stays fast. **Tested
+by:** `packages/compiler/test/wasm-u2-maybe-dynamic.test.ts` (rows equal
+to Node and the (a1) fences, on wasm and wasm-native), the converted rows
+of `wasm-any-array-shared.test.ts` (H-EXIT, H-FRESH-02, H-UNK),
+`wasm-dyn-copies.test.ts` and `wasm-u1-shared-dynamic.test.ts`. Measured
+against Node v24.18.1.

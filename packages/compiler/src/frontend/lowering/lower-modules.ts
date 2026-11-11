@@ -13,6 +13,7 @@ import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
+import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
 import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
@@ -1528,9 +1529,21 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // production — whatever the checker's namespace type mapped to
             // (lowerVarDecl's rule at module scope; the init body assigns
             // it).
+            // Unit U2b (dyn-arm.ts): a module-scope fresh cast takes two
+            // arms — this global holds the dynamic value.
+            const specT = ts.isIdentifier(decl.name) && nameNode === decl.name ? specGlobalTarget(L, decl) : null;
+            // A site whose global keeps typed storage this pass (dyn-arm.ts
+            // dynArmGlobalDecl) is no dynamic-arm binding: its reads keep
+            // the declared type.
+            if (L.dynamic && ts.isIdentifier(decl.name) && nameNode === decl.name && specT === null &&
+                dynArmDecl(L, decl) && !dynArmGlobalDecl(L, decl)) {
+              const s = L.checker.getSymbolAtLocation(decl.name);
+              if (s !== undefined) L.dynArmSyms.delete(s);
+            }
             const handleT =
               L.dynamic && ts.isIdentifier(decl.name) && nameNode === decl.name
-                ? (importCallHandleType(decl.initializer) ??
+                ? ((specT !== null ? JSVAL : dynArmGlobalDecl(L, decl) ? (isJsSourceFile(sf) ? DYN : JSVAL) : null) ??
+                  importCallHandleType(decl.initializer) ??
                   // An unchecked-overload call result stores the handle,
                   // exactly the local rule (uncheckedOverloadHandleCall).
                   (uncheckedOverloadHandleCall(L, decl.initializer) ? JSVAL : null))
@@ -1628,6 +1641,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             };
             L.globalsBySymbol.set(symbol, g);
             L.globalsList.push(g);
+            if (specT !== null && g.type.kind === "jsval") registerSpecGlobal(L, decl, g, specT);
             // Mutable checked-dynamic LET globals ride the same entry
             // init, so the slot is never NULL. A closure that can run
             // above the declaration statement does not observe it: its

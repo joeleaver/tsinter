@@ -4702,6 +4702,26 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
     if (value.kind === "unitLit" && value.unit === "undefined") {
       return { kind: "strLit", value: "", type: STRING, loc };
     }
+    // Unit U2 (SEMANTICS.md S128): a message on the dynamic arm is Node's
+    // `message === undefined ? "" : String(message)`.
+    if (L.dynArmActive && (value.type.kind === "jsval" || value.type.kind === "dyn")) {
+      const tmp = L.declareHiddenLocal("%errmsg", DYN);
+      const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "varDecl", localId: tmp.id, init: value.type.kind === "dyn" ? value : { kind: "dynFromJsval", value, type: DYN, loc }, loc }],
+        result: {
+          kind: "ternary",
+          cond: { kind: "dynTest", test: "undefined", value: ref(), type: BOOL, loc },
+          then: { kind: "strLit", value: "", type: STRING, loc },
+          else_: { kind: "libCall", fn: "dyn.toStringCoerce", args: [ref()], type: STRING, loc },
+          type: STRING,
+          loc,
+        },
+        type: STRING,
+        loc,
+      };
+    }
     L.unsupported(
       "SC1090",
       args[0]!,

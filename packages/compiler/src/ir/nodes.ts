@@ -4732,7 +4732,8 @@ export type IrExpr =
       loc: SrcLoc;
     }
   /** Call of a user function declared in this module, by name. */
-  | { kind: "call"; callee: string; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  /** `keepThis`: callValue's flag of that name (an async body's start). */
+  | { kind: "call"; callee: string; args: IrExpr[]; type: IrType; keepThis?: true; loc: SrcLoc }
   /** Direct call of a manifest-bound native C symbol. Arguments are
    * borrowed (native code may inspect but never retain string/bytes
    * pointers); scalar results return by value. The import's ABI signature
@@ -4765,7 +4766,10 @@ export type IrExpr =
   /** Indirect call of a func-typed value. Args follow `call`'s convention
    * (callee owns its params, callers pass +1). The callee expression is an
    * ordinary owned temp, released at statement end. */
-  | { kind: "callValue"; callee: IrExpr; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  /** `keepThis`: a lowering-internal call (an async body's resume kick) that
+   * runs inside its caller's receiver bracket, so the emitter does not run
+   * it with `this` undefined as it does every other call through a value. */
+  | { kind: "callValue"; callee: IrExpr; args: IrExpr[]; type: IrType; keepThis?: true; loc: SrcLoc }
   /** The currently-executing closure, as a value (+1). Valid only inside a
    * lifted function. Exists so a named nested function can recurse on itself
    * WITHOUT capturing its own binding — a box holding its own closure would
@@ -5438,6 +5442,15 @@ export type IrExpr =
    * static value (same typeKey) answers that static value itself (+1); any
    * other value throws the catchable named TypeError carrying `what`. */
   | { kind: "jsUnview"; value: IrExpr; typeKey: string; what: string; type: IrType; loc: SrcLoc }
+  /** Unit U2b (docs/design/dynamic-values.md §4.3 step 2): does the island
+   * value `value` fit the typed composite `target` EXACTLY — every record
+   * holding exactly its type's keys, in the order the typed record lists
+   * them, every value of the declared kind — so that a typed copy of it
+   * cannot be told from it? `type` is bool. Never throws, never copies.
+   * `lenient`: declared keys may be missing (S119 holds them as undefined,
+   * printed as Node prints the missing key); no undeclared key, order kept.
+   * WasmGC lanes only. */
+  | { kind: "jsFits"; value: IrExpr; target: IrType; type: IrType; lenient?: true; loc: SrcLoc }
   /** Island → static PROMISE bridge (--dynamic builds only): `value` is a
    * jsval whose declared type is Promise<T> (a package call's promise —
    * it lives in the engine); the result is a fresh pending static promise

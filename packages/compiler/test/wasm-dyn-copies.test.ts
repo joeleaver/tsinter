@@ -79,15 +79,15 @@ interface Row {
 const ROWS: Row[] = [
   // ── observable: refused ────────────────────────────────────────────
   // #120, both forms: a write through a cast of an `unknown` value.
-  { id: "issue-120-array", src: `const u: unknown = [1]; (u as number[]).push(2); console.log(u);`, refused: "out" },
-  { id: "issue-120-record", src: `const w: unknown = { k: 1 }; (w as { k: number }).k = 3; console.log(w);`, refused: "out" },
+  { id: "issue-120-array", src: `const u: unknown = [1]; (u as number[]).push(2); console.log(u);` } /* U2a: the dynamic arm, matches Node */,
+  { id: "issue-120-record", src: `const w: unknown = { k: 1 }; (w as { k: number }).k = 3; console.log(w);` } /* U2a: the dynamic arm, matches Node */,
   {
     id: "out-binding-write",
     src: `const u: unknown = JSON.parse('{"k":1}');
 const t = u as { k: number };
 t.k = 2;
 console.log(u);`,
-    refused: "out",
+    // U2a: the dynamic arm, matches Node
   },
   {
     id: "out-nested-write",
@@ -95,7 +95,7 @@ console.log(u);`,
 const keep = d;
 (d as { xs: number[] }).xs.push(2);
 console.log(keep);`,
-    refused: "out",
+    // U2a: the dynamic arm, matches Node
   },
   {
     id: "out-dyn-write-after",
@@ -103,7 +103,7 @@ console.log(keep);`,
 const t = d as { k: number };
 d.k = 7;
 console.log(t.k, d.k);`,
-    refused: "out",
+    // U2a: the dynamic arm, matches Node
   },
   {
     id: "out-identity",
@@ -133,7 +133,7 @@ const alias = d;
 const t = alias as { k: number };
 d.k = 7;
 console.log(t.k);`,
-    refused: "out",
+    // U2a: the dynamic arm, matches Node
   },
   // A typed value into `any`, written through the dynamic side.
   { id: "in-any-write", src: `const r = { a: 1 }; const a: any = r; a.a = 2; console.log(r.a);` } /* U1a: shared now, matches Node */,
@@ -193,7 +193,7 @@ console.log(list);`,
   {
     id: "fn-param-write",
     src: `const data: any = JSON.parse('[{"a":1}]'); data.forEach((o: { a: number }) => { o.a = 2; }); console.log(data);`,
-    refused: "fn",
+    // U2a: the parameter holds the dynamic argument, matches Node
   },
   {
     id: "fn-param-identity",
@@ -201,13 +201,15 @@ console.log(list);`,
 const data: any = JSON.parse('[{"a":1}]');
 data.forEach((o: { a: number }) => { seen.push(o); });
 console.log(seen.includes(seen[0]), seen.length);`,
-    refused: "fn",
+    // U2a: the parameter holds the dynamic argument; storing it into a typed
+    // element is the judged copy (fields and elements never take the arm).
+    refused: "out",
   },
   {
     id: "fn-param-dyn-write-during",
     src: `const data: any = JSON.parse('[{"a":1}]');
 data.forEach((o: { a: number }) => { data.at(0).a = 9; console.log(o.a); });`,
-    refused: "fn",
+    // U2a: the parameter holds the dynamic argument, matches Node
   },
   {
     id: "fn-result-shared",

@@ -3511,15 +3511,24 @@ class Assembler {
     // call of one is a plain call — `this` undefined — so it brackets the
     // ambient stack with undefined; otherwise it would read the receiver
     // of whatever method or element call is running around it.
-    const readsThis = (n: unknown): boolean => {
-      if (Array.isArray(n)) return n.some(readsThis);
+    // An async body's start (the resume kick, keepThis) forwards the
+    // ambient receiver to the body: its wrapper reads it as surely as the
+    // body would, so a plain call of the wrapper brackets undefined. Kicks
+    // count only once some function reads the receiver at all, so a
+    // program that never reads `this` emits no brackets (byte-identical).
+    const readsThis = (n: unknown, kicks: boolean): boolean => {
+      if (Array.isArray(n)) return n.some((x) => readsThis(x, kicks));
       if (n === null || typeof n !== "object") return false;
       const r = n as Record<string, unknown>;
       if (r["kind"] === "libCall" && r["fn"] === "dyn.this") return true;
-      for (const k in r) if (k !== "loc" && k !== "type" && readsThis(r[k])) return true;
+      if (kicks && (r["kind"] === "callValue" || r["kind"] === "call") && r["keepThis"] === true) return true;
+      for (const k in r) if (k !== "loc" && k !== "type" && readsThis(r[k], kicks)) return true;
       return false;
     };
-    for (const fn of mod.functions) if (readsThis(fn.body)) this.thisReaders.add(fn.name);
+    for (const fn of mod.functions) if (readsThis(fn.body, false)) this.thisReaders.add(fn.name);
+    if (this.thisReaders.size > 0) {
+      for (const fn of mod.functions) if (readsThis(fn.body, true)) this.thisReaders.add(fn.name);
+    }
     for (const cls of mod.classes ?? []) {
       for (const m of cls.methods ?? []) {
         if (this.mayThrow.has(`%${cls.name}.${m}`)) this.mayThrowMethods.add(m);
@@ -18150,6 +18159,26 @@ class Assembler {
   }
 
   /** `kind == K` on parameter 0. */
+  /** An optional field whose type has the undefined arm: the copy keeps
+   * its absence (S091's key rule, GH #132), so its key may be missing. */
+  private optionalUndefArmed(f: IrRecordShape["fields"][number]): boolean {
+    return f.optional === true && f.type.kind === "union" && this.unionDef(f.type.unionId).arms.some((a) => a.kind === "undefinedT");
+  }
+
+  /** U2's fit: an optional key the object HOLDS with the value undefined is
+   * an own key in Node, which the typed copy would drop (S091's key rule):
+   * such an object does not fit. `e` holds the entry. */
+  private failOnUndefEntry(c: Code, e: number, fail0: () => void): void {
+    c.localGet(e);
+    c.structGet(this.dyn.entryT(), ENTRY_VALUE);
+    c.structGet(this.dyn.dynT(), DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifVoid();
+    fail0();
+    c.end();
+  }
+
   private emitKindIs(c: Code, kind: number): void {
     c.localGet(0);
     c.structGet(this.dyn.dynT(), DYN_KIND);
@@ -18390,6 +18419,348 @@ class Assembler {
       default:
         this.refuse(`dynMatch:${t.kind}`, loc);
         return false;
+    }
+  }
+
+  /** %w.dyn.fits:<typeKey> — unit U2b's EXACT matcher (jsFits): 1 iff the
+   * dyn value has exactly `t`'s shape — every record exactly its type's
+   * keys in the order the typed record lists them (dynFieldOrder), every
+   * leaf of the declared kind, every union the arm the checked copy would
+   * pick, no view anywhere — so the checked copy (dynCheckHelper) builds a
+   * typed value nothing can tell from it. Never throws. */
+  private dynFitsHelper(t: IrType, loc: SrcLoc | undefined, lenient = false): number | null {
+    const key = `${lenient ? "L" : "E"}${typeKey(t)}`;
+    const hit = this.dynFitsFns.get(key);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [I32]), `%w.dyn.fits:${key}`);
+    this.dynFitsFns.set(key, idx);
+    const w = this.newWalker(1);
+    if (!this.emitDynFitsBody(w, t, loc, lenient)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  private readonly dynFitsFns = new Map<string, number>();
+
+  private emitDynFitsBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined, lenient: boolean): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const fail0 = (): void => {
+      c.i32Const(0);
+      c.return_();
+    };
+    // A view (a typed value shared into dynamic code) is never copied.
+    const noView = (): void => {
+      if (!dyn.viewsLive) return;
+      dyn.isView(c, (x) => x.localGet(0));
+      c.ifVoid();
+      fail0();
+      c.end();
+    };
+    switch (t.kind) {
+      case "f64":
+        this.emitKindIs(c, DK.NUM);
+        return true;
+      case "string":
+        this.emitKindIs(c, DK.STR);
+        return true;
+      case "bool":
+        this.emitKindIs(c, DK.BOOL);
+        return true;
+      case "nullT":
+        this.emitKindIs(c, DK.NULL);
+        return true;
+      case "undefinedT":
+        this.emitKindIs(c, DK.UNDEF);
+        return true;
+      case "dyn":
+      case "jsval":
+        // Shared by reference into the typed value: anything but an
+        // accessor cell (which a typed slot would hold as the cell).
+        this.emitKindIs(c, DK.JSVAL);
+        c.i32Eqz();
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        if (shape === undefined) return false;
+        if (shape.tuple) {
+          const fields = this.tupleFieldOrder(shape);
+          this.emitKindIs(c, DK.ARR);
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+          noView();
+          const a = this.wlocal(w, dyn.arrRef());
+          dyn.arrPayload(c, (x) => x.localGet(0));
+          c.localSet(a);
+          dyn.arrLen(c, (x) => x.localGet(a));
+          c.i32Const(fields.length);
+          c.i32Ne();
+          c.ifVoid();
+          fail0();
+          c.end();
+          for (let i = 0; i < fields.length; i++) {
+            const inner = this.dynFitsHelper(fields[i]!.type, loc, lenient);
+            if (inner === null) return false;
+            dyn.arrAt(c, (x) => x.localGet(a), (x) => x.i32Const(i));
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+          }
+          c.i32Const(1);
+          return true;
+        }
+        // Index signatures: the typed form's key order is not the
+        // object's own in general — the dynamic arm keeps the object.
+        if (shape.indexValue !== undefined) {
+          // A pure index-signature record (no declared field): the checked
+          // copy keeps every key in insertion order (S031), so under the
+          // lenient test it fits when every value fits the signature.
+          if (lenient && shape.fields.length === 0) {
+            const iv = this.dynFitsHelper(shape.indexValue, loc, true);
+            if (iv === null) return false;
+            this.emitKindIs(c, DK.OBJ);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            noView();
+            const o = this.wlocal(w, dyn.objRef());
+            const i = this.wlocal(w, I32);
+            const n = this.wlocal(w, I32);
+            c.localGet(0);
+            c.structGet(dyn.dynT(), DYN_REF);
+            c.refCast(dyn.objT());
+            c.localTee(o);
+            c.structGet(dyn.objT(), OBJ_PROTO);
+            c.i32Const(0);
+            c.i32Ne();
+            c.ifVoid();
+            fail0();
+            c.end();
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_LEN);
+            c.localSet(n);
+            c.i32Const(0);
+            c.localSet(i);
+            c.block();
+            c.loop();
+            c.localGet(i);
+            c.localGet(n);
+            c.i32GeU();
+            c.brIf(1);
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_ENTRIES);
+            c.localGet(i);
+            c.arrayGet(dyn.entriesArrayType());
+            c.structGet(dyn.entryT(), ENTRY_VALUE);
+            c.call(iv);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            c.localGet(i);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(i);
+            c.br(0);
+            c.end();
+            c.end();
+            c.i32Const(1);
+            return true;
+          }
+          c.i32Const(0);
+          return true;
+        }
+        const fields = this.dynFieldOrder(shape);
+        this.emitKindIs(c, DK.OBJ);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        noView();
+        const o = this.wlocal(w, dyn.objRef());
+        const e = this.wlocal(w, dyn.entryRef());
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(dyn.objT());
+        c.localTee(o);
+        // A plain object (no null prototype, no Map/Weak stand-in).
+        c.structGet(dyn.objT(), OBJ_PROTO);
+        c.i32Const(0);
+        c.i32Ne();
+        c.ifVoid();
+        fail0();
+        c.end();
+        if (lenient) {
+          // The fallback's test (S128 (a2)/(a3)/(b)): no key the type does
+          // not declare and the declared order kept; a REQUIRED plain-typed
+          // key may be missing (the checked copy marks it missing, S119 (i),
+          // and it prints as Node prints the absent key), and so may an
+          // optional one (GH #132: its absence is kept); another
+          // undefined-armed one may not, nor an optional key holding undefined.
+          const k = this.wlocal(w, I32);
+          const n = this.wlocal(w, I32);
+          c.localGet(o);
+          c.structGet(dyn.objT(), OBJ_LEN);
+          c.localSet(n);
+          c.i32Const(0);
+          c.localSet(k);
+          for (const f of fields) {
+            const inner = this.dynFitsHelper(f.type, loc, true);
+            if (inner === null) return false;
+            // Only a plain number, string or boolean slot carries S119's missing
+            // mark (printing then omits the key, as Node does), and an
+            // optional field's undefined arm is no own key (S091's key rule,
+            // GH #132's fast path): any other absent key would print as
+            // `key: undefined`.
+            const optUndef = this.optionalUndefArmed(f);
+            const mustBePresent = !(f.type.kind === "f64" || f.type.kind === "string" || f.type.kind === "bool") && !optUndef;
+            c.localGet(k);
+            c.localGet(n);
+            c.i32LtU();
+            c.ifVoid();
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_ENTRIES);
+            c.localGet(k);
+            c.arrayGet(dyn.entriesArrayType());
+            c.localTee(e);
+            c.structGet(dyn.entryT(), ENTRY_KEY);
+            this.pushStrLitInto(c, f.name);
+            c.call(this.strEqHelper());
+            c.ifVoid();
+            c.localGet(e);
+            c.structGet(dyn.entryT(), ENTRY_VALUE);
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            fail0();
+            c.end();
+            if (f.optional === true) this.failOnUndefEntry(c, e, fail0);
+            c.localGet(k);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(k);
+            // An undefined-armed (optional-flavored) field's absent key
+            // would be built as that arm and printed as `key: undefined`:
+            // it must be present.
+            if (mustBePresent) {
+              c.else_();
+              fail0();
+            }
+            c.end();
+            if (mustBePresent) {
+              c.else_();
+              fail0();
+            }
+            c.end();
+          }
+          c.localGet(k);
+          c.localGet(n);
+          c.i32Eq();
+          return true;
+        }
+        c.localGet(o);
+        c.structGet(dyn.objT(), OBJ_LEN);
+        c.i32Const(fields.length);
+        c.i32Ne();
+        c.ifVoid();
+        fail0();
+        c.end();
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i]!;
+          const inner = this.dynFitsHelper(f.type, loc);
+          if (inner === null) return false;
+          c.localGet(o);
+          c.structGet(dyn.objT(), OBJ_ENTRIES);
+          c.i32Const(i);
+          c.arrayGet(dyn.entriesArrayType());
+          c.localTee(e);
+          c.structGet(dyn.entryT(), ENTRY_KEY);
+          this.pushStrLitInto(c, f.name);
+          c.call(this.strEqHelper());
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+          c.localGet(e);
+          c.structGet(dyn.entryT(), ENTRY_VALUE);
+          c.call(inner);
+          c.i32Eqz();
+          c.ifVoid();
+          fail0();
+          c.end();
+          if (f.optional === true) this.failOnUndefEntry(c, e, fail0);
+        }
+        c.i32Const(1);
+        return true;
+      }
+      case "array": {
+        const inner = this.dynFitsHelper(t.elem, loc, lenient);
+        if (inner === null) return false;
+        this.emitKindIs(c, DK.ARR);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        noView();
+        const a = this.wlocal(w, dyn.arrRef());
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        dyn.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(a);
+        dyn.arrLen(c, (x) => x.localGet(a));
+        c.localSet(n);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(a), (x) => x.localGet(i));
+        c.call(inner);
+        c.i32Eqz();
+        c.ifVoid();
+        fail0();
+        c.end();
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        return true;
+      }
+      case "union": {
+        // The arm the checked copy picks (its first width-tolerant
+        // match, dynCheckHelper's union arm) must fit exactly.
+        const def = this.unionDef(t.unionId);
+        for (const arm of def.arms) {
+          const match = this.dynMatchHelper(arm, loc);
+          const fits = this.dynFitsHelper(arm, loc, lenient);
+          if (match === null || fits === null) return false;
+          c.localGet(0);
+          c.call(match);
+          c.ifVoid();
+          c.localGet(0);
+          c.call(fits);
+          c.return_();
+          c.end();
+        }
+        c.i32Const(0);
+        return true;
+      }
+      default:
+        // Every other target keeps the dynamic arm.
+        c.i32Const(0);
+        return true;
     }
   }
 
@@ -22098,7 +22469,7 @@ class Assembler {
         }
         // GH #133: a plain call of a receiver-reading function runs with
         // `this` undefined, whatever call encloses it (thisReaders' doc).
-        const plainThis = this.thisReaders.has(e.callee);
+        const plainThis = this.thisReaders.has(e.callee) && (e as { keepThis?: true }).keepThis !== true;
         if (plainThis) {
           code.globalGet(this.dyn.undefinedGlobal());
           code.call(this.dyn.thisPush());
@@ -22213,9 +22584,19 @@ class Assembler {
         }
         code.localGet(c); // arg0: the closure itself (selfRef, env)
         for (const a of e.args) this.walkValue(a);
+        // A call through a function value is a plain call: in a module with
+        // receiver-reading functions it runs with `this` undefined, never the
+        // receiver of a method call around it (thisReaders' doc; the U2
+        // review: `o.m = function () { const f = helper; return f(); }`).
+        const plainThis = this.thisReaders.size > 0 && (e as { keepThis?: true }).keepThis !== true;
+        if (plainThis) {
+          code.globalGet(this.dyn.undefinedGlobal());
+          code.call(this.dyn.thisPush());
+        }
         code.localGet(c);
         code.structGet(pair.clos, 0);
         code.callRef(pair.fn);
+        if (plainThis) code.call(this.dyn.thisPop());
         this.releaseScratch(closRef, c);
         // The indirect callee is unknown; one closure target that may
         // throw makes every callValue a check site (may-throw.ts's
@@ -33208,6 +33589,18 @@ class Assembler {
           () => this.pushStrLit(e.label),
           e.fns.map((f) => () => this.walkExpr(f)),
         );
+        return;
+      }
+      case "jsFits": {
+        // Unit U2b: the exact-shape test in front of a speculative copy.
+        const h = this.dynFitsHelper(e.target, e.loc, e.lenient === true);
+        if (h === null) {
+          this.refuse(`expr:${e.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.call(h);
         return;
       }
       case "jsUnview": {
