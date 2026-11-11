@@ -309,3 +309,46 @@ tidy-deps.py`. Run them from this directory, after `pnpm -r build`.
   factory passed as an argument does not.
 - **QuickJS bound** checks builtin imports only. It does not account for engine gaps, the value bridge, or
   `module:embedded` not existing on the wasm lanes yet.
+
+## Re-measure after U2 (main @ 7aff51dd), 2026-11-11
+
+Stratum A only (npm, 302 packages), run on nico-top, 2 workers, inside nico.sh's cap. Stratum B (repos) was
+started but not finished: the coordinator stopped it because main had moved on. Files:
+[`results/u2-7aff51dd/`](results/u2-7aff51dd/) (`npm.jsonl.gz`, `tables-npm.md`, `compare-vs-d4a95a74.md`,
+`compare-73-vs-u1b.md`). [`results/u1b-cbd34df1/`](results/u1b-cbd34df1/) is the U1b run (cbd34df1, 73 packages),
+collated from its nico-top raw records so the two runs can be compared.
+
+**Method caveat, which matters for reading U2.** `worker.mjs` patches `analyze()` with `hostFetch`, `undefSlots`
+and `targetPlatform` but not `sharedDynamic`, the one-dynamic-world switch U1a added and `compile()` sets on the
+wasm lanes. So the per-file sweep still lowers `any`/`unknown` in the old checked-dynamic world, and U1/U2 show up
+only in each package's first entry, which runs the real `compile({backend: "wasm"})`. The U1b run had the same
+limitation. A pass with `sharedDynamic: true` added to the hook, at 76ad09bd and at 7aff51dd, was queued and
+then stopped before it got the heavy lock: **not measured**. The same hook is in `tests/real-apps-top10/harness/sites.mjs`.
+
+| | d4a95a74 (302) | U2 7aff51dd (302) | U1b cbd34df1 (73) | U2 on the same 73 |
+|---|---|---|---|---|
+| build passes (wasm compile of the first entry) | 180 | **173** | 48 | **48** |
+| clean | 11 | 11 | 1 | 1 |
+| deferred fences only | 175 | 153 | 38 | 38 |
+| blocked | 108 | 131 | 34 | 34 |
+| loads (no build-time refusal, no top-level fence) | 29 | **30** | 2 | 2 |
+| clean files / per-file units | 1539 / 7760 | 1568 / 7851 | 320 / 2544 | 320 / 2544 |
+| internal errors (SC9001 sites, pkgs) | 192, 15 | 3, 2 | 0 | 0 |
+| SC3001 (pkgs) | 11 | 7 | 0 | 0 |
+
+- **U1b → U2 on the 73 packages: no change.** Every headline number and every family is equal, give or take
+  one site. The COPY refusals of S115 (d)/S125 (c) (27 packages and 487 sites for "dynamic value checked into a
+  typed slot", 26 and 2,107 for "typed value converted to dynamic", 14 and 81 for "function crossing into a
+  dynamic value") are identical before and after U2. U2's typed-slot sharing does not reach npm's JavaScript
+  sources, at least not through this measurement.
+- **d4a95a74 → U2 over 302** spans 2B, U0, U1a, U1b and U2. The main move is a new `other` bucket: the COPY
+  refusals of S125 (c) and S115 (d), not yet a family in `families.py`. They appear in 109 packages, 4,815 sites, and
+  are the hard (build-time) blocker in 79. That is why 34 packages went from "deferred only" or "clean" to
+  "blocked" (lodash, moment, chalk, tslib, sinon, core-js, date-fns, js-yaml, ...). The 107 internal errors of #107
+  are gone except for two new ones (below). 11 packages improved (jest, babel-jest, dayjs, regenerator-runtime,
+  source-map-support, react-router-dom now clean, ...).
+- **Regressions with no U1b data point** (outside the 73, so not attributable between U1b and U2 without a
+  bisect): uuid, SC9001 `dynFromJsval operand must be jsval, got f64`; jest-cli, SC9001 `local "%setVal" has bare
+  unit type undefinedT` and `bare unitLit 'undefined' outside a unionWrap`; @vue/cli-plugin-eslint,
+  rollup-plugin-postcss and web-vitals, SC3001 `jsOp:defineGetter-order`. The wasm build was lost for 17
+  packages and gained for 10.

@@ -1,0 +1,4 @@
+== /home/tsinter/u2home/.cache/tsinter-dl/top10/res/n8n/wasm 1 40s
+  expr           MISSING                                           t node=3.039 lane=?
+  graph          MISSING                                           t node=3.000 lane=?
+  params         MISSING                                           t node=2.862 lane=?

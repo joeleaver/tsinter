@@ -1,0 +1,6 @@
+== /home/tsinter/u2home/.cache/tsinter-dl/top10/res/shadcn/wasm 1 13s
+  build-missing  MISSING                                           t node=4.262 lane=?
+  build          SILENT   EXIT(0 vs 1 13s) STDOUT-DIFF stderr-diff FILES-DIFF t node=4.347 lane=4.668  err=
+  help           MISSING                                           t node=4.159 lane=?
+  info           MISSING                                           t node=4.290 lane=?
+  version        MISSING                                           t node=4.255 lane=?

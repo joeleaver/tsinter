@@ -1,0 +1,6 @@
+== /home/tsinter/u2home/.cache/tsinter-dl/top10/res/paperclip/wasm 1 84s
+  env            MISSING                                           t node=8.955 lane=?
+  help           MISSING                                           t node=8.674 lane=?
+  issue-help     MISSING                                           t node=8.890 lane=?
+  unknown        MISSING                                           t node=8.539 lane=?
+  version        MISSING                                           t node=8.774 lane=?

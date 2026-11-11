@@ -254,3 +254,19 @@ tsinter gets none of this: it compiles the same entry with its own resolver. Tha
 Re-run: `nico.sh <worktree> -- python3 -I tests/real-apps-top10/harness/fetch.py`, then
 `nico.sh <worktree> -- bash tests/real-apps-top10/harness/run-all.sh`, then
 `SURVEY_HEAP_MB=11000 nico.sh <worktree> -- bash tests/real-apps-top10/harness/run-census.sh`.
+
+## Re-measure after U2 (main @ 7aff51dd), 2026-11-11
+
+[`results/u2-7aff51dd/`](results/u2-7aff51dd/): `summary.tsv`, `build/<p>.wasm.log`, `build/<p>.codes.txt`, and `cmp/<p>.txt`.
+`run-all.sh` ran with `LANES="node wasm wn"` under an isolated `HOME` on nico-top, so it could not collide
+with R1's runs, which write the same `res/` directory. The census was queued and stopped before it ran: **not
+measured**. The coordinator stopped it because main had moved on (R1 and R2 merged).
+
+- **0 of 10 build, unchanged.** All nine measured projects refuse with exactly the baseline diagnostics, the
+  same codes, counts and messages. U2 changes nothing at the gate. rea is still 12× SC1010 `node:v8` plus
+  one SC0001 against `frida`, so U2 cannot show there until R2 (builtins refused at use) lets rea's build past
+  the import fences.
+- **openclaw: not measured.** The compile was OOM-killed at nico.sh's 14G cap with an 11 GB heap, the same as
+  the baseline.
+- The past-gate census, the only place where U2 could show for rea, was not run. Its `sites.mjs` hook also
+  lacks `sharedDynamic` (see the survey README's U2 section), so it would have needed the patched hook anyway.
