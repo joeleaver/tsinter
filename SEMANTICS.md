@@ -10293,7 +10293,11 @@ fields are read. The judgment follows the spread through a `?:`, `&&` or
 JavaScript's JSDoc-typed parameters and results. A dynamic, `any` or
 index-signature target keeps every key. Known cost, as in (b): a use the
 binding analysis does not follow counts as one that may print, so a
-union-typed binding read only through `n?.b` refuses. A JavaScript
+union-typed binding read only through `n?.b` refuses (a field write
+through the copy, `r.a = 5`, is not such a use here: it runs). A typed
+record spread source is not a dynamic one: its keys are at most its
+declared fields, so `({ ...r })` over a typed record that may be
+undefined runs. A JavaScript
 spread bound to an unannotated local first (`const r = { ...o }; return
 r` through a JSDoc record result) is S115's width-tolerant copy, not this
 judgment. **Tested by:**

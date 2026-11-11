@@ -362,8 +362,13 @@ describe("board #139: emitCheckpointCore drains a fixed point — a listener-que
     // Re-pinned again by the Unit U review round (S119 (a)): the record
     // and class receivers' undefined fence in the shared helpers.
     // And again by the re-review round (the guards' cold arms became helpers).
-    expect(hashA).toBe("689c6ba7f3d65c15a26ade9f08accd434cf6f4c030be06cbeb2fbc5a12b6ff7f");
-    expect(hashB).toBe("0c57460d137875f1c81f2ad2d8cea95521e0c78d94d583c72490a2bc86ad9587");
+    // Re-pinned after 921854f6 (GH #144/#146/#147: the error layout these
+    // programs' `new Error` builds changed; hashes 86f08ac0…/eb61ab4d…) and
+    // f9825769 (GH #155/#156: the shared throw and inspect helpers). Both
+    // programs' output is unchanged across them (S082 orders the second's
+    // nextTick against the rejection handler, as before).
+    expect(hashA).toBe("922b621c9f6ea49c47e6ccd0a5618f97c9f855fc6652db12d85075d73b40180c");
+    expect(hashB).toBe("edde44d06577857959e2ccee070e7d3389a897736e3bec399531a4bf6d36c640");
   });
 
   // R139-g's oracle: rev-27's probe, rev27/probes/b1/139g-two-function-timer.cjs
