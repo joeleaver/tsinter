@@ -5254,6 +5254,11 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
             mapped = ctxMapped;
           }
         }
+        // JavaScript's untyped-key Map (Map<any, V>) keeps its fence, as `new
+        // Set()` does below: a Map has no dynamic form in JS object literals.
+        if (isJsSourceFile(expr.getSourceFile()) && mapped?.kind === "map" && (mapped.key.kind === "dyn" || mapped.key.kind === "jsval")) {
+          mapped = null;
+        }
         if (seedArg && !entriesLit && mapped?.kind === "map") {
           const seeded = lowerMapSeedArrayNew(L, seedArg, mapped);
           if (seeded) return seeded;
@@ -5298,7 +5303,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
             "SC1090",
             expr,
             `Map keys of type '${L.checker.typeToString(targs[0])}' ` +
-              `(Map keys must be string or number)`,
+              `(a Map key may be any value but void or a generator)`,
           );
         }
         if (targs[1]) {
@@ -5307,7 +5312,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
             expr,
             `Map values of type '${L.checker.typeToString(targs[1])}' ` +
               `(Map values must be number, string, boolean, records, class instances, ` +
-              `arrays, promises, or unions of those — not functions, Maps, 'unknown', or 'any')`,
+              `arrays, promises, functions, Maps, Sets, or unions of those — not 'unknown' or 'any')`,
           );
         }
         L.badType(expr, tsType);
@@ -5324,6 +5329,30 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       // reach — the value lowers as an opaque dyn object (identity only;
       // every reached METHOD use meets its own per-site fence → runtime
       // fence). TypeScript keeps the compile fence.
+      // A TYPED `new WeakMap<K, V>()` / `new WeakSet<T>()` (object keys,
+      // docs/design/object-keys.md): the map/set storage marked weak — a
+      // strong table, which nothing in the language can tell apart.
+      // JavaScript keeps the opaque stand-in below: an untyped weak table
+      // there is a WeakMap<object, any>, and its any values have no slot.
+      if ((symbol?.name === "WeakMap" || symbol?.name === "WeakSet") && L.isStdlibSymbol(symbol) && !isJsSourceFile(expr.getSourceFile())) {
+        let wt = L.mapTypeOf(L.typeOf(expr));
+        const wantKind = symbol.name === "WeakMap" ? "map" : "set";
+        if (wt?.kind !== wantKind || wt.weak !== true) {
+          const ctx = L.checker.getContextualType(expr);
+          const cm = ctx ? L.mapTypeOf(ctx) : null;
+          if (cm?.kind === wantKind && cm.weak === true) wt = cm;
+        }
+        if (wt?.kind === wantKind && wt.weak === true) {
+          if ((expr.arguments?.length ?? 0) > 0) {
+            L.noLowering(
+              `new ${symbol.name}(entries)`,
+              expr,
+              `construct the ${symbol.name} empty and ${wantKind === "map" ? "set()" : "add()"} each entry`,
+            );
+          }
+          return wt.kind === "map" ? { kind: "mapNew", type: wt, loc } : { kind: "setNew", type: wt, loc };
+        }
+      }
       if (
         (symbol?.name === "WeakMap" || symbol?.name === "WeakSet") &&
         L.isStdlibSymbol(symbol) &&
@@ -5334,7 +5363,17 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       }
       if (symbol?.name === "Set" && L.isStdlibSymbol(symbol)) {
         const tsType = L.typeOf(expr);
-        const mapped = L.mapTypeOf(tsType);
+        let mapped = L.mapTypeOf(tsType);
+        // JavaScript's untyped `new Set()` (Set<any>) keeps its fence: its
+        // values reach JS object literals, where a Set has no dynamic form
+        // yet (object keys unit — typed Set<unknown> in TypeScript compiles).
+        if (
+          isJsSourceFile(expr.getSourceFile()) &&
+          mapped?.kind === "set" &&
+          (mapped.elem.kind === "dyn" || mapped.elem.kind === "jsval")
+        ) {
+          mapped = null;
+        }
         if (mapped?.kind === "set" && (expr.arguments?.length ?? 0) === 1) {
           const argNode = expr.arguments![0]!;
           // An array LITERAL seed builds element-wise (its contextual type
@@ -5417,7 +5456,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
             "SC1090",
             expr,
             `Set elements of type '${L.checker.typeToString(targs[0])}' ` +
-              `(Set elements must be string or number — Map's key kinds — or a server handle, which stores under reference identity)`,
+              `(a Set element may be any value but void or a generator)`,
           );
         }
         L.badType(expr, tsType);

@@ -675,8 +675,8 @@ test("B-i gate 7 (Map<string, symbol>) — the fixed r7-a shape, full sorted fou
   for (const dynamic of [false, true]) {
     const codes = await compileDiag(`bi-g7-${dynamic ? "dyn" : "plain"}`, sym, dynamic);
     expect(codes).toEqual([
-      "SC1090:Map values of type 'symbol' (Map values must be number, string, boolean, records, class instances, arrays, promises, or unions of those — not functions, Maps, 'unknown', or 'any') is not supported yet",
-      "SC2009:values of type 'Map<string, symbol>' cannot be compiled: the Map shape is supported, but 'symbol' values have no Map slot yet (functions, promises, and nested Maps stay out)",
+      "SC1090:Map values of type 'symbol' (Map values must be number, string, boolean, records, class instances, arrays, promises, functions, Maps, Sets, or unions of those — not 'unknown' or 'any') is not supported yet",
+      "SC2009:values of type 'Map<string, symbol>' cannot be compiled: the Map shape is supported, but 'symbol' values have no Map slot yet",
       "SC2020:'Map<string, symbol>.set' is part of the standard library types but has no scriptc lowering yet",
       "SC2020:'Map<string, symbol>.size' is part of the standard library types but has no scriptc lowering yet",
     ]);

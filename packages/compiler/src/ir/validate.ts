@@ -1446,11 +1446,11 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       // closure pointer identity per tag is the narrowing); a set arm is
       // valid exactly when every other arm is a unit (the defaulted-Set-
       // param ABI); func/set-beside-data stays out.
-      if (arm.kind === "void" || arm.kind === "union" || arm.kind === "map" || arm.kind === "dyn" || arm.kind === "jsval" || arm.kind === "generator") {
+      if (arm.kind === "void" || arm.kind === "union" || arm.kind === "dyn" || arm.kind === "jsval" || arm.kind === "generator") {
         errors.push({ message: `union ${u.id}: arm ${i} is ${arm.kind}`, loc: noLoc });
       }
       if (
-        (arm.kind === "func" || arm.kind === "set") &&
+        (arm.kind === "func" || arm.kind === "set" || arm.kind === "map") &&
         !unionFuncSetArmsOk(u.arms)
       ) {
         errors.push({ message: `union ${u.id}: ${arm.kind} arm ${i} beside non-unit arms`, loc: noLoc });

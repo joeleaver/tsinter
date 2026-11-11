@@ -281,9 +281,9 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       // runtime representation; the message stays honest either way).
       return t.elem === "u8" ? "Uint8Array" : t.elem === "u32" ? "Uint32Array" : t.elem === "i32" ? "Int32Array" : "Float32Array";
     case "map":
-      return `Map<${formatIrType(t.key, shapes, unions, seen)}, ${formatIrType(t.value, shapes, unions, seen)}>`;
+      return `${t.weak === true ? "WeakMap" : "Map"}<${formatIrType(t.key, shapes, unions, seen)}, ${formatIrType(t.value, shapes, unions, seen)}>`;
     case "set":
-      return `Set<${formatIrType(t.elem, shapes, unions, seen)}>`;
+      return `${t.weak === true ? "WeakSet" : "Set"}<${formatIrType(t.elem, shapes, unions, seen)}>`;
     case "func":
       return `(${t.params.map((p) => formatIrType(p, shapes, unions, seen)).join(", ")}) => ${formatIrType(t.ret, shapes, unions, seen)}`;
     case "object":
@@ -1423,24 +1423,33 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // readonly-ness is a checker-only view (no mutating members on the
   // interface), so both map to the identical IR kinds and the read-side
   // method lowerings (.has/.get/.size/iteration) dispatch unchanged.
-  if (isStdlibInterface("Map") || isStdlibInterface("ReadonlyMap")) {
+  const weakMap = isStdlibInterface("WeakMap");
+  if (isStdlibInterface("Map") || isStdlibInterface("ReadonlyMap") || weakMap) {
     const args = checker.getTypeArguments(widened as ts.TypeReference);
     if (args.length !== 2) return null;
+    // An `any`- or default-(`WeakKey`-)keyed weak table is an untyped `new
+    // WeakMap()` (JavaScript's, or TypeScript's without type arguments) — the
+    // opaque stand-in (lower-classes), not a typed table.
+    if (weakMap && ((args[0]!.flags & ts.TypeFlags.Any) !== 0 || checker.typeToString(args[0]!) === "WeakKey")) return null;
     const key = mapType(args[0]!, ctx);
     if (!key || !isSupportedMapKey(key)) return null;
     const value = mapType(args[1]!, ctx);
     if (!value || !isSupportedMapValue(value)) return null;
-    return mapOf(key, value);
+    // WeakMap (docs/design/object-keys.md): the same storage, a strong
+    // table — nothing observes the difference but the printer.
+    return weakMap ? { kind: "map", key, value, weak: true } : mapOf(key, value);
   }
   // Set<T>: Map's sibling — same provenance rule, elements fenced to Map's
-  // KEY kinds (f64/string, SameValueZero). Anything else stays unmapped;
+  // KEY kinds (any value but a generator, SameValueZero). Anything else stays unmapped;
   // the `new Set` lowering names the offending element type specifically.
-  if (isStdlibInterface("Set") || isStdlibInterface("ReadonlySet")) {
+  const weakSet = isStdlibInterface("WeakSet");
+  if (isStdlibInterface("Set") || isStdlibInterface("ReadonlySet") || weakSet) {
     const args = checker.getTypeArguments(widened as ts.TypeReference);
     if (args.length !== 1) return null;
+    if (weakSet && ((args[0]!.flags & ts.TypeFlags.Any) !== 0 || checker.typeToString(args[0]!) === "WeakKey")) return null;
     const elem = mapType(args[0]!, ctx);
     if (!elem || !isSupportedSetElem(elem)) return null;
-    return setOf(elem);
+    return weakSet ? { kind: "set", elem, weak: true } : setOf(elem);
   }
   // RegExp: a reference to the lib RegExp interface — provenance, not the
   // name (a user's own `interface RegExp` maps as a record). Regex values
@@ -2453,7 +2462,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
             // arms map: `x instanceof RegExp` is their narrowing test
             // (the skip-utility `string | RegExp` shape), and the arm
             // rides the ref machinery like array regex elements.
-            a.kind === "map" || a.kind === "set" || a.kind === "dyn" ||
+            // Object keys unit: a Map/Set arm maps beside unit arms only
+            // (`Set<T> | undefined` — the tag is the narrowing test),
+            // the promise rule below.
+            a.kind === "dyn" ||
+            ((a.kind === "map" || a.kind === "set") && !arms.every((b) => b === a || isUnitType(b))) ||
             // Generator arms follow the map/set rule: no narrowing test.
             a.kind === "generator" ||
             // Func arms map beside ANY sibling: `typeof x === "function"`
@@ -2791,7 +2804,7 @@ export function computeGenResultArms(
       for (const a of getUnionArms(t.unionId)) byKey.set(typeKey(a), a);
       return true;
     }
-    if (t.kind === "map" || t.kind === "regex" || t.kind === "jsval" || t.kind === "generator") {
+    if (t.kind === "regex" || t.kind === "jsval" || t.kind === "generator") {
       return false; // no legal union arm exists for these kinds
     }
     byKey.set(typeKey(t), t);
@@ -2802,7 +2815,7 @@ export function computeGenResultArms(
   const arms = [...byKey.values()];
   // func/set arms are legal only beside unit arms (no narrowing test
   // against data siblings — the union rule).
-  if (arms.some((a) => (a.kind === "func" || a.kind === "set") && !arms.every((b) => b === a || isUnitType(b)))) {
+  if (arms.some((a) => (a.kind === "func" || a.kind === "set" || a.kind === "map") && !arms.every((b) => b === a || isUnitType(b)))) {
     return null;
   }
   if (arms.every(isUnitType) && arms.length < 2) {
@@ -2893,7 +2906,7 @@ export function withUndefinedArm(t: IrType, unions: UnionRegistry): IrType | nul
     return { kind: "union", unionId: unions.intern(arms) };
   }
   if (
-    t.kind === "void" || t.kind === "map" || t.kind === "dyn" ||
+    t.kind === "void" || t.kind === "dyn" ||
     // A bare unit field type cannot occur (units live only inside unions),
     // but guard against constructing a single-arm union from one.
     isUnitType(t)
@@ -3405,14 +3418,14 @@ function armHasUnionHome(arm: IrType, siblingCount: number): boolean {
   switch (arm.kind) {
     case "void":
     case "union":
-    case "map":
-    case "set":
     case "regex":
     case "generator":
     case "dyn":
       return false;
-    // Promise arms map only beside unit siblings (the promise-or-absent
-    // shape); a data sibling has no narrowing test against them.
+    // Promise, Map and Set arms map only beside unit siblings (the
+    // value-or-absent shape); a data sibling has no narrowing test.
+    case "map":
+    case "set":
     case "promise":
       return siblingCount === 0;
     default:
@@ -3452,13 +3465,13 @@ export function describeComponentBlocker(widened: ts.Type, ctx: TypeMapperCtx): 
         return `the ${container} shape is supported, but its ${role} type '${text(arg)}' does not compile`;
       }
       if ((container === "Map" || container === "ReadonlyMap") && i === 0 && !isSupportedMapKey(mapped)) {
-        return `the ${container} shape is supported, but keys are limited to numbers and strings — '${text(arg)}' is outside that domain`;
+        return `the ${container} shape is supported, but '${text(arg)}' keys have no Map key representation`;
       }
       if ((container === "Map" || container === "ReadonlyMap") && i === 1 && !isSupportedMapValue(mapped)) {
-        return `the ${container} shape is supported, but '${text(arg)}' values have no Map slot yet (functions, promises, and nested Maps stay out)`;
+        return `the ${container} shape is supported, but '${text(arg)}' values have no Map slot yet`;
       }
       if ((container === "Set" || container === "ReadonlySet") && !isSupportedSetElem(mapped)) {
-        return `the ${container} shape is supported, but elements are limited to numbers and strings — '${text(arg)}' is outside that domain`;
+        return `the ${container} shape is supported, but '${text(arg)}' elements have no Set representation`;
       }
     }
     // Every argument passed the per-slot checks and the type still failed:

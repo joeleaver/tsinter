@@ -1,12 +1,3 @@
-sets.ts:8:7 - error SC2009: values of type 'Set<[string, number]>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — '[string, number]' is outside that domain
-
-  7 | // against the lib but keeps the fence: never silently an empty set.
-  8 | const seeded = new Set(new Map([["a", 1]]));
-    |       ^~~~~~
-  9 | 
-
-  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
 sets.ts:8:16 - error SC2020: 'new Set(values)' is part of the standard library types but has no scriptc lowering yet
 
   7 | // against the lib but keeps the fence: never silently an empty set.
@@ -16,93 +7,93 @@ sets.ts:8:16 - error SC2020: 'new Set(values)' is part of the standard library t
 
   hint: construct the Set empty and add() each value — only an array of already-legal elements (string or number) seeds a Set
 
-sets.ts:12:7 - error SC2009: values of type 'Set<boolean>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — 'boolean' is outside that domain
+sets.ts:12:7 - error SC2009: values of type 'Set<Generator<number, any, any>>' cannot be compiled: the Set shape is supported, but 'Generator<number, any, any>' elements have no Set representation
 
   11 | // element type.
-  12 | const byFlag = new Set<boolean>();
+  12 | const byFlag = new Set<Generator<number>>();
      |       ^~~~~~
   13 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-sets.ts:12:16 - error SC1090: Set elements of type 'boolean' (Set elements must be string or number — Map's key kinds — or a server handle, which stores under reference identity) is not supported yet
+sets.ts:12:16 - error SC1090: Set elements of type 'Generator<number, any, any>' (a Set element may be any value but void or a generator) is not supported yet
 
   11 | // element type.
-  12 | const byFlag = new Set<boolean>();
-     |                ^~~~~~~~~~~~~~~~~~
+  12 | const byFlag = new Set<Generator<number>>();
+     |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
   13 | 
 
-sets.ts:16:7 - error SC2009: values of type 'Set<{ id: number; }>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — '{ id: number; }' is outside that domain
+sets.ts:16:7 - error SC2009: values of type 'Set<Generator<string, any, any>>' cannot be compiled: the Set shape is supported, but 'Generator<string, any, any>' elements have no Set representation
 
-  15 | // fenced for now.
-  16 | const recs = new Set<{ id: number }>();
+  15 | 
+  16 | const recs = new Set<Generator<string>>();
      |       ^~~~
   17 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-sets.ts:16:14 - error SC1090: Set elements of type '{ id: number; }' (Set elements must be string or number — Map's key kinds — or a server handle, which stores under reference identity) is not supported yet
+sets.ts:16:14 - error SC1090: Set elements of type 'Generator<string, any, any>' (a Set element may be any value but void or a generator) is not supported yet
 
-  15 | // fenced for now.
-  16 | const recs = new Set<{ id: number }>();
-     |              ^~~~~~~~~~~~~~~~~~~~~~~~~
+  15 | 
+  16 | const recs = new Set<Generator<string>>();
+     |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
   17 | 
 
-sets.ts:19:17 - error SC2009: values of type 'Set<boolean>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — 'boolean' is outside that domain
+sets.ts:19:17 - error SC2009: values of type 'Set<Generator<number, any, any>>' cannot be compiled: the Set shape is supported, but 'Generator<number, any, any>' elements have no Set representation
 
   18 | // Set-typed slots elsewhere report the ordinary unsupported-type diagnostic.
-  19 | function useBad(s: Set<boolean>): number {
+  19 | function useBad(s: Set<Generator<number>>): number {
      |                 ^
   20 |   return s.size;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-sets.ts:24:10 - error SC2009: values of type 'Set<string> | undefined' cannot be compiled: the union shape is supported, but 'Set<string>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
+sets.ts:25:10 - error SC2009: values of type 'string | Set<string>' cannot be compiled: the union shape is supported, but 'Set<string>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
 
-  23 | // Sets as union arms have no narrowing test — rejected like Map arms.
-  24 | function maybeSet(cond: boolean): Set<string> | undefined {
+  24 | // undefined/null they map).
+  25 | function maybeSet(cond: boolean): Set<string> | string {
      |          ^~~~~~~~
-  25 |   return undefined;
+  26 |   return "none";
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-sets.ts:29:7 - error SC2009: values of type 'Set<string>[]' cannot be compiled: the array shape is supported, but 'Set<string>' elements have no array representation yet
+sets.ts:30:7 - error SC2009: values of type 'Set<string>[]' cannot be compiled: the array shape is supported, but 'Set<string>' elements have no array representation yet
 
-  28 | // Sets as array elements: ScrArr has no set element kind.
-  29 | const rows: Set<string>[] = [];
+  29 | // Sets as array elements: ScrArr has no set element kind.
+  30 | const rows: Set<string>[] = [];
      |       ^~~~
-  30 | 
+  31 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-sets.ts:34:28 - error SC1090: JSON.stringify of 'Set<string>' values (only number, string, boolean, records, arrays, unions of those, and 'unknown' stringify) are not supported yet
+sets.ts:35:28 - error SC1090: JSON.stringify of 'Set<string>' values (only number, string, boolean, records, arrays, unions of those, and 'unknown' stringify) are not supported yet
 
-  33 | const s = new Set<string>();
-  34 | console.log(JSON.stringify(s));
+  34 | const s = new Set<string>();
+  35 | console.log(JSON.stringify(s));
      |                            ^
-  35 | 
+  36 | 
 
-sets.ts:37:15 - error SC1090: Set methods as values (call 'add' directly) are not supported yet
+sets.ts:38:15 - error SC1090: Set methods as values (call 'add' directly) are not supported yet
 
-  36 | // Set methods have no bound-value form — call them directly.
-  37 | const adder = s.add;
+  37 | // Set methods have no bound-value form — call them directly.
+  38 | const adder = s.add;
      |               ^~~~~
-  38 | 
+  39 | 
 
-sets.ts:41:1 - error SC2004: uses of 'useBad' inherit the blocker on its declaration
+sets.ts:42:1 - error SC2004: uses of 'useBad' inherit the blocker on its declaration
 
-  40 | // them relevant; these references are what makes them count.
-  41 | useBad(new Set<boolean>());
+  41 | // them relevant; these references are what makes them count.
+  42 | useBad(new Set<Generator<number>>());
      | ^~~~~~
-  42 | maybeSet(true);
+  43 | maybeSet(true);
 
   hint: the declaration of 'useBad' did not compile — fix the diagnostic reported there and these sites clear with it
 
-sets.ts:42:1 - error SC2004: uses of 'maybeSet' inherit the blocker on its declaration
+sets.ts:43:1 - error SC2004: uses of 'maybeSet' inherit the blocker on its declaration
 
-  41 | useBad(new Set<boolean>());
-  42 | maybeSet(true);
+  42 | useBad(new Set<Generator<number>>());
+  43 | maybeSet(true);
      | ^~~~~~~~
-  43 | 
+  44 | 
 
   hint: the declaration of 'maybeSet' did not compile — fix the diagnostic reported there and these sites clear with it

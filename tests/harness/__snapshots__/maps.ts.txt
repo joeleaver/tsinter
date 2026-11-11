@@ -1,106 +1,106 @@
-maps.ts:8:7 - error SC2009: values of type 'Map<boolean, string>' cannot be compiled: the Map shape is supported, but keys are limited to numbers and strings — 'boolean' is outside that domain
+maps.ts:8:7 - error SC2009: values of type 'Map<Generator<number, any, any>, string>' cannot be compiled: the Map shape is supported, but 'Generator<number, any, any>' keys have no Map key representation
 
-  7 | // exactly those) — the new-site diagnostic names the key type.
-  8 | const byFlag = new Map<boolean, string>();
+  7 | // — the new-site diagnostic names the key type.
+  8 | const byFlag = new Map<Generator<number>, string>();
     |       ^~~~~~
   9 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:8:16 - error SC1090: Map keys of type 'boolean' (Map keys must be string or number) is not supported yet
+maps.ts:8:16 - error SC1090: Map keys of type 'Generator<number, any, any>' (a Map key may be any value but void or a generator) is not supported yet
 
-  7 | // exactly those) — the new-site diagnostic names the key type.
-  8 | const byFlag = new Map<boolean, string>();
-    |                ^~~~~~~~~~~~~~~~~~~~~~~~~~
+  7 | // — the new-site diagnostic names the key type.
+  8 | const byFlag = new Map<Generator<number>, string>();
+    |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   9 | 
 
-maps.ts:11:7 - error SC2009: values of type 'Map<string, () => void>' cannot be compiled: the Map shape is supported, but '() => void' values have no Map slot yet (functions, promises, and nested Maps stay out)
+maps.ts:11:7 - error SC2009: values of type 'Map<string, unknown>' cannot be compiled: the Map shape is supported, but 'unknown' values have no Map slot yet
 
-  10 | // Values exclude functions (no closure story in the uniform value slot yet).
-  11 | const handlers = new Map<string, () => void>();
+  10 | // Values exclude dynamic values.
+  11 | const handlers = new Map<string, unknown>();
      |       ^~~~~~~~
   12 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:11:18 - error SC1090: Map values of type '() => void' (Map values must be number, string, boolean, records, class instances, arrays, promises, or unions of those — not functions, Maps, 'unknown', or 'any') is not supported yet
+maps.ts:11:18 - error SC1090: Map values of type 'unknown' (Map values must be number, string, boolean, records, class instances, arrays, promises, functions, Maps, Sets, or unions of those — not 'unknown' or 'any') is not supported yet
 
-  10 | // Values exclude functions (no closure story in the uniform value slot yet).
-  11 | const handlers = new Map<string, () => void>();
-     |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  10 | // Values exclude dynamic values.
+  11 | const handlers = new Map<string, unknown>();
+     |                  ^~~~~~~~~~~~~~~~~~~~~~~~~~
   12 | 
 
-maps.ts:14:7 - error SC2009: values of type 'Map<string, Map<string, number>>' cannot be compiled: the Map shape is supported, but 'Map<string, number>' values have no Map slot yet (functions, promises, and nested Maps stay out)
+maps.ts:14:7 - error SC2009: values of type 'Map<string, Generator<number, any, any>>' cannot be compiled: the Map shape is supported, but 'Generator<number, any, any>' values have no Map slot yet
 
-  13 | // ... and nested Maps (no maps of maps this round).
-  14 | const nested = new Map<string, Map<string, number>>();
+  13 | // ... and generators.
+  14 | const nested = new Map<string, Generator<number>>();
      |       ^~~~~~
   15 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:14:16 - error SC1090: Map values of type 'Map<string, number>' (Map values must be number, string, boolean, records, class instances, arrays, promises, or unions of those — not functions, Maps, 'unknown', or 'any') is not supported yet
+maps.ts:14:16 - error SC1090: Map values of type 'Generator<number, any, any>' (Map values must be number, string, boolean, records, class instances, arrays, promises, functions, Maps, Sets, or unions of those — not 'unknown' or 'any') is not supported yet
 
-  13 | // ... and nested Maps (no maps of maps this round).
-  14 | const nested = new Map<string, Map<string, number>>();
-     |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  13 | // ... and generators.
+  14 | const nested = new Map<string, Generator<number>>();
+     |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   15 | 
 
-maps.ts:17:17 - error SC2009: values of type 'Map<boolean, number>' cannot be compiled: the Map shape is supported, but keys are limited to numbers and strings — 'boolean' is outside that domain
+maps.ts:17:17 - error SC2009: values of type 'Map<string, unknown>' cannot be compiled: the Map shape is supported, but 'unknown' values have no Map slot yet
 
   16 | // Map-typed slots elsewhere report the ordinary unsupported-type diagnostic.
-  17 | function useBad(m: Map<boolean, number>): number {
+  17 | function useBad(m: Map<string, unknown>): number {
      |                 ^
   18 |   return m.size;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:22:10 - error SC2009: values of type 'Map<string, number> | undefined' cannot be compiled: the union shape is supported, but 'Map<string, number>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
+maps.ts:23:10 - error SC2009: values of type 'string | Map<string, number>' cannot be compiled: the union shape is supported, but 'Map<string, number>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
 
-  21 | // Maps as union arms have no narrowing test — rejected like function arms.
-  22 | function maybeMap(cond: boolean): Map<string, number> | undefined {
+  22 | // undefined/null they map: the tag is the test).
+  23 | function maybeMap(cond: boolean): Map<string, number> | string {
      |          ^~~~~~~~
-  23 |   return undefined;
+  24 |   return "none";
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:27:7 - error SC2009: values of type 'Map<string, number>[]' cannot be compiled: the array shape is supported, but 'Map<string, number>' elements have no array representation yet
+maps.ts:28:7 - error SC2009: values of type 'Map<string, number>[]' cannot be compiled: the array shape is supported, but 'Map<string, number>' elements have no array representation yet
 
-  26 | // Maps as array elements: ScrArr has no map element kind.
-  27 | const rows: Map<string, number>[] = [];
+  27 | // Maps as array elements: ScrArr has no map element kind.
+  28 | const rows: Map<string, number>[] = [];
      |       ^~~~
-  28 | 
+  29 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-maps.ts:32:28 - error SC1090: JSON.stringify of 'Map<string, number>' values (only number, string, boolean, records, arrays, unions of those, and 'unknown' stringify) are not supported yet
+maps.ts:33:28 - error SC1090: JSON.stringify of 'Map<string, number>' values (only number, string, boolean, records, arrays, unions of those, and 'unknown' stringify) are not supported yet
 
-  31 | const m = new Map<string, number>();
-  32 | console.log(JSON.stringify(m));
+  32 | const m = new Map<string, number>();
+  33 | console.log(JSON.stringify(m));
      |                            ^
-  33 | 
+  34 | 
 
-maps.ts:35:16 - error SC1090: Map methods as values (call 'get' directly) are not supported yet
+maps.ts:36:16 - error SC1090: Map methods as values (call 'get' directly) are not supported yet
 
-  34 | // Map methods have no bound-value form — call them directly.
-  35 | const getter = m.get;
+  35 | // Map methods have no bound-value form — call them directly.
+  36 | const getter = m.get;
      |                ^~~~~
-  36 | 
+  37 | 
 
-maps.ts:39:1 - error SC2004: uses of 'useBad' inherit the blocker on its declaration
+maps.ts:40:1 - error SC2004: uses of 'useBad' inherit the blocker on its declaration
 
-  38 | // them relevant; these references are what makes them count.
-  39 | useBad(new Map<boolean, number>());
+  39 | // them relevant; these references are what makes them count.
+  40 | useBad(new Map<string, unknown>());
      | ^~~~~~
-  40 | maybeMap(true);
+  41 | maybeMap(true);
 
   hint: the declaration of 'useBad' did not compile — fix the diagnostic reported there and these sites clear with it
 
-maps.ts:40:1 - error SC2004: uses of 'maybeMap' inherit the blocker on its declaration
+maps.ts:41:1 - error SC2004: uses of 'maybeMap' inherit the blocker on its declaration
 
-  39 | useBad(new Map<boolean, number>());
-  40 | maybeMap(true);
+  40 | useBad(new Map<string, unknown>());
+  41 | maybeMap(true);
      | ^~~~~~~~
-  41 | 
+  42 | 
 
   hint: the declaration of 'maybeMap' did not compile — fix the diagnostic reported there and these sites clear with it

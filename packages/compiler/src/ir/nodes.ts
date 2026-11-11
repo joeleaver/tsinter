@@ -40,7 +40,7 @@ export type IrType =
    * f64 or string (SameValueZero); values are f64, string, bool, record,
    * object, union, or array — anything isRefCounted or scalar EXCEPT
    * func/promise/dyn/jsval/map (frontend-fenced, validator-checked). */
-  | { kind: "map"; key: IrType; value: IrType }
+  | { kind: "map"; key: IrType; value: IrType; weak?: true }
   /** ES `Set<T>` — heap, refcounted, insertion-ordered. Map's sibling with
    * the value slot removed: ONE runtime representation (the backend lowers
    * sets onto the map runtime with a constant unit value), elements are
@@ -48,7 +48,7 @@ export type IrType =
    * fences as map (no union arms, no array elements, no map values, no sets
    * of sets, not JSON-safe) and never cycle-capable: elements are scalars
    * or strings, which cannot point back. */
-  | { kind: "set"; elem: IrType }
+  | { kind: "set"; elem: IrType; weak?: true }
   /** A regular expression. Its pattern, flags and compiled program are
    * immutable; its `lastIndex` is the one piece of MUTABLE state (board
    * #301): every lane carries it on the value (the wasm lane's
@@ -419,28 +419,42 @@ export function setOf(elem: IrType): IrType {
   return { kind: "set", elem };
 }
 
-/** The Map KEY fence: string (content) or number (SameValueZero) — the two
- * kinds a hash of the VALUE is honest for. Booleans, objects, and the rest
- * of JS's anything-goes keys stay out. Shared by the frontend's
- * type mapping/diagnostics and the validator. Set ELEMENTS use the same
- * fence: a set is hashed storage of its elements exactly as a map is of
- * its keys (isSupportedSetElem is this predicate under its own name). */
+/** The Map KEY fence (object keys, docs/design/object-keys.md): every
+ * value kind a Map key can hold with SameValueZero — numbers, strings and
+ * booleans by value, every object kind by identity (records, class
+ * instances, arrays, functions, maps, sets, regexes, handles...), unions
+ * of those arm by arm, and dynamic values (`any`/`unknown`/`object`)
+ * through the dynamic world's own SameValueZero. Out: the kinds that are
+ * not values a program can hand a Map (void, the unit kinds alone, a catch
+ * binding, generators). Set ELEMENTS use the same fence. The legacy c and
+ * llvm emitters handle only the string/number/handle kinds and refuse the
+ * rest in their own emitters (ungated, retiring at N4). */
 export function isSupportedMapKey(t: IrType): boolean {
-  return t.kind === "f64" || t.kind === "string";
+  switch (t.kind) {
+    case "void":
+    case "undefinedT":
+    case "nullT":
+    case "caught":
+    case "generator":
+      return false;
+    default:
+      return true;
+  }
 }
 
-/** The Set ELEMENT fence — Map's key fence plus the refcounted HANDLE
- * kinds stored under identity hashing (SameValueZero for JS objects IS
- * reference identity, so a Set of server handles — portless's auxiliary-
- * server registry — is honest hashed storage; SCR_MAP_KEY_REF in the
- * runtime). netServer is the one handle admitted so far: it drops its
- * listener closures at close, so a set-in-listener cycle is temporary —
- * the child precedent's story. Symbols are identity values by DESIGN —
- * SameValueZero on a symbol IS pointer identity, so a Set of symbols (the
- * sentinel-registry idiom) is the same honest hashed storage with no
- * cycle risk at all (symbols hold only strings). */
+/** The Set ELEMENT fence — exactly Map's key fence (a set is hashed
+ * storage of its elements as a map is of its keys). */
 export function isSupportedSetElem(t: IrType): boolean {
-  return isSupportedMapKey(t) || t.kind === "netServer" || t.kind === "symbol";
+  return isSupportedMapKey(t);
+}
+
+/** Keys that need no identity-hash slot anywhere: compared by value (a
+ * boolean through its own one-instruction helpers) or, for the handle
+ * kinds, by reference with
+ * the pre-object-keys hashes. A module whose keys are all of these keeps
+ * its pre-object-keys layout. */
+export function isPrimitiveMapKey(t: IrType): boolean {
+  return t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "symbol" || t.kind === "netServer";
 }
 
 /** The Map VALUE fence: scalars plus every refcounted kind EXCEPT
@@ -491,6 +505,13 @@ export function isSupportedMapValue(t: IrType): boolean {
     // a regex holds no references), map form.
     case "regex":
       return true;
+    // Nested containers and functions (object keys unit, wasm lanes):
+    // Map<string, Set<number>>, Map<string, (s: string) => void>. The
+    // WasmGC collector traces them like any other ref value.
+    case "map":
+    case "set":
+    case "func":
+      return true;
     default:
       return false;
   }
@@ -534,7 +555,7 @@ export function funcOf(params: IrType[], ret: IrType): IrType {
  * against data arms). */
 export function unionFuncSetArmsOk(arms: IrType[]): boolean {
   return arms.every(
-    (a, i) => a.kind !== "set" || arms.every((b, j) => j === i || isUnitType(b)),
+    (a, i) => (a.kind !== "set" && a.kind !== "map") || arms.every((b, j) => j === i || isUnitType(b)),
   );
 }
 
@@ -583,9 +604,9 @@ export function typeKey(t: IrType): string {
     case "bytes":
       return `bytes<${t.elem}>`;
     case "map":
-      return `map<${typeKey(t.key)},${typeKey(t.value)}>`;
+      return `${t.weak === true ? "weak" : ""}map<${typeKey(t.key)},${typeKey(t.value)}>`;
     case "set":
-      return `set<${typeKey(t.elem)}>`;
+      return `${t.weak === true ? "weak" : ""}set<${typeKey(t.elem)}>`;
     case "func":
       return `func(${[...t.params.map(typeKey), ...(t.rest ? [t.restAbi === "jsval" ? "...jsval[]" : "...dyn[]"] : [])].join(",")})=>${typeKey(t.ret)}`;
     case "object":
@@ -612,9 +633,9 @@ export function typeEquals(a: IrType, b: IrType): boolean {
   if (a.kind === "array") return b.kind === "array" && typeEquals(a.elem, b.elem);
   if (a.kind === "bytes") return b.kind === "bytes" && a.elem === b.elem;
   if (a.kind === "map") {
-    return b.kind === "map" && typeEquals(a.key, b.key) && typeEquals(a.value, b.value);
+    return b.kind === "map" && (a.weak === true) === (b.weak === true) && typeEquals(a.key, b.key) && typeEquals(a.value, b.value);
   }
-  if (a.kind === "set") return b.kind === "set" && typeEquals(a.elem, b.elem);
+  if (a.kind === "set") return b.kind === "set" && (a.weak === true) === (b.weak === true) && typeEquals(a.elem, b.elem);
   if (a.kind === "func") {
     return (
       b.kind === "func" &&

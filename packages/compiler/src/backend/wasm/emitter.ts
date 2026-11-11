@@ -63,6 +63,7 @@ import {
   type IrUnionDef,
   type SrcLoc,
   isUnitType,
+  isPrimitiveMapKey,
   typeEquals,
   typeKey,
   DYN,
@@ -155,7 +156,7 @@ import {
   TZ_OP_NAME,
   IMPORT_WRITE,
 } from "./abi.js";
-import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
+import { BUF, LEN, VEC_IDH, VecBuilder, type VecInfo } from "./arrays.js";
 import {
   DK,
   DYN_KIND,
@@ -172,6 +173,7 @@ import {
   OBJ_ENTRIES,
   OBJ_LEN,
   OBJ_PROTO,
+  OBJ_IDH,
   OBJ_PROTO_MAP,
   OBJ_PROTO_WEAKMAP,
   OBJ_PROTO_WEAKSET,
@@ -202,7 +204,7 @@ import { PEM_ASN1, PEM_ASN1_FIELD_MISSING, PEM_ASN1_HEADER, PEM_ASN1_TOO_LONG, P
 import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
 import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
 import { A, Fn, type X } from "./asm.js";
-import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
+import { MAP_IDH, MapBuilder, type MapInfo, type MapKeyFns, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
   PromiseBuilder,
@@ -299,7 +301,7 @@ import {
 import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { UNDEF_BOOL, UNDEF_F64_BITS, UNDEF_UNION_TAG } from "./undef.js";
-import { Code, ENGINE_MEMORY, setCharsType } from "./code.js";
+import { Code, ENGINE_MEMORY, addZeroTailType, resetZeroTailTypes, setCharsType } from "./code.js";
 import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { buildPowCore } from "./pow.js";
@@ -1693,6 +1695,42 @@ const VIEW_REGEX_PIECE_METHODS: ReadonlySet<string> = new Set([
 const VIEW_REGEX_SUBJECT_RECV: ReadonlySet<string> = new Set(["match", "matchInto", "search"]);
 const VIEW_REGEX_SUBJECT_ARG0: ReadonlySet<string> = new Set(["test", "exec", "execInto"]);
 
+/** Object keys (docs/design/object-keys.md): does the module name a
+ * Map/Set (WeakMap/WeakSet) type whose key is compared by identity — any
+ * key that is not a number, string, symbol or server handle? Only such a
+ * module gives records, vectors, class instances, dynamic objects and maps
+ * their identity-hash slot; every other module's layout is unchanged.
+ * Scans the whole module (types live in locals, fields, arms and nodes). */
+function moduleHasIdentityKeys(mod: WModule): boolean {
+  let found = false;
+  const seen = new Set<object>();
+  const scan = (node: unknown): void => {
+    if (found || node === null || typeof node !== "object") return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    const k = rec["kind"];
+    if (k === "map" && typeof rec["key"] === "object" && typeof rec["value"] === "object" && rec["key"] !== null) {
+      if (!isPrimitiveMapKey(rec["key"] as IrType)) {
+        found = true;
+        return;
+      }
+    } else if (k === "set" && typeof rec["elem"] === "object" && rec["elem"] !== null && rec["method"] === undefined) {
+      if (!isPrimitiveMapKey(rec["elem"] as IrType)) {
+        found = true;
+        return;
+      }
+    }
+    for (const value of Object.values(rec)) scan(value);
+  };
+  scan(mod);
+  return found;
+}
+
 /** Does any emitted function build a slice view (strings unit S3)? A
  * view-producing string method (VIEW_PRODUCER_METHODS), a split, or a
  * regex method that builds pieces. A module with none holds no view and
@@ -1976,6 +2014,7 @@ export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, 
     fenceSourceTexts = null;
     setFlatCrossing(null);
     setCharsType(null);
+    resetZeroTailTypes();
   }
 }
 
@@ -1993,6 +2032,7 @@ export function surveyWasmModule(mod: IrModule): string[] {
   } finally {
     setFlatCrossing(null);
     setCharsType(null);
+    resetZeroTailTypes();
   }
   return [...seen];
 }
@@ -2091,6 +2131,10 @@ interface RecordInfo {
    * a nullable string[] past the fields (and the overflow), present on
    * the shapes recordOrderSlot names; null otherwise. */
   order: number | null;
+  /** Object keys (docs/design/object-keys.md): the identity-hash slot,
+   * the struct's last field, in a module with identity-keyed containers
+   * (Assembler.recordIdhSlot); null otherwise. */
+  idh: number | null;
 }
 
 /** GH #132: the shapes whose records carry an own-key order slot — a
@@ -2131,8 +2175,13 @@ const ERR_CODE = 3;
  * Not an IR field: a user `extends Error` class's own fields start past it
  * (classes.ts plan), and every `struct.new` of errT seeds it null. */
 const ERR_BOX = 4;
-/** errT's subtypes' own fields, past errT's five: class:domex's hasCause
- * and cause, class:fetchCause's cause. */
+/** Object keys (docs/design/object-keys.md): the lazily assigned identity
+ * hash, 0 until the error is first used as a Map/Set key. Every struct.new
+ * of errT (or a subtype) seeds it 0 right after ERR_BOX. */
+const ERR_IDH = 5;
+/** errT's subtypes' own fields, past errT's six: class:domex's hasCause
+ * and cause, class:fetchCause's cause — each one further on in a module
+ * whose errT carries ERR_IDH (Assembler.errIdhN). */
 const DOMEX_HAS_CAUSE = 5;
 const DOMEX_CAUSE = 6;
 const FETCH_CAUSE = 5;
@@ -2914,6 +2963,15 @@ class Assembler {
   /** Unit U (SEMANTICS.md S119): the module was lowered with undefSlots —
    * every typed slot can hold its kind's undefined. */
   private readonly undefSlots: boolean;
+  /** Object keys (docs/design/object-keys.md): the module has an
+   * identity-keyed container, so records, vectors, user class instances,
+   * dynamic objects and maps carry the identity-hash slot. */
+  private readonly idKeys: boolean;
+  /** errT's ERR_IDH slot count (1 in a module with identity keys): the
+   * shift of its subtypes' own field indices. */
+  private get errIdhN(): number {
+    return this.idKeys ? 1 : 0;
+  }
   /** S119 (i): a value here can reach typed storage from dynamic code, so
    * a record may lack a key. A wholly typed module pays nothing. */
   private readonly undefMarksLive: boolean;
@@ -3190,6 +3248,8 @@ class Assembler {
     this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper(), this.strViewsLive);
     this.nodesLive = this.strViewsLive || hasStrConcat(mod);
     this.undefSlots = (mod as { undefSlots?: true }).undefSlots === true;
+    resetZeroTailTypes();
+    this.idKeys = moduleHasIdentityKeys(mod);
     this.undefMarksLive = this.undefSlots && moduleCanLackKey(mod as unknown as { functions: unknown });
     setFlatCrossing(this.nodesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
     // Phase 2 E0/E1: a module that reaches the island engine carries it
@@ -3605,8 +3665,15 @@ class Assembler {
         { storage: strRef, mutable: true },
         { storage: strRef, mutable: false },
         { storage: EQ_REF, mutable: true },
+        // Object keys: the identity-hash slot (ERR_IDH), 0 until the error
+        // is first used as a Map/Set key — in a module with identity keys.
+        ...(this.idKeys ? [{ storage: I32, mutable: true } as FieldType] : []),
       ];
       const errT = this.mb.openStructType("class:err", errFields);
+      // Object keys: every struct.new of errT itself zeroes ERR_IDH (code.ts
+      // zero tail); its subtypes (domex, fetchCause, user error classes)
+      // spell the zero after ERR_BOX.
+      if (this.idKeys) addZeroTailType(errT);
       const kindG = this.mb.addGlobal(I32, true, (w) => {
         w.u8(0x41);
         w.sleb(0);
@@ -4807,7 +4874,7 @@ class Assembler {
   private fetchCauseType: number | null = null;
 
   /** `class:fetchCause` (#227) — errT's five fields, then the host's
-   * `cause` (an error, field 5: FETCH_CAUSE): fetch's "fetch failed" TypeError and the
+   * `cause` (an error, field 5 (6 with ERR_IDH): FETCH_CAUSE): fetch's "fetch failed" TypeError and the
    * request-construction errors that carry one. */
   private fetchCauseT(): number {
     if (this.fetchCauseType !== null) return this.fetchCauseType;
@@ -4859,6 +4926,7 @@ class Assembler {
       checkpoint: (c) => this.emitCheckpoint(c),
       errT: () => this.exc().errT,
       causeT: () => this.fetchCauseT(),
+      errIdh: this.idKeys,
       vtGlobal: (className) => this.classes.vtGlobal(className),
       plainErrVtByName: (c, nameLocal) => this.emitPlainErrVtByName(c, nameLocal, "foreign"),
       errPre: (c, pushErr) => {
@@ -4884,7 +4952,7 @@ class Assembler {
    * PRESENCE of the options bag's own `cause` member: an explicit
    * `cause: undefined` counts) and `cause` (the value, the undefined
    * singleton when absent). Both immutable: Node's `cause` is fixed at
-   * construction. Field indices 5 and 6 (DOMEX_HAS_CAUSE, DOMEX_CAUSE). */
+   * construction. Field indices 5 and 6, one further with ERR_IDH (DOMEX_HAS_CAUSE, DOMEX_CAUSE). */
   private domexT(): number {
     if (this.domexType !== null) return this.domexType;
     const exc = this.exc();
@@ -5121,6 +5189,7 @@ class Assembler {
     c.localGet(MSG);
     c.refNull(this.strType);
     c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
+    if (this.idKeys) c.i32Const(0); // ERR_IDH (object keys)
     c.localGet(HC);
     c.localGet(CAUSE);
     c.structNew(domexT);
@@ -5172,7 +5241,7 @@ class Assembler {
     c.ifResult(I32);
     c.localGet(slot);
     c.refCast(domexT);
-    c.structGet(domexT, DOMEX_HAS_CAUSE);
+    c.structGet(domexT, DOMEX_HAS_CAUSE + this.errIdhN);
     c.else_();
     c.i32Const(0);
     c.end();
@@ -5187,7 +5256,7 @@ class Assembler {
     c.ifResult(this.dyn.dynRef());
     c.localGet(slot);
     c.refCast(domexT);
-    c.structGet(domexT, DOMEX_CAUSE);
+    c.structGet(domexT, DOMEX_CAUSE + this.errIdhN);
     c.else_();
     c.globalGet(this.dyn.undefinedGlobal());
     c.end();
@@ -6115,6 +6184,8 @@ class Assembler {
     // every function has been walked and so after the last place a typed
     // promise can be boxed into dyn — see finalizeDynProm.
     this.finalizeDynProm();
+    // Object keys: the view-token hash dispatch, once every view sig is known.
+    this.finalizeKeyViewHash();
     // Unit B review: where the %error encoding can exist, JSON.stringify
     // skips an Error's non-enumerable name/message (json.ts
     // hideErrorMembers). Sampled after the dyn promise view, whose body
@@ -7122,10 +7193,12 @@ class Assembler {
         fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
       }
       if (recordOrderSlot(shape) !== null) fields.push({ storage: this.mapTypeSoft(arrayOf(IR_F64)), mutable: true }, { storage: F64, mutable: true });
+      if (this.recordIdhSlot(shape) !== null) fields.push({ storage: I32, mutable: true });
       built.push({ id, fields, overflow });
     }
     for (const { id, fields } of built) {
       this.mb.defineType(this.recordReserved.get(id)!, { kind: "struct", fields });
+      if (this.recordIdhSlot(this.recordShapes.get(id)!) !== null) addZeroTailType(this.recordReserved.get(id)!);
     }
     this.mb.endRecGroup();
     this.recGroupOpen = false;
@@ -7162,6 +7235,7 @@ class Assembler {
         fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])),
         overflow,
         order: recordOrderSlot(shape),
+        idh: this.recordIdhSlot(shape),
       });
       this.recordReserved.delete(id);
     }
@@ -7247,6 +7321,14 @@ class Assembler {
     return true;
   }
 
+  /** Object keys: the record's identity-hash slot index — past the fields,
+   * the overflow and the order pair — in a module with identity-keyed
+   * containers; frames (never values) carry none. */
+  private recordIdhSlot(shape: IrRecordShape): number | null {
+    if (!this.idKeys || shape.id.startsWith(FRAME_SHAPE_PREFIX)) return null;
+    return shape.fields.length + (shape.indexValue !== undefined ? 1 : 0) + (recordOrderSlot(shape) !== null ? 2 : 0);
+  }
+
   private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): RecordInfo | null {
     const cached = this.recordInfos.get(shapeId);
     if (cached !== undefined) {
@@ -7263,7 +7345,7 @@ class Assembler {
     if (reserved !== undefined) {
       const shape = this.recordShapes.get(shapeId);
       if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
-      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow: null, order: recordOrderSlot(shape) };
+      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow: null, order: recordOrderSlot(shape), idh: this.recordIdhSlot(shape) };
     }
     const shape = this.recordShapes.get(shapeId);
     if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
@@ -7287,6 +7369,7 @@ class Assembler {
       fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
     }
     if (recordOrderSlot(shape) !== null) fields.push({ storage: this.mapTypeSoft(arrayOf(IR_F64)), mutable: true }, { storage: F64, mutable: true });
+    if (this.recordIdhSlot(shape) !== null) fields.push({ storage: I32, mutable: true });
     this.recordInFlight.delete(shapeId);
     // A self-recursive shape poisoned its own cache entry while its
     // fields mapped — keep the refusal, never the placeholder struct.
@@ -7315,8 +7398,9 @@ class Assembler {
     // — so `overflow` is always null on this branch in practice.)
     const struct = shapeId.startsWith(FRAME_SHAPE_PREFIX)
       ? this.mb.subStructType(`frame:${shapeId}`, fields, this.frameBaseType())
-      : this.mb.structType(fields);
-    const made: RecordInfo = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow, order: recordOrderSlot(shape) };
+      : this.recordIdhSlot(shape) !== null ? this.mb.idSlotStructType(fields) : this.mb.structType(fields);
+    const made: RecordInfo = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow, order: recordOrderSlot(shape), idh: this.recordIdhSlot(shape) };
+    if (made.idh !== null) addZeroTailType(struct);
     this.recordInfos.set(shapeId, made);
     return made;
   }
@@ -10748,6 +10832,7 @@ class Assembler {
 
   private get dyn(): DynBuilder {
     this.dynField ??= new DynBuilder(this.mb, {
+      idSlot: this.idKeys,
       // INC-29 U1: a net module boxes its Sockets and Servers as HANDLEs.
       ...(this.netModule
         ? {
@@ -10856,7 +10941,7 @@ class Assembler {
                 this.pushStrLitInto(c, "cause");
                 c.localGet(errLocal);
                 c.refCast(causeT);
-                c.structGet(causeT, FETCH_CAUSE);
+                c.structGet(causeT, FETCH_CAUSE + this.errIdhN);
                 c.call(this.dynField!.fromError());
                 c.call(this.dynField!.objPut());
                 c.end();
@@ -19811,6 +19896,7 @@ class Assembler {
       new Map(this.mod.functions.map((f) => [f.name, f])) as unknown as Map<string, IrFunction>,
       {
         softType: (t) => this.mapTypeSoft(t),
+        idSlot: this.idKeys,
         refuse: (kind, loc) => this.refuse(kind, loc),
         slotFnType: (slot) => this.vtSlotPair(slot).fn,
         slotEntry: (slot, impl) => this.vtSlotEntry(slot, impl),
@@ -20161,6 +20247,7 @@ class Assembler {
    * through a class value would differ from one built with `new`. */
   private emitAlloc(c: Code, className: string, info: ClassInfo): void {
     if (info.meta.hierarchy) c.globalGet(this.classes.vtGlobal(className));
+    if (info.idh !== undefined) c.i32Const(0); // the identity-hash slot (object keys)
     if (this.classes.emitterRooted(className)) {
       // The ScrEmitter prefix past `vt` (nodes.ts:945-957): the registry
       // starts absent (lazily allocated on first .on()/setMaxListeners()
@@ -20179,10 +20266,16 @@ class Assembler {
     // after %Error's IR fields (classes.ts plan), null until it crosses.
     const errRooted = this.classes.errorRooted(className);
     info.meta.def.fields.forEach((f, i) => {
-      if (errRooted && i === ERR_IR_FIELDS) c.refNull(EQ_HEAP);
+      if (errRooted && i === ERR_IR_FIELDS) {
+        c.refNull(EQ_HEAP);
+        if (this.idKeys) c.i32Const(0); // ERR_IDH (object keys)
+      }
       this.emitFieldSeed(c, f.type);
     });
-    if (errRooted && info.meta.def.fields.length === ERR_IR_FIELDS) c.refNull(EQ_HEAP);
+    if (errRooted && info.meta.def.fields.length === ERR_IR_FIELDS) {
+      c.refNull(EQ_HEAP);
+      if (this.idKeys) c.i32Const(0); // ERR_IDH (object keys)
+    }
     c.structNew(info.struct);
   }
 
@@ -33591,6 +33684,7 @@ class Assembler {
         // the static value itself as the token, the accessor closures
         // (FUNC boxes) the frontend built per static type.
         const sig = this.viewSigId(e.typeKey);
+        if (!this.viewSigTypes.has(sig)) this.viewSigTypes.set(sig, e.value.type);
         this.dyn.boxView(
           code,
           e.record,
@@ -33796,6 +33890,7 @@ class Assembler {
   private get vecs(): VecBuilder {
     this.vecsField ??= new VecBuilder(this.mb, {
       undefSlots: this.undefSlots,
+      idSlot: this.idKeys,
       holesFlag: () => this.holesMadeGlobal(),
       unionUndefGlobal: () => this.unions.unitGlobal(UNDEF_UNION_TAG),
       strEq: () => this.strEqHelper(),
@@ -33833,7 +33928,7 @@ class Assembler {
       // exposing the struct/field indices themselves, so maps.ts never
       // needs to know symbols.ts's own type-section layout.
       readSymId: (c) => c.structGet(this.syms.structType(), this.syms.idField()),
-    });
+    }, this.idKeys);
     return this.mapsField;
   }
 
@@ -35154,7 +35249,11 @@ class Assembler {
    *     it outright (before any IR reaches this backend at all) —
    *     `mapNew:ref-key` can still fire on this path in principle, it
    *     just has no known live program to name today. */
-  private mapKeyRepFor(t: IrType): { kind: MapKeyKind; val: ValType } | null {
+  private mapKeyRepFor(
+    t: IrType,
+    loc: SrcLoc | undefined,
+    soft: boolean,
+  ): { kind: MapKeyKind; val: ValType; fns?: () => MapKeyFns } | null {
     if (t.kind === "f64") return { kind: "f64", val: F64 };
     if (t.kind === "string") {
       return { kind: "str", val: { kind: "ref", nullable: true, typeIndex: this.strType } };
@@ -35162,7 +35261,523 @@ class Assembler {
     if (t.kind === "symbol") return { kind: "sym", val: this.syms.symRef() };
     // INC-29 U2: a net.Server by reference identity (Set<http.Server>).
     if (t.kind === "netServer") return { kind: "ref", val: this.net.srvRef() };
-    return null;
+    // Object keys (docs/design/object-keys.md): every other key kind is
+    // "custom" — equality and hash are helpers below.
+    if (t.kind === "bool") {
+      return { kind: "custom", val: I32, fns: () => ({ hash: this.keyBoolHashFn(), eq: this.keyI32EqFn() }) };
+    }
+    if (t.kind === "dyn" || t.kind === "jsval") {
+      return {
+        kind: "custom",
+        val: this.dyn.dynRef(),
+        fns: () => ({ hash: this.keyDynHashFn(), eq: this.dyn.svZero(), norm: this.keyDynNormFn() }),
+      };
+    }
+    const val = soft ? this.mapTypeSoft(t) : this.mapType(t, loc);
+    if (val === null || val.kind !== "ref") return null;
+    if (t.kind === "union") {
+      const unionId = t.unionId;
+      return {
+        kind: "custom",
+        val,
+        fns: () => {
+          const eq = this.keyUnionEqFn(unionId, loc);
+          const hash = this.keyUnionHashFn(unionId, loc);
+          const norm = this.keyUnionNormFn(unionId, loc);
+          if (eq === null || hash === null) throw new Error(`wasm emitter bug: union key helpers for ${unionId}`);
+          return norm === null ? { hash, eq } : { hash, eq, norm };
+        },
+      };
+    }
+    return {
+      kind: "custom",
+      val,
+      fns: () => ({ hash: this.keyIdHashFn(t, val), eq: t.kind === "func" ? this.keyFuncEqFn(val) : this.keyRefEqFn(val) }),
+    };
+  }
+
+  /* ── object keys: identity hash, key equality (docs/design/object-keys.md) ──
+   *
+   * An object's identity hash is a lazily assigned i32 slot (idh) in its
+   * own struct — records, vectors, user-rooted class instances, errT,
+   * dynamic objects, maps — 0 until the object is first hashed as a key,
+   * then the next value of one module-wide counter: O(1) and stable for
+   * the object's life. Kinds without a slot (closures, regexes, handles,
+   * typed arrays, promises, class objects) hash to one constant: correct,
+   * linear for those keys only. Equality never consults the hash, so a
+   * collision (a copy that copied the slot, say) is only a collision. */
+
+  private readonly keyFns = new Map<string, number>();
+  private idhCounterG: number | null = null;
+
+  private keyFn(name: string, params: ValType[], locals: ValType[], body: (c: Code) => void): number {
+    const hit = this.keyFns.get(name);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType(params, [I32]), `%w.key.${name}`);
+    this.keyFns.set(name, idx);
+    const c = new Code();
+    body(c);
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  private idhCounter(): number {
+    this.idhCounterG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.idhCounterG;
+  }
+
+  /** Where `t`'s identity-hash slot lives, or null (a constant-hash kind). */
+  private idhSlotOf(t: IrType): { struct: number; field: number } | null {
+    switch (t.kind) {
+      case "record": {
+        const info = this.recordInfo(t.shapeId, undefined, true);
+        return info !== null && info.idh !== null ? { struct: info.struct, field: info.idh } : null;
+      }
+      case "array": {
+        if (!this.idKeys) return null;
+        const info = this.vecInfoFor(t, undefined);
+        return info === null ? null : { struct: info.struct, field: VEC_IDH };
+      }
+      case "object": {
+        if (RUNTIME_ERROR_CLASSES.has(t.className) || this.classes.errorRooted(t.className)) {
+          if (!this.idKeys) return null;
+          return { struct: this.exc().errT, field: ERR_IDH };
+        }
+        const info = this.classes.info(t.className, undefined, true);
+        return info !== null && info.idh !== undefined ? { struct: info.struct, field: info.idh } : null;
+      }
+      case "map":
+      case "set": {
+        if (!this.maps.idSlot) return null;
+        const info = this.mapInfoFor(t, undefined, true);
+        return info === null ? null : { struct: info.struct, field: MAP_IDH };
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** Pushes the identity hash of the ref in local `L` (typed as `slot`'s
+   * struct or a subtype), assigning it on first use. `H` is i32 scratch.
+   * The counter wraps after 2^32 assignments (i32.add): ids then repeat
+   * (never 0, which means "unassigned": the wrap skips it, so an object's
+   * hash never changes once read).
+   * Repeats are only hash collisions — equality never reads the slot — so a
+   * wrap costs probe length, never correctness. */
+  private emitIdhRead(c: Code, slot: { struct: number; field: number }, L: number, H: number): void {
+    c.localGet(L);
+    c.structGet(slot.struct, slot.field);
+    c.localTee(H);
+    c.i32Eqz();
+    c.ifVoid();
+    c.globalGet(this.idhCounter());
+    c.i32Const(1);
+    c.i32Add();
+    c.localTee(H);
+    // 0 means "unassigned": a wrapped counter skips it.
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(H);
+    c.end();
+    c.localGet(H);
+    c.globalSet(this.idhCounter());
+    c.localGet(L);
+    c.localGet(H);
+    c.structSet(slot.struct, slot.field);
+    c.end();
+    c.localGet(H);
+  }
+
+  /** `%w.key.idh:<type>(ref) -> i32` — an object key's identity hash. */
+  private keyIdHashFn(t: IrType, val: ValType): number {
+    const slot = this.idhSlotOf(t);
+    return this.keyFn(`idh:${slot === null ? "const" : typeKey(t)}`, [slot === null ? EQ_REF : val], [I32], (c) => {
+      if (slot === null) {
+        c.i32Const(0x2545f491);
+        return;
+      }
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      this.emitIdhRead(c, slot, 0, 1);
+    });
+  }
+
+  private keyRefEqFn(val: ValType): number {
+    return this.keyFn(`refEq:${valKey(val)}`, [val, val], [], (c) => {
+      c.localGet(0);
+      c.localGet(1);
+      c.refEq();
+    });
+  }
+
+  /** A function key compares as `===` does: through the board-#89
+   * identity unwrap (an adapted closure is its original). */
+  private keyFuncEqFn(val: ValType): number {
+    return this.keyFn(`fnEq:${valKey(val)}`, [val, val], [], (c) => {
+      c.localGet(0);
+      c.call(this.universalUnwrapFn());
+      c.localGet(1);
+      c.call(this.universalUnwrapFn());
+      c.refEq();
+    });
+  }
+
+  private keyI32EqFn(): number {
+    return this.keyFn("i32Eq", [I32, I32], [], (c) => {
+      c.localGet(0);
+      c.localGet(1);
+      c.i32Eq();
+    });
+  }
+
+  private keyBoolHashFn(): number {
+    return this.keyFn("boolHash", [I32], [], (c) => c.localGet(0));
+  }
+
+  /** `%w.key.f64Hash(n)` — consistent with SameValueZero: every NaN one
+   * hash, -0 with +0. */
+  private keyF64HashFn(): number {
+    return this.keyFn("f64Hash", [F64], [], (c) => {
+      c.localGet(0);
+      c.localGet(0);
+      c.f64Ne();
+      c.ifVoid();
+      c.i32Const(0x7ff80000);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.f64Const(0);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.i64ReinterpretF64();
+      c.i64Const(-7046029254386353131n);
+      c.i64Mul();
+      c.i64Const(32n);
+      c.i64ShrU();
+      c.i32WrapI64();
+    });
+  }
+
+  /** `%w.key.strHash(s)` — a polynomial hash over the code units (any
+   * string value: flattened first). */
+  private keyStrHashFn(): number {
+    const S = 1;
+    const L = 2;
+    const I = 3;
+    const ACC = 4;
+    return this.keyFn("strHash", [EQ_REF], [{ kind: "ref", nullable: true, typeIndex: this.strType }, I32, I32, I32], (c) => {
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      this.emitFlat(c);
+      c.localTee(S);
+      c.arrayLen();
+      c.localSet(L);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(ACC);
+      c.i32Const(31);
+      c.i32Mul();
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType);
+      c.i32Add();
+      c.localSet(ACC);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(ACC);
+    });
+  }
+
+  /** The static types whose views can reach a dynamic key, by view sig
+   * (recorded at each jsView): a view hashes through its token's slot. */
+  private readonly viewSigTypes = new Map<number, IrType>();
+  private viewTokHashIdx: number | null = null;
+
+  /** `%w.key.viewTokHash(sig, token)` — declared on first use, its body
+   * built once every function is walked (finalizeKeyViewHash). */
+  private keyViewTokHashFn(): number {
+    this.viewTokHashIdx ??= this.mb.declareFunc(this.mb.funcType([I32, EQ_REF], [I32]), "%w.key.viewTokHash");
+    return this.viewTokHashIdx;
+  }
+
+  private finalizeKeyViewHash(): void {
+    if (this.viewTokHashIdx === null) return;
+    const c = new Code();
+    for (const [sig, t] of this.viewSigTypes) {
+      const slot = this.idhSlotOf(t);
+      const val = this.mapTypeSoft(t);
+      if (slot === null || val.kind !== "ref") continue;
+      c.localGet(0);
+      c.i32Const(sig);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(1);
+      c.refCast(slot.struct);
+      c.call(this.keyIdHashFn(t, val));
+      c.return_();
+      c.end();
+    }
+    c.i32Const(0x2545f491);
+    this.mb.setBody(this.viewTokHashIdx, [], c.bytes());
+  }
+
+  /** `%w.key.dynHash(d)` — a dynamic key's hash, consistent with svZero:
+   * primitives by value, a view by its token's identity hash, a plain
+   * object or array by its payload's, everything else one constant. */
+  private keyDynHashFn(): number {
+    const dynT = this.dyn.dynT();
+    const K = 1;
+    const H = 2;
+    const O = 3;
+    const A = 4;
+    const objRef = this.dyn.objRef();
+    const arrRef = this.dyn.arrRef();
+    return this.keyFn("dynHash", [this.dyn.dynRef()], [I32, I32, objRef, arrRef], (c) => {
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(DK.UNDEF);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(K);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.BOOL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_NUM);
+      c.call(this.keyF64HashFn());
+      c.return_();
+      c.end();
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.strType);
+      c.call(this.keyStrHashFn());
+      c.return_();
+      c.end();
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      // A view: its token's identity (strictEq compares tokens).
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      c.refTest(this.dyn.viewT());
+      c.ifVoid();
+      this.dyn.viewField(c, (x) => x.localGet(0), VIEW_SIG);
+      this.dyn.viewField(c, (x) => x.localGet(0), VIEW_TOKEN);
+      c.call(this.keyViewTokHashFn());
+      c.return_();
+      c.end();
+      if (this.idKeys) {
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refTest(this.dyn.objT());
+        c.ifVoid();
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.dyn.objT());
+        c.localSet(O);
+        this.emitIdhRead(c, { struct: this.dyn.objT(), field: OBJ_IDH }, O, H);
+        c.return_();
+        c.end();
+        if (arrRef.kind === "ref") {
+          c.localGet(0);
+          c.structGet(dynT, DYN_REF);
+          c.refTest(arrRef.typeIndex);
+          c.ifVoid();
+          c.localGet(0);
+          c.structGet(dynT, DYN_REF);
+          c.refCast(arrRef.typeIndex);
+          c.localSet(A);
+          this.emitIdhRead(c, { struct: arrRef.typeIndex, field: VEC_IDH }, A, H);
+          c.return_();
+          c.end();
+        }
+      }
+      c.end();
+      c.localGet(K);
+    });
+  }
+
+  /** `%w.key.dynNorm(d)` — a dynamic -0 key is stored as +0. */
+  private keyDynNormFn(): number {
+    const name = "dynNorm";
+    const hit = this.keyFns.get(name);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), `%w.key.${name}`);
+    this.keyFns.set(name, idx);
+    const c = new Code();
+    const dynT = this.dyn.dynT();
+    c.localGet(0);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(0);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(0);
+    c.structGet(dynT, DYN_NUM);
+    c.f64Const(0);
+    c.f64Eq();
+    c.ifVoid();
+    this.dyn.boxNum(c, (x) => x.f64Const(0));
+    c.return_();
+    c.end();
+    c.end();
+    c.localGet(0);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%w.key.ueq:<id>` — SameValueZero over a union: strict equality OR
+   * SameValue (the one pair strict equality misses is NaN, NaN). */
+  private keyUnionEqFn(unionId: string, loc: SrcLoc | undefined): number | null {
+    const eq = this.unionEqHelper(unionId, false, loc);
+    const sv = this.unionEqHelper(unionId, true, loc);
+    if (eq === null || sv === null) return null;
+    const base = this.unions.baseRef();
+    return this.keyFn(`ueq:${unionId}`, [base, base], [], (c) => {
+      c.localGet(0);
+      c.localGet(1);
+      c.call(eq);
+      c.localGet(0);
+      c.localGet(1);
+      c.call(sv);
+      c.i32Or();
+    });
+  }
+
+  /** `%w.key.uhash:<id>` — per arm: primitives by value, object arms by
+   * their identity hash, unit arms by tag. */
+  private keyUnionHashFn(unionId: string, loc: SrcLoc | undefined): number | null {
+    const def = this.unionDef(unionId);
+    const arms: { tag: number; arm: IrType; st: number; val: ValType }[] = [];
+    for (let i = 0; i < def.arms.length; i++) {
+      const arm = def.arms[i]!;
+      if (isUnitType(arm)) continue;
+      const st = this.unionArmStruct(unionId, i, loc);
+      const val = this.mapType(arm, loc);
+      if (st === null || val === null) return null;
+      arms.push({ tag: i, arm, st, val });
+    }
+    const base = this.unions.baseRef();
+    return this.keyFn(`uhash:${unionId}`, [base], [I32], (c) => {
+      const TAG = 1;
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(UNDEF_UNION_TAG);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(this.unions.base(), 0);
+      c.localSet(TAG);
+      for (const { tag, arm, st, val } of arms) {
+        c.localGet(TAG);
+        c.i32Const(tag);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.refCast(st);
+        c.structGet(st, 1);
+        if (arm.kind === "f64") c.call(this.keyF64HashFn());
+        else if (arm.kind === "string") c.call(this.keyStrHashFn());
+        else if (arm.kind === "bool") {
+          // the payload is the i32 itself
+        } else c.call(this.keyIdHashFn(arm, val));
+        c.return_();
+        c.end();
+      }
+      c.localGet(TAG);
+    });
+  }
+
+  /** `%w.key.unorm:<id>` — a union's -0 number arm is stored as +0; null
+   * when the union has no number arm. */
+  private keyUnionNormFn(unionId: string, loc: SrcLoc | undefined): number | null {
+    const def = this.unionDef(unionId);
+    const tag = def.arms.findIndex((a) => a.kind === "f64");
+    if (tag < 0) return null;
+    const st = this.unionArmStruct(unionId, tag, loc);
+    if (st === null) return null;
+    const name = `unorm:${unionId}`;
+    const hit = this.keyFns.get(name);
+    if (hit !== undefined) return hit;
+    const base = this.unions.baseRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([base], [base]), `%w.key.${name}`);
+    this.keyFns.set(name, idx);
+    const c = new Code();
+    c.localGet(0);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(0);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    c.structGet(this.unions.base(), 0);
+    c.i32Const(tag);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(0);
+    c.refCast(st);
+    c.structGet(st, 1);
+    c.f64Const(0);
+    c.f64Eq();
+    c.ifVoid();
+    c.i32Const(tag);
+    c.f64Const(0);
+    c.structNew(st);
+    c.return_();
+    c.end();
+    c.end();
+    c.localGet(0);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   /** The VALUE representation for a map value / set element type (a Set
@@ -35207,7 +35822,7 @@ class Assembler {
     }
     const keyType = t.kind === "map" ? t.key : t.elem;
     const valueType: IrType = t.kind === "map" ? t.value : { kind: "f64" };
-    const kr = this.mapKeyRepFor(keyType);
+    const kr = this.mapKeyRepFor(keyType, loc, soft);
     if (kr === null) {
       if (!soft) this.refuse(t.kind === "map" ? "mapNew:ref-key" : "setNew:ref-elem", loc);
       return null;
@@ -35218,8 +35833,12 @@ class Assembler {
     // the placeholder fired (mapValRepFor's own doc), so this call site
     // (mapTypeSoft's own map/set arm) falls back to I32 without a refuse.
     if (vr === null) return null;
-    const key = `map(${this.vecKeyFor(keyType)},${this.vecKeyFor(valueType)})`;
-    return this.maps.info(key, kr.kind, kr.val, vr.kind, vr.val, vr.storage);
+    // A custom key kind's helpers (hash, equality, -0 normalization) depend
+    // on the key TYPE, not just its representation: vecKeyFor answers one
+    // "union" for every union, so a custom key interns by its typeKey.
+    const keyName = kr.kind === "custom" ? `key:${typeKey(keyType)}` : this.vecKeyFor(keyType);
+    const key = `map(${keyName},${this.vecKeyFor(valueType)})`;
+    return this.maps.info(key, kr.kind, kr.val, vr.kind, vr.val, vr.storage, kr.fns);
   }
 
   /** INC-26 P3 (design-host-v7.txt §2.7, scr_kill_pid_check ported): Node
@@ -36268,6 +36887,10 @@ class Assembler {
         code.call(this.maps.deleteM(info));
         return;
       case "set":
+        if (rt.weak === true && (rt.key.kind === "dyn" || rt.key.kind === "jsval")) {
+          this.emitWeakSet(info, e.receiver, e.args[0]!, e.args[1]!, "Invalid value used as weak map key");
+          return;
+        }
         this.walkExpr(e.receiver);
         this.walkExpr(e.args[0]!);
         this.walkExpr(e.args[1]!);
@@ -36430,6 +37053,65 @@ class Assembler {
    * keys agree — the "ONE representation" thesis, maps.ts's header).
    * `add` is `set` with the value pinned to the constant f64 0; `toArray`
    * has no Map counterpart (Map has no bulk-drain method). */
+  /** WeakMap.set / WeakSet.add over a dynamic key (docs/design/
+   * object-keys.md): a key that is not an object throws Node's TypeError
+   * (after every operand evaluated, Node's order); get/has/delete simply
+   * miss. `value` null: a WeakSet (the set's constant value). */
+  private emitWeakSet(info: MapInfo, recv: IrExpr, key: IrExpr, value: IrExpr | null, message: string): void {
+    const code = this.fn.code;
+    const mr = this.maps.mapRef(info);
+    const R = this.acquireScratch(mr);
+    const K = this.acquireScratch(info.keyVal);
+    const V = value === null ? -1 : this.acquireScratch(info.valVal);
+    this.walkExpr(recv);
+    code.localSet(R);
+    this.walkExpr(key);
+    code.localSet(K);
+    if (value !== null) {
+      this.walkExpr(value);
+      code.localSet(V);
+    }
+    code.localGet(K);
+    code.call(this.keyWeakOkFn());
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellError(code, "%TypeError", "TypeError", (c) => this.pushStrLitInto(c, message), null);
+    this.emitUnwind();
+    this.close();
+    code.localGet(R);
+    code.localGet(K);
+    if (value !== null) code.localGet(V);
+    else code.f64Const(0);
+    code.call(this.maps.set(info));
+    if (value !== null) this.releaseScratch(info.valVal, V);
+    this.releaseScratch(info.keyVal, K);
+    this.releaseScratch(mr, R);
+  }
+
+  /** `%w.key.weakOk(d)` — can this dynamic value be a weak key (an object
+   * or function; never a primitive, null or undefined)? */
+  private keyWeakOkFn(): number {
+    return this.keyFn("weakOk", [this.dyn.dynRef()], [I32], (c) => {
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(this.dyn.dynT(), DYN_KIND);
+      c.localTee(1);
+      c.i32Const(DK.NULL);
+      c.i32Ne();
+      for (const k of [DK.BOOL, DK.NUM, DK.STR, DK.UNDEF]) {
+        c.localGet(1);
+        c.i32Const(k);
+        c.i32Ne();
+        c.i32And();
+      }
+    });
+  }
+
   private emitSetIntrinsic(e: Extract<IrExpr, { kind: "setIntrinsic" }>): void {
     const code = this.fn.code;
     const rt = e.receiver.type;
@@ -36459,6 +37141,10 @@ class Assembler {
         code.call(this.maps.deleteM(info));
         return;
       case "add":
+        if (rt.weak === true && (rt.elem.kind === "dyn" || rt.elem.kind === "jsval")) {
+          this.emitWeakSet(info, e.receiver, e.args[0]!, null, "Invalid value used in weak set");
+          return;
+        }
         this.walkExpr(e.receiver);
         this.walkExpr(e.args[0]!);
         code.f64Const(0);

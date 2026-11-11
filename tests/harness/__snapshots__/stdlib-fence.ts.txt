@@ -120,15 +120,6 @@ stdlib-fence.ts:26:13 - error SC2020: 'new ArrayBuffer' is part of the standard 
 
   hint: no free-standing ArrayBuffer value exists — typed arrays own their storage: allocate the view directly (new Uint8Array(n)), or erase a fresh buffer into one (new Uint8Array(new ArrayBuffer(n)), new DataView(new ArrayBuffer(n), ...))
 
-stdlib-fence.ts:27:7 - error SC2009: values of type 'Set<[number, number]>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — '[number, number]' is outside that domain
-
-  26 | const buf = new ArrayBuffer(8);
-  27 | const st = new Set(new Map([[1, 2]])); // array/Set/iterable seeds lower (Step 2B); a Map's entries are no legal elements
-     |       ^~
-  28 | // (new Error / TypeError / RangeError / SyntaxError now LOWER — the error
-
-  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
 stdlib-fence.ts:27:12 - error SC2020: 'new Set(values)' is part of the standard library types but has no scriptc lowering yet
 
   26 | const buf = new ArrayBuffer(8);

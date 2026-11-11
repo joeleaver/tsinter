@@ -10628,3 +10628,24 @@ where Node never executes the read.
 top-10 past-gate census) and the same idiom across TypeScript code.
 **Tested by:** `packages/compiler/test/wasm-top10-rea-never-arm.test.ts`
 (wasm and wasm-native, against Node).
+
+## S131 — A WeakMap or WeakSet holds its keys strongly: an entry lives as long as the table, where Node lets a collected key's entry go *(wasm and wasm-native)*
+
+A typed `WeakMap<K, V>` / `WeakSet<T>` is the same insertion-ordered hash
+table as a `Map`/`Set` (docs/design/object-keys.md), so an entry whose key
+nothing else references stays in the table until the program deletes it or
+drops the table, where V8 frees it once the key is collected. Everything a
+program can ask the table answers as Node's: `get`/`set`/`has`/`delete`
+compare keys by identity, a non-object key given to `set`/`add` throws
+Node's TypeError (`Invalid value used as weak map key` / `Invalid value used
+in weak set`) while `get`/`has`/`delete` answer `undefined`/`false`, and
+printing shows `WeakMap { <items unknown> }`. Weak tables have no size and
+no iteration, and `WeakRef`/`FinalizationRegistry` (the only ways to watch a
+collection) refuse by name, so the difference shows only in memory use
+(`process.memoryUsage()`, an out-of-memory failure under a workload that
+keys a table by many short-lived objects). **Rationale:** a weak table needs
+ephemeron support from the collector, which neither the WasmGC host nor the
+wasm-native collector exposes; the idiom it serves (a per-object memo or
+mark) is correct with a strong table. **Tested by:**
+`packages/compiler/test/wasm-objkey-collections.test.ts` (OK-07, rows equal
+to Node on wasm and wasm-native). Measured against Node v24.18.1.

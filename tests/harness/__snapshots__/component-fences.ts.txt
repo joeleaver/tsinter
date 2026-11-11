@@ -1,72 +1,72 @@
-component-fences.ts:5:7 - error SC2009: values of type 'Map<boolean, string>' cannot be compiled: the Map shape is supported, but keys are limited to numbers and strings — 'boolean' is outside that domain
+component-fences.ts:5:7 - error SC2009: values of type 'Map<Generator<number, any, any>, string>' cannot be compiled: the Map shape is supported, but 'Generator<number, any, any>' keys have no Map key representation
 
-  4 | // Map keys are limited to numbers and strings.
-  5 | const byFlag = new Map<boolean, string>();
+  4 | // Map keys may be anything but a generator (no SameValueZero story).
+  5 | const byFlag = new Map<Generator<number>, string>();
     |       ^~~~~~
   6 | console.log(byFlag);
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:5:16 - error SC1090: Map keys of type 'boolean' (Map keys must be string or number) is not supported yet
+component-fences.ts:5:16 - error SC1090: Map keys of type 'Generator<number, any, any>' (a Map key may be any value but void or a generator) is not supported yet
 
-  4 | // Map keys are limited to numbers and strings.
-  5 | const byFlag = new Map<boolean, string>();
-    |                ^~~~~~~~~~~~~~~~~~~~~~~~~~
+  4 | // Map keys may be anything but a generator (no SameValueZero story).
+  5 | const byFlag = new Map<Generator<number>, string>();
+    |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   6 | console.log(byFlag);
 
 component-fences.ts:6:13 - error SC2004: uses of 'byFlag' inherit the blocker on its declaration
 
-  5 | const byFlag = new Map<boolean, string>();
+  5 | const byFlag = new Map<Generator<number>, string>();
   6 | console.log(byFlag);
     |             ^~~~~~
   7 | 
 
   hint: the declaration of 'byFlag' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:9:7 - error SC2009: values of type 'Map<string, () => void>' cannot be compiled: the Map shape is supported, but '() => void' values have no Map slot yet (functions, promises, and nested Maps stay out)
+component-fences.ts:9:7 - error SC2009: values of type 'Map<string, unknown>' cannot be compiled: the Map shape is supported, but 'unknown' values have no Map slot yet
 
-   8 | // Map values have no slot for functions.
-   9 | const listeners = new Map<string, () => void>();
+   8 | // Map values have no slot for dynamic values.
+   9 | const listeners = new Map<string, unknown>();
      |       ^~~~~~~~~
   10 | console.log(listeners);
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:9:19 - error SC1090: Map values of type '() => void' (Map values must be number, string, boolean, records, class instances, arrays, promises, or unions of those — not functions, Maps, 'unknown', or 'any') is not supported yet
+component-fences.ts:9:19 - error SC1090: Map values of type 'unknown' (Map values must be number, string, boolean, records, class instances, arrays, promises, functions, Maps, Sets, or unions of those — not 'unknown' or 'any') is not supported yet
 
-   8 | // Map values have no slot for functions.
-   9 | const listeners = new Map<string, () => void>();
-     |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   8 | // Map values have no slot for dynamic values.
+   9 | const listeners = new Map<string, unknown>();
+     |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~
   10 | console.log(listeners);
 
 component-fences.ts:10:13 - error SC2004: uses of 'listeners' inherit the blocker on its declaration
 
-   9 | const listeners = new Map<string, () => void>();
+   9 | const listeners = new Map<string, unknown>();
   10 | console.log(listeners);
      |             ^~~~~~~~~
   11 | 
 
   hint: the declaration of 'listeners' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:13:7 - error SC2009: values of type 'Set<boolean>' cannot be compiled: the Set shape is supported, but elements are limited to numbers and strings — 'boolean' is outside that domain
+component-fences.ts:13:7 - error SC2009: values of type 'Set<Generator<number, any, any>>' cannot be compiled: the Set shape is supported, but 'Generator<number, any, any>' elements have no Set representation
 
-  12 | // Set elements are limited to numbers and strings.
-  13 | const flags = new Set<boolean>();
+  12 | // Set elements may be anything but a generator.
+  13 | const flags = new Set<Generator<number>>();
      |       ^~~~~
   14 | console.log(flags);
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:13:15 - error SC1090: Set elements of type 'boolean' (Set elements must be string or number — Map's key kinds — or a server handle, which stores under reference identity) is not supported yet
+component-fences.ts:13:15 - error SC1090: Set elements of type 'Generator<number, any, any>' (a Set element may be any value but void or a generator) is not supported yet
 
-  12 | // Set elements are limited to numbers and strings.
-  13 | const flags = new Set<boolean>();
-     |               ^~~~~~~~~~~~~~~~~~
+  12 | // Set elements may be anything but a generator.
+  13 | const flags = new Set<Generator<number>>();
+     |               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
   14 | console.log(flags);
 
 component-fences.ts:14:13 - error SC2004: uses of 'flags' inherit the blocker on its declaration
 
-  13 | const flags = new Set<boolean>();
+  13 | const flags = new Set<Generator<number>>();
   14 | console.log(flags);
      |             ^~~~~
   15 | 
@@ -91,135 +91,135 @@ component-fences.ts:18:13 - error SC2004: uses of 'rows' inherit the blocker on 
 
   hint: the declaration of 'rows' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:21:17 - error SC2009: values of type 'Map<string, number> | undefined' cannot be compiled: the union shape is supported, but 'Map<string, number>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
+component-fences.ts:22:17 - error SC2009: values of type 'string | Map<string, number>' cannot be compiled: the union shape is supported, but 'Map<string, number>' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)
 
-  20 | // A Map arm has no home in a compiled union.
-  21 | function report(maybe: Map<string, number> | undefined): number {
+  21 | // undefined/null it does).
+  22 | function report(maybe: Map<string, number> | string): number {
      |                 ^~~~~
-  22 |   return maybe === undefined ? 0 : maybe.size;
+  23 |   return typeof maybe === "string" ? 0 : maybe.size;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:24:13 - error SC2004: uses of 'report' inherit the blocker on its declaration
+component-fences.ts:25:13 - error SC2004: uses of 'report' inherit the blocker on its declaration
 
-  23 | }
-  24 | console.log(report(undefined));
+  24 | }
+  25 | console.log(report("none"));
      |             ^~~~~~
-  25 | 
+  26 | 
 
   hint: the declaration of 'report' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:27:7 - error SC2009: values of type '(...xs: number[]) => number' cannot be compiled: the function shape is supported, but its rest parameter 'xs' has no compiled calling convention yet (a compiled signature is fixed-arity)
-
-  26 | // A rest parameter has no compiled calling convention.
-  27 | const sum = (...xs: number[]): number => xs.length;
-     |       ^~~
-  28 | const storedSum = sum;
-
-  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
-component-fences.ts:27:13 - error SC1090: functions with rest parameters as values (call them directly) are not supported yet
-
-  26 | // A rest parameter has no compiled calling convention.
-  27 | const sum = (...xs: number[]): number => xs.length;
-     |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  28 | const storedSum = sum;
-
 component-fences.ts:28:7 - error SC2009: values of type '(...xs: number[]) => number' cannot be compiled: the function shape is supported, but its rest parameter 'xs' has no compiled calling convention yet (a compiled signature is fixed-arity)
 
-  27 | const sum = (...xs: number[]): number => xs.length;
-  28 | const storedSum = sum;
-     |       ^~~~~~~~~
-  29 | console.log(storedSum(1, 2));
+  27 | // A rest parameter has no compiled calling convention.
+  28 | const sum = (...xs: number[]): number => xs.length;
+     |       ^~~
+  29 | const storedSum = sum;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:28:19 - error SC2004: uses of 'sum' inherit the blocker on its declaration
+component-fences.ts:28:13 - error SC1090: functions with rest parameters as values (call them directly) are not supported yet
 
-  27 | const sum = (...xs: number[]): number => xs.length;
-  28 | const storedSum = sum;
+  27 | // A rest parameter has no compiled calling convention.
+  28 | const sum = (...xs: number[]): number => xs.length;
+     |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  29 | const storedSum = sum;
+
+component-fences.ts:29:7 - error SC2009: values of type '(...xs: number[]) => number' cannot be compiled: the function shape is supported, but its rest parameter 'xs' has no compiled calling convention yet (a compiled signature is fixed-arity)
+
+  28 | const sum = (...xs: number[]): number => xs.length;
+  29 | const storedSum = sum;
+     |       ^~~~~~~~~
+  30 | console.log(storedSum(1, 2));
+
+  hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
+
+component-fences.ts:29:19 - error SC2004: uses of 'sum' inherit the blocker on its declaration
+
+  28 | const sum = (...xs: number[]): number => xs.length;
+  29 | const storedSum = sum;
      |                   ^~~
-  29 | console.log(storedSum(1, 2));
+  30 | console.log(storedSum(1, 2));
 
   hint: the declaration of 'sum' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:29:13 - error SC2004: uses of 'storedSum' inherit the blocker on its declaration
+component-fences.ts:30:13 - error SC2004: uses of 'storedSum' inherit the blocker on its declaration
 
-  28 | const storedSum = sum;
-  29 | console.log(storedSum(1, 2));
+  29 | const storedSum = sum;
+  30 | console.log(storedSum(1, 2));
      |             ^~~~~~~~~
-  30 | 
+  31 | 
 
   hint: the declaration of 'storedSum' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:34:7 - error SC2009: values of type '() => WeakMap<object, number>' cannot be compiled: the function shape is supported, but its return type 'WeakMap<object, number>' does not compile
+component-fences.ts:35:7 - error SC2009: values of type '() => WeakMap<object, unknown>' cannot be compiled: the function shape is supported, but its return type 'WeakMap<object, unknown>' does not compile
 
-  33 | // Node's ReferenceError at the root instead).
-  34 | const makeWeak = (0 as unknown) as () => WeakMap<object, number>;
+  34 | // Node's ReferenceError at the root instead).
+  35 | const makeWeak = (0 as unknown) as () => WeakMap<object, unknown>;
      |       ^~~~~~~~
-  35 | const storedMake = makeWeak;
+  36 | const storedMake = makeWeak;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:35:7 - error SC2009: values of type '() => WeakMap<object, number>' cannot be compiled: the function shape is supported, but its return type 'WeakMap<object, number>' does not compile
+component-fences.ts:36:7 - error SC2009: values of type '() => WeakMap<object, unknown>' cannot be compiled: the function shape is supported, but its return type 'WeakMap<object, unknown>' does not compile
 
-  34 | const makeWeak = (0 as unknown) as () => WeakMap<object, number>;
-  35 | const storedMake = makeWeak;
+  35 | const makeWeak = (0 as unknown) as () => WeakMap<object, unknown>;
+  36 | const storedMake = makeWeak;
      |       ^~~~~~~~~~
-  36 | console.log(storedMake());
+  37 | console.log(storedMake());
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:35:20 - error SC2004: uses of 'makeWeak' inherit the blocker on its declaration
+component-fences.ts:36:20 - error SC2004: uses of 'makeWeak' inherit the blocker on its declaration
 
-  34 | const makeWeak = (0 as unknown) as () => WeakMap<object, number>;
-  35 | const storedMake = makeWeak;
+  35 | const makeWeak = (0 as unknown) as () => WeakMap<object, unknown>;
+  36 | const storedMake = makeWeak;
      |                    ^~~~~~~~
-  36 | console.log(storedMake());
+  37 | console.log(storedMake());
 
   hint: the declaration of 'makeWeak' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:36:13 - error SC2004: uses of 'storedMake' inherit the blocker on its declaration
+component-fences.ts:37:13 - error SC2004: uses of 'storedMake' inherit the blocker on its declaration
 
-  35 | const storedMake = makeWeak;
-  36 | console.log(storedMake());
+  36 | const storedMake = makeWeak;
+  37 | console.log(storedMake());
      |             ^~~~~~~~~~
-  37 | 
+  38 | 
 
   hint: the declaration of 'storedMake' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:43:7 - error SC2009: values of type 'Holder' cannot be compiled: the record shape is supported, but its member 'cache' has type 'WeakMap<object, number>', which does not compile
+component-fences.ts:44:7 - error SC2009: values of type 'Holder' cannot be compiled: the record shape is supported, but its member 'cache' has type 'WeakMap<object, unknown>', which does not compile
 
-  42 | }
-  43 | const held = (0 as unknown) as Holder;
+  43 | }
+  44 | const held = (0 as unknown) as Holder;
      |       ^~~~
-  44 | const kept = held;
+  45 | const kept = held;
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:44:7 - error SC2009: values of type 'Holder' cannot be compiled: the record shape is supported, but its member 'cache' has type 'WeakMap<object, number>', which does not compile
+component-fences.ts:45:7 - error SC2009: values of type 'Holder' cannot be compiled: the record shape is supported, but its member 'cache' has type 'WeakMap<object, unknown>', which does not compile
 
-  43 | const held = (0 as unknown) as Holder;
-  44 | const kept = held;
+  44 | const held = (0 as unknown) as Holder;
+  45 | const kept = held;
      |       ^~~~
-  45 | console.log(kept.label);
+  46 | console.log(kept.label);
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
 
-component-fences.ts:44:14 - error SC2004: uses of 'held' inherit the blocker on its declaration
+component-fences.ts:45:14 - error SC2004: uses of 'held' inherit the blocker on its declaration
 
-  43 | const held = (0 as unknown) as Holder;
-  44 | const kept = held;
+  44 | const held = (0 as unknown) as Holder;
+  45 | const kept = held;
      |              ^~~~
-  45 | console.log(kept.label);
+  46 | console.log(kept.label);
 
   hint: the declaration of 'held' did not compile — fix the diagnostic reported there and these sites clear with it
 
-component-fences.ts:45:13 - error SC2004: uses of 'kept' inherit the blocker on its declaration
+component-fences.ts:46:13 - error SC2004: uses of 'kept' inherit the blocker on its declaration
 
-  44 | const kept = held;
-  45 | console.log(kept.label);
+  45 | const kept = held;
+  46 | console.log(kept.label);
      |             ^~~~~~~~~~
-  46 | 
+  47 | 
 
   hint: the declaration of 'kept' did not compile — fix the diagnostic reported there and these sites clear with it

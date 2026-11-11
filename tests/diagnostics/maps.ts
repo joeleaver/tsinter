@@ -3,24 +3,25 @@
 // entries(), spread, set-chaining — live in maps-surface.ts: the ambient
 // declaration makes those type errors before lowering).
 
-// Keys must be string or number (SameValueZero hashing is honest for
-// exactly those) — the new-site diagnostic names the key type.
-const byFlag = new Map<boolean, string>();
+// Keys may be any value but a generator (docs/design/object-keys.md)
+// — the new-site diagnostic names the key type.
+const byFlag = new Map<Generator<number>, string>();
 
-// Values exclude functions (no closure story in the uniform value slot yet).
-const handlers = new Map<string, () => void>();
+// Values exclude dynamic values.
+const handlers = new Map<string, unknown>();
 
-// ... and nested Maps (no maps of maps this round).
-const nested = new Map<string, Map<string, number>>();
+// ... and generators.
+const nested = new Map<string, Generator<number>>();
 
 // Map-typed slots elsewhere report the ordinary unsupported-type diagnostic.
-function useBad(m: Map<boolean, number>): number {
+function useBad(m: Map<string, unknown>): number {
   return m.size;
 }
 
-// Maps as union arms have no narrowing test — rejected like function arms.
-function maybeMap(cond: boolean): Map<string, number> | undefined {
-  return undefined;
+// Maps as union arms beside a data arm have no narrowing test (beside
+// undefined/null they map: the tag is the test).
+function maybeMap(cond: boolean): Map<string, number> | string {
+  return "none";
 }
 
 // Maps as array elements: ScrArr has no map element kind.
@@ -36,5 +37,5 @@ const getter = m.get;
 
 // Reached: collection defers its diagnostics until a reference makes
 // them relevant; these references are what makes them count.
-useBad(new Map<boolean, number>());
+useBad(new Map<string, unknown>());
 maybeMap(true);
