@@ -109,6 +109,7 @@ import { lowerAssertModuleCall, lowerAssertDirectCall } from "./lower-assert.js"
 import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
+import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { orderNoteCopy } from "./record-order.js";
 import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
@@ -1674,6 +1675,13 @@ export class Lowerer {
    * the fallthroughs report the inherited-blocker cascade (SC2004)
    * instead of misattributing the reference. */
   readonly blockedBindings = new Set<ts.Symbol>();
+  /** R2 (SEMANTICS.md S129, stub-builtins.ts): the stub-binding index
+   * (built on first use), the keys of the diagnostics that are stub
+   * touches (or their SC2004 cascades), and the bindings whose
+   * declaration became a stub fence. */
+  stubIndex: StubIndex | null = null;
+  readonly stubFenceKeys = new Set<string>();
+  readonly stubBlocked = new Set<ts.Symbol>();
   /** True while collectProgram runs: resolution helpers must not flush
    * deferred diagnostics (collection itself resolves symbols — extends
    * clauses — and collection order must not decide what reports). */
@@ -3111,7 +3119,10 @@ export class Lowerer {
     // applies to node-typed values.
     const typeSym = widened.getAliasSymbol() ?? widened.getSymbol();
     if (this.nodeTypesOnlySymbol(typeSym)) {
-      this.pushDiag(noLoweringDiag(this.checker.typeToString(type), locOf(node), undefined, true));
+      const d = noLoweringDiag(this.checker.typeToString(type), locOf(node), undefined, true);
+      // R2 (S129): a type a stub builtin declares — its values only come
+      // out of a stub touch, so the refusal defers with the touch.
+      this.pushDiag(stubDiagFor(this, typeSym, node, d) ?? d);
       throw new PoisonError();
     }
     // Island-backed ambient TYPES (Response, AbortSignal, RequestInit) in a
@@ -3329,7 +3340,10 @@ export class Lowerer {
    * `sym`, when given, picks the wording: surface declared only by the
    * adopted @types/node is blamed at @types/node. */
   noLowering(surface: string, node: ts.Node, hint?: string, sym?: ts.Symbol | null): never {
-    this.pushDiag(noLoweringDiag(surface, locOf(node), hint, this.nodeTypesOnlySymbol(sym)));
+    const d = noLoweringDiag(surface, locOf(node), hint, this.nodeTypesOnlySymbol(sym));
+    // R2 (S129): surface a stub builtin declares (a member of its types)
+    // is only reached through a value a stub touch produced.
+    this.pushDiag(stubDiagFor(this, sym, node, d) ?? d);
     throw new PoisonError();
   }
 
@@ -8387,7 +8401,11 @@ export class Lowerer {
     fallback: string,
   ): never {
     if (this.isBlockedBinding(symbol)) {
-      this.pushDiag(blockedBindingUseDiag(name, locOf(node)));
+      const d = blockedBindingUseDiag(name, locOf(node));
+      // R2 (S129): the binding's declaration is a stub fence — the use
+      // cannot run before it (the fence ends the program), so it defers
+      // with it.
+      this.pushDiag(symbol !== null && this.stubBlocked.has(symbol) ? markStubDiag(this, d) : d);
       throw new PoisonError();
     }
     // A binding whose TYPE keeps a generic call signature and whose

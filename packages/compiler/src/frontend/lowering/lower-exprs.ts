@@ -17,7 +17,8 @@ import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeTh
 import { armCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
-import { isJsSourceFileName, unsupportedModuleFeatureOf } from "../shared.js";
+import { isJsSourceFileName, stubBuiltinModuleOf, unsupportedModuleFeatureOf } from "../shared.js";
+import { onlyStubTouches, stubExprFence, stubMissingExport, stubModuleOf, stubTouch, stubTouchCheck } from "./stub-builtins.js";
 import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
@@ -437,8 +438,28 @@ export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     }
     lowerExprDepth++;
     try {
-      const tdz = L.moduleTdz;
-      const out = tdz !== null && tdz.occByFile.size > 0 ? guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr)) : lowerExprInner(L, expr);
+      // R2 (SEMANTICS.md S129): an expression that evaluates a stub
+      // builtin binding first stops here, before any lowering path reads
+      // the binding's declared type; and an expression whose lowering
+      // poisoned on stub touches alone becomes the touch's run-time fence
+      // when its own type maps (stubExprFence).
+      // `typeof` of an export the stub module does not have in Node
+      // (`const { SourceTextModule } = require("vm")`, feature detection):
+      // Node's "undefined", whatever @types/node declares.
+      if (ts.isTypeOfExpression(expr) && stubMissingExport(L, expr.expression)) {
+        return { kind: "strLit", value: "undefined", type: STRING, loc: locOf(expr) };
+      }
+      const stubDiagsBefore = L.diags.length;
+      let out: IrExpr;
+      try {
+        stubTouchCheck(L, expr);
+        const tdz = L.moduleTdz;
+        out = tdz !== null && tdz.occByFile.size > 0 ? guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr)) : lowerExprInner(L, expr);
+      } catch (e) {
+        const fenced = stubExprFence(L, expr, e, stubDiagsBefore);
+        if (fenced !== null) return fenced;
+        throw e;
+      }
       // One world in JavaScript sources (U1b): an island-typed expression
       // IS the $dyn value (one representation, the retype is free), and a
       // JS source's operations on it take the checked-dynamic arms — the
@@ -1499,7 +1520,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // report groups them into one blocker. (Builds never get here: the
       // import already failed preflight.)
       {
+        const stubSpec = stubModuleOf(L, expr);
+        if (stubSpec !== null) stubTouch(L, expr, stubSpec);
         const spec = L.fencedBuiltinImportOf(expr);
+        if (spec !== null && stubBuiltinModuleOf(spec) !== null) stubTouch(L, expr, spec);
         if (spec !== null) {
           L.pushDiag(unsupportedDiag("SC1010", loc, unsupportedModuleFeatureOf(spec)));
           throw new PoisonError();
@@ -5705,9 +5729,13 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         // the slot would answer typeof "function" and print as one where
         // Node has the object.
         const pureMember = ts.isIdentifier(valueExpr) && stdlibGlobalNameOf(L, valueExpr) === null && L.builtinImportOf(valueExpr) === null;
+        // R2 (SEMANTICS.md S129): a stub builtin binding in the slot is a
+        // TOUCH — the statement's own fence, never a closure that would
+        // answer typeof "function" where Node has the module object.
         if (
           !(err instanceof PoisonError) ||
           !pureMember ||
+          onlyStubTouches(L, L.diags.slice(propDiagsBefore)) ||
           L.diagSink !== null ||
           L.diags.length <= propDiagsBefore ||
           L.diags.slice(propDiagsBefore).some((d) => d.code === "SC9001")
@@ -7345,6 +7373,11 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     // Identifier (the grammar allows nothing else in shorthand position).
     const propName = prop.name as ts.Identifier;
     const loc = locOf(propName);
+    // R2 (SEMANTICS.md S129): `{ v8 }` over a stub binding is a touch.
+    {
+      const stubSpec = stubModuleOf(L, propName);
+      if (stubSpec !== null) stubTouch(L, propName, stubSpec);
+    }
     const symbol = L.checker.getShorthandAssignmentValueSymbol(prop);
     if (symbol) {
       if (L.ctx.selfSymbol === symbol) {

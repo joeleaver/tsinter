@@ -5,7 +5,7 @@
  * program.ts re-exports all of it, so lowering-side import sites kept
  * their spelling across the phase-4 flip that retired the 5.9.3 lane. */
 
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 
 const require = createRequire(import.meta.url);
 
@@ -139,6 +139,35 @@ const OUT_OF_SCOPE_BUILTIN_REASONS: Record<string, string | undefined> = {
   _tls_common: NODE_INTERNAL_REASON,
   _tls_wrap: NODE_INTERNAL_REASON,
 };
+
+/* ── stub builtins (R2, SEMANTICS.md S129) ───────────────────────────────
+ * An import of a Node builtin this build does not serve no longer refuses
+ * the build at the import: its bindings are STUBS whose first touch (the
+ * statement that calls, reads, passes or re-reads one) stops at the
+ * module's named run-time fence. That is exact only while the import
+ * itself does nothing observable in Node, so the builtins whose LOAD Node
+ * makes observable keep the compile-time refusal at the import line
+ * (measured on Node v24.18.1):
+ * - punycode (DEP0040), sys (DEP0025), _stream_wrap (DEP0125): a
+ *   DeprecationWarning on stderr at load;
+ * - wasi: an ExperimentalWarning on stderr at load;
+ * - domain, and repl (which loads domain): loading switches
+ *   EventEmitter.usingDomains to true. */
+const IMPORT_OBSERVABLE_BUILTINS: ReadonlySet<string> = new Set(["punycode", "sys", "_stream_wrap", "wasi", "domain", "repl"]);
+
+/** The bare name of a builtin module whose imported bindings are stubs
+ * (S129): a specifier Node itself serves as a builtin (both spellings, or
+ * only the node: one for the prefix-only builtins — node:sqlite, node:sea,
+ * node:test/reporters), with no scriptc lowering, whose load Node does
+ * not make observable. Null for everything else: supported builtins, npm
+ * specifiers, unknown node: names (Node's ERR_UNKNOWN_BUILTIN_MODULE) and
+ * the import-observable builtins above. */
+export function stubBuiltinModuleOf(spec: string): string | null {
+  if (!isBuiltin(spec)) return null;
+  if (canonicalBuiltinModule(spec) !== null) return null;
+  const bare = spec.startsWith("node:") ? spec.slice(5) : spec;
+  return IMPORT_OBSERVABLE_BUILTINS.has(bare) ? null : bare;
+}
 
 /** The SC1010 feature string for an unsupported module specifier: the
  * plain "the 'x' module" for pending surface, with the out-of-scope
