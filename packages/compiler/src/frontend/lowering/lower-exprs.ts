@@ -7751,7 +7751,18 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         // the read types `string | undefined`, which charAt cannot honor —
         // fenced.
         const index = L.lowerExpr(expr.argumentExpression);
-        if (index.type.kind === "f64" && L.mapTypeOf(L.typeOf(expr))?.kind === "string") {
+        // Under noUncheckedIndexedAccess the read types `string | undefined`:
+        // with undefined-capable string slots (Unit U, S119) the charAt read
+        // below already answers `undefined` past the end, so it is the same
+        // read the array element path gives `T | undefined` reads (the
+        // element type, its out-of-range answer undefined).
+        const readTs = L.typeOf(expr);
+        const uncheckedString =
+          L.undefSlots &&
+          readTs.isUnionType() &&
+          readTs.getTypes().every((p) => (p.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.String)) !== 0) &&
+          readTs.getTypes().some((p) => (p.flags & ts.TypeFlags.Undefined) !== 0);
+        if (index.type.kind === "f64" && (uncheckedString || L.mapTypeOf(readTs)?.kind === "string")) {
           const rawRecv = L.lowerExpr(expr.expression);
           if (L.undefSlots) {
             // Unit U (SEMANTICS.md S119): past the end, a fraction or NaN

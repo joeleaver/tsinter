@@ -2510,6 +2510,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
  * inhabited (S135). */
 function isUninhabitedRecordArm(part: ts.Type, checker: TypeMapperCtx["checker"]): boolean {
   if ((part.flags & ts.TypeFlags.Object) === 0) return false;
+  // Tuples and arrays are not records: a `[string, never]` element type is
+  // the checker's spelling of a JavaScript inference residue (the JS
+  // `Object.entries(...).map(([k]) => [k, v])` pair), and it keeps its own
+  // mapping and fences.
+  if (checker.isTupleType(part) || checker.isArrayType(part)) return false;
   const sym = part.getSymbol();
   if (sym !== undefined && (sym.flags & ts.SymbolFlags.Class) !== 0) return false;
   return checker.getPropertiesOfType(part).some(

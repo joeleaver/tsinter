@@ -659,9 +659,12 @@ function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
 }
 
 function nestsNodeClassShape(L: Lowerer, t: IrType, seen: Set<string>): boolean {
+  // One visit per type (carriesAccessors' guard): a recursive union (an arm
+  // holding an array of the union itself) recursed without end here.
+  const k = typeKey(t);
+  if (seen.has(k)) return false;
+  seen.add(k);
   if (t.kind === "record") {
-    if (seen.has(t.shapeId)) return false;
-    seen.add(t.shapeId);
     const shape = L.shapes.get(t.shapeId);
     if (!shape) return false;
     return isNodeClassShape(shape) || shape.fields.some((f) => nestsNodeClassShape(L, f.type, seen)) ||
