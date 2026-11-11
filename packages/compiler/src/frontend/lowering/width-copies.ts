@@ -224,10 +224,18 @@ function closedRecordArms(L: Lowerer, t: IrType): { t: IrType; shape: IrRecordSh
 
 /** GH #148 (review): may the island spread literal `v` carry an own key
  * that record shape `fields` has no field for? A literal part's keys are
- * known; any other spread source's are not. */
-function spreadMayCarryExtra(v: unknown, fields: Set<string>): boolean {
+ * known, and so are a TYPED record's (its view, or the record marshaled
+ * in: at most its declared fields — one that may be undefined spreads
+ * none); any other spread source's are not. */
+function spreadMayCarryExtra(L: Lowerer, v: unknown, fields: Set<string>): boolean {
   const r = v as Record<string, unknown>;
-  if (r["kind"] === "jsOp" && r["op"] === "objSpread") return (r["args"] as unknown[]).some((a) => spreadMayCarryExtra(a, fields));
+  if (r["kind"] === "jsOp" && r["op"] === "objSpread") return (r["args"] as unknown[]).some((a) => spreadMayCarryExtra(L, a, fields));
+  const typed = (r["kind"] === "call" && /^%view\./.test(r["callee"] as string)) ? (r["args"] as IrExpr[])[0]
+    : (r["kind"] === "jsMarshal" || r["kind"] === "dynFrom") ? (r["value"] as IrExpr) : undefined;
+  if (typed !== undefined && typed.type.kind === "record") {
+    const sh = L.shapes.get(typed.type.shapeId);
+    return sh === undefined || sh.indexValue !== undefined || sh.fields.some((f) => !fields.has(f.name));
+  }
   if (r["kind"] === "jsOp" && r["op"] === "objLit") {
     const args = r["args"] as Record<string, unknown>[];
     for (let i = 0; i < args.length; i += 2) {
@@ -272,6 +280,10 @@ interface Binding {
   parts: { t: IrType; use: Use; via?: string }[];
   assigns: IrExpr[];
   captured: boolean;
+  /** How many of the "other" uses are a field write ON the value
+   * (`b.f = v`: the receiver of a recordSet), which neither prints it nor
+   * lists its keys (GH #148's spread judgement). */
+  fieldWrites?: number;
 }
 
 const tkey = (t: IrType): string => typeKey(t);
@@ -872,6 +884,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       const [up, upKey] = stack[i]!;
       const b = binding(bkey(curFn, r["localId"] as string));
       b.uses.push(useOf(up, upKey));
+      if (up["kind"] === "recordSet" && upKey === "obj") b.fieldWrites = (b.fieldWrites ?? 0) + 1;
       // A chain of reads off the binding: the part it ends at, and that
       // part's own use.
       let j = i;
@@ -1055,7 +1068,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     if (arms.length === 0) return;
     const extra = arms.some((a) => {
       const fields = new Set(a.shape.fields.map((f) => f.name));
-      return spreads.some((s) => spreadMayCarryExtra(s, fields));
+      return spreads.some((s) => spreadMayCarryExtra(L, s, fields));
     });
     if (extra) spreadExits.push({ t, arms: arms.map((a) => a.t), loc, dest: destOf(parent, pkey, r) });
   }
@@ -1860,7 +1873,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const db = s.dest === null ? null : destBinding({ callee: "%dyn.spread", arg: undefined, loc: s.loc, where: "", top: 0, dest: s.dest });
     const types = [s.t, ...s.arms];
     const observed = db !== null
-      ? db.uses.some((u) => u === "print" || u === "keys" || u === "other") || types.some((t) => foldedKeys.has(tkey(t)) || foldedClass.has(tkey(t)))
+      ? db.uses.some((u) => u === "print" || u === "keys") ||
+        db.uses.filter((u) => u === "other").length > (db.fieldWrites ?? 0) ||
+        types.some((t) => foldedKeys.has(tkey(t)) || foldedClass.has(tkey(t)))
       : types.some((t) => reach.has(tkey(t)) || foldedKeys.has(tkey(t)));
     if (!observed) continue;
     const at = `${s.loc.file}:${s.loc.start}`;

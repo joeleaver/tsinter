@@ -164,6 +164,14 @@ const ROWS: Row[] = [
     src: "type Narrow = { b: number; a?: number };\nconst x: any = JSON.parse(\"{\\\"b\\\":1,\\\"c\\\":2}\");\nconst flag = process.argv.length > 0;\nconst m: Narrow = flag ? { ...x } : { b: 0 };\nconsole.log(m.b, ((flag && { ...x }) || { b: 0 }).b);",
   },
   {
+    id: "GH148-25 a typed record (one that may be undefined, from an index read) spread into an unknown-typed result is not a dynamic source and runs",
+    src: "const rs: { a: number; b: string }[] = [{ a: 1, b: \"x\" }];\nconst r = rs[0];\nconst r2 = rs[1];\nfunction t(label: string, f: () => unknown) { console.log(label, f()); }\nt(\"spread\", () => ({ ...r }));\nt(\"spread2\", () => ({ ...r, c: 1 }));\nt(\"undef\", () => ({ ...r2 }));\nt(\"undef2\", () => ({ ...r2, c: 1 }));",
+  },
+  {
+    id: "GH148-26 an any source spread whose copy is written through and read runs (H-FRESH-03c's shape)",
+    src: "const o: any = JSON.parse('{\"a\":1,\"b\":\"x\",\"c\":2}');\nconst r: { a: number; b: string } = { ...o };\nr.a = 5;\nconsole.log(r.a, r.b, o.a);",
+  },
+  {
     id: "GH148-12 the registered cost: a field write through the copy refuses although no run could tell",
     src: W + "const w: Wide = { b: 1, c: 2 };\nconst n: Narrow = { ...w, a: 3 };\nn.b = 7;\nconsole.log(n.b, w.b);",
     refused: COPY,
