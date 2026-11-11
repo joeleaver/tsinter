@@ -1320,6 +1320,24 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       ]),
     };
   }
+  // TextEncoder / TextDecoder (the WHATWG utf-8 codecs @types/node
+  // declares): a one-field record holding the encoding name ("utf-8", the
+  // `.encoding` property). Construction admits only the default utf-8
+  // codec (lowerNew), so the record needs no other state; encode/decode
+  // calls are special-cased in lowerTextCodecCall.
+  if (
+    (psym?.name === "TextEncoder" || psym?.name === "TextDecoder") &&
+    checker.declarationsOf(psym).some(
+      (d) =>
+        (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) &&
+        ctx.isStdlibFile(d.getSourceFile()),
+    )
+  ) {
+    return {
+      kind: "record",
+      shapeId: ctx.shapes.intern([{ name: "%enc", type: STRING, internal: true }]),
+    };
+  }
   // Promise.withResolvers's return type — `{ promise, resolve, reject }`
   // from the overrides declaration (or es2024's PromiseWithResolvers,
   // the same shape): a real data record, but its anonymous literal lives

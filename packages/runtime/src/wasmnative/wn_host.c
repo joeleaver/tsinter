@@ -1113,7 +1113,8 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
     }
     case 9:
     case 10: {
-      int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | (op == 9 ? O_TRUNC : O_APPEND), (op == 9 && x) ? (mode_t)(x - 1) : 0666);
+      /* op 9's y bits: 1 = the bytes payload, 2 = exclusive create (flag "wx") */
+      int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | (op == 9 ? O_TRUNC : O_APPEND) | (op == 9 && (y & 2) ? O_EXCL : 0), (op == 9 && x) ? (mode_t)(x - 1) : 0666);
       if (fd < 0) {
         rc = wn_fs_err(errno);
         break;
@@ -1121,7 +1122,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       size_t n;
       char *data;
       int own = 0;
-      if (op == 9 && y == 1) {
+      if (op == 9 && (y & 1)) {
         data = (char *)(w_hostmem + B);
         n = BL;
       } else {

@@ -76,6 +76,16 @@ async function nativeRun(path: string, args: string[]): Promise<Out> {
   }
 }
 
+/** A row whose program must REFUSE at build time with a diagnostic whose
+ * message contains `expected` (the loud-refusal half of a construct). */
+export async function checkRefuses(scratch: string, row: Row, expected: string): Promise<void> {
+  const entry = write(scratch, row, "refuse");
+  const dir = join(entry, "..");
+  const res = await compile(entry, { outPath: join(dir, "p.wasm"), outDir: dir, backend: "wasm" });
+  expect(res.ok, row.id).toBe(false);
+  expect(res.diagnostics.map((d) => `${d.code} ${d.message}`).join("\n")).toContain(expected);
+}
+
 export async function checkRow(scratch: string, row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(scratch, row, backend);
   const dir = join(entry, "..");

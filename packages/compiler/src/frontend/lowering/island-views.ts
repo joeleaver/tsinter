@@ -27,7 +27,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFileName } from "../shared.js";
 import {
-  BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isReservedField, isUnitType, shapeHasReservedFields, typeKey,
+  BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isNodeClassShape, isReservedField, isUnitType, shapeHasReservedFields, typeKey,
   type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc,
 } from "../../ir/nodes.js";
 import { UNSUPPORTED, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
@@ -658,8 +658,28 @@ function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
   return false;
 }
 
+function nestsNodeClassShape(L: Lowerer, t: IrType, seen: Set<string>): boolean {
+  if (t.kind === "record") {
+    if (seen.has(t.shapeId)) return false;
+    seen.add(t.shapeId);
+    const shape = L.shapes.get(t.shapeId);
+    if (!shape) return false;
+    return isNodeClassShape(shape) || shape.fields.some((f) => nestsNodeClassShape(L, f.type, seen)) ||
+      (shape.indexValue !== undefined && nestsNodeClassShape(L, shape.indexValue, seen));
+  }
+  if (t.kind === "array") return nestsNodeClassShape(L, t.elem, seen);
+  if (t.kind === "union") return (L.unions.get(t.unionId)?.arms ?? []).some((a) => nestsNodeClassShape(L, a, seen));
+  return false;
+}
+
 /** `e` (a typed array/tuple/record) as its island VIEW. */
 export function viewOf(L: Lowerer, e: IrExpr, loc: SrcLoc, frozen = false): IrExpr {
+  // A Node class instance's record (StringDecoder, TextEncoder,
+  // TextDecoder) is not program data: a view would show its hidden slot.
+  if (nestsNodeClassShape(L, e.type, new Set())) {
+    L.pushDiag(s115Diag(loc, `a StringDecoder/TextEncoder/TextDecoder instance crossing into an 'any' slot has no dynamic representation yet`));
+    return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: e, loc }], result: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, type: JSVAL, loc };
+  }
   if (frozen && e.type.kind === "array") {
     return { kind: "call", callee: viewFactory(L, e.type, loc, true), args: [e], type: JSVAL, loc };
   }

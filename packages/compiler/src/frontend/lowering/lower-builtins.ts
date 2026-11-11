@@ -1406,6 +1406,10 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         }
       }
       let modeNode: ts.Expression | null = null;
+      // flag: "w" is the default disposition (truncate-or-create); "wx"
+      // adds open(2)'s O_EXCL (EEXIST when the path exists, Node's own
+      // error). Other flags keep the fence ('a' IS appendFileSync).
+      let exclusive = false;
       let ok = ts.isObjectLiteralExpression(optsNode);
       if (ok) {
         for (const p of (optsNode as ts.ObjectLiteralExpression).properties) {
@@ -1417,12 +1421,17 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
             const t = L.typeOf(m.value);
             if (!t.isStringLiteralType() || (t.value !== "utf8" && t.value !== "utf-8")) { ok = false; break; }
           } else if (m.name === "flag") {
+            const t = L.typeOf(m.value);
+            if (t.isStringLiteralType() && (t.value === "w" || t.value === "wx")) {
+              exclusive = t.value === "wx";
+              continue;
+            }
             // Documented, behavior-changing (open(2)'s disposition — 'a'
             // IS appendFileSync), no lowering: fence by name.
             L.noLowering(
               "writeFileSync with the flag option",
               p,
-              "the write truncates-or-creates (Node's default 'w') — appendFileSync is the lowered append; other flags have no lowering",
+              "flag 'w' (the default) and 'wx' (exclusive create) lower — appendFileSync is the lowered append; other flags have no lowering",
             );
           } else {
             // The options-record stance: documented keys with no lowering
@@ -1443,6 +1452,10 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       }
       const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
+      if (exclusive) {
+        const exclMode: IrExpr = modeNode === null ? { kind: "numLit", value: 0o666, type: F64, loc } : L.lowerExprExpecting(modeNode, F64);
+        return deferArgChecks(L, [path, data, exclMode], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileExclModeSync", args, type: VOID, loc }));
+      }
       if (modeNode === null) {
         // encoding-only options change nothing: the plain write.
         return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileSync", args, type: VOID, loc }));
@@ -4616,7 +4629,11 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     // decoder.encoding on a StringDecoder-typed receiver: the record's
     // hidden canonical-name field (construction folded the aliases —
     // exactly what Node's normalized `.encoding` answers).
-    if (expr.name.text === "encoding" && isStringDecoderTyped(L, expr.expression) && L.isStdlibMember(expr)) {
+    if (
+      expr.name.text === "encoding" &&
+      (isStringDecoderTyped(L, expr.expression) || textCodecClassOf(L, expr.expression) !== null) &&
+      L.isStdlibMember(expr)
+    ) {
       const receiver = L.lowerExpr(expr.expression);
       if (receiver.type.kind !== "record") L.badType(expr.expression, L.typeOf(expr.expression));
       return { kind: "recordGet", obj: receiver, shapeId: receiver.type.shapeId, field: "%enc", type: STRING, loc: locOf(expr) };
@@ -6637,25 +6654,13 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
    * ScrStr storage is well-formed UTF-8, so the bytes are identical (lone
    * surrogates became U+FFFD at string construction, exactly what the
    * spec's encoder emits). Null when this is neither composed form. */
-  export function lowerTextCodecCall(L: Lowerer, call: ts.CallExpression,
-    access: ts.PropertyAccessExpression,): IrExpr | null {
-    if (call.questionDotToken || access.questionDotToken) return null;
-    const member = access.name.text;
-    if (member !== "decode" && member !== "encode") return null;
-    const recv = access.expression;
-    if (!ts.isNewExpression(recv) || !ts.isIdentifier(recv.expression)) return null;
-    const sym = L.resolveValueSymbol(recv.expression);
-    const cls = sym?.name;
-    if (!sym || !L.isStdlibSymbol(sym)) return null;
-    if (!(cls === "TextDecoder" && member === "decode") && !(cls === "TextEncoder" && member === "encode")) {
-      return null;
-    }
-    const loc = locOf(call);
+  /** The constructor arguments a TextEncoder/TextDecoder may carry: the
+   * decoder may spell the default label; anything else (other labels,
+   * { fatal }/{ ignoreBOM } options) changes behavior the runtime doesn't
+   * implement. The encoder takes none. */
+  export function checkTextCodecCtor(L: Lowerer, recv: ts.NewExpression, cls: string): void {
     const ctorArgs = recv.arguments ?? [];
     if (cls === "TextDecoder") {
-      // The constructor may spell the default label; anything else (other
-      // labels, { fatal }/{ ignoreBOM } options) changes behavior the
-      // runtime doesn't implement.
       const labelT = ctorArgs.length >= 1 ? L.typeOf(ctorArgs[0]!) : null;
       const utf8Label =
         labelT !== null && labelT.isStringLiteralType() && (labelT.value === "utf-8" || labelT.value === "utf8");
@@ -6666,9 +6671,58 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
           "utf-8 with default options is the supported decoder: new TextDecoder().decode(bytes)",
         );
       }
+    } else if (ctorArgs.length > 0) {
+      L.noLowering("new TextEncoder with arguments", recv);
+    }
+  }
+
+  /** The stdlib TextEncoder/TextDecoder class a value's checker type
+   * names ("TextEncoder" | "TextDecoder"), or null. */
+  function textCodecClassOf(L: Lowerer, node: ts.Expression): "TextEncoder" | "TextDecoder" | null {
+    const t = L.checker.getTypeAtLocation(node);
+    const sym = t.getAliasSymbol() ?? t.getSymbol();
+    const name = sym?.name;
+    if (name !== "TextEncoder" && name !== "TextDecoder") return null;
+    const stdlib = L.checker.declarationsOf(sym!).some(
+      (d) => (ts.isClassDeclaration(d) || ts.isInterfaceDeclaration(d)) && L.isStdlibFile(d.getSourceFile()),
+    );
+    return stdlib ? name : null;
+  }
+
+  export function lowerTextCodecCall(L: Lowerer, call: ts.CallExpression,
+    access: ts.PropertyAccessExpression,): IrExpr | null {
+    if (call.questionDotToken || access.questionDotToken) return null;
+    const member = access.name.text;
+    if (member !== "decode" && member !== "encode") return null;
+    const recv = access.expression;
+    let cls: string | undefined;
+    // A codec VALUE (`const enc = new TextEncoder(); enc.encode(s)`): the
+    // receiver evaluates for its effects, then the same lowering as the
+    // composed form. Construction already checked the codec's options.
+    let receiverEffect: IrExpr | null = null;
+    if (ts.isNewExpression(recv) && ts.isIdentifier(recv.expression)) {
+      const sym = L.resolveValueSymbol(recv.expression);
+      cls = sym?.name;
+      if (!sym || !L.isStdlibSymbol(sym)) return null;
+    } else {
+      const valueCls = textCodecClassOf(L, recv);
+      if (valueCls === null || !L.isStdlibMember(access)) return null;
+      cls = valueCls;
+    }
+    if (!(cls === "TextDecoder" && member === "decode") && !(cls === "TextEncoder" && member === "encode")) {
+      return null;
+    }
+    const loc = locOf(call);
+    if (ts.isNewExpression(recv)) checkTextCodecCtor(L, recv, cls);
+    else receiverEffect = L.lowerExpr(recv);
+    const withReceiver = (e: IrExpr): IrExpr =>
+      receiverEffect === null || droppableStatic(receiverEffect)
+        ? e
+        : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: receiverEffect, loc }], result: e, type: e.type, loc };
+    if (cls === "TextDecoder") {
       if (call.arguments.length === 0) {
         // decode() with no input is "" per spec — nothing to evaluate.
-        return { kind: "strLit", value: "", type: STRING, loc };
+        return withReceiver({ kind: "strLit", value: "", type: STRING, loc });
       }
       if (call.arguments.length !== 1) {
         L.noLowering(
@@ -6686,10 +6740,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
           "Uint8Array/Buffer input decodes (ArrayBuffer values have no representation)",
         );
       }
-      return { kind: "libCall", fn: "text.decode", args: [arg], type: STRING, loc };
-    }
-    if (ctorArgs.length > 0) {
-      L.noLowering("new TextEncoder with arguments", recv);
+      return withReceiver({ kind: "libCall", fn: "text.decode", args: [arg], type: STRING, loc });
     }
     if (call.arguments.length !== 1) {
       L.noLowering(
@@ -6701,7 +6752,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
     // GH #104 (SEMANTICS.md S119): an input holding undefined is the default "".
     const s = undefinedAsAbsent(L, L.lowerExprExpecting(call.arguments[0]!, STRING), { kind: "strLit", value: "", type: STRING, loc });
     const enc: IrExpr = { kind: "strLit", value: "utf8", type: STRING, loc };
-    return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
+    return withReceiver({ kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc });
   }
 
 /** `String.fromCharCode(...codes)` on THE String global: every argument

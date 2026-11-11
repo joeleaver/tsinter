@@ -36,7 +36,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, JSVAL, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
 import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
@@ -149,6 +149,9 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
       visiting.add(t.shapeId);
       const shape = L.shapes.get(t.shapeId);
       if (!shape) return "this record shape has no inspect lowering";
+      if (isNodeClassShape(shape)) {
+        return "StringDecoder/TextEncoder/TextDecoder instances have no inspect lowering (Node prints the class's own form)";
+      }
       // Accessor-carrying shapes: Node prints the accessor names as
       // `x: [Getter]` / `[Setter]` / `[Getter/Setter]` in insertion order
       // — a position the static field walk does not track (accessor slots

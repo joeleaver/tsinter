@@ -364,6 +364,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "fs.chownSync": { argTypes: [STRING, F64, F64], result: VOID },
   "fs.copyFileSync": { argTypes: [STRING, STRING], result: VOID },
   "fs.writeFileModeSync": { argTypes: [STRING, STRING, F64], result: VOID },
+  "fs.writeFileExclModeSync": { argTypes: [STRING, STRING, F64], result: VOID },
   "fs.mkdirModeSync": { argTypes: [STRING, F64], result: VOID },
   "fs.mkdirRecursiveModeSync": { argTypes: [STRING, F64], result: VOID },
   // Atomics.wait over an Int32Array — the synchronous-sleep idiom.

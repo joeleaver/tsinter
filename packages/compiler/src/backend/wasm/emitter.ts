@@ -1272,6 +1272,7 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fs.chownSync" ||
         node === "fs.copyFileSync" ||
         node === "fs.writeFileModeSync" ||
+        node === "fs.writeFileExclModeSync" ||
         node === "fs.mkdirModeSync" ||
         node === "fs.mkdirRecursiveModeSync" ||
         node === "fs.rmRetrySync" ||
@@ -27727,6 +27728,15 @@ class Assembler {
           this.walkExpr(e.args[2]!);
           code.call(this.toInt32Helper());
           code.call(this.fs.writeFileModeSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.writeFileExclModeSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.writeFileExclModeSyncHelper());
           this.emitPendingCheck();
           return;
         }

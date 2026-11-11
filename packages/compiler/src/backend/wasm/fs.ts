@@ -215,7 +215,7 @@ export const OP_TABLE: readonly FsOpTableEntry[] = [
   { op: 1, keys: ["readFileSync", "readFileSyncBytes"], syscall: "open", shape: "one", codeOverrides: { EISDIR: { syscall: "read", shape: "no" } } },
   { op: 2, keys: ["readdirSync", "readdirTypesSync"], syscall: "scandir", shape: "one", codeOverrides: {} },
   { op: 3, keys: ["mkdtempSync"], syscall: "mkdtemp", shape: "one", codeOverrides: {} },
-  { op: 9, keys: ["writeFileSync", "writeFileSyncBytes", "writeFileModeSync"], syscall: "open", shape: "one", codeOverrides: {} },
+  { op: 9, keys: ["writeFileSync", "writeFileSyncBytes", "writeFileModeSync", "writeFileExclModeSync"], syscall: "open", shape: "one", codeOverrides: {} },
   { op: 10, keys: ["appendFileSync"], syscall: "open", shape: "one", codeOverrides: {} },
   { op: 11, keys: ["mkdirSync", "mkdirRecursiveSync", "mkdirModeSync", "mkdirRecursiveModeSync"], syscall: "mkdir", shape: "one", codeOverrides: {} },
   { op: 12, keys: ["rmdirSync"], syscall: "rmdir", shape: "one", codeOverrides: {} },
@@ -934,7 +934,10 @@ export class FsBuilder {
    * (mode), forwarded as `x` instead of P4's hardcoded inert 0 — abi.ts's
    * own op-9 doc already names `mode=x`; P4's writeFileSync just never
    * had a caller needing a real value. */
-  private buildWriteOp(name: string, op: number, defaultSyscall: string, hasMode = false): number {
+  /** `y` (op 9 only): the flag bits the host reads — bit 0 is the bytes
+   * payload (writeFileSyncBytes' own), bit 1 the EXCLUSIVE create
+   * (flag "wx": O_CREAT|O_EXCL, EEXIST when the path exists). */
+  private buildWriteOp(name: string, op: number, defaultSyscall: string, hasMode = false, y = 0): number {
     return this.cached(name, hasMode ? [this.strRef(), this.strRef(), I32] : [this.strRef(), this.strRef()], [], (idx) => {
       const c = new Code();
       this.emitNulGuard(c, 0, "path", () => {});
@@ -1004,7 +1007,7 @@ export class FsBuilder {
       } else {
         c.i32Const(0);
       }
-      c.i32Const(0); // y unused
+      c.i32Const(y); // y: the flag bits (0 but for writeFileExclModeSync)
       c.call(this.deps.fsCallFunc(op));
       c.localSet(STATUS);
       c.localGet(STATUS);
@@ -1026,6 +1029,11 @@ export class FsBuilder {
   /** writeFileModeSync (op 9, a real mode) — P5's own key. */
   writeFileModeSyncHelper(): number {
     return this.buildWriteOp("writeFileModeSync", 9, "open", true);
+  }
+  /** writeFileExclModeSync (op 9, flag "wx"): a real mode (Node's 0o666
+   * when the options omit it) and y's exclusive-create bit. */
+  writeFileExclModeSyncHelper(): number {
+    return this.buildWriteOp("writeFileExclModeSync", 9, "open", true, 2);
   }
 
   /** `%w.fs.writeFileSyncBytes(path, bytes) -> void` (op 9, SAME row as

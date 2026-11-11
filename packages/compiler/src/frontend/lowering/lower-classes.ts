@@ -5123,18 +5123,21 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
           loc,
         };
       }
-      // Encoder objects likewise exist only inside the composed forms
-      // (lowerTextCodecCall claims those before the receiver lowers).
+      // `new TextEncoder()` / `new TextDecoder()` (default utf-8): the
+      // codec is its one-field record (types.ts), the encoding name the
+      // `.encoding` property answers. The composed forms
+      // (`new TextEncoder().encode(s)`) never build it (lowerTextCodecCall
+      // claims those before the receiver lowers).
       if (symbol && (symbol.name === "TextDecoder" || symbol.name === "TextEncoder") && L.isStdlibSymbol(symbol)) {
-        L.noLowering(
-          `new ${symbol.name}`,
-          expr,
-          `${symbol.name} values have no representation — the composed form compiles: ` +
-            (symbol.name === "TextDecoder"
-              ? "new TextDecoder().decode(bytes)"
-              : "new TextEncoder().encode(s)"),
-          symbol,
-        );
+        L.checkTextCodecCtor(expr, symbol.name);
+        const codecT = L.mapTypeOf(L.typeOf(expr));
+        if (codecT?.kind !== "record") L.badType(expr, L.typeOf(expr));
+        return {
+          kind: "recordLit",
+          fields: [{ name: "%enc", value: { kind: "strLit", value: "utf-8", type: STRING, loc } }],
+          type: codecT,
+          loc,
+        };
       }
       // `new Uint8Array(...)` / `new Uint32Array(...)` / `new
       // Float32Array(...)`: the typed-array constructors with a runtime

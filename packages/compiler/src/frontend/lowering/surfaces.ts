@@ -870,7 +870,7 @@ export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly I
     // "utf8"])), and the checked-dynamic encoding form.
     readFileSync: ["fs.readFileSyncBuf", "fs.readFileSyncBytes", "fs.readFileSyncDyn", "fs.readFdSync", "fs.readFdSyncBytes"],
     // The bytes-data form and the { mode } options form.
-    writeFileSync: ["fs.writeFileSyncBytes", "fs.writeFileModeSync"],
+    writeFileSync: ["fs.writeFileSyncBytes", "fs.writeFileModeSync", "fs.writeFileExclModeSync"],
     // The { recursive, mode } option lowerings.
     mkdirSync: ["fs.mkdirModeSync", "fs.mkdirRecursiveSync", "fs.mkdirRecursiveModeSync"],
     // The { recursive, force } and maxRetries/retryDelay option lowerings.

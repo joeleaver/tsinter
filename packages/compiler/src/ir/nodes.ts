@@ -1134,6 +1134,16 @@ export function isInternalField(shape: IrRecordShape, fieldName: string): boolea
   return shape.fields.some((f) => f.name === fieldName && f.internal === true);
 }
 
+/** True when `shape` is the record a NODE CLASS instance maps to (its
+ * hidden `%enc` slot: StringDecoder, TextEncoder, TextDecoder), not program
+ * data. Node's generic surfaces see the instance, not the record: JSON
+ * text, inspection and String() would print the hidden slot where Node
+ * prints the class's own form ("{}", "TextDecoder { ... }", "[object
+ * TextEncoder]"), so those consumers refuse such shapes by name. */
+export function isNodeClassShape(shape: IrRecordShape): boolean {
+  return shape.fields.some((f) => f.name === "%enc" && f.internal === true);
+}
+
 /** `field` with only its identity flags kept ({name, type, optional?,
  * internal?}) — what a shape DERIVED from another (a narrowing, a
  * rest, Partial) interns per field, so an internal slot stays internal. */
@@ -4304,6 +4314,7 @@ export type IrLibFn =
   | "stats.isSymbolicLink"
   | "stats.mtimeMs"
   | "fs.writeFileModeSync"
+  | "fs.writeFileExclModeSync"
   | "fs.mkdirModeSync"
   | "fs.mkdirRecursiveModeSync"
   /** spawnSync with options (scr_child.c): the cp.spawnSync core plus the
@@ -5652,6 +5663,7 @@ function isJsonSafeAt(
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
+      if (isNodeClassShape(shape)) return false;
       // The recursive knot: answer true and let the rest of the graph
       // decide (any unsafe constituent is found on its own path; a false
       // short-circuits every `every` up the walk).
@@ -6005,7 +6017,7 @@ function canBoxBytesComposite(
       return canBoxBytesComposite(t.elem, getRecord, getUnion, visiting);
     case "record": {
       const shape = getRecord(t.shapeId);
-      if (!shape) return false;
+      if (!shape || isNodeClassShape(shape)) return false;
       // Recursive shapes answer coinductively, like isJsonSafeType.
       if (visiting.has(t.shapeId)) return true;
       visiting.add(t.shapeId);
@@ -7630,6 +7642,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "fs.copyFileSync",
   "fs.lstatSync",
   "fs.writeFileModeSync",
+  "fs.writeFileExclModeSync",
   "fs.mkdirModeSync",
   "fs.mkdirRecursiveModeSync",
   "fs.openSync",
