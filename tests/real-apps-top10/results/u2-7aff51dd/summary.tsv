@@ -1,0 +1,11 @@
+project	wasm_build	diagnostics	top_codes	build_s
+rea	refuses	13	SC1010:12 SC0001:1 	530.588
+deepseek	refuses	41	SC0001:26 SC1010:15 	2.164
+opencode	refuses	35	SC2020:12 SC1090:10 SC2013:9 SC2009:2 SC2004:2 	10.567
+vue	refuses	205	SC0001:130 SC1010:75 	0.943
+n8n	refuses	170	SC0001:145 SC1010:25 	30.911
+shadcn	refuses	41	SC0001:21 SC1010:20 	4.668
+pi	refuses	30	SC0001:26 SC1010:4 	1.013
+paperclip	refuses	9	SC1010:6 SC0001:3 	75.327
+opendesign	refuses	961	SC0001:750 SC1010:211 	39.335
+openclaw	not measured		compile OOM at the 14G cap (11 GB heap), same as baseline	
