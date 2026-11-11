@@ -933,6 +933,20 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // rejected via the type fence.
       const value = L.lowerExpr(stmt.expression);
       if (value.type.kind === "void") L.badType(stmt.expression, L.typeOf(stmt.expression));
+      // GH #155: `throw undefined` / `throw null` (and `throw void 0`, a
+      // value typed `undefined` / `null`, a call returning one) throws the
+      // dynamic undefined / null — the same cell #127's unit arm fills, so
+      // a catch binding reads back `e === undefined` / `e === null` and an
+      // uncaught one reports "Uncaught undefined" (SEMANTICS.md S007).
+      // A unit kind has no standalone runtime value, so a non-literal
+      // operand runs for its effects first.
+      if (isUnitType(value.type)) {
+        const loc = locOf(stmt);
+        const unit: IrExpr = { kind: "unitLit", unit: value.type.kind === "nullT" ? "null" : "undefined", type: value.type, loc };
+        const thrown: IrStmt = { kind: "throw", value: { kind: "dynFrom", value: unit, type: DYN, loc }, loc };
+        if (value.kind === "unitLit") return thrown;
+        return { kind: "block", body: [{ kind: "exprStmt", expr: value, loc }, thrown], loc };
+      }
       // A dyn throw rides the REF cell arm (scr_throw_ref over the checked-dynamic tree
       // node — identity preserved through catch bindings, caughtToDyn
       // passes it back by reference). The JS-lane traced-call shape:

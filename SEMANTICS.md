@@ -256,6 +256,15 @@ confirmed (own hand-verification, reverted, hash equal before/after):
 routing the pending check to a dead condition reddens that pin by
 name.
 
+**Amendment (GH #155, wasm lanes):** a thrown DYNAMIC primitive — the
+value `throw undefined`, `throw null` and `throw void 0` throw, and any
+checked-dynamic undefined, null, boolean, number or string that unwinds
+uncaught — renders as its String() (`Uncaught undefined`, `Uncaught
+null`), the scalar arms' own spellings, where it used to print the
+generic `[object]`. Node's stderr is still its own (it prints the source
+line, a caret and the bare value), so stdout and the exit code are what
+match. **Tested by:** `packages/compiler/test/wasm-gh155-throw-unit.test.ts`.
+
 ## S008 — Wasm tier: string `repeat`/`pad`/`join` past the length limit trap
 
 *GH #93 amendment (wasm and wasm-native): `repeat` no longer traps — a
@@ -1400,6 +1409,21 @@ Node answers `named` / `handler` — the alias case above. Tuple and array
 elements stay anonymous, as in Node. **Tested by:**
 `packages/compiler/test/wasm-gh140-method-names.test.ts` (both lanes,
 against Node; the record-alias row pins this tier's answer with Node's
+beside it).
+
+**Amendment (GH #156, wasm lanes):** the inspect header names the
+function's KIND, as Node's does — `[AsyncFunction: f]`,
+`[GeneratorFunction: g]`, `[AsyncGeneratorFunction: h]`, their
+`(anonymous)` forms, and the bare `[AsyncFunction]` past the depth
+budget — where it always said `Function`. The kind is known exactly where
+this entry's own `prototype` answer is: a box built from a function the
+lowering can see by name (a declaration, a literal, a binding every write
+of which is one function). A box whose function the lowering cannot see —
+a parameter, a binding written with different functions, a function
+handed back out of a boxed call — prints `Function` whatever it is,
+beside this entry's name rule. **Tested by:**
+`packages/compiler/test/wasm-gh156-function-kind.test.ts` (both lanes,
+against Node; the unseen-kind row pins this tier's answer with Node's
 beside it).
 ## S021 — A caught Error crossing into `unknown` becomes an object whose members ENUMERATE *(inherited)*
 

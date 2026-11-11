@@ -207,7 +207,8 @@ export const FN_ARITY = 4;
 /** A function's source text, where the box was built from a known one in a
  * module that clones (GH #86 review); null otherwise. */
 export const FN_SRC = 5;
-/** Whether the function owns `prototype`: 1 yes, 2 no, 0 not known. */
+/** Whether the function owns `prototype`: 1 yes, 2 no, 0 not known (the
+ * low two bits); GH #156's kind bits above them: 4 async, 8 generator. */
 export const FN_PROTO = 6;
 
 /** `$dynView`'s field indices (unit H, SEMANTICS.md S115): the static
@@ -7157,6 +7158,8 @@ export class DynBuilder {
         c.ifVoid();
         this.fnPayload(c, (x) => x.localGet(0));
         c.structGet(this.fnT(), FN_PROTO);
+        c.i32Const(3); // GH #156: the kind bits above
+        c.i32And();
         c.i32Const(1);
         c.i32Eq();
         c.ifVoid();
@@ -7165,6 +7168,8 @@ export class DynBuilder {
         c.end();
         this.fnPayload(c, (x) => x.localGet(0));
         c.structGet(this.fnT(), FN_PROTO);
+        c.i32Const(3); // GH #156: the kind bits above
+        c.i32And();
         c.i32Const(2);
         c.i32Eq();
         c.ifVoid();

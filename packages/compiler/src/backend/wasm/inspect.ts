@@ -124,6 +124,7 @@ import {
   ENTRY_KEY,
   ENTRY_VALUE,
   FN_CLOS,
+  FN_PROTO,
   FN_SIG,
   OBJ_ENTRIES,
   OBJ_LEN,
@@ -3050,6 +3051,38 @@ export class InspectBuilder {
     });
   }
 
+  /** `%w.insp.fnKind(d)` → the constructor name Node's inspect header
+   * spells for the FUNC dyn `d` (GH #156): "Function", "AsyncFunction",
+   * "GeneratorFunction" or "AsyncGeneratorFunction", from FN_PROTO's kind
+   * bits. A box whose function's kind is not known reads "Function"
+   * (SEMANTICS.md S020). */
+  fnKind(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("fnKind", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const V = 1;
+      dyn.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(dyn.fnT(), FN_PROTO);
+      c.i32Const(2);
+      c.i32ShrU();
+      c.i32Const(3);
+      c.i32And();
+      c.localSet(V);
+      const names = ["Function", "AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"];
+      for (let k = 1; k < names.length; k++) {
+        c.localGet(V);
+        c.i32Const(k);
+        c.i32Eq();
+        c.ifVoid();
+        this.deps.lit(c, names[k]!);
+        c.return_();
+        c.end();
+      }
+      this.deps.lit(c, names[0]!);
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
   /** `%w.insp.circCheck(v)` → the circular id as an f64, or 0 when `v` is
    * not on the current traversal path. Assigns the id on first detection,
    * which is what makes the numbering discovery-ordered. */
@@ -4062,23 +4095,31 @@ export class InspectBuilder {
         // — UNCHANGED shape, fed by NAME above instead of a raw FN_NAME
         // read (this substitution alone is what makes a REDEFINED name
         // render, since keyGet already prefers the table entry).
+        // GH #156: the header's constructor name is the function's kind
+        // ("[AsyncFunction: f]", "[GeneratorFunction (anonymous)]").
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        c.i32Const(0x5b); // '['
+        c.call(this.ibPutc());
+        c.localGet(D);
+        c.call(this.fnKind());
+        c.call(this.ibPuts());
         c.localGet(NAME);
         c.arrayLen();
         c.i32Eqz();
-        c.ifResult(strRef);
-        this.deps.lit(c, "[Function (anonymous)]");
+        c.ifVoid();
+        this.deps.lit(c, " (anonymous)");
+        c.call(this.ibPuts());
         c.else_();
-        c.globalGet(this.len());
-        c.localSet(MARK);
-        this.deps.lit(c, "[Function: ");
+        this.deps.lit(c, ": ");
         c.call(this.ibPuts());
         c.localGet(NAME);
         c.call(this.ibPuts());
+        c.end();
         c.i32Const(0x5d); // ']'
         c.call(this.ibPutc());
         c.localGet(MARK);
         c.call(this.ibTake());
-        c.end();
         c.localSet(PREFIX);
 
         // No own enumerable properties: the base alone — CURRENT
@@ -4129,15 +4170,28 @@ export class InspectBuilder {
         c.localGet(RECURSE);
         c.localGet(DEPTH);
         c.f64Gt();
+        const bareHead = (tail: string): void => {
+          c.globalGet(this.len());
+          c.localSet(MARK);
+          c.i32Const(0x5b); // '['
+          c.call(this.ibPutc());
+          c.localGet(D);
+          c.call(this.fnKind());
+          c.call(this.ibPuts());
+          this.deps.lit(c, tail);
+          c.call(this.ibPuts());
+          c.localGet(MARK);
+          c.call(this.ibTake());
+        };
         c.ifVoid();
-        this.deps.lit(c, "[Function]");
+        bareHead("]");
         c.return_();
         c.end();
         c.localGet(RECURSE);
         c.f64Const(MAX_DYN_DEPTH);
         c.f64Gt();
         c.ifVoid();
-        this.deps.lit(c, `[Function${INTERRUPTED}`);
+        bareHead(INTERRUPTED);
         c.return_();
         c.end();
 
@@ -5051,13 +5105,18 @@ export class InspectBuilder {
       c.localGet(FLEN);
       c.i32Eqz();
       c.ifVoid();
+      // GH #156: the header names the function's kind.
+      putLit("[");
+      c.localGet(D);
+      c.call(this.fnKind());
+      c.call(this.ibPuts());
       c.localGet(FNM);
       c.arrayLen();
       c.i32Eqz();
       c.ifVoid();
-      putLit("[Function (anonymous)]");
+      putLit(" (anonymous)]");
       c.else_();
-      putLit("[Function: ");
+      putLit(": ");
       c.localGet(FNM);
       c.call(this.ibPuts());
       putLit("]");
@@ -5085,7 +5144,11 @@ export class InspectBuilder {
       c.i32Const(ASSERT_RENDER_DEPTH_OPTION);
       c.i32GtS();
       c.ifVoid();
-      putLit("[Function]");
+      putLit("[");
+      c.localGet(D);
+      c.call(this.fnKind());
+      c.call(this.ibPuts());
+      putLit("]");
       c.call(this.cfSeenPop());
       c.return_();
       c.end();
@@ -5200,13 +5263,17 @@ export class InspectBuilder {
       c.end();
       c.end();
       // Emit: the name prefix, then the SORTED block.
+      putLit("[");
+      c.localGet(D);
+      c.call(this.fnKind());
+      c.call(this.ibPuts());
       c.localGet(FNM);
       c.arrayLen();
       c.i32Eqz();
       c.ifVoid();
-      putLit("[Function (anonymous)] ");
+      putLit(" (anonymous)] ");
       c.else_();
-      putLit("[Function: ");
+      putLit(": ");
       c.localGet(FNM);
       c.call(this.ibPuts());
       putLit("] ");
