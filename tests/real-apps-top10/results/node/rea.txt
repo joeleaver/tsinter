@@ -1,0 +1,8 @@
+cmd-help         exit=0    stdout=   1749B 240cf2ad3ab527c2  stderr=     0B e3b0c44298fc1c14
+entropy          exit=0    stdout=   3217B 0e4de9df15940c92  stderr=     0B e3b0c44298fc1c14
+graphql          exit=0    stdout=  20016B 120f4af1a44ab73d  stderr=     0B e3b0c44298fc1c14
+help             exit=0    stdout=  25489B b5caebe5f634a382  stderr=     0B e3b0c44298fc1c14
+missing          exit=1    stdout=    590B 21f05a88b9f8a33d  stderr=     0B e3b0c44298fc1c14
+openapi          exit=0    stdout=   6332B 0a94e1205da9efa1  stderr=     0B e3b0c44298fc1c14
+unknown          exit=1    stdout=    193B 2d42a5c60bf53e84  stderr=     0B e3b0c44298fc1c14
+version          exit=0    stdout=      6B 4c7d245d1e1c2c70  stderr=     0B e3b0c44298fc1c14

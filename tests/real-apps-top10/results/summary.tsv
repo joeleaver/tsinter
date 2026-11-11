@@ -1,0 +1,11 @@
+project	node_cases	node_exit0	wasm_build	diagnostics	top_codes	run_verdicts
+rea	8	6	refuses	13	SC1010:12 SC0001:1	
+openclaw	6	4	internal-error	0		
+deepseek	5	3	refuses	41	SC0001:26 SC1010:15	
+opencode	4	3	refuses	35	SC2020:12 SC1090:10 SC2013:9 SC2009:2 SC2004:2	
+vue	3	3	refuses	205	SC0001:130 SC1010:75	
+n8n	3	3	refuses	178	SC0001:145 SC1010:25 :8	
+shadcn	5	4	refuses	41	SC0001:21 SC1010:20	
+pi	3	3	refuses	30	SC0001:26 SC1010:4	
+paperclip	5	4	refuses	9	SC1010:6 SC0001:3	
+opendesign	6	4	refuses	975	SC0001:750 SC1010:211 :14	

@@ -1,0 +1,182 @@
+## rea: 15935 root sites (17873 reached, cascades included)
+   6421 types:shape        e.g. D SC2009 src/domain/analysisErrorBase.ts:168 #cleanupDependencies: Set<AnalysisError> | undefined; -- values of type 'Set<AnalysisError> | undefined' cannot be compiled: the union shape is supported, but its arm 
+   4779 dep-edge           e.g. D SC2013 src/artifacts/ArtifactReader.ts:243 partialObservation: AnalysisPartialObservation | undefined; -- values from the 'zod' package run in the embedded dynamic engine, which this build does not include
+   1812 generic:fn         e.g. D SC1090 src/browser/ElectronFileScope.ts:55 return await this.#resources.run( -- calls of the generic method 'run' through this receiver (no compiled declaration with a body resolves statical
+    612 stdlib:js          e.g. D SC2020 src/domain/immutableJson.ts:5 const immutableSnapshots = new WeakSet<object>(); -- 'WeakSet<object>' is part of the standard library types but has no scriptc lowering yet
+    439 dyn:receiver       e.g. D SC1090 src/process/PrivateRuntimeRoot.ts:64 const runtime = WindowsPrivateRuntime.create( -- method calls like 'WindowsPrivateRuntime.create' is not supported yet
+    415 stdlib:node        e.g. D SC2020 src/domain/firmware/espImageStructures.ts:57 const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }); -- 'TextDecoder' is typed by @types/node but has no scriptc lowering yet
+    411 bigint             e.g. D SC2009 src/artifacts/ArtifactReader.ts:74 export const sameArtifactSourceIdentity = ( -- values of type '(expected: { readonly device: bigint; readonly inode: bigint; readonly size: bigint; readonly 
+    269 other              e.g. D SC1090 src/native/apple/losslessJson.ts:391 case "u": { -- fall-through between case bodies in a union-typed switch (end each case with break/return/throw/continue) is n
+    152 date               e.g. D SC1090 src/domain/evidenceErrors.ts:20 export class EvidenceIntegrityError extends AnalysisError { -- extending classes not declared in the program ('AnalysisError') is not supported yet
+    148 types:narrow       e.g. D SC1090 src/gpu/PtxKernels.ts:22 if (/\s/u.test(text[at]!)) { -- string indexing with this index/result shape (a number index typed 'string' lowers to charAt; use .charAt(i) u
+     84 error:shape        e.g. D SC1090 src/application/RegularFileRead.ts:96 super(`File is not valid UTF-8: ${path}`, { cause }); -- Error constructor options ('cause') are not supported yet
+     67 write:untyped      e.g. D SC1090 src/process/PrivateRuntimeRoot.ts:88 this.#closePromise ??= ( -- '??=' on non-variable targets (write it out: if (o.f === undefined) o.f = v) are not supported yet
+     59 spread             e.g. D SC1090 src/application/LinuxHopperPublisher.ts:122 ...(signal === undefined ? {} : { signal }), -- conditional spreads with effectful conditions in an 'any'-typed object literal (bind the condition to a const 
+     42 binding:blocked    e.g. D SC1090 src/domain/jsonSerialization.ts:212 const frame = openContainer( -- the reference to 'openContainer' (a binding form with no lowering) is not supported yet
+     35 cjs:require        e.g. D SC2011 src/domain/process/processCaptureCoverage.ts:140 export const processSourceTruncated = ( -- values of type '(capture: Pick<UnverifiedProcessCapture, "truncation_details">, source: "filesystem" | "intera
+     32 generator          e.g. D SC1071 src/domain/elfDeclaredRanges.ts:252 const declarations = yield* readElfTableDeclarations(prefix, fileSize); -- the value of 'yield*' (statement-position delegation compiles: 'yield* inner();' — bind the delegate's return 
+     30 fn:call-bind       e.g. D SC2009 src/sqlite/SqliteDatabaseWorkerExecution.ts:198 export const executeSqliteDatabaseWorker = async (request: { -- values of type '(request: { readonly input: { path: string; worker_timeout_ms?: number | undefined; table?: st
+     28 op:any             e.g. D SC1100 src/application/JsonFiles.ts:284 if (cause === signal.reason) return true; -- operators on 'unknown' values are not supported yet
+     20 destructure        e.g. D SC1031 src/domain/recordedTransportUrl.ts:169 for (const [start, nameEnd] of queryFields(query)) -- destructuring is not supported yet
+     14 module:builtin     e.g. D SC1010 src/application/JsonAuthenticationHeadroom.ts:2 import { getHeapStatistics } from "node:v8"; -- the 'node:v8' module (it observes V8 engine internals — heap statistics and snapshots, GC and CPU profiles, se
+     14 class:dyn          e.g. D SC1090 src/domain/analysisErrorPresentation.ts:324 if (error._tag === "ProcessCaptureError") -- reading the abstract property '_tag' through a 'AnalysisError'-typed receiver (abstract property declarations 
+     11 expr:assign        e.g. D SC1090 src/domain/analysisSettingDefinitions.ts:307 ): SettingDefinition => ANALYSIS_SETTINGS[id]; -- dynamic keyed reads of '{ asar.max_header_bytes: { appliesAt: string; defaultValue: number; environment: strin
+     10 tsgo:panic         e.g. D SC0004 src/domain/analysisView/environmentStateRules.ts:802 const shownKeys = (value: JsonValue, keys: readonly string[]): JsonValue => -- the TypeScript checker crashed answering a query here (an upstream typescript-go bug): panic: interface conver
+     10 container:elem     e.g. D SC1090 src/application/ProviderOperationExecution.ts:113 const judged = new Map<object, AnalysisPartialObservation | undefined>(); -- Map keys of type 'object' (Map keys must be string or number) is not supported yet
+      5 fn:value           e.g. D SC1090 src/application/Utf8JsonInput.ts:24 const stringLimitFailure = ( -- functions with optional or defaulted parameters as values, except where the target type spells the completed s
+      4 in:computed        e.g. D SC1090 src/pcap/PcapOutput.ts:239 if ("frame.number" in layers) { -- 'in' over index-signature keys (read the key and test '!== undefined' instead) are not supported yet
+      3 for:multi          e.g. D SC1090 src/domain/analysisView/environmentStateQueryCalls.ts:193 for (let index = 0, last = -1; index < records.length; index += 1) { -- multi-declaration for-loop initializers are not supported yet
+      2 es5:proto          e.g. D SC2020 src/domain/immutableJson.ts:265 prototype !== Object.prototype && -- 'Object.prototype' is part of the standard library types but has no scriptc lowering yet
+      2 typeof:static      e.g. D SC1090 src/domain/analysisView/environmentStateWriteExplain.ts:234 typeof ownMember(member, field) !== typeof value || -- typeof expressions on statically-typed values are not supported yet
+      1 tsc:missing-dep    e.g. D SC0001 src/frida/FridaInstrumentationManager.ts:8 FridaMessage, -- Module '"frida"' has no exported member 'FridaMessage'. Did you mean to use 'import FridaMessage from "frida"'
+      1 generic:class      e.g. D SC1090 src/application/RegularFileRead.ts:36 > extends RegularFileCleanupFailure<Value> { -- generic classes whose 'extends' clause mentions their own type parameters (each instantiation would need a dif
+      1 obj:computed       e.g. D SC1090 src/domain/analysisSnapshot.ts:251 [preparedEntryBrand]: true as const, -- computed property keys (compile-time-known keys fold — a pure expression whose checker type is one string or n
+      1 driver:dep-edge    e.g. D SC2013 .top10/rea-main.ts:9 await createCli(process.env, undefined).serve(args, { -- values from the 'incur' package run in the embedded dynamic engine, which this build does not include
+      1 symbol             e.g. D SC1090 src/domain/inputIssueProjection.ts:230 valueAtPath(input, [...path, guidance.expected]) !== undefined; -- a '(number | string)[]' value where '(number | string | symbol)[]' is expected: the slot would hold a COPY whe
+## deepseek: 43 root sites (43 reached, cascades included)
+     28 tsc:missing-dep    e.g. D SC0001 apps/cli/src/dump-config-schema.ts:9 import { generateConfigSchema, type ConfigSchemaDump } from '@deepseek-ai/dsh-ap -- Cannot find module '@deepseek-ai/dsh-app-boot' or its corresponding type declarations.
+      9 tsc:knock-on       e.g. D SC0001 apps/cli/src/dump-config.ts:56 const layers: ConfigDumpLayer[] = loaded.layers.map(layer => ({ -- Parameter 'layer' implicitly has an 'any' type.
+      4 driver:tsc:missing-dep e.g. D SC0001 apps/cli/src/bin.ts:9 import { getDshRuntimeVersion, loadLayeredEnv, StartupError } from '@deepseek-ai -- Cannot find module '@deepseek-ai/dsh-app-boot' or its corresponding type declarations.
+      1 dep-edge           e.g. D SC2013 apps/cli/src/args.ts:18 import { Command, CommanderError, InvalidArgumentError } from 'commander' -- importing 'commander' requires the embedded dynamic engine, which this build does not include — the package's 
+      1 driver:stdlib:node e.g. D SC2020 apps/cli/src/bin.ts:76 if (import.meta.main) { -- 'ImportMeta.main' is typed by @types/node but has no scriptc lowering yet
+## opencode: 31 root sites (35 reached, cascades included)
+     12 stdlib:js          e.g. D SC2020 packages/patchmark/src/html.ts:97 const blockHtmlCache = new WeakMap<BlockKind, { gfm: boolean; html: string }>() -- 'WeakMap<BlockKind, { gfm: boolean; html: string; }>' is part of the standard library types but has no scriptc
+      7 dep-edge           e.g. D SC2013 packages/util/src/bom.ts:34 export const readFile = Effect.fn("Bom.readFile")(function* (fs: FSUtil.Interfac -- values from the 'effect' package run in the embedded dynamic engine, which this build does not include
+      3 types:shape        e.g. D SC1090 packages/patchmark/src/html.ts:33 out += renderAlt(node.children) -- reading 'children' on a union-typed value (every arm must be an object/record with a same-typed field 'childre
+      2 driver:dep-edge    e.g. D SC2013 packages/util/.top10/opencode-main.ts:6 import { Result } from "effect"; -- importing 'effect' requires the embedded dynamic engine, which this build does not include — the package's imp
+      2 driver:generic:fn  e.g. D SC1090 packages/util/.top10/opencode-main.ts:43 if (Result.isFailure(r)) { -- calls of the generic method 'isFailure' with no defining object literal (the declaration is signature-only — o
+      2 driver:dyn:receiver e.g. D SC1090 packages/util/.top10/opencode-main.ts:105 const f = s.append(REPLY.slice(i, i + 17)); -- method calls like 's.append' is not supported yet
+      1 dyn:receiver       e.g. D SC1090 packages/patchmark/src/html.ts:128 let html = hit?.gfm === gfm ? hit[key] : undefined -- dynamic keyed reads of '{ gfm: boolean; loose: string | undefined; tight: string | undefined }' (the declared 
+      1 write:untyped      e.g. D SC1090 packages/patchmark/src/html.ts:132 entry[key] = html -- dynamic keyed writes to records without an index signature (declared fields of ONE shared type dispatch by key
+      1 driver:write:untyped e.g. D SC1090 packages/util/.top10/opencode-main.ts:118 process.exitCode = 2; -- assignment to non-variables are not supported yet
+## vue: 272 root sites (275 reached, cascades included)
+    162 tsc:missing-dep    e.g. D SC0001 packages/server-renderer/src/directives/model.ts:1 import { looseEqual, looseIndexOf } from 'shared/util' -- Cannot find module 'shared/util' or its corresponding type declarations.
+     30 binding:blocked    e.g. D SC1090 packages/server-renderer/src/index.ts:18 return _createRenderer( -- the reference to '_createRenderer' (a binding form with no lowering) is not supported yet
+     19 tsc:dom            e.g. D SC0001 src/platforms/web/runtime-with-compiler.ts:22 el?: string | Element, -- Cannot find name 'Element'.
+     18 tsc:ambient        e.g. D SC0001 src/platforms/web/compiler/directives/model.ts:24 if (__DEV__) { -- Cannot find name '__DEV__'.
+     17 types:shape        e.g. D SC2011 src/platforms/web/runtime/directives/model.ts:23 const directive = { -- values of type '{ inserted(el: any, binding: any, vnode: any, oldVnode: any): void; componentUpdated(el: any, 
+      6 tsc:knock-on       e.g. D SC0001 src/platforms/web/runtime-with-compiler.ts:61 // @ts-expect-error -- Unused '@ts-expect-error' directive.
+      6 write:untyped      e.g. D SC1090 src/platforms/web/runtime/index.ts:22 Vue.config.mustUseProp = mustUseProp -- assignment to non-variables are not supported yet
+      3 es5:proto          e.g. D SC1090 src/platforms/web/runtime/index.ts:33 Vue.prototype.__patch__ = inBrowser ? patch : noop -- assignment to non-variables are not supported yet
+      2 driver:op:any      e.g. D SC2011 .top10/vue-main.ts:21 console.log("render: " + r.render); -- the '+' operator on 'any'-typed values runs in the embedded dynamic engine, which this build does not include
+      2 driver:es5:proto   e.g. D SC1090 .top10/vue-main.ts:45 const app = new Vue({ -- constructing values other than classes declared in the program is not supported yet
+      2 class:dyn          e.g. D SC1090 src/platforms/web/runtime/components/transition.ts:90 let children: any = this.$slots.default -- references to 'this' in object literal methods are not supported yet
+      1 stdlib:js          e.g. D SC2020 src/platforms/web/runtime/patch.ts:10 export const patch: Function = createPatchFunction({ nodeOps, modules }) -- 'Function' is part of the standard library types but has no scriptc lowering yet
+      1 driver:types:shape e.g. D SC2011 .top10/vue-main.ts:34 const Card = Vue.extend({ -- values of type 'any' run in the embedded dynamic engine, which this build does not include
+      1 driver:stdlib:js   e.g. D SC2020 .top10/vue-globals.ts:4 const g = globalThis as unknown as Record<string, unknown>; -- 'globalThis' is part of the standard library types but has no scriptc lowering yet
+      1 dyn:receiver       e.g. D SC1090 src/platforms/web/runtime/components/transition-group.ts:36 delete props.mode -- 'delete' on 'unknown' receivers (process.env keys and pure Record<string, T> keys delete) are not supported ye
+      1 driver:write:untyped e.g. D SC1090 .top10/vue-main.ts:73 process.exitCode = 2; -- assignment to non-variables are not supported yet
+## n8n: 434 root sites (467 reached, cascades included)
+    108 tsc:knock-on       e.g. D SC0001 packages/workflow/src/common/find-ai-root-node-names.ts:23 for (const group of outputs) { -- 'outputs' is of type 'unknown'.
+     92 types:shape        e.g. D SC2011 packages/workflow/src/logger-proxy.ts:4 export let error: Logger['error'] = noOp; -- values of type '(message: string, metadata?: LogMetadata | undefined) => void' have no static representation b
+     61 tsc:missing-dep    e.g. D SC0001 packages/workflow/src/common/find-ai-root-node-names.ts:1 import { isUnknownArray } from '@n8n/utils/is-unknown-array'; -- Cannot find module '@n8n/utils/is-unknown-array' or its corresponding type declarations.
+     59 dep-edge           e.g. D SC2013 packages/workflow/src/extensions/number-extensions.ts:71 export function toDateTime(value: number, extraArgs: [DateTimeFormat]) { -- values from the '@types/luxon' package run in the embedded dynamic engine, which this build does not include
+     24 stdlib:js          e.g. D SC2020 packages/workflow/src/constants.ts:7 export const WAIT_INDEFINITELY = new Date('3000-01-01T00:00:00.000Z'); -- 'Date' is part of the standard library types but has no scriptc lowering yet
+     22 es5:proto          e.g. D SC1090 packages/workflow/src/utils.ts:17 BigInt.prototype.toJSON = function () { -- assignment to non-variables are not supported yet
+     15 date               e.g. D SC1090 packages/workflow/src/errors/abstract/execution-base.error.ts:9 export abstract class ExecutionBaseError extends BaseError { -- extending classes not declared in the program ('BaseError') is not supported yet
+     10 driver:dyn:receiver e.g. D SC1090 packages/workflow/.top10/n8n-main.ts:61 console.log(`${n.name}: parents=${JSON.stringify(wf.getParentNodes(n.name))} chi -- method calls like 'wf.getParentNodes' is not supported yet
+      8 dyn:receiver       e.g. D SC1090 packages/workflow/src/extensions/object-extensions.ts:36 const newObject = { ...value }; -- object spread of 'unknown' sources (only known record shapes spread — narrow first: check a discriminant field
+      8 binding:blocked    e.g. D SC1090 packages/workflow/src/expression-sandboxing.ts:20 const sanitizerIdentifier = b.identifier(sanitizerName); -- the reference to 'b' (a binding form with no lowering) is not supported yet
+      7 driver:types:shape e.g. D SC2011 packages/workflow/.top10/n8n-main.ts:9 const setDescription: INodeTypeDescription = { -- values of type 'INodeTypeDescription' have no static representation but run in the embedded dynamic engine, wh
+      6 other              e.g. D SC1090 packages/workflow/src/extensions/object-extensions.ts:38 delete (newObject as any)[name]; -- 'delete' of required record fields (a monomorphic shape cannot remove its slot — only optional fields delete, 
+      4 fn:call-bind       e.g. D SC1090 packages/workflow/src/extensions/array-extensions.ts:779 const removeDuplicates: Extension = unique.bind({}); -- Function.prototype.bind on a compiled function value (compiled calls are direct — no runtime 'this' or argumen
+      2 write:untyped      e.g. D SC1090 packages/workflow/src/extensions/array-extensions.ts:780 removeDuplicates.doc = { ...unique.doc, hidden: true }; -- assignment to non-variables are not supported yet
+      2 builtin:value      e.g. D SC1090 packages/workflow/src/extensions/extended-functions.ts:12 const min = Math.min; -- Math methods as values (call 'min' directly) are not supported yet
+      1 tsc:dom            e.g. D SC0001 packages/workflow/src/extensions/expression-extension.ts:140 typeof window !== 'object' ? 'global' : 'window', -- Cannot find name 'window'.
+      1 fn:value           e.g. D SC2007 packages/workflow/src/expressions/native-evaluation/index.ts:12 const { getPrototypeOf, keys } = Object; -- values of type '{ (o: object): string[]; (o: {}): string[]; }' cannot be compiled: the type declares multiple 
+      1 destructure        e.g. D SC1031 packages/workflow/src/expression-sandboxing.ts:92 const { value } = quasi; -- object destructuring of non-record values (the source is dyn-typed) are not supported yet
+      1 spread             e.g. D SC1090 packages/workflow/src/expressions/native-evaluation/grammar.ts:195 ...DATA_ROOTS, -- spreading '[string, string, string, string, string, string]' into a 'string[]' literal (only a same-element-ty
+      1 symbol             e.g. D SC1090 packages/workflow/src/extensions/extended-functions.ts:41 defineField(result, keys[i] as PropertyKey, values[i]); -- a checked cast of 'unknown' to 'number | string | symbol' (a dynamic value can only be validated against JSON-
+      1 driver:write:untyped e.g. D SC1090 packages/workflow/.top10/n8n-main.ts:111 process.exitCode = 2; -- assignment to non-variables are not supported yet
+## shadcn: 46 root sites (46 reached, cascades included)
+     30 driver:tsc:missing-dep e.g. D SC0001 packages/shadcn/src/index.ts:2 import { add } from "@/src/commands/add" -- Cannot find module '@/src/commands/add' or its corresponding type declarations.
+      8 tsc:missing-dep    e.g. D SC0001 packages/shadcn/src/utils/registry-api.ts:1 import { handleError } from "@/src/utils/handle-error" -- Cannot find module '@/src/utils/handle-error' or its corresponding type declarations.
+      4 driver:dep-edge    e.g. D SC2013 packages/shadcn/src/index.ts:16 import { Command } from "commander" -- importing 'commander' requires the embedded dynamic engine, which this build does not include — the package's 
+      2 tsc:knock-on       e.g. D SC0001 packages/shadcn/src/utils/registry-api.ts:46 const paths = tree.map((item) => `styles/${style}/${item.name}.json`) -- Parameter 'item' implicitly has an 'any' type.
+      1 driver:module:builtin e.g. D SC1010 packages/shadcn/src/index.ts:18 import packageJson from "../package.json" -- the '../package.json' import (Node refuses its import attributes: Module "file:///home/tsinter/.cache/tsinter-
+      1 dep-edge           e.g. D SC2013 packages/shadcn/src/utils/registry-api.ts:10 import { z } from "zod" -- importing 'zod' requires the embedded dynamic engine, which this build does not include — the package's implem
+## pi: 47 root sites (53 reached, cascades included)
+     14 tsc:knock-on       e.g. D SC0001 packages/agent/src/agent-loop.ts:202 reasoning: -- Object literal may only specify known properties, and 'reasoning' does not exist in type 'AgentLoopConfig'.
+      6 driver:tsc:knock-on e.g. D SC0001 packages/agent/.top10/pi-main.ts:31 msg.content.forEach((c, i) => { -- Parameter 'c' implicitly has an 'any' type.
+      6 tsc:missing-dep    e.g. D SC0001 packages/agent/src/agent-loop.ts:20 } from "@earendil-works/pi-ai"; -- Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+      6 driver:types:shape e.g. D SC2011 packages/agent/.top10/pi-main.ts:48 const wordCount: AgentTool<typeof wordCountSchema, { words: number }> = { -- values of type 'AgentTool<any, { words: number; }>' have no static representation but run in the embedded dyna
+      4 driver:tsc:missing-dep e.g. D SC0001 packages/agent/.top10/pi-main.ts:6 import { createAssistantMessageEventStream, type AssistantMessage, type Message, -- Cannot find module '@earendil-works/pi-ai' or its corresponding type declarations.
+      4 driver:dyn:receiver e.g. D SC1090 packages/agent/.top10/pi-main.ts:105 await agent.prompt("Count the words and add the numbers."); -- method calls like 'agent.prompt' is not supported yet
+      3 types:shape        e.g. D SC2011 packages/agent/src/stream-fn.ts:3 let defaultStreamFn: StreamFn | undefined; -- values of type 'StreamFn | undefined' have no static representation but run in the embedded dynamic engine, wh
+      2 driver:binding:blocked e.g. D SC1090 packages/agent/.top10/pi-main.ts:47 const wordCountSchema = obj({ text: str({ description: "text to count" }) }); -- the reference to 'obj' (a binding form with no lowering) is not supported yet
+      1 driver:expr:assign e.g. D SC1090 packages/agent/.top10/pi-main.ts:17 const tick = () => (clock += 1000); -- compound assignment as an expression (write `x op= e` as a statement, or spell out `x = x op e`) is not suppor
+      1 driver:write:untyped e.g. D SC1090 packages/agent/.top10/pi-main.ts:137 process.exitCode = 2; -- assignment to non-variables are not supported yet
+## paperclip: 250 root sites (289 reached, cascades included)
+    159 dep-edge           e.g. D SC2013 packages/shared/src/config-schema.ts:12 export const configMetaSchema = z.object({ -- values from the 'zod' package run in the embedded dynamic engine, which this build does not include
+     26 driver:dep-edge    e.g. D SC2013 cli/src/index.ts:63 const program = new Command(); -- values from the 'commander' package run in the embedded dynamic engine, which this build does not include
+     18 binding:blocked    e.g. D SC1090 cli/src/config/home.ts:24 return resolveSharedPaperclipInstanceRoot({ instanceId }); -- the reference to 'resolveSharedPaperclipInstanceRoot' (a binding form with no lowering) is not supported yet
+     14 stdlib:node        e.g. D SC2020 cli/src/commands/client/company.ts:1026 const inlineEstimateUtf8 = new TextEncoder(); -- 'TextEncoder' is typed by @types/node but has no scriptc lowering yet
+      8 other              e.g. D SC1090 packages/shared/src/telemetry/client.ts:379 if (typeof timer === "object" && timer !== null && "unref" in timer) { -- 'in' on 'number' receivers (only process.env, Error instances, record-typed values, and unions of fixed record
+      6 module:builtin     e.g. D SC1010 cli/src/client/mcp-auth.ts:4 import { DatabaseSync } from "node:sqlite"; -- the 'node:sqlite' module (it wraps the SQLite library bundled into the node executable, and scriptc binaries b
+      6 types:shape        e.g. D SC2009 cli/src/commands/channels.ts:9 const defaultRunCommand: CommandRunner = (command, args, options) => -- values of type 'CommandRunner' cannot be compiled: the function shape is supported, but its parameter 'options
+      5 stdlib:js          e.g. D SC2020 cli/src/install-store.ts:63 fs.writeFileSync(temporaryPath, contents, { mode, flag: "wx" }); -- 'writeFileSync with the flag option' is part of the standard library types but has no scriptc lowering yet
+      3 tsc:dom            e.g. D SC0001 cli/src/client/http.ts:95 body: body as unknown as BodyInit, -- Cannot find name 'BodyInit'.
+      2 dyn:receiver       e.g. D SC1090 cli/src/onboard-service.ts:64 const body = await response.json() as { status?: unknown }; -- a checked cast of 'any' to '{ status: unknown }' (an 'any' value can only be validated against JSON-representa
+      1 driver:binding:blocked e.g. D SC1090 cli/src/index.ts:284 warnIfUnsupportedNodeVersion(process.versions.node, (message) => console.warn(me -- the reference to 'warnIfUnsupportedNodeVersion' (a binding form with no lowering) is not supported yet
+      1 fn:value           e.g. D SC1090 cli/src/onboard-service.ts:76 waitUntilReady: waitUntilDashboardReady, -- functions with optional or defaulted parameters as values, except where the target type spells the completed s
+      1 container:elem     e.g. D SC1090 cli/src/commands/worktree.ts:1783 const activeSeedInterruptHandlers = new Map<string, (signal: NodeJS.Signals) =>  -- Map values of type '(signal: Signals) => void' (Map values must be number, string, boolean, records, class ins
+## opendesign: 1186 root sites (1214 reached, cascades included)
+    637 tsc:missing-dep    e.g. D SC0001 apps/daemon/src/agent-companion-setup.ts:7 import { createPackageManagerInvocation } from '@open-design/platform'; -- Cannot find module '@open-design/platform' or its corresponding type declarations.
+    319 tsc:knock-on       e.g. D SC0001 apps/daemon/src/agent-protocol/codex-app-server/thread-cleanup.ts:111 const root = snapshot.find(entry => entry.pid === child.pid -- Parameter 'entry' implicitly has an 'any' type.
+    121 types:shape        e.g. D SC2009 apps/daemon/src/mcp-observability.ts:61 const ALLOWED_DISTRIBUTION = new Set<AnalyticsDistributionMechanism>([ -- values of type 'Set<AnalyticsDistributionMechanism>' cannot be compiled: the Set shape is supported, but its e
+     21 stdlib:js          e.g. D SC2020 apps/daemon/src/agent-protocol/acp/emission-provenance.ts:6 const hostSynthesizedEmissions = new WeakSet<object>(); -- 'WeakSet<object>' is part of the standard library types but has no scriptc lowering yet
+     18 other              e.g. D SC1090 apps/daemon/src/tools-connectors-cli.ts:1105 ...(result.error === undefined ? {} : { error: redactSensitiveProcessOutput(resu -- conditional spread of 'error' over an earlier 'error' (the desugar keeps one entry per name — restructure so e
+     17 stdlib:node        e.g. D SC2020 apps/daemon/src/tools-connectors-cli.ts:172 function writeJson(value: unknown, stream: NodeJS.WriteStream = process.stdout): -- 'WriteStream' is typed by @types/node but has no scriptc lowering yet
+     17 write:untyped      e.g. D SC1090 apps/daemon/src/tools-connectors-cli.ts:256 url.pathname = url.pathname.replace(/\/+$/u, ''); -- assignment to non-variables are not supported yet
+      8 driver:write:untyped e.g. D SC1090 apps/daemon/src/cli.ts:1064 process.exitCode = exitCode; -- assignment to non-variables are not supported yet
+      6 container:elem     e.g. D SC1090 apps/daemon/src/app-config.ts:206 const AGENT_CLI_ENV_KEYS: ReadonlyMap<string, ReadonlySet<string>> = new Map([ -- Map values of type 'Set<string>' (Map values must be number, string, boolean, records, class instances, arrays
+      4 driver:tsc:missing-dep e.g. D SC1010 apps/daemon/src/cli.ts:22 import { SidecarFactory } from '@open-design/sidecar'; -- the '@open-design/sidecar' package (nothing installed resolves it) is not supported yet
+      4 dyn:receiver       e.g. D SC1090 apps/daemon/src/tools-connectors-cli.ts:2436 if (sourceNames.length === 0) return []; -- 'number[]' values where 'string[]' is expected is not supported yet
+      3 dep-edge           e.g. D SC2013 apps/daemon/src/connectionTest.ts:323 const assetDispatcher = new Agent({ -- values from the 'undici' package run in the embedded dynamic engine, which this build does not include
+      2 driver:types:shape e.g. D SC2011 apps/daemon/src/cli.ts:410 const SUBCOMMAND_MAP = { -- values of type '{ agent: (args: any) => Promise<void>; artifacts: (args: any) => Promise<void>; media: (args: 
+      2 error:shape        e.g. D SC1090 apps/daemon/src/tools-live-artifacts-cli.ts:124 if (error && typeof error === 'object' && 'code' in error && error.code === 'ENO -- 'typeof' catch-binding tests against "object" (only "string"/"number"/"boolean" narrow a catch binding; use 'i
+      2 driver:op:any      e.g. D SC2011 apps/daemon/src/cli.ts:1121 if (args.indexOf(flag, idx + 1) !== -1) { -- the '+' operator on 'any'-typed values runs in the embedded dynamic engine, which this build does not include
+      1 module:builtin     e.g. D SC1010 apps/daemon/src/services/daemon-health.ts:35 import v8 from 'node:v8'; -- the 'node:v8' module (it observes V8 engine internals — heap statistics and snapshots, GC and CPU profiles, se
+      1 generator          e.g. D SC1070 apps/daemon/src/mcp-live-artifacts-server.ts:252 for await (const line of rl) { -- 'for await' (async iteration over anything but process.stdin and readable streams) is not supported yet
+      1 types:narrow       e.g. D SC1090 apps/daemon/src/tools-connectors-cli.ts:2408 .filter((name): name is string => name !== undefined); -- narrowing '.filter' with a hand-written type predicate (a written 'x is T' is an unchecked assertion nothing v
+      1 driver:stdlib:js   e.g. D SC2012 apps/daemon/src/cli.ts:1111 const { DESIGN_DIRECTIONS, formatDirectionSpecText } = await import( -- 'import()' runs in the embedded dynamic engine, which this build does not include
+      1 binding:blocked    e.g. D SC1090 apps/daemon/src/codex-config-normalize.ts:279 const defaultIO: CodexConfigIO = { readFile, writeFile, rename, unlink }; -- the reference to 'readFile' (a binding form with no lowering) is not supported yet
+
+## census (projects blocked, root sites) — driver sites excluded
+   7 proj   6663 sites  types:shape        types with no static representation: unions with fields, intersections  {'rea': 6421, 'opendesign': 121, 'n8n': 92, 'vue': 17, 'paperclip': 6, 'opencode': 3, 'pi': 3}
+   7 proj   5009 sites  dep-edge           import of an npm package that is not compiled statically  {'rea': 4779, 'paperclip': 159, 'n8n': 59, 'opencode': 7, 'opendesign': 3, 'deepseek': 1, 'shadcn': 1}
+   7 proj    903 sites  tsc:missing-dep    unresolved import (dependency or generated file absent; survey artifac  {'opendesign': 637, 'vue': 162, 'n8n': 61, 'deepseek': 28, 'shadcn': 8, 'pi': 6, 'rea': 1}
+   6 proj    675 sites  stdlib:js          ECMAScript stdlib member with no lowering (reverse, splice/3, substr,   {'rea': 612, 'n8n': 24, 'opendesign': 21, 'opencode': 12, 'paperclip': 5, 'vue': 1}
+   6 proj    458 sites  tsc:knock-on       type errors downstream of an unresolved import or lost ambient types (  {'opendesign': 319, 'n8n': 108, 'pi': 14, 'deepseek': 9, 'vue': 6, 'shadcn': 2}
+   6 proj    455 sites  dyn:receiver       method calls, member reads, for-in, switch, spread on any/unknown rece  {'rea': 439, 'n8n': 8, 'opendesign': 4, 'paperclip': 2, 'opencode': 1, 'vue': 1}
+   5 proj     99 sites  binding:blocked    reference to a binding whose declaration was refused or has no lowerin  {'rea': 42, 'vue': 30, 'paperclip': 18, 'n8n': 8, 'opendesign': 1}
+   5 proj     93 sites  write:untyped      writes through untyped or nested receivers: o.a.b = v, o[k] = v, o.n++  {'rea': 67, 'opendesign': 17, 'vue': 6, 'n8n': 2, 'opencode': 1}
+   4 proj    301 sites  other              uncategorized  {'rea': 269, 'opendesign': 18, 'paperclip': 8, 'n8n': 6}
+   3 proj    446 sites  stdlib:node        Node API member with no lowering (path.parse, process.*, fs.*, stream.  {'rea': 415, 'opendesign': 17, 'paperclip': 14}
+   3 proj     27 sites  es5:proto          ES5 constructors and prototype wiring: X.prototype.m = fn, new on a fu  {'n8n': 22, 'vue': 3, 'rea': 2}
+   3 proj     23 sites  tsc:dom            browser globals: no DOM lib (document, window, HTMLElement, fetch type  {'vue': 19, 'paperclip': 3, 'n8n': 1}
+   3 proj     21 sites  module:builtin     Node builtin module with no support (SC1010, node:* import fences)  {'rea': 14, 'paperclip': 6, 'opendesign': 1}
+   3 proj     17 sites  container:elem     Map/Set/array element types outside the supported kinds  {'rea': 10, 'opendesign': 6, 'paperclip': 1}
+   3 proj      7 sites  fn:value           functions as values: optional/defaulted params, overloads, generics ke  {'rea': 5, 'n8n': 1, 'paperclip': 1}
+   2 proj    167 sites  date               Date values  {'rea': 152, 'n8n': 15}
+   2 proj    149 sites  types:narrow       narrowing forms: hand-written type predicates, ?? that changes the res  {'rea': 148, 'opendesign': 1}
+   2 proj     86 sites  error:shape        Error specifics: constructor options (cause), overriding Error methods  {'rea': 84, 'opendesign': 2}
+   2 proj     60 sites  spread             spreads beyond same-shape arrays and one-property conditional object s  {'rea': 59, 'n8n': 1}
+   2 proj     34 sites  fn:call-bind       Function.prototype.call/apply/bind and `arguments` on compiled functio  {'rea': 30, 'n8n': 4}
+   2 proj     33 sites  generator          async generators, generator methods, for-await beyond streams, .next(v  {'rea': 32, 'opendesign': 1}
+   2 proj     21 sites  destructure        destructuring beyond typed record sources: absent fields, optional pat  {'rea': 20, 'n8n': 1}
+   2 proj     16 sites  class:dyn          class objects used dynamically: statics via a class value, extending b  {'rea': 14, 'vue': 2}
+   2 proj      2 sites  symbol             symbol-keyed access outside class fields  {'rea': 1, 'n8n': 1}
+   1 proj   1812 sites  generic:fn         generic methods and arrows in forms with no monomorphized home  {'rea': 1812}
+   1 proj    411 sites  bigint             bigint  {'rea': 411}
+   1 proj     35 sites  cjs:require        require() off top level, computed, or as a value; createRequire; impor  {'rea': 35}
+   1 proj     28 sites  op:any             operators on any-typed values (|, >>>, ===, +=, comparisons), loose eq  {'rea': 28}
+   1 proj     18 sites  tsc:ambient        name not found: usually an ambient .d.ts the tsconfig includes, which   {'vue': 18}
+   1 proj     11 sites  expr:assign        assignments and side effects in expression position (x op= e as a valu  {'rea': 11}
+   1 proj     10 sites  tsgo:panic         typescript-go checker panic (SC0004)  {'rea': 10}
+   1 proj      4 sites  in:computed        `in` / hasOwnProperty with computed keys, dyn.hasKey  {'rea': 4}
+   1 proj      3 sites  for:multi          multi-declarator `for (let i = 0, n = ...)`  {'rea': 3}
+   1 proj      2 sites  typeof:static      typeof on statically typed values  {'rea': 2}
+   1 proj      2 sites  builtin:value      builtin globals, Math or string methods as values (#84)  {'n8n': 2}
+   1 proj      1 sites  generic:class      generic class hierarchies  {'rea': 1}
+   1 proj      1 sites  obj:computed       runtime-keyed (computed-key) object literals holding methods, spreads,  {'rea': 1}

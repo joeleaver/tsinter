@@ -1,0 +1,7 @@
+== /home/tsinter/.cache/tsinter-dl/top10/res/openclaw/wasm 1 181s
+  completion     MISSING                                           t node=58.523 lane=?
+  config-get     MISSING                                           t node=15.770 lane=?
+  config-help    MISSING                                           t node=9.034 lane=?
+  help           MISSING                                           t node=11.885 lane=?
+  unknown        MISSING                                           t node=20.415 lane=?
+  version        MISSING                                           t node=2.574 lane=?

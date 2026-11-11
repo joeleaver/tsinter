@@ -1,0 +1,3 @@
+bad              exit=0    stdout=    282B f703fcc03e39298d  stderr=     0B e3b0c44298fc1c14
+compile          exit=0    stdout=   1332B dc896439469c3a14  stderr=     0B e3b0c44298fc1c14
+ssr              exit=0    stdout=    564B 1061ce305309e0fc  stderr=     0B e3b0c44298fc1c14

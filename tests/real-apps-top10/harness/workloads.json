@@ -1,0 +1,417 @@
+{
+ "rea": {
+  "cwd": ".",
+  "entry": "@drivers/rea-main.ts",
+  "driverFiles": [
+   "@drivers/rea-fixtures"
+  ],
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "cmd-help",
+    "args": [
+     "inspect-api-contract",
+     "--help"
+    ]
+   },
+   {
+    "name": "openapi",
+    "args": [
+     "inspect-api-contract",
+     ".top10/rea-fixtures/petstore.openapi.json",
+     "--format",
+     "json"
+    ]
+   },
+   {
+    "name": "graphql",
+    "args": [
+     "inspect-api-contract",
+     ".top10/rea-fixtures/library.graphql",
+     "--contract-format",
+     "graphql-sdl",
+     "--format",
+     "json"
+    ]
+   },
+   {
+    "name": "entropy",
+    "args": [
+     "inspect-byte-entropy",
+     ".top10/rea-fixtures/petstore.openapi.json",
+     "--block-size",
+     "256",
+     "--format",
+     "json"
+    ]
+   },
+   {
+    "name": "missing",
+    "args": [
+     "inspect-byte-entropy",
+     ".top10/rea-fixtures/nope.bin"
+    ]
+   },
+   {
+    "name": "unknown",
+    "args": [
+     "frobnicate"
+    ]
+   }
+  ]
+ },
+ "openclaw": {
+  "cwd": ".",
+  "entry": "src/entry.ts",
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "config-help",
+    "args": [
+     "config",
+     "--help"
+    ]
+   },
+   {
+    "name": "config-get",
+    "args": [
+     "config",
+     "get",
+     "gateway.port"
+    ]
+   },
+   {
+    "name": "completion",
+    "args": [
+     "completion",
+     "--shell",
+     "bash"
+    ]
+   },
+   {
+    "name": "unknown",
+    "args": [
+     "frobnicate"
+    ]
+   }
+  ]
+ },
+ "deepseek": {
+  "cwd": "apps/cli",
+  "entry": "apps/cli/src/bin.ts",
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "schema",
+    "args": [
+     "--profile",
+     "web",
+     "--dump-config-schema"
+    ]
+   },
+   {
+    "name": "default-config",
+    "args": [
+     "web",
+     "--dump-default-config"
+    ]
+   },
+   {
+    "name": "no-profile",
+    "args": [
+     "--dump-config-schema"
+    ]
+   }
+  ]
+ },
+ "opencode": {
+  "cwd": "packages/util",
+  "driverDir": "packages/util/.top10",
+  "entry": "@drivers/opencode-main.ts",
+  "cases": [
+   {
+    "name": "patch",
+    "args": [
+     "patch"
+    ]
+   },
+   {
+    "name": "badpatch",
+    "args": [
+     "badpatch"
+    ]
+   },
+   {
+    "name": "markdown",
+    "args": [
+     "markdown"
+    ]
+   },
+   {
+    "name": "usage",
+    "args": [
+     "bogus"
+    ]
+   }
+  ]
+ },
+ "vue": {
+  "cwd": ".",
+  "entry": "@drivers/vue-main.ts",
+  "driverFiles": [
+   "@drivers/vue-globals.ts"
+  ],
+  "nodeEmit": "full",
+  "cases": [
+   {
+    "name": "compile",
+    "args": [
+     "compile"
+    ]
+   },
+   {
+    "name": "ssr",
+    "args": [
+     "ssr"
+    ]
+   },
+   {
+    "name": "bad",
+    "args": [
+     "bad"
+    ]
+   }
+  ]
+ },
+ "n8n": {
+  "cwd": "packages/workflow",
+  "driverDir": "packages/workflow/.top10",
+  "entry": "@drivers/n8n-main.ts",
+  "cases": [
+   {
+    "name": "graph",
+    "args": [
+     "graph"
+    ]
+   },
+   {
+    "name": "params",
+    "args": [
+     "params"
+    ]
+   },
+   {
+    "name": "expr",
+    "args": [
+     "expr"
+    ]
+   }
+  ]
+ },
+ "shadcn": {
+  "cwd": "apps/v4",
+  "entry": "packages/shadcn/src/index.ts",
+  "driverFiles": [
+   "@drivers/shadcn-registry.json"
+  ],
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "info",
+    "args": [
+     "info",
+     "--json"
+    ]
+   },
+   {
+    "name": "build",
+    "args": [
+     "build",
+     "../../.top10/shadcn-registry.json",
+     "--output",
+     "../../.top10/shadcn-out"
+    ],
+    "clean": [
+     "../../.top10/shadcn-out"
+    ],
+    "collect": [
+     "../../.top10/shadcn-out/registry.json",
+     "../../.top10/shadcn-out/utils.json",
+     "../../.top10/shadcn-out/button.json",
+     "../../.top10/shadcn-out/alert.json",
+     "../../.top10/shadcn-out/card.json"
+    ]
+   },
+   {
+    "name": "build-missing",
+    "args": [
+     "build",
+     "no-such-registry.json"
+    ]
+   }
+  ]
+ },
+ "pi": {
+  "cwd": "packages/agent",
+  "driverDir": "packages/agent/.top10",
+  "entry": "@drivers/pi-main.ts",
+  "cases": [
+   {
+    "name": "loop",
+    "args": [
+     "loop"
+    ]
+   },
+   {
+    "name": "badargs",
+    "args": [
+     "badargs"
+    ]
+   },
+   {
+    "name": "steer",
+    "args": [
+     "steer"
+    ]
+   }
+  ]
+ },
+ "paperclip": {
+  "cwd": "cli",
+  "entry": "cli/src/index.ts",
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "env",
+    "args": [
+     "env"
+    ]
+   },
+   {
+    "name": "issue-help",
+    "args": [
+     "issue",
+     "--help"
+    ]
+   },
+   {
+    "name": "unknown",
+    "args": [
+     "frobnicate"
+    ]
+   }
+  ]
+ },
+ "opendesign": {
+  "cwd": "apps/daemon",
+  "entry": "apps/daemon/src/cli.ts",
+  "timeout": 300,
+  "cases": [
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "directions",
+    "args": [
+     "tools",
+     "directions"
+    ]
+   },
+   {
+    "name": "directions-json",
+    "args": [
+     "tools",
+     "directions",
+     "--json"
+    ]
+   },
+   {
+    "name": "direction-one",
+    "args": [
+     "tools",
+     "directions",
+     "--id",
+     "modern-minimal"
+    ]
+   },
+   {
+    "name": "direction-bad",
+    "args": [
+     "tools",
+     "directions",
+     "--id",
+     "no-such-direction"
+    ]
+   },
+   {
+    "name": "unknown",
+    "args": [
+     "--version"
+    ]
+   }
+  ]
+ }
+}
