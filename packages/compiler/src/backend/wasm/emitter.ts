@@ -19594,15 +19594,26 @@ class Assembler {
    * `closure` already pushes. C is immune for free (a ScrClosure is
    * always a real pointer); this lane is immune by discipline. */
 
-  /** Unit A2: whether a defineGetter's getter was written AFTER every
-   * data member of the literal it defines onto (the only order the front
-   * end's append-the-getters lowering reproduces). The literal is the
+  /** Unit A2: whether a defineGetter's getter lands at its source
+   * position among the data members of the literal it defines onto:
+   * written after every data member, or holding its placeholder slot in
+   * the literal (GH #181), with no later data member of its name. The
+   * literal is the
    * objLit at the base of the defineGetter / objSpread chain, plus any
    * objLit an objSpread merges; a member without a position never
    * disqualifies. */
   private islandGetterInOrder(e: WExpr & { kind: "jsOp" }): boolean {
     const at = e.loc?.start;
     if (at === undefined) return true;
+    // GH #181: the front end puts a placeholder for the getter's key in the
+    // literal at the getter's source position, and objPut replaces it in
+    // place, so later data members are in order. Only a LATER data member
+    // of the same name (which in Node replaces the accessor) cannot be.
+    const keyArg = e.args[1]!;
+    const name = keyArg.kind === "jsMarshal" && keyArg.value.kind === "strLit" ? keyArg.value.value : null;
+    const end = e.loc?.end ?? at;
+    let slot = false;
+    let later = false;
     const lits: WExpr[] = [];
     let base: WExpr = e.args[0]!;
     for (;;) {
@@ -19623,10 +19634,16 @@ class Assembler {
       for (let i = 0; i < lit.args.length; i += 2) {
         const k = lit.args[i]!;
         const kAt = k.loc?.start ?? (k.kind === "jsMarshal" ? k.value.loc?.start : undefined);
-        if (kAt !== undefined && kAt > at) return false;
+        const kName = k.kind === "jsMarshal" && k.value.kind === "strLit" ? k.value.value : null;
+        if (name !== null && kName === name) {
+          if (kAt !== undefined && kAt >= end) return false;
+          slot = true;
+          continue;
+        }
+        if (kAt !== undefined && kAt > at) later = true;
       }
     }
-    return true;
+    return slot || !later;
   }
 
   private readonly dynFnSigIds = new Map<string, number>();
@@ -33817,10 +33834,12 @@ class Assembler {
           // getter's FUNC box, defined onto the literal the front end has
           // already built (args are the object, the marshaled key and the
           // getter), answering the object for chaining. The front end
-          // appends every getter AFTER the literal's data members, so a
-          // getter written BEFORE a data member would take the wrong own-
-          // key position (Node keeps source order): that shape refuses by
-          // name at compile time rather than enumerate out of order.
+          // defines every getter after the literal is built, over a
+          // placeholder at the getter's own position (GH #181), which
+          // objPut replaces in place. A shape whose order that cannot
+          // reproduce (a later data member of the getter's name, a getter
+          // with no slot before a data member) refuses by name at compile
+          // time rather than enumerate out of order.
           case "defineGetter": {
             const keyArg = e.args[1]!;
             if (keyArg.kind !== "jsMarshal" || keyArg.value.kind !== "strLit") {

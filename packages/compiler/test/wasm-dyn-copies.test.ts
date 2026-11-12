@@ -218,7 +218,8 @@ const data: any = JSON.parse('[1]');
 const out: any = data.map(() => shared);
 shared.n = 2;
 console.log(out);`,
-    refused: "fn",
+    // S128's result amendment: the function literal's result takes the
+    // dynamic arm (it returns the shared value itself), matches Node.
   },
 
   // A constructor's dynamic parameter (reached through `new`, not a direct call).

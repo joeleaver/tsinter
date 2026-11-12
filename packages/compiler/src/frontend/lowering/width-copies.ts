@@ -2477,6 +2477,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       }
       return e;
     };
+    /** A module global read inside a function other than a module's init:
+     * the binding still holds the value after the function returns (and
+     * across its calls), so a value read from it is never one nothing else
+     * holds. */
+    const heldElsewhere = (fn: string, id: string): boolean => globals.has(id) && !/^%init\./.test(fn);
+    /** A function literal whose result is on the dynamic arm this pass. */
+    const resultOnArm = (fn: string): boolean => {
+      const n = L.dynArmFnNodes.get(fn);
+      return n !== undefined && L.dynArmSites.has(`ret:${dynArmKey(n)}`);
+    };
     /** A binding assigned exactly once, never captured, with that value. */
     const onlyValue = (fn: string, id: string): IrExpr | null => {
       const b = bindings.get(bkey(fn, id));
@@ -2498,6 +2508,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "unionWrap":
         case "upcast":
           return deepFresh(e.value, fn, depth + 1);
+        case "dynCheck":
+          // The checked copy of a dynamic value nothing else holds (a
+          // JavaScript literal `[]` or `Object.keys(o)` checked into its
+          // inferred type): the copy is all there is.
+          return uniqueDyn(e.value, fn, depth + 1);
         case "ternary":
           return deepFresh(e.then, fn, depth + 1) && deepFresh(e.else_, fn, depth + 1);
         case "logical":
@@ -2526,7 +2541,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           return true;
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
-          return !!b && !b.captured && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
+          return !!b && !b.captured && !heldElsewhere(fn, e.localId) && b.assigns.length === 1 && b.uses.length === 1 && deepFresh(b.assigns[0], fn, depth + 1);
         }
         case "libCall":
           // The runtime builds the composites it returns (`s.split(" ")`, a
@@ -2620,7 +2635,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // One read in all: every value the binding ever holds is fresh
           // (an evolving `let flags = []` reassigned from a fresh result),
           // so the one read takes a value nothing else holds.
-          if (!b || b.captured || b.assigns.length === 0 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
+          if (!b || b.captured || heldElsewhere(fn, e.localId) || b.assigns.length === 0 || (dynUses.get(bkey(fn, e.localId)) ?? []).length !== 1) return false;
           return b.assigns.every((a) => uniqueDyn(a, fn, depth + 1));
         }
         default:
@@ -3027,12 +3042,20 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         };
         scan(f.body);
         const what = `its result typed '${L.fmt(f.returnType)}'`;
+        // Unit U2 (dyn-arm.ts): a refused result of a function literal
+        // takes the dynamic arm in the next pass, as its parameters do.
+        const fnNode = L.dynArmFnNodes.get(name);
+        const param = fnNode !== undefined ? `ret:${dynArmKey(fnNode)}` : undefined;
+        const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         for (const v0 of rets) {
           const v = unwrap(v0);
-          if (!v || deepFresh(v, name)) continue;
-          if (anyWritten(refsOf(v.type).refs, null)) return { why: ORIG_WRITTEN, what };
-          if (dynWritten(null, null)) return { why: DYN_WRITE_TO, what };
-          if (dynIdentity || anyIdentity(refsOf(v.type).refs)) return { why: DYN_SAME, what };
+          // A result nothing else holds once the function returns (built
+          // from its own locals): the copy the box hands out is the only
+          // one.
+          if (!v || deepFresh(v, name) || ownedTyped(v, name)) continue;
+          if (anyWritten(refsOf(v.type).refs, null)) return out(ORIG_WRITTEN);
+          if (dynWritten(null, null)) return out(DYN_WRITE_TO);
+          if (dynIdentity || anyIdentity(refsOf(v.type).refs)) return out(DYN_SAME);
         }
       }
       return null;
@@ -3042,6 +3065,16 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     let armParam: string | null = null;
     const judgedFns = new Map<string, { why: string; what: string; param?: string } | null>();
     if (dynIdentity) for (const k of islandEntered) identity.add(k);
+    // The program functions boxed into dynamic values (dynamic code calls
+    // them, and what they return is handed to it), and the functions whose
+    // result is on the dynamic arm; an unnamed boxed function (`open`)
+    // leaves the copies inside it to the ordinary judgement.
+    const boxedIntoDyn = new Set<string>();
+    for (const s of dynSites) {
+      if (refsOf(s.t).fns.length === 0 && s.t.kind !== "func") continue;
+      for (const name of boxedFns(s.arg, s.where).fns) boxedIntoDyn.add(name);
+    }
+    for (const name of byName.keys()) if (resultOnArm(name)) boxedIntoDyn.add(name);
     judgingDyn = true;
     for (const s of dynSites) {
       let why: string | null = null;
@@ -3086,7 +3119,13 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // lives in (and what that can call) runs, unless it suspends.
           const window = copyWindow(s);
           const viaHolder = s.dest === null && holderBinding(s) !== null;
-          if (!viaHolder && typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
+          // In a function dynamic code calls, a copy that lands in no
+          // binding of its own may be part of what the function hands back
+          // (`() => [cache]`, `() => ({ c: cache })`): it lives on after the
+          // function returns, so any dynamic write or identity test anywhere
+          // could tell it from the original.
+          if (s.dest === null && boxedIntoDyn.has(s.where) && (dynWritten(null, null) || dynIdentity || anyIdentity(refs))) why = dynWritten(null, null) ? DYN_WRITE_FROM : DYN_SAME;
+          else if (!viaHolder && typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
           else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) {
             why = DYN_WRITE_FROM;
           }

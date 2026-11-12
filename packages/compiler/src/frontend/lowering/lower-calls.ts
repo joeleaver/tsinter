@@ -10,7 +10,7 @@ import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
-import { armRooted, dynArmParam, isDynArmSite, stripParens } from "./dyn-arm.js";
+import { armRooted, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
@@ -2127,7 +2127,11 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
   const decl = decls[0]!;
   if (!ts.isFunctionDeclaration(decl) || !decl.body || decl.typeParameters !== undefined) return null;
   const sf = decl.getSourceFile();
-  if (sf.isDeclarationFile || isJsSourceFile(sf)) return null;
+  if (sf.isDeclarationFile) return null;
+  // A JavaScript function (its parameters typed by JSDoc): only the
+  // dynamic-arm binding below, its parameter in checked-dynamic storage
+  // (S014's U1b amendment); the record-width binding is TypeScript's.
+  const js = isJsSourceFile(sf);
   if (bodyReadsArguments(decl)) return null;
   if (decl.parameters.length !== sig.params.length) return null;
   const bindings = new Map<ts.Symbol, ts.Type>();
@@ -2143,10 +2147,11 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
       const psym = L.checker.getSymbolAtLocation(param.name);
       if (psym) {
         bindings.set(psym, L.checker.getAnyType());
-        shapes[i] = { type: JSVAL, mode: "required" };
+        shapes[i] = { type: js ? DYN : JSVAL, mode: "required" };
       }
       return;
     }
+    if (js) return;
     if (!arg || shape.type.kind !== "record" || shape.mode !== "required") return;
     if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.questionToken || param.initializer) return;
     if (isThisParameter(param)) return;
@@ -6300,6 +6305,11 @@ const inliningPredicates = new Set<ts.Symbol>();
     // declared params the alias story has no model — the fence says to
     // use a rest parameter. Arrows never claim it (JS: an arrow's
     // `arguments` is the enclosing function's).
+    // A function literal whose composite result crossed into dynamic code
+    // as a refused copy (S125 (c)) returns on the dynamic arm in this pass:
+    // the result is the dynamic value itself, as in Node (dyn-arm.ts).
+    const armRet = ret.kind !== "void" ? dynArmResultType(L, node) : null;
+    if (armRet !== null) ret = armRet;
     const hasDynRest = shapes.some((s) => s.mode === "dynRest");
     const hasIslandRest = shapes.some((s) => s.mode === "islandRest");
     const usesArguments =
@@ -6436,7 +6446,10 @@ function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpres
       !ts.isArrowFunction(node) && node.name && ts.isIdentifier(node.name) ? node.name : null;
     const baseName = nameIdent ? nameIdent.text : "";
     const fnName = `%fn${L.lambdaCounter++}${baseName ? `_${baseName}` : ""}`;
-    if (L.sharedDynamic) L.dynArmFnParams.set(fnName, node.parameters);
+    if (L.sharedDynamic) {
+      L.dynArmFnParams.set(fnName, node.parameters);
+      L.dynArmFnNodes.set(fnName, node);
+    }
     // Named function expressions/declarations can self-reference by name; an
     // object-literal method's name is a PROPERTY, not a binding — no self.
     // A reassigned nested declaration (selfBinding false) reads its name

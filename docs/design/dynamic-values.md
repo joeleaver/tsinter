@@ -355,6 +355,22 @@ S128).** Where the design above was underspecified, these are the calls made:
   parameters of a method called on an arm value take what the receiver holds.
   Returns, constructors, methods, generic functions and calls through a function
   value are not contained (refused as before, loudly).
+- **Function-literal results (2026-11-11, the survey's JavaScript copies).** The
+  result of a function literal handed to dynamic code is contained like its
+  parameters: a refused result copy (`judgeBoxedFn`) records a `ret:<literal>`
+  site, and in the next pass the literal returns `dyn` (JavaScript) or `jsval`.
+  The type mapper's `dynArmResultType` hook gives every mapping of the literal's
+  function type the same result, so its binding (`var __rest = function ...`),
+  the closure and a direct call agree; a direct call from typed code that then
+  cannot take the dynamic value fails validation and the pass falls back, as
+  any arm does. Separately, the judge counts a checked copy of a dynamic value
+  nothing else holds (`dynCheck` of `[]`, `Object.keys(o)`) as fresh, and an
+  owned local (`ownedTyped`) as a fresh result: neither copy is observable.
+  Async and generator literals are not on the arm. In the same change a
+  JavaScript function's own `var` is a contained binding (`armableBinding`),
+  and `widthSpecializedCall`'s dynamic-arm parameter binding applies to a
+  JavaScript function's JSDoc-typed parameters (its parameter `dyn`); the
+  record-width binding stays TypeScript's.
 - **U2b's two arms are compiled by continuation, not per use.** At the first
   statement of the binding's list that names it, the rest of the list lowers twice
   behind one flag test (once with the binding resolving to the typed copy, once to

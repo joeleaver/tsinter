@@ -10308,7 +10308,18 @@ read, while no code that can run in between writes a dynamic value; a
 (the evolving-array idiom `const acc = []; … return acc`); a `return`
 that converts a value the function built from its own locals, which die
 with the call (`return { flags }` into `any`); a copy whose local binding
-is last read before the function writes the original; library results
+is last read before the function writes the original; *(2026-11-11)* the
+result of a function dynamic code calls when it is a checked copy of a
+dynamic value nothing else holds (`() => []`, `(c) => Object.keys(c)`,
+`return [[], []]`), or a value the function built from its own locals
+(`var t = {}; …; return t`) — while a module binding read inside any
+function other than a module's initialization is never a value nothing
+else holds (it keeps the value after the function returns), and a copy
+that lands in no binding of its own inside a function dynamic code calls
+is judged against every dynamic write and identity test in the program
+(in a JavaScript source `() => [cache]` and `() => ({ c: cache })`
+refuse; in TypeScript the result takes S128's dynamic arm and shares, as
+Node does); library results
 (`readdirSync`, `split`, a match); a copy that no binding, field or
 unknown code holds, or that only printing helpers hold, read where it is
 made (`console.log(f())` over a `() => unknown` callback); a part read
@@ -10422,14 +10433,30 @@ composite slot (an array, tuple or record type, or a union carrying one)
 by a cast or an assignment. In Node the slot then holds that very object,
 whatever its shape. On these lanes the CONTAINED slots do the same:
 
-- a `const` or `let` binding (a local or a module global),
+- a `const` or `let` binding (a local or a module global), and
+  (*amended 2026-11-11*) in a JavaScript source a function's own `var`
+  (one function-scoped slot, holding the dynamic value as a `let` would),
 - a cast used in place (`(u as number[]).push(2)`),
 - the typed parameter of a function literal dynamic code calls
   (`data.forEach((o: { a: number }) => { o.a = 2; })`, a callback stored
   into a dynamic object),
+- *(amended 2026-11-11, the round-3 survey's JavaScript copies)* the
+  RESULT of such a function literal, when its composite result would be
+  a copy the program could tell from the original (`holder.get = () =>
+  cache`, tslib's `__rest`, lodash's `omit`): the literal returns the
+  value itself, `dyn` in a JavaScript source and `jsval` otherwise, and
+  every mapping of its function type (its binding, a direct call's
+  result) carries that result type. Async and generator literals keep
+  the judged copy. A direct call from typed code then answers the
+  dynamic value: a leaf checks where it enters typed storage (a1). Where
+  a typed direct caller cannot take the dynamic value (the program does
+  not compile with the result on the arm), the result arm drops and S125
+  (c)'s refusal of the copy stands, by name,
 - a parameter of a plain function declaration the value is passed to
   directly (`grow(p)`), through S125 (a)'s per-call-site instance with the
-  parameter typed by the argument's own type, `any`;
+  parameter typed by the argument's own type, `any` (*amended 2026-11-11:*
+  a JavaScript function's JSDoc-typed parameter too, in checked-dynamic
+  storage);
 - and, inside them, an unannotated callback parameter of a method called
   on such a value (`xs.map((x) => typeof x)` hands `x` whatever the array
   holds).
@@ -10463,7 +10490,8 @@ observable.) The parts from Node:
   parameters and results of unannotated callbacks handed to a method of
   the value.
 - **(a2) Never a silent copy.** Fields and elements never take the arm
-  (decision J4), nor do returns, constructor, method and generic-function
+  (decision J4), nor do returns (but a function literal's result handed
+  to dynamic code, above), constructor, method and generic-function
   parameters, or calls through a function value: a non-fresh dynamic value
   bound for one is S125 (c)'s judged copy, refused where the program could
   tell it from the original by a write or an identity test. A copy taken
@@ -10547,7 +10575,7 @@ common case (data that matches its declared type) stays fast. **Tested
 by:** `packages/compiler/test/wasm-u2-maybe-dynamic.test.ts` (rows equal
 to Node and the (a1) fences, on wasm and wasm-native), the converted rows
 of `wasm-any-array-shared.test.ts` (H-EXIT, H-FRESH-02, H-UNK),
-`wasm-dyn-copies.test.ts` and `wasm-u1-shared-dynamic.test.ts`. Measured
+`wasm-dyn-copies.test.ts`, `wasm-u1-shared-dynamic.test.ts` and (the result amendment) `wasm-js-copies-slots.test.ts`. Measured
 against Node v24.18.1.
 
 ## S129 — An import of a Node builtin this build does not serve binds stubs: the program runs until it first touches one, and stops there by name *(every lane; tested on wasm and wasm-native)*

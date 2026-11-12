@@ -35,7 +35,7 @@
  * consults the value at run time. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, JSVAL, typeEquals, type IrExpr, type IrGlobal, type IrLocal, type IrStmt, type IrType } from "../../ir/nodes.js";
+import { BOOL, DYN, JSVAL, typeEquals, type IrExpr, type IrGlobal, type IrLocal, type IrStmt, type IrType } from "../../ir/nodes.js";
 import { PoisonError } from "./lowerer.js";
 import { exitIsFresh } from "./island-views.js";
 import { isJsSourceFile, locOf } from "../program.js";
@@ -60,8 +60,22 @@ export function isDynArmSite(L: Lowerer, node: ts.Node): boolean {
  * initializer (parentheses aside) is a recorded site. */
 export function dynArmDecl(L: Lowerer, decl: ts.VariableDeclaration): boolean {
   if (L.dynArmSites.size === 0 || decl.initializer === undefined || !ts.isIdentifier(decl.name)) return false;
-  if ((ts.getCombinedNodeFlags(decl) & ts.NodeFlags.BlockScoped) === 0) return false;
+  if (!armableBinding(decl)) return false;
   return L.dynArmSites.has(dynArmKey(stripParens(decl.initializer))) || L.dynArmSites.has(dynArmKey(decl.initializer));
+}
+
+/** A binding that can hold the dynamic arm: a `const`/`let`, or (in a
+ * JavaScript source) a function's own `var` — one function-scoped slot,
+ * which holds the dynamic value as a `let` would. */
+export function armableBinding(decl: ts.VariableDeclaration): boolean {
+  if ((ts.getCombinedNodeFlags(decl) & ts.NodeFlags.BlockScoped) !== 0) return true;
+  if (!isJsSourceFile(decl.getSourceFile()) || !ts.isIdentifier(decl.name)) return false;
+  const list = decl.parent;
+  if (!ts.isVariableDeclarationList(list) || !ts.isVariableStatement(list.parent)) return false;
+  for (let p: ts.Node = list.parent.parent; !ts.isSourceFile(p); p = p.parent) {
+    if (ts.isFunctionLike(p)) return true;
+  }
+  return false;
 }
 
 /** A module-scope dynArmDecl whose initializer is a dynamic value in this
@@ -95,12 +109,32 @@ export function dynArmParam(L: Lowerer, param: ts.ParameterDeclaration): boolean
   return L.dynArmSites.size > 0 && L.dynArmSites.has(`param:${dynArmKey(param)}`);
 }
 
+/** A function literal whose result takes the dynamic arm: it crossed into
+ * dynamic code, and the copy its composite result would make there was
+ * refused (the result slot is contained like its parameters). */
+export function dynArmResult(L: Lowerer, fn: ts.Node): boolean {
+  return L.dynArmSites.size > 0 && L.dynArmSites.has(`ret:${dynArmKey(fn)}`);
+}
+
+/** The result type of a function literal on the result arm (a plain,
+ * non-async, non-generator function): the dynamic value — `dyn` in a
+ * JavaScript source (S014's U1b storage rule), `jsval` otherwise. Null when
+ * the literal's result is not on the arm. The type mapper asks this for
+ * every function type whose signature the literal declares, so a binding,
+ * a call result and the closure itself agree. */
+export function dynArmResultType(L: Lowerer, fn: ts.Node): IrType | null {
+  if (!dynArmResult(L, fn)) return null;
+  if (!(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn))) return null;
+  if (fn.asteriskToken !== undefined || fn.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true) return null;
+  return isJsSourceFile(fn.getSourceFile()) ? DYN : JSVAL;
+}
+
 /** Registers every binding and parameter this pass's sites put on the
  * dynamic arm, before anything lowers (a function declared before the
  * binding's statement may reference it). */
 export function collectDynArmSyms(L: Lowerer): void {
   if (L.dynArmSites.size === 0) return;
-  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^param:/, "").replace(/:\d+:\d+$/, "")));
+  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^(param|ret):/, "").replace(/:\d+:\d+$/, "")));
   for (const sf of L.program.getSourceFiles()) {
     if (sf.isDeclarationFile || !files.has(sf.fileName)) continue;
     const visit = (n: ts.Node): void => {

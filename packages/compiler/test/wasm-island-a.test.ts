@@ -296,14 +296,15 @@ for (const [id, call, msg] of [
   });
 }
 
-test("A2-REF-03 a getter written before a data member refuses at compile time (it would enumerate out of order)", async () => {
-  const diags = await refuseRow(
+test("A2-REF-03 a getter written before a data member keeps its source position (GH #181: it used to refuse, jsOp:defineGetter-order)", async () => {
+  const r = await runRow(
     "A2-REF-03",
     '// @dynamic\n"use strict";\n/** @type {*} */\nconst o = {\n  get g() {\n    return 1;\n  },\n  n: 2,\n};\nconsole.log(JSON.stringify(o));',
     "js",
   );
   // Node: {"g":1,"n":2}.
-  expect(diags.some((d) => d.startsWith("SC3001:") && d.includes("(jsOp:defineGetter-order)"))).toBe(true);
+  expect(r.stdout).toBe('{"g":1,"n":2}\n');
+  expect(r.exitCode).toBe(0);
 });
 
 test("A2-REF-04 a typed conversion of an object carrying an island getter: unit U2a — the typed callback parameter holds the object itself and reads its getter, as Node (SEMANTICS.md S128)", async () => {

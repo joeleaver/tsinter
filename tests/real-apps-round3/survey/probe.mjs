@@ -40,7 +40,11 @@ registerHooks({
     const r = next(url, ctx);
     if (url.endsWith("packages/compiler/dist/index.js")) {
       const s = String(r.source);
-      if (!s.includes(ANALYZE_LOWER)) throw new Error("analyze() lowering options moved; update probe.mjs");
+      // analyze() moved its lowering options (it lowers for the wasm lanes
+      // itself when given a wasm backend): the build phase, which runs the
+      // real compile(), needs no patch; the optional analyze phases then
+      // lower as stock analyze() does.
+      if (!s.includes(ANALYZE_LOWER)) return r;
       // globalThis.__probeShared toggles sharedDynamic per call.
       return { ...r, source: s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, sharedDynamic: globalThis.__probeShared !== false, targetPlatform: "host",') };
     }

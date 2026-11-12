@@ -93,7 +93,7 @@ import {
 } from "../types.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
-import { armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
+import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -1389,6 +1389,9 @@ export class Lowerer {
   /** Function name → the source parameters of the function literal it
    * was lowered from (the width-copy pass names a refused parameter). */
   readonly dynArmFnParams = new Map<string, readonly ts.ParameterDeclaration[]>();
+  /** Function name → the function literal it was lowered from (the
+   * width-copy pass names a refused result: `ret:` sites). */
+  readonly dynArmFnNodes = new Map<string, ts.Node>();
   /** Is `s` a per-call-site instance's parameter bound to a dynamic-arm
    * argument (S125 (a)'s instance with the argument's own type, `any`)? */
   dynArmBoundParam(s: ts.Symbol): boolean {
@@ -1413,7 +1416,7 @@ export class Lowerer {
     const contained =
       ts.isAsExpression(n) || ts.isTypeAssertion(n) ||
       (up !== undefined && ts.isVariableDeclaration(up) && up.initializer !== undefined && ts.isIdentifier(up.name) &&
-        (ts.getCombinedNodeFlags(up) & ts.NodeFlags.BlockScoped) !== 0) ||
+        armableBinding(up)) ||
       // An argument of a direct call: the callee's per-call-site instance
       // takes the parameter on the arm (widthSpecializedCall).
       (up !== undefined && ts.isCallExpression(up) && ts.isIdentifier(up.expression) && up.arguments.some((a) => a === n || a === node));
@@ -1782,6 +1785,7 @@ export class Lowerer {
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
       isProgramFile: (sf) => this.fileTag.has(sf),
+      dynArmResultType: (decl) => dynArmResultType(this, decl),
     };
     // --dynamic: modules reachable only through dynamic import() joined
     // moduleOrder BEFORE any pass constructed — lowerToIr runs
@@ -9331,7 +9335,14 @@ export class Lowerer {
           // and undefined or null (empty); anything else (a string, a
           // boolean, an array-like object) stops at the checked
           // extraction's named fence.
-          const asDyn: IrExpr = arg.type.kind === "dyn" ? arg : { kind: "dynFromJsval", value: arg, type: DYN, loc };
+          // GH #179: or a typed value the island expression lowered to
+          // (`16 + n` over an untyped `n` is a number), boxed as one.
+          const asDyn: IrExpr =
+            arg.type.kind === "dyn"
+              ? arg
+              : arg.type.kind === "jsval"
+                ? { kind: "dynFromJsval", value: arg, type: DYN, loc }
+                : this.coerceToExpected(arg, DYN);
           const tmp = this.declareHiddenLocal("%u8src", DYN);
           const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
           const numArr: IrType = { kind: "array", elem: F64 };

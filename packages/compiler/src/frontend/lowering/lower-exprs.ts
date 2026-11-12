@@ -898,6 +898,19 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           if (ts.isArrowFunction(inner) || ts.isFunctionExpression(inner)) return true;
           return L.checker.getCallSignatures(L.typeOf(src)).length > 0;
         };
+        // GH #181: a getter's own-key position is its SOURCE position, as
+        // in Node. The literal holds a placeholder (the engine undefined)
+        // at that position, and defineGetter, which runs right after the
+        // literal is built, replaces its value in place (objPut keeps an
+        // existing key where it is), so a data member written after the
+        // getter still enumerates after it. (Getters never combine with a
+        // conditional spread, so only the plain literal takes the slot.)
+        const pushGetterSlot = (name: ts.Identifier | ts.StringLiteral, at: ts.Node): void => {
+          argsWithout.push(
+            { kind: "jsMarshal", value: { kind: "strLit", value: name.text, type: STRING, loc: locOf(name) }, type: JSVAL, loc: locOf(name) },
+            { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc: locOf(at) },
+          );
+        };
         const pushProp = (
           name: ts.Identifier | ts.StringLiteral,
           value: IrExpr,
@@ -915,7 +928,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             // conditional spread owns the literal (getters cannot combine).
             const asGetter = value.type.kind !== "func" && spread === null;
             const fence = islandMemberFence(diagsBefore, err, valueNode, asGetter ? name.text : null);
-            if (fence === null) return; // registered as a fence getter — no data property
+            if (fence === null) {
+              // Registered as a fence getter: its key keeps its position.
+              pushGetterSlot(name, valueNode);
+              return;
+            }
             marshaled = fence;
           }
           for (const args of into) {
@@ -999,6 +1016,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           if (ts.isGetAccessorDeclaration(prop) && prop.body && name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) {
             L.rejectThisInObjectMethod(prop.body);
             getters.push({ name: name.text, fn: L.jsvalIn(L.lowerLambda(prop), prop), loc: locOf(prop) });
+            pushGetterSlot(name, prop);
             continue;
           }
           // A member VALUE that cannot lower at all (a generic function
@@ -1019,7 +1037,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
               name && (ts.isIdentifier(name) || ts.isStringLiteral(name)) ? name.text : null;
             const asGetter = nameText !== null && spread === null && !funcShapedMember(prop);
             value = islandMemberFence(valueDiagsBefore, err, prop, asGetter ? nameText : null);
-            if (value === null) continue; // registered as a fence getter — no data property
+            if (value === null) {
+              // Registered as a fence getter: its key keeps its position.
+              if (name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) pushGetterSlot(name, prop);
+              continue;
+            }
           }
           if (value && name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) {
             pushProp(name, value, prop, [argsWithout, argsWith]);
@@ -9391,7 +9413,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         if (ts.isPropertyAccessExpression(expr.left) && !expr.left.questionDotToken && L.isIslandExpr(expr.left.expression)) {
           const recv = L.lowerExpr(expr.left.expression);
           const recvTmp = L.declareHiddenLocal("%setRecv", recv.type);
-          const rhsVal = L.lowerExpr(expr.right);
+          let rhsVal = L.lowerExpr(expr.right);
+          // A bare unit RHS (`exports.a = exports.b = void 0`, the webpack
+          // export reset on a JavaScript `exports` parameter) has no
+          // standalone slot: it rides as the engine's own undefined or
+          // null, the value the write stores anyway (GH #180).
+          if (isUnitType(rhsVal.type)) rhsVal = L.jsvalIn(rhsVal, expr.right);
           const valTmp = L.declareHiddenLocal("%setVal", rhsVal.type);
           const valRef = (): IrExpr => ({ kind: "varRef", localId: valTmp.id, type: rhsVal.type, loc });
           return {

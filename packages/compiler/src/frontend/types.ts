@@ -573,6 +573,10 @@ export interface TypeMapperCtx {
    * would ICE the validator. Such instance types stay unmapped (null):
    * callers fence them like any other unsupported type. */
   isProgramFile: (sf: ts.SourceFile) => boolean;
+  /** Unit U2 (dyn-arm.ts): the dynamic type a function literal's result
+   * takes on the dynamic arm (its signature's declaration), or null. Every
+   * mapping of the literal's function type agrees with its lowered ABI. */
+  dynArmResultType?: (decl: ts.Node) => IrType | null;
 }
 
 
@@ -2426,8 +2430,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // `() => never` (a throw-only lambda's inferred type) is assignable to
     // `() => void` and its calls never produce a value — map the return
     // like declaredReturnType does for declarations.
-    const ret = retT.flags & ts.TypeFlags.Never ? VOID : mapType(retT, ctx);
+    let ret = retT.flags & ts.TypeFlags.Never ? VOID : mapType(retT, ctx);
     if (!ret) return null;
+    const armDecl = ctx.dynArmResultType !== undefined ? checker.signatureDeclaration(sig) : undefined;
+    const armRet = armDecl !== undefined && ret.kind !== "void" ? ctx.dynArmResultType!(armDecl) : null;
+    if (armRet !== null) ret = armRet;
     return funcOf(params, ret);
   }
   // Records: object types whose members are all data properties (shorthand
