@@ -4153,9 +4153,18 @@ class Assembler {
         x.structNew(this.exc().errT);
         x.call(dyn.fromError());
       });
-      const capThunk = this.omThunk("captureStackTrace", [dyn.dynRef(), I32], (x) => {
+      // the Error value's own prepareStackTrace, to tell a program's
+      // replacement apart
+      const prepG = this.mb.addGlobal(dyn.dynRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(dynT);
+      });
+      const capThunk = this.omThunk("captureStackTrace", [dyn.dynRef(), I32, this.strRef, this.strRef, dyn.dynRef()], (x) => {
         const T = 2;
         const K = 3;
+        const N = 4;
+        const M = 5;
+        const V = 6;
         dyn.arrLen(x, (y) => y.localGet(1));
         x.ifResult(dyn.dynRef());
         dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
@@ -4176,11 +4185,95 @@ class Assembler {
         x.refNull(dynT);
         x.return_();
         x.end();
+        // A program's own Error.prepareStackTrace would format this
+        // stack: that stops by name (SEMANTICS.md S114).
+        x.globalGet(g);
+        this.pushStrLitInto(x, "prepareStackTrace");
+        x.i32Const(0);
+        x.call(dyn.keyGet());
+        x.localTee(V);
+        x.refIsNull();
+        x.ifVoid();
+        x.refNull(dynT);
+        x.return_();
+        x.end();
+        x.localGet(V);
+        x.structGet(dynT, DYN_KIND);
+        x.i32Const(DK.UNDEF);
+        x.i32Ne();
+        x.localGet(V);
+        x.globalGet(prepG);
+        x.refEq();
+        x.i32Eqz();
+        x.i32And();
+        x.ifVoid();
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "Error.captureStackTrace after the program set its own Error.prepareStackTrace is not supported yet"), null);
+        x.end();
+        // The header V8 writes (ErrorUtils::ToString): `name` (undefined
+        // is "Error") and `message` (undefined is ""), joined by ": "
+        // when both are non-empty. An error answers its own toString.
+        x.localGet(T);
+        x.call(dyn.isError());
+        x.ifVoid();
+        x.localGet(T);
+        x.call(dyn.toStr());
+        x.localSet(N);
+        x.else_();
+        const member = (key: string, dflt: string, into: number): void => {
+          x.localGet(T);
+          this.pushStrLitInto(x, key);
+          x.i32Const(0);
+          x.call(dyn.keyGet());
+          x.localTee(V);
+          x.refIsNull();
+          x.ifVoid();
+          x.refNull(dynT);
+          x.return_();
+          x.end();
+          x.localGet(V);
+          x.structGet(dynT, DYN_KIND);
+          x.i32Const(DK.UNDEF);
+          x.i32Eq();
+          x.ifResult(this.strRef);
+          this.pushStrLitInto(x, dflt);
+          x.else_();
+          x.localGet(V);
+          x.call(dyn.toStrUser());
+          x.end();
+          x.localSet(into);
+          x.globalGet(this.exc().kindG);
+          x.ifVoid();
+          x.refNull(dynT);
+          x.return_();
+          x.end();
+        };
+        member("name", "Error", N);
+        member("message", "", M);
+        x.localGet(N);
+        emitFlatCast(x, this.strType);
+        x.arrayLen();
+        x.i32Eqz();
+        x.ifVoid();
+        x.localGet(M);
+        x.localSet(N);
+        x.else_();
+        x.localGet(M);
+        emitFlatCast(x, this.strType);
+        x.arrayLen();
+        x.ifVoid();
+        x.localGet(N);
+        this.pushStrLitInto(x, ": ");
+        x.call(this.concatHelper());
+        x.localGet(M);
+        x.call(this.concatHelper());
+        x.localSet(N);
+        x.end();
+        x.end();
+        x.end();
         x.localGet(T);
         this.pushStrLitInto(x, "stack");
         dyn.boxStr(x, (y) => {
-          y.localGet(T);
-          y.call(dyn.toStr());
+          y.localGet(N);
         });
         undef(x);
         undef(x);
@@ -4210,7 +4303,11 @@ class Assembler {
         this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "calling Error.prepareStackTrace is not supported yet"), null);
         x.refNull(dynT);
       });
-      define(c, "prepareStackTrace", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(prepThunk), -9, (y) => this.pushStrLitInto(y, "ErrorPrepareStackTrace"), 2, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
+      define(c, "prepareStackTrace", (x) => {
+        dyn.boxFn(x, marker, (y) => y.refFunc(prepThunk), -9, (y) => this.pushStrLitInto(y, "ErrorPrepareStackTrace"), 2, undefined, (y) => y.i32Const(2));
+        x.globalSet(prepG);
+        x.globalGet(prepG);
+      }, DATA | A_W | A_C);
       define(c, "isError", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(isErrThunk), -9, (y) => this.pushStrLitInto(y, "isError"), 1, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
       define(c, "stackTraceLimit", (x) => dyn.boxNum(x, (y) => y.f64Const(10)), DATA | A_W | A_E | A_C);
       define(c, "prototype", (x) => dyn.boxObj(x, (y) => dyn.pushNewObj(y, false)), DATA);
