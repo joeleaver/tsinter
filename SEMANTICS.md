@@ -9343,10 +9343,13 @@ leaving into typed storage follows (d)). So:
   the expando); (iii) reading `constructor` or `__proto__` through the
   view, and for an EventEmitter subclass the emitter's members (`on`,
   `emit`, ...), ends the program by name; (iv) a method read through the
-  view is a function bound to the
-  instance, a fresh one per read (Node: the one prototype function, so
-  `o.m === o.m` and `o.m.call(other)` differ), and a method with a rest
-  parameter stops by name when called through it; (v) printing the view
+  view is a fresh function per read (Node: the one prototype function, so
+  `o.m === o.m` differs) that runs on its call's own `this` — the view
+  for `o.m(x)`, another instance's view for `o.m.call(other, x)` — and a
+  call whose `this` is no instance of the class (a detached `const f =
+  o.m; f(x)`, where Node runs the method with `this` undefined) stops by
+  name, as does a method with a rest parameter called through it (GH
+  #186); (v) printing the view
   (`console.log`, `util.inspect`, an assertion message) ends the program
   by name — `printing a 'C' instance shared with dynamic code is not
   supported yet` — where Node prints `C { … }` with its cycle markers;

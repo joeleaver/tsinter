@@ -31,7 +31,7 @@ import * as ts from "../ts7/adapter.js";
 import { isUndefExpr } from "./lower-exprs.js";
 import { emitterRooted } from "./lower-emitter.js";
 import { EMITTER_API_MEMBERS, type ClassInfo } from "./lower-classes.js";
-import { BOOL, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, DYN, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 
 const str = (value: string, loc: SrcLoc): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
 const undef = (loc: SrcLoc): IrExpr => ({ kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc });
@@ -382,7 +382,27 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
       args.push(a);
     }
     if (ok) {
-      const call = methodCall(L, info, name, x(), args, loc)!;
+      // The receiver is the call's own `this`, as in Node: `o.m(x)`
+      // passes the view, `o.m.call(other, x)` another view of the class.
+      // A detached call (`const f = o.m; f(x)`, `this` undefined) — or a
+      // `this` that is no instance of the class — stops by name where
+      // Node runs the method with that `this` (SEMANTICS.md S115 (iv)).
+      const t = x().type as IrType & { kind: "object" };
+      const label = t.className.replace(/^%m\d+\./, "").replace(/^%/, "");
+      const th = (): IrExpr => ({ kind: "varRef", localId: "th.0", type: JSVAL, loc });
+      body.push({ kind: "varDecl", localId: "th.0", init: { kind: "jsMarshal", value: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, type: JSVAL, loc } as IrExpr, loc });
+      body.push({
+        kind: "if",
+        cond: { kind: "unary", op: "!", operand: { kind: "jsViewOfClass", value: th(), className: t.className, type: BOOL, loc }, type: BOOL, loc },
+        then: [
+          fence(`calling the method '${name}' of a '${label}' instance shared with dynamic code without that instance as 'this' (a method read off the instance and called detached) is not supported yet (SEMANTICS.md S115)`, loc),
+          { kind: "return", value: undef(loc), loc },
+        ],
+        else_: null,
+        loc,
+      });
+      body.push({ kind: "varDecl", localId: "r.0", init: classUnview(L, th(), t, loc), loc });
+      const call = methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!;
       if (call.type.kind === "void") {
         body.push({ kind: "exprStmt", expr: call, loc }, { kind: "return", value: undef(loc), loc });
       } else {
@@ -395,7 +415,12 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
     params,
     returnType: JSVAL,
     captures: [cap],
-    locals: [capLocal, ...params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: true }))],
+    locals: [
+      capLocal,
+      ...params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: true })),
+      { id: "th.0", name: "th", type: JSVAL, mutable: true },
+      { id: "r.0", name: "r", type: x().type, mutable: true },
+    ],
     body,
     loc,
   };

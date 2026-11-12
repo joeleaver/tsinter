@@ -159,6 +159,30 @@ console.log(one.add(2).add(3).n, one.add(1) === one, gs[0].n);
 console.log(one.pick(null), one.pick(one));`,
   },
   {
+    id: "CV-CALL-02 a method read off a view runs on the call's own this: .call(other) on another instance (GH #186)",
+    src: `class G {
+  n: number;
+  constructor(n: number) { this.n = n; }
+  a(s: string): string { return s + this.n; }
+}
+const xs: any[] = [new G(1), new G(2)];
+const m = xs[0].a;
+console.log(m.call(xs[1], "x"), xs[0].a("y"), typeof m);
+console.log(m.apply(xs[0], ["z"]));`,
+  },
+  {
+    id: "CV-CALL-03 a method read off a view and called detached stops by name (Node runs it with this undefined; GH #186)",
+    src: `class G {
+  n = 3;
+  a(s: string): string { return s + this.n; }
+}
+const one: any = new G();
+const h = one.a;
+console.log(one.a("x"));
+console.log(h("2"));`,
+    fence: { text: /calling the method 'a' of a 'G' instance shared with dynamic code without that instance as 'this'/, stdout: "x3\n" },
+  },
+  {
     id: "CV-PRIM-01 String(), a template, + and join convert a view through its own toString / valueOf",
     src: `class P {
   constructor(public x: number) {}
