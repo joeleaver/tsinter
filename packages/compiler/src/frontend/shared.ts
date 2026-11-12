@@ -373,6 +373,16 @@ export const JS_RELAXED_TSC_CODES: ReadonlySet<number> = new Set([
   // every use meets the lowerer's per-site unknown fences (member reads
   // ride the checked-dynamic tree; unsupported operations fence loudly).
   18046, 2571,
+  // Units U3 + U4: the object model's write and delete checks (2540 a
+  // write to a property tsc infers read-only — Object.defineProperty
+  // without `writable`, a getter-only accessor, Object.freeze; 2790/2704
+  // `delete` of a required or read-only property). Node decides these at
+  // run time (the strict-mode TypeError, the silent sloppy no-op), and so
+  // do the compiled dynamic objects.
+  2540, 2790, 2704,
+  // `instanceof` operand kinds (a primitive left side answers false and a
+  // non-callable right side throws Node's TypeError at run time)
+  2358, 2359,
 ]);
 
 /* Arithmetic on an `any` operand (TS2362/2363/2365 fire when the other

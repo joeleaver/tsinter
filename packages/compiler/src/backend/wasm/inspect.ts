@@ -130,6 +130,7 @@ import {
   OBJ_LEN,
   OBJ_PROTO,
   OBJ_PROTO_MAP,
+  OBJ_PROTO_NULL,
   OBJ_PROTO_WEAKMAP,
   type DynBuilder,
 } from "./dyn.js";
@@ -3963,6 +3964,8 @@ export class InspectBuilder {
       const BASE = 21; // BYTES: the "Uint8Array(N) " prefix
       const CLOS = 22; // P4 SITE D: FUNC's FN_CLOS, the circCheck/seenPush/refWrap key
       const PREFIX = 23; // P4 SITE D: the "[Function: name]" piece, built before the block
+      const CN = 24; // units U3 + U4: the prototype chain's constructor name (null: none / Object)
+      const MK2 = 25; // units U3 + U4: the region mark the class prefix renders in
       /** recurse + 1 — the depth children format at. */
       const deeper = (): void => {
         c.localGet(RECURSE);
@@ -4015,7 +4018,13 @@ export class InspectBuilder {
         // Unit A2: an island getter member, reached only as an entry of
         // the OBJ arm's raw walk — Node prints `[Getter]` and never runs it.
         this.kindArm(c, K, [DK.JSVAL], () => {
-          this.deps.lit(c, "[Getter]");
+          if (dyn.objModelLive) {
+            // Units U3 + U4: `[Getter/Setter]` / `[Setter]` too.
+            c.localGet(D);
+            c.call(dyn.om.cellText());
+          } else {
+            this.deps.lit(c, "[Getter]");
+          }
           c.return_();
         });
       }
@@ -4531,12 +4540,65 @@ export class InspectBuilder {
           x.ifResult(strRef);
           this.deps.lit(x, nullForm);
           x.else_();
-          this.deps.lit(x, plainForm);
+          if (dyn.objModelLive) {
+            // Units U3 + U4: an object whose chain names a constructor
+            // prints it the way Node does (`Point { x: 1 }`, `[Point]`).
+            const at = plainForm.indexOf("Object") >= 0 ? plainForm.indexOf("Object") : plainForm === "{}" || plainForm === "{" ? 0 : -1;
+            if (at >= 0) {
+              x.localGet(CN);
+              x.refIsNull();
+              x.ifResult(strRef);
+              this.deps.lit(x, plainForm);
+              x.else_();
+              const head = plainForm.indexOf("Object") >= 0 ? plainForm.slice(0, at) : "";
+              const tail = plainForm.indexOf("Object") >= 0 ? plainForm.slice(at + "Object".length) : " " + plainForm;
+              x.globalGet(this.len());
+              x.localSet(MK2);
+              this.deps.lit(x, head);
+              x.call(this.ibPuts());
+              x.localGet(CN);
+              x.call(this.ibPuts());
+              this.deps.lit(x, tail);
+              x.call(this.ibPuts());
+              x.localGet(MK2);
+              x.call(this.ibTake());
+              x.end();
+            } else {
+              this.deps.lit(x, plainForm);
+            }
+          } else {
+            this.deps.lit(x, plainForm);
+          }
           x.end();
         };
+        if (dyn.objModelLive) {
+          c.localGet(D);
+          c.call(dyn.om.ctorName());
+          c.localSet(CN);
+          // Units U3 + U4: a null prototype set later prints Node's
+          // `[Object: null prototype]`; a chain ending null further up
+          // (Node's `N <[Object: null prototype] {}>` form) stops by name.
+          c.localGet(O);
+          c.call(dyn.om.protoEnd());
+          c.localTee(MK2);
+          c.i32Const(2);
+          c.i32Eq();
+          c.ifVoid();
+          this.deps.fence(c, (x) => this.deps.lit(x, "inspecting an object whose prototype chain ends in a null prototype is not supported yet"));
+          c.end();
+        }
         c.localGet(O);
         c.structGet(objT, OBJ_PROTO);
         c.localSet(NP);
+        if (dyn.objModelLive) {
+          c.localGet(MK2);
+          c.i32Const(1);
+          c.i32Eq();
+          c.ifVoid();
+          c.i32Const(OBJ_PROTO_NULL);
+          c.localSet(NP);
+          c.end();
+        }
         c.localGet(O);
         c.structGet(objT, OBJ_LEN);
         c.localSet(N);
@@ -4830,7 +4892,7 @@ export class InspectBuilder {
         [
           I32, I32, dyn.arrRef(), dyn.objRef(), I32, I32, I32, I32, I32, F64,
           dyn.dynRef(), dyn.arrRef(), strRef, strRef, strRef, dyn.dynRef(), strRef,
-          this.deps.bytesRefU8(), strRef, EQ_REF, strRef,
+          this.deps.bytesRefU8(), strRef, EQ_REF, strRef, strRef, I32,
         ],
         c.bytes(),
       );

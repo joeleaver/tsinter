@@ -3616,6 +3616,20 @@ undefined for a plain call, never the receiver of the running caller.
 **Tested by:**
 `packages/compiler/test/wasm-u2-maybe-dynamic.test.ts` (U2R2-JS-01..03, U2R3-THIS-01..02, U2R4-ASYNC-01..05).
 
+*U3+U4 amendment (wasm and wasm-native).* `f.call(thisArg, …)`,
+`f.apply(thisArg, …)` and `f.bind(thisArg, …)` hand `thisArg` to the callee
+unchanged, in strict and sloppy code alike. Node does the same for a
+strict function. For a SLOPPY-mode function, Node replaces a null or
+undefined `thisArg` with `globalThis` and boxes a primitive one into its
+wrapper object. Here the sloppy function sees the value itself:
+`function f() { return [this === null, typeof this] }` called as
+`f.call(null)` prints `[ true, 'object' ]` where Node prints
+`[ false, 'object' ]`, and `f.call(5)` gives `typeof this` `'number'`
+where Node gives `'object'`. Strict code, which ES modules and classes
+always are, is unaffected.
+**Tested by:** `packages/compiler/test/wasm-u3u4-es5.test.ts` (U4-CALL-01..03
+pass a real object as `thisArg`, where the two agree).
+
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
 The wasm tier's island has no engine (jsval ≡ dyn, increment 21), so
@@ -5899,6 +5913,16 @@ both an OBJ and a FUNC target), confirmed as `instanceof Error` and NOT
 program can pin this directly (claim 0 — every consumer's descriptors
 are plain `value`/`enumerable` pairs).
 
+**U3+U4 amendment (2026-11-11).** On the WasmGC lanes,
+`Object.defineProperty`/`defineProperties` over a dynamic target (`any`,
+`unknown`, a JavaScript value the object model reaches) is the object model
+(docs/design/dynamic-values.md §4.6). An accessor descriptor defines a real
+accessor, a getter and a setter run with the receiver, and a descriptor that
+is not one Node accepts throws Node's own TypeError ("Getter must be a
+function: 1"). The refusal above remains for a statically typed function
+target (`Object.defineProperties(g, …)` with `g` a declared function) and
+for the c/llvm lanes.
+
 ## S062 — `Object.defineProperties`: a non-enumerable property on an OBJ target refuses by name *(wasm tier)*
 
 Node gives a plain object a genuine non-enumerable own property
@@ -5936,6 +5960,11 @@ control (`enumerable:true` on an OBJ target succeeds and reads back,
 proving the refusal is keyed on the flag and not the target kind); no
 corpus program can pin this directly (claim 0, the same reason S061
 gives).
+
+**U3+U4 amendment (2026-11-11).** Retired on the WasmGC lanes: a dynamic
+object has a hidden plane now (objmodel.ts, the non-enumerable table), so a
+non-enumerable property is Node's: readable, own, absent from every
+enumerable walk, and listed by getOwnPropertyNames in creation order.
 
 ## S063 — assert's error-identification messages (`assert.throws`'s class-mismatch text, `assert.ifError`'s empty-message fallback) substitute the error's stored `name` SLOT for Node's `constructor.name`, so a CUSTOM subclass without its own `this.name` override reports its BASE class, not its true derived class *(inherited)*
 
@@ -8097,6 +8126,14 @@ code), `packages/compiler/test/wasm-regex-disposition.test.ts` (one
 witness per fence key, and the syntax errors a fence must not hide),
 corpus 2448 and 2748 on the wasm census. Measured against Node
 v24.18.1.
+
+**U3+U4 amendment (2026-11-11).** A pattern known at build time (a
+literal, or folded `new RegExp` texts) is no longer refused for Annex B's
+literal `]` outside a class without the `u`/`v` flag (zod's `rfc5322Email`).
+It compiles as the same pattern with that `]` escaped (`\]`, the identity
+escape) and keeps its own `source`. A run-time pattern still takes the
+`annexb-extended-pattern-char` fence. **Tested by:**
+`packages/compiler/test/wasm-u3u4-es5.test.ts` (U4-ZOD-RE-01).
 
 ## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is the host's (S113; once UTC), its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, a rejection with an 'unhandledRejection' listener is fenced, and replacing `globalThis.eval` does not change what `__island_eval` runs *(wasm lane; (b), (c), (d) and (i) are shared with the native lanes)*
 
@@ -11150,3 +11187,46 @@ loss was reachable on main through any `unknown`/`any` crossing.
 `wasm-top10-rea-error-code-in.test.ts`, and the re-pinned rows of
 `wasm-gh144-error-subclass-write.test.ts`
 (wasm and wasm-native, against Node).
+
+## S132 — Code generation from strings is disallowed: the `Function` constructor and `eval` of a string throw Node's `--disallow-code-generation-from-strings` EvalError *(wasm and wasm-native)*
+
+A compiled program has no JavaScript compiler at run time, so tsinter
+behaves as **Node run with `--disallow-code-generation-from-strings`**,
+byte for byte, where plain Node would compile the string:
+
+- (a) `Function(...)` and `new Function(...)` throw a catchable
+  `EvalError: Code generation from strings disallowed for this context`.
+  This holds through any alias (`const F = Function; new F("")`), with any
+  arguments, the empty body included. The arguments are converted to
+  strings first (a `toString` runs), then the error is thrown. Calls
+  through `call`, `apply` and `bind` (`Function.call(null, s)`,
+  `F.bind(null)(s)`) throw it too. The value's `name` and `length` are
+  Node's (`Function`, 1). Nothing else of the constructor is modeled:
+  any other `Function.<member>` spelled directly stops by name (S122),
+  and so does `prototype` read through the value.
+- (b) `eval(...)` throws the same error whatever its argument (a number,
+  an object, none at all), direct or indirect (`(0, eval)(x)`). This is
+  measured under the flag: V8 refuses before it looks at the argument.
+- (c) An uncaught one ends the program the way every uncaught error does
+  on these lanes: exit 1, with S007's `Uncaught EvalError: Code generation
+  from strings disallowed for this context` line where Node prints its full
+  report (the source line and the stack).
+
+A catch handler can test `e.name === "EvalError"`. A test with
+`e instanceof EvalError` still refuses by name at compile time: EvalError
+is not a class this build models.
+
+So a feature probe such as zod 4's `util.allowsEval`
+(`try { new Function(""); return true } catch { return false }`) answers
+false, and the library takes its interpreted path. Its JIT fast path
+(`core/doc.js` `Doc.compile`) never runs. The program's observable output
+then matches Node with the flag, not plain Node, wherever the program
+itself tells the two apart (a probe's answer printed, a JIT-only code path
+with different output).
+
+**Why:** Joe, 2026-11-11 (unit U3+U4): zod, which paperclip and rea load at
+startup, must run in tsinter's own dynamic world. A fatal fence inside the
+probe's `try` would end the program, and compiling the string is out of
+tier.
+**Tested by:** `packages/compiler/test/wasm-u3u4-eval.test.ts` (wasm and
+wasm-native, against `node --disallow-code-generation-from-strings`).

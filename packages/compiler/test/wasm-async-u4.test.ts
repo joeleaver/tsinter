@@ -1247,11 +1247,10 @@ test("D21 DYNPROMISE: NOT-LIFTED: a function fulfilment keeps refusing", async (
   expect(survey).toEqual(["dynFrom:promise:adapt"]);
 });
 
-test("D22 DYNPROMISE: NOT-LIFTED: a dyn promise awaited into a typed slot", async () => {
-  const { diagnostics, survey } = await refuseRow("D22", "'use strict';\nfunction id(v) { return v; }\nasync function n() { return 1; }\nasync function waitIt(q) { return await q; }\nconst p = n();\nconst d = id(p);\nwaitIt(d).then((v) => console.log('awaited dyn', v, id(p) === d));", "cjs");
-  expect(diagnostics).toEqual(["SC3001:the wasm backend does not support this construct yet (fn:async:await-position); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
-  // U1b: the awaited JS parameter is an island value; the await refuses at its position.
-  expect(survey).toEqual(["expr:awaitExpr", "fn:async", "fn:async:await-position"]);
+test("D22 DYNPROMISE: a dyn promise awaited into a typed slot (lifted by units U3 + U4)", async () => {
+  // Node v24 prints "awaited dyn 1 true\n".
+  const { stdout, stderr, exitCode } = await runRow("D22", "'use strict';\nfunction id(v) { return v; }\nasync function n() { return 1; }\nasync function waitIt(q) { return await q; }\nconst p = n();\nconst d = id(p);\nwaitIt(d).then((v) => console.log('awaited dyn', v, id(p) === d));", "cjs");
+  expect({ stdout, stderr, exitCode }).toEqual({ stdout: "awaited dyn 1 true\n", stderr: "", exitCode: 0 });
 });
 
 test("D23 DYNPROMISE: NOT-LIFTED: a class-instance fulfilment is the deferred conversion fence", async () => {

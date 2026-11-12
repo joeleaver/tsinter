@@ -21,7 +21,7 @@
  * `new RegExp` folds to exactly the compiler's outcome, and a literal is
  * built only where Node accepts. */
 import { describe, expect, test } from "vitest";
-import { compileRegex, type RegexCompileOutcome } from "../src/backend/wasm/regex-buildtime.js";
+import { compileRegex, compileRegexBuildTime, type RegexCompileOutcome } from "../src/backend/wasm/regex-buildtime.js";
 import { foldRegexLiteral, foldRegexNew } from "../src/backend/wasm/regex-fold.js";
 import { lreCompileBatch } from "./regex-lre-oracle.js";
 import { patternPool, type PoolRow } from "./regex-pattern-pool.js";
@@ -90,13 +90,16 @@ function runGate(rows: readonly PoolRow[]): Report {
     // the build-time mapping: regex.new folds to the outcome itself; a
     // literal builds only what the compiler accepts
     const nw = foldRegexNew(p, f);
-    const expectNew = rt; // a fence too: thrown at the call, never a build refusal
+    // a fence too: thrown at the call, never a build refusal; a pattern
+    // known at build time also takes S102's U3+U4 lone-`]` rewrite
+    const bt: RegexCompileOutcome = compileRegexBuildTime(p, f);
+    const expectNew = bt;
     if (JSON.stringify(nw, (_, v) => (v instanceof Uint8Array ? hex(v) : v)) !== JSON.stringify(expectNew, (_, v) => (v instanceof Uint8Array ? hex(v) : v))) {
       rep.foldMismatch.push(`${tag}: new ${JSON.stringify(nw).slice(0, 120)}`);
     }
     const lit = foldRegexLiteral(p, f);
     if (lit.kind === "ok" && node.kind === "throw") rep.literalBuiltNodeThrows.push(`${tag}: ${node.message}`);
-    if ((lit.kind === "ok") !== (rt.kind === "ok")) rep.foldMismatch.push(`${tag}: literal ${lit.kind} / compiler ${rt.kind}`);
+    if ((lit.kind === "ok") !== (bt.kind === "ok")) rep.foldMismatch.push(`${tag}: literal ${lit.kind} / compiler ${bt.kind}`);
     if (rt.kind === "ok") {
       rep.accepted++;
       if (node.kind !== "ok") {

@@ -1264,6 +1264,9 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   // `const body: string = await res.text()` wraps the await in it). A
   // jsval temp is an ordinary dyn slot on this tier (jsval ≡ dyn).
   jsExit: ["value"],
+  // The island's entry (a JavaScript `return await f()` over a dynamic
+  // callee wraps the await in the dyn -> jsval retype): one operand.
+  jsMarshal: ["value"],
   // Type-only and tag-only nodes: one operand, nothing else to order.
   upcast: ["value"],
   downcast: ["value"],

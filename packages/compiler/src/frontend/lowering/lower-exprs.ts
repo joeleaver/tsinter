@@ -6,6 +6,7 @@
  * (FieldTarget). */
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
+import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
@@ -519,6 +520,36 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (chainRecv) return { ...chainRecv, loc };
 
     if (ts.isBigIntLiteral(expr)) return lowerBigIntLiteral(expr);
+    // SEMANTICS.md S132 and units U3 + U4 (lower-objmodel.ts).
+    if (ts.isIdentifier(expr) || ts.isNewExpression(expr) || ts.isCallExpression(expr) || ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) {
+      const cg = lowerCodegenSite(L, expr);
+      if (cg !== null) return cg;
+    }
+    if (ts.isCallExpression(expr)) {
+      const hop = lowerHasOwnPropertyCall(L, expr);
+      if (hop !== null) return hop;
+    }
+    if (ts.isIdentifier(expr)) {
+      const ref = lowerEs5Ref(L, expr);
+      if (ref !== null) return ref;
+    }
+    if (ts.isPropertyAccessExpression(expr)) {
+      const op = lowerObjectPrototypeRead(L, expr);
+      if (op !== null) return op;
+    }
+    if (ts.isDeleteExpression(expr)) {
+      const del = lowerObjModelDelete(L, expr);
+      if (del !== null) return del;
+    }
+    if (ts.isNewExpression(expr)) {
+      const nw = lowerObjModelNew(L, expr);
+      if (nw !== null) return nw;
+    }
+    if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword) {
+      const io = lowerObjModelInstanceof(L, expr);
+      if (io !== null) return io;
+    }
+
     if (ts.isNumericLiteral(expr)) {
       const value = Number(expr.text.replace(/_/g, ""));
       // Ask 4's representability input: a DECIMAL INTEGER source spelling
@@ -717,6 +748,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // `{ ...x }` with `x: any`) builds as the island literal — the
         // copy-out idiom — and enters a typed slot as a fresh value,
         // element- / field-checked by the exit.
+        // Units U3 + U4: a JavaScript literal the object model reaches
+        // (lower-objmodel.ts collectEs5) is a dynamic object.
+        if (L.es5 !== null && L.es5.lits.has(expr)) return true;
         const islandSrc = (e: ts.Expression): boolean =>
           (L.typeOf(e).flags & ts.TypeFlags.Any) !== 0 || L.mapTypeOf(L.typeOf(e))?.kind === "jsval";
         if (L.dynamic && (ts.isObjectLiteralExpression(expr)
@@ -844,6 +878,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           if (
             !(err instanceof PoisonError) ||
             !isJsSourceFile(expr.getSourceFile()) ||
+            // Units U3 + U4: a literal the object model reaches stops at its
+            // construction, never as a getter an observer would print
+            (L.es5 !== null && L.es5.lits.has(expr)) ||
             L.diagSink !== null ||
             L.diags.length <= diagsBefore ||
             L.diags.slice(diagsBefore).some((d) => d.code === "SC9001")
@@ -1014,8 +1051,16 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           // reads through the handle invoke it natively. `this` in the
           // body keeps the object-method rejection; setters stay fenced.
           if (ts.isGetAccessorDeclaration(prop) && prop.body && name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) {
-            L.rejectThisInObjectMethod(prop.body);
-            getters.push({ name: name.text, fn: L.jsvalIn(L.lowerLambda(prop), prop), loc: locOf(prop) });
+            // JavaScript: `this` is the receiver the getter runs with.
+            if (!isJsSourceFile(expr.getSourceFile())) L.rejectThisInObjectMethod(prop.body);
+            const gfn = L.jsvalIn(L.lowerLambda(prop), prop);
+            // Units U3 + U4: an accessor's function is named `get <key>`
+            {
+              let box: IrExpr = gfn;
+              while (box.kind === "jsMarshal" && box.value.kind !== "closure" && box.value.kind !== "varRef") box = box.value;
+              if (box.kind === "jsMarshal" || box.kind === "dynFrom") (box as { fnName?: string }).fnName = `get ${name.text}`;
+            }
+            getters.push({ name: name.text, fn: gfn, loc: locOf(prop) });
             pushGetterSlot(name, prop);
             continue;
           }
@@ -1030,7 +1075,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
               : ts.isShorthandPropertyAssignment(prop)
                 ? L.lowerShorthandValue(prop)
                 : ts.isMethodDeclaration(prop) && prop.body
-                  ? (L.rejectThisInObjectMethod(prop.body), L.lowerLambda(prop))
+                  ? (isJsSourceFile(expr.getSourceFile()) || L.rejectThisInObjectMethod(prop.body), L.lowerLambda(prop))
                   : null;
           } catch (err) {
             const nameText =
@@ -10770,6 +10815,11 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * Folding is limited to side-effect-free operands — dropping a computed
    * operand would skip its effects, so those are rejected instead. */
   export function lowerInstanceOf(L: Lowerer, expr: ts.BinaryExpression, loc: SrcLoc): IrExpr {
+    {
+      // Unit U4: a dynamic constructor on the right (lower-objmodel.ts).
+      const io = lowerObjModelInstanceof(L, expr);
+      if (io !== null) return io;
+    }
     // GH #109 (S125): `instanceof` asks for the operand's CLASS — a fold
     // may answer it from the static type alone, without the value, so a
     // width copy into that type must know it is asked.

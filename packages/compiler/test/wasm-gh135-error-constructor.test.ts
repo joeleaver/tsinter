@@ -148,10 +148,10 @@ try { nul.x; } catch (e) { console.log("before"); console.log(e.constructor === 
     fence: { text: /calling a constructor read from a dynamic value \(`x.constructor`\) is not supported yet/, stdout: "before\n" },
   },
   {
-    id: "GH135-JS-10 Object.getPrototypeOf(e) stops at its named fence",
+    id: "GH135-JS-10 Object.getPrototypeOf(e) === TypeError.prototype stops at its named fence (units U3 + U4 lower getPrototypeOf; the builtin's prototype stops)",
     entry: "main.js",
     src: `try { throw new TypeError("t"); } catch (e) { console.log("before"); console.log(Object.getPrototypeOf(e) === TypeError.prototype); }`,
-    fence: { text: /'Object.getPrototypeOf' is part of the standard library types but has no scriptc lowering yet \[SC2020/, stdout: "before\n" },
+    fence: { text: /'TypeError.prototype' is part of the standard library types but has no scriptc lowering yet \[SC2020/, stdout: "before\n" },
   },
   {
     id: "GH135-JS-11 the issue's literal spelling (null.x) refuses by name",

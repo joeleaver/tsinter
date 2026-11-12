@@ -24,7 +24,7 @@
  * assembler, disposition layer, syntax-reason classifier) is gone; the
  * run-time compiler's gate (wasm-regex-runtime-compiler.test.ts) holds the
  * one compiler to Node and to libregexp's lre_compile. */
-import { compileRegex, type RegexCompileOutcome } from "./regex-buildtime.js";
+import { compileRegexBuildTime, type RegexCompileOutcome } from "./regex-buildtime.js";
 
 export const BUILD_TIME_UNAVAILABLE = "build-time-compiler-unavailable";
 
@@ -41,7 +41,7 @@ export type RegexLiteralOutcome =
 
 function tryCompile(patternText: string, flagsText: string): RegexCompileOutcome | null {
   try {
-    return compileRegex(patternText, flagsText);
+    return compileRegexBuildTime(patternText, flagsText);
   } catch {
     return null;
   }

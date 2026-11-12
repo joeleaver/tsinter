@@ -9,6 +9,7 @@ import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
+import { lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -4509,6 +4510,11 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     if (!ts.isElementAccessExpression(target) && !ts.isPropertyAccessExpression(target)) {
       L.unsupported("SC1090", expr, "'delete' of non-property expressions");
     }
+    {
+      // Units U3 + U4: delete on a dynamic receiver (objmodel.ts).
+      const om = lowerObjModelDelete(L, expr);
+      if (om !== null) return { kind: "exprStmt", expr: om, loc };
+    }
     const lowerKey = (): IrExpr => {
       if (ts.isPropertyAccessExpression(target)) {
         return { kind: "strLit", value: target.name.text, type: STRING, loc: locOf(target.name) };
@@ -8282,6 +8288,15 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     const loc = locOf(stmt);
     if (stdlibGlobalNameOf(L, stmt.expression) === "globalThis") {
       return { kind: "block", body: [], loc };
+    }
+    // Units U3 + U4: for-in over a dynamic value walks own and inherited
+    // enumerable keys (objmodel.ts forInKeys).
+    {
+      const omKeys = lowerObjModelForInKeys(L, stmt.expression);
+      if (omKeys !== null) {
+        const keys: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: omKeys, type: DYN, loc }, type: arrayOf(STRING), loc } as IrExpr;
+        return lowerForInOverKeys(L, stmt, keys, labels);
+      }
     }
     const recvT = L.mapTypeOf(L.typeOf(stmt.expression));
     if (recvT?.kind === "array") return lowerForInArray(L, stmt, labels);

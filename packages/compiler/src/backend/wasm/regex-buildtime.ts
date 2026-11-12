@@ -117,6 +117,58 @@ export function compileRegex(pattern: string, flags: string): RegexCompileOutcom
   return hit;
 }
 
+/** A pattern known at build time (a literal, a folded `new RegExp` of
+ * constants): compileRegex, except that a lone `]` the run-time compiler
+ * fences compiles as its identity escape (SEMANTICS.md S102's U3+U4
+ * amendment). A pattern built at run time keeps the fence. */
+export function compileRegexBuildTime(pattern: string, flags: string): RegexCompileOutcome {
+  const hit = compileRegex(pattern, flags);
+  if (hit.kind === "fence" && hit.key === "annexb-extended-pattern-char") return annexBBracket(pattern, flags) ?? hit;
+  return hit;
+}
+
+/** Annex B's ExtendedPatternCharacter `]` (a `]` outside a class, outside
+ * unicode mode, is the character itself — zod's rfc5322Email literal):
+ * the pattern with each such `]` escaped is the same pattern (`\]` is the
+ * identity escape), so a constant pattern compiles through it and keeps
+ * its own source. Null when the rewrite does not apply or still fails. */
+function annexBBracket(pattern: string, flags: string): RegexCompileOutcome | null {
+  if (flags.includes("u") || flags.includes("v")) return null;
+  let out = "";
+  let inClass = false;
+  let changed = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "\\") {
+      out += ch + (pattern[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === "]") inClass = false;
+      out += ch;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      out += ch;
+      // A `]` right after `[` or `[^` is a member in JS (`[]` is empty,
+      // `[^]` any): the class parse handles it; nothing to rewrite.
+      continue;
+    }
+    if (ch === "]") {
+      out += "\\]";
+      changed = true;
+      continue;
+    }
+    out += ch;
+  }
+  if (!changed) return null;
+  const r = run(out, flags);
+  if (r.kind !== "ok" || r.source !== out) return null;
+  return { ...r, source: pattern };
+}
+
 /** Tests only: forget the built compiler module, so the next compile builds
  * it again (inside whatever module walk is current). */
 export function resetRegexBuildtimeForTests(): void {

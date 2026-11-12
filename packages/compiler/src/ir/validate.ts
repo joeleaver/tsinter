@@ -922,6 +922,23 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "dyn.packPushSpreadIter": { argTypes: [DYN, DYN], result: VOID },
   "dyn.assignAll": { argTypes: [DYN, DYN], result: DYN },
   "dyn.objCreateNullProto": { argTypes: [], result: DYN },
+  "om.defineProperty": { argTypes: [JSVAL, JSVAL, JSVAL], result: JSVAL },
+  "om.defineProperties": { argTypes: [JSVAL, JSVAL], result: JSVAL },
+  "om.getOwnPropertyDescriptor": { argTypes: [JSVAL, JSVAL], result: JSVAL },
+  "om.getOwnPropertyDescriptors": { argTypes: [JSVAL], result: JSVAL },
+  "om.getOwnPropertyNames": { argTypes: [JSVAL], result: JSVAL },
+  "om.getPrototypeOf": { argTypes: [JSVAL], result: JSVAL },
+  "om.setPrototypeOf": { argTypes: [JSVAL, JSVAL], result: JSVAL },
+  "om.create": { argTypes: [JSVAL, JSVAL], result: JSVAL },
+  "om.integrity": { argTypes: [JSVAL, F64], result: JSVAL },
+  "om.isIntegrity": { argTypes: [JSVAL, F64], result: BOOL },
+  "om.delete": { argTypes: [JSVAL, STRING], result: BOOL },
+  "om.forInKeys": { argTypes: [JSVAL], result: JSVAL },
+  "om.objectProto": { argTypes: [], result: JSVAL },
+  "om.codegenFn": { argTypes: [], result: JSVAL },
+  "om.instanceOf": { argTypes: [JSVAL, JSVAL], result: BOOL },
+  "om.bind": { argTypes: [JSVAL, JSVAL, JSVAL], result: JSVAL },
+  "om.sloppy": { argTypes: [F64], result: VOID },
   "dyn.objValues": { argTypes: [DYN], result: DYN },
   "dyn.objEntries": { argTypes: [DYN], result: DYN },
   "dyn.structuredClone": { argTypes: [DYN, DYN], result: DYN },
@@ -4964,8 +4981,8 @@ function validateFunction(
         if (named !== (e.name !== undefined)) {
           err(`jsOp ${e.op} ${named ? "requires" : "forbids"} a name`, e.loc);
         }
-        if (e.spelling !== undefined && e.op !== "callMethod" && e.op !== "callFn") {
-          err(`jsOp ${e.op} forbids a callee spelling (callMethod and callFn only)`, e.loc);
+        if (e.spelling !== undefined && e.op !== "callMethod" && e.op !== "callFn" && e.op !== "construct") {
+          err(`jsOp ${e.op} forbids a callee spelling (callMethod, callFn and construct only)`, e.loc);
         }
         if (e.recvThis !== undefined) {
           const callee = e.args[0];

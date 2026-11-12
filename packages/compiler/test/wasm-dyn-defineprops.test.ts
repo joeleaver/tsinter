@@ -146,7 +146,11 @@ test("semantics C-4: an ARRAY descriptor value is object-like — no throw, defi
   expect(stdout).toBe("undefined\n");
 });
 
-test("semantics S061: an accessor descriptor (get/set PRESENCE) is a named fence that ends the program (GH #86, SEMANTICS.md S122) — non-callable get, OBJ target", async () => {
+// Units U3 + U4 (SEMANTICS.md S061/S062's U3+U4 amendment): over an `any`
+// target the object model answers as Node does — a non-callable `get` is
+// Node's TypeError, a callable one defines a real accessor, and a
+// non-enumerable property is a hidden own property.
+test("semantics S061 (U3+U4): a non-callable get on an OBJ target throws Node's TypeError", async () => {
   const { stdout, stderr } = await compileAndRun(
     [
       "const o: any = {};",
@@ -160,12 +164,10 @@ test("semantics S061: an accessor descriptor (get/set PRESENCE) is a named fence
     true,
   );
   expect(stdout).toBe("");
-  expect(stderr).toBe(
-    "tsinter: unsupported: accessor (get/set) property descriptors on a dynamic value are not supported yet [SC1090]\n",
-  );
+  expect(stderr).toBe("Uncaught TypeError: Getter must be a function: 1\n");
 });
 
-test("semantics S061: a CALLABLE get on a FUNC target fences identically — presence is the trigger regardless of target kind or callability", async () => {
+test("semantics S061 (U3+U4): a CALLABLE get on a FUNC target defines an accessor", async () => {
   const { stdout, stderr } = await compileAndRun(
     [
       "function g() {}",
@@ -178,17 +180,14 @@ test("semantics S061: a CALLABLE get on a FUNC target fences identically — pre
       "const descs: any = {};",
       "descs.x = d;",
       "Object.defineProperties(f, descs);",
-      "console.log('unreachable');",
+      "console.log(f.x, Object.keys(f));",
     ].join("\n"),
-    true,
   );
-  expect(stdout).toBe("");
-  expect(stderr).toBe(
-    "tsinter: unsupported: accessor (get/set) property descriptors on a dynamic value are not supported yet [SC1090]\n",
-  );
+  expect(stderr).toBe("");
+  expect(stdout).toBe("42 [ 'x' ]\n");
 });
 
-test("semantics S062: a non-enumerable OBJ-target write refuses by name (Node succeeds silently)", async () => {
+test("semantics S062 (U3+U4): a non-enumerable OBJ-target property is a hidden own property", async () => {
   const { stdout, stderr } = await compileAndRun(
     [
       "const o: any = {};",
@@ -198,15 +197,11 @@ test("semantics S062: a non-enumerable OBJ-target write refuses by name (Node su
       "const descs: any = {};",
       "descs.x = d;",
       "Object.defineProperties(o, descs);",
-      "console.log('unreachable');",
+      "console.log(o.x, Object.keys(o), Object.hasOwn(o, 'x'), Object.getOwnPropertyNames(o));",
     ].join("\n"),
-    true,
   );
-  expect(stdout).toBe("");
-  expect(stderr).toBe(
-    "tsinter: unsupported: Object.defineProperties: a non-enumerable property descriptor on a plain-object " +
-      "dynamic value is not supported yet [SC1090]\n",
-  );
+  expect(stderr).toBe("");
+  expect(stdout).toBe("1 [] true [ 'x' ]\n");
 });
 
 test("semantics S062's own positive control: enumerable:true on an OBJ target succeeds", async () => {

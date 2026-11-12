@@ -3683,6 +3683,25 @@ export type IrLibFn =
    * and deepStrictEqual's prototype gate. Never throws. Static builds
    * only; --dynamic routes Object.create through the engine instead. */
   | "dyn.objCreateNullProto"
+  /** Units U3 + U4 (backend/wasm/objmodel.ts): the ES5 object model on
+   * dynamic values. WasmGC lanes only. */
+  | "om.defineProperty"
+  | "om.defineProperties"
+  | "om.getOwnPropertyDescriptor"
+  | "om.getOwnPropertyDescriptors"
+  | "om.getOwnPropertyNames"
+  | "om.getPrototypeOf"
+  | "om.setPrototypeOf"
+  | "om.create"
+  | "om.integrity"
+  | "om.isIntegrity"
+  | "om.delete"
+  | "om.forInKeys"
+  | "om.objectProto"
+  | "om.codegenFn"
+  | "om.instanceOf"
+  | "om.bind"
+  | "om.sloppy"
   | "dyn.objValues"
   | "dyn.objEntries"
   /** structuredClone over the checked-dynamic tree (scr_json.c): the JSON-safe subset plus
@@ -7440,6 +7459,20 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
  * seed on `dynCheck` and `awaitExpr` nodes, which throw on validation
  * failure / promise rejection). */
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
+  "om.defineProperty",
+  "om.defineProperties",
+  "om.getOwnPropertyDescriptor",
+  "om.getOwnPropertyDescriptors",
+  "om.getOwnPropertyNames",
+  "om.getPrototypeOf",
+  "om.setPrototypeOf",
+  "om.create",
+  "om.integrity",
+  "om.isIntegrity",
+  "om.delete",
+  "om.forInKeys",
+  "om.instanceOf",
+  "om.bind",
   "num.toFixed",
   // BigInt's RangeErrors/SyntaxErrors/TypeErrors (bigint.ts)
   "big.mul",

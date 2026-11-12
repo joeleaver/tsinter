@@ -17,6 +17,7 @@ import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
 import { classFuncBox, classLiftIn, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
+import { collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
   anyOpRequiresDynamicDiag,
@@ -235,6 +236,33 @@ export interface FnCtx {
    * prepends that statement. */
   lexThisOk?: true;
   lexThis?: IrLocal;
+}
+
+/** Unit U4: FN_PROTO's prototype bits for a function value read by name
+ * or member (1 an ordinary function, 2 an arrow, method or async
+ * function), or null when the declaration is not known. */
+export function fnProtoOfValueNode(L: Lowerer, node: ts.Expression): number | null {
+  let x = node;
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  if (!ts.isIdentifier(x) && !ts.isPropertyAccessExpression(x)) return null;
+  const sym = L.checker.getSymbolAtLocation(ts.isPropertyAccessExpression(x) ? x.name : x);
+  const d = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (d === undefined) return null;
+  let fn: ts.Node | undefined = d;
+  if (ts.isPropertyAssignment(d) || ts.isVariableDeclaration(d)) fn = d.initializer;
+  while (fn !== undefined && ts.isParenthesizedExpression(fn)) fn = fn.expression;
+  if (fn === undefined) return null;
+  // `const g = f`: the alias's function (a const only, never rewritten).
+  if ((ts.isIdentifier(fn) || ts.isPropertyAccessExpression(fn)) && ts.isVariableDeclaration(d) &&
+      (ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) !== 0 && fn !== node) {
+    return fnProtoOfValueNode(L, fn as ts.Expression);
+  }
+  if (ts.isMethodDeclaration(fn) || ts.isArrowFunction(fn)) return 2;
+  if (ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn)) {
+    const async = (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+    return async && fn.asteriskToken === undefined ? 2 : 1;
+  }
+  return null;
 }
 
 /** GH #133 review: the entry read of a function's lexical receiver (see
@@ -1801,7 +1829,13 @@ export class Lowerer {
     registerBuiltinEmitterClass(this);
     registerBuiltinStreamClasses(this);
     collectDynArmSyms(this);
+    this.es5 = collectEs5(this, this.moduleOrder.length > 0 ? this.moduleOrder : [entry]);
+    if (this.es5 !== null) (this.typeCtx as { es5EmptyDyn?: boolean }).es5EmptyDyn = true;
   }
+
+  /** Units U3 + U4 (lower-objmodel.ts): what the program's JavaScript
+   * sources make dynamic. */
+  es5: Es5Info | null = null;
 
   registerBuiltinErrorClasses(): void {
     return registerBuiltinErrorClasses(this);
@@ -3373,6 +3407,10 @@ export class Lowerer {
   }
 
   typeOf(node: ts.Node): ts.Type {
+    if (this.es5 !== null) {
+      const t = es5TypeOf(this, this.es5, node);
+      if (t !== null) return t;
+    }
     // Unit U2a (dyn-arm.ts): an expression rooted at a dynamic-arm value
     // is that dynamic value, whatever type the checker spelled — `any`.
     if (this.dynArmActive) {
@@ -3772,7 +3810,7 @@ export class Lowerer {
         return;
       }
       const rec = n as { kind?: unknown; fn?: unknown; op?: unknown; loc?: SrcLoc; sloppy?: boolean };
-      if (((rec.kind === "libCall" && rec.fn === "dyn.keySet") || (rec.kind === "jsOp" && (rec.op === "setProp" || rec.op === "setIdx"))) && rec.loc !== undefined) {
+      if (((rec.kind === "libCall" && (rec.fn === "dyn.keySet" || rec.fn === "om.delete")) || (rec.kind === "jsOp" && (rec.op === "setProp" || rec.op === "setIdx"))) && rec.loc !== undefined) {
         const info = infoOf(rec.loc.file);
         const at = rec.loc.start;
         if (info !== null && !info.strict && !info.ranges.some(([a, b]) => a <= at && at < b)) rec.sloppy = true;
@@ -3846,7 +3884,7 @@ export class Lowerer {
         return;
       }
       const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: number };
-      if (rec.kind === "dynFrom" && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
+      if ((rec.kind === "dynFrom" || rec.kind === "jsMarshal") && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
         const fnName = rec.value.kind === "closure" ? rec.value.fnName : boundFn.get(rec.value.localId as string);
         const loc = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;
         if (loc !== undefined) {
@@ -7034,6 +7072,12 @@ export class Lowerer {
     const fresh = this.dynamic && e.type.kind === "func" ? this.checkHostFunctionCopies(node, e.type) : true;
     const shallow = this.lastHostShallow;
     const out = jsvalIn(this, e, node);
+    if (e.type.kind === "func" && out.kind === "jsMarshal" && ts.isExpression(node)) {
+      // Unit U4: whether the function value owns `prototype` (a method or
+      // an arrow read off a record does not: `new` on one throws).
+      const k = fnProtoOfValueNode(this, node);
+      if (k !== null) (out as { fnProto?: number }).fnProto = k;
+    }
     if (e.type.kind === "func" && fresh) this.checkedHostMarshals.add(out);
     if (e.type.kind === "func" && shallow) this.shallowHostMarshals.add(out);
     return out;
@@ -7608,6 +7652,7 @@ export class Lowerer {
    * miss (process.env reads). "undefined" sorts last among all arm typeKeys,
    * so the sorted pair is always [t, undefined]. */
   withUndefinedArm(t: IrType): IrType {
+    if (t.kind === "jsval" || t.kind === "dyn") return t;
     const arms = [t, UNDEFINED_T].sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
     return { kind: "union", unionId: this.unions.intern(arms) };
   }

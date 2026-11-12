@@ -2218,6 +2218,21 @@ const PROTO_LINK_REFUSAL =
 
 /** Unit A2: the island's `Object.create(...)` call — jsOp callMethod
  * "create" over globalGet("Object"), the shape lower-island.ts builds. */
+/** Units U3 + U4: an IR node that needs the object model — an `om.*`
+ * libCall, or `new` on a dynamic callee other than the pattern-served
+ * globals. */
+function isObjModelNode(rec: Record<string, unknown>): boolean {
+  if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("om.")) return true;
+  if (rec["kind"] === "jsOp" && rec["op"] === "instanceOf") return true;
+  if (rec["kind"] === "jsOp" && rec["op"] === "construct") {
+    const args = rec["args"];
+    if (!Array.isArray(args) || args.length === 0) return false;
+    const callee = args[0] as Record<string, unknown>;
+    return !(callee["kind"] === "jsOp" && callee["op"] === "globalGet");
+  }
+  return false;
+}
+
 function isIslandObjectCreate(rec: Record<string, unknown>): boolean {
   if (rec["kind"] !== "jsOp" || rec["op"] !== "callMethod" || rec["name"] !== "create") return false;
   const args = rec["args"];
@@ -3170,6 +3185,8 @@ class Assembler {
   private readonly accessorsLive: boolean;
   /** Unit A2: the module calls the island's `Object.create`. */
   private readonly objCreateLive: boolean;
+  /** Units U3 + U4 (objmodel.ts): the module reaches an object-model op. */
+  private readonly objModelLive: boolean;
   /** Unit A2: the module builds an island tag call's strings array. */
   private readonly tplLive: boolean;
   /** Unit F1: the module builds an island RegExp (the island's
@@ -3474,7 +3491,8 @@ class Assembler {
     // Unit A2: the island's `Object.create(...)` (jsOp callMethod over
     // globalGet("Object")) can build a null-prototype object or a linked
     // one; both readers' refusals are installed only where it appears.
-    this.objCreateLive = this.irNodeReachable(mod, (rec) => isIslandObjectCreate(rec));
+    this.objModelLive = this.irNodeReachable(mod, (rec) => isObjModelNode(rec));
+    this.objCreateLive = this.objModelLive || this.irNodeReachable(mod, (rec) => isIslandObjectCreate(rec));
     this.nullProtoLive =
       this.objCreateLive ||
       this.irNodeReachable(
@@ -3484,7 +3502,7 @@ class Assembler {
           typeof rec["fn"] === "string" &&
           (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
       );
-    this.accessorsLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
+    this.accessorsLive = this.objModelLive || this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
     this.tplLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "tplStrings");
     {
       const unionHasUrl = (id: string): boolean => (mod.unions ?? []).some((u) => u.id === id && u.arms.some((arm) => arm.kind === "url"));
@@ -3753,6 +3771,158 @@ class Assembler {
    * ported): after EVERY call that can throw, test the pending tag and
    * unwind. Values already on the stack are simply abandoned by the
    * branch — wasm truncates the operand stack at a br. */
+  /** Units U3 + U4: the `om.*` libCalls (objmodel.ts). */
+  private emitObjModelLibCall(e: Extract<WExpr, { kind: "libCall" }>): void {
+    const code = this.fn.code;
+    const om = this.dyn.om;
+    const walk = (): void => {
+      for (const a of e.args) this.walkExpr(a);
+    };
+    switch (e.fn) {
+      case "om.defineProperty":
+        walk();
+        code.call(om.defineProperty());
+        break;
+      case "om.defineProperties":
+        walk();
+        code.call(om.defineProperties());
+        break;
+      case "om.getOwnPropertyDescriptor":
+        walk();
+        code.call(om.getOwnPropertyDescriptor());
+        break;
+      case "om.getOwnPropertyDescriptors":
+        walk();
+        code.call(om.getOwnPropertyDescriptors());
+        break;
+      case "om.getOwnPropertyNames":
+        walk();
+        code.call(om.ownNames());
+        break;
+      case "om.getPrototypeOf":
+        walk();
+        code.call(om.getProto());
+        break;
+      case "om.setPrototypeOf":
+        walk();
+        code.call(om.setProto());
+        break;
+      case "om.create":
+        walk();
+        code.call(om.create());
+        break;
+      case "om.integrity":
+      case "om.isIntegrity": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.i32TruncF64S();
+        code.call(e.fn === "om.integrity" ? om.integrity() : om.isIntegrity());
+        break;
+      }
+      case "om.delete":
+        walk();
+        if ((e as { sloppy?: boolean }).sloppy === true) {
+          code.i32Const(1);
+          code.globalSet(om.sloppyGlobal());
+        }
+        code.call(om.deleteKey());
+        code.i32Const(0);
+        code.globalSet(om.sloppyGlobal());
+        break;
+      case "om.forInKeys":
+        walk();
+        code.call(om.forInKeys());
+        break;
+      case "om.objectProto":
+        code.call(om.objectProto());
+        return;
+      case "om.codegenFn":
+        code.call(this.codegenFnHelper());
+        return;
+      case "om.instanceOf":
+        walk();
+        code.call(om.instanceOf());
+        break;
+      case "om.sloppy": {
+        const a = e.args[0]!;
+        code.i32Const(a.kind === "numLit" && a.value !== 0 ? 1 : 0);
+        code.globalSet(om.sloppyGlobal());
+        return;
+      }
+      default:
+        this.refuse(`expr:libCall:${e.fn}`, e.loc);
+        code.unreachable();
+        return;
+    }
+    this.emitPendingCheck();
+  }
+
+  private codegenFnFunc: number | null = null;
+
+  /** SEMANTICS.md S132: the `Function` constructor as a value — one FUNC
+   * box whose call (or construct) converts its arguments to strings and
+   * throws Node's --disallow-code-generation-from-strings EvalError. */
+  private codegenFnHelper(): number {
+    if (this.codegenFnFunc !== null) return this.codegenFnFunc;
+    const g = this.mb.addGlobal(this.dyn.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.dyn.dynT());
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [this.dyn.dynRef()]), "%w.om.codegenFn");
+    this.codegenFnFunc = idx;
+    const thunk = this.mb.declareFunc(this.dyn.thunkSig(), "%w.om.codegenThunk");
+    {
+      const c = new Code();
+      const I = 2;
+      const vec = this.dyn.arrRef();
+      void vec;
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      this.dyn.arrLen(c, (x) => x.localGet(1));
+      c.i32GeS();
+      c.brIf(1);
+      this.dyn.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+      c.call(this.dyn.toStrUser());
+      c.drop();
+      c.globalGet(this.exc().kindG);
+      c.ifVoid();
+      c.refNull(this.dyn.dynT());
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      this.emitSetCellError(c, "%Error", "EvalError", (x) => this.pushStrLitInto(x, "Code generation from strings disallowed for this context"), null);
+      c.refNull(this.dyn.dynT());
+      this.mb.setBody(thunk, [I32], c.bytes());
+    }
+    this.mb.declareFuncRef(thunk);
+    const c = new Code();
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.dyn.boxFn(
+      c,
+      (x) => x.structNew(this.fnEvalClosMarkerType()),
+      (x) => x.refFunc(thunk),
+      -4,
+      (x) => this.pushStrLitInto(x, "Function"),
+      1,
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   private emitPendingCheck(): void {
     this.fn.code.globalGet(this.exc().kindG);
     this.openIf();
@@ -11139,6 +11309,7 @@ class Assembler {
           }
         : {}),
       ...(this.tplLive ? { tpl: true as const } : {}),
+      ...(this.objModelLive ? { objModel: true as const } : {}),
       ...(this.regexIslandLive
         ? { regex: { reType: () => this.regex.regexType, test: () => this.dynRegexTestHelper() } }
         : {}),
@@ -25166,6 +25337,10 @@ class Assembler {
         }
         /* INC-27 U5: Object.create(null), variadic Object.assign's source
          * pack and structuredClone. */
+        if (e.fn.startsWith("om.")) {
+          this.emitObjModelLibCall(e);
+          return;
+        }
         if (e.fn === "dyn.objCreateNullProto") {
           // A fresh object whose payload carries the null-prototype flag
           // (dyn.ts OBJ_PROTO) — the flag every reader already
@@ -32468,7 +32643,9 @@ class Assembler {
             if (e.fnName !== undefined && e.fnName !== "") this.pushStrLitInto(code, e.fnName);
             else code.refNull(this.strType);
             code.refNull(this.strType);
-            code.i32Const(0);
+            // Unit U4: whether it owns `prototype` (arrows and methods do
+            // not: `new` on one throws), stamped by the lowering.
+            code.i32Const((e as { fnProto?: number }).fnProto ?? 0);
             code.call(box);
             return;
           }
@@ -32939,7 +33116,14 @@ class Assembler {
           // machinery is built for them yet; same stable "expr:jsOp"
           // bucket as every other still-unimplemented op below (bucket
           // names are census currency — see the header this replaces).
-          case "instanceOf":
+          case "instanceOf": {
+            // Unit U4: the prototype-chain walk (objmodel.ts instanceOf).
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.dyn.om.instanceOf());
+            this.emitPendingCheck();
+            return;
+          }
           case "not":
           case "iterNew":
           case "optCallMethod":
@@ -33701,6 +33885,24 @@ class Assembler {
                   }
                 }
               }
+            }
+            if (!(callee.kind === "jsOp" && callee.op === "globalGet")) {
+              // Unit U4: `new F(...)` on a dynamic constructor.
+              this.walkExpr(callee);
+              const argv = this.acquireScratch(this.dyn.arrRef());
+              this.dyn.pushNewArr(code);
+              code.localSet(argv);
+              for (let i = 1; i < e.args.length; i++) {
+                code.localGet(argv);
+                this.walkExpr(e.args[i]!);
+                code.call(this.dyn.arrPush());
+              }
+              code.localGet(argv);
+              this.pushStrLit(e.spelling ?? e.name ?? "value");
+              code.call(this.dyn.om.construct());
+              this.releaseScratch(this.dyn.arrRef(), argv);
+              this.emitPendingCheck();
+              return;
             }
             this.refuse(`expr:${e.kind}`, e.loc);
             code.unreachable();

@@ -3,6 +3,7 @@
  * function/lambda lowering and signature collection, and monomorphizing
  * generic instantiation (bounded by MAX_GENERIC_DEPTH and MAX_GENERIC_FN_INSTANCES). */
 import * as ts from "../ts7/adapter.js";
+import { lowerObjModelStatic } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
@@ -793,6 +794,12 @@ export interface GenericInstance {
       });
       return;
     }
+    // A dynamic body (an ES5 constructor whose one path returns an
+    // object, U4): JS completes with undefined.
+    if (bodyReturn.kind === "jsval") {
+      body.push({ kind: "return", value: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, loc });
+      return;
+    }
     if (bodyReturn.kind === "union") {
       const value = L.wrappedUndefined(bodyReturn, loc);
       if (value) {
@@ -806,7 +813,7 @@ export interface GenericInstance {
     // completes anyway — an exhaustive switch over a discriminant a checked
     // dynamic value lied about (`JSON.parse('{"kind":"c"}') as S`) — answers
     // undefined, as Node's function does, instead of the trap.
-    if (L.undefSlots && bodyReturn.kind !== "caught" && bodyReturn.kind !== "jsval" && !isUnitType(bodyReturn)) {
+    if (L.undefSlots && bodyReturn.kind !== "caught" && !isUnitType(bodyReturn)) {
       body.push({ kind: "return", value: { kind: "slotUndef", type: bodyReturn, loc }, loc });
       return;
     }
@@ -8000,6 +8007,11 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     if (call.questionDotToken || access.questionDotToken) return null;
     if (!L.isStdlibGlobal(access.expression, "Object")) return null;
     const member = access.name.text;
+    {
+      // Units U3 + U4: the object model over a dynamic operand.
+      const om = lowerObjModelStatic(L, call, member);
+      if (om !== null) return om;
+    }
     // Object.is — the spec's SameValue over the static kinds. Number
     // pairs take the runtime SameValue (NaN equals NaN, +0 differs from
     // -0 — the two divergences from ===); every other supported pair

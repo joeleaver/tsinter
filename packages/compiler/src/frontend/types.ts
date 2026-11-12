@@ -1,7 +1,7 @@
 import { isDtsMirrorPath } from "./npm-static.js";
 import * as ts from "./ts7/adapter.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
-import { arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
+import { arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, canMarshalIntoIsland, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
 import { accessorSlotProp, shapeFieldCopy } from "../ir/nodes.js";
@@ -561,6 +561,10 @@ export interface TypeMapperCtx {
    * `unknown` and `object` map to jsval too — the island value is the
    * only user-visible dynamic representation. */
   sharedDynamic?: boolean;
+  /** Units U3 + U4 (lower-objmodel.ts): the program's JavaScript reaches
+   * the object model, so a JavaScript empty object literal's type is a
+   * dynamic object, not the empty record. */
+  es5EmptyDyn?: boolean;
   /** LowerOptions.hostFetch: the backend's host supplies fetch, so the
    * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
    * without --dynamic (the module serves them — SEMANTICS.md S098). */
@@ -1340,6 +1344,10 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   for (const [irName, rec] of RUNTIME_ERROR_CLASSES) {
     if (isStdlibInterface(rec.lib)) return { kind: "object", className: irName };
   }
+  // SEMANTICS.md S132: the `Function` constructor as a value (`const F =
+  // Function`) is a dynamic FUNC whose call and construct throw Node's
+  // --disallow-code-generation-from-strings EvalError.
+  if (ctx.sharedDynamic === true && isStdlibInterface("FunctionConstructor")) return JSVAL;
   // The lib's `Object` interface is a TOP type: tsc admits every
   // non-nullish value into an `Object` slot (`const x: Object = "s"`), so
   // it lowers like `unknown` (the dyn) — the same rule as `object` and
@@ -3056,7 +3064,20 @@ export function isUnitOnlyTsType(t: ts.Type): boolean {
  * result is exactly the nullable-callback shape mapType's union branch
  * admits, `(() => void) | undefined`) so the interned union is IDENTICAL
  * to what mapping the checker's own `T | undefined` produces. */
+/** Units U3 + U4: a CommonJS export table literal (`module.exports = {…}`,
+ * `exports.k = {…}`) keeps its record: the module machinery owns it. */
+function isCjsExportLiteral(d: ts.Node): boolean {
+  if (!ts.isObjectLiteralExpression(d)) return false;
+  let p = d.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) p = p.parent;
+  if (p === undefined || !ts.isBinaryExpression(p) || p.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+  const t = p.left.getText();
+  return t === "module.exports" || t.startsWith("exports.") || t.startsWith("module.exports.");
+}
+
 export function withUndefinedArm(t: IrType, unions: UnionRegistry): IrType | null {
+  // A dynamic value holds undefined itself.
+  if (t.kind === "jsval") return t;
   if (t.kind === "union") {
     const def = unions.get(t.unionId);
     if (!def) return null;
@@ -3400,6 +3421,25 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       !(anonSym !== undefined && checker.declarationsOf(anonSym).some((d) => ts.isObjectLiteralExpression(d)))
     ) {
       return DYN;
+    }
+    if (
+      ctx.es5EmptyDyn === true &&
+      checker.getCallSignatures(widened).length === 0 && checker.getConstructSignatures(widened).length === 0 &&
+      anonSym !== undefined && checker.declarationsOf(anonSym).length > 0 &&
+      // the JavaScript of an npm package compiled statically (--npm-static):
+      // (the program's own JavaScript keeps its records, an empty one aside)
+      checker.declarationsOf(anonSym).every((d) => /\.[cm]?jsx?$/.test(d.getSourceFile().fileName) && (props.length === 0 || d.getSourceFile().fileName.includes("/node_modules/")) && !isCjsExportLiteral(d)) &&
+      // only a literal whose members a dynamic object can hold as they are
+      // (a class instance, a Map, a RegExp member keeps the record: making
+      // it dynamic would change what an unrelated program prints)
+      props.every((p) => {
+        if (p.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return false;
+        const m = mapType(checker.getTypeOfSymbol(p), ctx);
+        return m !== null && (m.kind === "jsval" || m.kind === "dyn" || m.kind === "func" ||
+          canMarshalIntoIsland(m, (id) => ctx.shapes.get(id), (id) => ctx.unions.get(id)));
+      })
+    ) {
+      return ctx.sharedDynamic === true ? JSVAL : DYN;
     }
     const fields: { name: string; type: IrType; optional?: true }[] = [];
     for (const p of props) {

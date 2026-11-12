@@ -6308,6 +6308,23 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "spawnRes.errName":
           case "spawnRes.errno":
           case "error.newCoded":
+          case "om.defineProperty":
+          case "om.defineProperties":
+          case "om.getOwnPropertyDescriptor":
+          case "om.getOwnPropertyDescriptors":
+          case "om.getOwnPropertyNames":
+          case "om.getPrototypeOf":
+          case "om.setPrototypeOf":
+          case "om.create":
+          case "om.integrity":
+          case "om.isIntegrity":
+          case "om.delete":
+          case "om.forInKeys":
+          case "om.objectProto":
+          case "om.codegenFn":
+          case "om.instanceOf":
+          case "om.bind":
+          case "om.sloppy":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
           case "big.lit":
           case "big.add":

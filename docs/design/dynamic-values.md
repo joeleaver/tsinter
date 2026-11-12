@@ -472,6 +472,153 @@ until materialized. A missing key answers `undefined`, which is Node's answer.
   - Instances are ordinary dynamic objects. Recovering a struct-backed "class"
     from an ES5 pattern is a later speed option, not the first step (decision J3).
 
+**U3 + U4 plan as built (one unit, 2026-11-11).** Driven by zod 4, which
+paperclip and rea load at startup (its `$constructor` trait mixins,
+`Object.defineProperty(inst, "_zod", …)`, `getPrototypeOf` walks, for-in over
+prototypes, `util.defineLazy` getters/setters, and an `allowsEval` probe).
+
+- **Gate.** Everything below builds only in a module whose IR reaches an
+  object-model op (the emitter's `objModelLive` prescan: the new `Object.*`
+  island calls, `delete`/for-in/`in` on a dynamic value, `new`/`.prototype`
+  on a dynamic constructor, `call`/`apply`/`bind` on a FUNC box). Other
+  modules are byte-identical.
+- **Layout.** In such a module every OBJ is allocated as the A2 linked
+  struct, widened to `{len, entries, protoCode, (mut) proto, (mut) hidden,
+  (mut) hiddenLen, (mut) oflags}`. The prototype link is mutable
+  (`setPrototypeOf`); a null box ends the chain at Object.prototype, the
+  interned `null` box means a null prototype.
+- **Attributes: the two-table split** that FUNC own properties already use
+  (`$fnProps` enumT/hidT, S062). Enumerable keys stay in `entries`, so every
+  existing walker (keys/values/entries, JSON, spread, `Object.assign`,
+  inspect, deep equality) honors enumerability by construction.
+  Non-enumerable keys live in `hidden`. Only the own-key readers consult it:
+  keyGet, keySet, `in`, hasOwn, `delete`, getOwnPropertyNames/Descriptor(s).
+  A non-default `writable`/`configurable` rides a `$dynEntryA <: $dynEntry`
+  subtype entry, with an `i32` flags field. A hidden entry's flags also
+  carry its position in the combined insertion order, so
+  getOwnPropertyNames lists keys in Node's order.
+- **Accessors.** The A2 cell (a `DK.JSVAL` `$dyn` holding the getter) gains
+  a `$dynAcc` subtype with a setter slot. Either half may be `undefined`.
+  Reads call the getter; writes call the setter. A write to a getter-only or
+  non-writable property, or a new key on a non-extensible object, throws
+  Node's strict-mode TypeError in strict code. In sloppy code it is ignored.
+  Strictness is the writing site's, passed as an operand.
+- **The calls** are pattern-served `callMethod(globalGet("Object"), …)`
+  shapes with dynamic operands: defineProperty, defineProperties,
+  getOwnPropertyDescriptor(s), getOwnPropertyNames, getPrototypeOf,
+  setPrototypeOf, create (with a properties argument), keys/values/entries/
+  assign, freeze/isFrozen, and `Object.prototype.hasOwnProperty.call`.
+  `delete o.k` / `delete o[k]`, computed `k in o` (own, hidden, then the
+  chain) and for-in (own enumerable keys, then each prototype's, skipping
+  shadowed names) are island ops.
+- **ES5 constructors (U4).** A function that is `new`ed, or whose
+  `.prototype` is read or written, is a *dynamic constructor*:
+  - Its instance type and its `this` type are `any` to the lowering
+    (`Lowerer.typeOf`, as U2's arm).
+  - `F.prototype` is created lazily in its `$fnProps` hidden table, with a
+    non-enumerable `constructor` back-link.
+  - `new F(…)` builds a linked OBJ over `F.prototype`, runs the body with
+    that `this`, and keeps an object result.
+  - `instanceof` walks the chain.
+  - inspect prints the constructor's name (`Point { x: 3 }`).
+  - `call`/`apply`/`bind` go through the FUNC box with `this` pushed.
+  - `arguments` in such a function is S081's real array.
+- **`new Function` / `eval`** (S132): they throw Node's own catchable
+  `EvalError: Code generation from strings disallowed for this context`,
+  Node's answer under `--disallow-code-generation-from-strings`. So feature
+  probes like zod's `allowsEval` answer false and take the runtime path.
+
+**As built (U3+U4, 2026-11-11).** Files: `backend/wasm/objmodel.ts` (the
+runtime) and `frontend/lowering/lower-objmodel.ts` (the lowering). Where the
+plan above was underspecified, these are the calls made:
+
+- **Which JavaScript values are dynamic: the ES5 analysis** (`collectEs5`).
+  It runs once per lowering over the program's JavaScript sources, before
+  anything lowers. It collects:
+  - *ES5 functions*: a function declaration, or a `var`/`const` bound to a
+    function expression, that is `new`ed, has its `.prototype` referenced,
+    has its `call`/`apply`/`bind` read, or is the target of an `Object.*`
+    model call.
+  - *dynamic literals*: an object literal that reaches the object model in
+    place or through the binding it initializes. That means the target or
+    descriptor of an `Object.*` model call, `delete`, for-in, computed `in`,
+    `F.prototype = {…}`, a method reading `this`, or a literal shaped like a
+    property descriptor in a program that hands descriptors to
+    `Object.defineProperty`, `defineProperties` or `create` at all (an
+    option table's `{ value: … }` rows elsewhere keep their typed records).
+    Its walk keeps an explicit stack, so a deeply nested expression cannot
+    overflow the compiler. Their nested literals and enclosing array literals
+    count too, and so do the bindings they initialize. Bindings initialized
+    by a member read, element read or call rooted at an ES5 function or a
+    dynamic binding are dynamic as well (computed to a fixpoint).
+
+  `Lowerer.typeOf` answers `any` for all of these, and for any value whose
+  checker type is an ES5 function or its instance type. That is U2's
+  mechanism: every checker-keyed fold takes the dynamic path. A reference
+  to an ES5 function lowers to its FUNC box (`lowerEs5Ref`), so `F`,
+  `F.prototype` and `F === G` all see one value.
+- **The program-wide switch** (`es5EmptyDyn` in the type context). When the
+  analysis finds anything, an anonymous object type maps to the dynamic
+  value, not to a record, when all three hold:
+  1. Every declaration of the type sits in JavaScript.
+  2. The declarations are in an npm package compiled statically
+     (`/node_modules/`), or the type is the EMPTY object-literal type `{}`
+     (it has no members to print or type, e.g. the type of
+     `Object.defineProperties({}, …)`).
+  3. Every member a dynamic object can hold as it is: no class instance,
+     Map, RegExp or accessor member.
+
+  Without the switch, zod's JavaScript had 38 S125 copy refusals where
+  inferred records met dynamic values.
+
+  The program's own non-empty JavaScript literals keep their records (the
+  first review found an unrelated literal holding a class instance printing
+  `[Getter]` under a wider switch). So does any literal holding a value the
+  dynamic world cannot hold. Within an npm package compiled statically,
+  what can change is:
+  - speed (dynamic-object reads, §5);
+  - which constructs compile. A construct the record path supported but the
+    dynamic path does not yet support refuses loudly at that site.
+
+  A literal the analysis marks dynamic itself, and that holds a value the
+  dynamic world cannot hold, stops by name where it is built. It never
+  becomes a refusing getter that an observer would print.
+
+  TypeScript sources, and programs whose JavaScript never reaches the object
+  model, lower exactly as before (both gates are off: `es5 === null`).
+- **tsc codes relaxed in JavaScript files** (`JS_RELAXED_TSC_CODES`). The
+  object model's write, delete and `instanceof` checks are run-time
+  questions in Node:
+  - 2540: a write to a property tsc infers read-only, e.g.
+    `Object.defineProperty` without `writable`, a getter-only accessor, or
+    `Object.freeze`.
+  - 2790 and 2704: `delete` of a required or read-only property.
+  - 2358 and 2359: `instanceof` with a primitive left side or a
+    non-callable right side.
+
+  Node runs all of these, as a strict-mode TypeError, a sloppy no-op, or
+  `false`, and so do the compiled values. TypeScript sources keep every
+  code as a gate.
+- **Strictness** of a write or a `delete` is the writing site's: the
+  lowering's existing sloppy-site marking (GH #86), extended to `om.delete`.
+  The runtime reads it from a flag the sloppy write sets and `om.set` clears
+  on entry, so a setter's own strict writes stay strict.
+- **Symbol keys**: only `Symbol.hasInstance` (zod's `$constructor` defines
+  it). It is stored under a reserved string key, a lone surrogate first,
+  which no walker lists. `instanceof` asks it first.
+- **U2's for-in rows**: for-in over a dynamic-arm binding now walks Node's
+  keys (two U2 fence rows became exact rows).
+- **Not built:**
+  - getOwnPropertyNames(Descriptors) of an ordinary function (Node adds
+    `prototype`, and `arguments`/`caller` when sloppy);
+  - `delete` of an array element;
+  - defineProperty on arrays;
+  - setPrototypeOf on functions.
+
+  Each of these fences by name. The Object.prototype stand-in carries no
+  members: `Object.prototype.x` reads keep their existing paths, and only
+  its identity (getPrototypeOf, setPrototypeOf, create) is modeled.
+
 ### 4.7 Composition with S125 and existing views
 
 - S125(a)'s per-call-site instance is the vehicle for `T~` parameters. It is the
