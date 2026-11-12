@@ -10,7 +10,7 @@ import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
-import { lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
+import { isDynClassDecl, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -1101,6 +1101,12 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     // and mutable-target aliases fence (lower-namespaces.ts).
     if (ts.isImportEqualsDeclaration(stmt)) return lowerImportEquals(L, stmt);
 
+    if (ts.isClassDeclaration(stmt) && stmt.name !== undefined && isDynClassDecl(L, stmt)) {
+      // Units U3 + U4: a member-less class over a dynamic base.
+      const local = L.declareLocal(stmt.name, stmt.name.text, DYN, false);
+      const loc = locOf(stmt);
+      return { kind: "varDecl", localId: local.id, init: { kind: "dynFromJsval", value: lowerDynClass(L, stmt), type: DYN, loc }, loc };
+    }
     const entry = UNSUPPORTED_STMT[stmt.kind];
     if (entry) L.unsupported(entry.code as `SC${number}` & keyof typeof UNSUPPORTED, stmt, entry.feature);
     L.unsupported("SC1090", stmt, `syntax '${ts.SyntaxKind[stmt.kind]}'`);

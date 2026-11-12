@@ -612,6 +612,7 @@ export interface TypeMapperCtx {
    * the object model, so a JavaScript empty object literal's type is a
    * dynamic object, not the empty record. */
   es5EmptyDyn?: boolean;
+  es5DynSymbol?: (s: ts.Symbol) => boolean;
   /** LowerOptions.hostFetch: the backend's host supplies fetch, so the
    * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
    * without --dynamic (the module serves them — SEMANTICS.md S098). */
@@ -974,6 +975,12 @@ function mapTypeStep(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   mapTypeDepth++;
   try {
+    // Units U3 + U4: an ES5 function's own type and its instances (and a
+    // dynamically derived class) are dynamic values.
+    if (ctx.es5DynSymbol !== undefined) {
+      const sym = type.getSymbol();
+      if (sym !== undefined && ctx.es5DynSymbol(sym)) return ctx.sharedDynamic === true ? JSVAL : DYN;
+    }
     return mapTypeInner(type, ctx);
   } finally {
     mapTypeDepth--;
@@ -1556,6 +1563,10 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // Function`) is a dynamic FUNC whose call and construct throw Node's
   // --disallow-code-generation-from-strings EvalError.
   if (ctx.sharedDynamic === true && isStdlibInterface("FunctionConstructor")) return JSVAL;
+  // Units U3 + U4: the Error constructor as a value (`const E = Error`) is
+  // its dynamic value (lower-objmodel.ts builtinBoxPosition). (Object's
+  // stays unmapped: `Object.keys(...)` and kin lower statically.)
+  if (ctx.sharedDynamic === true && isStdlibInterface("ErrorConstructor")) return JSVAL;
   // The lib's `Object` interface is a TOP type: tsc admits every
   // non-nullish value into an `Object` slot (`const x: Object = "s"`), so
   // it lowers like `unknown` (the dyn) — the same rule as `object` and

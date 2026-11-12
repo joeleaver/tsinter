@@ -8,7 +8,7 @@ import { wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
-import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
+import { isDynClassDecl, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
@@ -608,11 +608,16 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (ts.isCallExpression(expr)) {
       const hop = lowerHasOwnPropertyCall(L, expr);
       if (hop !== null) return hop;
+      const bc = lowerBuiltinBoxCall(L, expr);
+      if (bc !== null) return bc;
     }
     if (ts.isIdentifier(expr)) {
+      const box = lowerBuiltinBox(L, expr);
+      if (box !== null) return box;
       const ref = lowerEs5Ref(L, expr);
       if (ref !== null) return ref;
     }
+    if (ts.isClassExpression(expr) && isDynClassDecl(L, expr)) return lowerDynClass(L, expr);
     if (ts.isPropertyAccessExpression(expr)) {
       const op = lowerObjectPrototypeRead(L, expr);
       if (op !== null) return op;

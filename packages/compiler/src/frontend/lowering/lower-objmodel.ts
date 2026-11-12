@@ -571,6 +571,18 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
       p = p.parent;
     }
   }
+  // `class X extends <dynamic> {}`: a dynamic value (objmodel.ts dynClass).
+  for (const sf of jsFiles) {
+    const visit = (n: ts.Node): void => {
+      if ((ts.isClassDeclaration(n) || ts.isClassExpression(n)) && isDynClassDecl(L, n)) {
+        const nameNode = n.name ?? (ts.isVariableDeclaration(n.parent) ? n.parent.name : undefined);
+        const s = nameNode !== undefined ? checker.getSymbolAtLocation(nameNode) : undefined;
+        if (s !== undefined) info.ctors.add(s);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
+  }
   // A literal marked in place whose declaration binds it: the binding too.
   for (const sf of jsFiles) {
     walk(sf, (n) => {
@@ -805,6 +817,12 @@ function collectWidenedArrays(L: Lowerer, jsFiles: readonly ts.SourceFile[], inf
  * ES5 constructor, and any value of an ES5 constructor's instance type. */
 export function es5TypeOf(L: Lowerer, info: Es5Info, node: ts.Node): ts.Type | null {
   if (ts.isIdentifier(node)) {
+    // the class declaration's own name is the dynamic class value
+    const p0 = node.parent;
+    if (p0 !== undefined && (ts.isClassDeclaration(p0) || ts.isClassExpression(p0)) && p0.name === node) {
+      const s0 = L.checker.getSymbolAtLocation(node);
+      if (s0 !== undefined && info.ctors.has(s0)) return L.checker.getAnyType();
+    }
     const p = node.parent;
     if (p !== undefined && ts.isPropertyAccessExpression(p) && p.name === node) return null;
     if (p !== undefined && (ts.isPropertyAssignment(p) || ts.isMethodDeclaration(p)) && p.name === node) return null;
@@ -859,4 +877,89 @@ export function retsCall(L: Lowerer, info: Es5Info, call: ts.CallExpression): bo
   if (fs === undefined) return false;
   return L.checker.declarationsOf(fs).some((d) => info.rets.has(d) ||
     (ts.isVariableDeclaration(d) && d.initializer !== undefined && info.rets.has(strip(d.initializer))));
+}
+
+/* ── builtins as dynamic values: Error, Object, globalThis ─────────── */
+
+/** Error's own statics, readable through the dynamic Error value. */
+const ERROR_STATICS = new Set(["captureStackTrace", "stackTraceLimit", "prepareStackTrace", "isError"]);
+const BOX_BUILTINS = new Set(["Error", "Object", "globalThis"]);
+
+/** Is this identifier a standard-library `Error` / `Object` /
+ * `globalThis` in a position that takes the value itself (not a call,
+ * `new`, `instanceof`, `typeof`, a heritage clause or a static member the
+ * existing lowering serves)? */
+export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null {
+  if (!BOX_BUILTINS.has(id.text) || !omActive(L)) return null;
+  if (!L.isStdlibGlobal(id, id.text)) return null;
+  let child: ts.Node = id;
+  let p = id.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) {
+    child = p;
+    p = p.parent;
+  }
+  if (p === undefined) return null;
+  if (ts.isPropertyAccessExpression(p) && p.expression === child) {
+    const m = p.name.text;
+    if (id.text === "Error") return ERROR_STATICS.has(m) ? id.text : null;
+    if (id.text === "globalThis") {
+      // a member the standard library declares keeps its own lowering
+      const t = L.checker.getTypeAtLocation(id);
+      return L.checker.getPropertyOfType(t, m) === undefined ? id.text : null;
+    }
+    return null;
+  }
+  if (ts.isElementAccessExpression(p) && p.expression === child) return id.text === "globalThis" ? id.text : null;
+  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === child) return null;
+  if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === child) return null;
+  if (ts.isTypeOfExpression(p) || ts.isExpressionWithTypeArguments(p) || ts.isHeritageClause(p) || ts.isDecorator(p)) return null;
+  if (ts.isShorthandPropertyAssignment(p) || ts.isExportSpecifier(p) || ts.isImportSpecifier(p)) return null;
+  return id.text;
+}
+
+/** The builtin as its dynamic value. */
+export function lowerBuiltinBox(L: Lowerer, id: ts.Identifier): IrExpr | null {
+  const name = builtinBoxPosition(L, id);
+  if (name === null) return null;
+  const loc = locOf(id);
+  // globalThis: the globals the standard library declares (read through
+  // the value, each stops by name)
+  const globals = name === "globalThis" ? L.checker.getPropertiesOfType(L.checker.getTypeAtLocation(id)).map((p) => p.name).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n)).join("\n") : "";
+  return lib("om.builtinValue", [{ kind: "strLit", value: name, type: STRING, loc } as IrExpr, { kind: "strLit", value: globals, type: STRING, loc } as IrExpr], loc);
+}
+
+/** `Error.captureStackTrace(o)` and the other statics the dynamic value
+ * serves, called: a method call on the value. */
+export function lowerBuiltinBoxCall(L: Lowerer, call: ts.CallExpression): IrExpr | null {
+  const callee = strip(call.expression);
+  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.expression)) return null;
+  const box = lowerBuiltinBox(L, callee.expression);
+  if (box === null) return null;
+  if (call.arguments.some((a) => ts.isSpreadElement(a))) return null;
+  const loc = locOf(call);
+  return { kind: "jsOp", op: "callMethod", name: callee.name.text, args: [box, ...call.arguments.map((a) => js(L, a))], type: JSVAL, loc } as IrExpr;
+}
+
+/** `class X extends <dynamic> {}` (no members) in a JavaScript function
+ * or module: the class is a dynamic value (objmodel.ts dynClass). */
+export function isDynClassDecl(L: Lowerer, node: ts.ClassLikeDeclaration): boolean {
+  if (!omActive(L) || !isJsSourceFileName(node.getSourceFile().fileName)) return false;
+  if (node.members.length > 0) return false;
+  const clauses = node.heritageClauses ?? [];
+  if (clauses.length !== 1 || clauses[0]!.token !== ts.SyntaxKind.ExtendsKeyword || clauses[0]!.types.length !== 1) return false;
+  const base = clauses[0]!.types[0]!.expression;
+  // a base the class machinery resolves (a program class, a builtin error
+  // class named directly) keeps it
+  const sym = ts.isIdentifier(base) ? L.checker.getSymbolAtLocation(base) : undefined;
+  const decl = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (decl !== undefined && (ts.isClassDeclaration(decl) || ts.isClassExpression(decl))) return false;
+  if (ts.isIdentifier(base) && (L.isStdlibGlobal(base, "Error") || L.isStdlibGlobal(base, "TypeError") || L.isStdlibGlobal(base, "RangeError"))) return false;
+  return true;
+}
+
+export function lowerDynClass(L: Lowerer, node: ts.ClassLikeDeclaration): IrExpr {
+  const base = node.heritageClauses![0]!.types[0]!.expression;
+  const loc = locOf(node);
+  const name = node.name?.text ?? "";
+  return lib("om.dynClass", [js(L, base), { kind: "strLit", value: name, type: STRING, loc } as IrExpr], loc);
 }

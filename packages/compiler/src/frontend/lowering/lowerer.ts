@@ -18,7 +18,7 @@ import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
 import { buildErrorViews, classFuncBox, classLiftIn, finishConstructorNames, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
-import { collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
+import { builtinBoxPosition, collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
   anyOpRequiresDynamicDiag,
@@ -1884,7 +1884,11 @@ export class Lowerer {
     registerBuiltinStreamClasses(this);
     collectDynArmSyms(this);
     this.es5 = collectEs5(this, this.moduleOrder.length > 0 ? this.moduleOrder : [entry]);
-    if (this.es5 !== null) (this.typeCtx as { es5EmptyDyn?: boolean }).es5EmptyDyn = true;
+    if (this.es5 !== null) {
+      const ctors = this.es5.ctors;
+      (this.typeCtx as { es5EmptyDyn?: boolean }).es5EmptyDyn = true;
+      (this.typeCtx as { es5DynSymbol?: (s: ts.Symbol) => boolean }).es5DynSymbol = (s) => ctors.has(s);
+    }
   }
 
   /** Units U3 + U4 (lower-objmodel.ts): what the program's JavaScript
@@ -3559,6 +3563,11 @@ export class Lowerer {
   }
 
   typeOf(node: ts.Node): ts.Type {
+    // Units U3 + U4: Error / Object / globalThis taken as values are
+    // dynamic values.
+    if (ts.isIdentifier(node) && (node.text === "Error" || node.text === "Object" || node.text === "globalThis") && builtinBoxPosition(this, node) !== null) {
+      return this.checker.getAnyType();
+    }
     if (this.es5 !== null) {
       const t = es5TypeOf(this, this.es5, node);
       if (t !== null) return t;

@@ -42,15 +42,15 @@ const MARK_SHIFT = 8;
 export const OF_NONEXT = 1;
 
 /** Descriptor field masks (`omDefine`'s mask operand). */
-const HAS_VALUE = 1;
-const HAS_GET = 2;
-const HAS_SET = 4;
-const HAS_WRITABLE = 8;
-const HAS_ENUM = 16;
-const HAS_CONF = 32;
-const A_W = 64;
-const A_E = 128;
-const A_C = 256;
+export const HAS_VALUE = 1;
+export const HAS_GET = 2;
+export const HAS_SET = 4;
+export const HAS_WRITABLE = 8;
+export const HAS_ENUM = 16;
+export const HAS_CONF = 32;
+export const A_W = 64;
+export const A_E = 128;
+export const A_C = 256;
 
 const EQ_HEAP = -0x13;
 
@@ -3368,6 +3368,23 @@ export class ObjModel {
       c.i32Const(0);
       c.return_();
       c.end();
+      // The Error constructor read as a value: Node's answer is the
+      // value's error-ness (an error from any construction path).
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      this.d.fnPayload(c, (x) => x.localGet(1));
+      c.structGet(this.d.fnT(), FN_SIG);
+      c.i32Const(-6);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.call(this.d.isError());
+      c.return_();
+      c.end();
+      c.end();
       // A defined Symbol.hasInstance answers first (its truthiness), on any
       // object; only then must the right side be callable.
       c.localGet(1);
@@ -3583,5 +3600,188 @@ export class ObjModel {
       });
       void dynT;
     });
+  }
+
+  /* ── `class X extends <dynamic>` ───────────────────────────────────── */
+
+  private dynClassType: number | null = null;
+
+  /** The closure of a dynamically derived class: its base, and its own box
+   * (set right after the box is built). */
+  private dynClassT(): number {
+    this.dynClassType ??= this.k.mb.openStructType("om:dynClass", [
+      { storage: this.d.dynRef(), mutable: false },
+      { storage: this.d.dynRef(), mutable: true },
+    ]);
+    return this.dynClassType;
+  }
+
+  /** %w.om.dynClass(P, name) → a class `class name extends P {}` with no
+   * members, over a dynamic base: a FUNC whose prototype object inherits
+   * P.prototype. Constructing it runs P's construction (the default
+   * derived constructor's `super(...args)`) and gives the object the
+   * class's prototype; calling it without `new` throws V8's TypeError. */
+  dynClass(): number {
+    const dynT = this.d.dynT();
+    const fnT = this.d.fnT();
+    const B = this.dynClassT();
+    const thunk = this.fn("dynClassThunk", [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }, this.d.arrRef()], [this.d.dynRef()],
+      [{ kind: "ref", nullable: true, typeIndex: B }, this.d.dynRef(), this.d.dynRef(), this.d.dynRef(), this.d.dynRef()], (c) => {
+        const BC = 2;
+        const T = 3;
+        const PR = 4;
+        const R = 5;
+        const TP = 6;
+        c.localGet(0);
+        c.refCast(B);
+        c.localSet(BC);
+        c.call(this.d.thisGet());
+        c.localSet(T);
+        c.localGet(BC);
+        c.structGet(B, 1);
+        c.call(this.fnPrototype());
+        c.localSet(PR);
+        // constructed: `this` is the object om.construct made over the
+        // class's prototype
+        c.localGet(T);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.OBJ);
+        c.i32Eq();
+        c.ifResult(I32);
+        c.localGet(T);
+        c.call(this.protoBox());
+        c.localTee(TP);
+        c.refIsNull();
+        c.ifResult(I32);
+        c.i32Const(0);
+        c.else_();
+        c.localGet(TP);
+        c.structGet(dynT, DYN_REF);
+        c.localGet(PR);
+        c.structGet(dynT, DYN_REF);
+        c.refEq();
+        c.end();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Eqz();
+        c.ifVoid();
+        this.throwType(c, (x) => {
+          this.lit(x, "Class constructor ");
+          this.d.fnPayload(x, (y) => {
+            y.localGet(BC);
+            y.structGet(B, 1);
+          });
+          x.structGet(this.d.fnT(), FN_NAME);
+          this.concat(x);
+          this.lit(x, " cannot be invoked without 'new'");
+          this.concat(x);
+        });
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(BC);
+        c.structGet(B, 0);
+        c.localGet(1);
+        this.lit(c, "super");
+        c.call(this.construct());
+        c.localTee(R);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(R);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.OBJ);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(R);
+        c.localGet(PR);
+        c.call(this.setProto());
+        c.drop();
+        c.end();
+        c.localGet(R);
+      });
+    this.k.mb.declareFuncRef(thunk);
+    return this.fn("dynClass", [this.d.dynRef(), this.strRef()], [this.d.dynRef()],
+      [{ kind: "ref", nullable: true, typeIndex: B }, this.d.dynRef(), this.d.dynRef(), this.d.dynRef()], (c) => {
+        const BC = 2;
+        const F = 3;
+        const PR = 4;
+        const PP = 5;
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Ne();
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NULL);
+        c.i32Ne();
+        c.i32And();
+        c.ifVoid();
+        this.throwType(c, (x) => {
+          this.lit(x, "Class extends value ");
+          x.localGet(0);
+          x.call(this.d.toStr());
+          this.concat(x);
+          this.lit(x, " is not a constructor or null");
+          this.concat(x);
+        });
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.ifVoid();
+        this.k.deps.fence(c, (x) => this.lit(x, "a class extending null is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(0);
+        c.globalGet(this.d.undefinedGlobal());
+        c.structNew(B);
+        c.localSet(BC);
+        this.d.boxFunc(c, (x) => {
+          x.localGet(BC);
+          x.refFunc(thunk);
+          x.i32Const(-8);
+          x.localGet(1);
+          x.i32Const(0);
+          x.refNull(this.k.deps.strType());
+          x.i32Const(1);
+          x.structNew(fnT);
+        });
+        c.localSet(F);
+        c.localGet(BC);
+        c.localGet(F);
+        c.structSet(B, 1);
+        c.localGet(F);
+        c.call(this.fnPrototype());
+        c.localSet(PR);
+        c.localGet(0);
+        this.lit(c, "prototype");
+        c.i32Const(0);
+        c.call(this.d.keyGet());
+        c.localTee(PP);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(PP);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.OBJ);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(PR);
+        c.localGet(PP);
+        c.call(this.setProto());
+        c.drop();
+        c.end();
+        c.localGet(F);
+      });
   }
 }

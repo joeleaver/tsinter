@@ -51,6 +51,7 @@
  * implemented they move out of the grouped refusal arms into their own
  * case — the diff for one increment stays local, and the grouped arms
  * shrink to exactly the work that remains. */
+import { A_C, A_E, A_W, HAS_CONF, HAS_ENUM, HAS_GET, HAS_VALUE, HAS_WRITABLE } from "./objmodel.js";
 import {
   type IrExpr,
   type IrFunction,
@@ -4032,6 +4033,17 @@ class Assembler {
       case "om.codegenFn":
         code.call(this.codegenFnHelper());
         return;
+      case "om.dynClass":
+        walk();
+        code.call(om.dynClass());
+        break;
+      case "om.builtinValue": {
+        const a = e.args[0]!;
+        const names = e.args[1];
+        if (a.kind !== "strLit") throw new Error("emitter bug: om.builtinValue takes a literal name");
+        code.call(this.builtinValueHelper(a.value, names !== undefined && names.kind === "strLit" ? names.value.split("\n").filter((x) => x !== "") : []));
+        return;
+      }
       case "om.instanceOf":
         walk();
         code.call(om.instanceOf());
@@ -4048,6 +4060,226 @@ class Assembler {
         return;
     }
     this.emitPendingCheck();
+  }
+
+  private readonly builtinValueFns = new Map<string, number>();
+
+  /** A thunk that builds its body into `c` (params: the closure as eq, the
+   * argument vector; extra locals after them). */
+  private omThunk(name: string, locals: ValType[], body: (c: Code) => void): number {
+    const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.om.${name}`);
+    const c = new Code();
+    body(c);
+    this.mb.setBody(idx, locals, c.bytes());
+    this.mb.declareFuncRef(idx);
+    return idx;
+  }
+
+  /** Units U3 + U4: the standard library's Error, Object and globalThis
+   * taken as values — one interned dynamic value each.
+   *  - Error: a FUNC whose call and construct build an Error (message
+   *    only), with Node's own statics: captureStackTrace (defines a
+   *    non-enumerable `stack`, SEMANTICS.md S114's U3+U4 amendment),
+   *    prepareStackTrace (undefined), isError, stackTraceLimit (10).
+   *  - Object: a FUNC answering its object argument or a fresh object,
+   *    whose `prototype` is the Object.prototype stand-in.
+   *  - globalThis: an object holding what the program puts on it; every
+   *    global the standard library declares is a hidden accessor that
+   *    stops by name when read through this value. */
+  private builtinValueHelper(name: string, globals: string[]): number {
+    const hit = this.builtinValueFns.get(name);
+    if (hit !== undefined) return hit;
+    const dyn = this.dyn;
+    const om = dyn.om;
+    const dynT = dyn.dynT();
+    const g = this.mb.addGlobal(dyn.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(dynT);
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [dyn.dynRef()]), `%w.om.builtin:${name}`);
+    this.builtinValueFns.set(name, idx);
+    const marker = (x: Code): void => { x.structNew(this.fnEvalClosMarkerType()); };
+    const undef = (x: Code): void => { x.globalGet(dyn.undefinedGlobal()); };
+    const define = (c: Code, key: string, value: (x: Code) => void, mask: number): void => {
+      c.globalGet(g);
+      this.pushStrLitInto(c, key);
+      value(c);
+      undef(c);
+      undef(c);
+      c.i32Const(mask);
+      c.call(om.defineOn());
+      c.drop();
+    };
+    const DATA = HAS_VALUE | HAS_WRITABLE | HAS_ENUM | HAS_CONF;
+    const c = new Code();
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    if (name === "Error") {
+      const errThunk = this.omThunk("ErrorCtor", [this.strRef], (x) => {
+        const M = 2;
+        dyn.arrLen(x, (y) => y.localGet(1));
+        x.ifResult(this.strRef);
+        dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
+        x.structGet(dynT, DYN_KIND);
+        x.i32Const(DK.UNDEF);
+        x.i32Eq();
+        x.ifResult(this.strRef);
+        this.pushStrLitInto(x, "");
+        x.else_();
+        dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
+        x.call(dyn.toStrUser());
+        x.end();
+        x.else_();
+        this.pushStrLitInto(x, "");
+        x.end();
+        x.localSet(M);
+        x.globalGet(this.exc().kindG);
+        x.ifVoid();
+        x.refNull(dynT);
+        x.return_();
+        x.end();
+        dyn.arrLen(x, (y) => y.localGet(1));
+        x.i32Const(1);
+        x.i32GtU();
+        x.ifVoid();
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "the Error constructor read as a dynamic value with an options argument is not supported yet"), null);
+        x.end();
+        x.globalGet(this.classes.vtGlobal("%Error"));
+        this.pushStrLitInto(x, "Error");
+        x.localGet(M);
+        x.refNull(this.strType);
+        x.refNull(EQ_HEAP);
+        x.structNew(this.exc().errT);
+        x.call(dyn.fromError());
+      });
+      const capThunk = this.omThunk("captureStackTrace", [dyn.dynRef(), I32], (x) => {
+        const T = 2;
+        const K = 3;
+        dyn.arrLen(x, (y) => y.localGet(1));
+        x.ifResult(dyn.dynRef());
+        dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
+        x.else_();
+        undef(x);
+        x.end();
+        x.localTee(T);
+        x.structGet(dynT, DYN_KIND);
+        x.localTee(K);
+        x.i32Const(DK.OBJ);
+        x.i32Ne();
+        x.localGet(K);
+        x.i32Const(DK.FUNC);
+        x.i32Ne();
+        x.i32And();
+        x.ifVoid();
+        this.emitSetCellError(x, "%TypeError", "TypeError", (y) => this.pushStrLitInto(y, "invalid_argument"), null);
+        x.refNull(dynT);
+        x.return_();
+        x.end();
+        x.localGet(T);
+        this.pushStrLitInto(x, "stack");
+        dyn.boxStr(x, (y) => {
+          y.localGet(T);
+          y.call(dyn.toStr());
+        });
+        undef(x);
+        undef(x);
+        x.i32Const(DATA | A_W | A_C);
+        x.call(om.defineOn());
+        x.drop();
+        undef(x);
+      });
+      const isErrThunk = this.omThunk("isError", [], (x) => {
+        dyn.arrLen(x, (y) => y.localGet(1));
+        x.ifResult(I32);
+        dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
+        x.call(dyn.isError());
+        x.else_();
+        x.i32Const(0);
+        x.end();
+        x.ifResult(dyn.dynRef());
+        x.globalGet(dyn.boolGlobal(true));
+        x.else_();
+        x.globalGet(dyn.boolGlobal(false));
+        x.end();
+      });
+      dyn.boxFn(c, marker, (x) => x.refFunc(errThunk), -6, (x) => this.pushStrLitInto(x, "Error"), 1, undefined, (x) => x.i32Const(2));
+      c.globalSet(g);
+      define(c, "captureStackTrace", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(capThunk), -9, (y) => this.pushStrLitInto(y, "captureStackTrace"), 2, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
+      const prepThunk = this.omThunk("prepareStackTrace", [], (x) => {
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "calling Error.prepareStackTrace is not supported yet"), null);
+        x.refNull(dynT);
+      });
+      define(c, "prepareStackTrace", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(prepThunk), -9, (y) => this.pushStrLitInto(y, "ErrorPrepareStackTrace"), 2, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
+      define(c, "isError", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(isErrThunk), -9, (y) => this.pushStrLitInto(y, "isError"), 1, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
+      define(c, "stackTraceLimit", (x) => dyn.boxNum(x, (y) => y.f64Const(10)), DATA | A_W | A_E | A_C);
+      define(c, "prototype", (x) => dyn.boxObj(x, (y) => dyn.pushNewObj(y, false)), DATA);
+    } else if (name === "Object") {
+      const objThunk = this.omThunk("ObjectCtor", [dyn.dynRef(), I32], (x) => {
+        const A = 2;
+        const K = 3;
+        dyn.arrLen(x, (y) => y.localGet(1));
+        x.ifResult(dyn.dynRef());
+        dyn.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(0));
+        x.else_();
+        undef(x);
+        x.end();
+        x.localTee(A);
+        x.structGet(dynT, DYN_KIND);
+        x.localTee(K);
+        x.i32Const(DK.OBJ);
+        x.i32Eq();
+        x.localGet(K);
+        x.i32Const(DK.ARR);
+        x.i32Eq();
+        x.i32Or();
+        x.localGet(K);
+        x.i32Const(DK.FUNC);
+        x.i32Eq();
+        x.i32Or();
+        x.ifResult(dyn.dynRef());
+        x.localGet(A);
+        x.else_();
+        x.localGet(K);
+        x.i32Const(DK.UNDEF);
+        x.i32Eq();
+        x.localGet(K);
+        x.i32Const(DK.NULL);
+        x.i32Eq();
+        x.i32Or();
+        x.i32Eqz();
+        x.ifVoid();
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "Object(primitive) through the Object constructor read as a dynamic value is not supported yet"), null);
+        x.end();
+        dyn.boxObj(x, (y) => dyn.pushNewObj(y, false));
+        x.end();
+      });
+      dyn.boxFn(c, marker, (x) => x.refFunc(objThunk), -7, (x) => this.pushStrLitInto(x, "Object"), 1, undefined, (x) => x.i32Const(2));
+      c.globalSet(g);
+      define(c, "prototype", (x) => x.call(om.objectProto()), HAS_VALUE | HAS_WRITABLE | HAS_ENUM | HAS_CONF);
+    } else {
+      const fenceThunk = this.omThunk("globalFence", [], (x) => {
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "reading a standard global through globalThis as a dynamic value is not supported yet"), null);
+        x.refNull(dynT);
+      });
+      dyn.boxObj(c, (x) => dyn.pushNewObj(x, false));
+      c.globalSet(g);
+      const getterBox = (x: Code): void => dyn.boxFn(x, marker, (y) => y.refFunc(fenceThunk), -9, (y) => y.refNull(this.strType), 0, undefined, (y) => y.i32Const(2));
+      for (const gname of globals) {
+        c.globalGet(g);
+        this.pushStrLitInto(c, gname);
+        undef(c);
+        getterBox(c);
+        undef(c);
+        c.i32Const(HAS_GET | HAS_ENUM | HAS_CONF | A_C);
+        c.call(om.defineOn());
+        c.drop();
+      }
+    }
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   private codegenFnFunc: number | null = null;

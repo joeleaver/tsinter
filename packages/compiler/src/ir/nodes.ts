@@ -3872,6 +3872,8 @@ export type IrLibFn =
   | "om.instanceOf"
   | "om.bind"
   | "om.sloppy"
+  | "om.builtinValue"
+  | "om.dynClass"
   | "dyn.objValues"
   | "dyn.objEntries"
   /** structuredClone over the checked-dynamic tree (scr_json.c): the JSON-safe subset plus
@@ -7686,6 +7688,7 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
  * failure / promise rejection). */
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "om.defineProperty",
+  "om.dynClass",
   "om.defineProperties",
   "om.getOwnPropertyDescriptor",
   "om.getOwnPropertyDescriptors",

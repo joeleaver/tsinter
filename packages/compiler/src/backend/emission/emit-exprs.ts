@@ -6347,6 +6347,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "om.instanceOf":
           case "om.bind":
           case "om.sloppy":
+          case "om.builtinValue":
+          case "om.dynClass":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
           case "fs.statBig":
           case "fs.fstatBig":
