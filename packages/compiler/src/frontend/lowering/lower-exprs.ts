@@ -5472,6 +5472,27 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
             loc: locOf(el),
           };
         }
+        // `[...tuple]` of a fixed tuple whose elements share one type
+        // (`["-id", id, ...NAMES]` over `readonly [string, string, string]`):
+        // a tuple's array iterator yields its elements in index order, a
+        // fixed count, so the spread is a fresh array of its field reads
+        // (the source read once); the array then spreads, or lifts, below
+        // like any `T[]` source.
+        if (src.type.kind === "record") {
+          const shape = L.shapes.get(src.type.shapeId);
+          const fields = shape?.tuple === true ? [...shape.fields].sort((a, b) => Number(a.name) - Number(b.name)) : [];
+          if (fields.length > 0 && fields.every((f) => typeEquals(f.type, fields[0]!.type))) {
+            const sloc = locOf(el);
+            const elemT = fields[0]!.type;
+            const tupleSrc = src as IrExpr & { type: { kind: "record"; shapeId: string } };
+            src = bindOnce(L, tupleSrc, sloc, (r) => ({
+              kind: "arrayLit",
+              elems: fields.map((f): IrExpr => ({ kind: "recordGet", obj: r, shapeId: tupleSrc.type.shapeId, field: f.name, type: f.type, loc: sloc })),
+              type: arrayOf(elemT),
+              loc: sloc,
+            }));
+          }
+        }
         // A same-family array whose ELEMENT lifts (string[] into a
         // (string | symbol)[] literal — per-element wrap/width copy):
         // the interned width helper reshapes before the spread copies.
@@ -6657,11 +6678,81 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         // EAGERLY at the spread's position, so an explicit property
         // BEFORE a spread would need JS's overwrite — order-fenced (the
         // index-signature merge path above takes any order).
-        if (
-          expr.properties
-            .slice(0, expr.properties.indexOf(prop))
-            .some((p) => !ts.isSpreadAssignment(p))
-        ) {
+        // A spread whose source is a known record sharing NO field name
+        // with the explicit properties before it overwrites nothing: its
+        // keys land after theirs, in JS order, exactly what the desugar
+        // builds (`{ source: "x", ...proof }`, rea's launcher-identity
+        // shape). Only an overlap needs JS's overwrite.
+        const earlierExplicit = expr.properties.slice(0, expr.properties.indexOf(prop)).filter((p) => !ts.isSpreadAssignment(p));
+        const disjointFromEarlier = ((): boolean => {
+          if (earlierExplicit.length === 0) return true;
+          const names = new Set<string>();
+          for (const p of earlierExplicit) {
+            if (
+              !p.name ||
+              !(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name) ||
+                (ts.isComputedPropertyName(p.name) && literalComputedKey(L, p.name) !== null))
+            ) {
+              return false;
+            }
+            names.add(propNameText(L, p.name));
+          }
+          const st = L.mapTypeOf(L.typeOf(prop.expression));
+          if (st?.kind !== "record") return false;
+          const srcShapeEarly = L.shapes.get(st.shapeId);
+          if (!srcShapeEarly || srcShapeEarly.indexValue) return false;
+          if (!srcShapeEarly.fields.every((f) => !names.has(f.name))) return false;
+          // The record prints, serializes and lists its keys in its TYPE's
+          // key order (declaredOrder), which is the checker's spread-type
+          // order, not necessarily JS's (an unannotated `{ kind, ...proof }`
+          // types its spread's keys FIRST). Only a literal whose JS key
+          // order equals the target shape's order is exact.
+          // A spread source's OPTIONAL key may be absent at runtime (or
+          // added after the source was built), so a later property writing
+          // it puts the key at THAT later position in JS. The literal's
+          // order is then a runtime fact; only a result type whose field is
+          // optional too tracks it (the per-record key-order slot), so any
+          // other such shape keeps the refusal.
+          const laterWrites = (from: number): Set<string> => {
+            const out = new Set<string>();
+            for (const q of expr.properties.slice(from + 1)) {
+              if (ts.isSpreadAssignment(q)) {
+                const qt = L.mapTypeOf(L.typeOf(q.expression));
+                const qs = qt?.kind === "record" ? L.shapes.get(qt.shapeId) : undefined;
+                for (const f of qs?.fields ?? []) out.add(f.name);
+              } else if (q.name && (ts.isIdentifier(q.name) || ts.isStringLiteral(q.name) || ts.isNumericLiteral(q.name))) {
+                out.add(propNameText(L, q.name));
+              }
+            }
+            return out;
+          };
+          const jsOrder: string[] = [];
+          for (const [pi, p] of expr.properties.entries()) {
+            if (ts.isSpreadAssignment(p)) {
+              const pt = L.mapTypeOf(L.typeOf(p.expression));
+              const ps = pt?.kind === "record" ? L.shapes.get(pt.shapeId) : undefined;
+              if (!ps || ps.indexValue) return false;
+              const later = laterWrites(pi);
+              for (const f of ps.fields) {
+                if (f.optional === true && later.has(f.name) && shape.fields.find((g) => g.name === f.name)?.optional !== true) return false;
+              }
+              for (const n of ps.declaredOrder ?? ps.fields.map((f) => f.name)) if (!jsOrder.includes(n)) jsOrder.push(n);
+              continue;
+            }
+            if (
+              !p.name ||
+              !(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name) ||
+                (ts.isComputedPropertyName(p.name) && literalComputedKey(L, p.name) !== null))
+            ) {
+              return false;
+            }
+            const n = propNameText(L, p.name);
+            if (!jsOrder.includes(n)) jsOrder.push(n);
+          }
+          const targetOrder = shape.declaredOrder ?? shape.fields.map((f) => f.name);
+          return jsOrder.length === targetOrder.length && jsOrder.every((n, i) => targetOrder[i] === n);
+        })();
+        if (!disjointFromEarlier) {
           L.unsupported(
             "SC1090",
             prop,
