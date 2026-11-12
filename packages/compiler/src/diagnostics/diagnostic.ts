@@ -743,6 +743,21 @@ export function requiresDynamicPackageDiag(pkg: string, loc: SrcLoc): ScrDiagnos
   };
 }
 
+/** SEMANTICS.md S133: a program use of an npm package's DECLARED surface
+ * (its shipped .d.ts) that the package's compiled JS implements nowhere
+ * the lowering can see — a member the declarations promise but the JS
+ * never defines statically (or defines through a construct inference
+ * cannot follow). Node would answer at run time (often a TypeError); the
+ * static build refuses by name at the use. */
+export function npmDeclaredOnlyDiag(pkg: string, member: string, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC2013",
+    message: `'${member}' is declared by the '${pkg}' package's type declarations, but its compiled JavaScript defines no '${member}' the static build can reach (SEMANTICS.md S133)`,
+    loc,
+    milestone: "M4",
+  };
+}
+
 /** Building the embedded npm runtime graph failed — the package's entry
  * or one of its internal modules can't resolve, or it needs a Node builtin
  * the island doesn't shim. Named per problem, at the import site. */

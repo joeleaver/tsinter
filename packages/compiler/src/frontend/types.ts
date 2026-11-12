@@ -1,3 +1,4 @@
+import { isDtsMirrorPath } from "./npm-static.js";
 import * as ts from "./ts7/adapter.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
 import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
@@ -1005,7 +1006,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     npmDecls.length > 0 &&
     npmDecls.every((d) => {
       const sf = d.getSourceFile();
-      return sf.isDeclarationFile && !ctx.isStdlibFile(sf);
+      // (SEMANTICS.md S133: a compiled package's declared surface is the
+      // program's vocabulary, mapped like the program's own types.)
+      return sf.isDeclarationFile && !ctx.isStdlibFile(sf) && !isDtsMirrorPath(sf.fileName);
     })
   ) {
     return (ctx.engine ?? ctx.dynamic) ? JSVAL : null;
@@ -3149,7 +3152,7 @@ function recordProvenanceOk(t: ts.Type, checker: ts.TypeChecker): boolean {
   const tSym = t.getSymbol();
   const decls = tSym ? checker.declarationsOf(tSym) : undefined;
   if (!decls || decls.length === 0) return false;
-  return !decls.some((d) => d.getSourceFile().isDeclarationFile);
+  return !decls.some((d) => d.getSourceFile().isDeclarationFile && !isDtsMirrorPath(d.getSourceFile().fileName));
 }
 
 /** A GENERIC-callable member type (`m<T>(x: T): T` / `f: <T>(x: T) => T` in

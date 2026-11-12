@@ -128,6 +128,12 @@ export class Ts7Host {
     fsShadow?: {
       readFile: (path: string) => string | undefined;
       hideFile: (path: string) => boolean;
+      /** Answers for paths the real FS does not hold (npm-static's
+       * declared-surface mirror); undefined falls through. */
+      fileExists?: (path: string) => boolean | undefined;
+      directoryExists?: (path: string) => boolean | undefined;
+      getAccessibleEntries?: (path: string) => { files: string[]; directories: string[] } | undefined;
+      realpath?: (path: string) => string | undefined;
     } | null;
   }) {
     const virtualFiles = this.virtualFiles;
@@ -148,11 +154,11 @@ export class Ts7Host {
         fileExists: (fileName) => {
           if (virtualFiles.has(tsgoPath(fileName))) return true;
           if (shadow !== null && shadow.hideFile(fileName)) return false;
-          return undefined;
+          return shadow?.fileExists?.(fileName) ?? undefined;
         },
-        directoryExists: () => undefined,
-        realpath: (path) => (virtualFiles.has(tsgoPath(path)) ? path : undefined),
-        getAccessibleEntries: () => undefined,
+        directoryExists: (dir) => shadow?.directoryExists?.(dir) ?? undefined,
+        realpath: (path) => (virtualFiles.has(tsgoPath(path)) ? path : (shadow?.realpath?.(path) ?? undefined)),
+        getAccessibleEntries: (dir) => shadow?.getAccessibleEntries?.(dir) ?? undefined,
       },
     });
   }

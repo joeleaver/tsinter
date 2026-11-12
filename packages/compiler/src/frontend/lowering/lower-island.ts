@@ -7,7 +7,9 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
 import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
-import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
+import { npmDeclaredOnlyDiag, requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
+import { isDtsMirrorPath } from "../npm-static.js";
+import { classLiftIn } from "./class-views.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
 import { PoisonError, jsFuncNameOf, newFnCtx, own } from "./lowerer.js";
@@ -139,6 +141,11 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // accessor record) crosses as the checked-dynamic copy S014 made,
     // which S125 (c) judges like every copy. The \$dyn value IS the
     // island value.
+    // A class instance shares as its live view (class-views.ts).
+    {
+      const lifted = classLiftIn(L, e, e.loc);
+      if (lifted) return lifted;
+    }
     {
       const boxed = L.oneWorldDynFrom(e, node);
       if (boxed) return boxed;
@@ -214,6 +221,10 @@ import { regexCrossingChecked } from "./lower-regex.js";
       // have no JSON marshal but an honest per-field/per-element island
       // construction — the same lift the implicit coercion path uses.
       if (L.jsvalLiftable(e.type)) return L.jsvalLiftExpr(e, e.loc);
+      // One world: a typed record or array (functions inside included)
+      // shares as its live view, or a fresh literal builds as the dynamic
+      // object Node would build (unit H, SEMANTICS.md S115 (a)).
+      if (L.sharedDynamic && !L.engine && (e.type.kind === "record" || e.type.kind === "array")) return L.jsvalLiftExpr(e, e.loc);
       L.unsupported("SC1090", node, boundaryIntoIslandMsg(L.fmt(e.type)));
     }
     // U1a: a marshaled function carries its binding's spelling (S020).
@@ -951,10 +962,29 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * these) and for non-package receivers, so callers' fallbacks apply. */
   export function npmMemberFence(L: Lowerer, access: ts.PropertyAccessExpression): void {
     if (L.engine) return;
+    // SEMANTICS.md S133: a member still answering its mirrored declaration
+    // has no JS counterpart (dts-bridge.ts maps every one it can find).
+    {
+      const memberSym = L.checker.getSymbolAtLocation(access.name);
+      const memberDecl = memberSym ? L.checker.declarationsOf(memberSym)[0] : undefined;
+      if (memberDecl !== undefined && isDtsMirrorPath(memberDecl.getSourceFile().fileName) && !ts.isPropertySignature(memberDecl) && memberDecl.kind !== ts.SyntaxKind.MethodSignature) {
+        L.pushDiag(npmDeclaredOnlyDiag(npmPackageNameOf(memberDecl.getSourceFile().fileName) ?? "the", access.name.text, locOf(access)));
+        throw new PoisonError();
+      }
+    }
     const pkg =
       L.npmPackageOf(L.typeOf(access.expression)) ??
       L.npmPackageOfSymbol(L.checker.getSymbolAtLocation(access.name));
     if (!pkg) return;
+    // SEMANTICS.md S133: under a declared-surface view the package's JS is
+    // compiled — a member still answering its declaration has no JS
+    // counterpart (dts-bridge.ts maps every one it can find).
+    const memberSym = L.checker.getSymbolAtLocation(access.name);
+    const memberDecl = memberSym ? L.checker.declarationsOf(memberSym)[0] : undefined;
+    if (memberDecl !== undefined && isDtsMirrorPath(memberDecl.getSourceFile().fileName)) {
+      L.pushDiag(npmDeclaredOnlyDiag(pkg, access.name.text, locOf(access)));
+      throw new PoisonError();
+    }
     L.pushDiag(requiresDynamicPackageDiag(pkg, locOf(access)));
     throw new PoisonError();
   }
@@ -966,5 +996,9 @@ import { regexCrossingChecked } from "./lower-regex.js";
     const decls = sym ? L.checker.declarationsOf(sym) : undefined;
     if (!decls || decls.length === 0) return null;
     if (!decls.every((d) => L.isNpmFile(d.getSourceFile()))) return null;
+    // SEMANTICS.md S133: a TYPE the declared surface spells (a callback's
+    // function type, an options interface) is just a type — its values are
+    // the program's or the compiled package's own, never engine values.
+    if (decls.every((d) => isDtsMirrorPath(d.getSourceFile().fileName) && !ts.isClassDeclaration(d) && !ts.isFunctionDeclaration(d) && !ts.isVariableDeclaration(d) && !ts.isMethodDeclaration(d) && !ts.isPropertyDeclaration(d))) return null;
     return npmPackageNameOf(decls[0]!.getSourceFile().fileName);
   }

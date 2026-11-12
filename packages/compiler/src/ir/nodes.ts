@@ -5494,7 +5494,15 @@ export type IrExpr =
   /** The reverse of jsView: an island value that IS a view of a `type`
    * static value (same typeKey) answers that static value itself (+1); any
    * other value throws the catchable named TypeError carrying `what`. */
-  | { kind: "jsUnview"; value: IrExpr; typeKey: string; what: string; type: IrType; loc: SrcLoc }
+  | { kind: "jsUnview"; value: IrExpr; typeKey: string; what: string; type: IrType; loc: SrcLoc;
+      /** A CLASS slot (type is object:C): the view's token must be an
+       * instance of C or a subclass (a class-instance view, class-views.ts),
+       * not a view of exactly typeKey. */
+      classTest?: true }
+  /** Is the dynamic value a class-instance VIEW whose instance is a
+   * `className` (subclasses included)? `type` is bool; never throws. The
+   * dynamic side of `v instanceof C` for a program class C (class-views.ts). */
+  | { kind: "jsViewOfClass"; value: IrExpr; className: string; type: IrType; loc: SrcLoc }
   /** Unit U2b (docs/design/dynamic-values.md §4.3 step 2): does the island
    * value `value` fit the typed composite `target` EXACTLY — every record
    * holding exactly its type's keys, in the order the typed record lists
@@ -6307,7 +6315,7 @@ export function moduleUsesIslandEngine(mod: IrModule): boolean {
     const node = v as { kind?: unknown; fn?: unknown };
     if (
       node.kind === "jsOp" || node.kind === "jsExit" || node.kind === "jsBridgePromise" ||
-      node.kind === "jsView" || node.kind === "jsUnview" ||
+      node.kind === "jsView" || node.kind === "jsUnview" || node.kind === "jsViewOfClass" ||
       (typeof node.fn === "string" && node.fn.startsWith("island."))
     ) {
       found = true;

@@ -11,6 +11,7 @@ import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -2962,6 +2963,19 @@ function parenIsWriteReceiver(paren: ts.Expression): boolean {
       return expr;
     }
     if (expr.type.kind !== "union") return expr;
+    // A JavaScript `let` widened to its assigned union (jsLetAssignedUnion):
+    // the checker's type is the binding's declared class, not a control-flow
+    // proof, so a read keeps the union; a member read or call through it
+    // takes Node's TypeError on the unit arms.
+    if (expr.kind === "varRef" && L.jsWidenedLets.has(expr.localId)) {
+      const p = node.parent;
+      const narrowedT = L.mapTypeOf(L.typeOf(node));
+      if (p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === node && p.questionDotToken === undefined && narrowedT?.kind === "object") {
+        const tag = L.armTag(expr.type.unionId, narrowedT);
+        if (tag >= 0) return { kind: "unionNarrow", unionId: expr.type.unionId, tag, value: assertedRecvGuardFor(L, expr, p.name.text, expr.loc), type: narrowedT, loc: expr.loc };
+      }
+      return expr;
+    }
     const narrowed = L.mapTypeOf(L.typeOf(node));
     // `Array.isArray(u)` on a `string | readonly string[]` union: the lib
     // predicate narrows the READONLY arm to `any[]` (tsc's readonly-array
@@ -3574,6 +3588,13 @@ export function assertedRecvGuard(L: Lowerer, node: ts.Expression, inner: IrExpr
     if (ts.isStringLiteral(a) || ts.isNoSubstitutionTemplateLiteral(a) || ts.isNumericLiteral(a)) member = a.text;
   }
   if (member === null) return inner;
+  return assertedRecvGuardFor(L, inner, member, loc);
+}
+
+/** assertedRecvGuard's check for a known member name: Node's TypeError
+ * when the union holds one of its unit arms, the value otherwise. */
+export function assertedRecvGuardFor(L: Lowerer, inner: IrExpr, member: string, loc: SrcLoc): IrExpr {
+  if (inner.type.kind !== "union") return inner;
   const unionId = inner.type.unionId;
   const arms = L.unions.get(unionId)?.arms ?? [];
   const units = arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
@@ -4241,6 +4262,18 @@ export function pureReemittable(e: IrExpr): boolean {
           const helper = nullishRetagHelper(L, leftT, type, loc);
           return { kind: "call", callee: helper, args: [left, right], type, loc };
         }
+      }
+    }
+    // One world: a whole expression the checker types dynamic (a JS
+    // `useColor() ?? (isTTY && hasColors?.())`): the left crosses into the
+    // dynamic world and the engine's nullish test picks, the default
+    // lowering lazily in its branch.
+    if (L.sharedDynamic && (type.kind === "jsval" || type.kind === "dyn")) {
+      const lj = L.coerceToExpected(left, JSVAL);
+      if (lj.type.kind === "jsval") {
+        const right = L.jsvalIn(L.lowerExpr(expr.right), expr.right);
+        const out: IrExpr = { kind: "nullish", left: lj, right, type: JSVAL, loc };
+        return type.kind === "dyn" ? { kind: "dynFromJsval", value: out, type: DYN, loc } : out;
       }
     }
     L.unsupported(
@@ -7847,6 +7880,17 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     if (arr.type.kind === "dyn") {
       if (isJsonSafeType(receiverIr, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
         arr = { kind: "dynCheck", value: arr, type: receiverIr, loc: locOf(expr) };
+      } else if (L.sharedDynamic && receiverIr.kind === "array" && (viewableClass(L, receiverIr.elem) !== null ||
+          (receiverIr.elem.kind === "union" && (L.unions.get(receiverIr.elem.unionId)?.arms ?? []).some((a) => viewableClass(L, a) !== null)))) {
+        // A JS array of class instances the lowering holds dynamic (`const
+        // bag = []` then pushes): the element read is the dynamic read, and
+        // the instance comes back out of its view where typed code needs it.
+        const loc = locOf(expr);
+        const idx = L.jsvalLiftExpr(L.lowerExpr(expr.argumentExpression), loc);
+        const read: IrExpr = { kind: "jsOp", op: "getIdx", args: [{ kind: "jsMarshal", value: arr, type: JSVAL, loc }, idx], type: JSVAL, loc };
+        const elemT = L.mapTypeOf(L.typeOf(expr)) ?? receiverIr.elem;
+        const out = L.coerceToExpected(read, elemT);
+        return typeEquals(out.type, elemT) ? out : read;
       } else {
         L.unsupported(
           "SC1090",
@@ -10803,6 +10847,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         loc,
       };
     }
+    // A dynamic value against a program class: is it a view of an instance
+    // of that class (class-views.ts)? Everything else is no instance.
+    if ((left.type.kind === "dyn" || left.type.kind === "jsval") && L.sharedDynamic && viewableClass(L, { kind: "object", className: target.def.name })) {
+      const v: IrExpr = left.type.kind === "dyn" ? { kind: "jsMarshal", value: left, type: JSVAL, loc } : left;
+      return { kind: "jsViewOfClass", value: v, className: target.def.name, type: BOOL, loc };
+    }
     if (left.type.kind === "dyn") {
       L.unsupported(
         "SC1090",
@@ -12099,6 +12149,24 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
     const key: IrExpr = { kind: "strLit", value: field, type: STRING, loc: locOf(expr.name) };
     const keyed = lowerUnionKeyedRead(L, expr, value.type.unionId, value, key, field);
     if (keyed) return keyed;
+    // A JavaScript read through a value that is ONE class or record, or
+    // null/undefined (`this.parent.name` on a `Command | null` field —
+    // nothing in JS narrows it first): Node's TypeError on the unit arms,
+    // the field read otherwise.
+    if (L.undefSlots && isJsSourceFile(expr.getSourceFile())) {
+      const dataArms = def.arms.flatMap((a, i) => (isUnitType(a) ? [] : [{ a, i }]));
+      const only = dataArms.length === 1 ? dataArms[0]! : null;
+      const ft = only === null ? undefined
+        : only.a.kind === "object" ? L.classes.get(only.a.className)?.fields.get(field)
+        : only.a.kind === "record" ? L.shapes.get(only.a.shapeId)?.fields.find((f) => f.name === field)?.type
+        : undefined;
+      if (only !== null && ft !== undefined) {
+        const loc = locOf(expr);
+        const narrowed: IrExpr = { kind: "unionNarrow", unionId: value.type.unionId, tag: only.i, value: assertedRecvGuardFor(L, value, field, loc), type: only.a, loc };
+        if (only.a.kind === "object") return { kind: "fieldGet", obj: narrowed, className: only.a.className, field, type: ft, loc };
+        if (only.a.kind === "record") return { kind: "recordGet", obj: narrowed, shapeId: only.a.shapeId, field, type: ft, loc };
+      }
+    }
     L.unsupported(
       "SC1090",
       expr,

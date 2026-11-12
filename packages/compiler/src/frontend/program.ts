@@ -69,7 +69,8 @@ import {
   type AdoptedOptions,
 } from "./package-options.js";
 import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
-import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
+import { installDtsBridge } from "./dts-bridge.js";
+import { dtsMirrorPathOf, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsRoots, npmStaticFsShadow, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
 import { STUB_BUILTIN_EXPORTS } from "./stub-builtin-exports.js";
@@ -409,6 +410,11 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const dev = scanDevGraph([entryPath, ...includedDts]);
   const configDiags = [...config.diags, ...devConflictDiags(dev.conflicts)];
   if (paths !== null || Object.keys(dev.paths).length > 0) options = { ...options, paths: { ...dev.paths, ...(paths ?? {}) } };
+  // The declared-surface views (npm-static.ts, SEMANTICS.md S133): each
+  // viewed package's bare specifier types against its mirrored
+  // declarations, and its JS joins as a root.
+  const dtsPaths = npmStaticDtsPaths();
+  if (dtsPaths !== null) options = { ...options, paths: { ...(options.paths ?? {}), ...dtsPaths } };
   // Per-package options (SEMANTICS.md S136): each file is checked under its
   // nearest tsconfig's adopted knobs. The entry's set is the one the
   // program already carries (floor applied); another set anywhere in the
@@ -459,8 +465,9 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // A CORE root: preflight's project world (the second-chance program
   // without the overrides) needs them as much as the lowering world does.
   if (!libIncludesDom(options.lib as string[] | undefined)) coreRoots.push(fetchInitDtsPath());
-  const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
+  const program = ts.createProgram([...coreRoots, overridesDtsPath(), ...npmStaticDtsRoots()], options, host);
   if (config.syntheticDefaults !== undefined) syntheticDefaultsByProgram.set(program, config.syntheticDefaults);
+  installDtsBridge(program);
   const entry = program.getSourceFile(entryPath);
   if (!entry) {
     program.dispose();
@@ -568,6 +575,7 @@ export function loadProgram(
   for (const pkg of opts?.npmStatic ?? []) {
     const probe = resolveBareModule(entryPath, pkg);
     if (probe?.workspaceDir !== undefined) registerWorkspacePackage(probe.packageName, probe.workspaceDir);
+    registerDtsView(entryPath, pkg);
   }
   // Declaration-twin hiding is scoped to the entry's own package realm
   // (see projectDtsRuntimeSibling) — set before the host exists so the
@@ -580,6 +588,10 @@ export function loadProgram(
   // resolve.ts answers the same sibling for scriptc's own edges).
   const npmShadow = npmStaticFsShadow();
   const fsShadow = {
+    fileExists: (path: string) => npmShadow?.fileExists?.(path),
+    directoryExists: (path: string) => npmShadow?.directoryExists?.(path),
+    getAccessibleEntries: (path: string) => npmShadow?.getAccessibleEntries?.(path),
+    realpath: (path: string) => npmShadow?.realpath?.(path),
     // Project-scope package.json files (outside every node_modules) serve
     // Node's per-syntax "exports"/"imports" answers (node-conditions.ts):
     // the checker's #alias and self-name resolution then lands on the
@@ -604,6 +616,40 @@ export function loadProgram(
       host.close();
     },
   };
+}
+
+/** Registers an opted-in package's declared-surface view (npm-static.ts,
+ * SEMANTICS.md S133) when the ordinary types-first resolution of its bare
+ * specifier from the entry lands on a declaration file of the package's
+ * own (or of its @types twin): the program then types against those
+ * declarations while the package's JS compiles. No view (a JS-only
+ * package) keeps the inferred surface. */
+function registerDtsView(entryPath: string, pkg: string): void {
+  const declared = resolveBareModule(entryPath, pkg, "declared");
+  if (declared === null || !/\.d\.(ts|mts|cts)$/.test(declared.typesFile)) return;
+  const typesEntry = declared.typesFile.split("\\").join("/");
+  // The types root: the directory of the package (or @types twin) the
+  // entry lives in — the innermost node_modules/<name> (or workspace dir).
+  let typesRoot: string | null = null;
+  const nm = typesEntry.lastIndexOf("/node_modules/");
+  if (nm >= 0) {
+    const rest = typesEntry.slice(nm + "/node_modules/".length).split("/");
+    const depth = rest[0]!.startsWith("@") ? 2 : 1;
+    typesRoot = typesEntry.slice(0, nm + "/node_modules/".length) + rest.slice(0, depth).join("/");
+  } else if (declared.workspaceDir !== undefined) {
+    typesRoot = declared.workspaceDir.split("\\").join("/");
+  }
+  if (typesRoot === null || !typesEntry.startsWith(`${typesRoot}/`)) return;
+  const jsEntries: string[] = [];
+  for (const kind of ["import", "require"] as const) {
+    const js = resolveBareModule(entryPath, pkg, undefined, kind);
+    if (js !== null && isJsSourceFileName(js.typesFile) && !jsEntries.includes(js.typesFile)) jsEntries.push(js.typesFile);
+  }
+  // A DUAL package whose import and require syntaxes load different
+  // implementations: one declared surface cannot name both, so it keeps
+  // the inferred surface (each syntax types against its own file).
+  if (jsEntries.length !== 1) return;
+  registerNpmStaticDtsView({ pkg, typesRoot, typesEntry, mirrorEntry: dtsMirrorPathOf(typesRoot, typesEntry), jsEntries });
 }
 
 /** tsc diagnostics (syntax + types), the supported-import fence, and the

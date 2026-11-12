@@ -6111,6 +6111,11 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         if (data.type.kind === "dyn" && isJsSourceFile(call.getSourceFile())) {
           data = { kind: "dynCheck", value: data, type: STRING, loc };
         }
+        // (One world — the WasmGC lanes: the untyped parameter is the
+        // shared dynamic value; the same validated string exit.)
+        if (data.type.kind === "jsval" && L.sharedDynamic) {
+          data = { kind: "jsExit", value: data, type: STRING, loc };
+        }
         // GH #104 (SEMANTICS.md S119): a chunk holding undefined is Node's
         // type error, thrown at the call.
         const chunkChecked = (build: (read: IrExpr) => IrExpr): IrExpr =>

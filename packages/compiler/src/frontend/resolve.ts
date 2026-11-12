@@ -755,8 +755,11 @@ export function resolveBareModule(
   fromFile: string,
   specifier: string,
   /** "js-only" forces the runtime-JS resolution regardless of the active
-   * --npm-static set (the auto-detection probe); default follows the set. */
-  mode?: "js-only",
+   * --npm-static set (the auto-detection probe); "declared" forces the
+   * ordinary types-first lookup regardless of it (the declared-surface
+   * view of an opted-in package: npm-static.ts registerDtsViews); default
+   * follows the set. */
+  mode?: "js-only" | "declared",
   /** The importing SYNTAX: an import statement / import() / export-from
    * ("import") or a require() call ("require"). Only an opted-in
    * --npm-static package's resolution depends on it (Node's per-syntax
@@ -770,7 +773,7 @@ export function resolveBareModule(
   // An opted-in --npm-static package resolves to its RUNTIME JS: the js
   // pass only, the "types" export condition dropped, the @types mangling
   // never consulted — mirroring the shadowed world the tsgo host serves.
-  const npmStatic = mode === "js-only" || isNpmStaticPackage(pkgName);
+  const npmStatic = mode === "js-only" || (mode !== "declared" && isNpmStaticPackage(pkgName));
   const conditions = npmStatic
     ? kind === "require"
       ? JS_ONLY_REQUIRE_CONDITIONS

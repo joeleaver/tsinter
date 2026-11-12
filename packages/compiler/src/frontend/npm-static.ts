@@ -2,20 +2,23 @@
  * STATICALLY, as ordinary program modules, instead of island-running it
  * under --dynamic.
  *
- * The doctrine (slice 2 of the npm story): a package that ships readable,
- * unminified JS alongside its .d.ts can compile through the same
- * JS/CommonJS frontend the program's own JS files use — inference (JSDoc
- * included) types the bodies, and every statement the lowering cannot
- * honor becomes the standard JS runtime fence (the trap throws AT the
- * statement if the program ever drives it — trust-but-verify, never
- * silent trust). The .d.ts is deliberately DROPPED from the opted-in
- * package's resolution: a declaration is a CLAIM about the body, and the
- * compiled artifact must be built from what the body provably is, not
- * from what the declaration says it should be. Program-side use sites
- * therefore typecheck against the INFERRED export surface; where the
- * package's own JSDoc (usually written against that same .d.ts) types a
- * boundary, the declared types flow in through inference and the runtime
- * fences guard the sites the checker could not prove.
+ * The doctrine (SEMANTICS.md S133, Joe's ruling 2026-11-11; it replaces
+ * slice 2's "typecheck against the inferred surface"): a package that
+ * ships readable, unminified JS alongside its .d.ts compiles through the
+ * same JS/CommonJS frontend the program's own JS files use — inference
+ * (JSDoc included) types the BODIES, and every statement the lowering
+ * cannot honor becomes the standard JS runtime fence (the trap throws AT
+ * the statement if the program ever drives it). The PROGRAM, though,
+ * types against the package's SHIPPED declarations (its own .d.ts or the
+ * @types twin), exactly as the project's own tsc does: the declared-
+ * surface view below. A declaration is a CLAIM about the body, so the
+ * compiled artifact is still built from the body — the checker facade
+ * maps each declaration to the JS implementing it (dts-bridge.ts) — and
+ * every claim is VERIFIED where a value crosses it (lowering/lower-dts.ts):
+ * a value whose inferred type the declaration narrows is checked at the
+ * crossing and a false claim ends the run by name; a dynamic value stays
+ * dynamic and is checked where it enters typed storage (S128). A package
+ * with no declarations keeps the inferred surface (and its old fallback).
  *
  * MECHANISM. Resolution is the single lever:
  *   - tsgo's server-side resolution reads package.json and probes sibling
@@ -54,7 +57,7 @@
  * the state, so a flagless compile after a flagged one sees a clean
  * slate. */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { reduceConditionTargets, type WrapperSubstitution } from "./node-conditions.js";
 import { rewriteBundlerCjsExports } from "./npm-static-rewrite.js";
@@ -77,6 +80,103 @@ export function setNpmStaticPackages(packages: Iterable<string>): void {
   rewriteCache.clear();
   untypedPkgCache.clear();
   realpathProbed.clear();
+  dtsViews.clear();
+}
+
+/* ── the declared-surface view (SEMANTICS.md S133) ──────────────────────
+ * An opted-in package's PROGRAM-side view is its shipped declarations (its
+ * own .d.ts, or the @types twin), exactly what the project's own tsc
+ * checks against; the package's JS is still what compiles. The two views
+ * live in ONE tsgo program:
+ *   - the package's real declaration files stay hidden (the package's own
+ *     JS edges must keep landing on JS — a sibling `lib/x.d.ts` would
+ *     otherwise capture `require('./x')`), and
+ *   - a MIRROR of its declaration tree is served under
+ *     `<types root>/__tsinter_dts__/…` (same bytes, read through the fs
+ *     shadow), with tsconfig "paths" sending the package's bare specifier
+ *     to the mirrored types entry. The mirror sits inside the real types
+ *     root, so the nearest package.json, the node_modules walk-up of the
+ *     declarations' own bare imports, and their relative edges all answer
+ *     what they answer at the real location;
+ *   - the JS entries join the program as ROOTS (the program's import no
+ *     longer reaches them through resolution).
+ * scriptc's own resolver (resolve.ts) is unchanged: the module graph links
+ * the program's import to the package's JS, so the lowering compiles the
+ * JS while the checker types the program against the declarations. The
+ * lowering's checker facade maps each mirrored declaration to the JS
+ * declaration it describes (dts-bridge.ts); where the two types differ the
+ * crossing is a checked conversion. */
+
+/** One opted-in package's declared-surface view. */
+export interface NpmStaticDtsView {
+  pkg: string;
+  /** Real directory the declaration tree lives under (the package dir, or
+   * its @types twin's). */
+  typesRoot: string;
+  /** The types entry the ordinary (types-first) resolution answers for the
+   * bare specifier, real path. */
+  typesEntry: string;
+  /** The same entry under the mirror. */
+  mirrorEntry: string;
+  /** The package's runtime JS entries (import and require syntax) — the
+   * program roots that bring the compiled JS into the tsgo program. */
+  jsEntries: string[];
+}
+
+const DTS_MIRROR_SEGMENT = "/__tsinter_dts__";
+const dtsViews = new Map<string, NpmStaticDtsView>();
+
+export function registerNpmStaticDtsView(view: NpmStaticDtsView): void {
+  if (activePackages.has(view.pkg)) dtsViews.set(view.pkg, view);
+}
+
+export function npmStaticDtsViews(): ReadonlyMap<string, NpmStaticDtsView> {
+  return dtsViews;
+}
+
+export function npmStaticHasDtsView(pkg: string): boolean {
+  return dtsViews.has(pkg);
+}
+
+/** The mirror path of a real path under a view's types root. */
+export function dtsMirrorPathOf(typesRoot: string, real: string): string {
+  return `${typesRoot}${DTS_MIRROR_SEGMENT}${real.slice(typesRoot.length)}`;
+}
+
+/** For a path at or inside some view's mirror: the view and the real path
+ * it mirrors; else null. */
+export function dtsMirrorTargetOf(path: string): { view: NpmStaticDtsView; real: string } | null {
+  if (dtsViews.size === 0) return null;
+  const norm = path.split("\\").join("/");
+  let idx = norm.indexOf(`${DTS_MIRROR_SEGMENT}/`);
+  if (idx < 0 && norm.endsWith(DTS_MIRROR_SEGMENT)) idx = norm.length - DTS_MIRROR_SEGMENT.length;
+  if (idx < 0) return null;
+  const root = norm.slice(0, idx);
+  for (const view of dtsViews.values()) {
+    if (view.typesRoot === root) return { view, real: root + norm.slice(idx + DTS_MIRROR_SEGMENT.length) };
+  }
+  return null;
+}
+
+/** True for a path served from a declared-surface mirror. */
+export function isDtsMirrorPath(path: string): boolean {
+  return dtsMirrorTargetOf(path) !== null;
+}
+
+/** tsconfig "paths" sending each viewed package's bare specifier to its
+ * mirrored types entry (null when no view is registered). */
+export function npmStaticDtsPaths(): Record<string, string[]> | null {
+  if (dtsViews.size === 0) return null;
+  const paths: Record<string, string[]> = {};
+  for (const v of dtsViews.values()) paths[v.pkg] = [v.mirrorEntry];
+  return paths;
+}
+
+/** The JS roots the viewed packages add to the program. */
+export function npmStaticDtsRoots(): string[] {
+  const out: string[] = [];
+  for (const v of dtsViews.values()) for (const j of v.jsEntries) if (!out.includes(j)) out.push(j);
+  return out;
 }
 
 export function npmStaticActive(): boolean {
@@ -234,6 +334,22 @@ export function npmStaticTransformPkgJsonText(text: string, pkgDir?: string): st
   return JSON.stringify(doc);
 }
 
+function isFileSync(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDirSync(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** True for declaration-file names (the claims the opted-in resolution
  * must not see). */
 function isDeclarationFileName(path: string): boolean {
@@ -299,6 +415,12 @@ export interface NpmStaticFsShadow {
   /** True when the path must not exist for the type-checker's resolution
    * (an opted-in package's shipped .d.ts, or its @types twin whole). */
   hideFile: (path: string) => boolean;
+  /** Existence answers for paths the real FS does not hold (the
+   * declared-surface mirror): true/false, or undefined to fall through. */
+  fileExists?: (path: string) => boolean | undefined;
+  directoryExists?: (path: string) => boolean | undefined;
+  getAccessibleEntries?: (path: string) => { files: string[]; directories: string[] } | undefined;
+  realpath?: (path: string) => string | undefined;
 }
 
 /** The virtual-FS shadow loadProgram hands the tsgo host — null when the
@@ -307,6 +429,16 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
   if (!npmStaticActive()) return null;
   return {
     readFile: (path) => {
+      // The declared-surface mirror serves the real declaration's bytes.
+      const mirror = dtsMirrorTargetOf(path);
+      if (mirror !== null) {
+        if (!isDeclarationFileName(mirror.real)) return undefined;
+        try {
+          return readFileSync(mirror.real, "utf8");
+        } catch {
+          return undefined;
+        }
+      }
       const target = shadowTargetOf(path);
       /* NON-OPTED node_modules JS: maxNodeModuleJsDepth (set only on
        * --npm-static loads) admits third-party JS the flagless build never
@@ -366,11 +498,39 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
       return undefined;
     },
     hideFile: (path) => {
+      const mirror = dtsMirrorTargetOf(path);
+      if (mirror !== null) return !isDeclarationFileName(mirror.real) || !isFileSync(mirror.real);
       const target = shadowTargetOf(path);
       if (!target) return false;
       if (target.viaTypes) return true; // the @types twin hides whole
       return isDeclarationFileName(path);
     },
+    fileExists: (path) => {
+      const mirror = dtsMirrorTargetOf(path);
+      if (mirror === null) return undefined;
+      return isDeclarationFileName(mirror.real) && isFileSync(mirror.real);
+    },
+    directoryExists: (path) => {
+      const mirror = dtsMirrorTargetOf(path);
+      return mirror === null ? undefined : isDirSync(mirror.real);
+    },
+    getAccessibleEntries: (path) => {
+      const mirror = dtsMirrorTargetOf(path);
+      if (mirror === null) return undefined;
+      try {
+        const files: string[] = [];
+        const directories: string[] = [];
+        for (const e of readdirSync(mirror.real, { withFileTypes: true })) {
+          if (e.isDirectory()) {
+            if (e.name !== "node_modules") directories.push(e.name);
+          } else if (isDeclarationFileName(e.name)) files.push(e.name);
+        }
+        return { files, directories };
+      } catch {
+        return { files: [], directories: [] };
+      }
+    },
+    realpath: (path) => (dtsMirrorTargetOf(path) !== null ? path : undefined),
   };
 }
 

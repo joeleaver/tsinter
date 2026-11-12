@@ -4984,11 +4984,14 @@ function validateFunction(
       }
       case "jsView": {
         checkExpr(e.value);
-        if (e.value.type.kind !== "array" && e.value.type.kind !== "record") {
-          err(`jsView of a ${e.value.type.kind} (arrays, tuples and records only)`, e.loc);
+        if (e.value.type.kind !== "array" && e.value.type.kind !== "record" && !(e.record && e.value.type.kind === "object")) {
+          err(`jsView of a ${e.value.type.kind} (arrays, tuples, records and class instances only)`, e.loc);
         }
         expectType(e, JSVAL, "jsView result");
-        if (e.fns.length !== (e.record ? 3 : 4)) err("jsView takes 4 array / 3 record functions", e.loc);
+        // A class instance's record view adds a fourth: has(k), its
+        // prototype's members (class-views.ts).
+        const recordFns = e.value.type.kind === "object" ? 4 : 3;
+        if (e.fns.length !== (e.record ? recordFns : 4)) err("jsView takes 4 array / 3 record / 4 class-instance functions", e.loc);
         for (const f of e.fns) {
           checkExpr(f);
           expectType(f, JSVAL, "jsView function");
@@ -5007,7 +5010,13 @@ function validateFunction(
       case "jsUnview": {
         checkExpr(e.value);
         expectType(e.value, JSVAL, "jsUnview operand");
-        if (e.type.kind !== "array" && e.type.kind !== "record") err(`jsUnview to a ${e.type.kind}`, e.loc);
+        if (e.classTest === true ? e.type.kind !== "object" : e.type.kind !== "array" && e.type.kind !== "record") err(`jsUnview to a ${e.type.kind}`, e.loc);
+        break;
+      }
+      case "jsViewOfClass": {
+        checkExpr(e.value);
+        expectType(e.value, JSVAL, "jsViewOfClass operand");
+        expectType(e, BOOL, "jsViewOfClass result");
         break;
       }
       case "jsBridgePromise": {

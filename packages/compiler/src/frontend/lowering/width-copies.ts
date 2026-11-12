@@ -51,6 +51,8 @@
  *   under-refuses. */
 import { typeKey, type IrExpr, type IrFunction, type IrRecordShape, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
+import { npmStaticPackageOfPath } from "../npm-static.js";
+import { fencedValue } from "./class-views.js";
 import type { Lowerer } from "./lowerer.js";
 import * as ts from "../ts7/adapter.js";
 import { dynArmKey } from "./dyn-arm.js";
@@ -3148,9 +3150,22 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       if (armParam !== null) L.dynArmRetry.add(armParam);
       armParam = null;
       const at = `${s.loc.file}:${s.loc.start}`;
+      const diag = unsupportedDiag("SC1090", s.loc, `${feature}: it would be a COPY where JavaScript shares the object, and ${why} (SEMANTICS.md S125)`, hint);
+      // A compiled npm package's own JavaScript (SEMANTICS.md S133) takes the
+      // JS deferral stance: the observable copy refuses where it RUNS — the
+      // crossing ends the program by name — never the program's build.
+      if (npmStaticPackageOfPath(s.loc.file) !== null && s.node !== null && typeof s.node === "object" && typeof (s.node as { kind?: unknown }).kind === "string") {
+        const node = s.node as unknown as Record<string, unknown>;
+        const orig = { ...node };
+        for (const k of Object.keys(node)) delete node[k];
+        Object.assign(node, fencedValue(L, orig as unknown as IrExpr, diag.code, `${diag.message} [${diag.code} at ${s.loc.file}]`, s.loc));
+        if (!reportedDyn.has(at)) L.runtimeFences.push(diag);
+        reportedDyn.add(at);
+        continue;
+      }
       if (reportedDyn.has(at)) continue;
       reportedDyn.add(at);
-      L.pushDiag(unsupportedDiag("SC1090", s.loc, `${feature}: it would be a COPY where JavaScript shares the object, and ${why} (SEMANTICS.md S125)`, hint));
+      L.pushDiag(diag);
     }
     judgingDyn = false;
   }

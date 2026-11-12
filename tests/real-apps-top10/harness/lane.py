@@ -2,7 +2,7 @@
 """lane.py <project> <lane: node|wasm|wn> : run one project's workload on one lane (nico-top only).
 
 Round 3's lane.py (../../real-apps-round3/harness/lane.py), adapted:
-  - the spec comes from workloads.json: {cwd, entry, nodeEntry?, npmStatic?, dynamic?, timeout?, cases:[{name,args,stdin?}]}
+  - the spec comes from workloads.json: {cwd, entry, nodeEntry?, npmStatic?, dynamic?, timeout?, srcProject?, cases:[{name,args,stdin?}]}
     with cwd/entry relative to WORK/src/<project>/; drivers named "@drivers/x" are copied from ../drivers/ into
     WORK/src/<project>/<driverDir>/ (default .top10/) first, so they resolve the project's modules.
   - node  runs nodeEntry (default entry) under Node with node-src-loader.mjs (the project's own source, run
@@ -21,7 +21,9 @@ from common import CLI, DRIVERS, HERE, LOADER, NODE, REPO, RES, SRC, WORK, workl
 
 proj, lane = sys.argv[1], sys.argv[2]
 W = workloads()[proj]
-root = os.path.join(SRC, proj)
+# "srcProject": a workload that runs inside ANOTHER project's tree (the commander driver runs in paperclip's,
+# against the commander paperclip installed).
+root = os.path.join(SRC, W.get("srcProject", proj))
 out = os.path.join(RES, proj, lane)
 shutil.rmtree(out, ignore_errors=True)
 os.makedirs(out, exist_ok=True)

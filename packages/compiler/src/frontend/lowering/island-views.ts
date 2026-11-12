@@ -26,6 +26,8 @@ import { orderedFieldStmts } from "./record-order.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFileName } from "../shared.js";
+import { npmStaticPackageOfPath } from "../npm-static.js";
+import { fencedValue } from "./class-views.js";
 import {
   BOOL, DYN, F64, JSVAL, STRING, VOID, arrayOf, canExitIslandToType, isNodeClassShape, isReservedField, isUnitType, shapeHasReservedFields, typeKey,
   type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc,
@@ -643,7 +645,7 @@ function shallowArrayLift(e: IrExpr, loc: SrcLoc, L?: Lowerer): IrExpr {
 
 /** Does a typed composite carry an accessor-bearing record anywhere a view
  * would reach (the record itself, a field, an element, a union arm)? */
-function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
+export function carriesAccessors(L: Lowerer, t: IrType, seen: Set<string>): boolean {
   const k = typeKey(t);
   if (seen.has(k)) return false;
   seen.add(k);
@@ -1124,6 +1126,14 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
     if (k === "jsExit" && !node["fresh"] && isTypedComposite(L, node["type"] as IrType)) {
       const loc = node["loc"] as SrcLoc;
       const key = `${loc.file}:${loc.start}`;
+      // A compiled npm package's own JavaScript (SEMANTICS.md S133): the
+      // refusal stops the program where the exit RUNS, never the build.
+      if (npmStaticPackageOfPath(loc.file) !== null) {
+        const diag = s115Diag(loc, exitRefusal(L, node["type"] as IrType));
+        if (!reported.has(key)) L.runtimeFences.push(diag);
+        reported.add(key);
+        return fencedValue(L, node as unknown as IrExpr, diag.code, `${diag.message} [${diag.code} at ${loc.file}]`, loc) as unknown as Record<string, unknown>;
+      }
       if (!reported.has(key)) {
         reported.add(key);
         L.pushDiag(s115Diag(loc, exitRefusal(L, node["type"] as IrType)));

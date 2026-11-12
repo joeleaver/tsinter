@@ -6816,6 +6816,7 @@ class LlEmitter {
       case "isUndef":
       case "arrHasUndef":
       case "jsFits":
+      case "jsViewOfClass":
         // Unit U: undefSlots modules exist only on the WasmGC lanes
         // (compile() sets the option for --backend wasm / wasm-native);
         // the native lanes keep SEMANTICS.md S003/S006/S032.

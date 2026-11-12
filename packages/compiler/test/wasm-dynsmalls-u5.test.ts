@@ -218,13 +218,12 @@ test("R07 DYNCHECK: lifted by unit U1a: an instanceof TypeError narrow on unknow
   expect(exitCode).toBe(0);
 });
 
-test("R08 DYNCHECK: not lifted: instanceof a user class on unknown stays a named front-end refusal", async () => {
+test("R08 DYNCHECK: instanceof a user class on unknown answers on the instance's view (SEMANTICS.md S115 class instances)", async () => {
   const src = "class Box { v = 3; }\nfunction show(u: unknown): void {\n  if (u instanceof Box) console.log(`Box ${u.v}`);\n  else console.log(\"not Box\");\n}\nshow(new Box());\nshow(1);\n";
-  const { diagnostics, survey } = await refuseRow("R08", src, "ts");
-  expect(survey).toEqual([]);
-  // Unit U1a: the class instance entering `unknown` refuses with the one
-  // dynamic world's boundary text.
-  expect(diagnostics).toEqual(["SC1090: 'instanceof Box' on 'unknown' values (only the Error classes answer — test 'instanceof Error' and read '.name') are not supported yet","SC1090: passing a value of type 'Box' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  const { stdout, stderr, exitCode } = await runRow("R08", src, "ts");
+  expect(stdout).toBe("Box 3\nnot Box\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("R09 DYNCHECK: not lifted: a checked cast of unknown to Error stays a named front-end refusal", async () => {
@@ -880,12 +879,12 @@ test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", asy
   expect(stderr).toBe("tsinter: unsupported: 'new Date' is part of the standard library types but has no scriptc lowering yet [SC2020 at <ROW>:3]\n");
 });
 
-test("R48 UNCLONE: a class instance stops at its crossing", async () => {
+test("R48 CLONE: a class instance shared with dynamic code clones as a plain object (SEMANTICS.md S115 class instances)", async () => {
   const src = "'use strict';\nclass P { constructor() { this.x = 1; } }\nconst c = (x) => structuredClone(x);\nconst o = c(new P());\nconsole.log(o instanceof P, o.x, JSON.stringify(o));\n";
-  // This tier's answer (the existing SC1101 crossing fence); Node prints "false 1 {\"x\":1}\n" and exits 0.
-  const { stdout, stderr } = await runRowTrap("R48", src, "cjs");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'P' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:4]\n");
+  const { stdout, stderr, exitCode } = await runRow("R48", src, "cjs");
+  expect(stdout).toBe("false 1 {\"x\":1}\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ----------------------------------------------------------------------

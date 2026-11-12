@@ -190,9 +190,62 @@ export class CheckerFacade {
     return project;
   }
 
+  /* ── the declared-surface redirect (npm-static, SEMANTICS.md S133) ────
+   * A program that types against an npm package's shipped declarations
+   * while the package's JS compiles: the bridge (frontend/dts-bridge.ts)
+   * answers, for a symbol DECLARED in a mirrored .d.ts, the JS symbol that
+   * implements it. The symbol-declaration surface and alias resolution
+   * consult it, so every lowering that walks from a use to a declaration
+   * lands on the implementation; types (getTypeAtLocation and friends)
+   * stay the declared ones — the crossing between the two is the
+   * lowering's checked conversion. */
+  private symbolRedirect: ((symbol: Ts7Symbol, use: "decl" | "alias") => Ts7Symbol | null) | null = null;
+
+  setSymbolRedirect(fn: ((symbol: Ts7Symbol, use: "decl" | "alias") => Ts7Symbol | null) | null): void {
+    this.symbolRedirect = fn;
+  }
+
+  /** True when any of the symbol's declarations lives in a file whose path
+   * satisfies `pred` (no node resolution — handle paths only). */
+  symbolDeclaredIn(symbol: Ts7Symbol, pred: (path: string) => boolean): boolean {
+    return symbol.declarations.some((h) => pred(h.path as unknown as string));
+  }
+
+  /** declarationsOf WITHOUT the declared-surface redirect. */
+  rawDeclarationsOf(symbol: Ts7Symbol): readonly Node[] {
+    let decls = this.declsOf.get(symbol);
+    if (decls === undefined) {
+      const project = this.requireProject();
+      decls = symbol.declarations
+        .map((h) => h.resolve(project))
+        .filter((n): n is Node => n !== undefined);
+      const dead = deadDuplicates(decls);
+      if (dead.size > 0) decls = decls.filter((d) => !dead.has(d));
+      this.declsOf.set(symbol, decls);
+    }
+    return decls;
+  }
+
+  /** getAliasedSymbol WITHOUT the declared-surface redirect. */
+  rawGetAliasedSymbol(symbol: Ts7Symbol): Ts7Symbol {
+    let aliased = this.aliasedSymbol.get(symbol);
+    if (aliased === undefined) {
+      aliased = this.raw.getAliasedSymbol(symbol);
+      this.aliasedSymbol.set(symbol, aliased);
+    }
+    return aliased;
+  }
+
+  private redirected(symbol: Ts7Symbol, use: "decl" | "alias"): Ts7Symbol | null {
+    const r = this.symbolRedirect?.(symbol, use) ?? null;
+    return r !== null && r !== symbol ? r : null;
+  }
+
   /** 5.9.3's symbol.declarations (never undefined here: 7 answers an empty
    * array where 5.9.3 answered undefined — callers treat them alike). */
   declarationsOf(symbol: Ts7Symbol): readonly Node[] {
+    const r = this.redirected(symbol, "decl");
+    if (r !== null) return this.declarationsOf(r);
     let decls = this.declsOf.get(symbol);
     if (decls === undefined) {
       const project = this.requireProject();
@@ -216,6 +269,8 @@ export class CheckerFacade {
   /** 5.9.3's symbol.valueDeclaration (a dead duplicate function
    * declaration answers the live one — see declarationsOf). */
   valueDeclarationOf(symbol: Ts7Symbol): Node | undefined {
+    const r = this.redirected(symbol, "decl");
+    if (r !== null) return this.valueDeclarationOf(r);
     if (this.valueDeclOf.has(symbol)) return this.valueDeclOf.get(symbol);
     let decl = symbol.valueDeclaration?.resolve(this.requireProject());
     if (decl !== undefined && isBodiedFunctionDeclaration(decl)) {
@@ -419,12 +474,8 @@ export class CheckerFacade {
   }
 
   getAliasedSymbol(symbol: Ts7Symbol): Ts7Symbol {
-    let aliased = this.aliasedSymbol.get(symbol);
-    if (aliased === undefined) {
-      aliased = this.raw.getAliasedSymbol(symbol);
-      this.aliasedSymbol.set(symbol, aliased);
-    }
-    return aliased;
+    const aliased = this.rawGetAliasedSymbol(symbol);
+    return this.redirected(aliased, "alias") ?? aliased;
   }
 
   getDeclaredTypeOfSymbol(symbol: Ts7Symbol): Type {

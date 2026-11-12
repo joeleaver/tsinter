@@ -3328,6 +3328,37 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     return lowered;
   }
 
+/** The union a JavaScript `let` binding of class type `t` must hold: the
+ * mapped type of some later assignment's right-hand side that is `t` plus
+ * unit arms (null/undefined) only; null when every assignment fits `t`. */
+function jsLetAssignedUnion(L: Lowerer, decl: ts.VariableDeclaration, sym: ts.Symbol, t: IrType): IrType | "dynamic" | null {
+  let scope: ts.Node = decl;
+  while (scope.parent !== undefined && !ts.isBlock(scope) && !ts.isSourceFile(scope) && !ts.isForStatement(scope) && !ts.isFunctionLike(scope)) scope = scope.parent;
+  let found: IrType | "dynamic" | null = null;
+  const visit = (n: ts.Node): void => {
+    if (found === "dynamic") return;
+    if (
+      ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(n.left) && L.checker.getSymbolAtLocation(n.left) === sym
+    ) {
+      let mapped: IrType | null = null;
+      try {
+        mapped = L.mapTypeOf(L.typeOf(n.right));
+      } catch {
+        mapped = null;
+      }
+      if (mapped?.kind === "jsval" || mapped?.kind === "dyn") found = "dynamic";
+      else if (mapped?.kind === "union" && found === null) {
+        const arms = L.unions.get(mapped.unionId)?.arms ?? [];
+        if (arms.some((a) => typeEquals(a, t)) && arms.every((a) => typeEquals(a, t) || isUnitType(a))) found = mapped;
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(scope);
+  return found;
+}
+
 export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: boolean): IrStmt | null {
     // --provenance-sources: an elided pure-annotated dead const emits
     // nothing (collectGlobals registered no global by the same test —
@@ -3833,10 +3864,29 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
       init = L.coerceInto(decl.initializer, init, preSelf.type);
       return { kind: "assign", localId: preSelf.id, value: init, loc: locOf(decl) };
     }
+    // A JavaScript `let` of a class instance that the scope later assigns a
+    // value which may also be null/undefined (`for (let c = this; c; c =
+    // c.parent)` over a `Command | null` field — nothing narrows it in
+    // JS): the binding takes that union, so the unit value is held, not a
+    // narrowing failure.
+    let jsWidened = false;
+    if (isLet && !decl.type && type.kind === "object" && isJsSourceFile(decl.getSourceFile()) && declSymbol) {
+      const widened = jsLetAssignedUnion(L, decl, declSymbol, type);
+      if (widened === "dynamic") {
+        // Assigned an `any` value too: the binding is dynamic (U2's arm —
+        // every use asks the value), its class initializer a shared view.
+        L.dynArmSyms.add(declSymbol);
+        type = DYN;
+      } else if (widened !== null) {
+        type = widened;
+        jsWidened = true;
+      }
+    }
     // Slot coercion: `const r: A | B = bValue;` wraps implicitly; width
     // subtyping (`const p: {a: number} = wider;`) is rejected, not coerced.
     init = L.coerceInto(decl.initializer, init, type);
     const local = L.declareLocal(decl.name, decl.name.text, type, isLet);
+    if (jsWidened) L.jsWidenedLets.add(local.id);
     return { kind: "varDecl", localId: local.id, init, loc: locOf(decl) };
   }
 

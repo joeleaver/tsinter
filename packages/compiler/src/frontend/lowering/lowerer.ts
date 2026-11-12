@@ -14,6 +14,9 @@
  */
 import { isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
+import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
+import { isDtsMirrorPath } from "../npm-static.js";
+import { classFuncBox, classLiftIn, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
   anyOpRequiresDynamicDiag,
@@ -88,7 +91,7 @@ import {
   UnionRegistry,
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
-import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
+import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
@@ -1380,6 +1383,9 @@ export class Lowerer {
   readonly dynArmExitNodes = new WeakMap<object, string>();
   /** Bindings and parameters holding the dynamic arm. */
   readonly dynArmSyms = new Set<ts.Symbol>();
+  /** JavaScript `let` locals widened to the union their assignments hold
+   * (lower-stmts.ts jsLetAssignedUnion), by local id. */
+  readonly jsWidenedLets = new Set<string>();
   /** Function name → the source parameters of the function literal it
    * was lowered from (the width-copy pass names a refused parameter). */
   readonly dynArmFnParams = new Map<string, readonly ts.ParameterDeclaration[]>();
@@ -2596,7 +2602,12 @@ export class Lowerer {
     insertModuleTdzChecks(this.moduleTdz, functions, this.globalsList);
     // GH #109 (SEMANTICS.md S125): a width copy the program could tell
     // from the shared object refuses by name.
-    widthCopyPass(this, functions);
+    {
+      const liftedBefore = this.liftedFns.length;
+      widthCopyPass(this, functions);
+      // (Its deferred fences in compiled npm JavaScript intern helpers.)
+      functions.push(...this.liftedFns.slice(liftedBefore));
+    }
 
     if (this.remainder) {
       // Deferred collection diagnostics nothing flushed — declarations no
@@ -4225,6 +4236,22 @@ export class Lowerer {
       if (expr.type.kind === "dyn") {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
       }
+      // A class instance shares as its live view (class-views.ts); a
+      // function over instances boxes through its class adapter.
+      if (this.sharedDynamic && viewableClass(this, expr.type)) return classViewOf(this, expr, expr.loc);
+      if (this.sharedDynamic && expr.type.kind === "func") {
+        const boxedFn = classFuncBox(this, expr, expr.loc);
+        if (boxedFn !== null) return boxedFn;
+      }
+      // A union carrying class instances (beside units and scalars): each
+      // arm lifts as itself, an instance as its view.
+      if (this.sharedDynamic && expr.type.kind === "union") {
+        const arms = this.unions.get(expr.type.unionId)?.arms ?? [];
+        if (arms.some((a) => viewableClass(this, a) !== null) &&
+            arms.every((a) => viewableClass(this, a) !== null || isUnitType(a) || a.kind === "string" || a.kind === "f64" || a.kind === "bool")) {
+          return { kind: "call", callee: this.unionToJsvalHelper(expr.type.unionId, expr.loc), args: [expr], type: JSVAL, loc: expr.loc };
+        }
+      }
       // The one-world lanes without the engine: jsvalIn's rule — a
       // function crosses as the checked-dynamic box, and a typed value the
       // island cannot view as the checked-dynamic copy (S125 (c) judges it).
@@ -4247,6 +4274,16 @@ export class Lowerer {
       // of such records) have no JSON marshal but an honest per-field
       // island construction — see jsvalLiftExpr.
       if (this.jsvalLiftable(expr.type)) {
+        return this.jsvalLiftExpr(expr, expr.loc);
+      }
+      // One world: a typed record or array (functions inside included)
+      // shares as its live view, or a fresh literal builds as the dynamic
+      // object Node would build (unit H, SEMANTICS.md S115 (a)). A record
+      // with accessors or reserved slots (a %call hybrid, %get:/%set:
+      // closures, a codec instance's record) has no view and keeps the
+      // boundary refusal below; so does a composite with a leaf that has
+      // no dynamic form (a symbol).
+      if (this.sharedDynamic && !this.engine && (expr.type.kind === "record" || expr.type.kind === "array" || (expr.type.kind === "union" && isTypedComposite(this, expr.type))) && !carriesAccessors(this, expr.type, new Set()) && this.viewLeavesLiftable(expr.type)) {
         return this.jsvalLiftExpr(expr, expr.loc);
       }
       // A RegExp flowing into an 'any' slot: the fresh-engine-RegExp
@@ -4295,6 +4332,15 @@ export class Lowerer {
       // undefined arm before the JSON detour) — canExitIslandToType.
       if (this.boundaryExitSafe(expected)) {
         return { kind: "jsExit", value: expr, type: expected, loc: expr.loc };
+      }
+      // A class slot takes the instance a view holds (class-views.ts); a
+      // union of class, unit and scalar arms tests the value's kind.
+      if (this.sharedDynamic && expected.kind === "object" && viewableClass(this, expected)) {
+        return classUnview(this, expr, expected, expr.loc);
+      }
+      if (this.sharedDynamic && expected.kind === "union") {
+        const helper = classUnionExitHelper(this, expected.unionId, expr.loc);
+        if (helper !== null) return { kind: "call", callee: helper, args: [expr], type: expected, loc: expr.loc };
       }
       // One world (U1b): an island value leaving into a FUNCTION slot
       // takes the checked-dynamic function boundary's OUT direction (the
@@ -4363,6 +4409,12 @@ export class Lowerer {
           loc: expr.loc,
         };
       }
+      // A class instance shares as its live view (class-views.ts); a
+      // function over instances boxes through its class adapter.
+      {
+        const lifted = classLiftIn(this, expr, expr.loc);
+        if (lifted !== null) return { kind: "dynFromJsval", value: lifted, type: DYN, loc: expr.loc };
+      }
       return expr;
     }
     // A dyn ('unknown') ACTUAL flowing into a typed slot the checker
@@ -4393,6 +4445,14 @@ export class Lowerer {
         canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic);
       if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || funcOk) {
         return { kind: "dynCheck", value: expr, type: expected, loc: expr.loc };
+      }
+      // A class slot takes the instance a view holds (class-views.ts).
+      if (this.sharedDynamic && expected.kind === "object" && viewableClass(this, expected)) {
+        return classUnview(this, { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }, expected, expr.loc);
+      }
+      if (this.sharedDynamic && expected.kind === "union") {
+        const helper = classUnionExitHelper(this, expected.unionId, expr.loc);
+        if (helper !== null) return { kind: "call", callee: helper, args: [{ kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }], type: expected, loc: expr.loc };
       }
       return expr;
     }
@@ -6430,12 +6490,15 @@ export class Lowerer {
    * unchecked unionNarrow would misread the payload where JS lets the
    * impossible value flow on). Null when the target isn't a non-unit arm
    * of the union — those uses keep their erasure/fences. */
-  narrowedArmHelper(fromId: string, target: IrType, loc: SrcLoc): string | null {
+  narrowedArmHelper(fromId: string, target: IrType, loc: SrcLoc, mismatch?: (what: string) => string): string | null {
     const from = this.unions.get(fromId);
     if (!from || isUnitType(target)) return null;
     const tag = this.armTag(fromId, target);
     if (tag < 0) return null;
-    const key = `${fromId}:${tag}`;
+    // A crossing that names its own mismatch (SEMANTICS.md S133's declared
+    // npm surface) gets a helper of its own per message.
+    const custom = mismatch?.("%what%");
+    const key = custom === undefined ? `${fromId}:${tag}` : `${fromId}:${tag}:${custom}`;
     const existing = this.narrowHelpers.get(key);
     if (existing) return existing;
     const name = `%union.narrow.${this.narrowHelpers.size}`;
@@ -6467,7 +6530,7 @@ export class Lowerer {
         then: [
           // GH #86 review (SEMANTICS.md S122): a check Node never makes — it
           // ends the program; the helper is shared, so no single line.
-          { kind: "runtimeFence", code: "SC1090", message: `${what} is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]`, loc },
+          { kind: "runtimeFence", code: "SC1090", message: mismatch !== undefined ? mismatch(what) : `${what} is not representable in the target union (a value narrowed or asserted past it still held it) [SC1090 at a narrowed value's conversion]`, loc },
         ],
         else_: null,
         loc,
@@ -6545,6 +6608,25 @@ export class Lowerer {
       loc,
     });
     return name;
+  }
+
+  /** One world: does every leaf a view of `t` would lift have a dynamic
+   * form (jsvalLiftExpr's cases)? A composite with a leaf that has none (a
+   * symbol, a Map) keeps the boundary refusal instead of a view. */
+  viewLeavesLiftable(t: IrType, seen: Set<string> = new Set()): boolean {
+    const k = typeKey(t);
+    if (seen.has(k)) return true;
+    seen.add(k);
+    if (t.kind === "jsval" || t.kind === "dyn" || t.kind === "func" || t.kind === "bytes" || t.kind === "url" || isUnitType(t)) return true;
+    if (t.kind === "array") return this.viewLeavesLiftable(t.elem, seen);
+    if (t.kind === "record") {
+      const shape = this.shapes.get(t.shapeId);
+      if (!shape) return false;
+      return shape.fields.every((f) => this.viewLeavesLiftable(f.type, seen)) && (shape.indexValue === undefined || this.viewLeavesLiftable(shape.indexValue, seen));
+    }
+    if (t.kind === "union") return (this.unions.get(t.unionId)?.arms ?? []).every((a) => this.viewLeavesLiftable(a, seen));
+    if (viewableClass(this, t)) return true;
+    return this.boundarySafe(t);
   }
 
   /** True when a static value can become ONE island value: jsval itself,
@@ -6631,9 +6713,23 @@ export class Lowerer {
     }
     // Checked-dynamic values and marshalable closures ride jsMarshal
     // directly (the checked-dynamic tree deep copy / the host-function wrap).
+    if (e.type.kind === "func" && this.sharedDynamic) {
+      const boxedFn = classFuncBox(this, e, loc);
+      if (boxedFn !== null) return boxedFn;
+      // A signature the host box cannot marshal: the all-dynamic adapter,
+      // else a value that stops by name where it is produced.
+      if (!this.engine && !canMarshalTypedFuncIntoIsland(e.type, (id) => this.shapes.get(id), (id) => this.unions.get(id))) {
+        const dynBoxed = this.oneWorldDynFrom(e, null);
+        if (dynBoxed) return dynBoxed;
+        return classFuncBox(this, e, loc, true) ??
+          fencedValue(this, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, "SC1090", `a '${this.fmt(e.type)}' function crossing into dynamic code has no dynamic form yet [SC1090]`, loc);
+      }
+    }
     if (e.type.kind === "dyn" || e.type.kind === "func") {
       return { kind: "jsMarshal", value: e, type: JSVAL, loc };
     }
+    // A class instance crosses as its live view (class-views.ts).
+    if (this.sharedDynamic && viewableClass(this, e.type)) return classViewOf(this, e, loc);
     throw new Error(`lowerer bug: jsvalLiftExpr of unliftable ${e.type.kind}`);
   }
 
@@ -8830,7 +8926,7 @@ export class Lowerer {
   /* ── expressions ──────────────────────────────────────────────────── */
 
   lowerExpr(expr: ts.Expression): IrExpr {
-    const e = lowerExpr(this, expr);
+    const e = ts.isPropertyAccessExpression(expr) ? dtsPropertyRead(this, expr, lowerExpr(this, expr)) : lowerExpr(this, expr);
     // Unit U2a (dyn-arm.ts): an operator over a dynamic-arm operand lowers
     // to the dynamic operation (a jsval) where TypeScript types its result
     // primitive (`"n=" + v.a` is a string, `v.a < 1` a boolean, `-v.a` a
@@ -8883,7 +8979,11 @@ export class Lowerer {
   readonly isNpmFile = (sf: ts.SourceFile): boolean =>
     sf.isDeclarationFile &&
     (sf.fileName.includes("/node_modules/") || workspacePackageOfPath(sf.fileName) !== null) &&
-    !this.isStdlibFile(sf);
+    !this.isStdlibFile(sf) &&
+    // SEMANTICS.md S133: a compiled package's declared surface is the
+    // program's own vocabulary (its classes map to the compiled JS, its
+    // interfaces to records) — never engine handles.
+    !isDtsMirrorPath(sf.fileName);
 
   npmPackageOf(type: ts.Type): string | null {
     return npmPackageOf(this, type);
@@ -9273,7 +9373,7 @@ export class Lowerer {
       }
       return { kind: "jsOp", op: "construct", args: [ctor, arg], type: JSVAL, loc };
     }
-    return lowerNew(this, expr);
+    return dtsCallResult(this, expr, lowerNew(this, expr));
   }
 
   lowerFieldRead(expr: ts.PropertyAccessExpression): IrExpr | null {

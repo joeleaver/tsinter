@@ -413,5 +413,209 @@
     ]
    }
   ]
+ },
+ "commander": {
+  "srcProject": "paperclip",
+  "cwd": "cli",
+  "entry": "@drivers/commander-main.ts",
+  "driverDir": "cli/.top10",
+  "npmStatic": [
+   "commander"
+  ],
+  "timeout": 120,
+  "cases": [
+   {
+    "name": "help",
+    "args": [
+     "--help"
+    ]
+   },
+   {
+    "name": "version",
+    "args": [
+     "--version"
+    ]
+   },
+   {
+    "name": "V",
+    "args": [
+     "-V"
+    ]
+   },
+   {
+    "name": "deploy-help",
+    "args": [
+     "deploy",
+     "--help"
+    ]
+   },
+   {
+    "name": "help-deploy",
+    "args": [
+     "help",
+     "deploy"
+    ]
+   },
+   {
+    "name": "heartbeat-help",
+    "args": [
+     "heartbeat",
+     "--help"
+    ]
+   },
+   {
+    "name": "heartbeat-run-help",
+    "args": [
+     "heartbeat",
+     "run",
+     "--help"
+    ]
+   },
+   {
+    "name": "unknown",
+    "args": [
+     "frobnicate"
+    ]
+   },
+   {
+    "name": "unknown-near",
+    "args": [
+     "deplyo"
+    ]
+   },
+   {
+    "name": "unknown-option",
+    "args": [
+     "deploy",
+     "web",
+     "--target",
+     "prod",
+     "--frob"
+    ]
+   },
+   {
+    "name": "missing-required",
+    "args": [
+     "deploy",
+     "web"
+    ]
+   },
+   {
+    "name": "missing-arg",
+    "args": [
+     "deploy",
+     "--target",
+     "prod"
+    ]
+   },
+   {
+    "name": "deploy",
+    "args": [
+     "deploy",
+     "web",
+     "--target",
+     "prod"
+    ]
+   },
+   {
+    "name": "deploy-alias",
+    "args": [
+     "-v",
+     "-c",
+     "cfg.json",
+     "ship",
+     "api",
+     "x",
+     "y",
+     "-t",
+     "staging",
+     "-r",
+     "eu-west-1",
+     "--retries",
+     "5",
+     "--dry-run",
+     "--no-backup",
+     "--harness",
+     "codex",
+     "--api-key-env",
+     "KEY"
+    ]
+   },
+   {
+    "name": "bad-choice",
+    "args": [
+     "deploy",
+     "web",
+     "-t",
+     "prod",
+     "--harness",
+     "nope"
+    ]
+   },
+   {
+    "name": "conflicts",
+    "args": [
+     "deploy",
+     "web",
+     "-t",
+     "prod",
+     "--api-key",
+     "k",
+     "--api-key-env",
+     "KEY"
+    ]
+   },
+   {
+    "name": "env",
+    "args": [
+     "env"
+    ]
+   },
+   {
+    "name": "env-json",
+    "args": [
+     "env",
+     "--json"
+    ]
+   },
+   {
+    "name": "heartbeat-run",
+    "args": [
+     "heartbeat",
+     "run",
+     "-a",
+     "agent-7",
+     "--timeout-ms",
+     "500"
+    ]
+   },
+   {
+    "name": "heartbeat-missing",
+    "args": [
+     "heartbeat",
+     "run"
+    ]
+   },
+   {
+    "name": "strict-ok",
+    "args": [
+     "strict",
+     "2"
+    ]
+   },
+   {
+    "name": "strict-bad",
+    "args": [
+     "strict",
+     "9"
+    ]
+   },
+   {
+    "name": "strict-missing",
+    "args": [
+     "strict"
+    ]
+   }
+  ]
  }
 }

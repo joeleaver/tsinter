@@ -29,7 +29,7 @@ import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBu
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
 import { EntryLoadError, canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
-import { npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
+import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
@@ -252,6 +252,11 @@ export interface AnalyzeOptions {
   npmStatic?: readonly string[] | "auto";
   /** Analyze with the outbound native bindings from this FFI manifest. */
   ffiProfilePath?: string;
+  /** Lower as this backend's build does: "wasm"/"wasm-native" take the
+   * WasmGC lanes' lowering (one dynamic world, undefined slots, the host's
+   * fetch) so the report names what those builds would; default: the
+   * legacy lanes' lowering, as before. */
+  backend?: "wasm" | "wasm-native";
 }
 
 /* ── the frontend, one pipeline shape ───────────────────────────────────
@@ -517,7 +522,12 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
   // degrade the same way — the ratified stance for bundle-shaped dists is
   // graceful per-package degradation, never a failed gate the user cannot
   // act on (the note carries the why).
-  if (effective.size > 0 && preflight.some((d) => d.code === "SC0001")) {
+  // A package with a declared-surface view (SEMANTICS.md S133) types the
+  // program against its shipped declarations, exactly as the project's own
+  // tsc does: a program error against them is the program's own, never a
+  // reason to drop the package (the island would type it the same way).
+  const inferredOnly = [...effective].filter((p) => !npmStaticHasDtsView(p));
+  if (inferredOnly.length > 0 && preflight.some((d) => d.code === "SC0001")) {
     const dropWithNote = (p: string): void => {
       effective.delete(p);
       statuses.push({
@@ -535,17 +545,25 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
     // always independent — each package's inferred surface breaks its own
     // import sites), then reload with the survivors; interaction effects
     // that still fail drop everything left.
-    for (const p of [...effective]) {
-      const probe = loadProgram(entryPath, { npmStatic: [p] });
-      const probeDiags = checkPreflight(probe);
+    // A probe is measured against the no-opt-in load: errors the program
+    // has against declarations (a viewed package's, or its own) are not
+    // the probed package's.
+    const errorsOf = (pkgs: string[]): number => {
+      const probe = loadProgram(entryPath, { npmStatic: pkgs });
+      const n = checkPreflight(probe).filter((d) => d.code === "SC0001").length;
       probe.dispose();
-      if (probeDiags.some((d) => d.code === "SC0001")) dropWithNote(p);
+      return n;
+    };
+    const baseline = errorsOf([]);
+    for (const p of inferredOnly) {
+      if (errorsOf([p]) > baseline) dropWithNote(p);
     }
     load.dispose();
     load = loadProgram(entryPath, { npmStatic: effective });
     preflight = checkPreflight(load);
-    if (preflight.some((d) => d.code === "SC0001") && effective.size > 0) {
-      for (const p of [...effective]) dropWithNote(p);
+    const left = inferredOnly.filter((p) => effective.has(p));
+    if (preflight.filter((d) => d.code === "SC0001").length > baseline && left.length > 0) {
+      for (const p of left) dropWithNote(p);
       load.dispose();
       load = loadProgram(entryPath, { npmStatic: effective });
       preflight = checkPreflight(load);
@@ -658,10 +676,12 @@ export function analyze(entryPath: string, opts: AnalyzeOptions = {}): AnalyzeRe
     // reaches, but the analysis additionally lowers the unreached remainder
     // (throwaway) so the report covers everything the source declares — with
     // the unreached share in its own group.
+    const wasmGc = opts.backend === "wasm" || opts.backend === "wasm-native";
     const lowered = fe.lower({
       dynamic: opts.dynamic ?? false,
       coverage: true,
-      targetPlatform: buildTargetPlatform(),
+      targetPlatform: wasmGc ? "host" : buildTargetPlatform(),
+      ...(wasmGc ? { hostFetch: true, undefSlots: true, sharedDynamic: true } : {}),
       ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
     });
     const provenance = provenanceSources();

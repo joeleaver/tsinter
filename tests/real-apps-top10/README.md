@@ -185,6 +185,11 @@ nothing time-dependent). Every case also includes at least one error path where 
   display options, and 18 expressions on the default (legacy, tournament) engine.
 - **pi**: a scripted model behind pi's `streamFn` seam streams text and tool calls through the real agent
   loop (parallel tools, a tool error, schema-invalid arguments, an unknown tool, a follow-up queue).
+- **commander** (not one of the 10; the dependency paperclip, rea, deepseek and shadcn share, SEMANTICS.md
+  S133): `drivers/commander-main.ts`, a CLI written in paperclip's commander style, runs inside paperclip's
+  tree (`"srcProject": "paperclip"`) against the commander paperclip installed (15.0.0), with
+  `--npm-static commander`: help, version, subcommand help, unknown commands and options, missing required
+  options and arguments, choices and conflicts errors, a hook, and normal actions.
 - **opencode**: apply_patch envelopes parsed and applied (with a BOM, a move, add/delete hunks, five
   parser errors) and a markdown reply streamed in 17-character chunks, then rendered to HTML.
 

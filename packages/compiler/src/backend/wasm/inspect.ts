@@ -4449,6 +4449,10 @@ export class InspectBuilder {
       });
 
       this.kindArm(c, K, [DK.OBJ], () => {
+        dyn.classViewPrintFence(c, D, (x) => {
+          x.refNull(strT);
+          x.return_();
+        });
         dyn.objPayload(c, (x) => x.localGet(D));
         c.localSet(O);
         if (dyn.urlLive) {
@@ -5514,6 +5518,7 @@ export class InspectBuilder {
       c.i32Const(DK.OBJ);
       c.i32Eq();
       c.ifVoid();
+      dyn.classViewPrintFence(c, D, (x) => x.return_());
       // CLAIM 0 (A.6) — see the ARR arm's own comment; identical
       // discipline, the SAME shared seen stack, the SAME named trap.
       c.localGet(D);

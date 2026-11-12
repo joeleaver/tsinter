@@ -2705,6 +2705,74 @@ export class DynBuilder {
     c.refTest(this.viewT());
   }
 
+  /** Printing a class-instance view (class-views.ts: a record view whose
+   * fourth accessor slot is set) stops by name: Node prints the class
+   * name and tracks cycles by the instance, which the snapshot printers
+   * do not (SEMANTICS.md S115's class amendment). `after` leaves the
+   * enclosing helper's result and returns. */
+  classViewPrintFence(c: Code, d: number, after: (c: Code) => void): void {
+    if (!this.viewsLive) return;
+    this.isView(c, (x) => x.localGet(d));
+    c.ifResult(I32);
+    c.localGet(d);
+    c.structGet(this.dynT(), DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    this.viewField(c, (x) => x.localGet(d), VIEW_F3);
+    c.refIsNull();
+    c.i32Eqz();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifVoid();
+    this.deps.fence(c, (x) => {
+      this.deps.lit(x, "printing a '");
+      this.viewField(x, (y) => y.localGet(d), VIEW_LABEL);
+      x.call(this.deps.concat());
+      this.deps.lit(x, "' instance shared with dynamic code is not supported yet (SEMANTICS.md S115)");
+      x.call(this.deps.concat());
+    });
+    after(c);
+    c.end();
+  }
+
+  /** Leaves i32: is local `d` a class-instance view (class-views.ts) whose
+   * prototype chain has the method or getter named by the string in
+   * local `k` — `k in d` beyond the own fields. */
+  classViewHasMember(c: Code, d: number, k: number): void {
+    if (!this.viewsLive) {
+      c.i32Const(0);
+      return;
+    }
+    this.isView(c, (x) => x.localGet(d));
+    c.ifResult(I32);
+    c.localGet(d);
+    c.structGet(this.dynT(), DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    this.viewField(c, (x) => x.localGet(d), VIEW_F3);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(0);
+    c.else_();
+    this.viewField(c, (x) => x.localGet(d), VIEW_F3);
+    this.boxStr(c, (x) => x.localGet(k));
+    c.call(this.viewCall(1));
+    c.call(this.truthy());
+    c.end();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+  }
+
   /** Field `f` of the view the caller pushes (VIEW_* indices). */
   viewField(c: Code, pushDyn: (c: Code) => void, f: number): void {
     pushDyn(c);
@@ -3768,6 +3836,34 @@ export class DynBuilder {
         c.i32Const(DK.OBJ);
         c.i32Eq();
         c.ifVoid();
+        // A member the view answers as a function (a class view's method,
+        // a function-typed field) is called as itself, as Node calls the
+        // member it finds; anything else runs on the snapshot.
+        c.localGet(0);
+        this.deps.lit(c, method);
+        c.call(this.viewGetK());
+        c.localTee(R);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(R);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.call(this.thisPush());
+        c.localGet(R);
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.callFn());
+        c.localSet(R);
+        c.call(this.thisPop());
+        c.localGet(R);
+        c.return_();
+        c.end();
         this.boxObj(c, (x) => {
           x.localGet(0);
           x.call(this.viewObjSnap());
@@ -5128,6 +5224,31 @@ export class DynBuilder {
     c.call(this.fnOwnGet());
     c.localSet(m);
     c.else_();
+    if (this.viewsLive) {
+      // A record view (unit H, class-views.ts): its own member through the
+      // accessor — a class view answers its methods and getters there —
+      // and none to find when it answers undefined.
+      this.isView(c, (x) => x.localGet(d));
+      c.ifVoid();
+      c.localGet(d);
+      this.deps.lit(c, name);
+      c.call(this.viewGetK());
+      c.localTee(m);
+      c.refIsNull();
+      c.ifVoid();
+      onPending(c);
+      c.return_();
+      c.end();
+      c.localGet(m);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.localSet(m);
+      c.end();
+      c.else_();
+    }
     this.objPayload(c, (x) => x.localGet(d));
     this.deps.lit(c, name);
     c.call(this.protoLinkLive || this.accessorsLive ? this.memberLookup() : this.objGet());
@@ -5138,6 +5259,7 @@ export class DynBuilder {
     c.ifVoid();
     this.resolveCellInto(c, d, m, onPending);
     c.end();
+    if (this.viewsLive) c.end();
     c.end();
   }
 
@@ -7293,6 +7415,13 @@ export class DynBuilder {
         });
       }
       this.arm(c, K, [DK.OBJ], () => {
+        // A class-instance view: its prototype's methods and getters are
+        // `in` it, as in Node (the snapshot holds the own fields only).
+        this.classViewHasMember(c, 0, 1);
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
         c.call(this.memberLookup());

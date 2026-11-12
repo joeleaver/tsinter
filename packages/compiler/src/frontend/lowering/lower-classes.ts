@@ -4,6 +4,7 @@
  * accessor access, upcasts, `new` expressions, and the builtin Error
  * hierarchy registration. */
 import * as ts from "../ts7/adapter.js";
+import { declaredMemberTypeOf } from "../dts-bridge.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, UNDEFINED_T, URL_T, VOID, arrayOf, isSupportedMapKey, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
@@ -32,7 +33,7 @@ export interface ClassInfo {
   /** OWN fields only (declaration order) with their initializers: the
    * class's constructor runs exactly these — inherited fields initialize in
    * the base constructor, before/via super(). */
-  fieldOrder: { name: string; type: IrType; initializer: ts.Expression | undefined; /** Redeclared INHERITED field: the initializer assigns the base slot at this position; no new slot (def.fields excludes it). */ redeclared?: true }[];
+  fieldOrder: { name: string; type: IrType; initializer: ts.Expression | undefined; /** Redeclared INHERITED field: the initializer assigns the base slot at this position; no new slot (def.fields excludes it). */ redeclared?: true; /** A JavaScript class property first assigned past the constructor's top level (absent until that write runs, in Node). */ late?: true }[];
   /** OWN declared methods only — inherited lookups walk the base chain
    * (findMethodOn). An `abstract` entry is a signature with no body (and
    * no module function): it declares the vtable slot; concrete subclasses
@@ -1776,9 +1777,13 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // dispatch STATICALLY — override chains fence (the vtable slot
           // machinery has no fiber-spawn story), so every call site is a
           // direct call the emitter routes through the spawn wrapper.
+          // (One world — the WasmGC lanes: a JS async method collects like a
+          // TS one, its parameters typed by JSDoc or the dynamic value —
+          // commander's parseAsync() is THE entry of an async CLI.)
           if (
             member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) &&
-            isJsSourceFile(decl.getSourceFile())
+            isJsSourceFile(decl.getSourceFile()) &&
+            !(L.sharedDynamic && implicitAnyParamSymbolsOf(L, member) === null)
           ) {
             continue;
           }
@@ -2132,7 +2137,26 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
               // TS-annotated `unknown` fields keep their fence (KEEP NARROW
               // applies where an annotation could say better).
               let type = t ? (L.mapTypeOf(t) ?? dynFallbackType(L, assign, t)) : null;
+              // SEMANTICS.md S133: a field inference leaves `any` in a class
+              // the package's shipped declarations describe takes the declared
+              // type (`this.parent = null` declared `parent: Command | null`).
+              if (t !== undefined && (t.flags & ts.TypeFlags.Any) !== 0 && classSym !== undefined) {
+                const declared = declaredMemberTypeOf(classSym, name);
+                const dt = declared !== undefined && (declared.flags & ts.TypeFlags.Any) === 0 ? L.mapTypeOf(declared) : null;
+                if (dt !== null && dt.kind !== "void") type = dt;
+              }
               if (!type || type.kind === "void") L.badType(assign, t ?? L.typeOf(assign));
+              // A field initialized with an EMPTY object literal (`this._optionValues
+              // = {}` — a JS dictionary, written by computed keys and handed
+              // around as `object`): the dynamic object itself, shared, never
+              // the fieldless record inference spells it.
+              {
+                const rhs0 = ((stmt as ts.ExpressionStatement).expression as ts.BinaryExpression).right;
+                if (L.sharedDynamic && type.kind === "record" && ts.isObjectLiteralExpression(rhs0) && rhs0.properties.length === 0) {
+                  const shape = L.shapes.get(type.shapeId);
+                  if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;
+                }
+              }
               // A JSDoc claim the BODY contradicts (`@type {Command}`
               // assigned `undefined` — the lazy-init idiom): the
               // representation follows the body — the field widens to the
@@ -2144,7 +2168,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
                 const rhsT = L.typeOf(((stmt as ts.ExpressionStatement).expression as ts.BinaryExpression).right);
                 const assignsUndef = (rhsT.flags & ts.TypeFlags.Undefined) !== 0;
                 const admitsUndef =
-                  type.kind === "dyn" ||
+                  type.kind === "dyn" || type.kind === "jsval" ||
                   isUnitType(type) ||
                   (type.kind === "union" && L.armTag(type.unionId, UNDEFINED_T) >= 0);
                 if (assignsUndef && !admitsUndef) {
@@ -2251,7 +2275,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
             const armed = undefArmedFieldType(L, p);
             if (armed !== null) {
               fields.set(p.name, armed);
-              fieldOrder.push({ name: p.name, type: armed, initializer: undefined });
+              fieldOrder.push({ name: p.name, type: armed, initializer: undefined, late: true });
               continue;
             }
           }

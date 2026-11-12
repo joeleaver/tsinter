@@ -30,7 +30,9 @@ import { STREAM_API_MEMBERS, lowerStreamMethodCall, lowerStreamModuleCall, lower
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, nsMemberIdentOf, nsPathPrefix, nsUndefRead } from "./lower-namespaces.js";
 import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
-import { npmStaticPackageOfPath } from "../npm-static.js";
+import { isDtsMirrorPath, npmStaticPackageOfPath } from "../npm-static.js";
+import { dtsCallResult } from "./lower-dts.js";
+import { classViewOf, viewableClass } from "./class-views.js";
 import { lowerVoidTernaryStatement } from "./lower-stmts.js";
 import { onlyStubTouches } from "./stub-builtins.js";
 
@@ -3002,7 +3004,19 @@ export function lowerFfiCall(L: Lowerer, expr: ts.CallExpression): IrExpr | null
 /** Calls whose dynamic-arm callback scope is open (lowerCall). */
 const armCallScoped = new WeakSet<ts.CallExpression>();
 
+/** SEMANTICS.md S133: a call the checker resolved against an npm package's
+ * DECLARED surface (a mirrored .d.ts signature) whose implementation is
+ * the package's compiled JS. Every call form lowers the implementation
+ * (the facade maps the declaration to it); its result then crosses into
+ * the program's declared return type — the resolved-overload rule
+ * (reconcileOverloadReturn): a union narrows to the declared arm with a
+ * check, a dynamic result stays dynamic and checks at the typed leaf it
+ * reaches, anything else converts where the types differ. */
 export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
+  return dtsCallResult(L, expr, lowerCallInner(L, expr));
+}
+
+function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // Unit U2a (dyn-arm.ts): a method called on a dynamic-arm receiver hands
     // its callbacks whatever the receiver holds, whatever the receiver's
     // declared type said — an unannotated callback parameter binds that
@@ -4500,6 +4514,22 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // (m.keys(), p.then(f), Object.keys(o)) or an unlowered call FORM of
       // a lowered one (Math.min with three arguments, s.padStart(8),
       // x.toFixed()).
+      // One world: an array method called on a UNION of arrays (a JSDoc
+      // `Command[] | Option[]` parameter) runs as the dynamic call on the
+      // union's dynamic value — each arm crosses as its live view, the
+      // callbacks as adapters — and its result is dynamic.
+      if (L.sharedDynamic && !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+        const recvT = L.mapTypeOf(L.typeOf(expr.expression.expression));
+        const arms = recvT?.kind === "union" ? (L.unions.get(recvT.unionId)?.arms ?? []) : [];
+        if (arms.length > 0 && arms.some((a) => a.kind === "array") && arms.every((a) => a.kind === "array" || isUnitType(a))) {
+          const loc = locOf(expr);
+          const recv = L.coerceToExpected(L.lowerExpr(expr.expression.expression), JSVAL);
+          if (recv.type.kind === "jsval") {
+            const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
+            return { kind: "jsOp", op: "callMethod", name: expr.expression.name.text, args: [recv, ...args], type: JSVAL, loc };
+          }
+        }
+      }
       L.stdlibMemberFence(expr.expression);
       // The npm METHOD-CALL chokepoint: a call on a package-typed receiver
       // in a static build — attributed to the package.
@@ -5507,6 +5537,9 @@ const inliningPredicates = new Set<ts.Symbol>();
     if (!rsig || !rdecl || !(ts.isFunctionDeclaration(rdecl) || ts.isMethodDeclaration(rdecl)) || rdecl.body) {
       return call;
     }
+    // A declared npm surface (SEMANTICS.md S133) crosses at lowerCall's
+    // own exit (lower-dts.ts), naming the declaration in its check.
+    if (isDtsMirrorPath(rdecl.getSourceFile().fileName)) return call;
     const rt = L.mapTypeOf(L.checker.getReturnTypeOfSignature(rsig));
     // Unmappable, void, or unit resolved returns keep the implementation's
     // type: a discarded result never looks, a USED one meets its use
@@ -9746,6 +9779,66 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
     // dyn callee). Every other field type falls through to the fences.
     if (info && !found) {
       const fieldType = info.fields.get(access.name.text);
+      // A DYNAMIC field in call position on the one-world lanes (`this._handler(args)`
+      // over a null-initialized JS field later holding a closure): JS's method
+      // call — the field's value called with `this` = the instance, through
+      // the instance's shared view (class-views.ts).
+      if (fieldType && (fieldType.kind === "jsval" || (fieldType.kind === "dyn" && isJsSourceFile(call.getSourceFile()))) &&
+          L.sharedDynamic && !call.arguments.some((a) => ts.isSpreadElement(a)) && viewableClass(L, receiverIr) !== null) {
+        const recv = classViewOf(L, L.lowerExpr(access.expression), locOf(access.expression));
+        const args = call.arguments.map((a) => L.jsvalLiftExpr(L.lowerExpr(a), locOf(a)));
+        const out: IrExpr = { kind: "jsOp", op: "callMethod", name: access.name.text, args: [recv, ...args], type: JSVAL, loc: locOf(call) };
+        return fieldType.kind === "dyn" ? { kind: "dynFromJsval", value: out, type: DYN, loc: out.loc } : out;
+      }
+      // A field holding a function OR null/undefined (the lazily-set JS
+      // callback field, `this._handler = null` then a closure): Node's
+      // `<expr> is not a function` TypeError on the unit arms, the call
+      // through the function otherwise.
+      if (fieldType?.kind === "union" && L.undefSlots && !call.arguments.some((a) => ts.isSpreadElement(a))) {
+        const arms = L.unions.get(fieldType.unionId)?.arms ?? [];
+        const fnArms = arms.flatMap((a, i) => (a.kind === "func" ? [{ a, i }] : []));
+        if (fnArms.length === 1 && arms.every((a) => a.kind === "func" || isUnitType(a))) {
+          const target = L.fieldTarget(access);
+          const read = target ? L.fieldGetExpr(target, locOf(access), access) : null;
+          if (read !== null && read.type.kind === "union") {
+            const { a: fnT, i: tag } = fnArms[0]!;
+            if (fnT.kind !== "func") throw new Error("unreachable");
+            const loc = locOf(call);
+            const text = access.getText();
+            const key = `cbfield:${fieldType.unionId}:${text}`;
+            let helper = L.retagHelpers.get(key);
+            if (!helper) {
+              helper = `%union.cbfield.${L.retagHelpers.size}`;
+              L.retagHelpers.set(key, helper);
+              const u: IrExpr = { kind: "varRef", localId: "u.0", type: fieldType, loc };
+              const notFn: IrExpr = {
+                kind: "libCall", fn: "error.new",
+                args: [{ kind: "strLit", value: `${text} is not a function`, type: STRING, loc }],
+                type: { kind: "object", className: "%TypeError" }, loc,
+              };
+              L.liftedFns.push({
+                name: helper,
+                params: [{ localId: "u.0", name: "u", type: fieldType }],
+                returnType: fnT,
+                locals: [{ id: "u.0", name: "u", type: fieldType, mutable: false }],
+                body: [
+                  { kind: "if", cond: { kind: "unionIsTag", unionId: fieldType.unionId, tag, negated: true, value: u, type: BOOL, loc }, then: [{ kind: "throw", value: notFn, loc }], else_: null, loc },
+                  { kind: "return", value: { kind: "unionNarrow", unionId: fieldType.unionId, tag, value: u, type: fnT, loc }, loc },
+                ],
+                loc,
+              });
+            }
+            const callee: IrExpr = { kind: "call", callee: helper, args: [read], type: fnT, loc };
+            const args = call.arguments.map((a, i) => L.lowerExprExpecting(a, fnT.params[i]));
+            for (let i = args.length; i < fnT.params.length; i++) {
+              const absent = omittedArgFor(L, fnT.params[i]!, loc);
+              if (!absent) L.unsupported("SC1090", call, "calls omitting a non-optional parameter of the callee's type");
+              args.push(absent);
+            }
+            return { kind: "callValue", callee, args, type: fnT.ret, loc };
+          }
+        }
+      }
       if (fieldType && (fieldType.kind === "func" || fieldType.kind === "dyn")) {
         const target = L.fieldTarget(access);
         const callee = target ? L.fieldGetExpr(target, locOf(access), access) : null;

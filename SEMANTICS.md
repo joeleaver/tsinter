@@ -9184,6 +9184,53 @@ leaving into typed storage follows (d)). So:
   argument into typed storage, ... — type the parameter 'any' so it
   shares the caller's value, or copy explicitly inside the function with
   [...x] / { ...x }`.
+- **Class instances (one dynamic world on wasm and wasm-native, 2026-11-11
+  with S133).** A typed class instance entering a dynamic slot (an `any[]`
+  push, a null-initialized JavaScript field, a callback's argument, `fn.apply
+  (this, args)`) is SHARED as a live view of the instance, as in Node: its
+  own fields read and write through (a write must fit the field's type, as
+  in (b)), its methods and getters answer through it — dispatched on the
+  instance's runtime class, called directly (`o.m(x)`) or read first —
+  `in` finds its fields, methods and getters, `instanceof` the program's
+  classes answers on it, `===` is the instance's identity, and `String(o)`,
+  a template, `+` and `join` convert it through its own `toString` /
+  `valueOf` (Object.prototype's otherwise), `JSON.stringify` through its
+  own `toJSON`. A user error class (a class over `Error`) keeps the error
+  crossing and is never a view. A function over instances crossing into a
+  dynamic slot is an
+  adapter that unwraps its instance arguments and lifts its result. A
+  dynamic value leaving into a class-typed slot unwraps the instance a view
+  holds (a subclass instance included). The divergences, each loud where
+  Node runs on: (i) a dynamic value that is no view of an instance of the
+  slot's class (a plain object, an instance of another class, `null`) ends
+  the program by name — `Cannot store object into a 'C' slot (it holds
+  only 'C' instances)`, `Cannot store null into …` — where Node lets it
+  flow; (ii) adding a property the class
+  does not declare through the view ends the program by name (Node adds
+  the expando); (iii) reading `constructor` or `__proto__` through the
+  view, and for an EventEmitter subclass the emitter's members (`on`,
+  `emit`, ...), ends the program by name; (iv) a method read through the
+  view is a function bound to the
+  instance, a fresh one per read (Node: the one prototype function, so
+  `o.m === o.m` and `o.m.call(other)` differ), and a method with a rest
+  parameter stops by name when called through it; (v) printing the view
+  (`console.log`, `util.inspect`, an assertion message) ends the program
+  by name — `printing a 'C' instance shared with dynamic code is not
+  supported yet` — where Node prints `C { … }` with its cycle markers;
+  (vi) a JavaScript class's property first assigned outside the
+  constructor is no own property in Node until that write runs; the view
+  lists it only once its slot holds a value. That is exact when no write
+  in the program can store `undefined` there (no assignment whose value
+  may be `undefined` or dynamic, no logical assignment, no `delete`; a
+  dynamic write of `undefined` through the view then stops by name);
+  otherwise listing the view's own keys (`Object.keys`, a spread,
+  `JSON.stringify`, `in` on that name) while the slot holds `undefined`
+  ends the program by name. A JavaScript `let`
+  initialized with an instance and later assigned a value that may be
+  `null`/`undefined` holds that union (a member read through it throws
+  Node's `Cannot read properties of null` TypeError), or the dynamic value
+  when it is assigned an `any`. Tested by
+  `packages/compiler/test/wasm-class-views.test.ts`.
 
 **Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts` —
 H-VIEW-01..09 ((a), wasm and c against Node), H-VERR-01..08 ((b), wasm and
@@ -10910,3 +10957,82 @@ Its running rows compile synthetic multi-package trees whose packages
 differ in strictness and match Node on both WasmGC lanes. Its refusing
 rows pin each package's own errors, SC0006, and each legacy decorator kind
 on both lanes.
+
+## S133 — A program types against an npm package's shipped declarations while the package's JavaScript compiles; a value the implementation produces is checked where it crosses into the declared type, and a kind the declaration excludes ends the program by name *(every lane; tested on wasm and wasm-native)*
+
+`--npm-static` compiles a named (or, with `auto`, a detected) npm package's
+shipped JavaScript as program modules. Until this entry the program then
+type-checked against the TYPES INFERENCE GAVE THAT JAVASCRIPT, and the
+package's own `.d.ts` was dropped — so code the project's own `tsc`
+accepts broke: commander's JSDoc types `name()` as `string | Command`
+where its declarations overload `name(): string` / `name(str): this`, and
+paperclip's `.name("x").description("y").version("1")` chain did not
+typecheck. (Joe's ruling, 2026-11-11.) Now:
+
+- (a) **The program's view is the declarations.** The program typechecks
+  against the package's own `.d.ts` — or its `@types/<pkg>` twin — exactly
+  as the project's `tsc` does (same diagnostics). A program that fails
+  against them is a type error (SC0001), never a fallback. The package's
+  JavaScript is what compiles and runs; its own internal edges keep
+  resolving to its JavaScript (a sibling `lib/x.d.ts` never captures
+  `require("./x")`).
+- (b) **Uses reach the implementation.** Every program use of a declared
+  class, function, const or class member is the JavaScript that
+  implements it (the export of the same name, the class member of the same
+  name and staticness). A declared member the JavaScript does not define
+  where the static build can see it (a declaration-only member, a member
+  attached through a construct inference cannot follow) refuses at
+  compile time: `'<member>' is declared by the '<pkg>' package's type
+  declarations, but its compiled JavaScript defines no '<member>' the
+  static build can reach` (SC2013). Node would have thrown (or answered
+  `undefined`) only when that line ran.
+- (c) **Crossings are checked.** A value the implementation produces — a
+  call's or `new`'s result, a property read — carries the type inference
+  gave it, and crosses into the type the declarations give it:
+  - the same type: no check (the typed storage is the proof);
+  - a dynamic value (inference left it `any`/`unknown`): it stays the
+    dynamic value, as S128 holds any dynamic value in a contained slot —
+    every use asks it at run time, and only a value that must enter typed
+    storage is checked there (S128's `expected <T> at <path>, got <kind>`
+    fence);
+  - a union the declaration narrows (the getter/setter shape): the
+    declared member is taken with a check, and a value of any other
+    member ends the program with S122's fence: `tsinter: unsupported:
+    <pkg>'s declarations type the result of '<call>(…)' as '<T>', but its
+    implementation produced a '<U>' value (SEMANTICS.md S133)` on stderr,
+    exit 1. **This is the divergence:** Node lets the value flow — a
+    `console.log` of it prints it, a method call on it throws a catchable
+    TypeError, or nothing ever looks — where the compiled program stops at
+    the crossing, because the declaration's claim was false for this value
+    and the program's typed code was compiled on it;
+  - other differences convert as any typed coercion does, or refuse by
+    name at compile time.
+  Values the program passes IN (arguments, callbacks) meet the
+  implementation's parameter types through the ordinary call coercions;
+  a program callback typed by the declarations is adapted to the function
+  type the implementation calls.
+- (d) The coverage report says `static` for such a package. A package
+  with no declarations of its own (and no `@types` twin) keeps the
+  inferred surface, and its program-typecheck failures still drop it to
+  the island, as before.
+- (e) Inside the compiled package's own JavaScript, a field inference
+  leaves `any` (`this.parent = null`) takes the type the declarations give
+  that member, so the values stored there are checked against the claim;
+  and a crossing the static build cannot honor in that JavaScript — an
+  observable copy S125 refuses, an exit S115 (d) refuses — stops the
+  program where it RUNS, by name (`tsinter: unsupported: … [SC1090 at
+  <file>]`), instead of refusing the program's build: the package's author
+  wrote it, the program's author cannot fix it, and the paths a program
+  never drives cost nothing (the JS statement-fence stance of the
+  npm-static doctrine).
+
+**Rationale:** the declarations are what the program's author wrote
+against and what their `tsc` checked, so the compiled program must accept
+the same programs; the JavaScript is what Node runs, so it is what
+compiles. The declarations are claims the implementation never checked —
+each claim is verified where a value crosses it, and only a false one
+stops the run, by name.
+**Tested by:** `packages/compiler/test/npm-dts-doctrine.test.ts` (synthetic
+packages, wasm and wasm-native, against Node);
+`tests/harness/npm-static.test.ts`; the commander workload in
+`tests/real-apps-top10/harness/workloads.json` (nico-top only).

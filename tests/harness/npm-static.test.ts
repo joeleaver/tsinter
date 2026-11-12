@@ -188,30 +188,23 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
 
   // Tier 2: commander opts in and COMPILES as program modules — the
   // coverage floor is pinned (≥85% of ~1200 statements static) so frontier
-  // regressions surface here, while the remaining runtime fences keep the
-  // differential on the island lane (npm.test.ts) for now. Implicit-any
-  // monomorphization moved the driven frontier BEHIND the typed-value →
-  // untyped-param boundary (methods like _registerCommand and local
-  // helpers like knownBy now instantiate per argument types); the next
-  // fences are implicit-any FIELD writes of class instances (`cmd.parent
-  // = this` — the field inferred `any` from its ctor null) and
-  // getter/setter JSDoc union returns (`cmd.name()` → string | Command).
+  // regressions surface here. The program types against commander's
+  // shipped typings (SEMANTICS.md S133), so its chained getter/setter calls
+  // typecheck; the run itself is the commander workload's (nico-top only).
   test("commander compiles static at the pinned coverage floor", () => {
     const { coverage } = analyze(join(fixturesRoot, "commander-calc/calc-npm-static.ts"), {
       npmStatic: ["commander"],
     });
     expect(coverage.npmStatic).toEqual([{ package: "commander", status: "static" }]);
     expect(coverage.preflightFailed).toBe(false);
-    // Builds but for the dynamic-crossing copies S125 (c) refuses (GH #120,
-    // unit U0): every remaining diagnostic is one of those. Some are real —
-    // editDistance's evolving `d` matrix is checked out into a typed copy
-    // and then written (`d[0][j] = j`), a write Node makes and the copy
-    // would lose — and the rest are the analysis' conservatism in class
-    // methods (reached by virtual calls, so their dynamic parameters are
-    // not followed). Unit U1 (sharing) removes them all.
+    // The observable copies S125 (c) refuses inside commander's own JS
+    // (editDistance's evolving `d` matrix checked out into a typed copy and
+    // then written, `d[0][j] = j`) no longer fail the program's build: in a
+    // compiled package's JavaScript they stop the run where they execute,
+    // by name (SEMANTICS.md S133 (e)), like every other JS statement fence.
     const u0 = /it would be a COPY where JavaScript shares the object.*SEMANTICS\.md S125/;
-    expect(coverage.diagnostics.filter((d) => !u0.test(d.message))).toEqual([]);
-    expect(coverage.diagnostics.some((d) => d.loc.file.endsWith("suggestSimilar.js") && u0.test(d.message))).toBe(true);
+    expect(coverage.diagnostics).toEqual([]);
+    expect((coverage.runtimeFences ?? []).some((d) => d.loc.file.endsWith("suggestSimilar.js") && u0.test(d.message))).toBe(true);
     const total = coverage.stats.statementsTotal + (coverage.unreached?.stats.statementsTotal ?? 0);
     const failed = coverage.stats.statementsFailed + (coverage.unreached?.stats.statementsFailed ?? 0);
     expect(total).toBeGreaterThan(1000); // the whole package joined the program
@@ -279,23 +272,21 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     expect(coverage.preflightFailed).toBe(false);
   }, 120_000);
 
-  // AUTO drops a package whose opt-in breaks the PROGRAM's own typecheck
-  // (the .d.ts-overload vs inferred-surface gap — commander's chaining
-  // shape in miniature): chainy's declared `name(): string / name(v):
-  // this` overloads admit the chained spelling, its inferred surface
-  // (`string | Chainy`) does not, so auto answers fallback with the
-  // inferred-surface note and the program stays analyzable. Explicit
-  // opt-ins keep the errors (the user asked for exactly that package).
-  test("auto falls back when the program fails against an inferred surface", () => {
-    const { coverage } = analyze(join(pilotRoot, "chainy-cli.ts"), { npmStatic: "auto" });
-    expect(coverage.npmStatic).toEqual([
-      {
-        package: "chainy",
-        status: "fallback",
-        detail: "auto: the program does not typecheck against its inferred surface",
-      },
-    ]);
+  // SEMANTICS.md S133: the program types against the package's SHIPPED
+  // declarations (chainy's `name(): string` / `name(v): this` overloads),
+  // not the surface inference gives its JS (`string | Chainy`, which broke
+  // the chained spelling and used to drop the package to the island). The
+  // auto opt-in now takes it statically, and the binary byte-matches Node.
+  test("auto takes a package statically whose inferred surface breaks the program", async () => {
+    const entry = join(pilotRoot, "chainy-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "chainy", status: "static" }]);
     expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toEqual([]);
+    const binary = await buildStatic(entry, "auto");
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
   }, 120_000);
 
   // Non-opted UNTYPED node_modules packages keep the checked-dynamic
@@ -480,22 +471,16 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     ]);
   }, 120_000);
 
-  // 2469: a TYPE-ONLY surface name (an interface) has no JS value the
-  // inferred surface can carry — the import-site SC0001 NAMES the package,
-  // and the consumer-anchored attribution degrades exactly it to the
-  // island with the note, never a failed gate. Explicit opt-ins degrade
-  // like auto's: the ratified bundle-shape behavior.
-  test("a consumer-anchored surface break degrades the named package with a note", () => {
+  // 2469: a TYPE-ONLY surface name (an interface) has no JS value an
+  // inferred surface could carry — which used to break the import and drop
+  // the package to the island. Under SEMANTICS.md S133 the program types
+  // against the package's declarations, where the interface is just a
+  // type: the package compiles statically.
+  test("a type-only declared name no longer breaks a static package (S133)", () => {
     const entry = join(fixturesRoot, "npm/cases/2469-bundle-offender/main.ts");
     const { coverage } = analyze(entry, { npmStatic: ["gtghost"] });
     expect(coverage.preflightFailed).toBe(false);
-    expect(coverage.npmStatic).toEqual([
-      {
-        package: "gtghost",
-        status: "fallback",
-        detail: expect.stringContaining("inferred export surface breaks 1 import site") as string,
-      },
-    ]);
+    expect(coverage.npmStatic).toEqual([{ package: "gtghost", status: "static" }]);
   }, 120_000);
 
   // The build-transform-marker relaxation: a getter-table bundle with its

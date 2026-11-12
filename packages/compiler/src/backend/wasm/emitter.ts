@@ -11477,31 +11477,8 @@ class Assembler {
    * throw returns `onPending`'s value from the enclosing function); a
    * function's own property. */
   private emitPrimMemberGet(c: Code, d: number, m: number, name: string, onPending: (c: Code) => void): void {
-    const dyn = this.dyn;
-    const dynT = dyn.dynT();
-    c.localGet(d);
-    c.structGet(dynT, DYN_KIND);
-    c.i32Const(DK.FUNC);
-    c.i32Eq();
-    c.ifVoid();
-    c.localGet(d);
-    this.pushStrLitInto(c, name);
-    c.call(dyn.fnOwnGet());
-    c.localSet(m);
-    c.else_();
-    c.localGet(d);
-    c.structGet(dynT, DYN_REF);
-    c.refCast(dyn.objT());
-    this.pushStrLitInto(c, name);
-    c.call(dyn.protoLinkLive || dyn.accessorsLive ? dyn.memberLookup() : dyn.objGet());
-    c.localSet(m);
-    c.localGet(m);
-    c.refIsNull();
-    c.i32Eqz();
-    c.ifVoid();
-    dyn.resolveCellInto(c, d, m, onPending);
-    c.end();
-    c.end();
+    // One lookup (dyn.ts), record views included (class-views.ts).
+    this.dyn.primMemberInto(c, d, m, name, onPending);
   }
 
   /** Replaces the dyn in local `l` with its ToPrimitive (number/default
@@ -29728,6 +29705,18 @@ class Assembler {
         code.i32Const(DK.OBJ);
         code.i32Eq();
         this.openIfResult(I32);
+        // A class-instance view: its prototype's methods and getters are
+        // `in` it, as in Node (class-views.ts; the snapshot below holds
+        // the own fields only).
+        const viewKey = this.dyn.viewsLive ? this.acquireScratch(this.strRef) : -1;
+        if (viewKey >= 0) {
+          this.pushStrLit(e.key);
+          code.localSet(viewKey);
+          this.dyn.classViewHasMember(code, d, viewKey);
+          this.openIfResult(I32);
+          code.i32Const(1);
+          code.else_();
+        }
         this.dyn.objPayload(code, (c) => c.localGet(d));
         this.pushStrLit(e.key);
         // Unit A2: an accessor member is present (the raw lookup), and a
@@ -29741,6 +29730,10 @@ class Assembler {
           this.dyn.objPayload(code, (c) => c.localGet(d));
           code.refTest(this.dyn.objRegexT());
           code.i32Or();
+        }
+        if (viewKey >= 0) {
+          this.close();
+          this.releaseScratch(this.strRef, viewKey);
         }
         code.else_();
         // The FUNC arm, which the C emitter's inline lowering lacks: a
@@ -33820,9 +33813,16 @@ class Assembler {
         code.localSet(d);
         this.dyn.isView(code, (c) => c.localGet(d));
         this.openIfResult(I32);
-        this.dyn.viewField(code, (c) => c.localGet(d), VIEW_SIG);
-        code.i32Const(this.viewSigId(e.typeKey));
-        code.i32Eq();
+        if (e.classTest === true) {
+          // A class-instance view: its token is the instance, so the test
+          // is the instance's struct type (subclass structs are subtypes).
+          this.dyn.viewField(code, (c) => c.localGet(d), VIEW_TOKEN);
+          code.refTest(vt.typeIndex);
+        } else {
+          this.dyn.viewField(code, (c) => c.localGet(d), VIEW_SIG);
+          code.i32Const(this.viewSigId(e.typeKey));
+          code.i32Eq();
+        }
         code.else_();
         code.i32Const(0);
         this.close();
@@ -33842,8 +33842,18 @@ class Assembler {
         // — it ends the program.
         this.emitFenceFatal(code, (c) => {
           this.pushStrLitInto(c, "Cannot store ");
+          // The value's kind as `typeof` names it, but `null` by name
+          // (typeof says "object").
+          c.localGet(d);
+          c.structGet(this.dyn.dynT(), DYN_KIND);
+          c.i32Const(DK.NULL);
+          c.i32Eq();
+          c.ifResult(this.strRef);
+          this.pushStrLitInto(c, "null");
+          c.else_();
           c.localGet(d);
           c.call(this.dyn.typeOf());
+          c.end();
           c.call(this.concatHelper());
           this.pushStrLitInto(c, ` into ${e.what} (SEMANTICS.md S115)`);
           c.call(this.concatHelper());
@@ -33853,6 +33863,30 @@ class Assembler {
         this.close();
         this.releaseScratch(dynRef, d);
         this.emitPendingCheck();
+        return;
+      }
+
+      case "jsViewOfClass": {
+        // A class-instance view (class-views.ts) whose instance is a
+        // `className` (subclasses included): the token's struct type.
+        const vt = this.mapType({ kind: "object", className: e.className }, e.loc);
+        if (vt === null || vt.kind !== "ref") {
+          this.refuse(`expr:${e.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const dynRef = this.dyn.dynRef();
+        const d = this.acquireScratch(dynRef);
+        this.walkExpr(e.value);
+        code.localSet(d);
+        this.dyn.isView(code, (c) => c.localGet(d));
+        this.openIfResult(I32);
+        this.dyn.viewField(code, (c) => c.localGet(d), VIEW_TOKEN);
+        code.refTest(vt.typeIndex);
+        code.else_();
+        code.i32Const(0);
+        this.close();
+        this.releaseScratch(dynRef, d);
         return;
       }
 
