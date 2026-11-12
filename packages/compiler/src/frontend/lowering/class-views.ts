@@ -140,9 +140,55 @@ export function classLiftIn(L: Lowerer, e: IrExpr, loc: SrcLoc): IrExpr | null {
 /** Does `t` mention a class instance anywhere a function signature
  * crossing into dynamic code would need it converted? */
 function mentionsClass(L: Lowerer, t: IrType): boolean {
-  if (viewableClass(L, t) !== null) return true;
+  if (viewableClass(L, t) !== null || userErrorClass(L, t)) return true;
   if (t.kind === "union") return (L.unions.get(t.unionId)?.arms ?? []).some((a) => viewableClass(L, a) !== null);
   return false;
+}
+
+/** A program (or compiled package) class over the runtime Error — never a
+ * view (viewableClass); its instances cross as the error world's dynamic
+ * errors. */
+function userErrorClass(L: Lowerer, t: IrType): boolean {
+  if (t.kind !== "object") return false;
+  const info = L.classes.get(t.className);
+  if (!info || info.decl === null || info.builtinError) return false;
+  for (let b = info.base; b !== null; b = b.base) if (b.builtinError) return true;
+  return false;
+}
+
+/** `%cexit.err.<n>(v: jsval): C` — a dynamic value leaving into a user
+ * error class's slot (a callback's `(err: CommanderError) => …` parameter):
+ * the error it is (the error world's checked exit to Error, identity
+ * kept), when that error is a `C`; anything else stops by name. */
+function userErrorExitHelper(L: Lowerer, t: IrType & { kind: "object" }, loc: SrcLoc): string {
+  const key = `cexit:err:${t.className}`;
+  const hit = L.jsinHelpers.get(key);
+  if (hit) return hit;
+  const name = `%cexit.err.${L.jsinHelpers.size}`;
+  L.jsinHelpers.set(key, name);
+  const label = t.className.replace(/^%m\d+\./, "").replace(/^%/, "");
+  const errT: IrType = { kind: "object", className: "%Error" };
+  const v: IrExpr = { kind: "varRef", localId: "v.0", type: JSVAL, loc };
+  const e = (): IrExpr => ({ kind: "varRef", localId: "e.0", type: errT, loc });
+  const body: IrStmt[] = [
+    { kind: "if", cond: { kind: "unary", op: "!", operand: { kind: "dynTest", test: "error", value: { kind: "dynFromJsval", value: v, type: DYN, loc }, type: BOOL, loc } as IrExpr, type: BOOL, loc }, then: [
+      fence(`a dynamic value that is no '${label}' error leaving into a '${label}' slot is not supported yet`, loc),
+      { kind: "return", value: { kind: "slotUndef", type: t, loc } as IrExpr, loc },
+    ], else_: null, loc },
+    { kind: "varDecl", localId: "e.0", init: { kind: "dynCheck", value: { kind: "dynFromJsval", value: v, type: DYN, loc }, type: errT, loc } as IrExpr, loc },
+    { kind: "if", cond: { kind: "instanceOf", value: e(), className: t.className, type: BOOL, loc }, then: [{ kind: "return", value: { kind: "downcast", value: e(), type: t, loc }, loc }], else_: null, loc },
+    fence(`a dynamic value that is no '${label}' error leaving into a '${label}' slot is not supported yet`, loc),
+    { kind: "return", value: { kind: "slotUndef", type: t, loc } as IrExpr, loc },
+  ];
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "v.0", name: "v", type: JSVAL }],
+    returnType: t,
+    locals: [{ id: "v.0", name: "v", type: JSVAL, mutable: true }, { id: "e.0", name: "e", type: errT, mutable: true }],
+    body,
+    loc,
+  });
+  return name;
 }
 
 /** A typed function whose parameters or result carry class instances,
@@ -351,6 +397,9 @@ function liftOut(L: Lowerer, e: IrExpr, loc: SrcLoc): IrExpr {
  * conversion exists. */
 function exitArg(L: Lowerer, v: IrExpr, t: IrType): IrExpr | null {
   if (t.kind === "jsval") return v;
+  if (t.kind === "object" && userErrorClass(L, t)) {
+    return { kind: "call", callee: userErrorExitHelper(L, t, v.loc), args: [v], type: t, loc: v.loc };
+  }
   const out = L.coerceToExpected(v, t);
   return typeEquals(out.type, t) ? out : null;
 }

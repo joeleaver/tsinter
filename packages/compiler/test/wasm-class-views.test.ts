@@ -183,6 +183,23 @@ console.log(h("2"));`,
     fence: { text: /calling the method 'a' of a 'G' instance shared with dynamic code without that instance as 'this'/, stdout: "x3\n" },
   },
   {
+    id: "CV-ERR-01 a callback over a user error class crosses into dynamic code: the error it is called with arrives as itself; another error stops by name",
+    src: `class AppError extends Error {
+  describe(): string { return "AE:" + this.message; }
+}
+class Other extends Error {}
+const hooks: any[] = [];
+function onErr(cb: (err: AppError) => void): void { hooks.push(cb); }
+const seen: AppError[] = [];
+onErr((err) => { seen.push(err); console.log("got", err.describe(), err.message, err instanceof AppError); });
+const fire = (e: unknown): void => { for (const h of hooks) h(e); };
+const first = new AppError("boom");
+fire(first);
+console.log(seen[0] === first);
+fire(new Other("x"));`,
+    fence: { text: /a dynamic value that is no 'AppError' error leaving into a 'AppError' slot/, stdout: "got AE:boom boom true\ntrue\n" },
+  },
+  {
     id: "CV-PRIM-01 String(), a template, + and join convert a view through its own toString / valueOf",
     src: `class P {
   constructor(public x: number) {}

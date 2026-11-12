@@ -9329,7 +9329,10 @@ leaving into typed storage follows (d)). So:
   a template, `+` and `join` convert it through its own `toString` /
   `valueOf` (Object.prototype's otherwise), `JSON.stringify` through its
   own `toJSON`. A user error class (a class over `Error`) keeps the error
-  crossing and is never a view. A function over instances crossing into a
+  crossing and is never a view; a dynamic value leaving into its slot (a
+  callback's `(err: AppError) => …` parameter) is the error it holds when
+  that error is an instance of the class, and any other value ends the
+  program by name (Node lets it flow). A function over instances crossing into a
   dynamic slot is an
   adapter that unwraps its instance arguments and lifts its result. A
   dynamic value leaving into a class-typed slot unwraps the instance a view
