@@ -16,7 +16,7 @@ registerHooks({
     if (url.endsWith("packages/compiler/dist/index.js")) {
       const s = String(r.source);
       if (!s.includes(ANALYZE_LOWER)) throw new Error("analyze() lowering options moved; update sites.mjs (and survey/worker.mjs)");
-      return { ...r, source: s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, targetPlatform: "host",') };
+      return { ...r, source: s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, sharedDynamic: true, targetPlatform: "host",') };
     }
     return r;
   },

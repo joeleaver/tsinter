@@ -351,4 +351,21 @@ then stopped before it got the heavy lock: **not measured**. The same hook is in
   bisect): uuid, SC9001 `dynFromJsval operand must be jsval, got f64`; jest-cli, SC9001 `local "%setVal" has bare
   unit type undefinedT` and `bare unitLit 'undefined' outside a unionWrap`; @vue/cli-plugin-eslint,
   rollup-plugin-postcss and web-vitals, SC3001 `jsOp:defineGetter-order`. The wasm build was lost for 17
-  packages and gained for 10.
+  packages and gained for 10. *(Bisected 2026-11-11: all five appear first at U1b cbd34df1. U1a 40350319 is
+  clean on the JS repros.)*
+
+## 2026-11-11: sharedDynamic in the analyze hooks; the `dyn:copy` family
+
+- **Hooks fixed.** `worker.mjs`, `tests/real-apps-top10/harness/sites.mjs` and `../harness/sites.mjs` now pass
+  `sharedDynamic: true` to analyze(), as compile() does for the wasm lanes. Every per-file sweep before this one
+  (d4a95a74, U1b, U2) lowered `any`/`unknown` in the pre-U1 checked-dynamic world. Only each package's first
+  entry, which goes through the real build, saw U1/U2. The corrected re-measure is still pending: the full 302
+  was stopped to free nico's shared lock, and the 73-package U1b subset runs once nico's queue is clear.
+- **`dyn:copy`** (`families.py`) holds the S125 (c) / S115 (d) COPY refusals ("it would be a COPY where
+  JavaScript shares the object"), which used to fall into `other`. On the U2 results it absorbs 4,656 sites in
+  109 packages. Messages are cut at 240 characters, so a site whose type name pushes "COPY" past the cut still
+  lands in `other` (about 650 sites).
+- **`copyctx.mjs`** counts that family's sites by the syntactic slot the value lands in: a const/let/var
+  binding, a return, a call argument, a field, a destructuring pattern, or a function crossing. It reads the
+  raw records and prints only counts. **`probe.mjs`** lists one package's exact build refusals with their
+  syntactic context. Its output contains third-party source lines, so keep it out of the repo.
