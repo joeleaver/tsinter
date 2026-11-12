@@ -95,12 +95,95 @@ function lowerOptionalDefaultArg(
    * direct call of a synthetic loop function (see lowerArrayHofCall and
    * friends). Null when this isn't an ambient array method call. tsc has
    * already checked arity and argument types against ambient/scriptc.d.ts. */
+  /* Array methods a READONLY tuple receiver (`const S = ["a", "b"] as
+   * const; S.join(",")`) runs on a fresh array copy of its positions. The
+   * copy is unobservable only when nothing can write the tuple between
+   * the copy and the method's reads: a readonly tuple has no writes the
+   * checker admits (a mutable tuple keeps its own lowerings, which read
+   * it live: GH #117's f22-f24), none of these methods mutates or returns
+   * its receiver, the arguments are side-effect-free (a call argument
+   * could still run first in JS), and a callback is an inline arrow that
+   * does not declare the array parameter. */
+  const TUPLE_PLAIN_METHODS = new Set(["join", "includes", "indexOf", "lastIndexOf", "at", "slice", "concat"]);
+  const TUPLE_CALLBACK_METHODS = new Map<string, number>([
+    ["map", 2], ["filter", 2], ["forEach", 2], ["some", 2], ["every", 2], ["find", 2], ["findIndex", 2],
+    ["findLast", 2], ["findLastIndex", 2], ["flatMap", 2], ["reduce", 3], ["reduceRight", 3],
+  ]);
+
+  /** The array element type a readonly tuple receiver reads as for
+   * `method`, or null (not a readonly tuple, positions of differing IR
+   * types, or a call form whose copy could be observed). */
+  function tupleArrayElem(L: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression, method: string): IrType | null {
+    const checkerT = L.typeOf(access.expression);
+    if (!L.checker.isTupleType(checkerT) || !L.checker.typeToString(checkerT).startsWith("readonly ")) return null;
+    const t = L.mapTypeOf(checkerT);
+    if (t?.kind !== "record") return null;
+    const shape = L.shapes.get(t.shapeId);
+    if (!shape?.tuple || shape.fields.length === 0) return null;
+    const elem = shape.fields[0]!.type;
+    if (!shape.fields.every((f) => f.optional !== true && typeEquals(f.type, elem))) return null;
+    return tupleCopyUnobservable(call, method, true) ? elem : null;
+  }
+
+  /** A side-effect-free argument: a literal, an identifier, a negated
+   * numeric literal, an array literal of those. */
+  function pureTupleArg(a: ts.Expression): boolean {
+    let e = a;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken) e = e.operand;
+    if (ts.isArrayLiteralExpression(e)) return e.elements.every((x) => !ts.isSpreadElement(x) && pureTupleArg(x));
+    return ts.isIdentifier(e) || ts.isStringLiteral(e) || ts.isNumericLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) ||
+      e.kind === ts.SyntaxKind.TrueKeyword || e.kind === ts.SyntaxKind.FalseKeyword;
+  }
+
+  /** True when `method` called this way cannot observe that its receiver
+   * is a copy (see TUPLE_PLAIN_METHODS); `callbacks` admits the callback
+   * methods (readonly tuples only). */
+  function tupleCopyUnobservable(call: ts.CallExpression, method: string, callbacks: boolean): boolean {
+    if (TUPLE_PLAIN_METHODS.has(method)) return call.arguments.every(pureTupleArg);
+    const maxParams = callbacks ? TUPLE_CALLBACK_METHODS.get(method) : undefined;
+    if (maxParams === undefined) return false;
+    const [cb, ...rest] = call.arguments;
+    return cb !== undefined && ts.isArrowFunction(cb) && cb.parameters.length <= maxParams && rest.every(pureTupleArg);
+  }
+
+  /** A tuple receiver's fresh array copy (its positions in order). */
+  /** `elem`, when given, is the array element type the use site expects
+   * (a tuple cast to `readonly string[]`): each position coerces to it. */
+  export function tupleAsArray(L: Lowerer, receiver: IrExpr, loc: SrcLoc, elem?: IrType): IrExpr {
+    if (receiver.type.kind !== "record") return receiver;
+    const shape = L.shapes.get(receiver.type.shapeId);
+    if (!shape?.tuple || shape.fields.length === 0) return receiver;
+    const elemT = elem ?? shape.fields[0]!.type;
+    const recT = receiver.type;
+    return bindOnce(L, receiver, loc, (read) => ({
+      kind: "arrayLit",
+      elems: shape.fields.map((f) =>
+        L.coerceToExpected({ kind: "recordGet", obj: read, shapeId: recT.shapeId, field: f.name, type: f.type, loc }, elemT),
+      ),
+      type: arrayOf(elemT),
+      loc,
+    }));
+  }
+
   export function lowerArrayMethodCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (L.chainBlocked(access, call)) return null;
     const name = access.name.text;
     if (!ARRAY_METHODS.has(name) && name !== "sort" && name !== "shift" && name !== "splice") return null;
     let receiverIr = L.mapTypeOf(L.typeOf(access.expression));
+    if (receiverIr?.kind === "record" && !call.questionDotToken && !access.questionDotToken) {
+      const elem = tupleArrayElem(L, call, access, name);
+      if (elem !== null) {
+        receiverIr = arrayOf(elem);
+        L.tupleArrayRecv.add(access);
+      }
+    } else if (receiverIr?.kind === "array" && tupleCopyUnobservable(call, name, false)) {
+      // An array-typed receiver whose VALUE may still be a tuple (`(S as
+      // readonly string[]).includes(s)` — the cast converts nothing):
+      // lowerMemberRecv copies a tuple value into the expected array.
+      L.tupleArrayRecv.add(access);
+    }
     // A checker-`any[]` receiver (the readonly-array Array.isArray quirk)
     // whose VALUE lowers to a real static array (maybeNarrow's isArray
     // bridge): ride the ordinary tables on the lowered element type — the

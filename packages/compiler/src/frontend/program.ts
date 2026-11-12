@@ -69,6 +69,7 @@ import {
   clearWorkspacePackages,
   fallbackDtsPath,
   fetchInitDtsPath,
+  libIncludesDom,
   isJsSourceFileName,
   isNodeTypesPath,
   isRelativeSpecifier,
@@ -369,8 +370,10 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   if (paths !== null || Object.keys(dev.paths).length > 0) options = { ...options, paths: { ...dev.paths, ...(paths ?? {}) } };
   const coreRoots = [entryPath, ...includedDts, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
   // lib.dom's fetch init names, unless an adopted dom lib declares them.
-  const hasDom = (options.lib ?? []).some((l) => /^(lib\.)?dom(\.d\.ts)?$/i.test(l));
-  const program = ts.createProgram([...coreRoots, overridesDtsPath(), ...(hasDom ? [] : [fetchInitDtsPath()])], options, host);
+  // A CORE root: preflight's project world (the second-chance program
+  // without the overrides) needs them as much as the lowering world does.
+  if (!libIncludesDom(options.lib as string[] | undefined)) coreRoots.push(fetchInitDtsPath());
+  const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
   if (config.syntheticDefaults !== undefined) syntheticDefaultsByProgram.set(program, config.syntheticDefaults);
   const entry = program.getSourceFile(entryPath);
   if (!entry) {

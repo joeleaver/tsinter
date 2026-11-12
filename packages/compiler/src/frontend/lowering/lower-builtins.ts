@@ -5317,6 +5317,25 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
    * read in source order). Method members referenced without a call are
    * rejected specifically. Null for non-process receivers (the chain keeps
    * trying other property lowerings). */
+  /** The interned `%process.<getuid|getgid>` function: () => number, its
+   * body the member's libCall. */
+  function processIdFn(L: Lowerer, member: "getuid" | "getgid", loc: SrcLoc): string {
+    const key = `process.${member}.fn`;
+    const existing = L.widthHelpers.get(key);
+    if (existing) return existing;
+    const name = `%process.${member}.${L.widthHelpers.size}`;
+    L.widthHelpers.set(key, name);
+    L.liftedFns.push({
+      name,
+      params: [],
+      returnType: F64,
+      locals: [],
+      body: [{ kind: "return", value: { kind: "libCall", fn: member === "getuid" ? "process.getuid" : "process.getgid", args: [], type: F64, loc }, loc }],
+      loc,
+    });
+    return name;
+  }
+
   export function lowerProcessProperty(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     // process.versions.node — the ONE lowered member of process.versions:
     // there is no Node under the binary, so the honest answer is the
@@ -5422,7 +5441,20 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         "process.env as a value of this type (read one variable: process.env.NAME or process.env[name])",
       );
     }
-    if (member === "exit" || member === "cwd" || member === "getuid" || member === "kill") {
+    // process.getuid / process.getgid as VALUES (`const getuid =
+    // process.getuid; if (typeof getuid === "function") getuid()` — the
+    // optional-method probe @types/node's `getuid?: () => number` invites):
+    // one interned zero-argument function per member, referenced as a
+    // zero-capture closure, so every read is the same function (Node's
+    // own identity) and calling it is the libCall. The methods take no
+    // `this`, so the detached call is Node's own answer.
+    if (member === "getuid" || member === "getgid") {
+      const fnT: IrType = { kind: "func", params: [], ret: F64 };
+      const closure: IrExpr = { kind: "closure", fnName: processIdFn(L, member, loc), captures: [], type: fnT, loc };
+      const mapped = L.mapTypeOf(L.typeOf(expr));
+      return mapped === null || typeEquals(mapped, fnT) ? closure : L.coerceToExpected(closure, mapped);
+    }
+    if (member === "exit" || member === "cwd" || member === "kill") {
       L.unsupported("SC1090", expr, `process methods as values (call '${member}' directly)`);
     }
     // process.stdout / process.stderr as first-class VALUES (flowing into
@@ -6574,7 +6606,11 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         L.noLowering(`Number.${member} with ${call.arguments.length} arguments`, call);
       }
       const argNode = call.arguments[0]!;
-      const arg = L.lowerExpr(argNode);
+      const arg0 = L.lowerExpr(argNode);
+      // One world without the engine (U1a, the Number(x) precedent): an
+      // island-typed value is the checked-dynamic value, so the dyn arm
+      // below answers it.
+      const arg = L.sharedDynamic && !L.engine ? asDynOperand(arg0) : arg0;
       // An ISLAND ('any'-typed) argument evaluates the predicate in the
       // engine — the statics never coerce, so the engine's answer over the
       // real value is JS-exact where a static fence would refuse the
@@ -6585,6 +6621,20 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         const numberGlobal: IrExpr = { kind: "jsOp", op: "globalGet", name: "Number", args: [], type: JSVAL, loc };
         const raw: IrExpr = { kind: "jsOp", op: "callMethod", name: member, args: [numberGlobal, arg], type: JSVAL, loc };
         return { kind: "jsExit", value: raw, type: BOOL, loc };
+      }
+      // A checked-dynamic ('unknown') argument — paperclip's
+      // `Number.isInteger(record.pid)` over a parsed JSON record: the
+      // statics never coerce, so the answer is "is it a number" and then
+      // the predicate over that number (JS-exact for every dyn kind).
+      if (arg.type.kind === "dyn") {
+        return bindOnce(L, arg, loc, (read) => ({
+          kind: "logical",
+          op: "&&",
+          left: { kind: "dynTest", test: "number", value: read, type: BOOL, loc },
+          right: { kind: "libCall", fn, args: [{ kind: "dynCheck", value: read, type: F64, loc }], type: BOOL, loc },
+          type: BOOL,
+          loc,
+        }));
       }
       if (arg.type.kind !== "f64") {
         L.noLowering(
@@ -7407,7 +7457,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
    * not name, so a user's own `Timeout` never matches. The handle maps to
    * f64, so the method calls below can't tell it from a plain number by IR
    * type alone; this is the discriminator. */
-  function isTimerHandleTyped(L: Lowerer, node: ts.Expression, name: "Timeout" | "Immediate"): boolean {
+  export function isTimerHandleTyped(L: Lowerer, node: ts.Expression, name: "Timeout" | "Immediate"): boolean {
     const t = L.checker.getTypeAtLocation(node);
     const sym = t.getAliasSymbol() ?? t.getSymbol();
     if (sym?.name !== name) return false;

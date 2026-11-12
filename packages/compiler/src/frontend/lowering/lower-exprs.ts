@@ -16,7 +16,8 @@ import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinMod
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { armCast, isDynArmSite } from "./dyn-arm.js";
-import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall } from "./lower-containers.js";
+import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
+import { isTimerHandleTyped } from "./lower-builtins.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, stubBuiltinModuleOf, unsupportedModuleFeatureOf } from "../shared.js";
 import { onlyStubTouches, stubExprFence, stubMissingExport, stubModuleOf, stubTouch, stubTouchCheck } from "./stub-builtins.js";
@@ -1226,6 +1227,42 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         ) {
           return { kind: "strLit", value: "function", type: STRING, loc };
         }
+        // `typeof process.getuid` / `getgid`: @types/node types them
+        // optional (`getuid?: () => number`, absent on Windows), but on
+        // every POSIX host the builds target they are methods: "function".
+        if (
+          ts.isPropertyAccessExpression(target) &&
+          !target.questionDotToken &&
+          (target.name.text === "getuid" || target.name.text === "getgid") &&
+          stdlibGlobalNameOf(L, target.expression) === "process" &&
+          L.isStdlibMember(target)
+        ) {
+          return { kind: "strLit", value: "function", type: STRING, loc };
+        }
+      }
+      // A Timeout/Immediate handle is an OBJECT in Node (`typeof timer ===
+      // "object"` is the defensive unref probe); the numeric timer id is
+      // only scriptc's representation of it, so the f64 fold below would
+      // answer "number". The operand still evaluates.
+      // Only where the value IS the numeric handle (a traced call typed
+      // Immediate may lower to something else: S092's undefined answer).
+      if (
+        (isTimerHandleTyped(L, expr.expression, "Timeout") || isTimerHandleTyped(L, expr.expression, "Immediate")) &&
+        probeLower(L, expr.expression)?.type.kind === "f64"
+      ) {
+        const handle = L.lowerExpr(expr.expression);
+        const obj: IrExpr = { kind: "strLit", value: "object", type: STRING, loc };
+        if (mayHoldSlotUndef(L, handle)) {
+          return bindOnce(L, handle, loc, (read) => ({
+            kind: "ternary",
+            cond: isUndefExpr(read, false, loc),
+            then: { kind: "strLit", value: "undefined", type: STRING, loc },
+            else_: obj,
+            type: STRING,
+            loc,
+          }));
+        }
+        return droppableStatic(handle) ? obj : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: handle, loc }], result: obj, type: STRING, loc };
       }
       // Island values ask the engine; static primitives constant-fold to
       // the JS answer (the operand still evaluates — JS evaluates typeof
@@ -3642,6 +3679,11 @@ export function undefThrowGuard(L: Lowerer, operand: IrExpr, message: string, lo
  * chain's receiver (`s?.length`, which answers undefined itself) never
  * check. */
 export function lowerMemberRecv(L: Lowerer, access: ts.PropertyAccessExpression): IrExpr {
+  if (L.tupleArrayRecv.has(access)) {
+    const want = L.mapTypeOf(L.typeOf(access.expression));
+    const recv = tupleAsArray(L, L.lowerExpr(access.expression), locOf(access), want?.kind === "array" ? want.elem : undefined);
+    return access.questionDotToken ? recv : undefRecvGuardFor(L, access, recv);
+  }
   const receiver = L.lowerExpr(access.expression);
   if (access.questionDotToken) return receiver;
   return undefRecvGuardFor(L, access, receiver);
@@ -6104,7 +6146,9 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     // target names the wider slot type).
     {
       let p: ts.Node = expr.parent;
-      while (ts.isParenthesizedExpression(p)) p = p.parent;
+      // `{...} as const satisfies Record<string, number>` (paperclip's
+      // telemetry RETENTION_DAYS): the const assertion sits between.
+      while (ts.isParenthesizedExpression(p) || (ts.isAsExpression(p) && isConstAssertionTypeNode(p.type))) p = p.parent;
       if (ts.isSatisfiesExpression(p)) {
         const own = L.typeOf(expr);
         if (L.mapTypeOf(own)?.kind === "record") tsType = own;
@@ -11007,6 +11051,24 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       }
     }
     const key = foldedStringKeyOf(L, expr.left);
+    // `"unref" in timer` on a Timeout/Immediate handle (paperclip's
+    // telemetry: `typeof timer === "object" && timer !== null && "unref"
+    // in timer`): the handle's prototype methods answer true, exactly
+    // Node. Other names (Node's underscore-prefixed internals, symbols)
+    // keep the fence.
+    if (key !== null) {
+      const isTimeout = isTimerHandleTyped(L, expr.right, "Timeout");
+      if (isTimeout || isTimerHandleTyped(L, expr.right, "Immediate")) {
+        const members = isTimeout ? ["ref", "unref", "hasRef", "refresh", "close"] : ["ref", "unref", "hasRef"];
+        if (!members.includes(key)) {
+          L.unsupported("SC1090", expr, `'in' with the key '${key}' on a timer handle (its ${members.join("/")} methods answer)`);
+        }
+        const handle = L.lowerExpr(expr.right);
+        if (handle.type.kind !== "f64") L.unsupported("SC1090", expr, `'in' on a '${L.fmt(handle.type)}' value typed as a timer handle`);
+        const yes: IrExpr = { kind: "boolLit", value: true, type: BOOL, loc };
+        return droppableStatic(handle) ? yes : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: handle, loc }], result: yes, type: BOOL, loc };
+      }
+    }
     if (key === null) {
       // A RUNTIME string key over an INDEX-SIGNATURE record receiver (the
       // `names.filter((k) => k in config)` idiom): the interned key-

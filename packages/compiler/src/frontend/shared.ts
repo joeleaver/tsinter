@@ -23,6 +23,14 @@ export function ambientDtsPath(): string {
   return tsgoPath(require.resolve("@tsinter/compiler/scriptc.d.ts"));
 }
 
+/** True when a program's `lib` option names a DOM library ("dom",
+ * "lib.dom.d.ts", "dom.iterable", ...), whose own BodyInit/HeadersInit
+ * then stand. An absent lib is the target's default: DOM included. */
+export function libIncludesDom(lib: readonly string[] | undefined): boolean {
+  if (lib === undefined) return true;
+  return lib.some((l) => /^(lib\.)?dom([.]|$)/i.test(l));
+}
+
 /** Path of the shipped divergence/precision OVERRIDES (JSON.parse():
  * unknown, pop(): T, the Promise executor shape, ...). Part of the LOWERING
  * program only — preflight's project-world second chance builds without it,

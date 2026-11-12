@@ -60,6 +60,7 @@ import {
   cjsExportAssignmentOf,
   cjsExportDiscardReason,
   fallbackDtsPath,
+  fetchInitDtsPath,
   isCjsExportTableLiteral,
   isJsSourceFile,
   isNodeEsmFile,
@@ -1191,6 +1192,10 @@ export class Lowerer {
   /** Width-coercion helpers (%rec.width.N / %arr.width.N), interned per
    * (from, to) shape pair — see widthCoerce. */
   readonly widthHelpers = new Map<string, string>();
+  /** Method-call receivers that are TUPLES read as arrays (tupleArrayElem
+   * in lower-containers.ts): lowerMemberRecv answers the tuple's fresh
+   * array copy for these. */
+  readonly tupleArrayRecv = new WeakSet<ts.Node>();
   /** (fromShape, toShape) pairs whose width plan is being computed — the
    * cycle guard for RECURSIVE shapes (a self-referential record narrowing
    * into a self-referential subset). Re-entering an in-progress pair
@@ -1571,6 +1576,7 @@ export class Lowerer {
   readonly ambient = ambientDtsPath();
   readonly overridesAmbient = overridesDtsPath();
   readonly fallbackAmbient = fallbackDtsPath();
+  readonly fetchInitAmbient = fetchInitDtsPath();
   /** The one mapType context: registries + hooks, assembled in the
    * constructor (typeParamResolver reads the CURRENT instantiation bindings
    * through `this`, so the same ctx serves generic bodies too). */
@@ -8859,6 +8865,7 @@ export class Lowerer {
     sf.fileName === this.ambient ||
     sf.fileName === this.overridesAmbient ||
     sf.fileName === this.fallbackAmbient ||
+    sf.fileName === this.fetchInitAmbient ||
     this.program.isSourceFileDefaultLibrary(sf) ||
     (sf.isDeclarationFile && isNodeTypesPath(sf.fileName));
 

@@ -208,7 +208,9 @@ console.log(Object.keys(u), JSON.stringify(u));
 const d = new StringDecoder("utf8");
 const a: any = d;
 console.log(typeof a.write, a.write(Buffer.from("hi")));`,
-    refused: { code: "SC1090", text: /crossing into an 'any' slot/ },
+    // The decoder is a Node class instance's record (isNodeClassShape):
+    // the boundary check refuses it before any view is built.
+    refused: { code: "SC1090", text: /passing a value of type '\{ %enc: string; %pending: number \}' into dynamically-executed \('any'-typed\) code/ },
   },
   {
     id: "GH131-15 a user type spelling StringDecoder's fields beside a decoder keeps its own keys, and crosses into any",
