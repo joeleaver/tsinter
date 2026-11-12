@@ -22,12 +22,11 @@
  *   refuse.txt    optional: `<code> <message substring>` — the build must
  *                 refuse with it (an out-of-tier row); nothing runs. */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { compile } from "@tsinter/compiler";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -56,21 +55,22 @@ function findWasmtime(): string | null {
 const WASMTIME = findWasmtime();
 const NO_WASMTIME = "environment: no wasmtime 47 with its C API (scripts/cloud-setup.sh installs it; SCRIPTC_WASMTIME_DIR points at one)";
 
-/** The wasmtime column's host binary, built once per host.c content. */
+/** The wasmtime column's host binary, built once per run into the run's
+ * work directory (removed with it). */
 let hostBin: string | null = null;
 function wasmtimeHost(): string {
   if (hostBin !== null) return hostBin;
   const src = join(libmode, "host.c");
-  const hash = createHash("sha256").update(readFileSync(src)).digest("hex").slice(0, 16);
-  const out = join(tmpdir(), `tsinter-libmode-host-${hash}`);
-  if (!existsSync(out)) {
-    const cc = process.env["CC"] ?? "clang";
-    execFileSync(cc, ["-O1", "-Wall", "-Werror", "-o", `${out}.tmp`, src, `-I${join(WASMTIME!, "include")}`, join(WASMTIME!, "lib", "libwasmtime.a"), "-lpthread", "-ldl", "-lm"], { stdio: "inherit" });
-    execFileSync("mv", [`${out}.tmp`, out]);
-  }
+  const out = join(work, "host");
+  const cc = process.env["CC"] ?? "clang";
+  execFileSync(cc, ["-O1", "-Wall", "-Werror", "-o", out, src, `-I${join(WASMTIME!, "include")}`, join(WASMTIME!, "lib", "libwasmtime.a"), "-lpthread", "-ldl", "-lm"], { stdio: "inherit" });
   hostBin = out;
   return out;
 }
+
+afterAll(() => {
+  rmSync(work, { recursive: true, force: true });
+});
 
 interface Contract {
   exports: { name: string; params: string[]; result: string | null; constant?: true }[];

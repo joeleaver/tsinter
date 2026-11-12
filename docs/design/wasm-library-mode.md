@@ -912,7 +912,12 @@ Where this differs from §2, this section wins.
   Mitigations: P5's restore into a fresh store compacts the heap; Playweft
   watches heap size and recycles the instance at a tick boundary through
   snapshot and restore; and wasmtime's copying collector when it lands. P0
-  measures growth on the sample games over 100k ticks. Speed: Playweft measured
+  measures growth on the sample games over 100k ticks. **Measured (§10 w7,
+  w8):** wasmtime 47's default collector is already the copying one, and it
+  collects cycles (28 MB vs DRC's 656 MB on 4M cyclic objects); the coin
+  sample's heap is flat over 100,000 ticks (~700,000 export calls: RSS
+  57 → 54 MB on wasmtime, a 4.5 MB JS heap on V8). The risk now is only a
+  host that selects DRC. Speed: Playweft measured
   4–10× faster than QuickJS on both engines, and that is the baseline to keep.
 - **R3, size.** Measured: 55 KB raw / 27 KB gzip for the small sample, and
   13.6 KB per extra 53 lines. Playweft's 51–70 KB is in range. Library mode
