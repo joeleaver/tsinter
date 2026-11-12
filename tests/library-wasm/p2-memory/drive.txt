@@ -1,0 +1,7 @@
+call setup
+call vec
+call text
+call widths
+call heapChurn
+call vec
+call widths

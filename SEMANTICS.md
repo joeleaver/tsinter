@@ -11398,6 +11398,20 @@ same checks in JS.
 **Tested by:** tests/harness/wasm-library.test.ts rows `p1-classes`,
 `p1-defaults`, `p1-fences`, `p1-fence-result`, `p1-fence-nan`.
 
+## S144 — Library mode: strings cross as UTF-8, so a lone surrogate becomes U+FFFD *(wasm, library mode)*
+
+A `string` at the boundary is UTF-8 in linear memory, both ways: an import
+argument (staged in the scratch arena), an export argument (written by the
+host into a buffer from the alloc export) and an export result (the result
+buffer, `<export>_result_ptr` / `_result_len`). A lone surrogate, which a JS
+string can hold and UTF-8 cannot, becomes U+FFFD on the way out (the
+`TextEncoder` rule, the same as the write boundary, S002), and invalid UTF-8
+coming in decodes with replacement (the `TextDecoder` rule). Node passing
+the string to a JS function would keep the surrogate. The oracle (the
+harness's Node column) applies `toWellFormed()` where the module encodes.
+**Tested by:** tests/harness/wasm-library.test.ts rows `p2-strings`,
+`p2-strings-noprofile`.
+
 ## S146 — Library mode: every NaN whose bits are observable is the canonical NaN *(wasm, library mode)*
 
 WebAssembly leaves the sign and payload of a NaN that arithmetic produces to

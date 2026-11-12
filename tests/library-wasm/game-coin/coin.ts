@@ -4,8 +4,8 @@
 import * as pw from "pw";
 import { Field, Obj, POSITION, registerSystem, say, spawn, wait, command, type Vec3 } from "./std.ts";
 
-export const GOAL = 10;
-const ARENA = 7;
+export const GOAL = 3;
+const ARENA = 3;
 
 export const points = new Field(1, 0);
 export const player = new Field(1, 1);
@@ -85,6 +85,6 @@ async function celebrate(who: number): Promise<void> {
 
 export function placeAll(ducks: number, coins: number): void {
   for (let i = 0; i < ducks; i++) spawn(["controls", "score", "round"], [i % 2 === 0 ? -3 : 3, 0.5, 0]).setNum(player, (i % 2) + 1);
-  for (let i = 0; i < coins; i++) spawn(["coin"], [(i % 5) * 3 - 6, 0.5, -5 + (i % 3)]);
-  spawn(["hazard"], [0, 0.5, 4]);
+  for (let i = 0; i < coins; i++) spawn(["coin"], [(i % 5) * 1.5 - 3, 0.5, -2 + (i % 3)]);
+  spawn(["hazard"], [0, 0.5, 2]);
 }

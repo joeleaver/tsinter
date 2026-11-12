@@ -26,6 +26,7 @@ import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHost, defaultClass, render, roundTrip } from "./host.mjs";
+import { createMemory } from "./memory.mjs";
 
 export const CODE_UNCAUGHT = 1;
 export const CODE_FENCE = 2;
@@ -193,7 +194,9 @@ async function runNode(rowDir, entry, drivePath, contract) {
     const here = new URL(".", import.meta.url).href;
     const script =
       `const { createHost } = await import(${JSON.stringify(here + "host.mjs")});` +
-      `const h = createHost(() => {}, () => null);` +
+      `const { createMemory } = await import(${JSON.stringify(here + "memory.mjs")});` +
+      `globalThis.__libmem = createMemory((t) => { throw new Error(t); });` +
+      `const h = createHost(() => {}, () => globalThis.__libmem.bytes);` +
       `globalThis.__libhost = { bind: (m, n) => (...a) => (h.table[n].params[0] === "*" ? h.table[n].fn("f64", a[0]) : h.table[n].fn(...a)) };` +
       `Math.random = () => 0.5;` +
       `const m = await import(${JSON.stringify(pathToFileURL(resolve(entry)).href)}); const v = m[${JSON.stringify(e.name)}]();` +
@@ -205,9 +208,11 @@ async function runNode(rowDir, entry, drivePath, contract) {
   const constantChecks = [];
   const profile = loadProfile(rowDir);
   const report = profile?.report ?? null;
-  const host = createHost(out, () => {
-    throw new Error("node column: no linear memory (tsinter:memory is P2)");
+  const memory = createMemory((text) => {
+    throw new Failure(CODE_FENCE, text);
   });
+  globalThis.__libmem = memory;
+  const host = createHost(out, () => memory.bytes);
   const classesOf = (mod, name) => profile?.imports?.[mod]?.[name] ?? null;
   // The boundary in JS: each import checks what leaves TypeScript and hands
   // back what the module's view of the host's answer would be.
@@ -221,9 +226,10 @@ async function runNode(rowDir, entry, drivePath, contract) {
           const cls = decl !== null ? decl.params[i][1] : defaultClass(a);
           const bad = outboundMisfit(cls, a);
           if (bad !== null) throw new Failure(CODE_FENCE, `tsinter: argument ${i + 1} of ${mod}.${name} is not a ${cls}: ${bad}`);
-          // SEMANTICS.md S146: a NaN crosses as the canonical NaN
+          // SEMANTICS.md S146: a NaN crosses as the canonical NaN; S144: the
+          // host sees UTF-8, so a lone surrogate arrives as U+FFFD
           const v = (cls === "f64" || cls === "f32") && Number.isNaN(a) ? NaN : a;
-          return { cls, v: cls === "f32" ? Math.fround(v) : v };
+          return { cls, v: cls === "f32" ? Math.fround(v) : cls === "string" ? v.toWellFormed() : v };
         });
         const r = imp.params[0] === "*" ? imp.fn(conv[0].cls, conv[0].v) : imp.fn(...conv.map((c) => c.v));
         if (imp.result === null) return undefined;
@@ -285,9 +291,10 @@ async function runNode(rowDir, entry, drivePath, contract) {
       }
       const fn = mod[name];
       let r;
+      memory.reset();
       if (fn !== undefined) {
         try {
-          r = fn(...args);
+          r = fn(...args.map((a) => (typeof a === "string" ? a.toWellFormed() : a)));
         } catch (e) {
           if (e instanceof Failure) throw e;
           throw new Failure(CODE_UNCAUGHT, uncaughtText(e));
@@ -368,7 +375,16 @@ async function runV8(wasmPath, drivePath, contract) {
     for (let i = 0; i < cmd.times; i++) {
       const fn = ex[cmd.name];
       if (typeof fn !== "function") throw new Error(`v8 column: the module exports no ${cmd.name}`);
-      const args = cmd.args.map((a) => toWasm(a.cls, argValue(a.cls, a.text, i)));
+      const args = [];
+      for (const a of cmd.args) {
+        const v = argValue(a.cls, a.text, i);
+        if (a.cls === "string") {
+          const b = new TextEncoder().encode(v);
+          const p = ex[contract.alloc](b.length) >>> 0;
+          mem().set(b, p);
+          args.push(p, b.length);
+        } else args.push(toWasm(a.cls, v));
+      }
       let r;
       try {
         r = fn(...args);
@@ -381,7 +397,11 @@ async function runV8(wasmPath, drivePath, contract) {
         out(`error ${render("string", errorText())}`);
         continue;
       }
-      if (cmd.result !== null) out(`${cmd.name} -> ${render(cmd.result, fromWasm(cmd.result, r))}`);
+      if (cmd.result === "string") {
+        const p = ex[`${cmd.name}_result_ptr`]() >>> 0;
+        const n = ex[`${cmd.name}_result_len`]() >>> 0;
+        out(`${cmd.name} -> ${render("string", dec.decode(mem().subarray(p, p + n)))}`);
+      } else if (cmd.result !== null) out(`${cmd.name} -> ${render(cmd.result, fromWasm(cmd.result, r))}`);
     }
   }
   flushOut();

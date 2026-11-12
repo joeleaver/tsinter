@@ -1,0 +1,1 @@
+SC4025 pw.get_vec3 has 4 wasm parameters; this profile's limit is 3

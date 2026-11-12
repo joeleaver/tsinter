@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
-import { wasmLibClassType } from "./nodes.js";
+import { WASMLIB_MEMORY_FNS, wasmLibClassType } from "./nodes.js";
 import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
@@ -2755,6 +2755,20 @@ function validateFunction(
       }
       case "hostCall": {
         for (const arg of e.args) checkExpr(arg);
+        if (e.module === "tsinter:memory") {
+          const m = WASMLIB_MEMORY_FNS.get(e.name);
+          if (m === undefined) {
+            err(`tsinter:memory has no ${e.name}`, e.loc);
+            break;
+          }
+          if (m.params.length !== e.args.length) err(`mem.${e.name}: ${e.args.length} args, expected ${m.params.length}`, e.loc);
+          e.args.forEach((arg, i) => {
+            const t = m.params[i];
+            if (t !== undefined) expectType(arg, t, `mem.${e.name} arg ${i}`);
+          });
+          if (!typeEquals(e.type, m.result)) err(`mem.${e.name} type ${e.type.kind} != its result`, e.loc);
+          break;
+        }
         const imp = hostImports.get(`${e.module}.${e.name}`);
         if (imp === undefined) {
           err(`host call to undeclared import "${e.module}.${e.name}"`, e.loc);

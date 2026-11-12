@@ -869,6 +869,32 @@ Where this differs from §2, this section wins.
   continuation runs in that export's drain (Node-checkable).
 - **wasm-native:** library mode builds for `--backend wasm` only; other
   backends refuse by name.
+- **Linear memory (P2):** `[0, 256)` the report prefix area, `[256, 4352)`
+  the error buffer, then the persistent heap (8-byte headers, a first-fit
+  free list), then the scratch arena (the output stage), whose base moves up
+  as the heap grows. Growing the heap while the call's scratch is in use is
+  a fence (`mem.alloc` after `mem.scratch` in one call needs a free block).
+- **Pointer classes (P2):** an import's `string`/`list<…>` argument is
+  staged in the scratch arena and the cursor is restored after the import
+  returns, so a loop of calls does not grow memory. An export's pointer
+  argument is written by the host into a buffer from the **alloc export**
+  (the profile's `alloc`, default `tsinter_alloc`; it hands out scratch
+  between calls) and copied before the body runs. A pointer result goes to
+  a per-export persistent buffer, read with `<export>_result_ptr()` /
+  `<export>_result_len()` (length in bytes for a string, elements for a
+  list), valid until that export is called again. Lists: `list<u8>`
+  (Uint8Array), `list<s32>` (Int32Array), `list<u32>` (Uint32Array),
+  `list<f32>` (Float32Array); `list<f64>` refuses (no Float64Array in the
+  tier yet).
+- **tsinter:memory (P2):** the program types it (`declare module
+  "tsinter:memory" { export const mem: {...} }`, the bridge's
+  tsinter-memory.d.ts); tsinter recognizes `mem.<fn>(...)` by name: scratch,
+  alloc, free, u8, i32, u32, f32, f64, setU8, setI32, setU32, setF32,
+  setF64, utf8, copyU8, copyI32, copyU32, copyF32. Little-endian, byte
+  addresses, bounds-checked (outside memory: a fence); a value that does not
+  fit a setter's width is a fence (S143).
+- **Arity (P2):** `max_import_params` counts wasm parameters (a pointer class
+  is two), SC4025.
 
 ### 9.3 Risks
 

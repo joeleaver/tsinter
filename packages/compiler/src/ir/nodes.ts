@@ -908,6 +908,30 @@ export interface IrWasmLib {
   initialize: boolean;
 }
 
+/** tsinter:memory (docs/design/wasm-library-mode.md §3.2): the functions
+ * of its `mem` object and their IR signatures (hostCall module
+ * "tsinter:memory"). */
+export const WASMLIB_MEMORY_FNS: ReadonlyMap<string, { params: IrType[]; result: IrType }> = new Map([
+  ["scratch", { params: [F64], result: F64 }],
+  ["alloc", { params: [F64], result: F64 }],
+  ["free", { params: [F64], result: VOID }],
+  ["u8", { params: [F64], result: F64 }],
+  ["i32", { params: [F64], result: F64 }],
+  ["u32", { params: [F64], result: F64 }],
+  ["f32", { params: [F64], result: F64 }],
+  ["f64", { params: [F64], result: F64 }],
+  ["setU8", { params: [F64, F64], result: VOID }],
+  ["setI32", { params: [F64, F64], result: VOID }],
+  ["setU32", { params: [F64, F64], result: VOID }],
+  ["setF32", { params: [F64, F64], result: VOID }],
+  ["setF64", { params: [F64, F64], result: VOID }],
+  ["utf8", { params: [F64, F64], result: STRING }],
+  ["copyU8", { params: [F64, F64], result: BYTES_U8 }],
+  ["copyI32", { params: [F64, F64], result: { kind: "bytes", elem: "i32" } }],
+  ["copyU32", { params: [F64, F64], result: { kind: "bytes", elem: "u32" } }],
+  ["copyF32", { params: [F64, F64], result: { kind: "bytes", elem: "f32" } }],
+]);
+
 /** The IR type a library class's TS value has; null where the tier has no
  * such value (list<f64>: no Float64Array representation yet). */
 export function wasmLibClassType(cls: IrWasmLibClass): IrType | null {

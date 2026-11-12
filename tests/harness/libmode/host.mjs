@@ -34,6 +34,7 @@ export function render(cls, v) {
   switch (cls) {
     case "bool":
       return v ? "true" : "false";
+    case "u8":
     case "s32":
     case "u32":
     case "s64":
@@ -74,6 +75,8 @@ export function roundTrip(cls, v) {
       return BigInt.asUintN(64, BigInt(v));
     case "bool":
       return Number(v) !== 0;
+    case "string":
+      return v.toWellFormed();
     default:
       return v;
   }

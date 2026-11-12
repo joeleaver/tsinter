@@ -1,0 +1,53 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "send": {
+      "params": []
+    }
+  },
+  "imports": {
+    "pw": {
+      "put_bytes": {
+        "params": [
+          [
+            "b",
+            "list<u8>"
+          ]
+        ]
+      },
+      "put_u32s": {
+        "params": [
+          [
+            "b",
+            "list<u32>"
+          ]
+        ]
+      },
+      "put_f32s": {
+        "params": [
+          [
+            "b",
+            "list<f32>"
+          ]
+        ]
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  }
+}

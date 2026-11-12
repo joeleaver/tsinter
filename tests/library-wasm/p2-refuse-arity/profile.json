@@ -1,0 +1,50 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "run": {
+      "params": []
+    }
+  },
+  "imports": {
+    "pw": {
+      "get_vec3": {
+        "params": [
+          [
+            "e",
+            "u64"
+          ],
+          [
+            "c",
+            "u32"
+          ],
+          [
+            "f",
+            "u32"
+          ],
+          [
+            "out",
+            "u32"
+          ]
+        ]
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  },
+  "max_import_params": 3
+}

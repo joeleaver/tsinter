@@ -9,11 +9,15 @@ export function initialize(data) {
 }
 
 export async function resolve(specifier, context, next) {
+  if (specifier === "tsinter:memory") return { url: "libmem:", shortCircuit: true };
   if (hosts.includes(specifier)) return { url: `libhost:${specifier}`, shortCircuit: true };
   return next(specifier, context);
 }
 
 export async function load(url, context, next) {
+  if (url === "libmem:") {
+    return { format: "module", source: "export const mem = globalThis.__libmem.mem;\n", shortCircuit: true };
+  }
   if (url.startsWith("libhost:")) {
     const mod = url.slice("libhost:".length);
     const source =
