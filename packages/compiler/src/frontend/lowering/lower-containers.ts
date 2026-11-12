@@ -4,9 +4,9 @@
  * method surfaces. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BIGINT_T, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
+import { ARRAYBUFFER_T, BIGINT_T, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
-import { lowerArrayFromIterable } from "./lower-stdlib-members.js";
+import { lowerArrayFromIterable, optionalNumber } from "./lower-stdlib-members.js";
 import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
@@ -6231,6 +6231,26 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     if (symbol && symbol.name === "DataView" && L.isStdlibSymbol(symbol)) {
       return lowerDataViewNew(L, expr);
     }
+    // `new ArrayBuffer(n)` as a VALUE (WasmGC lanes; docs/design/
+    // arraybuffer.md): zeroed storage of ToIndex(n) bytes, or Node's
+    // "Invalid array buffer length" RangeError. The resizable form (an
+    // options bag) keeps a named fence.
+    if (symbol && symbol.name === "ArrayBuffer" && L.isStdlibSymbol(symbol) && L.sharedDynamic) {
+      const loc = locOf(expr);
+      const args = expr.arguments ?? [];
+      if (args.length > 1 || args.some(ts.isSpreadElement)) {
+        L.noLowering(
+          "new ArrayBuffer with a maxByteLength options bag (a resizable buffer)",
+          expr,
+          "resizable buffers (maxByteLength, resize, transfer) have no lowering; new ArrayBuffer(n) does",
+        );
+      }
+      const n: IrExpr = args.length === 0 ? { kind: "numLit", value: 0, type: F64, loc } : L.lowerExprExpecting(args[0]!, F64);
+      if (n.type.kind !== "f64") {
+        L.noLowering(`new ArrayBuffer of '${L.fmt(n.type)}' values`, args[0]!, "the byte length must be a number");
+      }
+      return { kind: "libCall", fn: "ab.new", args: [n], type: ARRAYBUFFER_T, loc };
+    }
     const elem = symbol ? own(BYTES_CTORS, symbol.name) : undefined;
     if (!elem || !symbol || !L.isStdlibSymbol(symbol)) return null;
     const name = symbol.name;
@@ -6238,6 +6258,11 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     const loc = locOf(expr);
     const args = expr.arguments ?? [];
     if (args.length === 0) return { kind: "bytesNew", source: null, type, loc };
+    // `new T(ab, byteOffset?, length?)` over an ArrayBuffer VALUE (WasmGC
+    // lanes; docs/design/arraybuffer.md step 2): a view sharing ab's
+    // storage, V8's RangeErrors for the indices.
+    const viewed = arrayBufferView(L, args, `new ${name}`, (a) => ({ kind: "libCall", fn: "ab.view", args: a, type, loc }));
+    if (viewed) return viewed;
     if (args.length === 1 && !ts.isSpreadElement(args[0]!)) {
       const argNode = args[0]!;
       if (ts.isArrayLiteralExpression(argNode) && !argNode.elements.some(ts.isSpreadElement)) {
@@ -6317,6 +6342,110 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     );
   }
 
+/** A view construction over an ArrayBuffer VALUE (WasmGC lanes): the
+ * `(ab, byteOffset?, length?)` arguments lowered to `[ab, offset,
+ * hasLength, length]` and handed to `build` — or null when the first
+ * argument is not an ArrayBuffer. An omitted or undefined offset is 0
+ * (ToIndex(undefined); an undefined slot's NaN pattern reads 0 the same
+ * way); an omitted or undefined length is absent — a `number | undefined`
+ * length tests its slot at runtime (the arguments bind in order first). A
+ * non-number index refuses by name. */
+function arrayBufferView(L: Lowerer, args: readonly ts.Expression[], what: string, build: (args: IrExpr[]) => IrExpr): IrExpr | null {
+  if (!L.sharedDynamic || args.length < 1 || args.length > 3 || args.some(ts.isSpreadElement)) return null;
+  if (L.mapTypeOf(L.typeOf(args[0]!))?.kind !== "arraybuffer") return null;
+  const ab = L.lowerExpr(args[0]!);
+  if (ab.type.kind !== "arraybuffer") return null;
+  const loc = locOf(args[0]!);
+  const refuse = (node: ts.Expression, label: string): never =>
+    L.noLowering(
+      `${what} over an ArrayBuffer with a ${label} of type '${L.checker.typeToString(L.typeOf(node))}'`,
+      node,
+      `the ${label} must be a number (or omitted)`,
+    );
+  const stmts: IrStmt[] = [];
+  const bind = (e: IrExpr, tag: string): IrExpr => {
+    if (droppableStatic(e)) return e;
+    const t = L.declareHiddenLocal(tag, e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const abRef = bind(ab, "%abv.b");
+  const ix = viewIndexArgs(L, args[1], args[2], bind, refuse, loc);
+  const hasLen: IrExpr = ix.hasLen === "absent" || ix.hasLen === "present"
+    ? { kind: "boolLit", value: ix.hasLen === "present", type: BOOL, loc }
+    : ix.hasLen;
+  const result = build([abRef, ix.off, hasLen, ix.len]);
+  return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: result.type, loc };
+}
+
+/** A view construction's `(byteOffset?, length?)` arguments, evaluated in
+ * order through `bind`: the offset with undefined (compile-time or at run
+ * time) as 0 — ToIndex(undefined); the length "absent" (omitted or the
+ * undefined literal), "present" (a number that cannot hold undefined), or
+ * a runtime test (a `number | undefined` value: an undefined length is an
+ * absent one, Node's rule) — `len` then reads 0 where it is absent. */
+function viewIndexArgs(
+  L: Lowerer,
+  offNode: ts.Expression | undefined,
+  lenNode: ts.Expression | undefined,
+  bind: (e: IrExpr, tag: string) => IrExpr,
+  refuse: (node: ts.Expression, label: string) => never,
+  loc: SrcLoc,
+): { off: IrExpr; hasLen: "absent" | "present" | IrExpr; len: IrExpr } {
+  const zero: IrExpr = { kind: "numLit", value: 0, type: F64, loc };
+  const off = bind(offNode === undefined ? zero : (optionalNumber(L, offNode, zero) ?? refuse(offNode, "byte offset")), "%abv.o");
+  if (lenNode === undefined || isGlobalUndefined(L, lenNode)) return { off, hasLen: "absent", len: zero };
+  const v = L.lowerExpr(lenNode);
+  if (v.type.kind === "f64") {
+    const len = bind(v, "%abv.n");
+    return { off, hasLen: mayHoldSlotUndef(L, len) ? isUndefExpr(len, true, loc) : "present", len };
+  }
+  if (v.type.kind === "union") {
+    const unionId = v.type.unionId;
+    const arms = L.unions.get(unionId)?.arms ?? [];
+    const undefTag = arms.findIndex((a) => a.kind === "undefinedT");
+    if (arms.length !== 2 || undefTag < 0 || !arms.some((a) => a.kind === "f64")) refuse(lenNode, "length");
+    const ref = bind(v, "%abv.n");
+    return {
+      off,
+      hasLen: { kind: "unionIsTag", unionId, tag: undefTag, negated: true, value: ref, type: BOOL, loc },
+      len: { kind: "nullish", left: ref, right: zero, type: F64, loc },
+    };
+  }
+  return refuse(lenNode, "length");
+}
+
+/** `dataViewNew` over a lowered receiver and the source's `(byteOffset?,
+ * byteLength?)`: a length that may be undefined at run time passes its
+ * runtime presence as a third argument (WasmGC lanes; the C lanes refuse
+ * it by name). */
+function dataViewNewOf(L: Lowerer, receiver: IrExpr, rest: readonly ts.Expression[], loc: SrcLoc): IrExpr {
+  const stmts: IrStmt[] = [];
+  const bind = (e: IrExpr, tag: string): IrExpr => {
+    if (droppableStatic(e)) return e;
+    const t = L.declareHiddenLocal(tag, e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const refuse = (node: ts.Expression, label: string): never =>
+    L.noLowering(
+      `new DataView with a ${label} of type '${L.checker.typeToString(L.typeOf(node))}'`,
+      node,
+      `the ${label} must be a number (or omitted)`,
+    );
+  const recv = bind(receiver, "%dv.r");
+  const ix = viewIndexArgs(L, rest[0], rest[1], bind, refuse, loc);
+  let args: IrExpr[];
+  if (ix.hasLen === "absent") args = rest.length === 0 ? [] : [ix.off];
+  else if (ix.hasLen === "present") args = [ix.off, ix.len];
+  else {
+    if (!L.sharedDynamic) refuse(rest[1]!, "byte length");
+    args = [ix.off, ix.len, ix.hasLen];
+  }
+  const result: IrExpr = { kind: "bytesIntrinsic", method: "dataViewNew", receiver: recv, args, type: BYTES_U8, loc };
+  return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: BYTES_U8, loc };
+}
+
 /** `new DataView(x.buffer, byteOffset?, byteLength?)` (stdlib provenance).
    * The first argument must be the SYNTACTIC `.buffer` of a typed-array/
    * Buffer value — `x.buffer` names x's own storage (scriptc typed arrays
@@ -6335,6 +6464,15 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
         expr,
         "supported: new DataView(x.buffer), (x.buffer, byteOffset), or (x.buffer, byteOffset, byteLength)",
       );
+    }
+    // Over an ArrayBuffer VALUE (WasmGC lanes): the whole buffer as the
+    // receiver — `x.buffer` and `new ArrayBuffer(n)` included.
+    if (L.sharedDynamic && L.mapTypeOf(L.typeOf(bufNode))?.kind === "arraybuffer") {
+      const ab = L.lowerExpr(bufNode);
+      if (ab.type.kind === "arraybuffer") {
+        const receiver: IrExpr = { kind: "libCall", fn: "ab.asView", args: [ab], type: BYTES_U8, loc };
+        return dataViewNewOf(L, receiver, args.slice(1), loc);
+      }
     }
     // The FRESH-BUFFER form: `new DataView(new ArrayBuffer(n), ...)` — the
     // buffer erases into the view (nothing else can ever reference it, so
@@ -6371,8 +6509,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       }
       const count: IrExpr = { kind: "numLit", value: byteLen, type: F64, loc };
       const receiver: IrExpr = { kind: "bytesNew", source: count, type: BYTES_U8, loc };
-      const idxArgs = args.slice(1).map((a) => L.lowerExprExpecting(a, F64));
-      return { kind: "bytesIntrinsic", method: "dataViewNew", receiver, args: idxArgs, type: BYTES_U8, loc };
+      return dataViewNewOf(L, receiver, args.slice(1), loc);
     }
     const hint =
       "views compile over a typed array's own storage — new DataView(x.buffer, byteOffset?, byteLength?) " +
@@ -6390,8 +6527,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
       );
     }
     const receiver = L.lowerExpr(bufNode.expression);
-    const idxArgs = args.slice(1).map((a) => L.lowerExprExpecting(a, F64));
-    return { kind: "bytesIntrinsic", method: "dataViewNew", receiver, args: idxArgs, type: BYTES_U8, loc };
+    return dataViewNewOf(L, receiver, args.slice(1), loc);
   }
 
 /** Method calls on typed-array/Buffer receivers: slice and subarray (BOTH
@@ -6406,6 +6542,25 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     if (L.chainBlocked(access, call)) return null;
     const name = access.name.text;
     const receiverIr = L.mapTypeOf(L.typeOf(access.expression));
+    if (receiverIr?.kind === "arraybuffer" && L.isStdlibMember(access)) {
+      // ArrayBuffer.prototype.slice(start?, end?): a fresh copy over
+      // relative/clamped indices (omitted start 0, omitted end the length).
+      if (name !== "slice") return null;
+      const loc = locOf(call);
+      if (call.arguments.length > 2 || call.arguments.some(ts.isSpreadElement)) {
+        L.noLowering(`ArrayBuffer.slice with ${call.arguments.length} arguments`, call);
+      }
+      const receiver = lowerMemberRecv(L, access);
+      // An undefined argument (compile-time or at run time: a `number |
+      // undefined` value) is an omitted one.
+      const idx = (i: number, dflt: number): IrExpr => {
+        const absent: IrExpr = { kind: "numLit", value: dflt, type: F64, loc };
+        const node = call.arguments[i];
+        if (node === undefined) return absent;
+        return optionalNumber(L, node, absent) ?? lowerOptionalDefaultArg(L, node, F64, absent);
+      };
+      return { kind: "libCall", fn: "ab.slice", args: [receiver, idx(0, 0), idx(1, Infinity)], type: ARRAYBUFFER_T, loc };
+    }
     if (receiverIr?.kind !== "bytes") return null;
     if (!L.isStdlibMember(access)) return null;
     const loc = locOf(call);
@@ -7040,6 +7195,11 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
     const loc = locOf(call);
     const args = call.arguments;
     if (member === "from") {
+      // Buffer.from(ab[, byteOffset[, length]]) over an ArrayBuffer VALUE
+      // (WasmGC lanes): Node's fromArrayBuffer — a u8 view sharing ab's
+      // storage, ERR_BUFFER_OUT_OF_BOUNDS for the indices.
+      const viewed = arrayBufferView(L, args, "Buffer.from", (a) => ({ kind: "libCall", fn: "ab.bufferFrom", args: a, type: BYTES_U8, loc }));
+      if (viewed) return viewed;
       // Buffer.from(x.buffer[, byteOffset[, length]]): a u8 VIEW sharing
       // x's storage (Node shares the ArrayBuffer; length is in BYTES).
       // The first argument must be the SYNTACTIC `.buffer` of a typed

@@ -9893,6 +9893,8 @@ class LlEmitter {
           false,
           true,
         );
+      case "buffer":
+        throw new Error("emitter bug: view.buffer (an ArrayBuffer value) reached the LLVM backend (the WasmGC tier's)");
       default: {
         const _exhaustive: never = method;
         void _exhaustive;

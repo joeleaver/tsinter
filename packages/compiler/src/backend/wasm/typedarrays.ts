@@ -468,6 +468,326 @@ export class BytesBuilder {
 
   /* ── construction ────────────────────────────────────────────────── */
 
+  /* ── ArrayBuffer values (docs/design/arraybuffer.md) ──────────────
+   * An ArrayBuffer IS the storage array every view of it shares: identity
+   * is the array's, byteLength its length. */
+
+  /** The ArrayBuffer valtype: the (nullable) storage array ref. */
+  abRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.bufType() };
+  }
+
+  /** %w.ab.new — (f64 n) → ab; ToIndex (NaN→0, truncate) zeroed bytes, or
+   * Node's catchable "Invalid array buffer length" RangeError (negative or
+   * past 2^53-1). A length past the storage limit traps, the typed-array
+   * stance. */
+  abNewHelper(): number {
+    return this.cached("abNew", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([F64], [this.abRef()]), "%w.ab.new");
+      const c = new Code();
+      const N = 0, T = 1;
+      c.localGet(N);
+      c.localGet(N);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(N);
+      c.f64Trunc();
+      c.end();
+      c.localSet(T);
+      c.localGet(T);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(T);
+      c.f64Const(9007199254740991);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) => this.deps.lit(x, "Invalid array buffer length"), null);
+      c.refNull(this.bufType());
+      c.return_();
+      c.end();
+      this.emitByteSizeGuard(c, 1, () => c.localGet(T));
+      c.localGet(T);
+      c.i32TruncF64S();
+      c.arrayNewDefault(this.bufType());
+      this.mb.setBody(idx, [F64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.ab.ofView — (bytes) → ab: the view's WHOLE storage (view.buffer). */
+  abOfViewHelper(): number {
+    return this.cached("abOfView", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef()], [this.abRef()]), "%w.ab.ofView");
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.bytesType(), STORAGE);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.ab.asView — (ab) → bytes: a u8 view over the whole storage (off 0,
+   * len = the byte length) — the bridge to the u8 helpers (slice). */
+  abAsViewHelper(): number {
+    return this.cached("abAsView", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.abRef()], [this.bytesRef()]), "%w.ab.asView");
+      const c = new Code();
+      c.localGet(0);
+      c.refAsNonNull();
+      c.i32Const(0);
+      c.localGet(0);
+      c.arrayLen();
+      c.structNew(this.bytesType());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.ab.byteLength — (ab) → f64. */
+  abByteLengthHelper(): number {
+    return this.cached("abByteLength", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.abRef()], [F64]), "%w.ab.byteLength");
+      const c = new Code();
+      c.localGet(0);
+      c.arrayLen();
+      c.f64ConvertI32U();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.ab.slice — (ab, f64 start, f64 end) → ab: a fresh copy over
+   * relative/clamped indices (the u8 slice over the whole storage, whose
+   * result owns exactly its bytes). */
+  abSliceHelper(): number {
+    return this.cached("abSlice", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.abRef(), F64, F64], [this.abRef()]), "%w.ab.slice");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.abAsViewHelper());
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.sliceHelper("u8"));
+      c.structGet(this.bytesType(), STORAGE);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** Throws Node's RangeError with `msg` built by `push` (and returns a
+   * typed dummy of `ret`) — the helpers' common throw arm. */
+  private throwRange(c: Code, push: (x: Code) => void, code: string | null, ret: "bytes" | "none"): void {
+    this.deps.throwError(c, "%RangeError", "RangeError", push, code);
+    if (ret === "bytes") c.refNull(this.bytesType());
+    c.return_();
+  }
+
+  /** %w.ab.view:<elem> — (ab, f64 offsetArg, i32 hasLength, f64 lengthArg)
+   * → bytes: `new <T>(ab, byteOffset?, length?)`, a view sharing ab's
+   * storage. V8's InitializeTypedArrayFromArrayBuffer order and messages:
+   * ToIndex(offset) ("Start offset <arg> is outside the bounds of the
+   * buffer", the ORIGINAL argument's text), offset alignment ("start offset
+   * of <T> should be a multiple of <n>"), ToIndex(length) ("Invalid typed
+   * array length: <arg>"), then against the buffer: with no length, its
+   * byte length must be a multiple of the element size ("byte length of
+   * <T> should be a multiple of <n>") and cover the offset (the "Start
+   * offset" text over the truncated offset); with one, offset + length *
+   * size must fit ("Invalid typed array length: <length>"). An omitted
+   * offset arrives as 0 (ToIndex(undefined)). */
+  abViewHelper(elem: BytesElem): number {
+    const esz = this.esize(elem);
+    const cls = elem === "u8" ? "Uint8Array" : elem === "u32" ? "Uint32Array" : elem === "i32" ? "Int32Array" : "Float32Array";
+    return this.cached(`abView:${elem}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.abRef(), F64, I32, F64], [this.bytesRef()]), `%w.ab.view:${elem}`);
+      const c = new Code();
+      const AB = 0, OFFA = 1, HASLEN = 2, LENA = 3, OFF = 4, LEN = 5, BUFLEN = 6;
+      const toIndex = (arg: number, into: number): void => {
+        c.localGet(arg);
+        c.localGet(arg);
+        c.f64Ne();
+        c.ifResult(F64);
+        c.f64Const(0);
+        c.else_();
+        c.localGet(arg);
+        c.f64Trunc();
+        c.end();
+        c.localSet(into);
+      };
+      const outOfIndex = (v: number): void => {
+        c.localGet(v);
+        c.f64Const(0);
+        c.f64Lt();
+        c.localGet(v);
+        c.f64Const(9007199254740991);
+        c.f64Gt();
+        c.i32Or();
+      };
+      const startOffsetMsg = (v: number) => (x: Code): void => {
+        this.deps.lit(x, "Start offset ");
+        x.localGet(v);
+        x.call(this.deps.f64ToStr());
+        x.call(this.deps.concat());
+        this.deps.lit(x, " is outside the bounds of the buffer");
+        x.call(this.deps.concat());
+      };
+      const lengthMsg = (v: number) => (x: Code): void => {
+        this.deps.lit(x, "Invalid typed array length: ");
+        x.localGet(v);
+        x.call(this.deps.f64ToStr());
+        x.call(this.deps.concat());
+      };
+      const notMultiple = (v: number): void => {
+        c.localGet(v);
+        c.localGet(v);
+        c.f64Const(esz);
+        c.f64Div();
+        c.f64Floor();
+        c.f64Const(esz);
+        c.f64Mul();
+        c.f64Ne();
+      };
+      toIndex(OFFA, OFF);
+      outOfIndex(OFF);
+      c.ifVoid();
+      this.throwRange(c, startOffsetMsg(OFFA), null, "bytes");
+      c.end();
+      if (esz > 1) {
+        notMultiple(OFF);
+        c.ifVoid();
+        this.throwRange(c, (x) => this.deps.lit(x, `start offset of ${cls} should be a multiple of ${esz}`), null, "bytes");
+        c.end();
+      }
+      c.localGet(HASLEN);
+      c.ifVoid();
+      toIndex(LENA, LEN);
+      outOfIndex(LEN);
+      c.ifVoid();
+      this.throwRange(c, lengthMsg(LENA), null, "bytes");
+      c.end();
+      c.end();
+      c.localGet(AB);
+      c.arrayLen();
+      c.f64ConvertI32U();
+      c.localSet(BUFLEN);
+      c.localGet(HASLEN);
+      c.ifVoid();
+      {
+        c.localGet(OFF);
+        c.localGet(LEN);
+        c.f64Const(esz);
+        c.f64Mul();
+        c.f64Add();
+        c.localGet(BUFLEN);
+        c.f64Gt();
+        c.ifVoid();
+        this.throwRange(c, lengthMsg(LEN), null, "bytes");
+        c.end();
+      }
+      c.else_();
+      {
+        if (esz > 1) {
+          notMultiple(BUFLEN);
+          c.ifVoid();
+          this.throwRange(c, (x) => this.deps.lit(x, `byte length of ${cls} should be a multiple of ${esz}`), null, "bytes");
+          c.end();
+        }
+        c.localGet(BUFLEN);
+        c.localGet(OFF);
+        c.f64Lt();
+        c.ifVoid();
+        this.throwRange(c, startOffsetMsg(OFF), null, "bytes");
+        c.end();
+        c.localGet(BUFLEN);
+        c.localGet(OFF);
+        c.f64Sub();
+        c.f64Const(esz);
+        c.f64Div();
+        c.localSet(LEN);
+      }
+      c.end();
+      c.localGet(AB);
+      c.refAsNonNull();
+      c.localGet(OFF);
+      c.i32TruncF64U();
+      c.localGet(LEN);
+      c.i32TruncF64U();
+      c.structNew(this.bytesType());
+      this.mb.setBody(idx, [F64, F64, F64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.ab.bufferFrom — (ab, f64 offsetArg, i32 hasLength, f64 lengthArg)
+   * → bytes<u8>: `Buffer.from(ab, byteOffset?, length?)`, Node's
+   * fromArrayBuffer — a NaN offset reads 0; an offset past the buffer is
+   * ERR_BUFFER_OUT_OF_BOUNDS "offset"; a length that is not positive reads
+   * 0, one past what remains is ERR_BUFFER_OUT_OF_BOUNDS "length" — then
+   * the Uint8Array construction over those numbers (V8's own checks). */
+  abBufferFromHelper(): number {
+    return this.cached("abBufferFrom", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.abRef(), F64, I32, F64], [this.bytesRef()]), "%w.ab.bufferFrom");
+      const c = new Code();
+      const AB = 0, OFFA = 1, HASLEN = 2, LENA = 3, OFF = 4, MAX = 5, LEN = 6;
+      const oob = (what: string): void =>
+        this.throwRange(c, (x) => this.deps.lit(x, `"${what}" is outside of buffer bounds`), "ERR_BUFFER_OUT_OF_BOUNDS", "bytes");
+      c.localGet(OFFA);
+      c.localGet(OFFA);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(OFFA);
+      c.end();
+      c.localSet(OFF);
+      c.localGet(AB);
+      c.arrayLen();
+      c.f64ConvertI32U();
+      c.localGet(OFF);
+      c.f64Sub();
+      c.localSet(MAX);
+      c.localGet(MAX);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifVoid();
+      oob("offset");
+      c.end();
+      c.localGet(HASLEN);
+      c.ifResult(F64);
+      {
+        c.localGet(LENA);
+        c.f64Const(0);
+        c.f64Gt();
+        c.ifResult(F64);
+        {
+          c.localGet(LENA);
+          c.localGet(MAX);
+          c.f64Gt();
+          c.ifVoid();
+          oob("length");
+          c.end();
+          c.localGet(LENA);
+        }
+        c.else_();
+        c.f64Const(0);
+        c.end();
+      }
+      c.else_();
+      c.localGet(MAX);
+      c.end();
+      c.localSet(LEN);
+      c.localGet(AB);
+      c.localGet(OFF);
+      c.i32Const(1);
+      c.localGet(LEN);
+      c.call(this.abViewHelper("u8"));
+      this.mb.setBody(idx, [F64, F64, F64], c.bytes());
+      return idx;
+    });
+  }
+
   /** %w.bytes.new:<elem> — (f64 n) → bytes; ToIndex (NaN→0, truncate) a
    * zero-filled buffer, or Node's catchable "Invalid typed array length:
    * N" RangeError (N is the ORIGINAL argument's ToString — measured

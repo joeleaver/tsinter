@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
-import { arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
+import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -1207,6 +1207,13 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "date.toISOString": { argTypes: [F64], result: STRING },
   "date.parseGetTime": { argTypes: [STRING], result: F64 },
   "date.tzOffsetMin": { argTypes: [F64], result: F64 },
+  "ab.new": { argTypes: [F64], result: ARRAYBUFFER_T },
+  "ab.byteLength": { argTypes: [ARRAYBUFFER_T], result: F64 },
+  "ab.slice": { argTypes: [ARRAYBUFFER_T, F64, F64], result: ARRAYBUFFER_T },
+  // ab.view's result is bytes of any element kind (checked in the libCall case).
+  "ab.view": { argTypes: [ARRAYBUFFER_T, F64, BOOL, F64], result: BYTES_U8 },
+  "ab.bufferFrom": { argTypes: [ARRAYBUFFER_T, F64, BOOL, F64], result: BYTES_U8 },
+  "ab.asView": { argTypes: [ARRAYBUFFER_T], result: BYTES_U8 },
   "date.utc": { argTypes: [F64, F64, F64, F64, F64, F64, F64], result: F64 },
   "text.decode": { argTypes: [BYTES_U8], result: STRING },
   "fs.mkdirRecursiveSync": { argTypes: [STRING], result: VOID },
@@ -1873,6 +1880,7 @@ function validateFunction(
             // Symbol identity IS pointer identity (the frontend's rule).
             e.left.type.kind === "symbol" ||
             e.left.type.kind === "bytes" ||
+            e.left.type.kind === "arraybuffer" ||
             e.left.type.kind === "promise" ||
             // Runtime handles are objects to === (one handle per socket/
             // request — pointer identity is JS's object equality).
@@ -2412,6 +2420,7 @@ function validateFunction(
           err(`bytesIntrinsic ${e.method} args[1] must be a strLit encoding`, e.loc);
         }
         const EXTRA_SIGS: Record<string, { argTypes: IrType[]; minArgs: number; result: IrType } | undefined> = {
+          buffer: { argTypes: [], minArgs: 0, result: ARRAYBUFFER_T },
           equals: { argTypes: [BYTES_U8], minArgs: 1, result: BOOL },
           compareBuf: { argTypes: [BYTES_U8, F64, F64, F64, F64], minArgs: 1, result: F64 },
           // [needle, align, byteOffset?] — an OMITTED byteOffset is Node's
@@ -2464,7 +2473,7 @@ function validateFunction(
                           : e.method === "writeNumVar"
                             ? { argTypes: [STRING, F64, F64, F64], minArgs: 4, result: F64 }
                             : e.method === "dataViewNew"
-                              ? { argTypes: [F64, F64], minArgs: 0, result: BYTES_U8 }
+                              ? { argTypes: [F64, F64, BOOL], minArgs: 0, result: BYTES_U8 }
                               : e.method.startsWith("dvSet")
                                 ? {
                                     // dvSet*: [offset, value], the 8-bit setters take no littleEndian.
@@ -4367,6 +4376,10 @@ function validateFunction(
           if (e.type.kind !== "promise") {
             err(`libCall island.castFail must return a promise type, got ${e.type.kind}`, e.loc);
           }
+          break;
+        }
+        if (e.fn === "ab.view") {
+          if (e.type.kind !== "bytes") err(`libCall ab.view must return a typed array, got ${e.type.kind}`, e.loc);
           break;
         }
         if (e.fn === "global.undefRead") {

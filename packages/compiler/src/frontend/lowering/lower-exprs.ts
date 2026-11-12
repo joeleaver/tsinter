@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
-import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { ARRAYBUFFER_T, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
@@ -28,7 +28,7 @@ import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUn
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
 import { assignsThisMemberConditionally, classInstanceMemberNames, findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
-import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
+import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver, staticKindTest } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
@@ -5006,7 +5006,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       const probe = L.lowerExpr(expr.expression);
       if (probe.type.kind === "array") kind = "array";
     }
-    if (kind !== "string" && kind !== "array" && kind !== "map" && kind !== "set" && kind !== "f64" && kind !== "regex" && kind !== "url" && kind !== "searchParams" && kind !== "stats" && kind !== "spawnRes" && kind !== "child" && kind !== "bytes" && kind !== "symbol") {
+    if (kind !== "string" && kind !== "array" && kind !== "map" && kind !== "set" && kind !== "f64" && kind !== "regex" && kind !== "url" && kind !== "searchParams" && kind !== "stats" && kind !== "spawnRes" && kind !== "child" && kind !== "bytes" && kind !== "arraybuffer" && kind !== "symbol") {
       return null;
     }
     // child receivers also admit the user's own child-shaped interface
@@ -5222,6 +5222,33 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       }
       return null;
     }
+    if (kind === "arraybuffer") {
+      // ArrayBuffer members (docs/design/arraybuffer.md): byteLength reads;
+      // slice is a call (lower-calls.ts). resizable/maxByteLength/detached
+      // answer the fixed-length buffer's constants; resize/transfer keep
+      // the member fence.
+      const loc = locOf(expr);
+      if (name === "byteLength") {
+        const receiver = L.lowerExpr(expr.expression);
+        return { kind: "libCall", fn: "ab.byteLength", args: [receiver], type: F64, loc };
+      }
+      if (name === "maxByteLength") {
+        const receiver = L.lowerExpr(expr.expression);
+        return { kind: "libCall", fn: "ab.byteLength", args: [receiver], type: F64, loc };
+      }
+      if (name === "resizable" || name === "detached") {
+        const receiver = L.lowerExpr(expr.expression);
+        return {
+          kind: "seqExpr",
+          stmts: [{ kind: "exprStmt", expr: receiver, loc }],
+          result: { kind: "boolLit", value: false, type: BOOL, loc },
+          type: BOOL,
+          loc,
+        };
+      }
+      if (name === "slice") L.unsupported("SC1090", expr, "ArrayBuffer methods as values (call 'slice' directly)");
+      return null;
+    }
     if (kind === "bytes") {
       const loc = locOf(expr);
       if (name === "length" || name === "byteLength") {
@@ -5244,9 +5271,15 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         const receiver = L.lowerExpr(expr.expression);
         return { kind: "bytesIntrinsic", method: "byteOffset", receiver, args: [], type: F64, loc };
       }
+      if (name === "buffer" && L.sharedDynamic) {
+        // The WasmGC lanes: the view's whole storage as an ArrayBuffer
+        // value (docs/design/arraybuffer.md).
+        const receiver = L.lowerExpr(expr.expression);
+        return { kind: "bytesIntrinsic", method: "buffer", receiver, args: [], type: ARRAYBUFFER_T, loc: locOf(expr) };
+      }
       if (name === "buffer") {
-        // No ArrayBuffer VALUE exists — `.buffer` compiles only in the
-        // one composed position that consumes it, the DataView
+        // No ArrayBuffer VALUE exists on the C lanes — `.buffer` compiles
+        // only in the one composed position that consumes it, the DataView
         // constructor's first argument (lowerDataViewNew peels it).
         L.unsupported(
           "SC1090",
@@ -8729,6 +8762,17 @@ function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
     if (e.type.kind === "string") return e;
     // String(1n) / `${1n}` / "" + 1n: the decimal text, no suffix
     if (e.type.kind === "bigint") return { kind: "toString", operand: e, type: STRING, loc: e.loc };
+    // String(ab) / `${ab}`: Object.prototype.toString's tag, after the
+    // value evaluates.
+    if (e.type.kind === "arraybuffer") {
+      return {
+        kind: "seqExpr",
+        stmts: [{ kind: "exprStmt", expr: e, loc: e.loc }],
+        result: { kind: "strLit", value: "[object ArrayBuffer]", type: STRING, loc: e.loc },
+        type: STRING,
+        loc: e.loc,
+      };
+    }
     if (e.type.kind === "dyn") {
       // String(u) / `${u}`: a runtime dispatch over the dyn kind — Node's
       // String() exactly (undefined/null texts, JS number formatting,
@@ -10096,6 +10140,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
             // Typed arrays / Buffers ARE objects to ===: pointer identity
             // (buf === buf.swap16() — the in-place mutators return this).
             idLeft.type.kind === "bytes" ||
+            // ArrayBuffers: the storage array IS the value, so two reads of
+            // one view's .buffer compare equal (docs/design/arraybuffer.md).
+            idLeft.type.kind === "arraybuffer" ||
             idLeft.type.kind === "promise") &&
           typeEquals(idLeft.type, idRight.type)
         ) {
@@ -10849,6 +10896,36 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * classes are unrelated (a standalone class has no other relatives).
    * Folding is limited to side-effect-free operands — dropping a computed
    * operand would skip its effects, so those are rejected instead. */
+  /** The standard-library classes whose values are known not to be a
+   * DataView (a DataView shares the u8 bytes representation, so a
+   * static-kind `instanceof Uint8Array` answer must know it is not one). */
+  const NOT_DATAVIEW_CLASSES = new Set(["Uint8Array", "Uint32Array", "Int32Array", "Float32Array", "ArrayBuffer", "SharedArrayBuffer", "Buffer"]);
+
+  /** Whether every value of `t` is known not to be a DataView: each union
+   * part a primitive or one of NOT_DATAVIEW_CLASSES (stdlib provenance); a
+   * type parameter by its declared constraint (none: unknown). Anything
+   * else — DataView, ArrayBufferView, an intersection, a user type — is
+   * not known. */
+  function knownNotDataView(L: Lowerer, t: ts.Type, depth = 0): boolean {
+    if (depth > 8) return false;
+    if (t.flags & ts.TypeFlags.TypeParameter) {
+      const tpSym = t.getSymbol();
+      const decl = (tpSym ? L.checker.declarationsOf(tpSym) : []).find((d) => d.kind === ts.SyntaxKind.TypeParameter) as
+        | (ts.Node & { constraint?: ts.TypeNode })
+        | undefined;
+      if (decl?.constraint === undefined) return false;
+      return knownNotDataView(L, L.checker.getTypeFromTypeNode(decl.constraint), depth + 1);
+    }
+    if (t.isUnionType()) return t.getTypes().every((p) => knownNotDataView(L, p, depth + 1));
+    const primitive =
+      ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.BigIntLike |
+      ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void;
+    if (t.flags & primitive) return true;
+    const sym = t.getSymbol();
+    if (sym === undefined || !NOT_DATAVIEW_CLASSES.has(sym.name)) return false;
+    return L.checker.declarationsOf(sym).every((d) => L.isStdlibFile(d.getSourceFile()));
+  }
+
   export function lowerInstanceOf(L: Lowerer, expr: ts.BinaryExpression, loc: SrcLoc): IrExpr {
     {
       // Unit U4: a dynamic constructor on the right (lower-objmodel.ts).
@@ -10937,6 +11014,36 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         const left = asDynOperand(L.lowerExpr(expr.left));
         if (left.type.kind === "dyn") {
           return { kind: "dynTest", test: "bytes", value: left, type: BOOL, loc };
+        }
+      }
+      // `x instanceof ArrayBuffer` / `x instanceof Uint8Array` (and the
+      // other typed-array classes) on the WasmGC lanes, over static
+      // ArrayBuffer/typed-array kinds: the static kind or the union tag
+      // answers (docs/design/arraybuffer.md step 2). A Buffer IS a
+      // Uint8Array, as in Node; a DataView rides the u8 bytes kind and is
+      // fenced out of the Uint8Array answer by its own static type below.
+      if (ts.isIdentifier(expr.right) && L.sharedDynamic && !L.caughtLocalOf(expr.left)) {
+        const ctor = (["ArrayBuffer", "Uint8Array", "Uint32Array", "Int32Array", "Float32Array"] as const)
+          .find((n) => L.isStdlibGlobal(expr.right as ts.Identifier, n));
+        if (ctor) {
+          const leftTs = L.typeOf(expr.left);
+          const leftIr = L.mapTypeOf(leftTs);
+          const relevant = (t: IrType | null | undefined): boolean =>
+            t?.kind === "arraybuffer" || t?.kind === "bytes" ||
+            (t?.kind === "union" && (L.unions.get(t.unionId)?.arms.some((a) => a.kind === "arraybuffer" || a.kind === "bytes") ?? false));
+          if (relevant(leftIr) && ctor === "Uint8Array" && !knownNotDataView(L, leftTs)) {
+            L.unsupported(
+              "SC1090",
+              expr,
+              `'instanceof Uint8Array' on a '${L.checker.typeToString(leftTs)}' value (a DataView shares the Uint8Array representation, so the answer has no static test — narrow with ArrayBuffer.isView or a typed parameter first)`,
+            );
+          }
+          if (relevant(leftIr)) {
+            const elem = ctor === "Uint8Array" ? "u8" : ctor === "Uint32Array" ? "u32" : ctor === "Int32Array" ? "i32" : "f32";
+            const pred = (t: IrType): boolean =>
+              ctor === "ArrayBuffer" ? t.kind === "arraybuffer" : t.kind === "bytes" && t.elem === elem;
+            return staticKindTest(L, L.lowerExpr(expr.left), expr.left, pred, `'instanceof ${ctor}'`, loc);
+          }
         }
       }
       // `x instanceof RegExp` over a union with a regex arm (the
@@ -12392,6 +12499,47 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
     const def = L.unions.get(value.type.unionId);
     if (!def) throw new Error(`lowerer bug: unknown union ${value.type.unionId}`);
     const field = expr.name.text;
+    // `x.byteLength` over ArrayBuffer and typed-array arms (cosmokit's
+    // `Source` shapes — docs/design/arraybuffer.md step 2), and the view
+    // members `byteOffset`/`buffer` over typed-array arms (ArrayBufferView):
+    // each arm's own read, chosen by the tag.
+    // A view member the checker admits on a narrowed receiver whose value
+    // still carries ArrayBuffer arms (`ArrayBuffer | ArrayBufferView` past
+    // an `instanceof ArrayBuffer` test) reads the view arms only: an
+    // ArrayBuffer reaching the last arm's narrow is the S122 fence.
+    const viewField = field === "byteOffset" || field === "buffer";
+    const allBuffers = def.arms.every((a) => a.kind === "arraybuffer" || a.kind === "bytes");
+    if (
+      (field === "byteLength" && allBuffers) ||
+      (viewField && L.sharedDynamic && allBuffers && def.arms.some((a) => a.kind === "bytes"))
+    ) {
+      const loc = locOf(expr);
+      const unionId = value.type.unionId;
+      const t = L.declareHiddenLocal("%ab.u", value.type);
+      const ref: IrExpr = { kind: "varRef", localId: t.id, type: value.type, loc };
+      const tags = def.arms.flatMap((a, i) => (viewField && a.kind !== "bytes" ? [] : [i]));
+      const read = (i: number): IrExpr => {
+        const arm = def.arms[i]!;
+        const narrowed: IrExpr = { kind: "unionNarrow", unionId, tag: i, value: ref, type: arm, loc };
+        if (arm.kind === "arraybuffer") return { kind: "libCall", fn: "ab.byteLength", args: [narrowed], type: F64, loc };
+        if (field === "buffer") return { kind: "bytesIntrinsic", method: "buffer", receiver: narrowed, args: [], type: ARRAYBUFFER_T, loc };
+        return { kind: "bytesIntrinsic", method: field === "byteOffset" ? "byteOffset" : "byteLength", receiver: narrowed, args: [], type: F64, loc };
+      };
+      const resultT: IrType = field === "buffer" ? ARRAYBUFFER_T : F64;
+      let result = read(tags[tags.length - 1]!);
+      for (let k = tags.length - 2; k >= 0; k--) {
+        const i = tags[k]!;
+        result = {
+          kind: "ternary",
+          cond: { kind: "unionIsTag", unionId, tag: i, negated: false, value: ref, type: BOOL, loc },
+          then: read(i),
+          else_: result,
+          type: resultT,
+          loc,
+        };
+      }
+      return { kind: "seqExpr", stmts: [{ kind: "varDecl", localId: t.id, init: value, loc }], result, type: resultT, loc };
+    }
     let common: IrType | null = null;
     for (const arm of def.arms) {
       let ft: IrType | undefined;

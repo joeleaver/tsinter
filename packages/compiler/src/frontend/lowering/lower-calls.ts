@@ -3498,6 +3498,28 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // transferable, so the call is Node's DataCloneError — decided here
       // (the list's values need no dyn representation to fail). An EMPTY
       // literal transfer list is a no-op member and drops.
+      // An ArrayBuffer root (WasmGC lanes) clones to a fresh copy of its
+      // bytes. With options, a transfer list may name the buffer, which
+      // detaches it — no lowering (detached buffers are not modelled).
+      if (L.sharedDynamic && L.mapTypeOf(L.typeOf(valueNode))?.kind === "arraybuffer") {
+        if (expr.arguments.length > 1) {
+          L.noLowering(
+            "structuredClone of an ArrayBuffer with options",
+            expr.arguments[1]!,
+            "a transfer list detaches the buffer, and detached buffers have no lowering — clone without options",
+          );
+        }
+        const ab = L.lowerExpr(valueNode);
+        if (ab.type.kind === "arraybuffer") {
+          return {
+            kind: "libCall",
+            fn: "ab.slice",
+            args: [ab, { kind: "numLit", value: 0, type: F64, loc }, { kind: "numLit", value: Infinity, type: F64, loc }],
+            type: ab.type,
+            loc,
+          };
+        }
+      }
       {
         let optNode = expr.arguments[1];
         while (optNode && ts.isParenthesizedExpression(optNode)) optNode = optNode.expression;
@@ -4536,6 +4558,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // by the receiver's own element.
         L.lowerFilterNarrowCall(expr, expr.expression) ??
         lowerArrayIsArrayCall(L, expr, expr.expression) ??
+        lowerArrayBufferIsViewCall(L, expr, expr.expression) ??
         lowerBigIntStaticCall(L, expr, expr.expression) ??
         lowerBigIntMethodCall(L, expr, expr.expression) ??
         lowerSymbolStaticCall(L, expr, expr.expression) ??
@@ -5220,6 +5243,60 @@ const DYN_STRING_ONLY_METHODS = new Set([
       call,
       "statically-decided Array.isArray on computed arguments (bind the value to a variable first)",
     );
+  }
+
+/** `ArrayBuffer.isView(v)` on the WasmGC lanes (docs/design/
+ * arraybuffer.md step 2): true for a typed array, Buffer or DataView (one
+ * bytes representation), false for an ArrayBuffer and every other static
+ * kind; a union answers by its runtime tag (staticKindTest). */
+  function lowerArrayBufferIsViewCall(L: Lowerer, call: ts.CallExpression,
+    access: ts.PropertyAccessExpression,): IrExpr | null {
+    if (call.questionDotToken || access.questionDotToken || !L.sharedDynamic) return null;
+    if (L.stdlibGlobalMember(access, "ArrayBuffer") !== "isView") return null;
+    if (call.arguments.length !== 1 || ts.isSpreadElement(call.arguments[0]!)) return null;
+    const argNode = call.arguments[0]!;
+    return staticKindTest(L, L.lowerExpr(argNode), argNode, (t) => t.kind === "bytes", "ArrayBuffer.isView", locOf(call));
+  }
+
+/** A test answered by the operand's STATIC kind (`pred` over each kind):
+ * a union by its runtime tag — one matching arm the plain tag test,
+ * several OR'd, none false (over side-effect-free reads, the
+ * Array.isArray discipline); a plain value folds over a side-effect-free
+ * read (a slot that may hold undefined answers false then). Opaque
+ * operands (dyn, jsval, caught arms) refuse with the narrow-first hint. */
+  export function staticKindTest(L: Lowerer, arg: IrExpr, argNode: ts.Node,
+    pred: (t: IrType) => boolean, what: string, loc: SrcLoc,): IrExpr {
+    const freeRead = arg.kind === "varRef" || arg.kind === "recordGet" || arg.kind === "fieldGet";
+    const opaqueKind = (t: IrType): boolean => t.kind === "dyn" || t.kind === "caught" || t.kind === "jsval";
+    if (arg.type.kind === "union") {
+      const unionId = arg.type.unionId;
+      const def = L.unions.get(unionId);
+      const opaque = !def || def.arms.some(opaqueKind);
+      const tags = def ? def.arms.flatMap((a, i) => (pred(a) ? [i] : [])) : [];
+      if (!opaque && tags.length === 1) {
+        return { kind: "unionIsTag", unionId, tag: tags[0]!, negated: false, value: arg, type: BOOL, loc };
+      }
+      if (!opaque && freeRead && tags.length === 0) return { kind: "boolLit", value: false, type: BOOL, loc };
+      if (!opaque && freeRead) {
+        return tags
+          .map((tag): IrExpr => ({ kind: "unionIsTag", unionId, tag, negated: false, value: arg, type: BOOL, loc }))
+          .reduce((left, right) => ({ kind: "logical", op: "||", left, right, type: BOOL, loc }));
+      }
+      L.unsupported("SC1090", argNode, `${what} on '${L.fmt(arg.type)}' values (narrow first, or bind the value to a variable)`);
+    }
+    if (opaqueKind(arg.type)) {
+      L.unsupported("SC1090", argNode, `${what} on '${L.fmt(arg.type)}' values (narrow first)`);
+    }
+    const answer = pred(arg.type);
+    if (answer && mayHoldSlotUndef(L, arg)) return isUndefExpr(arg, true, loc);
+    if (freeRead) return { kind: "boolLit", value: answer, type: BOOL, loc };
+    return {
+      kind: "seqExpr",
+      stmts: [{ kind: "exprStmt", expr: arg, loc }],
+      result: { kind: "boolLit", value: answer, type: BOOL, loc },
+      type: BOOL,
+      loc,
+    };
   }
 
 /** Predicate declarations currently being inlined — re-entrancy guard

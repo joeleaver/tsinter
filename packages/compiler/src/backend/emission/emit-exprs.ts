@@ -1328,6 +1328,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             E.emitPendingCheck();
             return { name: "", type: e.type };
           }
+          case "buffer":
+            throw new Error("emitter bug: view.buffer (an ArrayBuffer value) reached the C backend (the WasmGC tier's)");
           default: {
             const _exhaustive: never = method;
             void _exhaustive;
@@ -6306,6 +6308,12 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           // WasmGC lanes only; the legacy C runtime has no exclusive open.
           case "fs.writeFileExclModeSync":
           case "fsp.writeFileMode":
+          case "ab.new":
+          case "ab.byteLength":
+          case "ab.slice":
+          case "ab.view":
+          case "ab.bufferFrom":
+          case "ab.asView":
           case "fsp.writeFileExclMode":
           // child_process option values and the exec errors they build
           // (lower-child-options.ts) are lowered for the WasmGC lanes only.

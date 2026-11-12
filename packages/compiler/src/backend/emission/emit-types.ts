@@ -35,6 +35,10 @@ export function cType(t: IrType): string {
       // One struct for every element kind (the runtime dispatches on the
       // stored elem tag) — exactly the ScrArr pattern.
       return "ScrBytes *";
+    case "arraybuffer":
+      // The WasmGC tier's value (docs/design/arraybuffer.md): the frontend
+      // refuses it on the C lanes before a backend could see one.
+      throw new Error("emitter bug: an ArrayBuffer value reached the C backend (the WasmGC tier's)");
     case "url":
       return "ScrUrl *";
     case "searchParams":
@@ -322,6 +326,8 @@ export function boxKindC(t: IrType): string {
     case "childStream":
     case "bytes":
       throw new Error(`emitter bug: ${t.kind} boxes go through boxNewC, not boxKindC`);
+    case "arraybuffer":
+      throw new Error("emitter bug: an ArrayBuffer value reached the C backend (the WasmGC tier's)");
     case "procStream":
       // Scalar (the fd double) — the f64 box carries it.
       return "SCR_BOX_F64";
@@ -476,6 +482,8 @@ export function elemKindC(elem: IrType): string {
       return "SCR_ELEM_ARR";
     case "bytes":
       return "SCR_ELEM_BYTES";
+    case "arraybuffer":
+      throw new Error("emitter bug: an ArrayBuffer value reached the C backend (the WasmGC tier's)");
     case "record":
     case "object":
     case "union":

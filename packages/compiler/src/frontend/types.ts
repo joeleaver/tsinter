@@ -1,7 +1,7 @@
 import { isDtsMirrorPath } from "./npm-static.js";
 import * as ts from "./ts7/adapter.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
-import { arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, canMarshalIntoIsland, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
+import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, canMarshalIntoIsland, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
 import { accessorSlotProp, shapeFieldCopy } from "../ir/nodes.js";
@@ -281,6 +281,8 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       // The u8 kind reads as Uint8Array (Buffer maps here too — one
       // runtime representation; the message stays honest either way).
       return t.elem === "u8" ? "Uint8Array" : t.elem === "u32" ? "Uint32Array" : t.elem === "i32" ? "Int32Array" : "Float32Array";
+    case "arraybuffer":
+      return "ArrayBuffer";
     case "map":
       return `${t.weak === true ? "WeakMap" : "Map"}<${formatIrType(t.key, shapes, unions, seen)}, ${formatIrType(t.value, shapes, unions, seen)}>`;
     case "set":
@@ -977,6 +979,19 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // A union MIXING enum literals with non-enum arms (`E | undefined`)
   // falls through to the general union branch below, whose per-part
   // recursion re-enters here with the pure enum parts.
+  // ArrayBufferLike (ArrayBuffer | SharedArrayBuffer, a view's default
+  // buffer type — Buffer's `.buffer`): the ArrayBuffer value. No
+  // SharedArrayBuffer value ever exists here (the Atomics idiom erases it
+  // into its view), so every runtime value of the union is an ArrayBuffer.
+  if (ctx.sharedDynamic === true && widened.isUnionType()) {
+    const bufferPart = (p: ts.Type): string | null => {
+      const sym = p.getSymbol();
+      if (sym?.name !== "ArrayBuffer" && sym?.name !== "SharedArrayBuffer") return null;
+      return checker.declarationsOf(sym).some((d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile())) ? sym.name : null;
+    };
+    const names = widened.getTypes().map(bufferPart);
+    if (names.length > 0 && names.every((n) => n !== null) && names.includes("ArrayBuffer")) return ARRAYBUFFER_T;
+  }
   if (flags & ts.TypeFlags.EnumLike) {
     const parts = widened.isUnionType() ? widened.getTypes() : [widened];
     if (parts.every((p) => p.flags & ts.TypeFlags.EnumLike)) {
@@ -1640,6 +1655,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // the same numeric-handle story over the check-phase queue — its own id
   // space, so clearTimeout of an Immediate no-ops like Node.
   if (isStdlibInterface("Immediate")) return F64;
+  // ArrayBuffer (docs/design/arraybuffer.md): a value on the WasmGC lanes
+  // (the one shared dynamic world's lanes); the C lanes keep the fence.
+  if (isStdlibInterface("ArrayBuffer") && ctx.sharedDynamic === true) return ARRAYBUFFER_T;
   if (isStdlibInterface("Uint8Array")) return bytesOf("u8");
   if (isStdlibInterface("Uint32Array")) return bytesOf("u32");
   // Int32Array: the signed 32-bit kind (element reads sign-extend, writes
@@ -1647,6 +1665,14 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // SharedArrayBuffer, and the i32 semantics hold for every other use.
   if (isStdlibInterface("Int32Array")) return bytesOf("i32");
   if (isStdlibInterface("Float32Array")) return bytesOf("f32");
+  // ArrayBufferView (WasmGC lanes; docs/design/arraybuffer.md): any view —
+  // the union of the typed-array kinds (a DataView or Buffer rides the u8
+  // arm). Reads through it are the members every view shares.
+  if (isStdlibInterface("ArrayBufferView") && ctx.sharedDynamic === true) {
+    const arms = [bytesOf("u8"), bytesOf("u32"), bytesOf("i32"), bytesOf("f32")];
+    const sorted = arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+    return { kind: "union", unionId: ctx.unions.intern(sorted) };
+  }
   // DataView: the ONE view kind — a u8 bytes value whose runtime
   // representation borrows (aliases) its owner's storage, so reads through
   // it see writes to the source exactly like JS. The checker keeps the
@@ -2574,6 +2600,13 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
             if (mapType(rest, ctx)?.kind === "jsval") return JSVAL;
           }
           return null;
+        }
+        // An ArrayBufferView PART maps to the union of the view kinds
+        // (`ArrayBuffer | ArrayBufferView`, cosmokit's Source): its arms
+        // join this union's directly.
+        if (mapped.kind === "union" && part.getSymbol()?.name === "ArrayBufferView") {
+          for (const arm of unions.get(mapped.unionId)?.arms ?? []) byKey.set(typeKey(arm), arm);
+          continue;
         }
         byKey.set(typeKey(mapped), mapped);
       }

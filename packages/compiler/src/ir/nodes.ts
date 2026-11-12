@@ -99,6 +99,14 @@ export type IrType =
    * elements, and JSON. Holds only raw bytes — never part of a cycle, no
    * trace. */
   | { kind: "bytes"; elem: IrBytesElem }
+  /** An ArrayBuffer (docs/design/arraybuffer.md, SEMANTICS.md S035): the
+   * WHOLE byte storage typed arrays view — on the WasmGC lanes the same
+   * $bytes struct with off 0 and len = the storage's byte length. Views
+   * built over it share the storage; identity is the storage's. WasmGC
+   * lanes only (the C lanes refuse by name). Allowed as a union arm
+   * (tag-based narrowing); fenced out of map keys/values, set elements and
+   * JSON until those hooks land. */
+  | { kind: "arraybuffer" }
   /** A WHATWG URL instance (scr_url.c): heap, refcounted, IMMUTABLE — the
    * parsed components are frozen at construction, so getters are pure
    * reads (the mutating lib setters are fenced). Constructed by `new URL`
@@ -371,6 +379,7 @@ export const REF_TRUTHY_KINDS: ReadonlySet<string> = new Set([
 
 export const F64: IrType = { kind: "f64" };
 export const BYTES_U8: IrType = { kind: "bytes", elem: "u8" };
+export const ARRAYBUFFER_T: IrType = { kind: "arraybuffer" };
 export const STRING: IrType = { kind: "string" };
 export const BOOL: IrType = { kind: "bool" };
 export const REGEX: IrType = { kind: "regex" };
@@ -617,6 +626,8 @@ export function typeKey(t: IrType): string {
       return `array<${typeKey(t.elem)}>`;
     case "bytes":
       return `bytes<${t.elem}>`;
+    case "arraybuffer":
+      return "arraybuffer";
     case "map":
       return `${t.weak === true ? "weak" : ""}map<${typeKey(t.key)},${typeKey(t.value)}>`;
     case "set":
@@ -1693,6 +1704,9 @@ export type IrStrIntrinsicMethod =
  * (integer kinds by modular truncation, Float32 by double→float
  * rounding). No BIG setters exist — bigint arguments never lower. */
 export type IrBytesIntrinsicMethod =
+  /** `view.buffer` — the WHOLE storage the view (any elem kind, a DataView
+   * included) shares, as an ArrayBuffer value (WasmGC lanes). */
+  | "buffer"
   | "length"
   | "byteLength"
   | "get"
@@ -4307,6 +4321,24 @@ export type IrLibFn =
    * zone offset in minutes west of UTC (V8's integer truncation, never
    * -0); NaN for an invalid date. Never throws. */
   | "date.tzOffsetMin"
+  /** ArrayBuffer values (docs/design/arraybuffer.md; WasmGC lanes):
+   * `ab.new` [f64 n] -> arraybuffer — ToIndex(n) zeroed bytes, THROWS
+   * Node's "Invalid array buffer length" RangeError; `ab.byteLength`
+   * [arraybuffer] -> f64; `ab.slice` [arraybuffer, f64 start, f64 end] ->
+   * arraybuffer, a fresh copy over relative/clamped indices (an omitted
+   * start is 0, an omitted end +Infinity). `ab.view` [arraybuffer, f64
+   * byteOffset, bool hasLength, f64 length] -> bytes<elem of the result
+   * type> — `new T(ab, byteOffset?, length?)`, a view sharing ab's
+   * storage, V8's RangeErrors; `ab.bufferFrom` [same] -> bytes<u8> —
+   * `Buffer.from(ab, byteOffset?, length?)`, Node's fromArrayBuffer;
+   * `ab.asView` [arraybuffer] -> bytes<u8> — the whole buffer as a u8 view
+   * (the DataView construction's receiver). */
+  | "ab.new"
+  | "ab.byteLength"
+  | "ab.slice"
+  | "ab.view"
+  | "ab.bufferFrom"
+  | "ab.asView"
   /** `Date.UTC(...)` — seven f64 arguments (the frontend completes the
    * spec's defaults for omitted trailing parts: month 0, date 1, time
    * parts 0), the spec's MakeDay/MakeTime/TimeClip exactly: 0–99 years
@@ -5880,6 +5912,7 @@ function isJsonSafeAt(
     // Buffers as {type:"Buffer",data:[...]} in Node — neither shape is
     // representable type-directedly; rejected like Maps.
     case "bytes":
+    case "arraybuffer":
     case "stats":
     case "spawnRes":
     case "child":
@@ -7881,6 +7914,10 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "fs.lstatSync",
   "fs.writeFileModeSync",
   "fs.writeFileExclModeSync",
+  // new ArrayBuffer(n): Node's RangeError for an invalid length.
+  "ab.new",
+  "ab.view",
+  "ab.bufferFrom",
   "fs.mkdirModeSync",
   "fs.mkdirRecursiveModeSync",
   "fs.openSync",

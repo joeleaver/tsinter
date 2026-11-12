@@ -20885,6 +20885,10 @@ class Assembler {
         // never fails; elem-kind-specific representation questions live
         // at the bytesIntrinsic/bytesNew method sites, not here.
         return this.bytesB.bytesRef();
+      case "arraybuffer":
+        // The storage array every view of it shares (docs/design/
+        // arraybuffer.md): identity is the array's.
+        return this.bytesB.abRef();
       case "regex":
         // ONE immutable interned struct whatever the pattern (regex-
         // value.ts's %w.re.Regex, §3.2) — never fails, mirroring bytes
@@ -21026,6 +21030,7 @@ class Assembler {
           t.elem.kind === "map" ||
           t.elem.kind === "set" ||
           t.elem.kind === "bytes" ||
+          t.elem.kind === "arraybuffer" || // ArrayBuffer[] (docs/design/arraybuffer.md): mapType's arm never fails, the same lockstep
           t.elem.kind === "regex" ||
           t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
           t.elem.kind === "child" || // INC-28 U2: a ChildProcess[] (mapType's child arm never fails), the lockstep this list's header comment names
@@ -21112,6 +21117,8 @@ class Assembler {
       case "bytes":
         // mapType never fails on bytes either — the consistency rule.
         return this.bytesB.bytesRef();
+      case "arraybuffer":
+        return this.bytesB.abRef();
       case "regex":
         // mapType never fails on regex either — same consistency rule,
         // same shape as bytes/promise/dyn/caught: ONE struct (%w.re.Regex,
@@ -26653,6 +26660,41 @@ class Assembler {
           this.releaseScratch(F64, msLocal);
           return;
         }
+        // ArrayBuffer values (docs/design/arraybuffer.md).
+        if (e.fn === "ab.new") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.bytesB.abNewHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "ab.byteLength") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.bytesB.abByteLengthHelper());
+          return;
+        }
+        if (e.fn === "ab.slice") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.bytesB.abSliceHelper());
+          return;
+        }
+        if (e.fn === "ab.view" || e.fn === "ab.bufferFrom") {
+          for (const a of e.args) this.walkExpr(a);
+          if (e.fn === "ab.bufferFrom") {
+            code.call(this.bytesB.abBufferFromHelper());
+          } else {
+            if (e.type.kind !== "bytes") throw new Error("emitter bug: ab.view result is not a typed array");
+            code.call(this.bytesB.abViewHelper(e.type.elem));
+          }
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "ab.asView") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.bytesB.abAsViewHelper());
+          return;
+        }
         if (e.fn === "date.tzOffsetMin") {
           this.walkExpr(e.args[0]!);
           code.call(this.date.tzOffsetMinHelper());
@@ -31740,12 +31782,22 @@ class Assembler {
            * omitted → i32Const(0) (big-endian, the JS default) — mirrors
            * writeStr's hasLen flag pattern just above for dataViewNew's
            * hasLength. ─────────────────────────────────────────────── */
+          case "buffer": {
+            // view.buffer: the WHOLE storage the view shares.
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.abOfViewHelper());
+            return;
+          }
           case "dataViewNew": {
             this.walkExpr(e.receiver);
             if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
             else code.f64Const(0);
+            // A third argument is the length's RUNTIME presence (a
+            // `number | undefined` length: undefined is absent); its
+            // operands are bound reads, so the push order is free.
             const hasLen = e.args[1] !== undefined;
-            code.i32Const(hasLen ? 1 : 0);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.i32Const(hasLen ? 1 : 0);
             if (hasLen) this.walkExpr(e.args[1]!);
             else code.f64Const(0);
             code.call(this.bytesB.dataViewNewHelper());
@@ -38200,6 +38252,8 @@ class Assembler {
         if (
           k === "array" || k === "record" || k === "object" || k === "promise" ||
           k === "classval" || k === "map" || k === "set" || k === "bytes" || k === "symbol" ||
+          // An ArrayBuffer is its storage array: identity is the array's.
+          k === "arraybuffer" ||
           // INC-29 U1: a node:net Socket / Server is one GC struct per
           // handle; identity is the reference (`c.pause() === c`).
           k === "netSocket" || k === "netServer" ||

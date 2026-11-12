@@ -36,7 +36,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
 import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
@@ -137,6 +137,7 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
     case "bigint":
     case "dyn":
     case "jsval":
+    case "arraybuffer":
       return null;
     case "array":
       return inspectSupport(L, t.elem, visiting, out);
@@ -457,6 +458,67 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
   let body: IrStmt[];
 
   switch (t.kind) {
+    case "arraybuffer": {
+      // Node's formatArrayBuffer: `ArrayBuffer { [Uint8Contents]: <hex
+      // pairs>, [byteLength]: n }` — at most maxArrayLength (100) bytes,
+      // then " ... N more byte(s)"; the frame engine lays it out.
+      const sv = (): IrExpr => ref("s.0", STRING);
+      const hv = (): IrExpr => ref("h.0", STRING);
+      const nv = (): IrExpr => ref("n.0", F64);
+      const iv = (): IrExpr => ref("i.0", F64);
+      const cat = (l: IrExpr, rr: IrExpr): IrExpr => ({ kind: "strConcat", left: l, right: rr, type: STRING, loc });
+      const bin = (op: "+" | "-" | ">" | "<" | "===", l: IrExpr, rr: IrExpr, type: IrType): IrExpr => ({ kind: "bin", op, left: l, right: rr, type, loc });
+      locals.push(
+        { id: "h.0", name: "h", type: STRING, mutable: false },
+        { id: "n.0", name: "n", type: F64, mutable: false },
+        { id: "s.0", name: "s", type: STRING, mutable: true },
+        { id: "i.0", name: "i", type: F64, mutable: true },
+      );
+      const asView: IrExpr = { kind: "libCall", fn: "ab.asView", args: [v()], type: BYTES_U8, loc };
+      const more = bin("-", nv(), num(100, loc), F64);
+      body = [
+        depthGate("[ArrayBuffer]"),
+        { kind: "varDecl", localId: "n.0", init: { kind: "libCall", fn: "ab.byteLength", args: [v()], type: F64, loc }, loc },
+        { kind: "varDecl", localId: "h.0", init: { kind: "bytesIntrinsic", method: "toString", receiver: asView, args: [str("hex", loc), num(0, loc), num(100, loc)], type: STRING, loc }, loc },
+        { kind: "varDecl", localId: "s.0", init: str("", loc), loc },
+        {
+          kind: "for",
+          init: { kind: "varDecl", localId: "i.0", init: num(0, loc), loc },
+          cond: bin("<", iv(), { kind: "strIntrinsic", method: "length", receiver: hv(), args: [], type: F64, loc }, BOOL),
+          update: { kind: "assign", localId: "i.0", value: bin("+", iv(), num(2, loc), F64), loc },
+          body: [{
+            kind: "assign",
+            localId: "s.0",
+            value: cat(
+              cat(sv(), { kind: "ternary", cond: bin("===", iv(), num(0, loc), BOOL), then: str("", loc), else_: str(" ", loc), type: STRING, loc }),
+              { kind: "strIntrinsic", method: "slice", receiver: hv(), args: [iv(), bin("+", iv(), num(2, loc), F64)], type: STRING, loc },
+            ),
+            loc,
+          }],
+          loc,
+        },
+        {
+          kind: "if",
+          cond: bin(">", nv(), num(100, loc), BOOL),
+          then: [{
+            kind: "assign",
+            localId: "s.0",
+            value: cat(
+              cat(cat(sv(), str(" ... ", loc)), { kind: "toString", operand: more, type: STRING, loc }),
+              { kind: "ternary", cond: bin(">", more, num(1, loc), BOOL), then: str(" more bytes", loc), else_: str(" more byte", loc), type: STRING, loc },
+            ),
+            loc,
+          }],
+          else_: null,
+          loc,
+        },
+        ...begin(),
+        entry(cat(cat(str("[Uint8Contents]: <", loc), sv()), str(">", loc)), boolLit(false, loc)),
+        entry(cat(str("[byteLength]: ", loc), { kind: "libCall", fn: "insp.f64", args: [nv()], type: STRING, loc }), boolLit(false, loc)),
+        ret(end(str("", loc), str("ArrayBuffer {", loc), str("}", loc), false, boolLit(false, loc))),
+      ];
+      break;
+    }
     case "array": {
       const len = (): IrExpr => ({ kind: "arrIntrinsic", method: "length", receiver: v(), args: [], type: F64, loc });
       const at = (i: IrExpr): IrExpr => ({ kind: "arrayGet", arr: v(), index: i, type: t.elem, loc });

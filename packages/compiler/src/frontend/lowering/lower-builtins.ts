@@ -3846,6 +3846,17 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // types the return `string`, so no static consumer can tell), and a
       // runtime handle inside the tree throws (Node would walk its own
       // enumerable props, which the handle does not model).
+      // An ArrayBuffer root has no own enumerable properties and no
+      // toJSON: Node's "{}", after the argument evaluates.
+      if (value.type.kind === "arraybuffer") {
+        return {
+          kind: "seqExpr",
+          stmts: [{ kind: "exprStmt", expr: value, loc }],
+          result: { kind: "strLit", value: "{}", type: STRING, loc },
+          type: STRING,
+          loc,
+        };
+      }
       // A bigint root: Node's TypeError, after the argument evaluates.
       if (value.type.kind === "bigint") {
         return {
@@ -7044,7 +7055,9 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         );
       }
       const argNode = call.arguments[0]!;
-      const arg = L.lowerExpr(argNode);
+      let arg = L.lowerExpr(argNode);
+      // An ArrayBuffer decodes its whole storage (WasmGC lanes).
+      if (arg.type.kind === "arraybuffer") arg = { kind: "libCall", fn: "ab.asView", args: [arg], type: BYTES_U8, loc };
       if (!(arg.type.kind === "bytes" && arg.type.elem === "u8")) {
         L.noLowering(
           `TextDecoder.decode of '${L.fmt(arg.type)}' values`,

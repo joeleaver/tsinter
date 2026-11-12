@@ -2659,6 +2659,24 @@ emitter unit test's bytes validate-sweep prints `a.byteOffset` for a
 OUR answer, not Node's, and is commented as such with this citation so
 the test does not silently claim a Node-parity it does not have.
 
+**Amendment (2026-11-12, Joe's ruling: no pool): `.buffer` is a value on
+the WasmGC lanes** (docs/design/arraybuffer.md). A view's `.buffer` is the
+ArrayBuffer of its OWN storage, so the pool becomes observable through it
+where Node's differs: a pooled `Buffer.from(...)`/`Buffer.allocUnsafe(...)`
+result's `buf.buffer.byteLength` is the Buffer's own length here, where
+Node's is the pool slab's (`Buffer.poolSize`, 65536 on Node 24.18, for an
+allocation below 32768 bytes); two small Buffers never share a `.buffer`
+here, where Node's may; and nothing outside the Buffer is reachable through
+its `.buffer` here, where Node's slab holds other allocations' bytes. The
+common idiom `buf.buffer.slice(buf.byteOffset, buf.byteOffset +
+buf.byteLength)` answers Node's exact bytes either way, and allocations of
+32768 bytes or more (which Node does not pool) match exactly. Views built
+over an ArrayBuffer share its storage as Node's do, and two reads of one
+view's `.buffer` are the same ArrayBuffer (`===`). **Tested by:**
+`packages/compiler/test/wasm-arraybuffer.test.ts` (its S035 row pins this
+tier's `.buffer.byteLength` for a pooled `Buffer.from`, which is OUR
+answer, not Node's).
+
 ## S036 — A NaN's bit pattern depends on its PROVENANCE, on both Node and this tier — mirrored by folding at the SAME (measured) boundary V8 folds *(wasm tier)*
 
 A NaN value's byte pattern is not one fixed thing on Node itself — it

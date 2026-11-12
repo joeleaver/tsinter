@@ -1651,6 +1651,7 @@ export class CEmitter {
       case "fsWatcher":
       case "childStream":
       case "bytes":
+      case "arraybuffer":
       case "func":
       case "object":
       case "classval":
