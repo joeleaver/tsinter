@@ -36,7 +36,7 @@ import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.
  * `struct` is the payload subtype when (and only when) that helper reads
  * the payload. */
 export interface UnionArmRep {
-  kind: "undefined" | "null" | "f64" | "bool" | "string" | "bytes" | "ref";
+  kind: "undefined" | "null" | "f64" | "bool" | "string" | "bytes" | "bigint" | "ref";
   struct: number | null;
 }
 
@@ -53,6 +53,10 @@ export interface UnionDeps {
   strRef: () => ValType;
   /** Push an interned string literal onto `c`'s stack. */
   lit: (c: Code, s: string) => void;
+  /** BigInt arms (bigint.ts): ToBoolean, `===` by value, decimal ToString. */
+  bigTruthy: () => number;
+  bigEq: () => number;
+  bigToStr: () => number;
 }
 
 const TAG = 0; // struct field indices
@@ -222,6 +226,10 @@ export class UnionBuilder {
             c.i32Const(0);
             c.i32Ne();
             return;
+          case "bigint":
+            this.payload(c, rep, 0);
+            c.call(this.deps.bigTruthy());
+            return;
           case "ref":
             c.i32Const(1);
             return;
@@ -315,6 +323,12 @@ export class UnionBuilder {
             this.payload(c, rep, 1);
             c.call(this.deps.strEq());
             break;
+          case "bigint":
+            // by value (SameValue and === agree on bigints)
+            this.payload(c, rep, 0);
+            this.payload(c, rep, 1);
+            c.call(this.deps.bigEq());
+            break;
           case "ref":
             this.payload(c, rep, 0);
             this.payload(c, rep, 1);
@@ -373,6 +387,10 @@ export class UnionBuilder {
             this.payload(c, rep, 0);
             c.call(this.deps.bytesToStrUtf8());
             return;
+          case "bigint":
+            this.payload(c, rep, 0);
+            c.call(this.deps.bigToStr());
+            return;
           case "ref":
             throw new Error("ToString over a ref union arm (frontend fence breached)");
         }
@@ -418,6 +436,10 @@ export class UnionBuilder {
             c.else_();
             this.deps.lit(c, "false");
             c.end();
+            return;
+          case "bigint":
+            this.payload(c, rep, 0);
+            c.call(this.deps.bigToStr());
             return;
           case "bytes":
           case "ref":

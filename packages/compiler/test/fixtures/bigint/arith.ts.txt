@@ -1,0 +1,16 @@
+const a = 123n;
+const b: bigint = a * 2n;
+console.log(a, b, typeof a);
+let x = 2n ** 100n;
+console.log(x, -x, x / 3n, x % 7n, x - 1n, x + x);
+console.log(a < b, a >= b, a === 123n, a !== b, 5n == 5n, 1n < 2, 3 > 2n);
+let i = 0n;
+i++;
+i += 10n;
+++i;
+console.log(i, i--, i, `t=${i}`, "s" + i, String(-i), Number(2n ** 64n));
+console.log(1n << 70n, (1n << 70n) >> 3n, -5n >> 1n, 0xffn & 0x0fn, 6n | 1n, 6n ^ 3n, ~7n);
+console.log([1n, -2n], { k: 3n });
+const z: bigint = i - i;
+if (z) console.log("bad"); else console.log("zero falsy");
+if (i) console.log("nonzero truthy");

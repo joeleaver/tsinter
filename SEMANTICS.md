@@ -11036,3 +11036,37 @@ stops the run, by name.
 packages, wasm and wasm-native, against Node);
 `tests/harness/npm-static.test.ts`; the commander workload in
 `tests/real-apps-top10/harness/workloads.json` (nico-top only).
+
+## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
+
+V8 throws `RangeError: Maximum BigInt size exceeded` when a result would
+need more than 2^30 bits. The WasmGC lanes' BigInt (`backend/wasm/bigint.ts`,
+`bigint-src.ts`) throws the same error, decided as follows:
+- **Exact:** `<<` by the shifted length; a product throws before it
+  allocates when `bitLength(a) + bitLength(b)` is two or more past the
+  limit and otherwise by its own length (it is that sum or one bit
+  shorter); `**` on a power-of-two base is a shift, exact and fast
+  (`(-2n) ** 1073741823n` answers at once, as in V8);
+  `BigInt.asUintN(bits, negative)` throws for `bits > 2^30`.
+- **Estimated, within two bits:** `**` on any other base compares
+  `log2|base| * exponent` (log2 from the leading bits, accurate to about
+  2^-40) with the limit. Clearly past it (`3n ** 1_000_000_000n`) throws at
+  once; within two bits of it, the power is computed and its own length
+  decides. So no result past the limit is ever returned, and the only
+  difference from V8 is a power whose estimate is within two bits of the
+  boundary, which can throw where V8 fits it or the reverse.
+- **Slower than V8:** multiplication, division and toString of operands of
+  millions of bits are the schoolbook algorithms (quadratic), where V8 uses
+  Karatsuba/FFT and divide-and-conquer conversion: such a computation can
+  take seconds or minutes where Node takes milliseconds. The values are the
+  same.
+
+**Rationale:** reaching the boundary needs results of about 128 MB; exact
+lengths for every power would cost computing it, and the faster algorithms
+are code size every bigint module pays for values no measured program
+builds. **Tested by:** `packages/compiler/test/wasm-bigint-ops.test.ts`
+(`size-limit`: products past the limit throw without allocating, a shift
+lands on the boundary, `3n ** 1_000_000_000n`, `7n ** 383000000n` and
+`4n ** 536870912n` throw, `(-2n) ** 1073741823n` answers, both lanes) and
+`wasm-bigint-core.test.ts` (`bn_pow_limited` against the host BigInt).
+Measured against Node v24.18.1.

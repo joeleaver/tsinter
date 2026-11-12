@@ -132,6 +132,16 @@ export type IrType =
    * Property KEYS stay frontend-fenced: static record/class shapes have
    * no symbol-keyed storage. */
   | { kind: "symbol" }
+  /** An ES BigInt primitive: an arbitrary-precision integer. IMMUTABLE,
+   * with value semantics: `===` and SameValueZero compare by VALUE (never
+   * identity), typeof answers "bigint", truthiness is "not 0n". The wasm
+   * lanes represent it as one GC struct (backend/wasm/bigint.ts): an i64
+   * fast path for every value in [-2^63, 2^63), and a sign plus u32-limb
+   * magnitude for the rest. Allowed in locals, globals, params, returns,
+   * fields, captures, array elements, union arms, Map keys/values and Set
+   * elements; JSON.stringify throws Node's TypeError on it. The legacy
+   * C/LLVM lanes refuse it by name. */
+  | { kind: "bigint" }
   /** An fs.Stats instance (statSync / fs.promises.stat): heap, refcounted,
    * IMMUTABLE — a snapshot of stat(2) results. Holds no references —
    * never part of a cycle, no trace. Same container rules as url: union
@@ -367,6 +377,7 @@ export const REGEX: IrType = { kind: "regex" };
 export const URL_T: IrType = { kind: "url" };
 export const SEARCH_PARAMS_T: IrType = { kind: "searchParams" };
 export const SYMBOL_T: IrType = { kind: "symbol" };
+export const BIGINT_T: IrType = { kind: "bigint" };
 export const STATS_T: IrType = { kind: "stats" };
 export const SPAWNRES_T: IrType = { kind: "spawnRes" };
 export const CHILD_T: IrType = { kind: "child" };
@@ -454,7 +465,7 @@ export function isSupportedSetElem(t: IrType): boolean {
  * the pre-object-keys hashes. A module whose keys are all of these keeps
  * its pre-object-keys layout. */
 export function isPrimitiveMapKey(t: IrType): boolean {
-  return t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "symbol" || t.kind === "netServer";
+  return t.kind === "f64" || t.kind === "string" || t.kind === "bool" || t.kind === "symbol" || t.kind === "netServer" || t.kind === "bigint";
 }
 
 /** The Map VALUE fence: scalars plus every refcounted kind EXCEPT
@@ -511,6 +522,8 @@ export function isSupportedMapValue(t: IrType): boolean {
     case "map":
     case "set":
     case "func":
+    // BigInt values (Map<string, bigint>): immutable, no references.
+    case "bigint":
       return true;
     default:
       return false;
@@ -574,6 +587,7 @@ export function typeKey(t: IrType): string {
     case "url":
     case "searchParams":
     case "symbol":
+    case "bigint":
     case "stats":
     case "spawnRes":
     case "child":
@@ -721,6 +735,8 @@ export function isRefCounted(t: IrType): boolean {
     // Symbols are the same story: immutable identity values holding at
     // most two strings.
     t.kind === "symbol" ||
+    // BigInts are immutable heap values (wasm lanes only).
+    t.kind === "bigint" ||
     t.kind === "stats" ||
     t.kind === "spawnRes" ||
     t.kind === "child" ||
@@ -2371,6 +2387,58 @@ export type IrLibFn =
   | "sym.keyFor"
   | "sym.desc"
   | "sym.toString"
+  /** BigInt (the bigint kind; the WasmGC lanes only — backend/wasm/
+   * bigint.ts). big.lit: the literal whose decimal spelling is its one
+   * strLit argument. The operators take and answer bigint values with JS
+   * semantics: div truncates, rem takes the dividend's sign, pow/shl/sar/
+   * div/rem throw V8's RangeErrors, ushr always throws its TypeError.
+   * big.eq is `===` (by value); big.cmp's third strLit argument is the
+   * relation ("<", "<=", ">", ">="); big.cmpNum / big.numCmp compare a
+   * bigint with a number (either order, NaN false), big.eqNum is `==`
+   * between the two. Conversions: toStr (decimal), toStrRadix (number
+   * radix, RangeError outside 2..36), toLocale (en-US grouping), inspect
+   * ("123n"), toNum (Number(b)), fromNum (BigInt(n): RangeError for a
+   * non-integer), fromStr (BigInt(s): SyntaxError), asIntN / asUintN
+   * (number bits first). */
+  | "big.lit"
+  | "big.add"
+  | "big.sub"
+  | "big.mul"
+  | "big.div"
+  | "big.rem"
+  | "big.pow"
+  | "big.and"
+  | "big.or"
+  | "big.xor"
+  | "big.shl"
+  | "big.sar"
+  | "big.ushr"
+  | "big.neg"
+  | "big.not"
+  | "big.eq"
+  | "big.cmp"
+  | "big.cmpNum"
+  | "big.numCmp"
+  | "big.eqNum"
+  | "big.truthy"
+  | "big.toStr"
+  | "big.toStrRadix"
+  | "big.toLocale"
+  | "big.inspect"
+  | "big.toNum"
+  | "big.fromNum"
+  | "big.fromStr"
+  | "big.asIntN"
+  | "big.asUintN"
+  /** Buffer's readBig(U)Int64(LE|BE) / writeBig(U)Int64(LE|BE) and
+   * DataView's get/setBig(U)int64: (bytes, offset[, value], kind strLit
+   * "u64le" | "u64be" | "i64le" | "i64be") for the Buffer pair, (bytes,
+   * offset[, value], littleEndian, signed strLit "u" | "i") for DataView.
+   * Node's bounds and value-range errors. */
+  | "big.bufRead"
+  | "big.bufWrite"
+  | "big.dvGet"
+  | "big.dvSet"
   /** fs.statSync → a Stats value (may throw, like the other sync fs
    * calls); the stats.* getters are pure reads on it. */
   | "fs.statSync"
@@ -5708,6 +5776,12 @@ function isJsonSafeAt(
     case "string":
     case "bool":
       return true;
+    // A BigInt is data the dynamic world holds (the BIGINT kind, WasmGC
+    // lanes): it converts and validates like the scalars, and the JSON
+    // writers throw Node's "Do not know how to serialize a BigInt"
+    // TypeError where stringify reaches one.
+    case "bigint":
+      return true;
     case "array":
       return isJsonSafeAt(t.elem, getRecord, getUnion, false, visiting);
     case "record": {
@@ -6060,6 +6134,8 @@ function canBoxBytesComposite(
     case "dyn":
     case "undefinedT":
     case "nullT":
+    // A BigInt boxes as the dynamic world's BIGINT kind (WasmGC lanes).
+    case "bigint":
       return true;
     case "bytes":
       return t.elem === "u8";
@@ -6760,6 +6836,48 @@ export function moduleUsesSymbol(mod: IrModule): boolean {
   return found;
 }
 
+/** The source location of the first bigint-carrying node (a bigint-kind
+ * type or a big.* libCall) — the legacy C/LLVM lanes' SC3003 refusal
+ * anchor — or null when the module has none. */
+export function firstBigintSite(mod: IrModule): SrcLoc | null {
+  let found: SrcLoc | null = null;
+  const visit = (v: unknown, loc: SrcLoc | null): boolean => {
+    if (v === null || typeof v !== "object") return false;
+    if (Array.isArray(v)) return v.some((item) => visit(item, loc));
+    const node = v as { kind?: unknown; fn?: unknown; loc?: SrcLoc };
+    const here = node.loc !== undefined && typeof node.loc === "object" ? node.loc : loc;
+    if (node.kind === "bigint" || (node.kind === "libCall" && typeof node.fn === "string" && node.fn.startsWith("big."))) {
+      found = here;
+      return true;
+    }
+    return Object.keys(v).some((key) => key !== "loc" && visit((v as Record<string, unknown>)[key], here));
+  };
+  return visit(mod, null) ? found : null;
+}
+
+/** True when the module carries a bigint anywhere — a bigint-kind type or
+ * a big.* libCall — the switch that gives the WasmGC lanes' dynamic world
+ * its BIGINT kind's arms (dyn.ts), so a bigint-free module stays byte for
+ * byte what it was. */
+export function moduleUsesBigint(mod: IrModule): boolean {
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const node = v as { kind?: unknown; fn?: unknown };
+    if (node.kind === "bigint" || (node.kind === "libCall" && typeof node.fn === "string" && node.fn.startsWith("big."))) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(v)) visit((v as Record<string, unknown>)[key]);
+  };
+  visit(mod);
+  return found;
+}
+
 /** True when the module uses the URLSearchParams surface — sp.* libCalls,
  * the url.searchParams getter, or a searchParams-kind type anywhere on
  * the IR (a fenced statement can leave a typed local whose release call
@@ -7313,6 +7431,23 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
  * failure / promise rejection). */
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "num.toFixed",
+  // BigInt's RangeErrors/SyntaxErrors/TypeErrors (bigint.ts)
+  "big.mul",
+  "big.div",
+  "big.rem",
+  "big.pow",
+  "big.shl",
+  "big.sar",
+  "big.ushr",
+  "big.toStrRadix",
+  "big.fromNum",
+  "big.fromStr",
+  "big.asIntN",
+  "big.asUintN",
+  "big.bufRead",
+  "big.bufWrite",
+  "big.dvGet",
+  "big.dvSet",
   "insp.jsonDyn",
   "insp.dynHidden",
   // diagnostics_channel: publish runs subscribers synchronously (a throw

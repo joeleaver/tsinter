@@ -106,6 +106,8 @@ const SNIPPET_WHOLE_MAX = 20;
 const SNIPPET_RADIUS = 10;
 
 export interface JsonDeps {
+  /** A module that uses BigInt: a dynamic BIGINT throws Node's TypeError. */
+  bigLive?: boolean;
   strRef: () => ValType;
   strType: () => number;
   concat: () => number;
@@ -5097,6 +5099,13 @@ export class JsonBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
 
+      if (this.deps.bigLive === true) {
+        this.emitKindArm(c, K, [DK.BIGINT], () => {
+          this.deps.throwError(c, "%TypeError", "TypeError", (x) => this.deps.lit(x, "Do not know how to serialize a BigInt"));
+          c.i32Const(0);
+          c.return_();
+        });
+      }
       // Absent under stringify. C returns false here and so do we; the
       // three callers differ only in what they do about it.
       this.emitKindArm(c, K, [DK.UNDEF, DK.FUNC], () => {

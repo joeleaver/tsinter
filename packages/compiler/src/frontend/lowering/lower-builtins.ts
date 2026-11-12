@@ -3793,6 +3793,16 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       // types the return `string`, so no static consumer can tell), and a
       // runtime handle inside the tree throws (Node would walk its own
       // enumerable props, which the handle does not model).
+      // A bigint root: Node's TypeError, after the argument evaluates.
+      if (value.type.kind === "bigint") {
+        return {
+          kind: "seqExpr",
+          stmts: [{ kind: "exprStmt", expr: value, loc }],
+          result: nodeThrowExpr(1, "", "Do not know how to serialize a BigInt", STRING, loc),
+          type: STRING,
+          loc,
+        };
+      }
       if (!L.jsonSafe(value.type) && value.type.kind !== "dyn") {
         // Bare undefined-armed unions get their own wording: Node's
         // stringify of bare undefined is not a string at all — per-type

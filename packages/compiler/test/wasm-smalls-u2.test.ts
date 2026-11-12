@@ -594,12 +594,9 @@ test("row59 B-i [plain]: an array of Date (element does not compile) — the EXA
   ]);
 });
 
-test("row60 B-i [plain]: a (bigint|null)[] union — the EXACT two-diagnostic set, an explicit separator (same shape as row59)", async () => {
-  const diags = await runRowRefuse("row60", 'const a: (bigint | null)[] = [1n, null]; console.log(a.join(","));', false);
-  expect(diags).toEqual([
-    "SC2009:values of type '(bigint | null)[]' cannot be compiled: the array shape is supported, but its element type 'bigint | null' does not compile",
-    "SC2020:'(bigint | null)[].join' is part of the standard library types but has no scriptc lowering yet",
-  ]);
+test("row60 [plain]: a (bigint|null)[] union joins (BigInt unit: the decimal text, null empty)", async () => {
+  const out = await runRow("row60", 'const a: (bigint | null)[] = [1n, null, -(2n ** 64n)]; console.log(a.join(","));');
+  expect(out).toBe("1,,-18446744073709551616\n");
 });
 
 test("row61 B-i [plain]: a nested array element (number[][])", async () => {

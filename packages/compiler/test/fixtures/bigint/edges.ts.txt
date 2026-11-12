@@ -1,0 +1,23 @@
+// edge cases: huge values, negative shifts, asIntN/asUintN wraparound, -0n,
+// comparisons against NaN and the infinities
+const huge = 3n ** 2000n;
+const h2 = 2n ** 4096n - 1n;
+console.log(huge % 1000000007n, (huge / 7n ** 500n) % 10n ** 20n, huge.toString(36).length, h2.toString(16).length);
+console.log((h2 * h2 - 1n) / (h2 + 1n) === h2 - 1n, (huge * huge) / huge === huge, -huge / huge, huge % -huge);
+console.log(BigInt(huge.toString()) === huge, BigInt("-" + huge.toString(10)) === -huge, BigInt("0x" + h2.toString(16)) === h2);
+for (const s of [-130n, -65n, -64n, -63n, -33n, -32n, -1n, 0n, 1n, 31n, 32n, 63n, 64n, 65n, 129n]) {
+  console.log(s, 1n << s, -1n << s, 12345n << s, -12345n >> s, (2n ** 100n + 1n) >> s, -(2n ** 100n) >> s);
+}
+const words = [0n, 1n, -1n, 2n ** 63n - 1n, -(2n ** 63n), 2n ** 63n, 2n ** 64n - 1n, 2n ** 64n, -(2n ** 64n) - 5n, 3n ** 50n, -(3n ** 50n)];
+for (const bits of [0, 1, 7, 8, 31, 32, 33, 53, 63, 64, 65, 100, 128, 200]) {
+  console.log(bits, words.map((w) => BigInt.asIntN(bits, w)).join(" "), words.map((w) => BigInt.asUintN(bits, w)).join(" "));
+}
+console.log(BigInt.asUintN(64, 1n << 64n), BigInt.asIntN(64, (1n << 63n) + 7n), BigInt.asIntN(3.9, 7n), BigInt.asUintN(-0, 5n));
+const nz = -0n;
+console.log(nz, -nz, nz === 0n, Object.is(nz, 0n), String(nz), `${-0n}`, 0n * -1n, -(0n));
+for (const d of [NaN, Infinity, -Infinity, 0, -0, 0.5, -0.5, 2 ** 64, -(2 ** 64), 1e300, 2 ** 53 + 2]) {
+  const b = 2n ** 64n;
+  console.log(d, [b < d, b > d, b <= d, b >= d, 0n < d, 0n >= d, -b < d, -b > d, 1n > d, -1n < d].join(""));
+}
+console.log(Number(2n ** 1023n * 3n), Number(-(2n ** 1024n)), Number(2n ** 53n + 1n), Number(2n ** 53n + 3n), Number(-(2n ** 63n)));
+console.log((2n ** 200n).toString(2).length, (-(2n ** 70n)).toString(7), (10n ** 30n).toString(36), (255n).toString(16.9));

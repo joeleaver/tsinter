@@ -6309,6 +6309,41 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "spawnRes.errno":
           case "error.newCoded":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
+          case "big.lit":
+          case "big.add":
+          case "big.sub":
+          case "big.mul":
+          case "big.div":
+          case "big.rem":
+          case "big.pow":
+          case "big.and":
+          case "big.or":
+          case "big.xor":
+          case "big.shl":
+          case "big.sar":
+          case "big.ushr":
+          case "big.neg":
+          case "big.not":
+          case "big.eq":
+          case "big.cmp":
+          case "big.cmpNum":
+          case "big.numCmp":
+          case "big.eqNum":
+          case "big.truthy":
+          case "big.toStr":
+          case "big.toStrRadix":
+          case "big.toLocale":
+          case "big.inspect":
+          case "big.toNum":
+          case "big.fromNum":
+          case "big.fromStr":
+          case "big.asIntN":
+          case "big.asUintN":
+          case "big.bufRead":
+          case "big.bufWrite":
+          case "big.dvGet":
+          case "big.dvSet":
+            throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
           default: {
             const _exhaustive: never = fn;
             void _exhaustive;

@@ -17,6 +17,7 @@ import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.
 import { blockedBindingUseDiag, ffiBindingDiag, ffiSignatureDiag, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
+import { lowerBigIntGlobalCall, lowerBigIntMethodCall, lowerBigIntStaticCall } from "./lower-bigint.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
@@ -3585,6 +3586,8 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (name === "String") return undefinedAsText(L, L.ensureString(arg, argNode), loc);
       if (arg.type.kind === "f64") return toNumberCanon(L, arg);
       if (arg.type.kind === "bool") return boolToNumber(L, arg, loc);
+      // Number(1n): the nearest double (ties to even)
+      if (arg.type.kind === "bigint") return { kind: "libCall", fn: "big.toNum", args: [arg], type: F64, loc };
       if (arg.type.kind === "string") {
         return { kind: "libCall", fn: "num.fromString", args: [arg], type: F64, loc };
       }
@@ -3984,6 +3987,14 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // values — no static lowering, fenced with the honest hint).
       // `new Symbol()` throws in Node and is a checker error — the
       // generic new fence keeps it.
+      // `BigInt(x)` (lower-bigint.ts): a bigint, number, string or boolean
+      // argument; `new BigInt()` is a checker error.
+      if (
+        expr.expression.text === "BigInt" &&
+        L.isStdlibSymbol(L.resolveValueSymbol(expr.expression) ?? undefined)
+      ) {
+        return lowerBigIntGlobalCall(L, expr);
+      }
       if (
         expr.expression.text === "Symbol" &&
         L.isStdlibSymbol(L.resolveValueSymbol(expr.expression) ?? undefined)
@@ -4509,6 +4520,8 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // by the receiver's own element.
         L.lowerFilterNarrowCall(expr, expr.expression) ??
         lowerArrayIsArrayCall(L, expr, expr.expression) ??
+        lowerBigIntStaticCall(L, expr, expr.expression) ??
+        lowerBigIntMethodCall(L, expr, expr.expression) ??
         lowerSymbolStaticCall(L, expr, expr.expression) ??
         lowerSymbolMethodCall(L, expr, expr.expression) ??
         lowerRegExpStaticCall(L, expr, expr.expression) ??
@@ -8064,6 +8077,10 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         } else if (L.isSubclassOf(right.type.className, left.type.className)) {
           idRight = L.upcastTo(right, left.type.className);
         }
+      }
+      // SameValue on bigints is mathematical equality (Object.is(0n, -0n))
+      if (idLeft.type.kind === "bigint" && idRight.type.kind === "bigint") {
+        return { kind: "libCall", fn: "big.eq", args: [idLeft, idRight], type: BOOL, loc };
       }
       if (
         (idLeft.type.kind === "func" && idRight.type.kind === "func") ||

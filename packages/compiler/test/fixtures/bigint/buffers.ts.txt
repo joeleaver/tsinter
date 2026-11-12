@@ -1,0 +1,30 @@
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const b = Buffer.alloc(10);
+t("w1", () => b.writeBigUInt64LE(2n ** 64n, 0));
+t("w2", () => b.writeBigUInt64LE(-1n, 0));
+t("w3", () => b.writeBigInt64LE(2n ** 63n, 0));
+t("w4", () => b.writeBigInt64BE(-(2n ** 63n) - 1n, 0));
+t("w5", () => b.writeBigUInt64LE(5n, 3));
+t("w6", () => b.writeBigUInt64LE(5n, 2));
+t("r1", () => b.readBigUInt64LE(3));
+t("r2", () => b.readBigUInt64LE(1.5));
+t("w7", () => b.writeBigUInt64LE(-(2n ** 40n), 0));
+t("w8", () => b.writeBigUInt64LE(2n ** 100n, 0));
+t("w9", () => b.writeBigInt64LE(-(2n ** 100n), 0));
+t("w10", () => { b.writeBigUInt64BE(0x0102030405060708n, 1); return b.toString("hex"); });
+t("r3", () => [b.readBigUInt64BE(1), b.readBigUInt64LE(1), b.readBigInt64LE(2), b.readBigInt64BE(0)]);
+t("r4", () => { b.writeBigInt64LE(-2n, 0); return [b.readBigInt64LE(0), b.readBigUInt64LE(0)]; });
+t("r5", () => { b.writeBigUInt64LE(0x7ff4000000000001n, 0); return [b.readBigUInt64LE(0), b.readBigUint64LE()]; });
+const dv = new DataView(new ArrayBuffer(16));
+t("dv1", () => { dv.setBigUint64(0, 2n ** 64n - 1n); dv.setBigInt64(8, -5n, true); return [dv.getBigUint64(0), dv.getBigInt64(8, true), dv.getBigInt64(0), dv.getBigUint64(8)]; });
+t("dv2", () => dv.getBigUint64(9));
+t("dv3", () => dv.setBigUint64(0, 2n ** 64n + 3n));
+t("dv4", () => dv.getBigUint64(0));
+t("dv5", () => Number(dv.getBigUint64(0)));
+t("w11", () => b.writeBigUInt64LE(1n));

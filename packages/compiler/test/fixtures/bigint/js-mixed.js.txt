@@ -1,0 +1,12 @@
+// forms the checker rejects in TypeScript, reachable from JavaScript
+function t(name, f) {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    console.log(name, e.name + ": " + e.message);
+  }
+}
+const one = 1n;
+const n = 1;
+t("eqn", () => [one == n, one == 1.5, 2n ** 64n == 2 ** 64, n != one, one === n, one !== n]);
+t("cmp", () => [one < 1.5, 2 > one, one >= NaN]);

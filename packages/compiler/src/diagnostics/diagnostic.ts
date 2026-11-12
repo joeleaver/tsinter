@@ -20,7 +20,9 @@
  *            SC3002 — the WasmGC backend's island engine artifact
  *            (vendor/quickjs-ng-wasm/engine.wasm) failed its sha256 or
  *            shape check (engine.ts EngineFormatError): an installation
- *            fault, not a program one
+ *            fault, not a program one; SC3003 — a bigint on the legacy
+ *            C/LLVM lanes (index.ts legacyBigintRefusal: only the WasmGC
+ *            lanes represent BigInt)
  *   SC4xxx  library-mode/profile refusals (the library-emission mode): profile
  *            malformed (SC4001), export unresolved (SC4002), unmappable
  *            signature (SC4003), async/generator export (SC4004), the

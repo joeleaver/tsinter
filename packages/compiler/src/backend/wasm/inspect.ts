@@ -202,6 +202,9 @@ const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
 export interface InspectDeps {
   strRef: () => ValType;
   strType: () => number;
+  /** A module that uses BigInt: the dynamic BIGINT kind prints `123n`
+   * (bigint.ts's struct type and decimal ToString). */
+  big?: { bigType: () => number; inspect: () => number };
   /** Push an interned string literal (the emitter's data-segment path). */
   lit: (c: Code, s: string) => void;
   /** `%w.f64ToStr` — the trailer's count. */
@@ -4016,6 +4019,16 @@ export class InspectBuilder {
           c.return_();
         });
       }
+      const big = this.deps.big;
+      if (big !== undefined) {
+        this.kindArm(c, K, [DK.BIGINT], () => {
+          c.localGet(D);
+          c.structGet(dynT, DYN_REF);
+          c.refCast(big.bigType());
+          c.call(big.inspect());
+          c.return_();
+        });
+      }
       this.kindArm(c, K, [DK.UNDEF], () => {
         this.deps.lit(c, "undefined");
         c.return_();
@@ -5007,6 +5020,22 @@ export class InspectBuilder {
       c.localGet(D);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+
+      // BIGINT: `5n`, as inspect prints it
+      const big = this.deps.big;
+      if (big !== undefined) {
+        c.localGet(K);
+        c.i32Const(DK.BIGINT);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(D);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(big.bigType());
+        c.call(big.inspect());
+        c.call(this.ibPuts());
+        c.return_();
+        c.end();
+      }
 
       // UNDEF, NULL
       c.localGet(K);

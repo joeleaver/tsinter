@@ -1788,10 +1788,13 @@ export class BytesBuilder {
    * (stage A's element-read primitives, reused). f64: assemble 8 bytes
    * into an i64, `f64.reinterpret_i64` — no widening step needed, the
    * bytes ARE an f64 already. */
-  readNumFloatHelper(kind: string): number {
+  readNumFloatHelper(kind: string, bits = false): number {
     const { width, le } = this.parseFloatNumKind(kind);
-    return this.cached(`readNum:${kind}`, () => {
-      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64], [F64]), `%w.bytes.readNum:${kind}`);
+    // `bits`: the 8 bytes as a raw i64 (BigInt's readBig(U)Int64 —
+    // every pattern, the undefined one included, is a value there)
+    const tag = bits ? "readBits" : "readNum";
+    return this.cached(`${tag}:${kind}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64], [bits ? I64 : F64]), `%w.bytes.${tag}:${kind}`);
       const c = new Code();
       const V = 0, OFFSET = 1;
       const LENI = 2, CAP = 3, ADDR = 4, BUFL = 5, BITS32 = 6, BITS64 = 7;
@@ -1824,7 +1827,8 @@ export class BytesBuilder {
         c.localGet(OFFSET);
         c.localGet(CAP);
         c.call(this.boundsErrorHelper());
-        c.f64Const(0);
+        if (bits) c.i64Const(0n);
+        else c.f64Const(0);
         c.return_();
       }
       c.end();
@@ -1842,6 +1846,9 @@ export class BytesBuilder {
         c.localGet(BITS32);
         c.f32ReinterpretI32();
         c.f64PromoteF32();
+      } else if (bits) {
+        this.emitAssembleI64(c, BUFL, ADDR, 8, le, BITS64);
+        c.localGet(BITS64);
       } else {
         this.emitAssembleI64(c, BUFL, ADDR, 8, le, BITS64);
         emitNotUndefBits(c, BITS64);
@@ -1866,12 +1873,14 @@ export class BytesBuilder {
    * not here — a runtime-computed NaN's bit pattern is whatever the
    * toolchain produces, on this tier exactly as on Node's own runtime,
    * so passing it through unchanged is the Node-exact answer). */
-  writeNumFloatHelper(kind: string): number {
+  writeNumFloatHelper(kind: string, bits = false): number {
     const { width, le } = this.parseFloatNumKind(kind);
-    return this.cached(`writeNum:${kind}`, () => {
+    // `bits`: the value is a raw i64 (BigInt's writeBig(U)Int64)
+    const tag = bits ? "writeBits" : "writeNum";
+    return this.cached(`${tag}:${kind}`, () => {
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.bytesRef(), F64, F64], [F64]),
-        `%w.bytes.writeNum:${kind}`,
+        this.mb.funcType([this.bytesRef(), bits ? I64 : F64, F64], [F64]),
+        `%w.bytes.${tag}:${kind}`,
       );
       const c = new Code();
       const V = 0, VALUE = 1, OFFSET = 2;
@@ -1926,7 +1935,7 @@ export class BytesBuilder {
         this.emitScatterI32(c, BUFL, ADDR, 4, le, BITS32);
       } else {
         c.localGet(VALUE);
-        c.i64ReinterpretF64();
+        if (!bits) c.i64ReinterpretF64();
         c.localSet(BITS64);
         this.emitScatterI64(c, BUFL, ADDR, 8, le, BITS64);
       }
@@ -6254,14 +6263,16 @@ export class BytesBuilder {
    * primitives (f32ReinterpretI32/f64PromoteF32 for the narrow kind,
    * f64ReinterpretI64 for the wide one) — bit-exact passthrough, no NaN
    * handling of any kind on the READ side (matches readNumFloatHelper). */
-  dvGetFloatHelper(method: "dvGetFloat32" | "dvGetFloat64"): number {
+  dvGetFloatHelper(method: "dvGetFloat32" | "dvGetFloat64", bits = false): number {
     const width = method === "dvGetFloat32" ? 4 : 8;
-    return this.cached(method, () => {
-      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, I32], [F64]), `%w.bytes.${method}`);
+    // `bits`: getBig(U)int64's raw i64 (no undefined-pattern rewrite)
+    const name = bits ? "dvGetBits64" : method;
+    return this.cached(name, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, I32], [bits ? I64 : F64]), `%w.bytes.${name}`);
       const c = new Code();
       const V = 0, OFFARG = 1, LE = 2;
       const OFFT = 3, RECVBYTES = 4, ADDR = 5, BUFL = 6, BITS32 = 7, BITS64 = 8;
-      this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => c.f64Const(0));
+      this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => (bits ? c.i64Const(0n) : c.f64Const(0)));
       c.localGet(V);
       c.structGet(this.bytesType(), OFF);
       c.localGet(OFFT);
@@ -6288,9 +6299,12 @@ export class BytesBuilder {
         c.else_();
         this.emitAssembleI64(c, BUFL, ADDR, 8, false, BITS64);
         c.end();
-        emitNotUndefBits(c, BITS64);
-        c.localGet(BITS64);
-        c.f64ReinterpretI64();
+        if (bits) c.localGet(BITS64);
+        else {
+          emitNotUndefBits(c, BITS64);
+          c.localGet(BITS64);
+          c.f64ReinterpretI64();
+        }
       }
       this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32, I64], c.bytes());
       return idx;
@@ -6303,12 +6317,14 @@ export class BytesBuilder {
    * orthogonal to write-side byte assembly; a runtime-computed NaN's bits
    * pass through here exactly like every other value, matching
    * writeNumFloatHelper's current, REVERTED design). */
-  dvSetFloatHelper(method: "dvSetFloat32" | "dvSetFloat64"): number {
+  dvSetFloatHelper(method: "dvSetFloat32" | "dvSetFloat64", bits = false): number {
     const width = method === "dvSetFloat32" ? 4 : 8;
-    return this.cached(method, () => {
+    // `bits`: setBig(U)int64's value as a raw i64
+    const name = bits ? "dvSetBits64" : method;
+    return this.cached(name, () => {
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.bytesRef(), F64, F64, I32], []),
-        `%w.bytes.${method}`,
+        this.mb.funcType([this.bytesRef(), F64, bits ? I64 : F64, I32], []),
+        `%w.bytes.${name}`,
       );
       const c = new Code();
       const V = 0, OFFARG = 1, VALUE = 2, LE = 3;
@@ -6336,7 +6352,7 @@ export class BytesBuilder {
         c.end();
       } else {
         c.localGet(VALUE);
-        c.i64ReinterpretF64();
+        if (!bits) c.i64ReinterpretF64();
         c.localSet(BITS64);
         c.localGet(LE);
         c.ifVoid();

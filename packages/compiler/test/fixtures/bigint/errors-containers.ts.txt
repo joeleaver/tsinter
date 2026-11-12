@@ -1,0 +1,70 @@
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const zero = BigInt(0);
+t("div0", () => 1n / zero);
+t("mod0", () => 1n % zero);
+t("negexp", () => 2n ** BigInt(-1));
+t("frac", () => BigInt(1.5));
+t("nan", () => BigInt(NaN));
+t("inf", () => BigInt(-Infinity));
+const s = "abc";
+t("str", () => BigInt(s));
+t("str2", () => BigInt(" 0x1f "));
+t("str3", () => BigInt("-0x1"));
+t("radix", () => (255n).toString(37));
+t("radix16", () => (255n).toString(16));
+t("radix2", () => (-255n).toString(2));
+t("big", () => 1n << (2n ** 40n));
+t("pow", () => 2n ** (2n ** 40n));
+t("asIntN-1", () => BigInt.asIntN(-1, 1n));
+t("asUintN", () => BigInt.asUintN(64, -1n));
+t("asIntN", () => BigInt.asIntN(64, 2n ** 63n));
+t("asIntN3", () => BigInt.asIntN(3, 5n));
+t("asUintN0", () => BigInt.asUintN(0, 5n));
+t("loc", () => (123456789n).toLocaleString("en-US"));
+t("loc2", () => (-1234n).toLocaleString("en-US"));
+t("from53", () => BigInt(2 ** 53));
+t("from64", () => BigInt(2 ** 64));
+t("from1e300", () => BigInt(1e300));
+t("tonum", () => Number(-(2n ** 1100n)));
+t("tonum2", () => Number(2n ** 64n + 1n));
+t("bool", () => BigInt(true) + BigInt(false));
+t("negzero", () => -0n);
+t("shneg", () => 1n << -1n);
+t("shneg2", () => -5n >> BigInt(-2));
+t("cmpnan", () => [2n > NaN, 2n < NaN, 2n <= Infinity, -(2n ** 2000n) < -Infinity, 2n ** 2000n > 1e308]);
+t("mixed", () => [1n < 1.5, 2n > 1.5, -1n < -0.5, 5n >= 5]);
+t("divs", () => [-7n / 2n, -7n % 2n, 7n / -2n, 7n % -2n, (-(2n ** 63n)) / -1n, (-(2n ** 63n)) % -1n]);
+const m = new Map<bigint, string>();
+m.set(1n, "a");
+m.set(2n ** 70n, "b");
+m.set(BigInt("1"), "c");
+console.log(m.get(1n), m.get(2n ** 70n), m.size, m.has(3n), m);
+const st = new Set<bigint>([1n, 1n, 2n ** 64n, BigInt(2 ** 64)]);
+console.log(st.size, st);
+function f(x: bigint | number): string {
+  if (typeof x === "bigint") return "big " + (x * 2n);
+  return "num " + x * 2;
+}
+console.log(f(3n), f(3));
+const u: bigint | undefined = (zero === 0n ? 5n : undefined);
+console.log(u, u === 5n);
+class C {
+  v: bigint = 7n;
+  bump(): bigint { this.v *= 3n; return this.v; }
+}
+const c = new C();
+console.log(c.bump(), c.v, c);
+const arr: bigint[] = [3n, 1n, 2n];
+arr.push(10n ** 30n);
+console.log(arr, arr.indexOf(1n), arr.includes(2n), arr.join("-"), arr.map((x) => x + 1n));
+console.log(arr.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)));
+t("json", () => JSON.stringify(1n));
+const rec = { a: 1n, b: [2n] };
+console.log(rec, `${rec.a}`, String(rec.b));
+console.log(Object.is(0n, -0n), 0n === -0n);

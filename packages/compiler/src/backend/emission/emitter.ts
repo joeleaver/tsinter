@@ -1675,6 +1675,8 @@ export class CEmitter {
       case "nullT":
       case "caught":
         throw new Error(`emitter bug: truthiness of ${t.type.kind}`);
+      case "bigint":
+        throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
       case "void":
         throw new Error("emitter bug: truthiness of void");
       default: {

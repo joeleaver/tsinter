@@ -134,6 +134,7 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
     case "nullT":
     case "regex":
     case "symbol":
+    case "bigint":
     case "dyn":
     case "jsval":
       return null;
@@ -269,7 +270,7 @@ function inspectExpr(
   // per-type helper tests its parameter first (undefGuard); only the
   // remaining library renderers need the test here, over a pure read.
   if (
-    (t.kind === "regex" || t.kind === "symbol" || t.kind === "bytes" || t.kind === "object") &&
+    (t.kind === "regex" || t.kind === "symbol" || t.kind === "bigint" || t.kind === "bytes" || t.kind === "object") &&
     mayHoldSlotUndef(L, value) && pureReemittable(value)
   ) {
     return {
@@ -317,6 +318,9 @@ function inspectExprRaw(
       // inspect(sym) IS Symbol.prototype.toString's text ("Symbol(foo)")
       // — Node prints it unquoted at every depth.
       return { kind: "libCall", fn: "sym.toString", args: [value], type: STRING, loc };
+    case "bigint":
+      // `123n` at every depth
+      return { kind: "libCall", fn: "big.inspect", args: [value], type: STRING, loc };
     case "bytes":
       return { kind: "libCall", fn: "insp.buffer", args: [value], type: STRING, loc };
     case "dyn":

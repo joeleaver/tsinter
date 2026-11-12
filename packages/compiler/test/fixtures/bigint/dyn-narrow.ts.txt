@@ -1,0 +1,8 @@
+const vals: unknown[] = [5n, 7];
+for (const v of vals) {
+  if (typeof v === "bigint") {
+    const w = v * 2n;
+    console.log("big", w, typeof w);
+    console.log(v * 2n);
+  }
+}

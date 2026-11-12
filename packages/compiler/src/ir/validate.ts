@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
+import { arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -288,6 +288,40 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "sym.keyFor": { argTypes: [SYMBOL_T], result: VOID },
   "sym.desc": { argTypes: [SYMBOL_T], result: VOID },
   "sym.toString": { argTypes: [SYMBOL_T], result: STRING },
+  "big.lit": { argTypes: [STRING], result: BIGINT_T },
+  "big.add": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.sub": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.mul": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.div": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.rem": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.pow": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.and": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.or": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.xor": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.shl": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.sar": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.ushr": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
+  "big.neg": { argTypes: [BIGINT_T], result: BIGINT_T },
+  "big.not": { argTypes: [BIGINT_T], result: BIGINT_T },
+  "big.eq": { argTypes: [BIGINT_T, BIGINT_T], result: BOOL },
+  "big.cmp": { argTypes: [BIGINT_T, BIGINT_T, STRING], result: BOOL },
+  "big.cmpNum": { argTypes: [BIGINT_T, F64, STRING], result: BOOL },
+  "big.numCmp": { argTypes: [F64, BIGINT_T, STRING], result: BOOL },
+  "big.eqNum": { argTypes: [BIGINT_T, F64], result: BOOL },
+  "big.truthy": { argTypes: [BIGINT_T], result: BOOL },
+  "big.toStr": { argTypes: [BIGINT_T], result: STRING },
+  "big.toStrRadix": { argTypes: [BIGINT_T, F64], result: STRING },
+  "big.toLocale": { argTypes: [BIGINT_T], result: STRING },
+  "big.inspect": { argTypes: [BIGINT_T], result: STRING },
+  "big.toNum": { argTypes: [BIGINT_T], result: F64 },
+  "big.fromNum": { argTypes: [F64], result: BIGINT_T },
+  "big.fromStr": { argTypes: [STRING], result: BIGINT_T },
+  "big.asIntN": { argTypes: [F64, BIGINT_T], result: BIGINT_T },
+  "big.asUintN": { argTypes: [F64, BIGINT_T], result: BIGINT_T },
+  "big.bufRead": { argTypes: [BYTES_U8, F64, STRING], result: BIGINT_T },
+  "big.bufWrite": { argTypes: [BYTES_U8, BIGINT_T, F64, STRING], result: F64 },
+  "big.dvGet": { argTypes: [BYTES_U8, F64, BOOL, STRING], result: BIGINT_T },
+  "big.dvSet": { argTypes: [BYTES_U8, F64, BIGINT_T, BOOL], result: VOID },
   "url.new": { argTypes: [STRING], result: URL_T },
   "url.newBase": { argTypes: [STRING, STRING], result: URL_T },
   "url.parse": { argTypes: [STRING], result: VOID },
@@ -1943,7 +1977,7 @@ function validateFunction(
         if (
           e.operand.type.kind !== "f64" &&
           e.operand.type.kind !== "string" &&
-          e.operand.type.kind !== "union" &&
+          e.operand.type.kind !== "union" && e.operand.type.kind !== "bigint" &&
           !REF_TRUTHY_KINDS.has(e.operand.type.kind)
         ) {
           err(`toBool operand must be f64|string|union|ref, got ${e.operand.type.kind}`, e.loc);
@@ -2167,7 +2201,7 @@ function validateFunction(
             !def.arms.every(
               (a) =>
                 a.kind === "undefinedT" || a.kind === "nullT" ||
-                a.kind === "string" || a.kind === "f64" || a.kind === "bool" ||
+                a.kind === "string" || a.kind === "f64" || a.kind === "bool" || a.kind === "bigint" ||
                 (a.kind === "bytes" && a.elem === "u8"),
             )
           ) {
@@ -2176,6 +2210,7 @@ function validateFunction(
         } else if (
           e.operand.type.kind !== "f64" &&
           e.operand.type.kind !== "bool" &&
+          e.operand.type.kind !== "bigint" &&
           // Unit U: String(s) over a string slot that may hold undefined.
           !(undefSlots && e.operand.type.kind === "string") &&
           e.operand.type.kind !== "caught" &&
@@ -2477,13 +2512,13 @@ function validateFunction(
                           : { argTypes: [], result: F64 }; // length
         if (
           e.method === "join" &&
-          elem.kind !== "f64" && elem.kind !== "string" && elem.kind !== "bool" &&
+          elem.kind !== "f64" && elem.kind !== "string" && elem.kind !== "bool" && elem.kind !== "bigint" &&
           !(
             elem.kind === "union" &&
             (unions
               .get(elem.unionId)
               ?.arms.every(
-                (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a),
+                (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || a.kind === "bigint" || isUnitType(a),
               ) ??
               false)
           )

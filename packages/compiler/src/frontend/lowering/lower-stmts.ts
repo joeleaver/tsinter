@@ -12,6 +12,7 @@ import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
+import { bigArith, bigLitOf } from "./lower-bigint.js";
 import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf } from "./surfaces.js";
 import { isProvenanceSourceFile } from "../provenance-registry.js";
 import { ambientUndefVarRootOf, lowerImportEquals, nsUndefRead, nsWritableTarget, trapDeclRootOf } from "./lower-namespaces.js";
@@ -5560,6 +5561,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     // JS any-origin targets: check the read to number, convert the
     // result back into the dyn slot (the compound-assign stance).
     const dynTarget = target.type.kind === "dyn" && isJsSourceFile(expr.getSourceFile());
+    if (target.type.kind === "bigint") {
+      return { kind: "assign", localId: target.id, value: bigArith(op, readTarget, bigLitOf(1n, loc), loc)!, loc };
+    }
     if (target.type.kind !== "f64" && !dynTarget) {
       L.unsupported("SC1090", expr.operand, "increment/decrement of non-number targets");
     }
@@ -5599,6 +5603,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: ensureConcatString(L, r, expr.right), type: STRING, loc }));
     } else if (target.type.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op: compound, left: read, right: rhs, type: F64, loc };
+    } else if (target.type.kind === "bigint" && rhs.type.kind === "bigint" && bigArith(compound, read, rhs, loc) !== null) {
+      value = bigArith(compound, read, rhs, loc)!;
     } else if (
       (target.type.kind === "dyn" || rhs.type.kind === "dyn") &&
       (target.type.kind === "dyn" || target.type.kind === "f64") &&

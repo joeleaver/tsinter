@@ -79,6 +79,7 @@ import {
   F64 as IR_F64,
   REF_TRUTHY_KINDS,
   keyedReadRecv,
+  moduleUsesBigint,
 } from "../../ir/nodes.js";
 import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -300,6 +301,7 @@ import {
   FIN_KIND_PROMISE,
 } from "./stream.js";
 import { SymBuilder } from "./symbols.js";
+import { BigBuilder } from "./bigint.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { UNDEF_BOOL, UNDEF_F64_BITS, UNDEF_UNION_TAG } from "./undef.js";
 import { Code, ENGINE_MEMORY, addZeroTailType, resetZeroTailTypes, setCharsType } from "./code.js";
@@ -1417,7 +1419,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
   // Node's RangeError on this tier (the native lanes abort), so each one
   // reads as a throwing call.
   const concats = hasStrConcat(mod);
-  if (!found && !netKeys && !concats) return mod;
+  // a BigInt module: `in` over a dynamic BigInt throws V8's TypeError
+  const bigKeys = moduleUsesBigint(asIrModule(mod));
+  if (!found && !netKeys && !concats && !bigKeys) return mod;
   const copy = (node: unknown): unknown => {
     if (Array.isArray(node)) return node.map(copy);
     if (node !== null && typeof node === "object") {
@@ -1440,7 +1444,7 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
       if (out["kind"] === "strIntrinsic" && out["method"] === "repeat") {
         return { kind: "libCall", fn: "cp.execSync", args: [out["receiver"], ...(out["args"] as unknown[])], type: out["type"], loc: out["loc"] };
       }
-      if (out["kind"] === "dynHasKey" && netKeys) {
+      if (out["kind"] === "dynHasKey" && (netKeys || bigKeys)) {
         return { kind: "libCall", fn: "cp.execSync", args: [out["value"]], type: out["type"], loc: out["loc"] };
       }
       return out;
@@ -3041,6 +3045,9 @@ class Assembler {
   /** INC-29 U1: the module reaches node:net's host I/O (netModuleReachable):
    * an event module whose poll phase reads the net kinds (net.ts). */
   private readonly netModule: boolean;
+  /** The module carries a bigint (moduleUsesBigint): the dynamic world
+   * gets its BIGINT kind's arms. */
+  private readonly bigModule: boolean;
   /** INC-29 U1: the module reaches cp.spawn / cp.spawnOpts (the INC-28 U2
    * event-module condition, before net joined it). */
   private readonly cpEventModule: boolean;
@@ -3375,6 +3382,7 @@ class Assembler {
     // event modules only, minted LAST so no earlier import index moves.
     this.cpEventModule = eventModuleReachable(mod);
     this.netModule = netMod;
+    this.bigModule = moduleUsesBigint(asIrModule(mod));
     this.closeOverride = closeOverrideReachable(mod);
     this.httpModule = httpModuleReachable(mod);
     // INC-29 U1: a net module is an event module too; units G1-G3: so is a
@@ -5676,7 +5684,8 @@ class Assembler {
         if (i > 0) c.i32Or();
       });
     };
-    kindIn([DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR]);
+    // (a BigInt is an immutable primitive: it clones as itself)
+    kindIn([DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR, ...(this.bigModule ? [DK.BIGINT] : [])]);
     c.ifVoid();
     c.localGet(0);
     ret();
@@ -10826,6 +10835,9 @@ class Assembler {
       bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
       strRef: () => this.strRef,
       lit: (c, s) => this.pushStrLitInto(c, s),
+      bigTruthy: () => this.big.truthy(),
+      bigEq: () => this.big.eq(),
+      bigToStr: () => this.big.toStr10(),
     });
     return this.unionsField;
   }
@@ -10841,6 +10853,18 @@ class Assembler {
   private get dyn(): DynBuilder {
     this.dynField ??= new DynBuilder(this.mb, {
       idSlot: this.idKeys,
+      ...(this.bigModule
+        ? {
+            big: {
+              bigType: () => this.big.bigType,
+              truthy: () => this.big.truthy(),
+              eq: () => this.big.eq(),
+              toStr10: () => this.big.toStr10(),
+              toStrRadix: () => this.big.toStrRadix(),
+              hash: () => this.big.hash(),
+            },
+          }
+        : {}),
       // INC-29 U1: a net module boxes its Sockets and Servers as HANDLEs.
       ...(this.netModule
         ? {
@@ -11045,6 +11069,7 @@ class Assembler {
 
   private get json(): JsonBuilder {
     this.jsonField ??= new JsonBuilder(this.mb, {
+      ...(this.bigModule ? { bigLive: true } : {}),
       strEq: () => this.strEqHelper(),
       strRef: () => this.strRef,
       strType: () => this.strType,
@@ -11078,6 +11103,7 @@ class Assembler {
 
   private get insp(): InspectBuilder {
     this.inspField ??= new InspectBuilder(this.mb, {
+      ...(this.bigModule ? { big: { bigType: () => this.big.bigType, inspect: () => this.big.inspect() } } : {}),
       strRef: () => this.strRef,
       strType: () => this.strType,
       lit: (c, s) => this.pushStrLitInto(c, s),
@@ -11232,6 +11258,20 @@ class Assembler {
     const M = 2;
     const R = 3;
     const vec = this.dynVecInfo();
+    if (this.bigModule) {
+      // a BigInt's string conversion is its decimal text
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.BIGINT);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.big.bigType);
+      c.call(this.big.toStr10());
+      c.return_();
+      c.end();
+    }
     const isPrim = (local: number): void => {
       // NULL BOOL NUM STR UNDEF
       c.localGet(local);
@@ -11351,6 +11391,18 @@ class Assembler {
     const M = 2;
     const R = 3;
     const vec = this.dynVecInfo();
+    if (this.bigModule) {
+      // ToNumber(bigint) is V8's TypeError
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.BIGINT);
+      c.i32Eq();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot convert a BigInt value to a number"), null);
+      c.f64Const(NaN);
+      c.return_();
+      c.end();
+    }
     const isPrim = (local: number): void => {
       // NULL BOOL NUM STR UNDEF
       c.localGet(local);
@@ -17071,6 +17123,8 @@ class Assembler {
     switch (t.kind) {
       case "f64":
         return "number";
+      case "bigint":
+        return "bigint";
       case "string":
         return "string";
       case "bool":
@@ -17200,6 +17254,9 @@ class Assembler {
     switch (t.kind) {
       case "f64":
         dyn.boxNum(c, (x) => x.localGet(0));
+        return true;
+      case "bigint":
+        dyn.boxBig(c, (x) => x.localGet(0));
         return true;
       case "bool":
         dyn.boxBool(c, (x) => x.localGet(0));
@@ -17765,6 +17822,11 @@ class Assembler {
         c.localGet(0);
         c.call(json.jbPutF64());
         return true;
+      case "bigint":
+        // Node's TypeError; the root's pending check unwinds (the walk
+        // runs no user code, so finishing it is unobservable)
+        this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Do not know how to serialize a BigInt"), null);
+        return true;
       case "bool":
         if (this.undefSlots) {
           // Unit U: the bool undefined (2) serializes as null.
@@ -18264,6 +18326,9 @@ class Assembler {
       case "f64":
         this.emitKindIs(c, DK.NUM);
         return true;
+      case "bigint":
+        this.emitKindIs(c, DK.BIGINT);
+        return true;
       case "string":
         this.emitKindIs(c, DK.STR);
         return true;
@@ -18531,6 +18596,9 @@ class Assembler {
     switch (t.kind) {
       case "f64":
         this.emitKindIs(c, DK.NUM);
+        return true;
+      case "bigint":
+        this.emitKindIs(c, DK.BIGINT);
         return true;
       case "string":
         this.emitKindIs(c, DK.STR);
@@ -18943,6 +19011,12 @@ class Assembler {
         kindGuard(DK.NUM);
         c.localGet(0);
         c.structGet(dyn.dynT(), DYN_NUM);
+        return true;
+      case "bigint":
+        kindGuard(DK.BIGINT);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(this.big.bigType);
         return true;
       case "bool":
         kindGuard(DK.BOOL);
@@ -19789,6 +19863,12 @@ class Assembler {
         reps.push({ kind: arm.kind, struct: this.unionArmStruct(unionId, i, loc) });
         continue;
       }
+      // A bigint arm is a value, not an object: truthiness, equality and
+      // ToString all read it (bigint.ts).
+      if (arm.kind === "bigint") {
+        reps.push({ kind: "bigint", struct: this.unionArmStruct(unionId, i, loc) });
+        continue;
+      }
       if (need === "toStr") {
         // The frontend fences union ToString to unit/string/f64/bool
         // arms plus bytes (lowerUnionToStringCall's own `elem === "u8"`
@@ -20540,6 +20620,10 @@ class Assembler {
       // below and refuse as `type:symbol`.
       case "symbol":
         return this.syms.symRef();
+      // BigInt (bigint.ts): one struct for every value; never fails, and
+      // mapTypeSoft and its array-element list carry the same arm.
+      case "bigint":
+        return this.big.bigRef();
       // INC-29 U3: the WHATWG URL and URLSearchParams (url-whatwg.ts) —
       // never fail; mapTypeSoft and its array-element list carry the same
       // arms.
@@ -20627,6 +20711,7 @@ class Assembler {
           t.elem.kind === "netServer" || // INC-29 U1: a Server[], the same lockstep
           (this.httpModule && (t.elem.kind === "httpReq" || t.elem.kind === "httpRes" || t.elem.kind === "httpClientReq")) || // INC-29 U2
           t.elem.kind === "url" || t.elem.kind === "searchParams" || // INC-29 U3: the same lockstep
+          t.elem.kind === "bigint" ||
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -20762,6 +20847,8 @@ class Assembler {
       // the I32 placeholder instead.
       case "symbol":
         return this.syms.symRef();
+      case "bigint":
+        return this.big.bigRef();
       // INC-29 U3: mapType's url / searchParams arms, in lockstep.
       case "url":
         return this.urlEngine.urlRef();
@@ -22830,6 +22917,21 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
+        if (k === "bigint") {
+          // not 0n (a null slot is Unit U's undefined: falsy)
+          this.walkExpr(e.operand);
+          const s = this.acquireScratch(this.big.bigRef());
+          code.localTee(s);
+          code.refIsNull();
+          this.openIfResult(I32);
+          code.i32Const(0);
+          code.else_();
+          code.localGet(s);
+          code.call(this.big.truthy());
+          this.close();
+          this.releaseScratch(this.big.bigRef(), s);
+          return;
+        }
         if (k === "classval" || REF_TRUTHY_KINDS.has(k)) {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
@@ -23439,6 +23541,22 @@ class Assembler {
         if (k === "f64") {
           this.walkExpr(e.operand);
           code.call(this.f64ToStrHelper());
+          return;
+        }
+        if (k === "bigint") {
+          // decimal, no suffix (String(1n) is "1"); a null slot is Unit
+          // U's undefined
+          this.walkExpr(e.operand);
+          const s = this.acquireScratch(this.big.bigRef());
+          code.localTee(s);
+          code.refIsNull();
+          this.openIfResult(this.strRef);
+          this.pushStrLit("undefined");
+          code.else_();
+          code.localGet(s);
+          code.call(this.big.toStr10());
+          this.close();
+          this.releaseScratch(this.big.bigRef(), s);
           return;
         }
         if (k === "bool") {
@@ -25596,6 +25714,27 @@ class Assembler {
           // ToNumber over a dyn value (board #263): may run an own
           // valueOf/toString, whose throw propagates.
           this.walkExpr(e.args[0]!);
+          if (this.bigModule) {
+            // Number(5n) is 5 (the Number constructor converts a BigInt;
+            // only ToNumber itself — unary +, arithmetic — throws)
+            const d = this.acquireScratch(this.dyn.dynRef());
+            code.localTee(d);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.BIGINT);
+            code.i32Eq();
+            this.openIfResult(F64);
+            code.localGet(d);
+            code.structGet(this.dyn.dynT(), DYN_REF);
+            code.refCast(this.big.bigType);
+            code.call(this.big.toF64());
+            code.else_();
+            code.localGet(d);
+            code.call(this.dynToNumberFn());
+            this.close();
+            this.releaseScratch(this.dyn.dynRef(), d);
+            this.emitPendingCheck();
+            return;
+          }
           code.call(this.dynToNumberFn());
           this.emitPendingCheck();
           return;
@@ -28979,6 +29118,7 @@ class Assembler {
           code.call(this.hev.rlOnCloseHelper());
           return;
         }
+        if (this.emitBigLibCall(e)) return;
         if (this.emitCryptoLibCall(e)) return;
         if (this.emitZlibLibCall(e)) return;
         if (this.emitTlsLibCall(e)) return;
@@ -29461,6 +29601,7 @@ class Assembler {
           case "union":
           case "promise":
           case "bytes":
+          case "bigint":
           // INC-29 U1: a node:net Socket / Server, boxed by reference
           // (emitDynFromBody's own arm; refused outside a net module).
           case "netSocket":
@@ -29549,6 +29690,7 @@ class Assembler {
             t.kind === "union" ||
             t.kind === "func" ||
             t.kind === "bytes" ||
+            t.kind === "bigint" ||
             // The %Error extraction after an `instanceof Error` narrow
             // (INC-27 U5); no other class reaches here from the frontend
             // (TypeError/RangeError narrows are board #189's front-end
@@ -29690,6 +29832,24 @@ class Assembler {
         // S087 (f)) — the handle's members are not a table to ask. Only in
         // a module that boxes handles; the may-throw view reads dynHasKey
         // as throwing there, and the pending check follows below.
+        if (this.bigModule) {
+          // `"k" in 5n`: V8's TypeError (the right operand is no object)
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.BIGINT);
+          code.i32Eq();
+          this.openIf();
+          this.emitSetCellError(code, "%TypeError", "TypeError", (c2) => {
+            this.pushStrLitInto(c2, `Cannot use 'in' operator to search for '${e.key}' in `);
+            c2.localGet(d);
+            c2.structGet(this.dyn.dynT(), DYN_REF);
+            c2.refCast(this.big.bigType);
+            c2.call(this.big.toStr10());
+            c2.call(this.concatHelper());
+          }, null);
+          this.emitUnwind();
+          this.close();
+        }
         const handleIn = (this.netModule || this.fetchModule) && this.dyn.handleLive();
         if (handleIn) {
           code.localGet(d);
@@ -32018,6 +32178,18 @@ class Assembler {
           case "string":
             this.dyn.boxStr(code, () => this.walkExpr(e.value));
             return;
+          case "bigint": {
+            // dynFrom's walker: a slot's undefined (null) crosses as the
+            // dynamic undefined
+            const h = this.dynFromHelper(vt, e.loc);
+            if (h === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.call(h);
+            return;
+          }
           case "undefinedT":
           case "nullT": {
             // A unit VALUE is the literal and nothing else (dynFrom's own
@@ -32432,6 +32604,7 @@ class Assembler {
             code.localSet(b);
             this.emitDynToPrimInPlace(a);
             this.emitDynToPrimInPlace(b);
+            this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn("add")));
             code.localGet(a);
             code.call(this.jsIsStrLikeHelper());
             code.localGet(b);
@@ -32454,6 +32627,7 @@ class Assembler {
               c.f64Add();
             });
             code.end();
+            this.closeBigDyn(true);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -32470,6 +32644,7 @@ class Assembler {
             // propagates before the right operand converts).
             this.emitDynToPrimInPlace(a);
             this.emitDynToPrimInPlace(b);
+            this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn(op)));
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
               c.call(this.jsToNumberHelper());
@@ -32480,6 +32655,7 @@ class Assembler {
               else if (op === "div") c.f64Div();
               else c.call(this.fmodHelper()); // JS % is C fmod, ported already
             });
+            this.closeBigDyn(true);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -32493,6 +32669,7 @@ class Assembler {
             code.localSet(b);
             this.emitDynToPrimInPlace(a);
             this.emitDynToPrimInPlace(b);
+            this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn("pow")));
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
               c.call(this.jsToNumberHelper());
@@ -32500,6 +32677,7 @@ class Assembler {
               c.call(this.jsToNumberHelper());
               c.call(this.jsPowHelper());
             });
+            this.closeBigDyn(true);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -32512,11 +32690,13 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
+            if (op === "neg") this.openBigDyn(a, a, this.dyn.dynRef(), () => code.call(this.bigDynArithFn("neg")));
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
               c.call(this.dynToNumberFn());
               if (op === "neg") c.f64Neg();
             });
+            if (op === "neg") this.closeBigDyn(false);
             this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), a);
             return;
@@ -32544,6 +32724,7 @@ class Assembler {
             // LeftFirst false still converts the source-left one first).
             this.emitDynToPrimInPlace(a);
             this.emitDynToPrimInPlace(b);
+            this.openBigDyn(a, b, I32, () => code.call(this.bigDynCmpFn(op)));
             // Abstract Relational Comparison (7.2.14): both operands are
             // strings (post-ToPrimitive) → code-UNIT order (strCmpU16,
             // S005's own comparator); otherwise numeric — IEEE f64
@@ -32576,6 +32757,7 @@ class Assembler {
             else if (op === "gt") code.f64Gt();
             else code.f64Ge();
             code.end();
+            this.closeBigDyn(false);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -34030,6 +34212,7 @@ class Assembler {
       ...(this.strViewsLive ? { strViews: { len: () => this.ropes.len(), copyInto: () => this.slices.copyInto() } } : {}),
       strRef: () => this.strRef,
       f64ToStr: () => this.f64ToStrHelper(),
+      bigEq: () => this.big.eq(),
       concat: () => this.concatHelper(),
       lit: (c, s) => this.pushStrLitInto(c, s),
       // INC-27 U2: the array `with`'s catchable RangeError shares
@@ -34062,6 +34245,375 @@ class Assembler {
       readSymId: (c) => c.structGet(this.syms.structType(), this.syms.idField()),
     }, this.idKeys);
     return this.mapsField;
+  }
+
+  private bigField: BigBuilder | null = null;
+
+  /** BigInt values and their helpers (bigint.ts), built on first use. */
+  private get big(): BigBuilder {
+    this.bigField ??= new BigBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      throwError: (c, className, name, pushMessage, codeLit) => this.emitSetCellError(c, className, name, pushMessage, codeLit ?? null),
+    });
+    return this.bigField;
+  }
+
+  /** The big.* libCalls (bigint.ts): operands in order, then the helper;
+   * the throwing ones run the pending check. */
+  private emitBigLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!e.fn.startsWith("big.")) return false;
+    const code = this.fn.code;
+    const big = this.big;
+    const args = (): void => {
+      for (const a of e.args) this.walkExpr(a);
+    };
+    const strArg = (i: number): string => {
+      const a = e.args[i];
+      if (a?.kind !== "strLit") throw new Error(`emitter bug: ${e.fn} argument ${i} is not a string literal`);
+      return a.value;
+    };
+    const call = (idx: number, throws: boolean): true => {
+      code.call(idx);
+      if (throws) this.emitPendingCheck();
+      return true;
+    };
+    switch (e.fn) {
+      case "big.lit":
+        code.globalGet(big.literal(BigInt(strArg(0))));
+        return true;
+      case "big.add":
+      case "big.sub":
+      case "big.mul":
+        args();
+        return call(big.arith(e.fn === "big.add" ? "add" : e.fn === "big.sub" ? "sub" : "mul"), e.fn === "big.mul");
+      case "big.div":
+      case "big.rem":
+        args();
+        return call(big.divRem(e.fn === "big.div" ? "div" : "rem"), true);
+      case "big.pow":
+        args();
+        return call(big.pow(), true);
+      case "big.and":
+      case "big.or":
+      case "big.xor":
+        args();
+        return call(big.bitop(e.fn === "big.and" ? 0 : e.fn === "big.or" ? 1 : 2), false);
+      case "big.shl":
+      case "big.sar":
+        args();
+        return call(big.shift(e.fn === "big.shl"), true);
+      case "big.ushr":
+        // both operands evaluate, then V8's TypeError
+        args();
+        code.drop();
+        code.drop();
+        this.emitSetCellError(code, "%TypeError", "TypeError", (c) => this.pushStrLitInto(c, "BigInts have no unsigned right shift, use >> instead"), null);
+        this.emitUnwind();
+        code.refNull(big.bigType);
+        return true;
+      case "big.neg":
+        args();
+        return call(big.neg(), false);
+      case "big.not":
+        args();
+        return call(big.not(), false);
+      case "big.eq":
+        args();
+        return call(big.eq(), false);
+      case "big.cmp":
+      case "big.cmpNum":
+      case "big.numCmp": {
+        const rel = strArg(2);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        let flip = false;
+        if (e.fn === "big.numCmp") {
+          // (number, bigint): evaluated in order, compared with the
+          // relation mirrored
+          const n = this.acquireScratch(F64);
+          const b = this.acquireScratch(big.bigRef());
+          code.localSet(b);
+          code.localSet(n);
+          code.localGet(b);
+          code.localGet(n);
+          this.releaseScratch(big.bigRef(), b);
+          this.releaseScratch(F64, n);
+          flip = true;
+        }
+        code.call(e.fn === "big.cmp" ? big.cmp() : big.cmpF64());
+        // the order (-1/0/1, or 2 unordered) against the relation
+        const r = flip ? ({ "<": ">", "<=": ">=", ">": "<", ">=": "<=" } as Record<string, string>)[rel]! : rel;
+        emitBigRel(code, r);
+        return true;
+      }
+      case "big.eqNum":
+        args();
+        code.call(big.cmpF64());
+        code.i32Eqz();
+        return true;
+      case "big.truthy":
+        args();
+        return call(big.truthy(), false);
+      case "big.toStr":
+        args();
+        code.i32Const(10);
+        return call(big.toStr(), false);
+      case "big.inspect":
+        args();
+        return call(big.inspect(), false);
+      case "big.toStrRadix":
+        args();
+        return call(big.toStrRadix(), true);
+      case "big.toLocale":
+        args();
+        return call(big.toStr(true), false);
+      case "big.toNum":
+        args();
+        return call(big.toF64(), false);
+      case "big.fromNum":
+        args();
+        return call(big.fromF64(), true);
+      case "big.fromStr":
+        args();
+        return call(big.fromStr(), true);
+      case "big.asIntN":
+      case "big.asUintN":
+        args();
+        return call(big.asN(e.fn === "big.asIntN" ? 1 : 0), true);
+      case "big.bufRead": {
+        // (bytes, offset, kind): readDouble's 8-byte bounds ladder over raw bits
+        const kind = strArg(2);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.bytesB.readNumFloatHelper(kind.endsWith("le") ? "f64le" : "f64be", true));
+        this.emitPendingCheck();
+        return call(big.fromBits(kind.startsWith("i")), false);
+      }
+      case "big.bufWrite": {
+        // (bytes, value, offset, kind): both arguments evaluate, then the
+        // value's range (Node's checkInt), then the bounds
+        const kind = strArg(3);
+        const recv = this.acquireScratch(this.bytesB.bytesRef());
+        const off = this.acquireScratch(F64);
+        const bits = this.acquireScratch(I64);
+        this.walkExpr(e.args[0]!);
+        code.localSet(recv);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.localSet(off);
+        code.call(big.toBitsChecked(kind.startsWith("i")));
+        code.localSet(bits);
+        this.emitPendingCheck();
+        code.localGet(recv);
+        code.localGet(bits);
+        code.localGet(off);
+        code.call(this.bytesB.writeNumFloatHelper(kind.endsWith("le") ? "f64le" : "f64be", true));
+        this.releaseScratch(I64, bits);
+        this.releaseScratch(F64, off);
+        this.releaseScratch(this.bytesB.bytesRef(), recv);
+        this.emitPendingCheck();
+        return true;
+      }
+      case "big.dvGet": {
+        // (bytes, offset, le, "u" | "i"): getFloat64's DataView ladder
+        const signed = strArg(3) === "i";
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(this.bytesB.dvGetFloatHelper("dvGetFloat64", true));
+        this.emitPendingCheck();
+        return call(big.fromBits(signed), false);
+      }
+      case "big.dvSet": {
+        // (bytes, offset, value, le): ToBigUint64 wraps, then setFloat64's ladder
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(big.toBitsWrap());
+        this.walkExpr(e.args[3]!);
+        code.call(this.bytesB.dvSetFloatHelper("dvSetFloat64", true));
+        this.emitPendingCheck();
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+
+
+  /** BigInt in the one dynamic world's operators (a module that uses
+   * BigInt only): when either operand (locals a, b) holds a BIGINT, the
+   * `big` arm answers; otherwise the existing number/string code runs in
+   * the else arm. closeBigDyn ends the if (and runs the pending check for
+   * the arms that can throw). */
+  private bigDynOpen: boolean[] = [];
+
+  private openBigDyn(a: number, b: number, result: ValType, big: () => void): void {
+    if (!this.bigModule) {
+      this.bigDynOpen.push(false);
+      return;
+    }
+    const code = this.fn.code;
+    const dynT = this.dyn.dynT();
+    code.localGet(a);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BIGINT);
+    code.i32Eq();
+    code.localGet(b);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BIGINT);
+    code.i32Eq();
+    code.i32Or();
+    this.openIfResult(result);
+    code.localGet(a);
+    code.localGet(b);
+    big();
+    code.else_();
+    this.bigDynOpen.push(true);
+  }
+
+  private closeBigDyn(throws: boolean): void {
+    if (!this.bigDynOpen.pop()) return;
+    this.close();
+    if (throws) this.emitPendingCheck();
+  }
+
+  private bigDynFns = new Map<string, number>();
+
+  /** `%w.big.dyn:<op>(a, b) -> dyn` — an arithmetic operator with a BIGINT
+   * operand: both BigInt computes; `+` beside a string concatenates;
+   * anything else is V8's "Cannot mix BigInt and other types" TypeError
+   * (pending, a null result). `neg` reads only `a`. */
+  private bigDynArithFn(op: string): number {
+    const hit = this.bigDynFns.get(op);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef, dynRef], [dynRef]), `%w.big.dyn:${op}`);
+    this.bigDynFns.set(op, idx);
+    const c = new Code();
+    const dynT = this.dyn.dynT();
+    const big = this.big;
+    const payload = (p: number): void => {
+      c.localGet(p);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(big.bigType);
+    };
+    const isBig = (p: number): void => {
+      c.localGet(p);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.BIGINT);
+      c.i32Eq();
+    };
+    const fn =
+      op === "add" ? big.arith("add") : op === "sub" ? big.arith("sub") : op === "mul" ? big.arith("mul")
+      : op === "div" ? big.divRem("div") : op === "mod" ? big.divRem("rem") : op === "pow" ? big.pow() : big.neg();
+    isBig(0);
+    if (op !== "neg") {
+      isBig(1);
+      c.i32And();
+    }
+    c.ifVoid();
+    this.dyn.boxBig(c, (x) => {
+      payload(0);
+      if (op !== "neg") payload(1);
+      x.call(fn);
+    });
+    c.return_();
+    c.end();
+    if (op === "add") {
+      // the operands are primitives (ToPrimitive ran): a string concatenates
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.dyn.boxStr(c, (x) => {
+        x.localGet(0);
+        x.call(this.dyn.toStr());
+        x.localGet(1);
+        x.call(this.dyn.toStr());
+        x.call(this.concatHelper());
+      });
+      c.return_();
+      c.end();
+    }
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot mix BigInt and other types, use explicit conversions"), null);
+    c.refNull(dynT);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%w.big.dynCmp:<op>(a, b) -> i32` — a relational operator with a
+   * BIGINT operand: against a BigInt, or a number/boolean/null/undefined
+   * operand's ToNumber (NaN false); a string operand (StringToBigInt) is
+   * fenced by name. */
+  private bigDynCmpFn(op: string): number {
+    const key = `cmp:${op}`;
+    const hit = this.bigDynFns.get(key);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef, dynRef], [I32]), `%w.big.dynCmp:${op}`);
+    this.bigDynFns.set(key, idx);
+    const c = new Code();
+    const dynT = this.dyn.dynT();
+    const big = this.big;
+    const rel = op === "lt" ? "<" : op === "le" ? "<=" : op === "gt" ? ">" : ">=";
+    const mirror: Record<string, string> = { "<": ">", "<=": ">=", ">": "<", ">=": "<=" };
+    const payload = (p: number): void => {
+      c.localGet(p);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(big.bigType);
+    };
+    const kindIs = (p: number, k: number): void => {
+      c.localGet(p);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(k);
+      c.i32Eq();
+    };
+    // a string operand: fenced
+    kindIs(0, DK.STR);
+    kindIs(1, DK.STR);
+    c.i32Or();
+    c.ifVoid();
+    this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, "comparing a BigInt with a string held in a dynamic value is not supported yet"), null);
+    c.unreachable();
+    c.end();
+    kindIs(0, DK.BIGINT);
+    kindIs(1, DK.BIGINT);
+    c.i32And();
+    c.ifVoid();
+    payload(0);
+    payload(1);
+    c.call(big.cmp());
+    emitBigRel(c, rel);
+    c.return_();
+    c.end();
+    kindIs(0, DK.BIGINT);
+    c.ifVoid();
+    payload(0);
+    c.localGet(1);
+    c.call(this.jsToNumberHelper());
+    c.call(big.cmpF64());
+    emitBigRel(c, rel);
+    c.return_();
+    c.end();
+    payload(1);
+    c.localGet(0);
+    c.call(this.jsToNumberHelper());
+    c.call(big.cmpF64());
+    emitBigRel(c, mirror[rel]!);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   private symsField: SymBuilder | null = null;
@@ -35391,6 +35943,10 @@ class Assembler {
       return { kind: "str", val: { kind: "ref", nullable: true, typeIndex: this.strType } };
     }
     if (t.kind === "symbol") return { kind: "sym", val: this.syms.symRef() };
+    // BigInt keys by value (SameValueZero is mathematical equality).
+    if (t.kind === "bigint") {
+      return { kind: "custom", val: this.big.bigRef(), fns: () => ({ hash: this.big.hash(), eq: this.big.eq() }) };
+    }
     // INC-29 U2: a net.Server by reference identity (Set<http.Server>).
     if (t.kind === "netServer") return { kind: "ref", val: this.net.srvRef() };
     // Object keys (docs/design/object-keys.md): every other key kind is
@@ -35712,6 +36268,19 @@ class Assembler {
       c.call(this.keyF64HashFn());
       c.return_();
       c.end();
+      if (this.bigModule) {
+        // by value
+        c.localGet(K);
+        c.i32Const(DK.BIGINT);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.big.bigType);
+        c.call(this.big.hash());
+        c.return_();
+        c.end();
+      }
       c.localGet(K);
       c.i32Const(DK.STR);
       c.i32Eq();
@@ -35859,6 +36428,7 @@ class Assembler {
         c.structGet(st, 1);
         if (arm.kind === "f64") c.call(this.keyF64HashFn());
         else if (arm.kind === "string") c.call(this.keyStrHashFn());
+        else if (arm.kind === "bigint") c.call(this.big.hash());
         else if (arm.kind === "bool") {
           // the payload is the i32 itself
         } else c.call(this.keyIdHashFn(arm, val));
@@ -37399,7 +37969,9 @@ class Assembler {
         // knows how to resolve (the same resolver toString's union arm
         // and String()/template-literal ToString already share).
         let refJoinToStr: (() => number) | null = null;
-        if (info.elemKind === "ref") {
+        if (info.elemKind === "ref" && rt.elem.kind === "bigint") {
+          refJoinToStr = () => this.big.toStr10();
+        } else if (info.elemKind === "ref") {
           if (rt.elem.kind !== "union") {
             this.refuse("arrIntrinsic:join:ref-elem", e.loc);
             code.unreachable();
@@ -56730,4 +57302,26 @@ class Assembler {
     }
     c.end();
   }
+}
+
+/** The order on the stack (-1 / 0 / 1, or 2 when unordered: a NaN) against
+ * a relation: an i32 bool. */
+function emitBigRel(c: Code, r: string): void {
+  if (r === "<") {
+    c.i32Const(-1);
+    c.i32Eq();
+  } else if (r === ">") {
+    c.i32Const(1);
+    c.i32Eq();
+  } else if (r === "<=") {
+    // -1 or 0
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(1);
+    c.i32LeU();
+  } else if (r === ">=") {
+    // 0 or 1
+    c.i32Const(1);
+    c.i32LeU();
+  } else throw new Error(`emitter bug: BigInt relation ${r}`);
 }

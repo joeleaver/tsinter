@@ -137,6 +137,17 @@ import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./s
 import { emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 
+/** The BigInt helpers the BIGINT kind's arms call (bigint.ts). */
+export interface DynBigDeps {
+  bigType: () => number;
+  truthy: () => number;
+  eq: () => number;
+  toStr10: () => number;
+  /** (big, f64 radix) -> string, RangeError pending outside 2..36. */
+  toStrRadix: () => number;
+  hash: () => number;
+}
+
 /** ScrDynKind's numeric values (scr_runtime.h), shared verbatim with
  * `backend/llvm/dyn.ts`'s `DK` and the C runtime. A CROSS-LANE CONTRACT —
  * see the header: never renumber, never insert. */
@@ -153,6 +164,9 @@ export const DK = {
   HANDLE: 9,
   PROMISE: 10,
   JSVAL: 11,
+  /** A BigInt (bigint.ts's `$big` in `ref`). WasmGC lanes only, past the
+   * C runtime's table (which has no bigint): appended, never inserted. */
+  BIGINT: 12,
 } as const;
 
 /** GH #134: the named run-time refusal the TOTAL ToString helper (toStr)
@@ -308,6 +322,9 @@ export interface DynDeps {
   /** Object keys (docs/design/object-keys.md): `$dynObj` carries the
    * identity-hash slot (OBJ_IDH). */
   idSlot?: boolean;
+  /** A module that uses BigInt: the BIGINT kind's arms (bigint.ts's
+   * helpers), so every other module is byte-identical. */
+  big?: DynBigDeps;
   /** INC-29 U1: see DynHandleDeps. */
   handle?: DynHandleDeps;
   /** INC-29 U1: Buffer / Uint8Array `slice` and `at` on a dyn BYTES value
@@ -1587,6 +1604,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "Object.create over");
       this.arm(c, K, [DK.NULL], () => this.boxObj(c, (x) => this.pushNewObj(x, true)));
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
@@ -3994,6 +4012,7 @@ export class DynBuilder {
       c.i32Const(0);
       c.return_();
       c.end();
+      this.bigArm(c, K, () => { this.bigPayload(c, 0); this.bigPayload(c, 1); c.call(this.deps.big!.eq()); });
       // Unit I: two dynamic typed arrays are the same value when they
       // alias the same bytes (each crossing boxes afresh, S014's bytes rule).
       this.typedArm(c, 0, K, () => {
@@ -4398,6 +4417,13 @@ export class DynBuilder {
       c.return_();
       c.end();
 
+      // BIGINT -> by value
+      this.bigArm(c, KA, () => {
+        this.bigPayload(c, A);
+        this.bigPayload(c, B);
+        c.call(this.deps.big!.eq());
+      });
+
       // BOOL -> the shared num slot, exact (0/1)
       c.localGet(KA);
       c.i32Const(DK.BOOL);
@@ -4791,6 +4817,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.truthy()); });
       this.typedArm(c, 0, K, () => c.i32Const(1)); // Unit I
       this.arm(c, K, [DK.BOOL], () => {
         c.localGet(0);
@@ -4840,6 +4867,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => this.deps.lit(c, "bigint"));
       this.typedArm(c, 0, K, () => this.deps.lit(c, "object")); // Unit I
       // C tests the island kind BEFORE the switch and early-returns into
       // the engine's own typeof (scr_json.c:1122) — so JSVAL has no answer
@@ -4889,6 +4917,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); });
       this.typedArm(c, 0, K, () => {
         // Unit I: Array.prototype.join over the elements is not built; the
         // conversion sites are not catchable, so this refuses uncaught.
@@ -6129,6 +6158,7 @@ export class DynBuilder {
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
+        this.bigFence(c, K, "reading a member of");
         // Unit I: a dynamic typed array's own surface (dyn.ts typedKey).
         this.typedArm(c, 0, K, () => {
           c.localGet(0);
@@ -6604,6 +6634,35 @@ export class DynBuilder {
    * dynamic world on the WasmGC lanes (dynamic-values design §4.1) they
    * can, so each ends the program at a named fence (S122) instead of a
    * bare trap — never a silent stop. */
+  /** The BIGINT arm (`if (kind == BIGINT) { arm(); return }`), in a module
+   * that uses BigInt only. */
+  private bigArm(c: Code, kindLocal: number, arm: () => void): void {
+    if (this.deps.big !== undefined) this.arm(c, kindLocal, [DK.BIGINT], arm);
+  }
+
+  /** Param `p`'s BIGINT payload, as the `$big` struct. */
+  private bigPayload(c: Code, p: number): void {
+    c.localGet(p);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.deps.big!.bigType());
+  }
+
+  /** An operation with no BigInt arm yet: loud, by name. */
+  private bigFence(c: Code, kindLocal: number, what: string): void {
+    this.bigArm(c, kindLocal, () => {
+      this.deps.fence(c, (x) => this.deps.lit(x, `${what} a BigInt held in a dynamic value is not supported yet`));
+      c.unreachable();
+    });
+  }
+
+  /** Box a BigInt the caller pushes (`$big`). */
+  boxBig(c: Code, pushValue: (c: Code) => void): void {
+    c.i32Const(DK.BIGINT);
+    c.f64Const(0);
+    pushValue(c);
+    c.structNew(this.dynT());
+  }
+
   private unmodeledKindFence(c: Code, kinds: number[]): void {
     const what = kinds.map((k) => (k === DK.BYTES ? "a typed array" : k === DK.HANDLE ? "a runtime handle" : k === DK.JSVAL ? "an accessor cell" : `kind ${k}`)).join(" or ");
     this.deps.fence(c, (x) => this.deps.lit(x, `this operation on ${what} held in a dynamic value is not supported yet`));
@@ -6683,6 +6742,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "assigning a member of");
       this.typedArm(c, 0, K, () => this.typedFence(c, "assigning a member of", () => {})); // Unit I
       this.urlWriteFence(c, 0, K, () => {}); // Unit I
       const SETM = 8;
@@ -7102,6 +7162,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "'in' or Object.hasOwn on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' or Object.hasOwn on", (x) => x.i32Const(0))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
@@ -7335,6 +7396,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(this.dynT(), DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "assigning a member of");
       this.arm(c, K, [DK.STR, DK.NUM, DK.BOOL], () => {});
       c.localGet(0);
       c.localGet(1);
@@ -7353,6 +7415,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(this.dynT(), DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => c.i32Const(0));
       this.typedArm(c, 0, K, () => c.i32Const(1));
       this.arm(c, K, [DK.BYTES], () => c.i32Const(1));
       c.localGet(K);
@@ -7394,6 +7457,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "'in' on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' on", (x) => x.i32Const(0)));
       this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR], () => {
         this.deps.throwTypeError(c, (x) => {
@@ -7824,6 +7888,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "walking the keys of");
       this.typedArm(c, 0, K, () => this.typedFence(c, "walking the keys of", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
@@ -8407,6 +8472,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => { this.deps.lit(c, "bigint "); this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); c.call(this.deps.concat()); });
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "object null"));
       this.arm(c, K, [DK.BOOL], () => {
@@ -8473,6 +8539,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); });
       this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "[object Array]"));
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "#<Promise>"));
       this.arm(c, K, [DK.OBJ], () => {
@@ -8636,6 +8703,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "iterating");
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       // Buffers step by BYTE in C; unconstructible here, and the
       // not-iterable throw below would be a wrong claim about one.
@@ -8679,6 +8747,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "iterating");
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.BYTES, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.JSVAL]));
       c.localGet(K);
@@ -8781,6 +8850,7 @@ export class DynBuilder {
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigFence(c, K, "spreading");
       this.typedArm(c, 1, K, () => this.typedFence(c, "spreading", () => {})); // Unit I
       this.arm(c, K, [DK.ARR], () => {
         this.arrPayload(c, (x) => x.localGet(1));
@@ -9014,6 +9084,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => this.deps.lit(c, "bigint"));
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
       this.arm(c, K, [DK.BOOL], () => this.deps.lit(c, "boolean"));
       this.arm(c, K, [DK.NUM], () => this.deps.lit(c, "number"));
@@ -9097,6 +9168,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.bigArm(c, K, () => { this.deps.lit(c, "type bigint ("); this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); c.call(this.deps.concat()); this.deps.lit(c, "n)"); c.call(this.deps.concat()); });
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "an instance of Array"));
@@ -11024,6 +11096,61 @@ export class DynBuilder {
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
+        if (this.deps.big !== undefined && method === "toString") {
+          this.arrLen(c, (x) => x.localGet(1));
+          c.localSet(ARGC);
+        }
+        if (method === "valueOf") {
+          this.bigArm(c, K, () => c.localGet(0));
+        } else if (method === "toString") {
+          // toString(radix?): an absent/undefined radix is 10, a number
+          // radix takes BigInt.prototype.toString's RangeError
+          this.bigArm(c, K, () => {
+            c.localGet(ARGC);
+            c.i32Eqz();
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              this.bigPayload(x, 0);
+              x.call(this.deps.big!.toStr10());
+            });
+            c.return_();
+            c.end();
+            this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+            c.localSet(E);
+            c.localGet(E);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.UNDEF);
+            c.i32Eq();
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              this.bigPayload(x, 0);
+              x.call(this.deps.big!.toStr10());
+            });
+            c.return_();
+            c.end();
+            c.localGet(E);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.NUM);
+            c.i32Ne();
+            c.ifVoid();
+            this.deps.fence(c, (x) => this.deps.lit(x, "BigInt.prototype.toString with a non-number radix on a BigInt held in a dynamic value is not supported yet"));
+            c.unreachable();
+            c.end();
+            this.bigPayload(c, 0);
+            c.localGet(E);
+            c.structGet(dynT, DYN_NUM);
+            c.call(this.deps.big!.toStrRadix());
+            c.localSet(S);
+            c.globalGet(this.deps.excKind());
+            c.ifVoid();
+            c.refNull(dynT);
+            c.return_();
+            c.end();
+            this.boxStr(c, (x) => x.localGet(S));
+          });
+        } else {
+          this.bigFence(c, K, `calling '${method}' on`);
+        }
         this.typedArm(c, 0, K, () => this.typedFence(c, `calling '${method}' on`, (x) => x.refNull(dynT))); // Unit I
         this.arrLen(c, (x) => x.localGet(1));
         c.localSet(ARGC);

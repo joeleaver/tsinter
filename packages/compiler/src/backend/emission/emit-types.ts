@@ -107,6 +107,8 @@ export function cType(t: IrType): string {
       return "ScrPromise *";
     case "generator":
       return "ScrGen *";
+    case "bigint":
+      throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
     case "void":
       return "void";
     case "undefinedT":
@@ -341,6 +343,8 @@ export function boxKindC(t: IrType): string {
       // unit kinds never stand alone (and catch bindings never box), so
       // nothing to box
       throw new Error(`emitter bug: box of ${t.kind}`);
+    case "bigint":
+      throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
     case "void":
       throw new Error("emitter bug: box of void");
     default: {
@@ -528,6 +532,8 @@ export function elemKindC(elem: IrType): string {
     case "undefinedT":
     case "nullT":
       throw new Error(`emitter bug: array of ${elem.kind} (frontend rejects these)`);
+    case "bigint":
+      throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
     case "void":
       throw new Error("emitter bug: array of void");
     default: {

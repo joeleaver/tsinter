@@ -1,0 +1,25 @@
+// BigInts held in any/unknown through Number(), `in`, structuredClone and
+// assert.deepStrictEqual
+import assert from "node:assert";
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const x: any = 5n;
+const u: unknown = 2n ** 70n;
+console.log(Number(x), Number(u), Number(-(2n ** 1100n) as unknown));
+t("plus", () => +x);
+t("in", () => "foo" in x);
+t("in2", () => "toString" in x);
+const c1 = structuredClone(x);
+const c2 = structuredClone({ a: 1n, b: [2n ** 65n] });
+console.log(c1, c2, structuredClone(u) === u);
+assert.deepStrictEqual(x, 5n);
+assert.deepStrictEqual(u, 2n ** 70n);
+const o: any = { k: u, l: [1n] };
+assert.deepStrictEqual(o, { k: 2n ** 70n, l: [1n] });
+console.log("deep ok");
+t("deepFail", () => assert.deepStrictEqual(x, 6n));

@@ -45,6 +45,9 @@ export interface VecDeps {
   strRef: () => ValType;
   /** %w.f64ToStr's index (join over number elements). */
   f64ToStr: () => number;
+  /** BigInt elements (the "vec(bigint)" vector): `===` by value
+   * (bigint.ts), for indexOf/includes. */
+  bigEq?: () => number;
   /** %w.concat's index (join accumulates by concatenation). */
   concat: () => number;
   /** Push an interned string literal onto `c`'s stack. */
@@ -919,6 +922,24 @@ export class VecBuilder {
         c.end();
         return;
       case "ref":
+        if (v.key === "vec(bigint)" && this.deps.bigEq !== undefined) {
+          // by value; an absent (null) slot equals only another
+          c.localGet(A);
+          c.refIsNull();
+          c.localGet(B);
+          c.refIsNull();
+          c.i32Or();
+          c.ifResult(I32);
+          c.localGet(A);
+          c.localGet(B);
+          c.refEq();
+          c.else_();
+          c.localGet(A);
+          c.localGet(B);
+          c.call(this.deps.bigEq());
+          c.end();
+          return;
+        }
         c.localGet(A);
         c.localGet(B);
         c.refEq();

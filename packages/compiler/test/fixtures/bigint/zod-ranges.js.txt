@@ -1,0 +1,24 @@
+// zod 4's util.js BIGINT_FORMAT_RANGES construction, and the checks over it
+export const BIGINT_FORMAT_RANGES = {
+  int64: [/* @__PURE__*/ BigInt("-9223372036854775808"), /* @__PURE__*/ BigInt("9223372036854775807")],
+  uint64: [/* @__PURE__*/ BigInt(0), /* @__PURE__*/ BigInt("18446744073709551615")],
+};
+function check(format, input) {
+  const [minimum, maximum] = BIGINT_FORMAT_RANGES[format];
+  if (typeof input !== "bigint") return "expected bigint, got " + typeof input;
+  if (input < minimum) return "too small";
+  if (input > maximum) return "too big";
+  return "ok";
+}
+console.log(BIGINT_FORMAT_RANGES);
+console.log(check("int64", 3));
+const v = BIGINT_FORMAT_RANGES.uint64[1];
+console.log(typeof v, v === 18446744073709551615n, String(v), `${v}`, v + 1n, [v].includes(18446744073709551615n));
+try {
+  JSON.stringify({ a: 1n });
+} catch (e) {
+  console.log(e.name, e.message);
+}
+let any1 = 7n;
+any1 = any1 * 6n;
+console.log(any1, Object.is(any1, 42n));

@@ -454,6 +454,18 @@ export class Code {
   i64GeS(): void {
     this.w.u8(0x59);
   }
+  i64GtS(): void {
+    this.w.u8(0x55);
+  }
+  i64DivS(): void {
+    this.w.u8(0x7f);
+  }
+  i64RemS(): void {
+    this.w.u8(0x81);
+  }
+  i64LeS(): void {
+    this.w.u8(0x57);
+  }
   i64GeU(): void {
     this.w.u8(0x5a);
   }

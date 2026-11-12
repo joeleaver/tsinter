@@ -1,0 +1,32 @@
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const shape: string[] = ["12"];
+t("u1", () => BigInt(shape[0] ?? "1"));
+t("u2", () => BigInt(shape[3] ?? "1"));
+function conv(x: number | string | boolean | bigint): bigint { return BigInt(x); }
+t("u3", () => [conv(5), conv("0x10"), conv(true), conv(7n)]);
+t("u4", () => conv(1.5));
+const opt: bigint | undefined = shape.length > 5 ? 1n : undefined;
+t("u5", () => opt ?? 0n); t("u5b", () => opt === undefined); t("u5c", () => typeof opt);
+let acc = 0n;
+for (let i = 0n; i < 5n; i++) acc += i * i;
+t("loop", () => acc);
+t("reduce", () => [1n, 2n, 3n].reduce((a, b) => a + b, 0n));
+const MASK = 0xffffffffffffffffn;
+let h = 0xcbf29ce484222325n;
+for (const ch of "hello") h = ((h ^ BigInt(ch.charCodeAt(0))) * 0x100000001b3n) & MASK;
+t("fnv", () => [h, h.toString(16).padStart(16, "0"), BigInt.asUintN(64, h << 3n), Number(h & 0xffn)]);
+t("safe", () => { const size = 2n ** 60n; return size > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(size); });
+const zob = new Map<bigint, number>();
+for (let k = 0n; k < 100n; k++) zob.set((k * 0x9e3779b97f4a7c15n) & MASK, Number(k));
+t("zob", () => [zob.size, zob.get((42n * 0x9e3779b97f4a7c15n) & MASK) ?? -1]);
+class Rec { constructor(public id: bigint, public tag = "x") {} }
+console.log("cls", new Rec(2n ** 65n), new Rec(1n).id === 1n);
+t("tmpl", () => `${-3n}|${2n ** 64n}|${[1n, 2n]}`);
+t("cmp", () => [1n < 2n, 2n ** 70n > 2n ** 69n, -(2n ** 70n) < -1n, 3n <= 3n, 4n >= 5n]);
+t("eq", () => [2n ** 70n === 2n ** 70n, 2n ** 70n !== 2n ** 70n + 1n, -0n === 0n]);

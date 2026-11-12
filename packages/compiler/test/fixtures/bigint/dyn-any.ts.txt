@@ -1,0 +1,29 @@
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const vals: unknown[] = [3n, -(2n ** 66n), 2, "s", null, undefined, true];
+for (const a of vals) {
+  if (typeof a !== "bigint") continue;
+  for (const b of vals) {
+    t("op", () => {
+      if (typeof b === "bigint") return [a + b, a - b, a * b, a / b, a % b, a ** 2n, -a, a < b, a >= b, a === b].join(" ");
+      if (typeof b === "number") return [a < b, a > b, a <= b, a >= b].join(" ");
+      if (typeof b === "string") return a + b;
+      return typeof b;
+    });
+  }
+}
+const x: any = 7n;
+const y: any = 2;
+t("anyMix", () => x * y);
+t("anyMix2", () => x + y);
+t("anyStr", () => x + "!");
+t("anyDiv0", () => x / (x - x));
+console.log("anyNeg", -x, x - 1n, x * x);
+t("anyPlus", () => +x);
+t("anyCmp", () => [x > y, x < 7.5, x <= NaN, x >= true]);
+t("anyEq", () => [x === 7n, x === 7, x !== 7n]);

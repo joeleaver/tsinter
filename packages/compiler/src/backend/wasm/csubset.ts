@@ -453,6 +453,9 @@ const TYPE_NAMES: Record<string, CT> = {
   int32_t: "int",
   uint32_t: "uint",
   uint64_t: "u64",
+  // signed 64-bit: + - * << >> (arithmetic) and every comparison; signed
+  // 64-bit / and % stay outside the subset (they refuse at the operator)
+  int64_t: "i64",
   // only with a CExt: see CExt below
   elem_t: "el",
   ctx_t: "ctx",
@@ -620,7 +623,9 @@ class Parser {
       }
       if (!this.atDecl()) this.err("expected a declaration");
       const line = this.line();
-      const [t, isStatic, qualified] = this.declSpec();
+      const [spec, isStatic, qualified] = this.declSpec();
+      // a function answering a GC array (`int* f(...)`, bigint-src.ts)
+      const t = this.is("*") && this.peek(2)?.v === "(" ? (this.i++, this.pointerTo(spec)) : spec;
       const name = this.ident();
       const fresh = (n: string): void => {
         if (funcs.has(n) || globals.has(n)) this.err(`a second file-scope definition of ${n}`);
@@ -888,7 +893,14 @@ class Parser {
         return lv;
       }
       if (t.v === "(" && this.peek(1)?.k === "id" && Object.hasOwn(TYPE_NAMES, this.peek(1)!.v)) {
-        this.err("C-style casts are outside the subset");
+        // `(T)x` between arithmetic types is exactly static_cast<T>(x)
+        // (bigint-src.ts); a pointer cast stays outside the subset
+        const line = this.line();
+        this.i++;
+        const to = this.typeName();
+        if (to === "fa" || to === "ia" || to === "ea") this.err("pointer casts are outside the subset");
+        this.expect(")");
+        return { k: "cast", t: to, a: this.unary(), line };
       }
     }
     return this.postfix(this.primary());
@@ -1490,7 +1502,7 @@ class FnGen {
         if (e.name === "fabs" || e.name === "sqrt" || e.name === "floor") return "double";
         if (e.name === "ea_new") return "ea";
         if (e.name === "ia_new") return "ia";
-        if (e.name === "ea_copy" || e.name === "sort_threw") return "int";
+        if (e.name === "ea_copy" || e.name === "sort_threw" || e.name === "ia_len") return "int";
         const ext = this.cc.ext?.externs[e.name];
         if (ext !== undefined) return ext.ret;
         const f = this.unit.funcs.get(e.name);
@@ -1881,7 +1893,9 @@ class FnGen {
       else if (op === "<" && u) c.i64LtU();
       else if (op === "<") c.i64LtS();
       else if (op === ">" && u) c.i64GtU();
+      else if (op === ">") c.i64GtS();
       else if (op === "<=" && u) c.i64LeU();
+      else if (op === "<=") c.i64LeS();
       else if (op === ">=" && u) c.i64GeU();
       else if (op === ">=") c.i64GeS();
       else throw new CSubsetError(`signed 64-bit ${op}`);
@@ -1990,6 +2004,19 @@ class FnGen {
       else if (e.name === "sqrt") c.f64Sqrt();
       else c.f64Floor();
       return "double";
+    }
+    // int arrays need no instantiation (bigint-src.ts): `ia_new(n)` is
+    // array.new_default (n zeros), `ia_len(a)` array.len
+    if (e.name === "ia_len" || (e.name === "ia_new" && this.cc.ext === undefined)) {
+      if (e.args.length !== 1) this.err(e.line, `${e.name} takes one argument`);
+      if (e.name === "ia_len") {
+        if (this.emit(e.args[0]!) !== "ia") this.err(e.line, "ia_len of a non-int array");
+        c.arrayLen();
+        return "int";
+      }
+      this.emitAs(e.args[0]!, "int");
+      c.arrayNewDefault(this.cc.ia);
+      return "ia";
     }
     const x = this.cc.ext;
     if (x !== undefined) {

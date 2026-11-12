@@ -33,6 +33,7 @@ import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
+import { bigArith, bigLitOf, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
@@ -517,6 +518,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     const chainRecv = L.chainRecvByNode.get(expr);
     if (chainRecv) return { ...chainRecv, loc };
 
+    if (ts.isBigIntLiteral(expr)) return lowerBigIntLiteral(expr);
     if (ts.isNumericLiteral(expr)) {
       const value = Number(expr.text.replace(/_/g, ""));
       // Ask 4's representability input: a DECIMAL INTEGER source spelling
@@ -1285,7 +1287,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       const FOLD: Partial<Record<string, string>> = {
         f64: "number", string: "string", bool: "boolean", func: "function",
         array: "object", object: "object", record: "object",
-        symbol: "symbol",
+        symbol: "symbol", bigint: "bigint",
         map: "object", set: "object", promise: "object", bytes: "object",
         regexp: "object", generator: "object", classval: "function",
         undefinedT: "undefined", nullT: "object",
@@ -1623,7 +1625,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           // The families with a WHY: each hint states what makes the
           // surface genuinely non-static (or what to use instead).
           const globalHints: Record<string, string | undefined> = {
-            BigInt: "arbitrary-precision integers have no static representation — f64 is the one number type (Number.MAX_SAFE_INTEGER bounds exact integers)",
+            BigInt: "the BigInt function as a value has no lowering — call it directly (BigInt(x), BigInt.asIntN, BigInt.asUintN)",
             Proxy: "property-access metaprogramming has no static lowering (every property read must resolve at compile time)",
             Reflect: "reflective property access has no static lowering — read and call members directly",
             Intl: "locale- and ICU-backed behavior lives outside the static runtime (no locale data beyond localeCompare's root collation) — what lowers: the composed new Intl.NumberFormat(\"en-US\").format(x) and x.toLocaleString(\"en-US\") with default options",
@@ -4825,7 +4827,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
    * tested. */
   export function ensureBool(L: Lowerer, e: IrExpr, node: ts.Expression): IrExpr {
     if (e.type.kind === "bool") return e;
-    if (e.type.kind === "f64" || e.type.kind === "string") {
+    if (e.type.kind === "f64" || e.type.kind === "string" || e.type.kind === "bigint") {
       return { kind: "toBool", operand: e, type: BOOL, loc: e.loc };
     }
     if (e.type.kind === "dyn") {
@@ -8623,6 +8625,8 @@ export function ensureString(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
 
 function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
     if (e.type.kind === "string") return e;
+    // String(1n) / `${1n}` / "" + 1n: the decimal text, no suffix
+    if (e.type.kind === "bigint") return { kind: "toString", operand: e, type: STRING, loc: e.loc };
     if (e.type.kind === "dyn") {
       // String(u) / `${u}`: a runtime dispatch over the dyn kind — Node's
       // String() exactly (undefined/null texts, JS number formatting,
@@ -8654,7 +8658,7 @@ function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
       const stringable = def?.arms.every(
         (a) =>
           a.kind === "undefinedT" || a.kind === "nullT" ||
-          a.kind === "string" || a.kind === "f64" || a.kind === "bool",
+          a.kind === "string" || a.kind === "f64" || a.kind === "bool" || a.kind === "bigint",
       );
       if (stringable) {
         return { kind: "toString", operand: e, type: STRING, loc: e.loc };
@@ -8697,10 +8701,10 @@ function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
         (L.unions
           .get(elem.unionId)
           ?.arms.every(
-            (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a),
+            (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || a.kind === "bigint" || isUnitType(a),
           ) ??
           false);
-      if (elem.kind === "f64" || elem.kind === "string" || elem.kind === "bool" || joinableUnion) {
+      if (elem.kind === "f64" || elem.kind === "string" || elem.kind === "bool" || elem.kind === "bigint" || joinableUnion) {
         const sep: IrExpr = { kind: "strLit", value: ",", type: STRING, loc: e.loc };
         return { kind: "arrIntrinsic", method: "join", receiver: e, args: [sep], type: STRING, loc: e.loc };
       }
@@ -9169,6 +9173,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
         if (operand.type.kind === "jsval") {
           return { kind: "jsOp", op: "neg", args: [operand], type: JSVAL, loc };
         }
+        if (operand.type.kind === "bigint") return lowerBigUnary("-", operand, loc);
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
         if (operand.kind === "numLit") return { ...operand, value: -operand.value, loc };
         return { kind: "unary", op: "-", operand, type: F64, loc };
@@ -9184,6 +9189,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
         if (operand.type.kind === "string") {
           return { kind: "libCall", fn: "num.fromString", args: [operand], type: F64, loc };
         }
+        if (operand.type.kind === "bigint") return lowerBigUnaryPlus(operand, loc);
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
         return toNumberCanon(L, operand);
       }
@@ -9195,6 +9201,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
       case ts.SyntaxKind.TildeToken: {
         // `~x`: ToInt32, complement, back to f64 (JS-exact, incl. NaN → -1).
         const operand = L.lowerExpr(expr.operand);
+        if (operand.type.kind === "bigint") return lowerBigUnary("~", operand, loc);
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
         return { kind: "unary", op: "~", operand, type: F64, loc };
       }
@@ -9270,6 +9277,7 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
     if (!target) {
       L.rejectUnresolved(expr.operand, `increment/decrement of '${expr.operand.text}' (not a writable local or module global)`);
     }
+    if (target.type.kind === "bigint") return lowerBigIncDec(L, target, op, prefix, loc);
     if (target.type.kind !== "f64") L.unsupported("SC1043", expr);
     return { kind: "incDec", op, prefix, localId: target.id, type: F64, loc };
   }
@@ -9482,6 +9490,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         const right = L.lowerExpr(expr.right);
         if (left.type.kind === "string" && right.type.kind === "string") {
           return { kind: "strEq", negated, left, right, type: BOOL, loc };
+        }
+        // bigint == bigint (by value), bigint == number (mathematical
+        // value: 1n == 1, never 1n == 1.5)
+        if (left.type.kind === "bigint" || right.type.kind === "bigint") {
+          const big = lowerBigBinary(L, expr, left, right);
+          if (big) return big;
         }
         if (
           (left.type.kind === "f64" && right.type.kind === "f64") ||
@@ -9839,6 +9853,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         type, loc,
       };
     }
+    if (left.type.kind === "bigint" || right.type.kind === "bigint") {
+      const big = lowerBigBinary(L, expr, left, right);
+      if (big) return big;
+    }
     const bothNum = left.type.kind === "f64" && right.type.kind === "f64";
     const bothStr = left.type.kind === "string" && right.type.kind === "string";
 
@@ -10192,6 +10210,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       case "undefinedT": return "undefined";
       case "func": return "function";
       case "symbol": return "symbol";
+      case "bigint": return "bigint";
       case "nullT":
       case "array": case "map": case "set": case "regex": case "bytes":
       case "url": case "searchParams": case "stats": case "spawnRes": case "child":
@@ -10482,8 +10501,19 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // probes this settles (`typeof ms === 'bigint'` in dual-mode number
       // helpers) then FOLD their impossible arm (lowerTernary), which is
       // what lets the reachable arm compile statically.
-      if (b.text === "bigint" || b.text === "symbol") {
+      if (b.text === "symbol") {
         return { kind: "boolLit", value: negated, type: BOOL, loc };
+      }
+      // A BigInt CAN be held (the BIGINT kind): the runtime typeof answers.
+      if (b.text === "bigint") {
+        return {
+          kind: "strEq",
+          negated,
+          left: { kind: "libCall", fn: "dyn.typeof", args: [value], type: STRING, loc },
+          right: { kind: "strLit", value: "bigint", type: STRING, loc },
+          type: BOOL,
+          loc,
+        };
       }
       L.unsupported(
         "SC1090",
@@ -13057,7 +13087,9 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
     const read = islandField ? asDynOperand(read0) : read0;
     const rhs0: IrExpr = rhsNode
       ? L.lowerExpr(rhsNode)
-      : { kind: "numLit", value: 1, type: F64, loc };
+      : target.fieldType.kind === "bigint"
+        ? bigLitOf(1n, loc)
+        : { kind: "numLit", value: 1, type: F64, loc };
     const rhs = islandField ? asDynOperand(rhs0) : rhs0;
     const fieldKind = islandField ? "dyn" : target.fieldType.kind;
     let value: IrExpr;
@@ -13065,6 +13097,8 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
       value = undefPlusGuard(L, read, rhs, loc, (l, r) => ({ kind: "strConcat", left: l, right: ensureConcatString(L, r, rhsNode ?? access), type: STRING, loc }));
     } else if (target.fieldType.kind === "f64" && rhs.type.kind === "f64") {
       value = { kind: "bin", op, left: read, right: rhs, type: F64, loc };
+    } else if (target.fieldType.kind === "bigint" && rhs.type.kind === "bigint" && bigArith(op, read, rhs, loc) !== null) {
+      value = bigArith(op, read, rhs, loc)!;
     } else if (
       fieldKind === "dyn" &&
       isJsSourceFile(access.getSourceFile()) &&

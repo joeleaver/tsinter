@@ -1,7 +1,7 @@
 import { isDtsMirrorPath } from "./npm-static.js";
 import * as ts from "./ts7/adapter.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
-import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
+import { arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
 import { accessorSlotProp, shapeFieldCopy } from "../ir/nodes.js";
@@ -346,6 +346,8 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       return "URLSearchParams";
     case "symbol":
       return "symbol";
+    case "bigint":
+      return "bigint";
     case "stats":
       return "Stats";
     case "spawnRes":
@@ -915,6 +917,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // getBaseTypeOfLiteralType widens unique symbols, but check both flags)
   // map to the symbol identity kind.
   if (flags & (ts.TypeFlags.ESSymbol | ts.TypeFlags.UniqueESSymbol)) return SYMBOL_T;
+  // `bigint` (literal types widen above): the arbitrary-precision integer
+  // kind, on the WasmGC lanes (the legacy emitters refuse it by name).
+  if (flags & ts.TypeFlags.BigInt) return BIGINT_T;
   // STANDALONE undefined (and void) map to VOID: return-type mapping flows
   // through here, and `(): void | undefined` functions must stay void.
   // Inside a union, undefined becomes the undefinedT unit ARM instead (see

@@ -1,0 +1,27 @@
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const vals: unknown[] = [0n, 5n, -(2n ** 70n), 5, "5", null];
+for (const v of vals) {
+  console.log(typeof v, v ? "truthy" : "falsy", String(v), `${v}`, v === 5n);
+  if (typeof v === "bigint") console.log("big", v * 2n, v.toString(16));
+}
+const u: unknown = 2n ** 64n;
+t("cast", () => (u as bigint) + 1n);
+t("json", () => JSON.stringify(u));
+t("nested", () => ({ a: u, b: [u, 1n] }));
+const m = new Map<unknown, string>();
+m.set(2n ** 64n, "big");
+m.set(1n, "one");
+m.set(1, "num");
+t("keys", () => [m.get(u) ?? "", m.get(1n) ?? "", m.get(1) ?? "", m.get(2n) ?? "-"].join() + m.size);
+const s = new Set<unknown>([1n, 1n, 2n ** 64n, u]);
+t("set", () => s.size);
+function take(x: unknown): string { return typeof x; }
+t("param", () => take(3n));
+t("eqdyn", () => { const a: unknown = 2n ** 80n; const b: unknown = 2n ** 80n; return [a === b, a !== b]; });
+t("num", () => Number(u as bigint));

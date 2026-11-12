@@ -25,7 +25,7 @@ import {
 import { validateSidecar } from "./library/sidecar-validate.js";
 import { entryFunctionExports, type EntryExportInfo } from "./frontend/lib-exports.js";
 import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.js";
-import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
+import { firstBigintSite, moduleUsesBigint, moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
 import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
@@ -188,6 +188,19 @@ function backendRefusalDiag(err: LlvmUnsupportedError | WasmUnsupportedError, en
     code: "SC3001",
     message: err.message,
     loc: err.loc ?? { file: entryPath, start: 0, end: 0 },
+  };
+}
+
+/** BigInt on the legacy C/LLVM lanes: SC3003, by name, at the first
+ * bigint site. Only the WasmGC lanes (wasm, wasm-native) carry the bigint
+ * representation; the legacy lanes retire at N4. */
+function legacyBigintRefusal(mod: IrModule, entryPath: string): ScrDiagnostic | null {
+  const loc = firstBigintSite(mod);
+  if (loc === null && !moduleUsesBigint(mod)) return null;
+  return {
+    code: "SC3003",
+    message: "bigint values are not supported on the legacy C and LLVM backends; build with --backend wasm or --backend wasm-native",
+    loc: loc ?? { file: entryPath, start: 0, end: 0 },
   };
 }
 
@@ -941,6 +954,8 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
   if (regexRefusal !== null) {
     return { ok: false, diagnostics: [nativeRegexRefusalDiag(regexRefusal, entryPath)], sourceTexts };
   }
+  const bigRefusal = legacyBigintRefusal(lowered.module!, entryPath);
+  if (bigRefusal !== null) return { ok: false, diagnostics: [bigRefusal], sourceTexts };
   let cPath = join(opts.outDir, `${stem}.c`);
   let backend: "c" | "llvm" = "c";
   let llvmRefusal: string | undefined;
@@ -1570,6 +1585,8 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
 
   const regexRefusal = nativeRegexLiteralRefusal(mod);
   if (regexRefusal !== null) return fail([nativeRegexRefusalDiag(regexRefusal, entryPath)]);
+  const bigRefusal = legacyBigintRefusal(mod, entryPath);
+  if (bigRefusal !== null) return fail([bigRefusal]);
 
   await mkdir(opts.outDir, { recursive: true });
   const stem = basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "");

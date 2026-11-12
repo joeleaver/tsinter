@@ -1,0 +1,21 @@
+// V8's size limit (2^30 bits): a product past it throws before allocating;
+// a shift lands exactly on the boundary; ** is a shift for a power-of-two base and an estimate within two bits otherwise (S137)
+function t(name: string, f: () => unknown): void {
+  try {
+    console.log(name, f());
+  } catch (e) {
+    if (e instanceof Error) console.log(name, e.name + ": " + e.message);
+  }
+}
+const a = 1n << 600000000n;
+t("mul", () => a * a);
+t("mulNeg", () => -a * a);
+t("mulSmall", () => (a * 3n) >> 599999999n);
+t("shlEdge", () => (1n << (2n ** 30n - 1n)) > 0n);
+t("shlOver", () => 1n << (2n ** 30n));
+t("powOdd", () => 3n ** 1_000_000_000n);
+t("powEst", () => 7n ** 383000000n);
+t("pow2Neg", () => (-2n) ** 1073741823n > 0n);
+t("pow2Over", () => 4n ** 536870912n);
+t("pow2Edge", () => ((-8n) ** 3n) + (2n ** 64n));
+t("powFits", () => (3n ** 200000n) % 1000000007n);

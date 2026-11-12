@@ -4,7 +4,7 @@
  * method surfaces. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
+import { BIGINT_T, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { lowerArrayFromIterable } from "./lower-stdlib-members.js";
 import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
@@ -591,10 +591,10 @@ function lowerOptionalDefaultArg(
         (L.unions
           .get(elem.unionId)
           ?.arms.every(
-            (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || isUnitType(a),
+            (a) => a.kind === "f64" || a.kind === "string" || a.kind === "bool" || a.kind === "bigint" || isUnitType(a),
           ) ??
           false);
-      if (elem.kind !== "f64" && elem.kind !== "string" && elem.kind !== "bool" && !joinableUnion) {
+      if (elem.kind !== "f64" && elem.kind !== "string" && elem.kind !== "bool" && elem.kind !== "bigint" && !joinableUnion) {
         L.unsupported(
           "SC1090",
           call,
@@ -6580,6 +6580,28 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     // both endiannesses ("Uint" and "UInt" alike: Node aliases both), plus
     // the variable-width read/writeUIntLE quartet. The kind token rides as
     // a strLit args[0]; omitted offsets complete to Node's default 0.
+    // The BigInt families (lower-bigint.ts's big.bufRead / big.bufWrite):
+    // readBig(U)Int64(LE|BE)(offset = 0), writeBig(U)Int64(LE|BE)(value,
+    // offset = 0) — readDouble/writeDouble's 8-byte bounds ladder over the
+    // raw bits, plus Node's value-range check on the write.
+    const bigKind = own(BUF_BIG_METHODS, name);
+    if (bigKind !== undefined && receiverIr.elem === "u8") {
+      const write = name.startsWith("write");
+      const required = write ? 1 : 0;
+      if (nArgs < required || nArgs > required + 1) {
+        L.noLowering(`.${name} with ${nArgs} arguments`, call);
+      }
+      const receiver = lowerMemberRecv(L, access);
+      const kindLit: IrExpr = { kind: "strLit", value: bigKind, type: STRING, loc };
+      const offNode = call.arguments[required];
+      const off = (): IrExpr => (offNode === undefined ? { kind: "numLit", value: 0, type: F64, loc } : L.lowerExprExpecting(offNode, F64));
+      if (!write) {
+        return { kind: "libCall", fn: "big.bufRead", args: [receiver, off(), kindLit], type: BIGINT_T, loc };
+      }
+      const value = L.lowerExprExpecting(call.arguments[0]!, BIGINT_T);
+      if (value.type.kind !== "bigint") L.noLowering(`.${name} of a '${L.fmt(value.type)}' value`, call.arguments[0]!);
+      return { kind: "libCall", fn: "big.bufWrite", args: [receiver, value, off(), kindLit], type: F64, loc };
+    }
     const numKind = own(BUF_NUM_METHODS, name);
     if (numKind !== undefined) {
       if (receiverIr.elem !== "u8") {
@@ -6621,6 +6643,8 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     const dvGetter = own(DV_GETTERS, name);
     if (dvGetter !== undefined && receiverIr.elem === "u8") {
       if (dvGetter.method === "dvGetBigUint64Number" || dvGetter.method === "dvGetBigInt64Number") {
+        // A bigint value (big.dvGet) — except inside Number(...), whose
+        // composed f64 form is the same number without the bigint.
         // bigint values have no representation — only the COMPOSED
         // `Number(view.getBigUint64/getBigInt64(...))` compiles (the
         // randomBytesToString pattern): the 8-byte integer converts to
@@ -6636,11 +6660,12 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
           p.expression.text === "Number" &&
           L.isStdlibSymbol(L.resolveValueSymbol(p.expression) ?? undefined);
         if (!composed) {
-          L.noLowering(
-            `.${name} outside Number(...)`,
-            call,
-            `bigint values have no representation — Number(view.${name}(offset, littleEndian?)) is the lowered form`,
-          );
+          if (nArgs < 1 || nArgs > 2) L.noLowering(`.${name} with ${nArgs} arguments`, call);
+          const receiver = lowerMemberRecv(L, access);
+          const off = L.lowerExprExpecting(call.arguments[0]!, F64);
+          const le: IrExpr = nArgs === 2 ? L.lowerExprExpecting(call.arguments[1]!, BOOL) : { kind: "boolLit", value: false, type: BOOL, loc };
+          const signed: IrExpr = { kind: "strLit", value: dvGetter.method === "dvGetBigInt64Number" ? "i" : "u", type: STRING, loc };
+          return { kind: "libCall", fn: "big.dvGet", args: [receiver, off, le, signed], type: BIGINT_T, loc };
         }
       }
       const maxArgs = dvGetter.le ? 2 : 1;
@@ -6658,6 +6683,17 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
     // setBigUint64/setBigInt64 never lower (bigint ARGUMENTS have no
     // representation and no composed form exists) — they keep the member
     // fence, as does setFloat16.
+    // setBigUint64 / setBigInt64 (big.dvSet): the value wraps to 64 bits
+    // (ToBigUint64 and ToBigInt64 write the same bits).
+    if ((name === "setBigUint64" || name === "setBigInt64") && receiverIr.elem === "u8" && L.isStdlibMember(access)) {
+      if (nArgs < 2 || nArgs > 3) L.noLowering(`.${name} with ${nArgs} arguments`, call);
+      const receiver = lowerMemberRecv(L, access);
+      const off = L.lowerExprExpecting(call.arguments[0]!, F64);
+      const value = L.lowerExprExpecting(call.arguments[1]!, BIGINT_T);
+      if (value.type.kind !== "bigint") L.noLowering(`.${name} of a '${L.fmt(value.type)}' value`, call.arguments[1]!);
+      const le: IrExpr = nArgs === 3 ? L.lowerExprExpecting(call.arguments[2]!, BOOL) : { kind: "boolLit", value: false, type: BOOL, loc };
+      return { kind: "libCall", fn: "big.dvSet", args: [receiver, off, value, le], type: VOID, loc };
+    }
     const dvSetter = own(DV_SETTERS, name);
     if (dvSetter !== undefined && receiverIr.elem === "u8") {
       const maxArgs = dvSetter.le ? 3 : 2;
@@ -6740,6 +6776,23 @@ const BUF_NUM_METHODS: Record<string, string | undefined> = (() => {
   }
   return out;
 })();
+
+/** The BigInt pairs → big.bufRead/bufWrite's kind token (both "UInt" and
+ * "Uint" spellings, as Node aliases them). */
+const BUF_BIG_METHODS: Record<string, string | undefined> = {
+  readBigUInt64LE: "u64le",
+  readBigUint64LE: "u64le",
+  readBigUInt64BE: "u64be",
+  readBigUint64BE: "u64be",
+  readBigInt64LE: "i64le",
+  readBigInt64BE: "i64be",
+  writeBigUInt64LE: "u64le",
+  writeBigUint64LE: "u64le",
+  writeBigUInt64BE: "u64be",
+  writeBigUint64BE: "u64be",
+  writeBigInt64LE: "i64le",
+  writeBigInt64BE: "i64be",
+};
 
 /** The variable-width quartet (offset + byteLength) → sign/endian token. */
 const BUF_NUM_VAR_METHODS: Record<string, string | undefined> = {

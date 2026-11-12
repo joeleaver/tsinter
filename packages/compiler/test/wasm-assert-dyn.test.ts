@@ -798,7 +798,7 @@ async function buildAndRunStr(
  * shape). JSVAL is permanently unreachable (0.1) — isObject's own
  * logic does not special-case it; recorded for completeness, not as a
  * reachability claim. ────────────────────────────────────────────── */
-test("dyn.isObject: all 12 DK kinds — ARR/OBJ/BYTES/PROMISE/HANDLE true, everything else false", async () => {
+test("dyn.isObject: all 13 DK kinds — ARR/OBJ/BYTES/PROMISE/HANDLE true, everything else false", async () => {
   const kinds = Object.entries(DK) as [string, number][];
   const out = await buildAndRun(
     kinds.map(([name, kind]) => ({
@@ -829,6 +829,8 @@ test("dyn.isObject: all 12 DK kinds — ARR/OBJ/BYTES/PROMISE/HANDLE true, every
     // matching the file header's own note ("JSVAL is permanently
     // unreachable ... isObject's own logic does not special-case it").
     JSVAL: 0,
+    // a BigInt is a primitive (typeof "bigint")
+    BIGINT: 0,
   };
   for (const [name] of kinds) expect(out[`isObj_${name}`], name).toBe(expected[name]);
 });
