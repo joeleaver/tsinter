@@ -118,16 +118,20 @@ async function compileAndRun(name: string, source: string, ext: "ts" | "cjs" = "
 
 describe(`dynamic-boundary checks (scriptc-only${sanitize ? ", sanitized" : ""})`, () => {
   test("wrong-typed field throws with the path", async () => {
-    const r = await compileAndRun(
-      "wrong-type",
-      `type Config = { host: string; port: number };
+    const src = `type Config = { host: string; port: number };
 const c = JSON.parse('{"host":"h","port":"eighty"}') as Config;
 console.log("unreachable", c.host);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got string");
+`;
+    const r = await compileAndRun("wrong-type", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toContain("tsinter: unsupported: expected number at $.port, got string");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "wrong-type", src);
   });
 
   test("missing field: the c lane throws as undefined; wasm-native reads undefined as Node does (S119)", async () => {
@@ -149,17 +153,21 @@ console.log("unreachable", c.port);
     // (A MISSING key producing the undefined arm is corpus-tested
     // differentially — 1009-json-optional-fields; this covers the failure
     // wording when the key IS there but fits no arm.)
-    const r = await compileAndRun(
-      "optional-present-wrong",
-      `type Cfg = { host: string; port?: number };
+    const src = `type Cfg = { host: string; port?: number };
 const c = JSON.parse('{"host":"h","port":"eighty"}') as Cfg;
 console.log("unreachable", c.host);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain(
-      "tsinter: unsupported: expected number | undefined at $.port, got string",
-    );
+`;
+    const r = await compileAndRun("optional-present-wrong", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain(
+        "tsinter: unsupported: expected number | undefined at $.port, got string",
+      );
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "optional-present-wrong", src);
   });
 
   test("JSON null matches nothing", async () => {
@@ -176,70 +184,90 @@ console.log("unreachable", n);
   test("JSON null misses a null-armed union's OTHER arm with the arms named", async () => {
     // (JSON null MATCHING a null arm is corpus-tested differentially —
     // 1008-json-null-arms; this covers the failure wording.)
-    const r = await compileAndRun(
-      "null-arm-miss",
-      `type Rec = { a: string | null };
+    const src = `type Rec = { a: string | null };
 const x = JSON.parse('{"a": 5}') as Rec;
 console.log("unreachable", x.a === null);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected null | string at $.a, got number");
+`;
+    const r = await compileAndRun("null-arm-miss", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected null | string at $.a, got number");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "null-arm-miss", src);
   });
 
   test("union with no matching arm throws with all arms named", async () => {
-    const r = await compileAndRun(
-      "union-no-match",
-      `type Shape = { kind: "circle"; r: number } | { h: number; kind: "rect"; w: number };
+    const src = `type Shape = { kind: "circle"; r: number } | { h: number; kind: "rect"; w: number };
 const s = JSON.parse('{"kind":"circle"}') as Shape; // r missing: matches NO arm
 console.log("unreachable", s.kind);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected object | object at $, got object");
+`;
+    const r = await compileAndRun("union-no-match", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected object | object at $, got object");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "union-no-match", src);
   });
 
   test("nested paths point at the offending element", async () => {
-    const r = await compileAndRun(
-      "nested-path",
-      `type Deploy = { server: { host: string; ports: number[] } };
+    const src = `type Deploy = { server: { host: string; ports: number[] } };
 const d = JSON.parse('{"server":{"host":"h","ports":[80,443,"oops"]}}') as Deploy;
 console.log("unreachable", d.server.host);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain(
-      "tsinter: unsupported: expected number at $.server.ports[2], got string",
-    );
+`;
+    const r = await compileAndRun("nested-path", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain(
+        "tsinter: unsupported: expected number at $.server.ports[2], got string",
+      );
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "nested-path", src);
   });
 
   test("RECURSIVE shapes validate depth-first: the path names the deep offender", async () => {
     // The named-recursive-shape walker calls itself per level (JSON input
     // is a tree, so the recursion terminates); a failure three knots down
     // still renders the full path.
-    const r = await compileAndRun(
-      "recursive-path",
-      `interface TreeNode { label: string; children: TreeNode[] }
+    const src = `interface TreeNode { label: string; children: TreeNode[] }
 const t = JSON.parse('{"label":"r","children":[{"label":"a","children":[{"label":7,"children":[]}]}]}') as TreeNode;
 console.log("unreachable", t.label);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain(
-      "tsinter: unsupported: expected string at $.children[0].children[0].label, got number",
-    );
+`;
+    const r = await compileAndRun("recursive-path", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain(
+        "tsinter: unsupported: expected string at $.children[0].children[0].label, got number",
+      );
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "recursive-path", src);
   });
 
   test("array where a record is expected names the mismatch at the root", async () => {
-    const r = await compileAndRun(
-      "root-kind",
-      `type Config = { port: number };
+    const src = `type Config = { port: number };
 const c = JSON.parse("[1,2,3]") as Config;
 console.log("unreachable", c.port);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected object at $, got array");
+`;
+    const r = await compileAndRun("root-kind", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected object at $, got array");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "root-kind", src);
   });
 
   test("a failed check ENDS the program, even inside try/catch (GH #86 review, SEMANTICS.md S122)", async () => {
@@ -264,55 +292,69 @@ console.log(load('{"port":8080}'), load('{"port":"x"}'), load('{"port":1}'));
   });
 
   test("width tolerance really is check-and-extract: extras dropped, no throw", async () => {
-    const r = await compileAndRun(
-      "width-tolerant",
-      `type Slim = { a: number };
+    const src = `type Slim = { a: number };
 const s = JSON.parse('{"a":1,"b":{"huge":[1,2,3]},"c":"ignored"}') as Slim;
 console.log(s.a, JSON.stringify(s));
-`,
-    );
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe('1 {"a":1}\n');
+`;
+    const r = await compileAndRun("width-tolerant", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toBe('1 {"a":1}\n');
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "width-tolerant", src);
   });
 
   test("tuple targets validate arity exactly", async () => {
-    const r = await compileAndRun(
-      "tuple-arity",
-      `const rows = JSON.parse('[["a",1],["b",2,3]]') as [string, number][];
+    const src = `const rows = JSON.parse('[["a",1],["b",2,3]]') as [string, number][];
 console.log("unreachable", rows.length);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected array of length 2 at $[1], got array");
+`;
+    const r = await compileAndRun("tuple-arity", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected array of length 2 at $[1], got array");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "tuple-arity", src);
   });
 
   test("tuple positions fail with index paths and per-position types", async () => {
-    const r = await compileAndRun(
-      "tuple-pos",
-      `type Span = { range: [number, number] };
+    const src = `type Span = { range: [number, number] };
 const s = JSON.parse('{"range":[0,"nine"]}') as Span;
 console.log("unreachable", s.range[0]);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected number at $.range[1], got string");
+`;
+    const r = await compileAndRun("tuple-pos", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected number at $.range[1], got string");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "tuple-pos", src);
   });
 
   test("an object where a tuple is expected names the array shape", async () => {
-    const r = await compileAndRun(
-      "tuple-kind",
-      `const t = JSON.parse('{"0":"a","1":1}') as [string, number];
+    const src = `const t = JSON.parse('{"0":"a","1":1}') as [string, number];
 console.log("unreachable", t[1]);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected array at $, got object");
+`;
+    const r = await compileAndRun("tuple-kind", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected array at $, got object");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "tuple-kind", src);
   });
 
   test("tuple failure path: a partial tuple's mismatch inside try ends the program (GH #86 review, SEMANTICS.md S122; no unwind path remains to stress)", async () => {
-    const r = await compileAndRun(
-      "tuple-rc-failure",
-      `let recovered = 0;
+    const src = `let recovered = 0;
 for (let i = 0; i < 100; i = i + 1) {
   try {
     const rows = JSON.parse('[["ok","fine"],["bad",7]]') as [string, string][];
@@ -322,19 +364,23 @@ for (let i = 0; i < 100; i = i + 1) {
   }
 }
 console.log(recovered);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toBe("tsinter: unsupported: expected string at $[1][1], got number [SC1100]\n");
+`;
+    const r = await compileAndRun("tuple-rc-failure", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe("tsinter: unsupported: expected string at $[1][1], got number [SC1100]\n");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "tuple-rc-failure", src);
   });
 
   test("failure path: a record's mismatch inside try ends the program (GH #86 review, SEMANTICS.md S122; no unwind path remains to stress)", async () => {
     // Meaningful mostly under SCRIPTC_SAN=1 (ASan + RC audit at exit): every
     // iteration builds a partial record/array that must release on unwind.
-    const r = await compileAndRun(
-      "rc-failure-stress",
-      `type Entry = { tags: string[]; v: number };
+    const src = `type Entry = { tags: string[]; v: number };
 let recovered = 0;
 for (let i = 0; i < 100; i = i + 1) {
   try {
@@ -351,25 +397,35 @@ for (let i = 0; i < 100; i = i + 1) {
   }
 }
 console.log(recovered);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toBe("tsinter: unsupported: expected string at $.tags[2], got number [SC1100]\n");
+`;
+    const r = await compileAndRun("rc-failure-stress", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toBe("tsinter: unsupported: expected string at $.tags[2], got number [SC1100]\n");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "rc-failure-stress", src);
   });
 
   test("index-signature shapes CAPTURE extras — and a wrong-typed extra throws with its key path", async () => {
     // Width tolerance becomes width capture on index-signature shapes: the
     // extras must fit the signature's value type. (The capture SUCCESS
     // path is corpus-tested differentially — 909-records-index-json.)
-    const r = await compileAndRun(
-      "index-capture-wrong",
-      `const bag = JSON.parse('{"a":"1","b":7}') as Record<string, string>;
+    const src = `const bag = JSON.parse('{"a":"1","b":7}') as Record<string, string>;
 console.log("unreachable", bag["a"]);
-`,
-    );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain("tsinter: unsupported: expected string at $.b, got number");
+`;
+    const r = await compileAndRun("index-capture-wrong", src);
+    if (LEGACY_LANES) {
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("tsinter: unsupported: expected string at $.b, got number");
+      return;
+    }
+    // S128: the cast lands in a contained `const`, which holds the parsed value as
+    // Node does (no check, no copy) on the WasmGC lanes.
+    await expectAsNode(r, "index-capture-wrong", src);
   });
 
   test("a dynamic write colliding with a declared field validates: a mismatch ends the program (GH #86 review, SEMANTICS.md S122)", async () => {
