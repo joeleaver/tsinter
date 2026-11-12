@@ -244,6 +244,18 @@ const m3 = new Map<number | boolean, number>();
 m3.set(true, 1); m3.set(1, 2); m3.set(-0, 3); m3.set(0, 4);
 console.log(m1.size, m1.get(undefined), m2.size, m2.get(0), m2.get(NaN), m2, m3.size, m3);`,
   },
+  {
+    id: "OK-10 a dynamic RegExp and URL beside identity-keyed tables: a valid module, each payload told apart",
+    src: `const m = new Map<unknown, number>();
+const o: any = { k: 1 };
+m.set(o, 1);
+const r: any = /a+/g;
+const u: any = new URL("https://example.com/p?q=1");
+m.set(r, 2);
+m.set(u, 3);
+console.log(r.source, r.flags, m.get(o), m.get(r), m.get(u), m.size);
+console.log(String(u), u.pathname, String(r));`,
+  },
 ];
 
 function write(row: Row, backend: string): string {

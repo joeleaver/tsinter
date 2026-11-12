@@ -812,6 +812,12 @@ export class DynBuilder {
     return this.objType;
   }
 
+  /** The field index of a URL / RegExp OBJ payload's own slot (after the
+   * identity-hash slot, where the module has one). */
+  objPayloadSlot(): number {
+    return this.deps.idSlot === true ? 4 : 3;
+  }
+
   objRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.objT() };
   }
@@ -1016,13 +1022,20 @@ export class DynBuilder {
     if (this.objUrlType !== null) return this.objUrlType;
     const objT = this.objT();
     const entries = this.entriesArrayType();
+    const held = this.deps.url!.urlType();
     this.objUrlType = this.mb.subStructType(
       "dyn:objUrl",
       [
         { storage: I32, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
         { storage: I32, mutable: false },
-        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+        // The OBJ payload's identity-hash slot, where the module has one: a
+        // subtype repeats its supertype's fields first.
+        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        // Typed by what it holds: each payload subtype is its own singleton
+        // recursion group, so two subtypes of one shape would canonicalize
+        // to ONE type and a ref.test could not tell a URL from a RegExp.
+        { storage: { kind: "ref", nullable: true, typeIndex: held }, mutable: false },
       ],
       objT,
     );
@@ -1035,6 +1048,7 @@ export class DynBuilder {
       x.i32Const(0);
       x.refNull(this.entriesArrayType());
       x.i32Const(OBJ_PROTO_PLAIN);
+      if (this.deps.idSlot === true) x.i32Const(0); // OBJ_IDH
       pushUrl(x);
       x.structNew(this.objUrlT());
     });
@@ -1043,7 +1057,7 @@ export class DynBuilder {
   /** The URL struct of a dynamic-URL OBJ payload the caller pushes. */
   private urlOf(c: Code): void {
     c.refCast(this.objUrlT());
-    c.structGet(this.objUrlT(), 3);
+    c.structGet(this.objUrlT(), this.objPayloadSlot());
     c.refCast(this.deps.url!.urlType());
   }
 
@@ -1355,13 +1369,20 @@ export class DynBuilder {
     if (this.objRegexType !== null) return this.objRegexType;
     const objT = this.objT();
     const entries = this.entriesArrayType();
+    const held = this.deps.regex!.reType();
     this.objRegexType = this.mb.subStructType(
       "dyn:objRegex",
       [
         { storage: I32, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
         { storage: I32, mutable: false },
-        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+        // The OBJ payload's identity-hash slot, where the module has one: a
+        // subtype repeats its supertype's fields first.
+        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        // Typed by what it holds: each payload subtype is its own singleton
+        // recursion group, so two subtypes of one shape would canonicalize
+        // to ONE type and a ref.test could not tell a URL from a RegExp.
+        { storage: { kind: "ref", nullable: true, typeIndex: held }, mutable: false },
       ],
       objT,
     );
@@ -1374,6 +1395,7 @@ export class DynBuilder {
       x.i32Const(0);
       x.refNull(this.entriesArrayType());
       x.i32Const(OBJ_PROTO_PLAIN);
+      if (this.deps.idSlot === true) x.i32Const(0); // OBJ_IDH
       pushRe(x);
       x.structNew(this.objRegexT());
     });
@@ -1436,7 +1458,7 @@ export class DynBuilder {
     const rx = this.deps.regex!;
     c.localGet(o);
     c.refCast(this.objRegexT());
-    c.structGet(this.objRegexT(), 3);
+    c.structGet(this.objRegexT(), this.objPayloadSlot());
     c.refCast(rx.reType());
   }
 
@@ -4838,7 +4860,7 @@ export class DynBuilder {
         const reOf = (o: number): void => {
           c.localGet(o);
           c.refCast(this.objRegexT());
-          c.structGet(this.objRegexT(), 3);
+          c.structGet(this.objRegexT(), this.objPayloadSlot());
           c.refCast(reT);
         };
         c.localGet(OBJA);
@@ -7703,8 +7725,12 @@ export class DynBuilder {
       c.i32Const(DK.OBJ);
       c.i32Eq();
       c.ifResult(I32);
-      this.objPayload(c, (x) => x.localGet(0));
-      c.refTest(this.objUrlT());
+      if (this.urlLive) {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.refTest(this.objUrlT());
+      } else {
+        c.i32Const(0);
+      }
       c.else_();
       c.i32Const(0);
       c.end();
@@ -11853,7 +11879,7 @@ export class DynBuilder {
             const pushRe = (x: Code): void => {
               this.objPayload(x, (y) => y.localGet(0));
               x.refCast(this.objRegexT());
-              x.structGet(this.objRegexT(), 3);
+              x.structGet(this.objRegexT(), this.objPayloadSlot());
               x.refCast(reT);
             };
             this.objPayload(c, (x) => x.localGet(0));
