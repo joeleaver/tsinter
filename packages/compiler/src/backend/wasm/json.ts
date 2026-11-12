@@ -5421,6 +5421,9 @@ export class JsonBuilder {
         }
         dyn.objPayload(c, (x) => x.localGet(0));
         c.localSet(OP);
+        // SEMANTICS.md S138: an Error subclass's own name (Node prints it).
+        c.localGet(OP);
+        c.call(dyn.errNameListFence());
         c.localGet(OP);
         c.i32Const(0); // prints as an Object
         c.call(this.jbEnter());

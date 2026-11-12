@@ -3986,6 +3986,117 @@ class Assembler {
     return idx;
   }
 
+  private errDataPresMemo: readonly number[] | null = null;
+  private errProtoMemo: Map<number, readonly string[]> | null = null;
+
+  /** SEMANTICS.md S138: the user Error classes, by vt preorder number,
+   * whose own declaration or a user ancestor's gives instances OWN data the
+   * dynamic error encoding drops (dynLossyMembers.data). */
+  private errDataPres(): readonly number[] {
+    if (this.errDataPresMemo !== null) return this.errDataPresMemo;
+    const out: number[] = [];
+    for (const meta of this.classes.errorClasses()) {
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
+        if (m.def.dynLossyMembers?.data === true) {
+          out.push(meta.pre);
+          break;
+        }
+      }
+    }
+    this.errDataPresMemo = out;
+    return out;
+  }
+
+  /** S138: per user Error class (vt preorder number), the prototype member
+   * names its chain declares (dynLossyMembers.proto), for classes with any. */
+  private errProtoNames(): Map<number, readonly string[]> {
+    if (this.errProtoMemo !== null) return this.errProtoMemo;
+    const out = new Map<number, readonly string[]>();
+    for (const meta of this.classes.errorClasses()) {
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      const names = new Set<string>();
+      for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
+        for (const n of m.def.dynLossyMembers?.proto ?? []) names.add(n);
+      }
+      if (names.size > 0) out.set(meta.pre, [...names]);
+    }
+    this.errProtoMemo = out;
+    return out;
+  }
+
+  private errNamePresMemo: readonly number[] | null = null;
+
+  /** S138: the user Error classes (vt preorder) whose chain sets an own
+   * `name` (dynLossyMembers.name). */
+  private errNamePres(): readonly number[] {
+    if (this.errNamePresMemo !== null) return this.errNamePresMemo;
+    const out: number[] = [];
+    for (const meta of this.classes.errorClasses()) {
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
+        if (m.def.dynLossyMembers?.name === true) {
+          out.push(meta.pre);
+          break;
+        }
+      }
+    }
+    this.errNamePresMemo = out;
+    return out;
+  }
+
+  /** Pushes i32: the error `pushErr` leaves is an instance (its exact
+   * class, by the vt interval's preorder number) of an errDataPres class
+   * (or, `name`, of an errNamePres class). */
+  private emitErrStopTest(c: Code, pushErr: (c: Code) => void, name = false): void {
+    const errT = this.exc().errT;
+    c.i32Const(0);
+    for (const pre of name ? this.errNamePres() : this.errDataPres()) {
+      pushErr(c);
+      c.structGet(errT, 0);
+      c.structGet(this.classes.ci(), CI_PRE);
+      c.i32Const(pre);
+      c.i32Eq();
+      c.i32Or();
+    }
+  }
+
+  private errProtoDeclaresFn: number | null = null;
+
+  /** `%w.err.protoDeclares(err, key) -> i32` (S138): does the error's exact
+   * user class chain declare a prototype method or accessor named `key`? */
+  private errProtoDeclares(): number {
+    if (this.errProtoDeclaresFn !== null) return this.errProtoDeclaresFn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef, this.strRef], [I32]), "%w.err.protoDeclares");
+    this.errProtoDeclaresFn = idx;
+    const c = new Code();
+    const PRE = 2;
+    c.localGet(0);
+    c.structGet(exc.errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.localSet(PRE);
+    for (const [pre, names] of this.errProtoNames()) {
+      c.localGet(PRE);
+      c.i32Const(pre);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      for (const n of names) {
+        c.localGet(1);
+        this.pushStrLitInto(c, n);
+        c.call(this.strEqHelper());
+        c.i32Or();
+      }
+      c.return_();
+      c.end();
+    }
+    c.i32Const(0);
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
   /** GH #86: end the program at a runtime fence — `pushMessage` leaves the
    * fence's text (a flat string) on `c`'s stack; `codeLit`, when the text
    * does not already carry it, is appended as ` [SC####]`. Emits the
@@ -10918,6 +11029,9 @@ class Assembler {
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
       fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
+      errStopTest: (c, pushErr) => this.emitErrStopTest(c, pushErr),
+      ...(this.errNamePres().length > 0 ? { errNameTest: (c: Code, pushErr: (c: Code) => void) => this.emitErrStopTest(c, pushErr, true) } : {}),
+      ...(this.errProtoNames().size > 0 ? { errProtoDeclares: () => this.errProtoDeclares() } : {}),
       ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
       excKind: () => this.exc().kindG,
       strCmpU16: () => this.strCmpHelper(true),
@@ -25022,7 +25136,7 @@ class Assembler {
           // TypeError, so all three carry the pending check.
           this.walkExpr(e.args[0]!);
           code.i32Const(e.fn === "dyn.objKeys" ? 0 : e.fn === "dyn.objValues" ? 1 : 2);
-          code.call(this.dyn.objWalk());
+          code.call(this.dyn.objWalkUser());
           this.emitPendingCheck();
           return;
         }
@@ -29876,6 +29990,13 @@ class Assembler {
           this.openIfResult(I32);
           code.i32Const(1);
           code.else_();
+        }
+        // SEMANTICS.md S138: a prototype member an Error subclass declares
+        // is `in` it in Node; its encoding lacks it — a named stop.
+        if (this.errProtoNames().size > 0) {
+          this.dyn.objPayload(code, (c) => c.localGet(d));
+          this.pushStrLit(e.key);
+          code.call(this.dyn.errProtoFence());
         }
         this.dyn.objPayload(code, (c) => c.localGet(d));
         this.pushStrLit(e.key);
@@ -39662,7 +39783,7 @@ class Assembler {
     const keysBoxed = this.wlocal(w, dynRef);
     c.localGet(srcLocal);
     c.i32Const(0); // objWalk mode 0: KEYS
-    c.call(dyn.objWalk());
+    c.call(dyn.objWalkUser());
     this.emitWalkerPending(c, dynRef);
     c.localSet(keysBoxed);
     const keysPayload = this.wlocal(w, dyn.arrRef());

@@ -702,6 +702,139 @@ export const EMITTER_API_MEMBERS: ReadonlySet<string> = new Set([
     return null;
   }
 
+/** The instance member names a class's OWN declaration gives its instances
+ * in Node (SEMANTICS.md S138): instance fields that emit (a `declare` field
+ * emits nothing), parameter properties, instance methods and accessors (on
+ * the prototype, which `in` and a dynamic read see), and `this.<name> = …`
+ * assignments at the constructor's top level. Static members, abstract
+ * declarations and index signatures give instances nothing. */
+export function classInstanceMemberNames(decl: ts.ClassLikeDeclaration): Set<string> {
+  const out = new Set<string>();
+  const nameOf = (nm: ts.PropertyName | undefined): string | undefined =>
+    nm === undefined ? undefined : ts.isIdentifier(nm) || ts.isStringLiteralLike(nm) || ts.isNumericLiteral(nm) ? nm.text : undefined;
+  for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+    const flags = ts.canHaveModifiers(m) ? ts.getCombinedModifierFlags(m as unknown as ts.Declaration) : 0;
+    if (flags & (ts.ModifierFlags.Static | ts.ModifierFlags.Abstract)) continue;
+    if (ts.isPropertyDeclaration(m)) {
+      if (flags & ts.ModifierFlags.Ambient) continue; // `declare x: T` emits nothing
+      const n = nameOf(m.name);
+      if (n !== undefined) out.add(n);
+    } else if (ts.isMethodDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) {
+      const n = nameOf(m.name);
+      if (n !== undefined) out.add(n);
+    } else if (ts.isConstructorDeclaration(m)) {
+      for (const p of m.parameters) {
+        const pf = ts.getCombinedModifierFlags(p);
+        if (pf & (ts.ModifierFlags.Public | ts.ModifierFlags.Private | ts.ModifierFlags.Protected | ts.ModifierFlags.Readonly)) {
+          if (ts.isIdentifier(p.name)) out.add(p.name.text);
+        }
+      }
+      for (const st of m.body?.statements ?? []) {
+        if (!ts.isExpressionStatement(st)) continue;
+        const e = st.expression;
+        if (
+          ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          ts.isPropertyAccessExpression(e.left) && e.left.expression.kind === ts.SyntaxKind.ThisKeyword
+        ) {
+          out.add(e.left.name.text);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Does the class assign `this.<name>` anywhere OTHER than a top-level
+ * statement of its constructor (inside an `if`, a nested block, a method,
+ * an arrow)? Such a property exists only once that code has run, so its
+ * presence is a runtime fact. */
+export function assignsThisMemberConditionally(decl: ts.ClassLikeDeclaration, name: string): boolean {
+  let found = false;
+  const isAssign = (n: ts.Node): boolean =>
+    ts.isBinaryExpression(n) &&
+    n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+    ts.isPropertyAccessExpression(n.left) && n.left.expression.kind === ts.SyntaxKind.ThisKeyword && n.left.name.text === name;
+  const visit = (n: ts.Node): void => {
+    if (found) return;
+    if (isAssign(n)) {
+      found = true;
+      return;
+    }
+    if (ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) return;
+    ts.forEachChild(n, visit);
+  };
+  for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+    if (ts.isConstructorDeclaration(m)) {
+      for (const st of m.body?.statements ?? []) {
+        // A top-level `this.x = …;` runs on every construction.
+        if (ts.isExpressionStatement(st) && isAssign(st.expression)) continue;
+        ts.forEachChild(st, visit);
+      }
+    } else {
+      ts.forEachChild(m, visit);
+    }
+    if (found) return true;
+  }
+  return found;
+}
+
+/** S138: what an Error subclass's own declaration gives its instances that
+ * the dynamic error encoding drops. `data`: OWN properties other than
+ * Error's own `message` — an emitting field (a `message` FIELD too: it
+ * defines a new enumerable property), a parameter property, and a
+ * `this.<name> <op>= …` anywhere in the class body (a constructor at any
+ * depth, a method: a `declare` field assigned anywhere, `name` and `code`
+ * included), or a `toJSON` method (JSON would call it). `proto`: the names
+ * of instance methods and accessors (on the prototype). */
+function errorDynLossy(decl: ts.ClassLikeDeclaration): { data?: true; name?: true; proto?: string[] } | null {
+  const protoNames = new Set<string>();
+  let data = false;
+  let name = false;
+  for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+    const flags = ts.canHaveModifiers(m) ? ts.getCombinedModifierFlags(m as unknown as ts.Declaration) : 0;
+    if (flags & (ts.ModifierFlags.Static | ts.ModifierFlags.Abstract)) continue;
+    if ((ts.isMethodDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) && (ts.isIdentifier(m.name) || ts.isStringLiteralLike(m.name))) {
+      protoNames.add(m.name.text);
+    } else if (ts.isPropertyDeclaration(m) && !(flags & ts.ModifierFlags.Ambient)) {
+      // An emitting field (`message` included); a `name` field is the own
+      // name (below).
+      if (ts.isIdentifier(m.name) && m.name.text === "name") name = true;
+      else data = true;
+    }
+  }
+  if (protoNames.has("toJSON")) data = true;
+  for (const n of classInstanceMemberNames(decl)) {
+    if (n === "name") name = true;
+    else if (n !== "message" && !protoNames.has(n)) data = true;
+  }
+  // `this.x <op>= …` anywhere in the class body.
+  const visit = (n: ts.Node): void => {
+    if (data) return;
+    if (
+      ts.isBinaryExpression(n) &&
+      n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      ts.isPropertyAccessExpression(n.left) && n.left.expression.kind === ts.SyntaxKind.ThisKeyword &&
+      n.left.name.text !== "message"
+    ) {
+      if (n.left.name.text === "name") name = true;
+      else {
+        data = true;
+        return;
+      }
+    }
+    // A nested class or a non-arrow function has its own `this`.
+    if (ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) return;
+    ts.forEachChild(n, visit);
+  };
+  for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+    const flags = ts.canHaveModifiers(m) ? ts.getCombinedModifierFlags(m as unknown as ts.Declaration) : 0;
+    if (flags & ts.ModifierFlags.Static) continue;
+    ts.forEachChild(m, visit);
+  }
+  if (!data && !name && protoNames.size === 0) return null;
+  return { ...(data ? { data: true as const } : {}), ...(name ? { name: true as const } : {}), ...(protoNames.size > 0 ? { proto: [...protoNames] } : {}) };
+}
+
 /** GH #135: does the class declare a STATIC `name` or `length` member? */
 function declaresStaticNameOrLength(decl: ts.ClassLikeDeclaration): boolean {
   return (decl.members as ts.NodeArray<ts.ClassElement>).some((m: ts.ClassElement) => {
@@ -2330,6 +2463,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // INSTANTIATION prints its family's name — JS has one `Box`.
           jsName: jsNameOverride ?? decl.name?.text ?? "",
           ...(declaresStaticNameOrLength(decl) ? { staticNameOrLength: true as const } : {}),
+          ...((): { dynLossyMembers?: { data?: true; name?: true; proto?: string[] } } => { const k = errorDynLossy(decl); return k !== null ? { dynLossyMembers: k } : {}; })(),
           ...(ctor === null ? { implicitCtor: true as const } : {}),
           ...(base ? { base: base.def.name } : {}),
           // Layout order: the base chain's fields as an IDENTICAL prefix,

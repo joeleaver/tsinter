@@ -11070,3 +11070,55 @@ lands on the boundary, `3n ** 1_000_000_000n`, `7n ** 383000000n` and
 `4n ** 536870912n` throw, `(-2n) ** 1073741823n` answers, both lanes) and
 `wasm-bigint-core.test.ts` (`bn_pow_limited` against the host BigInt).
 Measured against Node v24.18.1.
+## S138 — An Error subclass instance whose members the dynamic error encoding would drop stops by name: at the crossing for own data, at the read for a prototype member *(wasm and wasm-native)*
+
+An error crossing into `unknown` or `any` (an assignment, a parameter, a
+catch binding read as `unknown`/`any`, an island argument) becomes the
+checked-dynamic error encoding (S021), which carries the error's `name`,
+`message` and stamped `code` only. A program's own `extends Error` class
+can give its instances more, and in Node the object keeps it. Before this
+entry the encoding silently dropped it (`a.code` read `undefined`,
+`JSON.stringify` gave `{}`). Until #191 carries those members:
+
+- **Own data** — an emitting field (a `message` field included), a
+  parameter property, a `this.x <op>= …` anywhere in the class body (a
+  constructor at any depth, a method, a `declare` field assigned anywhere,
+  an own `code` included; a `declare` field nothing assigns gives
+  nothing), or a `toJSON` method: an instance of such a class (or of a
+  subclass of one) ends the program by name (SC1090) where it crosses into
+  a dynamic value. This also stops programs that only read `name`,
+  `message` or `String(e)` through the dynamic value, which matched Node
+  before (GH144-TS-03/04 are pinned as such stops); #191 lifts them.
+- **Own name only** (a `name` field or `this.name = …`, nothing else of
+  the above): the instance crosses, and reads of `name`, `message`,
+  `String(e)` match Node (the encoding carries the name). JSON, a key
+  listing (`Object.keys`/`values`/`entries`, an object rest) or
+  `Object.assign` of it through a dynamic value stops by name, since Node
+  lists the own `name` and the encoding cannot.
+- **Prototype members only** (methods, accessors): the instance crosses.
+  A dynamic read, call or `in` of a name the class chain declares stops by
+  name (Node finds it on the prototype); every other name answers as in
+  Node (`e.code` of an undeclared `code` is `undefined`, `Object.hasOwn`
+  of a method is `false`, JSON and key listings show no members).
+
+Error subclasses that declare nothing of their own, the builtin error
+classes and Node's own errors are unaffected. Separately (GH #193), a
+program's key listing (`Object.keys`/`values`/`entries`, an object rest)
+or `Object.assign` of any error held in a dynamic value no longer shows
+the encoding's `%error` marker or its `name`/`message`/`code` entries; an
+expando the program wrote still shows.
+
+A typed `"code" in e` on an Error-rooted receiver answers through the
+classes declaring `code` (rea step 8); while any Error subclass assigns
+`this.code` only conditionally, that `in` refuses at compile time by name
+(its presence is a runtime fact).
+
+**Divergence:** the program stops by name where Node continues; never a
+silently missing member.
+
+**Rationale:** found while lifting rea's catch idiom (top-10 #2); the same
+loss was reachable on main through any `unknown`/`any` crossing.
+**Tested by:** `packages/compiler/test/wasm-top10-rea-error-subclass-dyn.test.ts`,
+`wasm-top10-rea-error-code-in.test.ts`, and the re-pinned rows of
+`wasm-gh144-error-subclass-write.test.ts`
+(wasm and wasm-native, against Node).

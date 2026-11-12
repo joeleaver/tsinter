@@ -978,6 +978,16 @@ export interface IrClassDef {
    * declared parameter count, so the wasm backend's dynamic
    * `x.constructor` answer fences instead of naming the class. */
   staticNameOrLength?: true;
+  /** What the class's own declaration gives its instances that the dynamic
+   * error encoding drops (SEMANTICS.md S138; frontend errorDynLossy).
+   * `data`: own properties other than Error's `message` and `name` (fields,
+   * parameter properties, `this.x = …` anywhere, `code` included, a `toJSON`
+   * method): such an instance stops when it crosses into a dynamic value.
+   * `name`: an own `name` (a field or `this.name = …`): the encoding
+   * answers it, but JSON, key listings and Object.assign of the encoding
+   * stop (Node lists it). `proto`: the instance method and accessor names:
+   * a dynamic read, call or `in` of one of them stops. */
+  dynLossyMembers?: { data?: true; name?: true; proto?: string[] };
   /** The class declares no constructor of its own (GH #135): its
    * constructor's `length` is 0 in Node, whatever the synthesized one
    * forwards to its base. */

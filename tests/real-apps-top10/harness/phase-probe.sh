@@ -38,7 +38,7 @@ if (!r.ok) {
 EOF
 cd "$CWD" || exit 2
 PORT=$((9300 + RANDOM % 600))
-timeout -s KILL "$((MIN * 60))" node --max-old-space-size="${SURVEY_HEAP_MB:-11000}" --inspect-port="127.0.0.1:$PORT" \
+timeout -s KILL "$((MIN * 60))" node --max-old-space-size="${SURVEY_HEAP_MB:-11000}" --inspect="127.0.0.1:$PORT" \
   "$OUT/driver.mjs" "$ENTRY" "$NPM" > "$OUT/driver.log" 2>&1 &
 TPID=$!
 sleep 2
@@ -51,8 +51,8 @@ while kill -0 "$TPID" 2>/dev/null; do
   rss=$(ps -o rss= -p "$NPID" 2>/dev/null | tr -d ' ')
   kids=$(ps -o pid=,etime=,rss=,comm= --ppid "$NPID" 2>/dev/null | tr -s ' ' | tr '\n' ';')
   echo "== t=${t}s rss=${rss}k children: $kids"
-  # A JS stack sample through the inspector (stack-sample.mjs; SIGUSR1 to the NODE pid only).
-  timeout 90 node "$H/stack-sample.mjs" "$NPID" "$PORT" 2>&1 | head -24
+  # A JS stack sample through the inspector the compile was started with (stack-sample.mjs; no signal).
+  timeout 90 node "$H/stack-sample.mjs" "$PORT" 2>&1 | head -24
 done
 wait "$TPID"; echo "exit $?"
 cat "$OUT/driver.log" | tail -20

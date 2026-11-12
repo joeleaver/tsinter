@@ -26,7 +26,7 @@ import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
-import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
+import { assignsThisMemberConditionally, classInstanceMemberNames, findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
 import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
@@ -11340,8 +11340,48 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           const codeType = L.envValueType();
           if (codeType.kind !== "union") throw new Error("lowerer bug: error code type is not a union");
           const undefTag = L.armTag(codeType.unionId, UNDEFINED_T);
-          const read: IrExpr = { kind: "libCall", fn: "error.code", args: [recv], type: codeType, loc };
-          return { kind: "unionIsTag", unionId: codeType.unionId, tag: undefTag, negated: true, value: read, type: BOOL, loc };
+          // A program's own Error subclass DECLARING a `code` field (a
+          // parameter property, an initialized or plain field) gives its
+          // instances an own `code` property whatever its value, so `in`
+          // answers true for them; the runtime code slot answers the rest
+          // (system errors). Before, an `Error`-typed value holding such an
+          // instance answered false (Node: true).
+          const coded = [...L.classes.values()].filter((c) => {
+            let root: typeof c | null = c;
+            while (root?.base) root = root.base;
+            if (root?.def.name !== "%Error" || c.def.name === "%Error" || !L.inHierarchy(c)) return false;
+            for (let k: typeof c | null = c; k && k.def.name !== "%Error"; k = k.base ?? null) {
+              // What the declaration gives instances in Node: an emitting
+              // field (a `declare code` emits nothing), a parameter
+              // property, a constructor `this.code = …`, or a prototype
+              // method/accessor (`in` sees the prototype chain).
+              if (k.decl !== null && classInstanceMemberNames(k.decl).has("code")) return true;
+            }
+            return false;
+          });
+          // A subclass assigning `this.code` only in a branch, a nested
+          // block or a method: whether its instance has `code` is a
+          // runtime fact no class test answers.
+          for (const c of L.classes.values()) {
+            let root: typeof c | null = c;
+            while (root?.base) root = root.base;
+            if (root?.def.name !== "%Error" || c.def.name === "%Error") continue;
+            if (c.decl !== null && assignsThisMemberConditionally(c.decl, "code")) {
+              L.unsupported(
+                "SC1090",
+                expr,
+                `'in' with the key 'code' on Error receivers while an Error subclass ('${c.def.jsName ?? c.def.name}') assigns 'this.code' conditionally (its presence is a runtime fact)`,
+              );
+            }
+          }
+          return bindOnce(L, recv, loc, (r) => {
+            const read: IrExpr = { kind: "libCall", fn: "error.code", args: [r], type: codeType, loc };
+            let answer: IrExpr = { kind: "unionIsTag", unionId: codeType.unionId, tag: undefTag, negated: true, value: read, type: BOOL, loc };
+            for (const c of coded) {
+              answer = { kind: "logical", op: "||", left: { kind: "instanceOf", value: r, className: c.def.name, type: BOOL, loc }, right: answer, type: BOOL, loc };
+            }
+            return answer;
+          });
         }
         if ((key === "message" || key === "name") && (recv.kind === "varRef" || recv.kind === "caughtNarrow")) {
           return { kind: "boolLit", value: true, type: BOOL, loc };

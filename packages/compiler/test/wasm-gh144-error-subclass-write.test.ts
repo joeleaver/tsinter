@@ -30,6 +30,9 @@ interface Row {
   id: string;
   /** The entry's source, written as main.ts. */
   src: string;
+  /** Ends at a run-time fence whose message matches, after printing
+   * exactly `stdout` (a prefix of Node's). */
+  fence?: { text: RegExp; stdout: string };
 }
 
 const ROWS: Row[] = [
@@ -67,6 +70,8 @@ const t = new TypeError("t");
 t.message += "?" + t.name;
 t.name = "R" + t.message;
 console.log(String(t));`,
+    // SEMANTICS.md S138: the class has own data the dynamic error encoding drops; #191 lifts this.
+    fence: { text: /an instance of an Error subclass with own properties .* crossing into a dynamic value .*SEMANTICS\.md S138/, stdout: "x!x ex x!x+ Nx: x!x+ Nx\n" }
   },
   {
     id: "GH144-TS-04 a user error class keeps its own fields beside the error slots, crossed or thrown",
@@ -83,6 +88,8 @@ for (const e of errs) console.log(String(e), e.code2, e.label, e instanceof AppE
 const again: any = errs[1];
 console.log(crossed.name, String(crossed), crossed === again);
 try { throw errs[0]!; } catch (x) { const c = x as AppError; console.log(c.code2, c.label, c.message, c === errs[0]); }`,
+    // SEMANTICS.md S138: the class has own data the dynamic error encoding drops; #191 lifts this.
+    fence: { text: /an instance of an Error subclass with own properties .* crossing into a dynamic value .*SEMANTICS\.md S138/, stdout: "" }
   },
 ];
 
@@ -118,6 +125,16 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
   const node = nodeRun(entry);
   expect(node.exitCode).toBe(0);
+  if (row.fence !== undefined) {
+    const stopped: Out = backend === "wasm"
+      ? await runWasmToTrap(res.binaryPath!).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: 1 }))
+      : await nativeRun(res.binaryPath!);
+    expect(stopped.exitCode).toBe(1);
+    expect(stopped.stdout).toBe(row.fence.stdout);
+    expect(node.stdout.startsWith(stopped.stdout)).toBe(true);
+    expect(stopped.stderr.split("\n")[0]).toMatch(row.fence.text);
+    return;
+  }
   const got: Out = backend === "wasm"
     ? await runWasm(res.binaryPath!).then(
         (r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: r.exitCode }),

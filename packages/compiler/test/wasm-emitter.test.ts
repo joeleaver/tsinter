@@ -3175,7 +3175,7 @@ test("S021/S022: a caught value crossing into `unknown`", async () => {
       "name TypeError message boom marker true",
       // S021 — Node answers [] here: its name and message are not
       // enumerable and its marker does not exist.
-      "keys [%error,name,message]",
+      "keys []", // GH #193: Node lists none of the encoding's internal entries
       "empties [m] [Weird]",
       "same true distinct false",
       "custom [CustomError: cf] isErr true name CustomError",

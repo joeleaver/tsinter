@@ -394,6 +394,19 @@ export interface DynDeps {
    * the text already carries its code) and traps — nothing catches it.
    * Code emitted after it is dead. */
   fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
+  /** SEMANTICS.md S138. Pushes i32: is the error `pushErr` leaves an
+   * instance of one of the program's own Error subclasses with OWN data the
+   * encoding drops (fields, parameter properties, `this.x = …`)? Such an
+   * instance stops when it crosses into a dynamic value. Absent: no class. */
+  errStopTest?: (c: Code, pushErr: (c: Code) => void) => void;
+  /** S138: `(err, key) -> i32`, does the error's user class chain declare a
+   * prototype method or accessor named `key`? A dynamic read, call or `in`
+   * of such a name stops. Absent: no class declares one. */
+  errProtoDeclares?: () => number;
+  /** S138: pushes i32, is the error an instance of a user Error subclass
+   * that sets an own `name`? JSON, key listings and Object.assign of its
+   * encoding stop (Node lists the own name; the encoding hides it). */
+  errNameTest?: (c: Code, pushErr: (c: Code) => void) => void;
   /** Unit U (SEMANTICS.md S119 (b)): the module's "a hole was made" i32
    * global, when the module was lowered with undefSlots — an array that
    * crossed in from typed storage holds the element's `undefined` where
@@ -3758,7 +3771,7 @@ export class DynBuilder {
         c.end();
         c.localGet(1);
         c.i32Const(2);
-        c.call(this.objWalk());
+        c.call(this.objWalkUser());
         c.localTee(P);
         c.refIsNull();
         c.ifVoid();
@@ -6291,6 +6304,12 @@ export class DynBuilder {
           c.localTee(M);
           c.refIsNull();
           c.ifResult(this.dynRef());
+          // S138: a prototype member an Error subclass's encoding lacks.
+          if (this.deps.errProtoDeclares !== undefined) {
+            this.objPayload(c, (x) => x.localGet(0));
+            c.localGet(1);
+            c.call(this.errProtoFence());
+          }
           c.globalGet(this.undefinedGlobal());
           c.else_();
           this.resolveCellInto(c, 0, M, (x) => x.refNull(dynT));
@@ -7486,6 +7505,13 @@ export class DynBuilder {
         c.i32Const(1);
         c.return_();
         c.end();
+        // S138: an Error subclass's prototype member, which its encoding
+        // lacks (Node: true).
+        if (this.deps.errProtoDeclares !== undefined) {
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.errProtoFence());
+        }
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
         c.call(this.memberLookup());
@@ -7863,6 +7889,140 @@ export class DynBuilder {
    *    the two agree on every string without an astral character — which
    *    is every string a corpus program can hold, since the C lane would
    *    already fail the differential on one. */
+  /** %w.dyn.errUserView(obj) → obj itself, or for an error's dynamic
+   * encoding a copy without its `%error` marker and the error's `name`,
+   * `message` and stamped `code` entries (GH #193): Node does not list them
+   * (the marker does not exist; the rest are non-enumerable or on the
+   * prototype), so a program's key listing or Object.assign walks the copy
+   * and an expando the program wrote still shows. The runtime's own walks
+   * (inspection, JSON) hide them their own way. */
+  errUserView(): number {
+    return this.cached("errUserView", [this.objRef()], [this.objRef()], (idx) => {
+      const objT = this.objT();
+      const entryT = this.entryT();
+      const entries = this.entriesArrayType();
+      const c = new Code();
+      const CP = 1;
+      const N = 2;
+      const I = 3;
+      const E = 4;
+      const ERR = 5;
+      c.localGet(0);
+      c.call(this.errLinkOf());
+      c.localTee(ERR);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      this.errNameFence(c, ERR);
+      this.pushNewObj(c, false);
+      c.localSet(CP);
+      c.localGet(0);
+      c.structGet(objT, OBJ_LEN);
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.structGet(objT, OBJ_ENTRIES);
+      c.localGet(I);
+      c.arrayGet(entries);
+      c.localSet(E);
+      c.i32Const(0);
+      for (const key of ["%error", "name", "message", "code"]) {
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        this.deps.lit(c, key);
+        c.call(this.deps.strEq());
+        c.i32Or();
+      }
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(CP);
+      c.localGet(E);
+      c.structGet(entryT, ENTRY_KEY);
+      c.localGet(E);
+      c.structGet(entryT, ENTRY_VALUE);
+      c.call(this.objPut());
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(CP);
+      this.mb.setBody(idx, [this.objRef(), I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
+  }
+
+  /** S138: when the error in local `err` (non-null) is an instance of a
+   * user Error subclass setting its own `name`, a listing of its encoding
+   * stops by name (Node lists the own name; the encoding cannot). */
+  errNameFence(c: Code, err: number): void {
+    const test = this.deps.errNameTest;
+    if (test === undefined) return;
+    test(c, (x) => x.localGet(err));
+    c.ifVoid();
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, "JSON, a key listing or Object.assign of an instance of an Error subclass setting its own name, held in a dynamic value (unknown, any, a catch binding) — Node lists the own name, the dynamic error does not (SEMANTICS.md S138)"),
+    );
+    c.end();
+  }
+
+  /** %w.dyn.errNameListFence(obj) — errNameFence over an encoding (JSON's
+   * object walk): nothing for any other object. */
+  errNameListFence(): number {
+    return this.cached("errNameListFence", [this.objRef()], [], (idx) => {
+      const c = new Code();
+      const ERR = 1;
+      if (this.deps.errNameTest !== undefined) {
+        c.localGet(0);
+        c.call(this.errLinkOf());
+        c.localTee(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        this.errNameFence(c, ERR);
+        c.end();
+      }
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.objWalkUser(d, mode) — objWalk for a PROGRAM's key listing
+   * (Object.keys/values/entries, an object rest): an error's encoding walks
+   * as errUserView (GH #193). */
+  objWalkUser(): number {
+    return this.cached("objWalkUser", [this.dynRef(), I32], [this.dynRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      this.boxObj(c, (x) => {
+        this.objPayload(x, (y) => y.localGet(0));
+        x.call(this.errUserView());
+      });
+      c.localGet(1);
+      c.call(this.objWalk());
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.objWalk());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   objWalk(): number {
     return this.cached("objWalk", [this.dynRef(), I32], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
@@ -8177,6 +8337,13 @@ export class DynBuilder {
         const objT = this.objT();
         const entries = this.entriesArrayType();
         const entryT = this.entryT();
+        // GH #193: an error's encoding copies as its user view (no marker,
+        // no name/message/code entries — Node copies none of them).
+        this.boxObj(c, (x) => {
+          this.objPayload(x, (y) => y.localGet(1));
+          x.call(this.errUserView());
+        });
+        c.localSet(1);
         this.objPayload(c, (x) => x.localGet(1));
         c.structGet(objT, OBJ_LEN);
         c.localSet(N);
@@ -9500,6 +9667,18 @@ export class DynBuilder {
         c.refCast(this.dynT());
         c.return_();
         c.end();
+        // SEMANTICS.md S138: an instance of a program's own Error subclass
+        // with OWN data (fields, parameter properties, `this.x = …`) would
+        // lose it in the encoding, which carries name, message and code
+        // only: the crossing stops by name (#191 carries them).
+        if (this.deps.errStopTest !== undefined) {
+          this.deps.errStopTest(c, (x) => x.localGet(0));
+          c.ifVoid();
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "an instance of an Error subclass with own properties (fields, parameter properties, this.x assignments) crossing into a dynamic value (unknown, any, a catch binding) — the dynamic error carries only name, message and code (SEMANTICS.md S138)"),
+          );
+          c.end();
+        }
         // A first crossing builds the encoding.
         this.pushNewObj(c, false);
         c.localSet(O);
@@ -9671,6 +9850,38 @@ export class DynBuilder {
         this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }, errRef], c.bytes());
       },
     );
+  }
+
+  /** %w.dyn.errProtoFence(obj, key) — SEMANTICS.md S138. When `obj` is
+   * the encoding of an instance of one of the program's own Error
+   * subclasses whose class chain declares a prototype method or accessor
+   * named `key`, the read, call or `in` that asked ends the program by name
+   * (the encoding has no prototype members: Node would find it). Any other
+   * object or key: nothing (it reads undefined, as in Node). */
+  errProtoFence(): number {
+    return this.cached("errProtoFence", [this.objRef(), this.deps.strRef()], [], (idx) => {
+      const c = new Code();
+      const ERR = 2;
+      const declares = this.deps.errProtoDeclares;
+      if (declares !== undefined) {
+        c.localGet(0);
+        c.call(this.errLinkOf());
+        c.localTee(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ERR);
+        c.localGet(1);
+        c.call(declares());
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "a method or accessor of an Error subclass read, called or tested with 'in' through a dynamic value (unknown, any, a catch binding) — the dynamic error carries no prototype members (SEMANTICS.md S138)"),
+        );
+        c.end();
+        c.end();
+      }
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
   }
 
   /** %w.dyn.errLinkOf(obj) → the error an encoding was built from, or NULL
@@ -11445,6 +11656,17 @@ export class DynBuilder {
           c.return_();
           c.end();
           c.end();
+          // S138: a method an Error subclass declares, which its encoding
+          // lacks (any other name keeps the answers below).
+          if (this.deps.errProtoDeclares !== undefined) {
+            c.localGet(M);
+            c.refIsNull();
+            c.ifVoid();
+            this.objPayload(c, (x) => x.localGet(0));
+            this.deps.lit(c, method);
+            c.call(this.errProtoFence());
+            c.end();
+          }
           if (objProto) {
             // No own member, and a prototype to inherit from: every proto
             // code but null-prototype's reaches Object.prototype (a Map
