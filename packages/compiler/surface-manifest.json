@@ -2023,6 +2023,13 @@
       "note": "the composed new Date(dateString).getTime() form; new Date().getTime() is stdlib.date.now's surface"
     },
     {
+      "id": "stdlib.date.getTimezoneOffset",
+      "kind": "stdlib",
+      "name": "Date.prototype.getTimezoneOffset",
+      "status": "static",
+      "note": "the composed new Date(ms? | dateString).getTimezoneOffset() form; the host zone's offset"
+    },
+    {
       "id": "stdlib.date.now",
       "kind": "stdlib",
       "name": "Date.now",

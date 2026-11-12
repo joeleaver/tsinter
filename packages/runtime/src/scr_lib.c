@@ -3535,6 +3535,14 @@ double scr_tz_offset_ms(double t) {
 #endif
 }
 
+/* Date#getTimezoneOffset (V8's DateCache::TimezoneOffset): (t - local)
+ * in whole minutes, the integer division truncating toward zero; NaN for
+ * an invalid date. */
+double scr_date_tz_offset_min(double t) {
+  if (isnan(t) || t < -8640000000000000.0 || t > 8640000000000000.0) return NAN;
+  return trunc(-scr_tz_offset_ms(t) / 60000.0) + 0.0; /* an int in V8: never -0 */
+}
+
 /* The zone's DST flag at an instant (the name's choice, scr_web.c), and
  * the zone as chosen: SCR_TZ_ZONE with its name, SCR_TZ_FIXED, or
  * SCR_TZ_SYSTEM (unidentified). */

@@ -150,6 +150,21 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
   }, 120_000);
 
+  // Auto judges an import typed by an @types twin as the RUNTIME package
+  // (js-yaml, semver: their declarations are @types/js-yaml, @types/semver):
+  // the twin is the declared surface (S133), the package's JS compiles.
+  test("--npm-static=auto pairs an @types twin with its runtime package", async () => {
+    const entry = join(pilotRoot, "twin-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "twinned", status: "static" }]);
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.stats.statementsFailed).toBe(0);
+    const binary = await buildStatic(entry, "auto");
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+
   // Auto refuses ms: it ships no own .d.ts (the declared-claim criterion),
   // so the import keeps today's story — and the explicit opt-in below is
   // the user's override.

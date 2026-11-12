@@ -565,13 +565,64 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
  * gracefully per-package-degraded when the attempt fails. */
 const TRANSFORM_MARKERS = ["__webpack_require__"];
 
-/** Unminified-JS heuristic over an entry source: at least two lines and
- * an average line length under 200 characters (minified dists are one
- * enormous line; readable code averages well under 100). */
+/** Unminified-JS heuristic over an entry source. Minified output has two
+ * signals together: LONG LINES (one enormous line, or an average far past
+ * readable code's) and MANGLED NAMES (one- and two-character identifiers
+ * dominating the identifier occurrences). Either alone is ordinary code: a
+ * compact single-file package writes long lines with real names, and a
+ * readable loop body has its `i`s and `k`s on short lines. An empty or
+ * comment-only entry (a types-only package's stub) has nothing minified. */
 export function looksUnminified(source: string): boolean {
   const lines = source.split("\n");
-  if (lines.length < 2) return false;
-  return source.length / lines.length <= 200;
+  const longest = lines.reduce((m, l) => Math.max(m, l.length), 0);
+  const longLines = longest > 500 || source.length / lines.length > 200;
+  if (!longLines) return true;
+  return mangledShare(source) < MANGLED_SHARE;
+}
+
+/** The share of identifier occurrences at or above which a long-lined
+ * source reads as name-mangled. */
+const MANGLED_SHARE = 0.4;
+
+const JS_WORDS = new Set([
+  "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else",
+  "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "let",
+  "new", "null", "of", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var",
+  "void", "while", "with", "yield", "async", "await", "static", "get", "set", "undefined",
+]);
+
+/** One- and two-character identifiers as a share of all identifier
+ * occurrences outside strings and comments (keywords excluded). */
+function mangledShare(source: string): number {
+  // Strings first (a URL's // is not a comment), then comments.
+  const code = source
+    .replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""')
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/[^\n]*/g, " ");
+  let total = 0;
+  let short = 0;
+  for (const m of code.matchAll(/[A-Za-z_$][\w$]*/g)) {
+    const id = m[0];
+    if (JS_WORDS.has(id)) continue;
+    total++;
+    if (id.length <= 2) short++;
+  }
+  return total === 0 ? 0 : short / total;
+}
+
+/** The DefinitelyTyped twin of a package name (`js-yaml` → `@types/js-yaml`,
+ * `@scope/name` → `@types/scope__name`). */
+export function typesTwinOf(pkgName: string): string {
+  return pkgName.startsWith("@") ? `@types/${pkgName.slice(1).replace("/", "__")}` : `@types/${pkgName}`;
+}
+
+/** The runtime package a DefinitelyTyped package describes (the inverse of
+ * typesTwinOf), or null for a name outside @types. */
+export function runtimeOfTypesTwin(pkgName: string): string | null {
+  if (!pkgName.startsWith("@types/")) return null;
+  const rest = pkgName.slice("@types/".length);
+  if (rest === "node") return null;
+  return rest.includes("__") ? `@${rest.replace("__", "/")}` : rest;
 }
 
 export function hasTransformMarkers(source: string): boolean {
@@ -587,7 +638,11 @@ export function npmStaticIneligibleReason(
   typesFile: string,
   jsEntry: string | null,
 ): string | null {
-  if (npmPackageNameOf(typesFile) !== pkgName) {
+  // The package's own declarations, or its @types twin (the declared-
+  // surface view serves either — S133); any other package's types are a
+  // third party's claim about this one.
+  const typesPkg = npmPackageNameOf(typesFile);
+  if (typesPkg !== pkgName && typesPkg !== typesTwinOf(pkgName)) {
     return "its declared types come from a third-party @types package, not the package itself";
   }
   if (!/\.d\.(ts|mts|cts)$/.test(typesFile)) {

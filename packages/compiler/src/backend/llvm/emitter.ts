@@ -304,6 +304,7 @@ const LIB_FN_SYMS: Record<string, string> = {
   "process.isTTY": "scr_process_is_tty",
   "date.now": "scr_date_now",
   "date.parseGetTime": "scr_date_parse_get_time",
+  "date.tzOffsetMin": "scr_date_tz_offset_min",
   "date.utc": "scr_date_utc",
   "fs.existsSync": "scr_fs_exists",
   // ── the throwing slice (MAY_THROW_LIB_FNS members): the generic path

@@ -5536,6 +5536,29 @@ const inliningPredicates = new Set<ts.Symbol>();
     return name;
   }
 
+/** The `as` / `<T>` cast that takes an Object.freeze(...) result to a
+   * type with WRITABLE members, or null. Walks the wrappers above the call
+   * (parentheses, non-null, satisfies, casts); a cast keeps readonly-ness
+   * when its target is the call's own type, `as const`, a `readonly` array
+   * or tuple, or a `Readonly<...>`. */
+  function mutableCastOfFrozen(L: Lowerer, call: ts.CallExpression): ts.Node | null {
+    const frozenText = L.checker.typeToString(L.typeOf(call));
+    let n: ts.Node = call;
+    while (n.parent && (ts.isParenthesizedExpression(n.parent) || ts.isNonNullExpression(n.parent) ||
+      ts.isSatisfiesExpression(n.parent) || ts.isAsExpression(n.parent) || n.parent.kind === ts.SyntaxKind.TypeAssertionExpression)) {
+      const p = n.parent;
+      if (ts.isAsExpression(p) || p.kind === ts.SyntaxKind.TypeAssertionExpression) {
+        const t = (p as ts.Node & { type: ts.TypeNode }).type;
+        const isConst = ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && t.typeName.text === "const";
+        const text = L.checker.typeToString(L.typeOf(p));
+        const keepsReadonly = isConst || text === frozenText || text.startsWith("readonly ") || text.startsWith("Readonly<");
+        if (!keepsReadonly) return p;
+      }
+      n = p;
+    }
+    return null;
+  }
+
 /** `A.hasOwnProperty(lit)` on a PROGRAM CLASS constructor: the own
    * properties of a class object are compile-time-known — its OWN static
    * member names (fields, methods, accessors; inherited statics live on
@@ -8623,9 +8646,21 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       }
       const argNode = call.arguments[0]!;
       let inner: ts.Expression = argNode;
-      while (ts.isParenthesizedExpression(inner) || ts.isAsExpression(inner)) inner = inner.expression;
+      while (ts.isParenthesizedExpression(inner) || ts.isAsExpression(inner) || ts.isSatisfiesExpression(inner)) inner = inner.expression;
       const value = L.lowerExpr(argNode);
       if (ts.isObjectLiteralExpression(inner) || ts.isArrayLiteralExpression(inner)) {
+        // The frozen-ness is unobservable only while every reference is
+        // typed readonly (writes are then compile errors). A cast of the
+        // result to a MUTABLE type would let the program write where Node
+        // throws (strict mode), so the cast refuses by name instead.
+        const cast = mutableCastOfFrozen(L, call);
+        if (cast !== null) {
+          L.noLowering(
+            "a cast of an Object.freeze result to a mutable type",
+            cast,
+            "a frozen value's writes throw in Node, and this build keeps no runtime frozen bit — keep the readonly type (or copy before mutating: [...frozen], { ...frozen })",
+          );
+        }
         return value; // fresh — freeze is identity here, honestly
       }
       if (

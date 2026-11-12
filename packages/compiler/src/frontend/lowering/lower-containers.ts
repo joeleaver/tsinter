@@ -7392,6 +7392,136 @@ function checkedBufferSize(L: Lowerer, size: IrExpr, loc: SrcLoc): IrExpr {
   };
 }
 
+/** Node's parseFileMode over a NUMBER mode (fs's `mode` options):
+ * validateUint32 — a non-integer (NaN, Infinity, a fraction) is
+ * ERR_OUT_OF_RANGE "It must be an integer", one outside [0, 2^32 - 1]
+ * "It must be >= 0 && <= 4294967295", both with errors.js's "Received"
+ * rendering. `name` is the option's spelling in the message: "mode" for
+ * writeFile and fs.promises.mkdir, "options.mode" for mkdirSync. An
+ * interned `%fs.modeMsg(m) -> string`, "" for a valid mode. */
+function fileModeMessage(L: Lowerer, name: string, loc: SrcLoc): string {
+  const key = `fs:modeMsg:${name}`;
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const fn = `%fs.modeMsg.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, fn);
+  const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const m: IrExpr = { kind: "varRef", localId: "m.0", type: F64, loc };
+  const fail = (rule: string): IrStmt => ({
+    kind: "return",
+    value: {
+      kind: "strConcat",
+      left: { kind: "strLit", value: `The value of "${name}" is out of range. ${rule}. Received `, type: STRING, loc },
+      right: { kind: "call", callee: bufferReceivedHelper(L, loc), args: [m], type: STRING, loc },
+      type: STRING,
+      loc,
+    },
+    loc,
+  });
+  const notInteger: IrExpr = {
+    kind: "logical",
+    op: "||",
+    left: { kind: "bin", op: "!==", left: { kind: "libCall", fn: "math.trunc", args: [m], type: F64, loc }, right: m, type: BOOL, loc },
+    right: { kind: "bin", op: "!==", left: { kind: "bin", op: "-", left: m, right: m, type: F64, loc }, right: num(0), type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  const outOfRange: IrExpr = {
+    kind: "logical",
+    op: "||",
+    left: { kind: "bin", op: "<", left: m, right: num(0), type: BOOL, loc },
+    right: { kind: "bin", op: ">", left: m, right: num(4294967295), type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  L.liftedFns.push({
+    name: fn,
+    params: [{ localId: "m.0", name: "m", type: F64 }],
+    returnType: STRING,
+    locals: [{ id: "m.0", name: "m", type: F64, mutable: false }],
+    body: [
+      { kind: "if", cond: notInteger, then: [fail("It must be an integer")], else_: null, loc },
+      { kind: "if", cond: outOfRange, then: [fail("It must be >= 0 && <= 4294967295")], else_: null, loc },
+      { kind: "return", value: { kind: "strLit", value: "", type: STRING, loc }, loc },
+    ],
+    loc,
+  });
+  return fn;
+}
+
+/** A synchronous fs call's mode: `%fs.modeChk(m) -> m`, throwing Node's
+ * ERR_OUT_OF_RANGE RangeError (fileModeMessage) for an invalid one. */
+export function checkedFileMode(L: Lowerer, mode: IrExpr, loc: SrcLoc, name = "mode"): IrExpr {
+  const key = `fs:modeChk:${name}`;
+  let fn = L.inspectHelpers.get(key);
+  if (!fn) {
+    fn = `%fs.modeChk.${L.inspectHelpers.size}`;
+    L.inspectHelpers.set(key, fn);
+    const m: IrExpr = { kind: "varRef", localId: "m.0", type: F64, loc };
+    const msg: IrExpr = { kind: "varRef", localId: "msg.0", type: STRING, loc };
+    L.liftedFns.push({
+      name: fn,
+      params: [{ localId: "m.0", name: "m", type: F64 }],
+      returnType: F64,
+      locals: [
+        { id: "m.0", name: "m", type: F64, mutable: false },
+        { id: "msg.0", name: "msg", type: STRING, mutable: false },
+      ],
+      body: [
+        { kind: "varDecl", localId: "msg.0", init: { kind: "call", callee: fileModeMessage(L, name, loc), args: [m], type: STRING, loc }, loc },
+        {
+          kind: "if",
+          cond: { kind: "bin", op: "!==", left: { kind: "strIntrinsic", method: "length", receiver: msg, args: [], type: F64, loc }, right: { kind: "numLit", value: 0, type: F64, loc }, type: BOOL, loc },
+          then: [{
+            kind: "exprStmt",
+            expr: { kind: "libCall", fn: "error.nodeThrow", args: [{ kind: "numLit", value: 2, type: F64, loc }, { kind: "strLit", value: "ERR_OUT_OF_RANGE", type: STRING, loc }, msg], type: F64, loc },
+            loc,
+          }],
+          else_: null,
+          loc,
+        },
+        { kind: "return", value: m, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: fn, args: [mode], type: F64, loc };
+}
+
+/** An fs.promises call's mode: Node validates inside the async function,
+ * so an invalid mode REJECTS the returned promise with the same
+ * ERR_OUT_OF_RANGE RangeError rather than throwing. `build` makes the
+ * call from the (bound) mode; the result is
+ * `msg === "" ? build(m) : Promise.reject(RangeError(msg))`. */
+export function fspCheckedFileMode(L: Lowerer, mode: IrExpr, loc: SrcLoc, name: string, build: (mode: IrExpr) => IrExpr): IrExpr {
+  const stmts: IrStmt[] = [];
+  const bind = (e: IrExpr, tag: string): IrExpr => {
+    if (droppableStatic(e)) return e;
+    const t = L.declareHiddenLocal(tag, e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  const m = bind(mode, "%fsp.mode");
+  const msg = bind({ kind: "call", callee: fileModeMessage(L, name, loc), args: [m], type: STRING, loc }, "%fsp.modeMsg");
+  const ok = build(m);
+  const err: IrExpr = {
+    kind: "libCall",
+    fn: "error.newCoded",
+    args: [msg, { kind: "strLit", value: "ERR_OUT_OF_RANGE", type: STRING, loc }],
+    type: { kind: "object", className: "%RangeError" },
+    loc,
+  };
+  const result: IrExpr = {
+    kind: "ternary",
+    cond: { kind: "bin", op: "===", left: { kind: "strIntrinsic", method: "length", receiver: msg, args: [], type: F64, loc }, right: { kind: "numLit", value: 0, type: F64, loc }, type: BOOL, loc },
+    then: ok,
+    else_: { kind: "intrinsic", name: "promise.reject", args: [err], type: ok.type, loc },
+    type: ok.type,
+    loc,
+  };
+  return { kind: "seqExpr", stmts, result, type: ok.type, loc };
+}
+
 /** `%errors.received(n): string` — ERR_OUT_OF_RANGE's "Received" text for
  * a number: an integer past 2 ** 32 in magnitude gets
  * addNumericalSeparator over String(n) ("9_007_199_254_740_992"; the

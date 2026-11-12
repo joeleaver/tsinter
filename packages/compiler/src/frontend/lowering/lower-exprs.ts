@@ -2072,6 +2072,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (ts.isConditionalExpression(expr)) return lowerTernary(L, expr);
 
     if (ts.isPropertyAccessExpression(expr)) {
+      // `import.meta.main` (Node 24): true exactly in the module Node was
+      // started with — the build's entry; a compile-time constant.
+      if (ts.isMetaProperty(expr.expression) && expr.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+          expr.expression.name.text === "meta" && expr.name.text === "main") {
+        return { kind: "boolLit", value: expr.getSourceFile().fileName === L.entry.fileName, type: BOOL, loc: locOf(expr) };
+      }
       // `super.x`: the base chain's GETTER, called directly (super
       // dispatch is static in JS — never through the dynamic class).
       // super.method() calls are routed at the call site; a bare super

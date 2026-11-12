@@ -1308,6 +1308,8 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fsp.stat" ||
         node === "fsp.mkdir" ||
         node === "fsp.mkdirRecursiveMode" ||
+        node === "fsp.writeFileMode" ||
+        node === "fsp.writeFileExclMode" ||
         node === "fsp.readdir" ||
         node === "fsp.unlink" ||
         node === "fsp.chmod" ||
@@ -3482,7 +3484,7 @@ class Assembler {
     // offset-less date-time (local time) — a parse of a string literal that
     // carries its zone, or has no time, never asks — minted after fetch so
     // no earlier import index moves.
-    this.tzCallFunc = this.engineLive || libCallWhere(mod, (fn, args) => fn === "date.parseGetTime" && !zoneFreeDateLiteral(args[0]))
+    this.tzCallFunc = this.engineLive || libCallWhere(mod, (fn, args) => (fn === "date.parseGetTime" && !zoneFreeDateLiteral(args[0])) || fn === "date.tzOffsetMin")
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TZ_CALL, this.mb.funcType([I32, F64, I32, I32], [F64]))
       : null;
     // ── end INC-26 host-import block ──
@@ -26651,6 +26653,11 @@ class Assembler {
           this.releaseScratch(F64, msLocal);
           return;
         }
+        if (e.fn === "date.tzOffsetMin") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.date.tzOffsetMinHelper());
+          return;
+        }
         if (e.fn === "date.parseGetTime") {
           this.walkExpr(e.args[0]!);
           code.call(this.date.parseGetTimeHelper());
@@ -29237,6 +29244,16 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             this.walkExpr(e.args[1]!);
             code.call(this.fs.writeFileSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.writeFileMode" || e.fn === "fsp.writeFileExclMode") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            this.walkExpr(e.args[2]!);
+            code.call(this.toInt32Helper());
+            code.call(e.fn === "fsp.writeFileMode" ? this.fs.writeFileModeSyncHelper() : this.fs.writeFileExclModeSyncHelper());
           });
           return;
         }

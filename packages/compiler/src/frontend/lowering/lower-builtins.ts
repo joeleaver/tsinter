@@ -32,6 +32,7 @@ import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { execFileAsyncValueCall, execNormLiteral, execSyncValueCall, lowerOptionsValue, spawnValueCall } from "./lower-child-options.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
+import { checkedFileMode, fspCheckedFileMode } from "./lower-containers.js";
 import { registerHttpClientFnBinding } from "./lower-server.js";
 import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTREAM_T, IrExpr, IrFunction, IrLibFn, IrLocal, IrStmt, IrType, JSVAL, NULL_T, SEARCH_PARAMS_T, SPAWNRES_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, funcOf, isUnitType, typeEquals, typeKey } from "../../ir/nodes.js";
 
@@ -1261,7 +1262,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         );
       }
       const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
-      const mode: IrExpr | null = modeNode ? L.lowerExprExpecting(modeNode, F64) : null;
+      const mode: IrExpr | null = modeNode ? checkedFileMode(L, L.lowerExprExpecting(modeNode, F64), loc, "options.mode") : null;
       if (!recursive) {
         return mode
           ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fs.mkdirModeSync", args, type: VOID, loc }))
@@ -1277,6 +1278,58 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       return mode
         ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fs.mkdirRecursiveModeSync", args, type: VOID, loc }))
         : { kind: "libCall", fn: "fs.mkdirRecursiveSync", args: [path], type: VOID, loc };
+    }
+    // fs.promises.writeFile(p, data, options): writeFileSync's options
+    // matrix behind a settled promise — a literal { mode?: <number>,
+    // flag?: "w" | "wx", encoding?: "utf8" } over string data (deepseek's
+    // startup report: { flag: 'wx', mode: 0o600 }). "wx" is the exclusive
+    // create (EEXIST rejects).
+    if (bi.module === "fs/promises" && bi.member === "writeFile" && expr.arguments.length === 3) {
+      const optsNode = expr.arguments[2]!;
+      // The bare-encoding spelling — writeFile(p, s, "utf8") — is the
+      // options record's encoding alone (writeFileSync's own rule).
+      {
+        const t = L.typeOf(optsNode);
+        if (t.isStringLiteralType() && (t.value === "utf8" || t.value === "utf-8") &&
+            L.mapTypeOf(L.typeOf(expr.arguments[1]!))?.kind === "string") {
+          const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, true);
+          const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
+          const type: IrType = { kind: "promise", inner: VOID };
+          return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fsp.writeFile", args, type, loc }));
+        }
+      }
+      let modeNode: ts.Expression | null = null;
+      let exclusive = false;
+      let ok = ts.isObjectLiteralExpression(optsNode) && L.mapTypeOf(L.typeOf(expr.arguments[1]!))?.kind === "string";
+      if (ok) {
+        for (const p of (optsNode as ts.ObjectLiteralExpression).properties) {
+          const m = optionMember(p);
+          if (!m) { ok = false; break; }
+          const t = L.typeOf(m.value);
+          if (m.name === "mode") modeNode = m.value;
+          else if (m.name === "encoding") {
+            if (!t.isStringLiteralType() || (t.value !== "utf8" && t.value !== "utf-8")) { ok = false; break; }
+          } else if (m.name === "flag") {
+            if (!t.isStringLiteralType() || (t.value !== "w" && t.value !== "wx")) { ok = false; break; }
+            exclusive = t.value === "wx";
+          } else { ok = false; break; }
+        }
+      }
+      if (!ok) {
+        L.noLowering(
+          "fs.promises.writeFile with 3 arguments",
+          optsNode,
+          'the supported options are a literal { mode: <number>, flag: "w" | "wx", encoding: "utf8" } over string data',
+        );
+      }
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, true);
+      const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
+      const type: IrType = { kind: "promise", inner: VOID };
+      if (!exclusive && modeNode === null) {
+        return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fsp.writeFile", args, type, loc }));
+      }
+      const mode: IrExpr = modeNode === null ? { kind: "numLit", value: 0o666, type: F64, loc } : L.lowerExprExpecting(modeNode, F64);
+      return deferArgChecks(L, [path, data, mode], loc, ([p, d, m]) => fspCheckedFileMode(L, m!, loc, "mode", (cm) => ({ kind: "libCall", fn: exclusive ? "fsp.writeFileExclMode" : "fsp.writeFileMode", args: [p!, d!, cm], type, loc })));
     }
     // fs.promises.mkdir(p, options): the mkdirSync matrix behind settled
     // promises — literal { recursive?: <boolean literal>, mode?: number }.
@@ -1312,11 +1365,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const type: IrType = { kind: "promise", inner: VOID };
       if (!recursive) {
         return mode
-          ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fsp.mkdirMode", args, type, loc }))
+          ? deferArgChecks(L, [path, mode], loc, ([p, m]) => fspCheckedFileMode(L, m!, loc, "mode", (cm) => ({ kind: "libCall", fn: "fsp.mkdirMode", args: [p!, cm], type, loc })))
           : { kind: "libCall", fn: "fsp.mkdir", args: [path], type, loc };
       }
       return mode
-        ? deferArgChecks(L, [path, mode], loc, (args) => ({ kind: "libCall", fn: "fsp.mkdirRecursiveMode", args, type, loc }))
+        ? deferArgChecks(L, [path, mode], loc, ([p, m]) => fspCheckedFileMode(L, m!, loc, "mode", (cm) => ({ kind: "libCall", fn: "fsp.mkdirRecursiveMode", args: [p!, cm], type, loc })))
         : { kind: "libCall", fn: "fsp.mkdirRecursive", args: [path], type, loc };
     }
     // rmSync(p, options): literal { recursive?, force? } booleans — the
@@ -1454,14 +1507,14 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, FS_FD_MEMBERS.has(bi.member) ? "fd" : true);
       const data = checkedStrParam(L, expr.arguments[1]!, "data", FS_DATA_TEXT, true);
       if (exclusive) {
-        const exclMode: IrExpr = modeNode === null ? { kind: "numLit", value: 0o666, type: F64, loc } : L.lowerExprExpecting(modeNode, F64);
+        const exclMode: IrExpr = modeNode === null ? { kind: "numLit", value: 0o666, type: F64, loc } : checkedFileMode(L, L.lowerExprExpecting(modeNode, F64), loc);
         return deferArgChecks(L, [path, data, exclMode], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileExclModeSync", args, type: VOID, loc }));
       }
       if (modeNode === null) {
         // encoding-only options change nothing: the plain write.
         return deferArgChecks(L, [path, data], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileSync", args, type: VOID, loc }));
       }
-      const mode = L.lowerExprExpecting(modeNode, F64);
+      const mode = checkedFileMode(L, L.lowerExprExpecting(modeNode, F64), loc);
       return deferArgChecks(L, [path, data, mode], loc, (args) => ({ kind: "libCall", fn: "fs.writeFileModeSync", args, type: VOID, loc }));
     }
     // zlib takes Buffers; a string argument (the lib admits it) gets the
@@ -6105,13 +6158,34 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
       const stream = L.stdlibGlobalMember(access.expression, "process");
       if (stream === "stdout" || stream === "stderr") {
         const loc = locOf(call);
-        if (call.arguments.length !== 1) {
+        // write(chunk, callback): Node writes, then calls back with null on
+        // the tick queue (Writable's afterWrite, deferred because the write
+        // completed synchronously). A callback spelled as a function or
+        // arrow literal only (never undefined, nothing to evaluate).
+        const cbNode = call.arguments.length === 2 ? call.arguments[1]! : null;
+        const cbOk = cbNode !== null && (ts.isArrowFunction(cbNode) || ts.isFunctionExpression(cbNode));
+        if (call.arguments.length !== 1 && !cbOk) {
           L.noLowering(
             `process.${stream}.write with ${call.arguments.length} arguments`,
             call,
-            "the supported form is write(data) with one string — encodings and callbacks have no lowering",
+            "the supported forms are write(data) and write(data, callback) — encodings have no lowering",
           );
         }
+        const withCallback = (write: IrExpr): IrExpr => {
+          if (cbNode === null) return write;
+          const thunk = writeCallbackThunk(L, cbNode, `process.${stream}.write`, loc);
+          const t = L.declareHiddenLocal("%wcb.r", BOOL);
+          return {
+            kind: "seqExpr",
+            stmts: [
+              { kind: "varDecl", localId: t.id, init: write, loc },
+              { kind: "exprStmt", expr: { kind: "libCall", fn: "process.nextTick", args: [thunk], type: VOID, loc }, loc },
+            ],
+            result: { kind: "varRef", localId: t.id, type: BOOL, loc },
+            type: BOOL,
+            loc,
+          };
+        };
         let data = L.lowerExpr(call.arguments[0]!);
         // A checked-dynamic argument in a JS file takes the validated
         // string exit (the trust-but-verify boundary: commander's
@@ -6133,13 +6207,13 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         // The Buffer overload writes raw bytes through the same promptly
         // submitted streams.
         if (data.type.kind === "bytes" && data.type.elem === "u8") {
-          return chunkChecked((read) => ({
+          return withCallback(chunkChecked((read) => ({
             kind: "libCall",
             fn: stream === "stdout" ? "process.stdoutWriteBytes" : "process.stderrWriteBytes",
             args: [read],
             type: BOOL,
             loc,
-          }));
+          })));
         }
         if (data.type.kind !== "string") {
           L.noLowering(
@@ -6148,13 +6222,13 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
             "strings and Buffer/Uint8Array values write; narrow unions first",
           );
         }
-        return chunkChecked((read) => ({
+        return withCallback(chunkChecked((read) => ({
           kind: "libCall",
           fn: stream === "stdout" ? "process.stdoutWrite" : "process.stderrWrite",
           args: [read],
           type: BOOL,
           loc,
-        }));
+        })));
       }
     }
     const member = L.stdlibGlobalMember(access, "process");
@@ -6703,6 +6777,51 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
     return null; // other Number statics land on the member fence
   }
 
+/** A write callback, called with null: `() => cb(null)` as a closure over
+   * the typed callback (its error parameter takes the null arm). Interned
+   * per callback type. */
+  function writeCallbackThunk(L: Lowerer, cbNode: ts.Expression, what: string, loc: SrcLoc): IrExpr {
+    const cb = L.lowerExpr(cbNode);
+    const cbT = cb.type;
+    if (cbT.kind !== "func" || cbT.params.length > 1) {
+      L.noLowering(`${what} with a '${L.fmt(cbT)}' callback`, cbNode, "the callback takes at most the error parameter");
+    }
+    const fT = cbT as IrType & { kind: "func" };
+    const paramT = fT.params[0];
+    const nullLit: IrExpr = { kind: "unitLit", unit: "null", type: NULL_T, loc };
+    const arg = paramT === undefined ? null : L.coerceToExpected(nullLit, paramT);
+    if (arg !== null && !typeEquals(arg.type, paramT!)) {
+      L.noLowering(`${what} with a '${L.fmt(cbT)}' callback`, cbNode, "the callback's error parameter must accept null");
+    }
+    const toT: IrType = { kind: "func", params: [], ret: VOID };
+    const key = `write.cbthunk:${typeKey(fT)}`;
+    const existing = L.arrHofHelpers.get(key);
+    const name = existing ?? `%write.cbthunk.${L.arrHofHelpers.size}`;
+    if (!existing) {
+      L.arrHofHelpers.set(key, name);
+      const impl = `${name}.impl`;
+      const fRef: IrExpr = { kind: "varRef", localId: "f.0", type: fT, loc };
+      L.liftedFns.push({
+        name: impl,
+        params: [],
+        returnType: VOID,
+        captures: [{ localId: "f.0", name: "f", type: fT }],
+        locals: [{ id: "f.0", name: "f", type: fT, mutable: false, boxed: true }],
+        body: [{ kind: "exprStmt", expr: { kind: "callValue", callee: fRef, args: arg === null ? [] : [arg], type: fT.ret, loc }, loc }],
+        loc,
+      });
+      L.liftedFns.push({
+        name,
+        params: [{ localId: "f.0", name: "f", type: fT }],
+        returnType: toT,
+        locals: [{ id: "f.0", name: "f", type: fT, mutable: false, boxed: true }],
+        body: [{ kind: "return", value: { kind: "closure", fnName: impl, captures: ["f.0"], type: toT, loc }, loc }],
+        loc,
+      });
+    }
+    return { kind: "call", callee: name, args: [cb], type: toT, loc };
+  }
+
 /** The Date slice: `Date.now()` and the COMPOSED
    * `new Date(ms?).toISOString()` — the Date object between the two calls
    * never exists (the crypto randomBytes(n).toString(enc) precedent). An
@@ -6740,11 +6859,42 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       }
       return { kind: "libCall", fn: "date.utc", args, type: F64, loc };
     }
-    if (access.name.text !== "toISOString" && access.name.text !== "getTime") return null;
+    if (access.name.text !== "toISOString" && access.name.text !== "getTime" && access.name.text !== "getTimezoneOffset") return null;
     const recv = access.expression;
     if (!ts.isNewExpression(recv) || !ts.isIdentifier(recv.expression)) return null;
     const sym = L.resolveValueSymbol(recv.expression);
     if (!sym || sym.name !== "Date" || !L.isStdlibSymbol(sym)) return null;
+    if (access.name.text === "getTimezoneOffset") {
+      // The composed `new Date(x).getTimezoneOffset()` (cosmokit's
+      // module-load `new Date().getTimezoneOffset()`): the host zone's
+      // offset at that instant, in minutes west of UTC, V8's truncation
+      // toward zero (SEMANTICS.md S113's tzCall OFFSET). An invalid date
+      // answers NaN.
+      if (call.arguments.length !== 0) L.noLowering("getTimezoneOffset with arguments", call);
+      const ctorArgs = recv.arguments ?? [];
+      let ms: IrExpr;
+      if (ctorArgs.length === 0) {
+        ms = { kind: "libCall", fn: "date.now", args: [], type: F64, loc };
+      } else if (ctorArgs.length === 1) {
+        const arg = L.lowerExpr(ctorArgs[0]!);
+        if (arg.type.kind === "f64") ms = arg;
+        else if (arg.type.kind === "string") ms = { kind: "libCall", fn: "date.parseGetTime", args: [arg], type: F64, loc };
+        else {
+          L.noLowering(
+            `new Date of '${L.fmt(arg.type)}' values composed with .getTimezoneOffset()`,
+            ctorArgs[0]!,
+            "only new Date(), new Date(ms) and new Date(dateString) compose with .getTimezoneOffset()",
+          );
+        }
+      } else {
+        L.noLowering(
+          "new Date with year/month/day arguments",
+          recv,
+          "the field constructor is local-time; only new Date(), new Date(ms) and new Date(dateString) compose with .getTimezoneOffset()",
+        );
+      }
+      return { kind: "libCall", fn: "date.tzOffsetMin", args: [ms], type: F64, loc };
+    }
     if (access.name.text === "getTime") {
       // The composed `new Date(x).getTime()` read — the Date value
       // between the two never materializes (the toISOString precedent).

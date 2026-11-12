@@ -891,6 +891,8 @@ export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly I
   "fs/promises": {
     // The Buffer form (no encoding).
     readFile: ["fsp.readFileBytes"],
+    // The options form ({ mode?, flag?: "w" | "wx", encoding?: "utf8" }).
+    writeFile: ["fsp.writeFileMode", "fsp.writeFileExclMode"],
   },
   crypto: {
     // The composed randomBytes(n).toString(enc) chain keeps its one-libCall
@@ -953,6 +955,13 @@ export const AMBIENT_SURFACE_FNS: readonly AmbientSurfaceRow[] = [
     name: "Date.prototype.getTime",
     fns: ["date.parseGetTime"],
     note: "the composed new Date(dateString).getTime() form; new Date().getTime() is stdlib.date.now's surface",
+  },
+  {
+    id: "stdlib.date.getTimezoneOffset",
+    kind: "stdlib",
+    name: "Date.prototype.getTimezoneOffset",
+    fns: ["date.tzOffsetMin"],
+    note: "the composed new Date(ms? | dateString).getTimezoneOffset() form; the host zone's offset",
   },
   {
     id: "stdlib.date.toISOString",

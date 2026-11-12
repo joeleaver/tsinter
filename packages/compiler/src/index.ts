@@ -28,7 +28,7 @@ import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.
 import { firstBigintSite, moduleUsesBigint, moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
-import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
+import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath, runtimeOfTypesTwin } from "./frontend/npm-static.js";
 import { EntryLoadError, canonicalBuiltinModule, checkPreflight, clearImportEdgeMemo, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
@@ -366,10 +366,14 @@ function detectAutoPackages(
         statuses.push({ package: js.packageName, status: "fallback", detail: "it ships no own .d.ts declaration surface" });
         continue;
       }
-      if (judged?.has(npm.packageName)) continue;
-      if (!seen.has(npm.packageName)) {
-        seen.set(npm.packageName, { typesFile: npm.typesFile, fromFile: sf.fileName });
-        sites?.set(npm.packageName, loc);
+      // An import typed by its @types twin (`js-yaml` → @types/js-yaml)
+      // is judged as the RUNTIME package it describes: that package's JS
+      // is what would compile, and the twin is its declared surface (S133).
+      const pkgName = runtimeOfTypesTwin(npm.packageName) ?? npm.packageName;
+      if (judged?.has(pkgName)) continue;
+      if (!seen.has(pkgName)) {
+        seen.set(pkgName, { typesFile: npm.typesFile, fromFile: sf.fileName });
+        sites?.set(pkgName, loc);
       }
     }
   }

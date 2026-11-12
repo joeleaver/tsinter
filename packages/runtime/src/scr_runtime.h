@@ -4616,6 +4616,9 @@ double scr_date_parse_get_time(ScrStr *s);
  * offset (ms, seconds kept) at a UTC instant, V8's ToUTC of a local time
  * value, and the re-read after process.env.TZ changes. */
 double scr_tz_offset_ms(double t);
+/* Date#getTimezoneOffset of the instant t (ms): minutes WEST of UTC,
+ * truncated toward zero as V8 does; NaN for an invalid t. */
+double scr_date_tz_offset_min(double t);
 double scr_tz_local_to_utc(double local);
 void scr_tz_changed(void);
 /* The zone's DST flag at an instant, and the zone as chosen (0 the C

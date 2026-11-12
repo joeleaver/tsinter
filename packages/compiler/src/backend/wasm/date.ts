@@ -1915,6 +1915,38 @@ export class DateBuilder {
     });
   }
 
+  /** `%w.date.tzOffsetMin(t) -> f64` — Date#getTimezoneOffset of the
+   * instant t: V8's DateCache::TimezoneOffset, (t - local) / msPerMinute
+   * as an integer division (truncating toward zero, never -0); NaN for an
+   * invalid date. The offset is the host zone's (tzCall OFFSET). */
+  tzOffsetMinHelper(): number {
+    return this.cached("tzOffsetMin", [F64], [F64], (idx) => {
+      const c = new Code();
+      const T = 0;
+      c.localGet(T);
+      c.localGet(T);
+      c.f64Ne(); // NaN
+      c.localGet(T);
+      c.f64Abs();
+      c.f64Const(8.64e15);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      c.f64Const(NaN);
+      c.return_();
+      c.end();
+      c.localGet(T);
+      c.call(this.zoneOffsetHelper());
+      c.f64Neg();
+      c.f64Const(60000);
+      c.f64Div();
+      c.f64Trunc();
+      c.f64Const(0);
+      c.f64Add(); // -0 + 0 is +0: V8's int has no -0
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   /** `%w.date.localToUtc(local) -> f64` — V8's ParseDateTimeString local
    * arm: NaN outside ±kMaxTimeBeforeUTCInMs, else DateCache::ToUTC — the
    * local time minus ICU's offset with UCAL_TZ_LOCAL_FORMER for both a

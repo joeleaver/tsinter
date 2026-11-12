@@ -6185,6 +6185,10 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             // The bounded date-string parse (X509 validity + ECMA format);
             // NaN elsewhere. Never throws.
             return finish(`scr_date_parse_get_time(${arg(0)})`);
+          case "date.tzOffsetMin":
+            // getTimezoneOffset of the instant: the C library's zone,
+            // minutes west of UTC truncated toward zero. Never throws.
+            return finish(`scr_date_tz_offset_min(${arg(0)})`);
           case "date.utc":
             // MakeDay/MakeTime/TimeClip over seven completed number
             // arguments; NaN outside the time range. Never throws.
@@ -6301,6 +6305,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           // writeFileSync's flag "wx" (exclusive create) is lowered for the
           // WasmGC lanes only; the legacy C runtime has no exclusive open.
           case "fs.writeFileExclModeSync":
+          case "fsp.writeFileMode":
+          case "fsp.writeFileExclMode":
           // child_process option values and the exec errors they build
           // (lower-child-options.ts) are lowered for the WasmGC lanes only.
           case "cp.execFileRun":

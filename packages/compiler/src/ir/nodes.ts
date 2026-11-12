@@ -3301,6 +3301,11 @@ export type IrLibFn =
   | "fsp.mkdirMode"
   | "fsp.mkdirRecursive"
   | "fsp.mkdirRecursiveMode"
+  /** fs.promises.writeFile(p, data, { mode?, flag?: "w" | "wx" }): the
+   * writeFileSync options matrix behind a settled promise (WasmGC lanes;
+   * the C runtime has no exclusive open). Failures reject. */
+  | "fsp.writeFileMode"
+  | "fsp.writeFileExclMode"
   | "fsp.unlink"
   | "fsp.chmod"
   | "fsp.readdir"
@@ -4298,6 +4303,10 @@ export type IrLibFn =
    * date-only forms are UTC, exactly the spec). Anything else is NaN,
    * Node's invalid-date getTime. Never throws. */
   | "date.parseGetTime"
+  /** `new Date(x).getTimezoneOffset()` composed: the f64 instant's host
+   * zone offset in minutes west of UTC (V8's integer truncation, never
+   * -0); NaN for an invalid date. Never throws. */
+  | "date.tzOffsetMin"
   /** `Date.UTC(...)` — seven f64 arguments (the frontend completes the
    * spec's defaults for omitted trailing parts: month 0, date 1, time
    * parts 0), the spec's MakeDay/MakeTime/TimeClip exactly: 0–99 years
