@@ -209,6 +209,50 @@ export declare function width(t: Table): number;
 `,
 };
 
+/** commander's Option shape: a field the JS fills from an untyped helper
+ * (`let longFlag;` — inference says any) and the declarations type
+ * `long?: string`, then called through as a string. */
+const OPTFLAGS: Files = {
+  "package.json": JSON.stringify({ name: "optflags", version: "1.0.0", main: "index.js", types: "index.d.ts" }),
+  "index.js": `'use strict';
+function split(flags) {
+  let shortFlag;
+  let longFlag;
+  for (const part of flags.split(/[ |,]+/)) {
+    if (/^--[^-]/.test(part)) longFlag = part;
+    else if (/^-[^-]$/.test(part)) shortFlag = part;
+  }
+  return { shortFlag, longFlag };
+}
+class Opt {
+  constructor(flags) {
+    this.flags = flags;
+    const f = split(flags);
+    this.short = f.shortFlag;
+    this.long = f.longFlag;
+    this.negate = false;
+    if (this.long) {
+      this.negate = this.long.startsWith('--no-');
+    }
+  }
+  name() {
+    if (this.long) return this.long.replace(/^--/, '');
+    return this.short.replace(/^-/, '');
+  }
+}
+exports.Opt = Opt;
+`,
+  "index.d.ts": `export declare class Opt {
+  constructor(flags: string);
+  flags: string;
+  short?: string;
+  long?: string;
+  negate: boolean;
+  name(): string;
+}
+`,
+};
+
 interface Row {
   id: string;
   pkgs: Record<string, Files>;
@@ -235,6 +279,15 @@ console.log(n, r.name().length, r.items.length);`,
 const r = new Registry("top");
 const c = r.child("kid");
 console.log(c.parent?.name(), r.parent?.name(), c.parent?.name() === "top", c.parent === r, r.parent === null);`,
+  },
+  {
+    id: "DTS-OPT-02 a declared 'string | undefined' field the JS fills from an untyped helper is called through as a string (commander's Option)",
+    pkgs: { optflags: OPTFLAGS },
+    src: `import { Opt } from "optflags";
+for (const flags of ["--no-color", "-v, --verbose", "-q"]) {
+  const o = new Opt(flags);
+  console.log(flags, o.negate, o.long ?? "-", o.short ?? "-", o.name());
+}`,
   },
   {
     id: "DTS-READ-01 a field the declarations type narrower than inference reads as declared",

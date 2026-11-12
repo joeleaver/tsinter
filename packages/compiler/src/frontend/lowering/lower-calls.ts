@@ -4997,6 +4997,16 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     let recv: IrExpr;
     if (recvTs.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || anyArray) {
       recv = L.lowerExpr(access.expression);
+      // A checker-`any` read that lowered to a typed union of a string and
+      // units (a compiled package field its declarations type
+      // `string | undefined`, SEMANTICS.md S133 (e)): its dynamic value —
+      // a string method call validates the receiver as for any dyn value.
+      if (L.sharedDynamic && recv.type.kind === "union") {
+        const arms = L.unions.get(recv.type.unionId)?.arms ?? [];
+        if (arms.some((a) => a.kind === "string") && arms.every((a) => a.kind === "string" || isUnitType(a))) {
+          recv = L.coerceToExpected(recv, JSVAL);
+        }
+      }
       // One world (U1a): the island receiver is the same \$dyn value.
       if (L.sharedDynamic) recv = asDynOperand(recv);
     } else {
