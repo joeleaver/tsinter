@@ -969,5 +969,10 @@ MemoryMax=16G -p MemorySwapMax=0`, with `compile()` from this worktree's
 - **w8 (P0/P1, 2026-11-12):** heap growth over ticks, the forest sample
   (`tests/library-wasm/game-forest`) under the harness's wasmtime 47 C host
   (default config): max RSS 33.6 MB at 1,000 ticks, 34.7 MB at 10,000,
-  37.5 MB at 100,000. The coin sample (closures, Maps, promises across
-  ticks) is measured once P2 runs it.
+  37.5 MB at 100,000. The coin sample (`game-coin`: closures, Maps,
+  promises and a task across ticks, ~700,000 export calls): max RSS 57.2 MB
+  at 1,000 ticks, 57.6 MB at 10,000, 54.0 MB at 100,000 under wasmtime 47;
+  on V8 the JS heap after a full GC stays at 4.4–4.5 MB and linear memory
+  at one page throughout. No growth: the copying collector keeps up, and the
+  scratch arena does not creep. (A first measurement showed growth; it was
+  the harness host leaking query cursors, fixed in host.mjs/host.c.)

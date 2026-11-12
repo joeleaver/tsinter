@@ -88,6 +88,7 @@ export function createHost(out, mem) {
   const ents = []; // { id: bigint, kind: number, fields: Map<string, number> }
   let nextId = 1n;
   const cursors = [];
+  let nextCursor = 0;
   let rand = RAND_SEED;
   const names = [];
   const find = (id) => ents.find((e) => e.id === id);
@@ -109,10 +110,12 @@ export function createHost(out, mem) {
       ents.splice(i, 1);
       return true;
     } },
+    // A ring of 64 cursors (a cursor lives for one system's dispatch).
     query_begin: { params: ["u32"], result: "u32", fn: (mask) => {
       const m = Number(mask) >>> 0;
-      cursors.push({ list: ents.filter((e) => ((e.kind & m) >>> 0) === m).map((e) => e.id), i: 0 });
-      return cursors.length;
+      const slot = nextCursor++ % 64;
+      cursors[slot] = { list: ents.filter((e) => ((e.kind & m) >>> 0) === m).map((e) => e.id), i: 0 };
+      return slot + 1;
     } },
     query_next: { params: ["u32"], result: "u64", fn: (c) => {
       const cur = cursors[Number(c) - 1];

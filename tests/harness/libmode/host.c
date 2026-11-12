@@ -115,7 +115,7 @@ static int nents, capents;
 static uint64_t next_id = 1;
 typedef struct { uint64_t *list; int n, i; } Cursor;
 static Cursor *cursors;
-static int ncursors;
+static int next_cursor;
 static uint64_t rand_state = 0x2545f4914f6cdd1dULL;
 static char *names[256];
 static size_t name_len[256];
@@ -206,18 +206,20 @@ static V call_import(const Import *im, const V *a) {
     if (e != NULL) e->alive = 0;
     r = vi(e != NULL);
   } else if (strcmp(n, "query_begin") == 0) {
+    /* a ring of 64 cursors (host.mjs) */
     uint32_t m = (uint32_t)(int64_t)a[0].d;
-    cursors = realloc(cursors, sizeof(Cursor) * (ncursors + 1));
-    Cursor *c = &cursors[ncursors++];
-    c->list = malloc(sizeof(uint64_t) * (nents + 1));
+    if (cursors == NULL) cursors = calloc(64, sizeof(Cursor));
+    int slot = next_cursor++ % 64;
+    Cursor *c = &cursors[slot];
+    c->list = realloc(c->list, sizeof(uint64_t) * (nents + 1));
     c->n = 0;
     c->i = 0;
     for (int i = 0; i < nents; i++)
       if (ents[i].alive && (ents[i].kind & m) == m) c->list[c->n++] = ents[i].id;
-    r = vu((uint64_t)ncursors);
+    r = vu((uint64_t)slot + 1);
   } else if (strcmp(n, "query_next") == 0) {
     int k = (int)a[0].d;
-    if (k < 1 || k > ncursors || cursors[k - 1].i >= cursors[k - 1].n) r = vu(0);
+    if (k < 1 || k > 64 || cursors == NULL || cursors[k - 1].i >= cursors[k - 1].n) r = vu(0);
     else r = vu(cursors[k - 1].list[cursors[k - 1].i++]);
   } else if (strcmp(n, "get_f32") == 0) {
     Ent *e = find(a[0].u);
