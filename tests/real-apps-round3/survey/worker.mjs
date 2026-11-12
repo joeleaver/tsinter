@@ -7,7 +7,9 @@
 // Two load-time hooks adjust the compiler's dist in memory. The repo is not changed:
 //  1. node:vm is replaced with a stub that throws. `comptime(fn)` is an ambient global that the compiler
 //     evaluates in node:vm during lowering, and surveyed code is never to be executed.
-//  2. analyze() is told to lower as the WasmGC lanes do (undefSlots, hostFetch, targetPlatform host).
+//  2. analyze() is told to lower as the WasmGC lanes do (undefSlots, hostFetch, sharedDynamic, targetPlatform
+//     host), the options compile() sets for backend wasm/wasm-native. Without sharedDynamic (added 2026-11-11)
+//     the sweep lowered any/unknown in the pre-U1 checked-dynamic world and never saw U1/U2.
 //     Stock analyze() lowers for the C/LLVM lanes, whose refusal set differs from the wasm lanes'.
 //  3. Stratum "repogate" only: checker errors no longer stop analyze() at preflight, so entries that a
 //     missing dependency or ambient .d.ts stopped still get lowered. Types are degraded there, so
@@ -35,7 +37,7 @@ registerHooks({
     if (url.endsWith("packages/compiler/dist/index.js")) {
       const s = String(r.source);
       if (!s.includes(ANALYZE_LOWER)) throw new Error("analyze() lowering options moved; update the worker hook");
-      let patched = s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, targetPlatform: "host",');
+      let patched = s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, sharedDynamic: true, targetPlatform: "host",');
       if (PAST_GATE) {
         if (!patched.includes(FENCE_SET)) throw new Error("analyze() preflight gate moved; update the worker hook");
         patched = patched.replace(FENCE_SET, 'new Set(["SC1010", "SC1012", "SC1013", "SC1014", "SC1015", "SC0001", "SC0002"])');

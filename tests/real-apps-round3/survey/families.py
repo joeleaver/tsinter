@@ -31,6 +31,10 @@ RULES = [
     ("tsc:knock-on", "type errors downstream of an unresolved import or lost ambient types (implicit any, missing property, assignability)",
      lambda m, s, c: c == "SC0001"),
     ("cfg:strict-off", "tsconfig disables strictNullChecks (SC0002)", lambda m, s, c: c == "SC0002"),
+    # Before bigint/types rules: the message names the copied type ("a 'bigint[]' value converted ...").
+    ("dyn:copy", "observable copies at the typed/dynamic boundary (SEMANTICS.md S125 (c) / S115 (d)): a value checked into a typed slot, "
+     "converted to dynamic, or a function crossing, where JavaScript would share the object",
+     lambda m, s, c: re.search(r"would (be|hold) a COPY where JavaScript shares the object", m)),
     ("bigint", "bigint", lambda m, s, c: re.search(r"\bbigint\b|BigIntLiteral|BigInt\b", m)),
     ("es5:proto", "ES5 constructors and prototype wiring: X.prototype.m = fn, new on a function, Object.create, setPrototypeOf, props on function objects",
      lambda m, s, c: ("assignment to non-variables" in m and re.search(r"\.prototype\b|^_\._ = function|^_\._ = \(|^_ = function", s))

@@ -22,7 +22,7 @@ registerHooks({
     if (url.endsWith("packages/compiler/dist/index.js")) {
       const s = String(r.source);
       if (!s.includes(ANALYZE_LOWER)) throw new Error("analyze() lowering options moved; update sites.mjs (and survey/worker.mjs)");
-      let patched = s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, targetPlatform: "host",');
+      let patched = s.replace(ANALYZE_LOWER, 'coverage: true, hostFetch: true, undefSlots: true, sharedDynamic: true, targetPlatform: "host",');
       if (PAST_GATE) {
         if (!patched.includes(FENCE_SET)) throw new Error("analyze() preflight gate moved; update sites.mjs (and survey/worker.mjs)");
         patched = patched.replace(FENCE_SET, 'new Set(["SC1010", "SC1012", "SC1013", "SC1014", "SC1015", "SC0001", "SC0002"])');
