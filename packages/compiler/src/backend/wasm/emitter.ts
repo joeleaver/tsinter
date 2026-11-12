@@ -24257,7 +24257,7 @@ class Assembler {
           const at = this.fenceSiteTag(e.loc);
           this.emitFenceFatal(
             code,
-            (c) => this.pushStrLitInto(c, "a value narrowed to one member of a union holds another member (a dynamic value checked into the union carried a discriminant or shape its static type does not admit — SEMANTICS.md S122)"),
+            (c) => this.pushStrLitInto(c, "a value narrowed to one member of a union holds another member (the member the type checker narrowed to is not the one the value holds: a dynamic value checked into the union carried a discriminant or shape its static type does not admit, or a write the checker did not track, such as one inside a called function, replaced it — SEMANTICS.md S122)"),
             `SC1100${at}`,
           );
           this.close();

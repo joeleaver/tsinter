@@ -72,6 +72,28 @@ export type FieldTarget =
  * off the SOURCE: between the piece's delimiters — backticks for the
  * no-substitution form, `\`...${` / `}...${` / `}...\`` for head/middle/
  * tail. 5.9.3's rawText, when a build ever supplies it, wins unchanged. */
+/** A `const` key bound by `for (const k in arr)` over an ARRAY: every
+ * value it takes is a canonical array index string ("0", "1", ...), so
+ * indexing another array with it is exactly indexing with Number(k)
+ * (n8n's `connections[src][type][inputIndex]`). */
+export function forInArrayKey(L: Lowerer, node: ts.Expression): boolean {
+  let e = node;
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (!ts.isIdentifier(e)) return false;
+  const sym = L.resolveValueSymbol(e);
+  const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (!decl || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name)) return false;
+  const list = decl.parent;
+  if (!ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return false;
+  const loop = list.parent;
+  if (!ts.isForInStatement(loop) || loop.initializer !== list) return false;
+  return L.mapTypeOf(L.typeOf(loop.expression))?.kind === "array";
+}
+
+/** GH #194: target-part nodes pre-evaluated into hidden locals while an
+ * assignment statement lowers (bindAssignTargetParts, lower-stmts.ts). */
+export const boundTargetParts = new Map<ts.Node, IrExpr>();
+
 export function templateRawTextOf(
   node: ts.NoSubstitutionTemplateLiteral | ts.TemplateHead | ts.TemplateMiddle | ts.TemplateTail,
 ): string {
@@ -438,6 +460,10 @@ function requireBuiltinTokenUse(L: Lowerer, expr: ts.Expression, name: string): 
 }
 
 export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
+    // GH #194: an assignment target's receiver/key evaluated once, ahead of
+    // the right-hand side (lower-stmts.ts bindAssignTargetParts).
+    const bound = boundTargetParts.get(expr);
+    if (bound !== undefined) return { ...bound };
     if (lowerExprDepth >= LOWER_EXPR_MAX_DEPTH) {
       L.unsupported("SC1090", expr, `expressions nested deeper than ${LOWER_EXPR_MAX_DEPTH} levels`);
     }
@@ -8059,7 +8085,10 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         );
       }
     }
-    const index = L.lowerExpr(expr.argumentExpression);
+    let index = L.lowerExpr(expr.argumentExpression);
+    if (index.type.kind === "string" && forInArrayKey(L, expr.argumentExpression)) {
+      index = { kind: "libCall", fn: "num.fromString", args: [index], type: F64, loc: index.loc };
+    }
     if (index.type.kind !== "f64") {
       L.unsupported("SC1090", expr.argumentExpression, "indexing with non-number keys");
     }

@@ -27,6 +27,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, createRequireSpecOf } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
+import { boundTargetParts } from "./lower-exprs.js";
 import { orderedRecordWrite, abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
@@ -4619,6 +4620,145 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
 
 /** The exact `Object.defineProperty(exports|module.exports, "__esModule",
  * { value: true })` interop stamp (see the no-op lowering above). */
+/** A side-effect-free member chain: identifiers, `this`, literals, and
+ * property / element reads over those (no calls, no optional chaining).
+ * Re-evaluating it reads the same storage again. */
+function pureMemberChain(L: Lowerer, e: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+  if (ts.isIdentifier(e) || e.kind === ts.SyntaxKind.ThisKeyword || ts.isStringLiteralLike(e) || ts.isNumericLiteral(e)) return true;
+  if (ts.isPropertyAccessExpression(e)) return !e.questionDotToken && noAccessor(L, e) && pureMemberChain(L, e.expression);
+  if (ts.isElementAccessExpression(e)) return !e.questionDotToken && pureMemberChain(L, e.expression) && pureMemberChain(L, e.argumentExpression);
+  return false;
+}
+
+/** The property read is a plain slot: the receiver's shape declares no
+ * get/set accessor under that name (an accessor would make the second read
+ * of the desugared form observable). */
+function noAccessor(L: Lowerer, e: ts.PropertyAccessExpression): boolean {
+  const recv = L.mapTypeOf(L.typeOf(e.expression));
+  if (recv?.kind !== "record") return recv?.kind !== "object"; // class instances: getters possible
+  const shape = L.shapes.get(recv.shapeId);
+  return shape !== undefined && !shapeHasAccessorSlots(shape);
+}
+
+/** `o.f ??= e` / `o[k] ??= e` in statement position, over a pure member
+ * chain (n8n's `foundIssues.parameters ??= {}` and
+ * `issues.parameters[name] ??= []`): JS reads the target once and writes
+ * only when it is nullish, so the statement is `if (target == null)
+ * target = e` with the receiver and key re-read (pure: same storage) and e
+ * evaluated only on the write path. */
+function lowerMemberNullishAssign(L: Lowerer, expr: ts.BinaryExpression): IrStmt | null {
+  const left = expr.left;
+  if (!ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return null;
+  if (!pureMemberChain(L, left)) return null;
+  const loc = locOf(expr);
+  const read = L.lowerExpr(left);
+  let cond: IrExpr;
+  if (read.type.kind === "union") {
+    const def = L.unions.get(read.type.unionId);
+    if (!def) return null;
+    const tests: IrExpr[] = [];
+    def.arms.forEach((arm, tag) => {
+      if (isUnitType(arm)) {
+        tests.push({ kind: "unionIsTag", unionId: (read.type as IrType & { kind: "union" }).unionId, tag, negated: false, value: read, type: BOOL, loc });
+      }
+    });
+    if (tests.length === 0) {
+      if (!mayHoldSlotUndef(L, read)) return { kind: "block", body: [], loc };
+      cond = { kind: "isUndef", operand: read, type: BOOL, loc };
+    } else if (tests.length === 1) cond = tests[0]!;
+    else return null; // both units: the read would evaluate twice
+  } else if (read.type.kind === "dyn" || read.type.kind === "jsval") {
+    return null;
+  } else {
+    // The checker says never nullish; a plain slot can still hold
+    // undefined on the WasmGC lanes (S119).
+    if (!mayHoldSlotUndef(L, read)) return { kind: "block", body: [], loc };
+    cond = { kind: "isUndef", operand: read, type: BOOL, loc };
+  }
+  let write: IrStmt;
+  if (ts.isElementAccessExpression(left)) {
+    write = L.lowerElementWrite(expr);
+  } else {
+    const target = L.fieldTarget(left);
+    if (!target) return null;
+    write = L.fieldSetStmt(target, L.lowerExprExpecting(expr.right, target.fieldType), loc, left);
+  }
+  return { kind: "if", cond, then: [write], else_: null, loc };
+}
+
+/** Can evaluating `e` run code that writes a binding (a call, `new`, an
+ * assignment, `++`/`--`, `delete`, `await`, `yield`, a tagged template)?
+ * Nested function bodies do not run here. */
+function mayWriteBindings(e: ts.Node): boolean {
+  if (ts.isArrowFunction(e) || ts.isFunctionExpression(e) || ts.isClassExpression(e)) return false;
+  if (
+    ts.isCallExpression(e) || ts.isNewExpression(e) || ts.isTaggedTemplateExpression(e) ||
+    ts.isDeleteExpression(e) || ts.isAwaitExpression(e) || ts.isYieldExpression(e) ||
+    ts.isPrefixUnaryExpression(e) && (e.operator === ts.SyntaxKind.PlusPlusToken || e.operator === ts.SyntaxKind.MinusMinusToken) ||
+    ts.isPostfixUnaryExpression(e) ||
+    ts.isBinaryExpression(e) && e.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && e.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+  ) return true;
+  let found = false;
+  ts.forEachChild(e, (c) => {
+    if (!found && mayWriteBindings(c)) found = true;
+  });
+  return found;
+}
+
+/** A target part that re-reads the same value however the right-hand side
+ * runs: `this`, a literal, a `const` binding (or a parameter-free import). */
+function stablePart(L: Lowerer, e: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (e.kind === ts.SyntaxKind.ThisKeyword || ts.isStringLiteralLike(e) || ts.isNumericLiteral(e)) return true;
+  if (!ts.isIdentifier(e)) return false;
+  const sym = L.resolveValueSymbol(e);
+  const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (!decl) return false;
+  if (ts.isVariableDeclaration(decl)) {
+    const list = decl.parent;
+    return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0;
+  }
+  return ts.isFunctionDeclaration(decl) || ts.isClassDeclaration(decl) || ts.isImportSpecifier(decl) || ts.isNamespaceImport(decl) || ts.isImportClause(decl);
+}
+
+/** GH #194: for `recv.f = rhs` / `recv[k] = rhs` (and `??=`) whose rhs may
+ * write a binding, the receiver (and key) evaluate into hidden locals
+ * first; lowerExpr answers those locals for the part nodes while the
+ * statement lowers. Only value-typed parts bind (records, class objects,
+ * arrays, maps, strings, numbers, checked-dynamic values) — module objects,
+ * process.env and other builtin roots keep their own lowering. Null when
+ * nothing needs binding. */
+function bindAssignTargetParts(L: Lowerer, expr: ts.BinaryExpression): { stmts: IrStmt[]; nodes: ts.Node[] } | null {
+  const left = expr.left;
+  if (!ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return null;
+  if (left.questionDotToken) return null;
+  if (!mayWriteBindings(expr.right)) return null;
+  const parts: ts.Expression[] = [left.expression];
+  if (ts.isElementAccessExpression(left)) parts.push(left.argumentExpression);
+  const bindable = (e: ts.Expression): boolean => {
+    if (stablePart(L, e) || boundTargetParts.has(e)) return false;
+    if (L.isProcessEnv(e)) return false;
+    const t = L.mapTypeOf(L.typeOf(e));
+    return t !== null && t !== undefined &&
+      (t.kind === "record" || t.kind === "object" || t.kind === "array" || t.kind === "map" ||
+        t.kind === "string" || t.kind === "f64" || t.kind === "dyn");
+  };
+  const toBind = parts.filter(bindable);
+  if (toBind.length === 0) return null;
+  const stmts: IrStmt[] = [];
+  const nodes: ts.Node[] = [];
+  const loc = locOf(expr);
+  for (const p of toBind) {
+    const v = L.lowerExpr(p);
+    const t = L.declareHiddenLocal("%asg.part", v.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: v, loc });
+    boundTargetParts.set(p, { kind: "varRef", localId: t.id, type: v.type, loc: v.loc });
+    nodes.push(p);
+  }
+  return { stmts, nodes };
+}
+
 function isEsModuleStamp(expr: ts.Expression): boolean {
   if (!ts.isCallExpression(expr) || expr.questionDotToken !== undefined) return false;
   const callee = expr.expression;
@@ -5105,6 +5245,20 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         const li = lowerRegexLastIndexWrite(L, expr);
         if (li) return li;
       }
+      // GH #194: JS evaluates a member target's receiver (and an element
+      // target's key) BEFORE the right-hand side, so a right-hand side that
+      // reassigns a binding the chain reads must not move the write.
+      if (opKind === ts.SyntaxKind.EqualsToken || opKind === ts.SyntaxKind.QuestionQuestionEqualsToken || COMPOUND_ASSIGN_OPS[opKind] !== undefined) {
+        const pre = bindAssignTargetParts(L, expr);
+        if (pre !== null) {
+          try {
+            const write = lowerExprStatement(L, expr);
+            return { kind: "block", body: [...pre.stmts, write], loc: locOf(expr) };
+          } finally {
+            for (const n of pre.nodes) boundTargetParts.delete(n);
+          }
+        }
+      }
       if (opKind === ts.SyntaxKind.EqualsToken) {
         // Expando function members (`foo.bar = 12`, `foo[SYM] = v` on a
         // module-level function/callable const): the member's module
@@ -5378,6 +5532,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         // on the non-nullish path is the same box. Property targets keep a
         // distinct fence: accessors would make the always-write observable.
         if (!ts.isIdentifier(expr.left)) {
+          const viaMember = lowerMemberNullishAssign(L, expr);
+          if (viaMember) return viaMember;
           L.unsupported(
             "SC1090",
             expr.left,

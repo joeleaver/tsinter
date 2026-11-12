@@ -23,6 +23,7 @@ import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilter
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
+import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -4522,6 +4523,9 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // hasOwnProperty on a program class CONSTRUCTOR — own statics are
         // compile-time-known, so a literal key folds to a constant.
         lowerClassHasOwnPropertyCall(L, expr, expr.expression) ??
+        // hasOwnProperty(k) on a RECORD — Object.hasOwn's own-key walk
+        // (n8n's connection maps).
+        lowerRecordHasOwnPropertyCall(L, expr, expr.expression) ??
         L.lowerIslandMethodCall(expr, expr.expression) ??
         // Dyn receivers (JSON.parse-derived `unknown`/`any` values) —
         // validated-extract, then the static machinery. After the island
@@ -4798,6 +4802,9 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const k = n.argumentExpression;
       if (ts.isStringLiteral(k)) return `${b}.${k.text}`;
       if (ts.isNumericLiteral(k) || ts.isIdentifier(k)) return `${b}[${k.text}]`;
+      // A member-chain key prints as its own spelling (`o[info.node]`).
+      const ks = ts.isPropertyAccessExpression(k) || ts.isElementAccessExpression(k) ? calleeSpelling(k) : null;
+      if (ks !== null) return `${b}[${ks}]`;
     }
     return null;
   }
@@ -5376,6 +5383,157 @@ const inliningPredicates = new Set<ts.Symbol>();
     }
     if (ts.isObjectLiteralExpression(e) && e.properties.length === 0) return true;
     return pureReceiverNode(e);
+  }
+
+/** `r.hasOwnProperty(k)` on a RECORD receiver, inherited from
+   * Object.prototype (the shape declares no member of that name): the
+   * same own-key answer as `Object.hasOwn(r, k)` — declared names (an
+   * optional field by its value tag), then an index-signature shape's
+   * overflow keys; the key is ToPropertyKey'd the same way. One
+   * difference from Object.hasOwn: the method is READ off the receiver
+   * first, so an index-signature record holding an own "hasOwnProperty"
+   * key shadows it, and calling a non-function value is Node's
+   * `TypeError: <callee> is not a function`, thrown after the argument
+   * evaluated. A shape whose values may be callable keeps the fence (Node
+   * would call the stored function). */
+  function lowerRecordHasOwnPropertyCall(L: Lowerer, call: ts.CallExpression,
+    access: ts.PropertyAccessExpression,): IrExpr | null {
+    if (call.questionDotToken || access.questionDotToken) return null;
+    if (access.name.text !== "hasOwnProperty" || call.arguments.length !== 1) return null;
+    const keyNode = call.arguments[0]!;
+    if (ts.isSpreadElement(keyNode)) return null;
+    if (!L.isStdlibMember(access)) return null;
+    const recvT = L.mapTypeOf(L.typeOf(access.expression));
+    if (recvT?.kind === "array") return lowerArrayHasOwnProperty(L, call, access, keyNode);
+    if (recvT?.kind !== "record") return null;
+    const shape = L.shapes.get(recvT.shapeId);
+    if (!shape || shape.tuple || (!shape.indexValue && shapeHasAccessorSlots(shape))) return null;
+    if (shape.fields.some((f) => f.name === "hasOwnProperty")) return null;
+    const iv = shape.indexValue;
+    const mayCall = (t: IrType): boolean =>
+      t.kind === "func" || t.kind === "dyn" || t.kind === "jsval" ||
+      (t.kind === "union" && (L.unions.get(t.unionId)?.arms.some((a) => mayCall(a)) ?? true));
+    if (iv && mayCall(iv)) return null;
+    const spelled = iv ? calleeSpelling(access) : "";
+    if (spelled === null) return null;
+    const loc = locOf(call);
+    const stmts: IrStmt[] = [];
+    const bind = (e: IrExpr, tag: string): IrExpr => {
+      if (droppableStatic(e)) return e;
+      const t = L.declareHiddenLocal(tag, e.type);
+      stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+      return { kind: "varRef", localId: t.id, type: e.type, loc };
+    };
+    const lowered = undefRecvGuard(L, L.lowerExpr(access.expression), "hasOwnProperty", loc);
+    if (lowered.type.kind !== "record") return null; // probe/lower drift: keep the fence
+    const receiver = bind(lowered, "%hop.r");
+    let key = L.lowerExpr(keyNode);
+    if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
+      key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
+    }
+    if (key.type.kind !== "string") return null;
+    key = bind(undefinedAsText(L, key, locOf(keyNode)), "%hop.k");
+    const recShapeId = (receiver.type as IrType & { kind: "record" }).shapeId;
+    const helper = iv ? recordHasOwnIndexHelper(L, recShapeId, loc) : recordHasOwnHelper(L, recShapeId, loc);
+    if (iv) {
+      const guard = hasOwnPropertyShadowGuard(L, recShapeId, helper, loc);
+      stmts.push({
+        kind: "exprStmt",
+        expr: { kind: "call", callee: guard, args: [receiver, { kind: "strLit", value: `${spelled} is not a function`, type: STRING, loc }], type: VOID, loc },
+        loc,
+      });
+    }
+    const result: IrExpr = { kind: "call", callee: helper, args: [receiver, key], type: BOOL, loc };
+    return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: BOOL, loc };
+  }
+
+/** `arr.hasOwnProperty(k)` on an ARRAY: its own keys are "length" and
+   * the in-range canonical indices (a static array has no holes and no
+   * other own properties). Number keys: an integer in [0, length). String
+   * keys: a literal answers at compile time; a `for (const k in arr)` key is
+   * a canonical index by construction, so Number(k) < length (n8n's
+   * `connections[src][type].hasOwnProperty(inputIndex)`). Any other
+   * string key keeps the fence (the canonical-index test has no lowering). */
+  function lowerArrayHasOwnProperty(L: Lowerer, call: ts.CallExpression,
+    access: ts.PropertyAccessExpression, keyNode: ts.Expression,): IrExpr | null {
+    const loc = locOf(call);
+    const keyT = L.mapTypeOf(L.typeOf(keyNode))?.kind;
+    const literal = ts.isStringLiteralLike(keyNode) ? keyNode.text : null;
+    if (keyT !== "f64" && literal === null && !(keyT === "string" && forInArrayKey(L, keyNode))) return null;
+    const stmts: IrStmt[] = [];
+    const bind = (e: IrExpr, tag: string): IrExpr => {
+      if (droppableStatic(e)) return e;
+      const t = L.declareHiddenLocal(tag, e.type);
+      stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+      return { kind: "varRef", localId: t.id, type: e.type, loc };
+    };
+    const lowered = undefRecvGuard(L, L.lowerExpr(access.expression), "hasOwnProperty", loc);
+    if (lowered.type.kind !== "array") return null;
+    // Holes (SEMANTICS.md S119): a hole is not an own index, but this tier
+    // stores it as the slot's undefined — once the program has made one,
+    // an array holding undefined takes the named fence (the for-in rule).
+    const arr = bind(holeFencedArray(L, lowered, "hasOwnProperty", loc), "%hop.a");
+    const len: IrExpr = { kind: "arrIntrinsic", method: "length", receiver: arr, args: [], type: F64, loc };
+    const num = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
+    const and = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: l, right: r, type: BOOL, loc });
+    let result: IrExpr;
+    if (literal !== null) {
+      L.lowerExpr(keyNode); // a literal: nothing to evaluate
+      if (literal === "length") result = { kind: "boolLit", value: true, type: BOOL, loc };
+      else if (/^(0|[1-9][0-9]*)$/.test(literal) && Number(literal) <= 2 ** 32 - 2) {
+        result = { kind: "bin", op: "<", left: num(Number(literal)), right: len, type: BOOL, loc };
+      } else result = { kind: "boolLit", value: false, type: BOOL, loc };
+    } else {
+      let k = L.lowerExpr(keyNode);
+      if (k.type.kind === "string") k = { kind: "libCall", fn: "num.fromString", args: [k], type: F64, loc: k.loc };
+      if (k.type.kind !== "f64") return null;
+      k = bind(k, "%hop.k");
+      // An integer in [0, length): -0 is "0"; NaN and fractions are not indices.
+      result = and(
+        and({ kind: "bin", op: ">=", left: k, right: num(0), type: BOOL, loc }, { kind: "bin", op: "<", left: k, right: len, type: BOOL, loc }),
+        { kind: "bin", op: "===", left: { kind: "bin", op: "%", left: k, right: num(1), type: F64, loc }, right: num(0), type: BOOL, loc },
+      );
+    }
+    return stmts.length === 0 ? result : { kind: "seqExpr", stmts, result, type: BOOL, loc };
+  }
+
+/** Interned `%obj.hopShadow.<n>(r, msg)`: the index-signature record
+   * owns a "hasOwnProperty" key (the method read finds that value, never a
+   * function here) — Node's TypeError with the call site's text. */
+  function hasOwnPropertyShadowGuard(L: Lowerer, shapeId: string, hasOwn: string, loc: SrcLoc): string {
+    const key = `obj.hopShadow:${shapeId}`;
+    const existing = L.arrHofHelpers.get(key);
+    if (existing) return existing;
+    const name = `%obj.hopShadow.${L.arrHofHelpers.size}`;
+    L.arrHofHelpers.set(key, name);
+    const recT: IrType = { kind: "record", shapeId };
+    const rRef: IrExpr = { kind: "varRef", localId: "r.0", type: recT, loc };
+    const mRef: IrExpr = { kind: "varRef", localId: "m.0", type: STRING, loc };
+    L.liftedFns.push({
+      name,
+      params: [
+        { localId: "r.0", name: "r", type: recT },
+        { localId: "m.0", name: "m", type: STRING },
+      ],
+      returnType: VOID,
+      locals: [
+        { id: "r.0", name: "r", type: recT, mutable: false },
+        { id: "m.0", name: "m", type: STRING, mutable: false },
+      ],
+      body: [{
+        kind: "if",
+        cond: { kind: "call", callee: hasOwn, args: [rRef, { kind: "strLit", value: "hasOwnProperty", type: STRING, loc }], type: BOOL, loc },
+        then: [{
+          kind: "throw",
+          value: { kind: "libCall", fn: "error.new", args: [mRef], type: { kind: "object", className: "%TypeError" }, loc },
+          loc,
+        }],
+        else_: null,
+        loc,
+      }],
+      loc,
+    });
+    return name;
   }
 
 /** `A.hasOwnProperty(lit)` on a PROGRAM CLASS constructor: the own

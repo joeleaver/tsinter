@@ -5,13 +5,28 @@
 H=$(cd "$(dirname "$0")" && pwd)
 p=$1; shift
 read -r cwd entry flags < <(python3 -I - "$H" "$p" <<'PY'
-import json, os, sys
+import json, os, shutil, sys
 h, p = sys.argv[1], sys.argv[2]
 w = json.load(open(os.path.join(h, "workloads.json")))[p]
 src = os.path.expanduser("~/.cache/tsinter-dl/top10/src/" + p)
 ns = w.get("npmStatic", "auto")
 f = (["--dynamic"] if w.get("dynamic") else []) + (["--npm-static", ns if isinstance(ns, str) else ",".join(ns)] if ns else [])
-print(os.path.join(src, w["cwd"]), os.path.join(src, w["entry"]), " ".join(f))
+def place(e):  # lane.py's placement: an @drivers/ file is copied into the project's driverDir
+    if not e.startswith("@drivers/"):
+        return os.path.join(src, e)
+    ddir = os.path.join(src, w.get("driverDir", ".top10"))
+    os.makedirs(ddir, exist_ok=True)
+    s = os.path.join(h, "..", "drivers", e[len("@drivers/"):])
+    d = os.path.join(ddir, os.path.basename(s.rstrip("/")))
+    if os.path.isdir(s):
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(s, d)
+    else:
+        shutil.copyfile(s, d)
+    return d
+for extra in w.get("driverFiles", []):
+    place(extra)
+print(os.path.join(src, w["cwd"]), place(w["entry"]), " ".join(f))
 PY
 )
 o=$HOME/.cache/tsinter-dl/top10/res/$p; mkdir -p "$o"
