@@ -4,6 +4,7 @@
  * comparisons, nullish coalescing and optional chains, conditions and
  * ToBoolean/ToString coercion helpers, and field/element reads and writes
  * (FieldTarget). */
+import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
@@ -2300,6 +2301,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // same constants and per-member fences as named builtin imports.
         L.lowerNamespaceBuiltinProperty(expr) ??
         L.lowerJsonProperty(expr) ??
+        lowerExecErrorMember(L, expr) ??
         L.lowerErrorCodeProperty(expr) ??
         L.lowerNumberStaticProperty(expr) ??
         L.lowerMathProperty(expr) ??
@@ -5997,6 +5999,10 @@ function literalUnionArmOf(
 }
 
 export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
+  return checkedExecEncodingLiteral(L, expr, lowerObjectLiteralCore);
+}
+
+function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
     const loc = locOf(expr);
     // The RUNTIME-KEYED literal (JS): a computed key that doesn't fold to a
     // compile-time string means the literal's shape is not a compile-time
@@ -6733,7 +6739,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
               thenVal = L.applyWidthLift(lift, fRead(), targetType, locOf(prop));
             }
             const at = fields.findIndex((x) => x.name === f.name && !x.drop);
-            const elseVal = at >= 0 ? fields[at]!.value : L.wrappedUndefined(targetType, locOf(prop));
+            const elseVal = at >= 0 ? fields[at]!.value : L.wrappedUndefined(targetType, locOf(prop)) ?? (targetType.kind === "dyn" ? dynUndefinedExpr(locOf(prop)) : null);
             if (!elseVal) {
               L.unsupported(
                 "SC1090",

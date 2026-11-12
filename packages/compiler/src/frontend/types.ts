@@ -579,6 +579,117 @@ export interface TypeMapperCtx {
  * jsval are one runtime value (the same \$dyn reference, shared: storing a
  * dynamic value there copies nothing). `any` members keep unit H's
  * absorb (the whole composite is the island value). */
+/** The Node OPTION RECORDS: @types/node (or shipped-fallback) interfaces
+ * that are pure input option bags — the program builds them (literals,
+ * spreads, typed consts and parameters) and only a lowered call of the
+ * module reads them; no Node API hands one back. Such an interface maps
+ * as an ordinary structural record (the .d.ts provenance fence does not
+ * apply), and so does any shape whose members come from one (`{
+ * ...options, encoding: "utf8" }`, `Omit<ExecFileOptions, "shell">`).
+ * Members whose declared type has no data representation get a slot
+ * type from NODE_OPTION_MEMBER_SLOTS; the call lowerings read every
+ * member at run time and fence the ones they do not implement by name
+ * when present (lower-child-options.ts). Keyed by ambient module. */
+const NODE_OPTION_RECORDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  [
+    "child_process",
+    new Set([
+      "ProcessEnvOptions",
+      "CommonOptions",
+      "MessagingOptions",
+      "CommonSpawnOptions",
+      "SpawnOptions",
+      "SpawnOptionsWithoutStdio",
+      "SpawnOptionsWithStdioTuple",
+      "SpawnSyncOptions",
+      "SpawnSyncOptionsWithStringEncoding",
+      "SpawnSyncOptionsWithBufferEncoding",
+      "ExecOptions",
+      "ExecOptionsWithStringEncoding",
+      "ExecOptionsWithBufferEncoding",
+      "ExecFileOptions",
+      "ExecFileOptionsWithStringEncoding",
+      "ExecFileOptionsWithBufferEncoding",
+      "ExecFileOptionsWithOtherEncoding",
+      "CommonExecOptions",
+      "ExecSyncOptions",
+      "ExecSyncOptionsWithStringEncoding",
+      "ExecSyncOptionsWithBufferEncoding",
+      "ExecFileSyncOptions",
+      "ExecFileSyncOptionsWithStringEncoding",
+      "ExecFileSyncOptionsWithBufferEncoding",
+      "ForkOptions",
+    ]),
+  ],
+  // events.Abortable: the `signal` member's base (ExecFileOptions,
+  // MessagingOptions and ForkOptions extend it).
+  ["events", new Set(["Abortable"])],
+]);
+
+/** True when `d` is an interface declaration (or a member of one) listed
+ * in NODE_OPTION_RECORDS, from a standard-library file. */
+function isNodeOptionRecordDecl(d: ts.Node, ctx: TypeMapperCtx): boolean {
+  const iface = ts.isInterfaceDeclaration(d) ? d : d.parent !== undefined && ts.isInterfaceDeclaration(d.parent) ? d.parent : null;
+  if (iface === null || !ctx.isStdlibFile(iface.getSourceFile())) return false;
+  for (const [mod, names] of NODE_OPTION_RECORDS) {
+    if (names.has(iface.name.text) && isDeclaredInAmbientModule(iface, mod)) return true;
+  }
+  return false;
+}
+
+/** The option-record type itself: an interface reference listed in
+ * NODE_OPTION_RECORDS (every declaration of the symbol is one). */
+function isNodeOptionRecordType(t: ts.Type, ctx: TypeMapperCtx): boolean {
+  const sym = t.getSymbol();
+  if (sym === undefined) return false;
+  const decls = ctx.checker.declarationsOf(sym);
+  return decls.length > 0 && decls.every((d) => isNodeOptionRecordDecl(d, ctx) || isChildResultLiteral(d, ctx));
+}
+
+/** The promisified exec family's settled value as @types/node spells it:
+ * the type literal `{ stdout: ...; stderr: ... }` inside child_process's
+ * `__promisify__` signatures — a data record the lowering builds. */
+function isChildResultLiteral(d: ts.Node, ctx: TypeMapperCtx): boolean {
+  if (d.kind !== ts.SyntaxKind.TypeLiteral || !ctx.isStdlibFile(d.getSourceFile())) return false;
+  const members = (d as ts.TypeLiteralNode).members;
+  return (
+    members.length === 2 &&
+    members.every((m) => ts.isPropertySignature(m) && ts.isIdentifier(m.name) && (m.name.text === "stdout" || m.name.text === "stderr")) &&
+    isDeclaredInAmbientModule(d as ts.Declaration, "child_process")
+  );
+}
+
+/** A member every declaration of which sits in a Node option record. */
+function isNodeOptionMember(p: ts.Symbol, ctx: TypeMapperCtx): boolean {
+  const decls = ctx.checker.declarationsOf(p);
+  return decls.length > 0 && decls.every((d) => isNodeOptionRecordDecl(d, ctx));
+}
+
+/** Slot types for option-record members whose declared types have no data
+ * representation: `signal` (an AbortSignal — an engine handle, which as a
+ * record field would absorb the whole record into the engine) holds a
+ * dynamic value, `stdio` (StdioOptions admits Stream objects) holds the
+ * string or array-of-(string | number | null | undefined) data forms,
+ * and `input` (string | ArrayBufferView) holds a string or a Uint8Array.
+ * A value outside the slot (a Stream in a stdio tuple) is refused where
+ * it is written. */
+function nodeOptionMemberSlot(name: string, ctx: TypeMapperCtx): IrType | null {
+  const union = (arms: IrType[]): IrType => {
+    const sorted = [...arms].sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+    return { kind: "union", unionId: ctx.unions.intern(sorted) };
+  };
+  switch (name) {
+    case "signal":
+      return DYN;
+    case "stdio":
+      return union([STRING, arrayOf(union([STRING, F64, NULL_T, UNDEFINED_T])), UNDEFINED_T]);
+    case "input":
+      return union([STRING, bytesOf("u8"), UNDEFINED_T]);
+    default:
+      return null;
+  }
+}
+
 function slotOfMember<T extends IrType | null>(memberTs: ts.Type, mapped: T, ctx: TypeMapperCtx): T | IrType {
   if (ctx.sharedDynamic !== true || mapped === null || mapped.kind !== "jsval") return mapped;
   if ((memberTs.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0) return DYN;
@@ -1396,6 +1507,24 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // no-op cast, error-typed listener params accept it, and the `.code`
   // read has its own lowering (errno/syscall/path stay per-member fences).
   if (isStdlibInterface("ErrnoException")) return { kind: "object", className: "%Error" };
+  // child_process.ExecException and its ExecFileException alias (the exec
+  // family's rejections): the %Error root, like ErrnoException. Their own
+  // members (cmd, killed, code, signal, stdout, stderr) read off the
+  // error's dynamic value (lower-child-options.ts lowerExecErrorMember).
+  {
+    const execSym = widened.getAliasSymbol() ?? psym;
+    if (
+      (execSym?.name === "ExecException" || execSym?.name === "ExecFileException") &&
+      checker.declarationsOf(execSym).some(
+        (d) =>
+          (ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d)) &&
+          ctx.isStdlibFile(d.getSourceFile()) &&
+          isDeclaredInAmbientModule(d, "child_process"),
+      )
+    ) {
+      return { kind: "object", className: "%Error" };
+    }
+  }
   // The fetch ambient slice (Response, RequestInit, AbortSignal): island-
   // backed ambient TYPES — the values behind them live in the embedded
   // engine (fetch's Response, AbortSignal.timeout's signal), so under
@@ -1870,7 +1999,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   // Promise<T>: a reference to the lib Promise interface. The inner type
   // maps recursively; promise-of-unmappable stays unmappable.
-  if (isStdlibInterface("Promise")) {
+  // child_process.PromiseWithChild<T> (the promisified exec family's
+  // result) is the same promise: its extra `child` member has no lowering
+  // and fences where it is read.
+  if (
+    isStdlibInterface("Promise") ||
+    (psym?.name === "PromiseWithChild" &&
+      checker.declarationsOf(psym).some(
+        (d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()) && isDeclaredInAmbientModule(d, "child_process"),
+      ))
+  ) {
     const arg = checker.getTypeArguments(widened as ts.TypeReference)[0];
     if (!arg) return null;
     // Promise<never> — a throw-only async function's inference. Like sync
@@ -1963,7 +2101,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // accepted-but-inert maxBuffer/windowsHide. Members outside this set
   // (env, killSignal, shell, uid, ...) keep the shape unmatched — their
   // literals fence at the shape check instead of silently dropping.
-  if (isStdlibInterface("ExecFileSyncOptionsWithStringEncoding")) {
+  // (The WasmGC lanes map it as a Node option record instead —
+  // NODE_OPTION_RECORDS — read member by member at run time.)
+  if (isStdlibInterface("ExecFileSyncOptionsWithStringEncoding") && ctx.sharedDynamic !== true) {
     const optStr = withUndefinedArm(STRING, ctx.unions);
     const optNum = withUndefinedArm(F64, ctx.unions);
     const optBool = withUndefinedArm(BOOL, ctx.unions);
@@ -3209,7 +3349,9 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     !widened.isIntersectionType() &&
     indexValue === undefined &&
     checker.getPropertiesOfType(widened).length === 0;
-  if (!recordProvenanceOk(widened, checker) && !pureIndexShape && !anonymousEmpty) return null;
+  // Node option records (NODE_OPTION_RECORDS) are data shapes by contract.
+  const optionRecord = isNodeOptionRecordType(widened, ctx);
+  if (!recordProvenanceOk(widened, checker) && !pureIndexShape && !anonymousEmpty && !optionRecord) return null;
   // Checker-computed shapes (no user declaration) need two extra fences in
   // the member walk below; see the comments there.
   const computed = widened.isIntersectionType() || isMappedShape(widened);
@@ -3306,10 +3448,16 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // lib interface (`Readonly<Date>`) is still the lib's type world, not
       // a data shape. Synthesized members (a literal-key Record's) have no
       // declarations and pass.
-      if (computed && checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile)) {
+      const optionMember = isNodeOptionMember(p, ctx);
+      if (computed && !optionMember && checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile)) {
         return null;
       }
       const fieldTs = checker.getTypeOfSymbol(p);
+      const optionSlot = optionMember ? nodeOptionMemberSlot(p.name, ctx) : null;
+      if (optionSlot !== null) {
+        fields.push({ name: p.name, type: optionSlot, ...((p.flags & ts.SymbolFlags.Optional) !== 0 ? { optional: true as const } : {}) });
+        continue;
+      }
       // GENERIC-callable members leave the shape (no single closure slot
       // can hold them — see isGenericCallableMemberType): the shape keeps
       // its data fields, and calls of the member monomorphize per call

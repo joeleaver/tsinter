@@ -29,6 +29,7 @@ import {
 } from "./surfaces.js";
 import { afterArgs, asDynOperand, evaluateArgsFirst, bindOnce, conditionalSpreadOf, droppableStatic, ensureString, isUndefExpr, lowerDynObjectLiteral, mayHoldSlotUndef, slotUndefOf, undefinedAsAbsent, undefCallSpreadGuard, undefElse, undefinedAsText, probeLower } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
+import { execFileAsyncValueCall, execNormLiteral, execSyncValueCall, lowerOptionsValue, spawnValueCall } from "./lower-child-options.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
 import { registerHttpClientFnBinding } from "./lower-server.js";
@@ -1876,6 +1877,12 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     const cmd = L.lowerExprExpecting(expr.arguments[0]!, STRING);
     const argsNode = expr.arguments.length === 3 ? expr.arguments[1] : undefined;
     const optsNode = expr.arguments[expr.arguments.length - 1];
+    // The WasmGC lanes: an options VALUE (a typed SpawnOptions, a spread
+    // with overrides) is read at run time (lower-child-options.ts).
+    if (L.undefSlots === true && optsNode && expr.arguments.length >= 2 && spawnOptionsAtRuntime(L, optsNode)) {
+      const opts = lowerOptionsValue(L, optsNode, "spawn");
+      return spawnValueCall(L, cmd, L.lowerChildArgsArg(argsNode, loc), opts, optsNode, loc);
+    }
 
     const bool = (v: boolean): IrExpr => ({ kind: "boolLit", value: v, type: BOOL, loc });
     const numLit = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
@@ -2145,6 +2152,13 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     // itself splits into a ternary of the two env-nesses at the tail.
     let condEnvSpread: { cond: IrExpr; pairs: IrExpr; whenTrue: boolean } | null = null;
 
+    // The WasmGC lanes: an options VALUE other than the interned
+    // exec-options record below (a typed ExecSyncOptions, a spread with
+    // overrides) is read at run time (lower-child-options.ts).
+    if (L.undefSlots === true && optsNode && execSyncOptionsAtRuntime(L, optsNode)) {
+      const opts = lowerOptionsValue(L, optsNode, shell ? "execSync" : "execFileSync");
+      return execSyncValueCall(L, expr, cmdArg, argvExpr, shell, opts, optsNode, loc);
+    }
     if (optsNode) {
       if (!ts.isObjectLiteralExpression(optsNode)) {
         // A TYPED options VALUE (the interned exec-options record —
@@ -2768,6 +2782,15 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     let cwd: IrExpr = emptyStr;
     let env: IrExpr = envRec(false, emptyPairs());
     let timeout: IrExpr = num(0);
+    // The WasmGC lanes: an options VALUE (a typed record, a spread with
+    // overrides, a literal using members the literal checks below do not
+    // take) is read at run time (lower-child-options.ts), and every call
+    // settles through that module's helper, so the rejection carries
+    // Node's properties either way (SEMANTICS.md S134).
+    if (L.undefSlots === true && optsNode && execFileOptionsAtRuntime(L, optsNode)) {
+      const opts = lowerOptionsValue(L, optsNode, "the promisified execFile");
+      return execFileAsyncValueCall(L, expr, cmd, argv, opts, optsNode, loc);
+    }
     if (optsNode) {
       if (!ts.isObjectLiteralExpression(optsNode)) {
         L.noLowering(
@@ -2861,6 +2884,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         }
       }
     }
+    if (L.undefSlots === true) {
+      return execFileAsyncValueCall(L, expr, cmd, argv, execNormLiteral(L, cwd, env, helper.envShapeId, timeout, loc), expr, loc);
+    }
     return {
       kind: "call",
       callee: helper.name,
@@ -2868,6 +2894,77 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       type: { kind: "promise", inner: { kind: "record", shapeId: helper.shapeId } },
       loc,
     };
+  }
+
+  /** The WasmGC lanes' choice for an execSync/execFileSync options
+   * argument: the run-time path for a non-literal (the native lanes keep
+   * lowerExecSyncRuntimeOptions's one interned record), or a literal with
+   * a spread other than the conditional `env` one the literal path
+   * takes. */
+  function execSyncOptionsAtRuntime(_L: Lowerer, node: ts.Expression): boolean {
+    if (!ts.isObjectLiteralExpression(node)) return true;
+    return node.properties.some((p) => {
+      if (!ts.isSpreadAssignment(p)) return false;
+      const cs = conditionalSpreadOf(p.expression);
+      return !(cs !== null && cs !== "unsupported" && cs.props.length === 1 &&
+        cs.props[0]!.name.text === "env" && ts.isPropertyAssignment(cs.props[0]!));
+    });
+  }
+
+  /** The WasmGC lanes' choice for a spawn options argument: the run-time
+   * path for a non-literal (whose type is not an args array — the
+   * two-argument `spawn(cmd, args)`), or a literal with a spread other
+   * than the conditional `detached` one the literal path takes. */
+  function spawnOptionsAtRuntime(L: Lowerer, node: ts.Expression): boolean {
+    if (!ts.isObjectLiteralExpression(node)) {
+      const t = L.mapTypeOf(L.typeOf(node));
+      return t !== null && t.kind !== "array";
+    }
+    return node.properties.some((p) => {
+      if (!ts.isSpreadAssignment(p)) return false;
+      const cs = conditionalSpreadOf(p.expression);
+      return !(cs !== null && cs !== "unsupported" && cs.props.length === 1 &&
+        cs.props[0]!.name.text === "detached" && ts.isPropertyAssignment(cs.props[0]!));
+    });
+  }
+
+  /** The WasmGC lanes' choice for a promisified execFile options argument:
+   * the run-time path unless it is an object literal whose members the
+   * literal checks take as they stand (utf8 encoding, cwd, env, timeout,
+   * maxBuffer, windowsHide, the SIGTERM killSignal, and the conditional
+   * env spread). */
+  function execFileOptionsAtRuntime(L: Lowerer, node: ts.Expression): boolean {
+    if (!ts.isObjectLiteralExpression(node)) return true;
+    for (const p of node.properties) {
+      if (ts.isSpreadAssignment(p)) {
+        const cs = conditionalSpreadOf(p.expression);
+        if (cs !== null && cs !== "unsupported" && cs.props.length === 1 &&
+            cs.props[0]!.name.text === "env" && ts.isPropertyAssignment(cs.props[0]!)) continue;
+        return true;
+      }
+      const m = optionMember(p);
+      if (!m) return true;
+      const lit = L.typeOf(m.value);
+      switch (m.name) {
+        case "cwd":
+          if (L.mapTypeOf(lit)?.kind === "string") continue;
+          return true;
+        case "env":
+        case "timeout":
+        case "maxBuffer":
+        case "windowsHide":
+          continue;
+        case "encoding":
+          if (lit.isStringLiteralType() && (lit.value === "utf8" || lit.value === "utf-8")) continue;
+          return true;
+        case "killSignal":
+          if (lit.isStringLiteralType() && lit.value === "SIGTERM") continue;
+          return true;
+        default:
+          return true;
+      }
+    }
+    return false;
   }
 
 /** The interned `%execFileAsync` helper behind promisified-execFile

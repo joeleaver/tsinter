@@ -191,7 +191,8 @@ import { ProcessBuilder } from "./process.js";
 import { PathBuilder, type PathHostMember } from "./path.js";
 import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
-import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
+import { ChildProcBuilder, CP_CODES, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
+import { errnoIndex } from "./os-names.js";
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
 import { HostEvBuilder } from "./hostev.js";
@@ -755,7 +756,8 @@ function timerSurfaceReachable(mod: WModule): boolean {
         node === "process.activeResources" ||
         node === "fs.existsChk" ||
         node === "cp.spawn" ||
-        node === "cp.spawnOpts"
+        node === "cp.spawnOpts" ||
+        node === "cp.spawnOptsRt"
       ) {
         found = true;
       }
@@ -958,10 +960,12 @@ function hostStrReachable(mod: WModule): boolean {
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
         node === "cp.execCapture" ||
+        node === "cp.execFileRun" ||
         // INC-28 U2: an asynchronous child's environment comes from the
         // same map (exact names; the cp.spawnSync* keys are listed above).
         node === "cp.spawn" ||
-        node === "cp.spawnOpts"
+        node === "cp.spawnOpts" ||
+        node === "cp.spawnOptsRt"
       ) {
         found = true;
       }
@@ -1045,9 +1049,11 @@ function hostNumReachable(mod: WModule): boolean {
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
         node === "cp.execCapture" ||
+        node === "cp.execFileRun" ||
         // INC-28 U2: and the two asynchronous keys, as hostStrReachable.
         node === "cp.spawn" ||
         node === "cp.spawnOpts" ||
+        node === "cp.spawnOptsRt" ||
         // SEMANTICS.md S118: the run-time OS choices (hostNum kind 18) —
         // the bare path module, path.sep/delimiter/os.EOL, the url win32
         // arms, and every stream's default highWaterMark
@@ -1359,7 +1365,7 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     "date.parseGetTime",
     "str.encodeUri",
     "str.encodeUriComponent",
-    "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum",
+    "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "cp.spawnOptsRt", "child.killNum",
     "net.listen", "net.listenCb", "net.listenOpts", "net.listenOptsCb", "net.connect", "net.connectCb", "net.serverPort",
     // node:querystring: escape and stringify throw URIError
     // [ERR_INVALID_URI] for a string ending in a surrogate (encodeStr);
@@ -1461,10 +1467,12 @@ function cpCallReachable(mod: WModule): boolean {
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
         node === "cp.execCapture" ||
+        node === "cp.execFileRun" ||
         // INC-28 U2: ops 5-8 (abi.ts) — spawn's SPAWN, and the KILL, UNREF
         // and RELEASE a ChildProcess's own members send.
         node === "cp.spawn" ||
         node === "cp.spawnOpts" ||
+        node === "cp.spawnOptsRt" ||
         node === "child.kill" ||
         node === "child.killNum" ||
         node === "child.unref" ||
@@ -1500,7 +1508,7 @@ function eventModuleReachable(mod: WModule): boolean {
   const scan = (node: unknown): void => {
     if (found) return;
     if (typeof node === "string") {
-      if (node === "cp.spawn" || node === "cp.spawnOpts") found = true;
+      if (node === "cp.spawn" || node === "cp.spawnOpts" || node === "cp.spawnOptsRt") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -24701,6 +24709,31 @@ class Assembler {
           code.structNew(this.exc().errT);
           return;
         }
+        if (e.fn === "error.newCoded") {
+          // error.new with the %code slot stamped from args[1] ("" = none):
+          // the errno errors the child_process lowering builds.
+          const t = e.type;
+          if (t.kind !== "object") throw new Error("emitter bug: error.newCoded result is not a class");
+          const rec = RUNTIME_ERROR_CLASSES.get(t.className);
+          if (rec === undefined) throw new Error(`emitter bug: error.newCoded of ${t.className}`);
+          const C = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[1]!);
+          code.localSet(C);
+          this.pushErrVt(t.className);
+          this.pushStrLit(rec.lib);
+          this.walkExpr(e.args[0]!);
+          code.localGet(C);
+          code.arrayLen();
+          this.openIfResult(this.strRef);
+          code.localGet(C);
+          code.else_();
+          code.refNull(this.strType);
+          this.close();
+          code.refNull(EQ_HEAP); // ERR_BOX (GH #146)
+          code.structNew(this.exc().errT);
+          this.releaseScratch(this.strRef, C);
+          return;
+        }
         if (e.fn === "error.ctor") {
           // super(message) into the builtin base — scr_error_init, minus
           // the vt stamp: `new` already wrote the DERIVED class's vt, and
@@ -27407,6 +27440,55 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (e.fn === "cp.execFileRun") {
+          // (cmd, argv, cwd, hasEnv, envPairs, timeout, killName, killNum,
+          // raw) — lower-child-options.ts builds the rejection.
+          for (const k of [0, 1, 2, 3, 4, 5, 6, 7, 8]) this.walkExpr(e.args[k]!);
+          code.call(this.cp.execFileRunHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "spawnRes.errName") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.cp.errNameHelper());
+          return;
+        }
+        if (e.fn === "spawnRes.errno") {
+          // Node's (negative, libuv) errno for the result's code: a
+          // CP_CODES index names it (the host OS's number, S118); a code
+          // outside the table carries -(256 + n) for host errno -n.
+          const R = this.acquireScratch(I32);
+          const N = this.acquireScratch(I32);
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.cp.spawnResType(), SR_ERR_CODE);
+          code.localSet(R);
+          code.i32Const(0);
+          code.localSet(N);
+          code.localGet(R);
+          code.i32Const(0);
+          code.i32LtS();
+          code.ifVoid();
+          code.localGet(R);
+          code.i32Const(256);
+          code.i32Add();
+          code.localSet(N);
+          code.end();
+          CP_CODES.forEach((name, i) => {
+            code.localGet(R);
+            code.i32Const(i + 1);
+            code.i32Eq();
+            code.ifVoid();
+            code.i32Const(errnoIndex(name));
+            code.call(this.os.errnoNumHelper());
+            code.localSet(N);
+            code.end();
+          });
+          code.localGet(N);
+          code.f64ConvertI32S();
+          this.releaseScratch(I32, N);
+          this.releaseScratch(I32, R);
+          return;
+        }
         if (e.fn === "spawnRes.stdout" || e.fn === "spawnRes.stderr") {
           this.walkExpr(e.args[0]!);
           code.structGet(this.cp.spawnResType(), e.fn === "spawnRes.stdout" ? SR_STDOUT : SR_STDERR);
@@ -27483,6 +27565,22 @@ class Assembler {
         // cpCall ops 5-8, evPoll). spawn validates and can throw (Node's
         // own argument checks, and the spawn failures Node throws at once),
         // so it is followed by the pending check.
+        if (e.fn === "cp.spawnOptsRt") {
+          // cp.spawnOpts over RUN-TIME modes, each 0 (ignore), 1 (inherit)
+          // or 2 (fd): the front end's option-value reader
+          // (lower-child-options.ts) fences "pipe", so none of the
+          // static pipe checks below apply.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          for (const k of [2, 3, 4, 5, 6]) {
+            this.walkExpr(e.args[k]!);
+            code.call(this.toInt32Helper());
+          }
+          for (const k of [7, 8, 9, 10]) this.walkExpr(e.args[k]!);
+          code.call(this.cpa.spawnHelper());
+          this.emitPendingCheck();
+          return;
+        }
         if (e.fn === "cp.spawn" || e.fn === "cp.spawnOpts") {
           const opts = e.fn === "cp.spawnOpts";
           const modes = opts ? [e.args[2]!, e.args[3]!, e.args[4]!] : [];

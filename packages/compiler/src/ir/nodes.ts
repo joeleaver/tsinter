@@ -3332,6 +3332,20 @@ export type IrLibFn =
    * Called only from the frontend's interned %execFileAsync ASYNC helper,
    * whose fiber turns the throw into the rejection. */
   | "cp.execCapture"
+  /** The promisified execFile over option VALUES (WasmGC lanes; args:
+   * cmd, argv, cwd, hasEnv, envPairs, timeoutMs, killName, killNum —
+   * NaN unless the option was a number —, raw): Node's synchronous
+   * checks THROW (timeout, kill signal, file, args, cwd, env); after
+   * them it never throws — the frontend's %execFileAsync helper reads
+   * the result (spawnRes.errName/errno/status/signal) and builds Node's
+   * rejection with its properties (lower-child-options.ts). `raw`
+   * captures stdout/stderr as latin1 strings, one code unit per byte. */
+  | "cp.execFileRun"
+  /** The result's errno as Node's code: "" when the child spawned,
+   * "ETIMEDOUT" after a timeout kill, else the spawn failure's code. */
+  | "spawnRes.errName"
+  /** The result's errno as Node's negative number (0 when none). */
+  | "spawnRes.errno"
   /** The raw byte writes: one borrowed string arg → bool (constantly true
    * — this synchronous runtime never queues backpressure). stdoutWrite
    * shares console.log's stream, each call is submitted promptly, and
@@ -3477,6 +3491,9 @@ export type IrLibFn =
    * field to stamp. error.toString: borrowed `%Error`-typed receiver, +1
    * string in Node's "name: message" shape. None of the three throws. */
   | "error.new"
+  /** error.new with the %code slot stamped from a second string arg ("" =
+   * none). Never throws. */
+  | "error.newCoded"
   /** The compiler-resolved Node-parity throw for always-throwing lowered
    * arms (ERR_INVALID_THIS receivers, ERR_MISSING_ARGS arity ladders,
    * the symbol-to-string TypeError): args are [error-kind f64 (the
@@ -4366,6 +4383,10 @@ export type IrLibFn =
    * pairs like cp.execSync's), cwd ""=inherit. Same event/loop story as
    * cp.spawn. */
   | "cp.spawnOpts"
+  /** cp.spawnOpts over run-time stdio modes (each 0 ignore, 1 inherit or 2
+   * fd — never "pipe", which the option-value reader fences): a spawn
+   * whose options are a record VALUE (lower-child-options.ts). */
+  | "cp.spawnOptsRt"
   /** Atomics.wait(int32Array, idx, expected, timeoutMs) → "not-equal"
    * when the element differs from `expected`, else a real nanosleep for
    * the timeout and "timed-out" (scr_lib.c). scriptc has no threads —
@@ -7463,6 +7484,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "net.connectLookup",
   "cp.execSync",
   "cp.execCapture",
+  "cp.execFileRun",
   // The client request constructors validate the method token
   // synchronously (Node's ClientRequest ctor throw:
   // ERR_INVALID_HTTP_TOKEN).

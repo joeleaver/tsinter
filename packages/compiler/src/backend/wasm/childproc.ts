@@ -375,9 +375,11 @@ export class ChildProcBuilder {
   /** `%w.cp.readStream(h, which, len, mode, echo) -> string` — copies one
    * stream out of the host's result (READ) when it is non-empty, writes
    * it raw to fd `which` when inherited (mode 2) and to fd 2 when `echo`,
-   * and answers its decoded text when captured (mode 0), else "". */
-  private readStreamHelper(): number {
-    return this.cached("readStream", [I32, I32, I32, I32, I32], [this.strRef()], (idx) => {
+   * and answers its decoded text when captured (mode 0), else "". The
+   * RAW variant answers a captured stream's bytes one per code unit (a
+   * latin1 string — the lowering turns it into the Buffer, lossless). */
+  private readStreamHelper(raw = false): number {
+    return this.cached(raw ? "readStreamRaw" : "readStream", [I32, I32, I32, I32, I32], [this.strRef()], (idx) => {
       const c = new Code();
       const H = 0;
       const WHICH = 1;
@@ -387,6 +389,7 @@ export class ChildProcBuilder {
       const BASE = 5;
       const I = 6;
       const BYTES = 7;
+      const STR = 8;
       c.localGet(LEN);
       c.i32Eqz();
       c.ifVoid();
@@ -436,6 +439,38 @@ export class ChildProcBuilder {
       this.deps.pushStrLit(c, "");
       c.return_();
       c.end();
+      if (raw) {
+        // Captured raw: one code unit per byte.
+        const t = this.deps.strType();
+        c.localGet(LEN);
+        c.arrayNewDefault(t);
+        c.localSet(STR);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(LEN);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(STR);
+        c.localGet(I);
+        c.localGet(BASE);
+        c.localGet(I);
+        c.i32Add();
+        c.i32Load8U();
+        c.arraySet(t);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(STR);
+        this.mb.setBody(idx, [I32, I32, this.deps.bytesRef(), this.strRef()], c.bytes());
+        return;
+      }
       // Captured: bytes from memory, then the utf8 decoder.
       c.localGet(LEN);
       c.f64ConvertI32U();
@@ -476,11 +511,12 @@ export class ChildProcBuilder {
    * spawnRes` — one child, start to finish (abi.ts `cpCall`). `pairs` is
    * the WHOLE environment as [k0, v0, k1, v1, ...]; `cutEnv` = 1 cuts
    * each key and value at its first U+0000 (the module's own map). `input`
-   * is read only when stdinMode is 1. Validation is the caller's. */
-  runHelper(): number {
+   * is read only when stdinMode is 1. Validation is the caller's. `raw`
+   * captures the streams as latin1 strings (readStreamHelper). */
+  runHelper(raw = false): number {
     const vec = this.deps.stringVecRef();
     return this.cached(
-      "run",
+      raw ? "runRaw" : "run",
       [this.strRef(), vec, this.strRef(), vec, this.strRef(), I32, I32, I32, I32, F64, I32, I32, I32],
       [this.spawnResRef()],
       (idx) => {
@@ -733,14 +769,14 @@ export class ChildProcBuilder {
         c.localGet(OUTLEN);
         c.localGet(OUT_MODE);
         c.i32Const(0);
-        c.call(this.readStreamHelper());
+        c.call(this.readStreamHelper(raw));
         c.localSet(OUTSTR);
         c.localGet(H);
         c.i32Const(2);
         c.localGet(ERRLEN);
         c.localGet(ERR_MODE);
         c.localGet(ECHO);
-        c.call(this.readStreamHelper());
+        c.call(this.readStreamHelper(raw));
         c.localSet(ERRSTR);
         // FREE.
         c.i32Const(OP_FREE);
@@ -1814,6 +1850,177 @@ export class ChildProcBuilder {
         this.mb.setBody(idx, [this.spawnResRef(), this.strRef(), I32], c.bytes());
       },
     );
+  }
+
+  /** `%w.cp.execFileRun(file, argv, cwd, hasEnv, pairs, timeout, killName,
+   * killNum, raw) -> spawnRes` — the promisified execFile's child for
+   * option VALUES (lower-child-options.ts): Node's synchronous checks in
+   * its execFile order (the timeout, the kill signal — `killNum` is NaN
+   * unless the option was a number, else `killName` is the name, "" for
+   * the SIGTERM default — then spawn's file, args, cwd and env), each a
+   * throw; then the child, run to completion. Never throws after that: the
+   * lowering reads the result (spawnRes.errName, status, signal) and
+   * builds Node's rejection itself. `raw` captures both streams as latin1
+   * strings, for the Buffer encodings. */
+  execFileRunHelper(): number {
+    const vec = this.deps.stringVecRef();
+    return this.cached(
+      "execFileRun",
+      [this.strRef(), vec, this.strRef(), I32, vec, F64, this.strRef(), F64, I32],
+      [this.spawnResRef()],
+      (idx) => {
+        const c = new Code();
+        const FILE = 0;
+        const ARGV = 1;
+        const CWD = 2;
+        const HAS_ENV = 3;
+        const PAIRS = 4;
+        const TIMEOUT = 5;
+        const KILLNAME = 6;
+        const KILLNUM = 7;
+        const RAW = 8;
+        const KILL = 9; // i32
+        const NAME = 10; // string
+        const fail = (): void => {
+          c.i32Eqz();
+          c.ifVoid();
+          c.refNull(this.spawnResType());
+          c.return_();
+          c.end();
+        };
+        const unknownSignal = (pushWhat: (c2: Code) => void): void => {
+          this.deps.throwCoded(
+            c,
+            "%TypeError",
+            "TypeError",
+            (c2) => {
+              this.deps.pushStrLit(c2, "Unknown signal: ");
+              pushWhat(c2);
+              c2.call(this.deps.concat());
+            },
+            (c2) => this.deps.pushStrLit(c2, "ERR_UNKNOWN_SIGNAL"),
+          );
+          c.refNull(this.spawnResType());
+          c.return_();
+        };
+        c.localGet(TIMEOUT);
+        c.call(this.checkTimeoutHelper());
+        fail();
+        // The kill signal: a number must name a signal of the host OS; a
+        // name must be one (killSignalByName answers 15 for "").
+        c.localGet(KILLNUM);
+        c.localGet(KILLNUM);
+        c.f64Eq();
+        c.ifVoid();
+        c.localGet(KILLNUM);
+        c.f64Trunc();
+        c.localGet(KILLNUM);
+        c.f64Ne();
+        c.ifVoid();
+        unknownSignal((c2) => {
+          c2.localGet(KILLNUM);
+          c2.call(this.deps.f64ToStr());
+        });
+        c.end();
+        c.localGet(KILLNUM);
+        c.f64Const(1);
+        c.f64Lt();
+        c.localGet(KILLNUM);
+        c.f64Const(1024);
+        c.f64Gt();
+        c.i32Or();
+        c.ifResult(this.strRef());
+        this.deps.pushStrLit(c, "");
+        c.else_();
+        c.localGet(KILLNUM);
+        c.i32TruncF64S();
+        c.call(this.deps.osSignalName());
+        c.end();
+        c.localTee(NAME);
+        c.arrayLen();
+        c.i32Eqz();
+        c.ifVoid();
+        unknownSignal((c2) => {
+          c2.localGet(KILLNUM);
+          c2.call(this.deps.f64ToStr());
+        });
+        c.end();
+        c.localGet(KILLNUM);
+        c.i32TruncF64S();
+        c.localSet(KILL);
+        c.else_();
+        c.localGet(KILLNAME);
+        c.call(this.deps.killSignalByName());
+        c.i32TruncF64S();
+        c.localTee(KILL);
+        c.i32Const(0);
+        c.i32LtS();
+        c.ifVoid();
+        unknownSignal((c2) => c2.localGet(KILLNAME));
+        c.end();
+        c.end();
+        c.localGet(FILE);
+        c.call(this.checkFileHelper());
+        fail();
+        c.localGet(ARGV);
+        c.i32Const(0);
+        c.call(this.checkArgsHelper());
+        fail();
+        c.localGet(CWD);
+        c.localGet(HAS_ENV);
+        c.localGet(PAIRS);
+        c.call(this.checkCwdEnvHelper());
+        fail();
+        const run = (raw: boolean): void => {
+          c.localGet(FILE);
+          c.localGet(ARGV);
+          c.localGet(CWD);
+          c.localGet(HAS_ENV);
+          c.ifResult(vec);
+          c.localGet(PAIRS);
+          c.else_();
+          c.call(this.deps.envPairs());
+          c.end();
+          c.refNull(this.deps.strType());
+          c.i32Const(0);
+          c.i32Const(0);
+          c.i32Const(0);
+          c.localGet(KILL);
+          c.localGet(TIMEOUT);
+          c.i32Const(1);
+          c.i32Const(0);
+          c.localGet(HAS_ENV);
+          c.i32Eqz();
+          c.call(this.runHelper(raw));
+        };
+        c.localGet(RAW);
+        c.ifResult(this.spawnResRef());
+        run(true);
+        c.else_();
+        run(false);
+        c.end();
+        this.mb.setBody(idx, [I32, this.strRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `%w.cp.errName(res) -> string` — the result's errno as Node's code
+   * ("" when the child spawned; "ETIMEDOUT" after a timeout's kill). */
+  errNameHelper(): number {
+    return this.cached("errName", [this.spawnResRef()], [this.strRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.spawnResType(), SR_ERR_CODE);
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.pushStrLit(c, "");
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(this.spawnResType(), SR_ERR_CODE);
+      c.call(this.codeNameHelper());
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
 
 }

@@ -713,11 +713,23 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
     argTypes: [STRING, arrayOf(STRING), STRING, BOOL, arrayOf(STRING), F64],
     result: SPAWNRES_T,
   },
+  "cp.execFileRun": {
+    argTypes: [STRING, arrayOf(STRING), STRING, BOOL, arrayOf(STRING), F64, STRING, F64, BOOL],
+    result: SPAWNRES_T,
+  },
+  "spawnRes.errName": { argTypes: [SPAWNRES_T], result: STRING },
+  "spawnRes.errno": { argTypes: [SPAWNRES_T], result: F64 },
   "cp.spawn": { argTypes: [STRING, arrayOf(STRING)], result: CHILD_T },
   // spawn's options form: per-slot stdio modes (0 ignore / 1 inherit /
   // 2 fd) with the out/err fds for mode 2, detached, env replacement
   // pairs, cwd ("" = inherit).
   "cp.spawnOpts": {
+    argTypes: [STRING, arrayOf(STRING), F64, F64, F64, F64, F64, BOOL, BOOL, arrayOf(STRING), STRING],
+    result: CHILD_T,
+  },
+  // cp.spawnOpts with RUN-TIME modes (0/1/2 only — the option-value
+  // reader fences "pipe").
+  "cp.spawnOptsRt": {
     argTypes: [STRING, arrayOf(STRING), F64, F64, F64, F64, F64, BOOL, BOOL, arrayOf(STRING), STRING],
     result: CHILD_T,
   },
@@ -841,6 +853,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // error.new's result and the receiver slots are builtin-error classes —
   // program-dependent object types, checked in the libCall case.
   "error.new": { argTypes: [STRING], result: VOID },
+  "error.newCoded": { argTypes: [STRING, STRING], result: VOID },
   "error.nodeThrow": { argTypes: [F64, STRING, STRING], result: VOID },
   "dyn.toStringCoerce": { argTypes: [DYN], result: STRING },
   // Always throws; the result is the READ's declared type (a typed dummy
@@ -4318,7 +4331,7 @@ function validateFunction(
           // compiler-rendered fence.
           break;
         }
-        if (e.fn === "error.new") {
+        if (e.fn === "error.new" || e.fn === "error.newCoded") {
           // Which builtin the runtime constructs is named by the result type.
           if (!isBuiltinErrorObject(e.type)) {
             err(`libCall error.new must return a builtin error class, got ${e.type.kind}`, e.loc);

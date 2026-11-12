@@ -7577,7 +7577,7 @@ tier's own llvm/c/wasm lanes.
 `spawnSync`, `execSync`, `execFileSync` and promisified `execFile` (`const execFileAsync = promisify(execFile)`) differ from Node in these ways, each on every lane unless the clause says otherwise:
 
 - **(a) Uncaptured and failed-spawn outputs read `""`.** A `stdout`/`stderr` that is not captured (stdio `"ignore"` or `"inherit"`) reads `""` where Node reads `null`, and `execSync`/`execFileSync` with an `encoding` RETURN `""` where Node returns `null` when stdout is not captured (without an `encoding` such a result can only be discarded: the front end refuses any other use by name); the outputs of a child that could not be spawned read `""` where Node reads `undefined`. `.output` and `.pid` are not lowered (front-end fences). A result read through `status`, `signal` or `error` is Node-exact on the wasm lane (the llvm and c lanes' cells: board #209).
-- **(b) Errors carry `name`, `message` and `code` only.** This holds for the asynchronous family too: the `'error'` event of a `spawn` that failed ("spawn <file> <CODE>") carries name, message and code on every lane; on the wasm lane so do the failures `spawn` throws at once ("spawn <CODE>") and `kill`'s ("kill <CODE>") — the llvm and c lanes do not throw the former (board #213), and the latter are shown only by a scripted host. Node's extra error properties (`status`, `signal`, `stdout`, `stderr`, `pid`, `output`, `errno`, `syscall`, `path`, `spawnargs`) are absent, so an UNCAUGHT `execSync`/`execFileSync` failure prints the tier's uncaught report (`Uncaught Error: Command failed: ...`) where Node prints its stack and those properties; and promisified `execFile`'s "Command failed" rejection has no numeric `code` (Node: the exit status, or `null` for a signal). This registers the exec clause board #137 recorded as unregistered (`tests/corpus/1472-errno-code.ts`'s header); that site is retired by subject with the others below.
+- **(b) Errors carry `name`, `message` and `code` only.** This holds for the asynchronous family too: the `'error'` event of a `spawn` that failed ("spawn <file> <CODE>") carries name, message and code on every lane; on the wasm lane so do the failures `spawn` throws at once ("spawn <CODE>") and `kill`'s ("kill <CODE>") — the llvm and c lanes do not throw the former (board #213), and the latter are shown only by a scripted host. Node's extra error properties (`status`, `signal`, `stdout`, `stderr`, `pid`, `output`, `errno`, `syscall`, `path`, `spawnargs`) are absent, so an UNCAUGHT `execSync`/`execFileSync` failure prints the tier's uncaught report (`Uncaught Error: Command failed: ...`) where Node prints its stack and those properties; and promisified `execFile`'s "Command failed" rejection has no numeric `code` (Node: the exit status, or `null` for a signal). On the wasm and wasm-native lanes, promisified `execFile`'s rejection now carries Node's members, read through @types/node's exec error types; the ErrnoException-typed `code` read is unchanged (S134 (c)). This registers the exec clause board #137 recorded as unregistered (`tests/corpus/1472-errno-code.ts`'s header); that site is retired by subject with the others below.
 - **(c) `spawnSync`'s `error` is a fresh Error on every read.** Node hands back one object, so `r.error === r.error` is `true` there and `false` here, and a property written through one read is not seen through the next.
 - **(d) The exec family has no maxBuffer.** `execSync`, `execFileSync` and promisified `execFile` capture without limit (the lowering accepts and drops `maxBuffer`; Node's default is 1 MiB, past which it throws ENOBUFS, or rejects with "stdout maxBuffer length exceeded"). `spawnSync`'s own 1 MiB default (the front end refuses a `maxBuffer` option there) is Node-exact on the wasm lane and not enforced on the llvm and c lanes (board #209).
 - **(e) Promisified `execFile` runs the child to completion before its promise settles, with stdin at end-of-file** — Node runs it asynchronously with stdin open (S074's class, for child_process): a timer armed before the call fires after the promise settles here and before it in Node, and a child that reads stdin sees end-of-file here where Node's waits for the timeout. Its argument-validation errors (the timeout, a NUL byte, an empty file name — validated in Node's own order, timeout first) REJECT the returned promise here where Node throws them synchronously from the call: different only for a call not awaited inside a `try`.
@@ -10760,3 +10760,73 @@ wasm-native collector exposes; the idiom it serves (a per-object memo or
 mark) is correct with a strong table. **Tested by:**
 `packages/compiler/test/wasm-objkey-collections.test.ts` (OK-07, rows equal
 to Node on wasm and wasm-native). Measured against Node v24.18.1.
+
+## S134 — child_process option records held as values: members this build does not run stop the program by name when present, so does a present `encoding` key holding `undefined`, and a promisified `execFile` rejection's own members read through the exec error types only *(wasm and wasm-native)*
+
+The option interfaces @types/node declares for child_process
+(`ExecOptions`, `ExecFileOptions`, `SpawnOptions`, `SpawnSyncOptions`,
+`ExecSyncOptions`, `ExecFileSyncOptions`, `ForkOptions`, their
+`CommonOptions` / `ProcessEnvOptions` / `MessagingOptions` bases and
+encoding refinements, and `events.Abortable`) map as records, and so does
+any shape built from their members (`{ ...options, encoding: "utf8" }`,
+`Omit<ExecFileOptions, "shell">`). The promisified `execFile`, `spawn`,
+`execSync` and `execFileSync` take such a record as a run-time value
+(a typed const or parameter, a nullable record, a spread with overrides)
+and read every member when the call runs. Node's behaviour holds for the
+members read — `cwd` (a string or a `file:` URL; another scheme rejects
+with Node's ERR_INVALID_URL_SCHEME), `env`, `timeout`, `killSignal` (a
+name or a number, Node's ERR_UNKNOWN_SIGNAL for one it does not know),
+`shell` (`true` is `/bin/sh`), `encoding` (utf8 strings, or Buffers for
+`"buffer"` and `null`), spawn's `stdio` and `detached`, the sync pair's
+`input` and `stdio` — and a promisified `execFile` rejection carries
+Node's members: `code` (the exit status, or `null`), `killed`, `signal`,
+`cmd`, `stdout`, `stderr`, and for a spawn failure `errno`, `code`,
+`syscall`, `path` and `spawnargs`. Where it parts from Node:
+
+- **(a) A member this build does not run, when present (not `undefined`),
+  stops the program by name** (S122's run-time fence) where Node honors
+  it: `signal` (an AbortSignal) on every family, `uid` / `gid`, spawn's
+  `timeout`, `killSignal` and `argv0`, a piped spawn stdio slot from a
+  value (`"pipe"`, `"overlapped"`, `"ipc"`, `null`/`undefined` entries,
+  and an absent `stdio`, which is Node's `"pipe"`), a `shell` with an
+  arguments list (Node prints its DEP0190 DeprecationWarning, with its
+  pid), an `execFile` encoding other than utf8, `"buffer"` and `null`
+  (Node decodes it, or answers Buffers for an unknown name), and the sync
+  pair's non-utf8 encodings, a Buffer `input`, a number fd in `stdio`, a
+  non-default `killSignal`, `detached` and a non-default `shell`.
+  `maxBuffer` stays unenforced (S085 (d)); `windowsHide`,
+  `windowsVerbatimArguments` and `serialization` are POSIX no-ops, as in
+  Node.
+- **(b) A present `encoding` key holding `undefined` stops the program by
+  name** for the promisified `execFile`: Node spreads the options over its
+  own `{ encoding: "utf8" }`, so a present undefined key answers Buffers
+  where an absent one answers strings, and a typed record holds the two
+  alike (S091) — the checker's result type would be wrong either way.
+  The stop comes where the key is known present: an object literal
+  contextually typed as an async exec options record (`ExecOptions`,
+  `ExecFileOptions` and their encoding variants) whose `encoding` value
+  may be undefined is checked when it is built (a literal `encoding:
+  undefined` stops there), and an options value whose type has a required
+  `encoding` key admitting undefined (`const o = { ...opts, encoding: x }`)
+  is checked by the call. A member write (`o.encoding = v`) or an
+  `Object.assign` onto such a record whose value may be undefined refuses
+  the build by name. An optional key that holds undefined otherwise reads
+  as absent (S091), as Node's absent key does: the utf8 default.
+- **(c) The rejection's members live on the error's dynamic value.**
+  They read through @types/node's `ExecException` / `ExecFileException`
+  types (`(e as ExecFileException).stdout`). A value outside the member's
+  declared type — Node's `signal: null` after a plain exit, where
+  @types/node declares a signal name — stops the program by name when
+  read. `(e as NodeJS.ErrnoException).code` still reads the error's
+  string code slot: `undefined` for a command failure, where Node answers
+  the exit status (S085 (b)). `errno`, `syscall`, `path` and `spawnargs`
+  are carried but read only dynamically.
+
+**Why:** paperclip's command runner (`(cmd, args, options) =>
+execFileAsync(cmd, args, { ...options, encoding: "utf8" })`) and the
+CLIs like it pass option records through; every member they do not
+pass runs as Node does, and the ones this build has no child for are
+loud rather than dropped.
+**Tested by:** `packages/compiler/test/wasm-child-options-execfile.test.ts`
+and `packages/compiler/test/wasm-child-options-spawn.test.ts`
+(wasm-native against Node; each row also builds on wasm).

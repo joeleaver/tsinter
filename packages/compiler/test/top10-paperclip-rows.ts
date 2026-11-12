@@ -86,6 +86,44 @@ export async function checkRefuses(scratch: string, row: Row, expected: string):
   expect(res.diagnostics.map((d) => `${d.code} ${d.message}`).join("\n")).toContain(expected);
 }
 
+/** A row whose program BUILDS for `backend` (the wasm lane's in-process
+ * host has no real child_process, so child rows only build there). */
+export async function checkBuilds(scratch: string, row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
+  const entry = write(scratch, row, `${backend}-build`);
+  const dir = join(entry, "..");
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+  if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
+}
+
+/** A row whose program runs as Node does up to a construct this build
+ * stops at by name (SEMANTICS.md S122): our stdout is Node's up to the
+ * fence (`nodeStdoutPrefix`, checked against Node's own run), stderr
+ * names the fence, and the exit code is 1. */
+export async function checkFenced(scratch: string, row: Row, backend: "wasm-native", nodeStdoutPrefix: string, fence: string): Promise<void> {
+  const entry = write(scratch, row, `${backend}-fence`);
+  const dir = join(entry, "..");
+  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend });
+  if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
+  const node = nodeRun(entry, []);
+  expect(node.stdout.startsWith(nodeStdoutPrefix), `${row.id}: Node's stdout ${JSON.stringify(node.stdout)}`).toBe(true);
+  const got = await nativeRun(res.binaryPath!, []);
+  expect(got.stdout, row.id).toBe(nodeStdoutPrefix);
+  expect(got.stderr, row.id).toContain(`tsinter: unsupported: ${fence}`);
+  expect(got.exitCode, row.id).toBe(1);
+}
+
+/** A fenced row's report names `suffix` (e.g. "main.ts:8]": the line of
+ * the construct that stopped it). */
+export async function checkFencedLine(scratch: string, row: Row, suffix: string): Promise<void> {
+  const entry = write(scratch, row, "wasm-native-line");
+  const dir = join(entry, "..");
+  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native" });
+  if (!res.ok) throw new Error(`${row.id} refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
+  const got = await nativeRun(res.binaryPath!, []);
+  const line = got.stderr.split("\n").find((l) => l.startsWith("tsinter: unsupported: ")) ?? "";
+  expect(line.endsWith(suffix), `${row.id}: ${line}`).toBe(true);
+}
+
 export async function checkRow(scratch: string, row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(scratch, row, backend);
   const dir = join(entry, "..");

@@ -6301,6 +6301,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           // writeFileSync's flag "wx" (exclusive create) is lowered for the
           // WasmGC lanes only; the legacy C runtime has no exclusive open.
           case "fs.writeFileExclModeSync":
+          // child_process option values and the exec errors they build
+          // (lower-child-options.ts) are lowered for the WasmGC lanes only.
+          case "cp.execFileRun":
+          case "cp.spawnOptsRt":
+          case "spawnRes.errName":
+          case "spawnRes.errno":
+          case "error.newCoded":
             throw new Error(`emitter bug: ${fn} reached the C backend (a "host" build is the WasmGC tier's)`);
           default: {
             const _exhaustive: never = fn;
