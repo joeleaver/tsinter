@@ -22,6 +22,7 @@ import { uniqueSymbolKeyOf } from "./lower-exprs.js";
 import { lowerHttpAgentNew, lowerHttpServerNew } from "./lower-server.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, fenceEarlyAliasUse, fenceEarlyNsMemberRef, nsMemberIdentOf, nsUndefRead } from "./lower-namespaces.js";
 import { mixinResultBindingClassOf, type MixinInstanceInfo } from "./lower-mixins.js";
+import { legacyDecoratorsFor } from "../package-options.js";
 
 export interface ClassInfo {
   def: IrClassDef;
@@ -587,7 +588,44 @@ export const EMITTER_API_MEMBERS: ReadonlySet<string> = new Set([
     );
   }
 
-/** The AMBIENT name a decorator expression's evaluation throws on, or
+/** The first decorator anywhere on a class (the class itself, a member,
+   * or a member's parameter), or null. */
+  export function firstDecoratorOf(decl: ts.ClassLikeDeclaration): ts.Decorator | null {
+    const own = decoratorNodesOf(decl)[0];
+    if (own !== undefined) return own;
+    for (const m of decl.members) {
+      const d = decoratorNodesOf(m)[0];
+      if (d !== undefined) return d;
+      const params = (m as { parameters?: readonly ts.Node[] }).parameters ?? [];
+      for (const p of params) {
+        const pd = decoratorNodesOf(p)[0];
+        if (pd !== undefined) return pd;
+      }
+    }
+    return null;
+  }
+
+  /** SEMANTICS.md S136: in a file whose own tsconfig enables
+   * experimentalDecorators, Node (under the dev-runner loader) runs tsc's
+   * LEGACY decorator emit: applied after the class and its static
+   * initializers, member decorators over property descriptors, parameter
+   * decorators, design:* metadata. The lowering implements none of it, so
+   * every decorator such a class carries refuses by name here, before the
+   * TC39 lowering (whose order differs) could claim it. */
+  export function refuseLegacyDecorators(L: Lowerer, decl: ts.ClassLikeDeclaration): void {
+    const sf = decl.getSourceFile();
+    if (isJsSourceFile(sf) || !legacyDecoratorsFor(sf.fileName)) return;
+    const d = firstDecoratorOf(decl);
+    if (d === null) return;
+    L.unsupported(
+      "SC1090",
+      d,
+      "legacy decorators (this file's tsconfig enables experimentalDecorators, so Node runs TypeScript's legacy decorator emit)",
+      "only standard (TC39) class decorators lower; SEMANTICS.md S136 registers legacy decorators as refused",
+    );
+  }
+
+  /** The AMBIENT name a decorator expression's evaluation throws on, or
    * null. Node erases ambient declarations (`declare let dec: any`,
    * `declare const instance: T`, `declare function dec<T>(t: T): T`), so
    * reading the name is a ReferenceError. Factory spellings ride along —
@@ -618,6 +656,9 @@ export const EMITTER_API_MEMBERS: ReadonlySet<string> = new Set([
    * property-access reads, computed-key calls) stops the proof — the
    * named fences answer instead. */
   export function guaranteedDecorationThrow(L: Lowerer, decl: ts.ClassLikeDeclaration,): { name: string; node: ts.Decorator } | null {
+    // Legacy decorators throw AFTER the class's static initializers ran:
+    // no shell (refuseLegacyDecorators names them).
+    if (!isJsSourceFile(decl.getSourceFile()) && legacyDecoratorsFor(decl.getSourceFile().fileName)) return null;
     const stripParens = (e: ts.Expression): ts.Expression => {
       let x = e;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
@@ -690,11 +731,16 @@ export function collectClassShape(L: Lowerer, decl: ts.ClassDeclaration): void {
     // when the class statement evaluates, referenced or not, so silently
     // dropping the declaration would drop observable side effects (the
     // classStaticBlock13/28 miscompiles).
-    const hasDeclTimeCode = (n: ts.Node): boolean =>
-      ts.isClassStaticBlockDeclaration(n) ||
+    const hasDecorator = (n: ts.Node): boolean =>
       ((n as { modifiers?: readonly ts.Node[] }).modifiers ?? []).some(
         (m) => m.kind === ts.SyntaxKind.Decorator,
       );
+    // Parameter decorators run at declaration time too (legacy decorators,
+    // S136): a class carrying only those must flush its refusal eagerly.
+    const hasDeclTimeCode = (n: ts.Node): boolean =>
+      ts.isClassStaticBlockDeclaration(n) ||
+      hasDecorator(n) ||
+      ((n as { parameters?: readonly ts.Node[] }).parameters ?? []).some(hasDecorator);
     if (symbol && (hasDeclTimeCode(decl) || decl.members.some(hasDeclTimeCode))) {
       const diags = L.deferredDiags.get(symbol);
       if (diags) {
@@ -763,6 +809,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
       // (addInitializer, access) has no static story yet. Parameter
       // decorators are not valid ES decorators — the checker rejects
       // them first.
+      refuseLegacyDecorators(L, decl);
       const classDecoratorNodes: ts.Decorator[] = [];
       {
         classDecoratorNodes.push(...decoratorNodesOf(decl));
@@ -3115,6 +3162,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
    * throws identically, which is why the once-evaluated restriction and
    * the member fences don't apply. */
   export function lowerClassExpression(L: Lowerer, expr: ts.ClassExpression): IrExpr {
+    refuseLegacyDecorators(L, expr);
     if (
       decoratorNodesOf(expr).length > 0 ||
       expr.members.some((m) => decoratorNodesOf(m).length > 0)

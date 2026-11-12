@@ -110,6 +110,8 @@ export interface DevGraph {
   /** Exact-specifier tsconfig "paths" for the checker (absolute targets). */
   paths: Record<string, string[]>;
   conflicts: DevGraphConflict[];
+  /** Every source file the walk reached (absolute; node_modules excluded). */
+  files: string[];
 }
 
 /** Walks the source graph from `roots` (see the header) and answers the
@@ -158,5 +160,5 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
     if (answers.size === 1 && typeof only === "string" && only !== "node") paths[spec] = [only];
     else conflicts.push({ spec, sites });
   }
-  return { paths, conflicts };
+  return { paths, conflicts, files: [...seen] };
 }

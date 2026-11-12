@@ -8,7 +8,9 @@
  *            project-config incompatibilities (SC0002), malformed imported
  *            JSON modules (SC0003), upstream tsgo checker panics
  *            surfaced as source-anchored diagnostics (SC0004), and an
- *            entry file the checker's program does not contain (SC0005)
+ *            entry file the checker's program does not contain (SC0005), and
+ *            a site valid under its own package's tsconfig whose types the
+ *            lowering cannot rely on (SC0006, SEMANTICS.md S136)
  *   SC1xxx  supported-TypeScript-not-yet: valid TS outside the current subset
  *   SC2xxx  scriptc type rules (types we cannot compile yet)
  *   SC3xxx  backend coverage: the program is compilable (the C backend
@@ -398,6 +400,24 @@ export function invalidJsonModuleDiag(fileName: string, detail: string, loc: Src
     code: "SC0003",
     message: `imported JSON module '${fileName}' is not valid JSON (${detail})`,
     loc,
+  };
+}
+
+/** SEMANTICS.md S136: a site that type-checks under its own package's
+ * tsconfig but not under the knobs the whole program is LOWERED with
+ * (strictNullChecks, strictFunctionTypes, ...): the lowering's static
+ * types do not hold there, so the site refuses by name instead of
+ * compiling on them. `lowered` is the lowering program's own error. */
+export function packageTypingDiag(lowered: ScrDiagnostic): ScrDiagnostic {
+  return {
+    code: "SC0006",
+    message:
+      "this code type-checks under its own package's tsconfig, but scriptc lowers the whole " +
+      `program under the entry's type-shaping options, where it does not: ${lowered.message}`,
+    loc: lowered.loc,
+    hint:
+      "the package's tsconfig relaxes an option that changes types (strictNullChecks, strictFunctionTypes, " +
+      "strictBindCallApply, useUnknownInCatchVariables, strictBuiltinIteratorReturn); SEMANTICS.md S136",
   };
 }
 

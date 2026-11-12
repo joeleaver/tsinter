@@ -298,6 +298,11 @@ export const ADOPTED_OPTIONS = [
   // SC1012 "not supported yet" beats a raw TS1259 at the same site.
   "esModuleInterop",
   "allowSyntheticDefaultImports",
+  // Decorator checking mode (SEMANTICS.md S136): which decorator CALL
+  // signatures typecheck. A legacy decorator that would run refuses in the
+  // lowering either way (refuseLegacyDecorators).
+  "experimentalDecorators",
+  "emitDecoratorMetadata",
 ] as const;
 
 /* The JAVASCRIPT strictness stance (the JS-input design made real):

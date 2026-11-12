@@ -10688,8 +10688,9 @@ The checker would otherwise type one importer against the wrong module.
 
 **The project's tsconfig.** The entry's nearest `tsconfig.json`
 contributes these:
-- the strictness family and the import-interop knobs, as before
-  (`ADOPTED_OPTIONS`, shared.ts), with the `strictNullChecks` floor;
+- the strictness family, the import-interop knobs and the decorator
+  checking mode (`ADOPTED_OPTIONS`, shared.ts), with the `strictNullChecks`
+  floor; S136 takes them from each file's own nearest tsconfig;
 - `paths`/`baseUrl` (with `extends`), through rule 1 for each importing
   file's own nearest tsconfig, never handed raw to the checker;
 - `lib`, when the tsconfig lists one: its non-ECMAScript entries (`dom`, `dom.iterable`, `webworker`,
@@ -10711,8 +10712,7 @@ provenance fences.
 
 **Not adopted** (they change emit semantics or scriptc's fixed world):
 `target`, `module`, `moduleResolution`, the ECMAScript `lib` levels (the
-`es2025` floor stays), `jsx*`, `experimentalDecorators`,
-`emitDecoratorMetadata`, `useDefineForClassFields`, `verbatimModuleSyntax`,
+`es2025` floor stays), `jsx*`, `useDefineForClassFields`, `verbatimModuleSyntax`,
 `isolatedModules`, `allowJs`/`checkJs`, `resolveJsonModule`,
 `allowImportingTsExtensions`, `customConditions`, `rootDirs`, `typeRoots`,
 `references`, the emit options, and the non-declaration files of `include`
@@ -10727,8 +10727,8 @@ tsinter does not read that option.
 - Rule 2's pattern takes the first `dist|lib|out|build` segment of the
   absolute path, so a workspace package that lives under a directory with
   one of those names does not map.
-- `lib`, `types` and `include` come from the entry's tsconfig only, not
-  from each workspace package's.
+- `include` comes from the entry's tsconfig only, not from each workspace
+  package's (S136 takes `lib` and `types` from each package's own).
 - tsc's implicit default lib (the target's full lib, which includes DOM)
   is not adopted when the tsconfig names no `lib`. lib.dom would then
   declare the web globals ahead of `@types/node`, and their fences would
@@ -10830,3 +10830,83 @@ loud rather than dropped.
 **Tested by:** `packages/compiler/test/wasm-child-options-execfile.test.ts`
 and `packages/compiler/test/wasm-child-options-spawn.test.ts`
 (wasm-native against Node; each row also builds on wasm).
+
+## S136 — Each package's files are checked under that package's own tsconfig; legacy decorators that would run refuse by name *(every lane; tested on wasm and wasm-native)*
+
+**The rule** (Joe, 2026-11-11). In a multi-package project, each file is
+type-checked the way its own package's tsc checks it: under the file's
+nearest `tsconfig.json`, `extends` followed. That is the same file the
+dev-runner loader (`tests/real-apps-top10/harness/node-src-loader.mjs`)
+reads for each file it transpiles. The knobs taken from it are the adopted
+ones (`ADOPTED_OPTIONS`, shared.ts): the strictness family, the
+import-interop knobs, and the decorator checking mode (`experimentalDecorators`,
+`emitDecoratorMetadata`). Each package's own type surface counts too:
+its non-ECMAScript `lib` entries (beside `@types/node`, as S130 adopts the
+entry's) and its explicit `types` list. The included `.d.ts` files,
+`paths` and the forced options stay the entry's (S130). The
+`strictNullChecks` floor (SC0002) applies to the entry's tsconfig. A
+package whose own tsconfig turns it off is checked with it off, and its
+sites meet the type-shaping rule below instead.
+
+**The mechanism.** A project whose files all share the entry's option set
+compiles exactly as before, through one program. A file with no tsconfig
+above it shares the entry's set; an entry with no tsconfig still sees its
+packages' own. When the source graph
+reaches a file under another option set, the project is mixed:
+- One program still lowers the whole project. Its check-only knobs, which
+  decide what is an error but never what type a node has, are relaxed:
+  `noImplicitAny`, `noImplicitThis`, `strictPropertyInitialization`,
+  `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`,
+  `noImplicitOverride`, `noPropertyAccessFromIndexSignature`,
+  `noImplicitReturns`, `noFallthroughCasesInSwitch`, `noUnused*`, the
+  unused-label and unreachable-code knobs, and the decorator mode.
+  `noUncheckedIndexedAccess` off is the setting every tsconfig-less program
+  lowers under.
+- Each distinct option set gets its own check-only program in the same
+  tsgo server, rooted at the files of that set. A file's errors come from
+  its own set's program only, so every package is gated by its own knobs.
+- The type-shaping knobs (`strictNullChecks`, `strictFunctionTypes`,
+  `strictBindCallApply`, `strictBuiltinIteratorReturn`,
+  `useUnknownInCatchVariables`) stay the entry's in the lowering program,
+  because the lowering's representation choices follow the types. Where a
+  file's own set gives one of them a different value and the lowering
+  program reports an error in that file, the lowering's types do not hold
+  at that site. If Node evaluates the file (statically or through
+  `import()`), the site refuses by name (SC0006, which carries the lowering
+  program's error). If the file is reached only through type imports, Node
+  never runs it and nothing refuses. An error that only scriptc's override
+  declarations cause (`JSON.parse(): unknown`, …) is not a package typing
+  difference: those sites keep the checked-cast fences, as in a
+  single-set project.
+- The check-only programs share the entry's included `.d.ts` files and
+  the forced `skipLibCheck` beside `@types/node`; scriptc's fetch-init
+  names join each one whose own lib has no `dom`.
+
+**Legacy decorators.** In a file whose own tsconfig enables
+`experimentalDecorators`, Node under the loader runs TypeScript's legacy
+decorator emit. It applies class decorators after the class and its
+static initializers, calls member decorators with property descriptors,
+supports parameter decorators, and with `emitDecoratorMetadata` records
+`design:*` metadata through `Reflect.metadata`. None of this lowers. In
+such a file every decorator on a class that runs (class, method, accessor,
+property or parameter) refuses by name (SC1090), before the standard (TC39)
+decorator lowering could claim it with its different order. Decorated code
+reached only through type imports (n8n's `@n8n/config` behind
+`import type { LogScope }`) is checked in legacy mode and never runs.
+Running legacy decorators waits until a workload executes one (Joe,
+2026-11-11).
+
+**Known limits:**
+- The nearest tsconfig governs a file even when that tsconfig's `include`
+  does not list it (a `files: []` solution config, a tests-only config).
+  The loader uses the same nearest file.
+- A file the source graph does not reach but the checker does (a
+  triple-slash reference) is grouped by its own nearest tsconfig, but its
+  set does not by itself make the project mixed.
+- `useDefineForClassFields` stays unread (S130).
+
+**Tested by:** `packages/compiler/test/wasm-r3-package-options.test.ts`.
+Its running rows compile synthetic multi-package trees whose packages
+differ in strictness and match Node on both WasmGC lanes. Its refusing
+rows pin each package's own errors, SC0006, and each legacy decorator kind
+on both lanes.

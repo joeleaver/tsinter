@@ -33,6 +33,8 @@ export interface Row {
   /** link path → target (relative to the link's directory), e.g. a
    * workspace member's node_modules symlink. */
   links?: Record<string, string>;
+  /** No tsconfig.json at the project root (only the files' own). */
+  noTsconfig?: boolean;
 }
 
 export function scratchDir(tag: string): string {
@@ -45,7 +47,7 @@ function write(scratch: string, row: Row, backend: string): string {
   const dir = join(scratch, `${row.id.split(" ")[0]}-${backend}`);
   mkdirSync(dir, { recursive: true });
   if (row.nodeTypes !== false) symlinkSync(nodeTypes, join(dir, "node_modules"));
-  writeFileSync(join(dir, "tsconfig.json"), TSCONFIG);
+  if (row.noTsconfig !== true) writeFileSync(join(dir, "tsconfig.json"), TSCONFIG);
   let entry = "";
   for (const [name, src] of Object.entries(row.files)) {
     mkdirSync(join(dir, name, ".."), { recursive: true });
@@ -78,10 +80,10 @@ async function nativeRun(path: string, args: string[]): Promise<Out> {
 
 /** A row whose program must REFUSE at build time with a diagnostic whose
  * message contains `expected` (the loud-refusal half of a construct). */
-export async function checkRefuses(scratch: string, row: Row, expected: string, absent?: string): Promise<void> {
-  const entry = write(scratch, row, "refuse");
+export async function checkRefuses(scratch: string, row: Row, expected: string, absent?: string, backend: "wasm" | "wasm-native" = "wasm"): Promise<void> {
+  const entry = write(scratch, row, `refuse-${backend}`);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, "p.wasm"), outDir: dir, backend: "wasm" });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
   expect(res.ok, row.id).toBe(false);
   const text = res.diagnostics.map((d) => `${d.code} ${d.message}`).join("\n");
   expect(text).toContain(expected);

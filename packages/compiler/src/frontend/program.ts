@@ -49,12 +49,25 @@ import * as ts from "./ts7/adapter.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
 import {
   strictNullChecksFloorDiag,
+  packageTypingDiag,
   tscPassthroughDiag,
   unsupportedDiag,
 } from "../diagnostics/diagnostic.js";
 import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { clearDevResolveCaches, devResolve } from "./dev-resolve.js";
+import { appendDynamicImportModules } from "./lowering/lower-modules.js";
+import {
+  adoptedOptionsFor,
+  CHECK_ONLY_RELAXED,
+  nearestTsconfig,
+  SURFACE_LIB,
+  SURFACE_TYPES,
+  optionSetKey,
+  setPackageOptions,
+  typeShapingDiffers,
+  type AdoptedOptions,
+} from "./package-options.js";
 import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
@@ -142,6 +155,25 @@ function jsoncSyntaxError(text: string): string | null {
   } catch (e) {
     return e instanceof Error ? e.message : String(e);
   }
+}
+
+/** The ADOPTED subset of one tsconfig's options (extends resolved by
+ * tsgo's parser), raw: S136's per-package reader. */
+function readAdoptedOptions7(host: ts.Ts7Host, configFile: string): AdoptedOptions {
+  const parsed = host.parseConfigFile(configFile);
+  const adopted: AdoptedOptions = {};
+  for (const key of ADOPTED_OPTIONS) {
+    const value = parsed.options[key];
+    if (value !== undefined) adopted[key] = value;
+  }
+  // The package's own type surface (S136): its non-ES lib entries and its
+  // explicit "types" list, read the way the entry's are (S130).
+  adopted[SURFACE_LIB] = adoptedLibsOf(parsed.options["lib"]).sort();
+  const types = parsed.options["types"];
+  adopted[SURFACE_TYPES] = Array.isArray(types)
+    ? types.filter((t): t is string => typeof t === "string" && t !== "node").sort()
+    : [];
+  return adopted;
 }
 
 /** The project's tsconfig adoption in the 7 world: tsgo's own config parser
@@ -309,6 +341,15 @@ export interface LoadResult {
   startupCrash?: StartupCrash | null;
   configDiags: ScrDiagnostic[];
   projectWorld: () => ts.Program;
+  /** SEMANTICS.md S136, set only when the project's files carry more than
+   * one adopted option set: the lowering program's own set (check-only
+   * knobs relaxed), each file's set, and one check-only program per set
+   * (built lazily) whose diagnostics gate the files it owns. */
+  packageChecks?: {
+    loweringSet: AdoptedOptions;
+    setOf: (file: string) => AdoptedOptions;
+    worlds: () => { program: ts.Program; owns: (file: string | undefined) => boolean }[];
+  };
 }
 
 /** See LoadResult.startupCrash: Node's exact error message, the IR error
@@ -368,6 +409,51 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const dev = scanDevGraph([entryPath, ...includedDts]);
   const configDiags = [...config.diags, ...devConflictDiags(dev.conflicts)];
   if (paths !== null || Object.keys(dev.paths).length > 0) options = { ...options, paths: { ...dev.paths, ...(paths ?? {}) } };
+  // Per-package options (SEMANTICS.md S136): each file is checked under its
+  // nearest tsconfig's adopted knobs. The entry's set is the one the
+  // program already carries (floor applied); another set anywhere in the
+  // source graph makes the project MIXED.
+  setPackageOptions((cfg) => readAdoptedOptions7(host, cfg));
+  const entrySet: AdoptedOptions = {};
+  for (const key of ADOPTED_OPTIONS) {
+    const v = (config.options as Record<string, unknown>)[key];
+    if (v !== undefined) entrySet[key] = v;
+  }
+  entrySet[SURFACE_LIB] = [...projectLibs].sort();
+  entrySet[SURFACE_TYPES] = [...(config.options.types ?? [])].sort();
+  const entryKey = optionSetKey(entrySet);
+  // A file under the entry's own tsconfig, or under none, is the entry's
+  // set (its floor applied); any other tsconfig answers its own knobs over
+  // scriptc's strict base, as its package's tsc would see them.
+  const setOf = (file: string): AdoptedOptions => {
+    const cfg = nearestTsconfig(file);
+    if (cfg === null || cfg === config.configFile) return entrySet;
+    // Without @types/node no project lib is adopted (S130), so lib lists
+    // cannot tell sets apart.
+    if (!nodeTypes) {
+      const own = { ...BASE_OPTIONS, ...adoptedOptionsFor(file), [SURFACE_LIB]: entrySet[SURFACE_LIB] } as AdoptedOptions;
+      return optionSetKey(own) === entryKey ? entrySet : own;
+    }
+    const set = { ...BASE_OPTIONS, ...adoptedOptionsFor(file) } as AdoptedOptions;
+    return optionSetKey(set) === entryKey ? entrySet : set;
+  };
+  const mixed = dev.files.some((f) => !isNodeModulesPath(f) && optionSetKey(setOf(f)) !== entryKey);
+  let loweringSet: AdoptedOptions = entrySet;
+  if (mixed) {
+    const relaxed: Record<string, unknown> = { ...options };
+    delete relaxed[SURFACE_LIB];
+    delete relaxed[SURFACE_TYPES];
+    for (const [k, v] of Object.entries(CHECK_ONLY_RELAXED)) {
+      if (v === undefined) delete relaxed[k];
+      else relaxed[k] = v;
+    }
+    options = relaxed as ts.Ts7CompilerOptions;
+    loweringSet = {};
+    for (const key of ADOPTED_OPTIONS) {
+      const v = relaxed[key];
+      if (v !== undefined) loweringSet[key] = v;
+    }
+  }
   const coreRoots = [entryPath, ...includedDts, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
   // lib.dom's fetch init names, unless an adopted dom lib declares them.
   // A CORE root: preflight's project world (the second-chance program
@@ -381,15 +467,71 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
     throw new EntryLoadError(entryPath);
   }
   let projectWorld: ts.Program | null = null;
+  let worlds: { program: ts.Program; owns: (file: string | undefined) => boolean }[] | null = null;
+  const typeRoots = [ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
+  // Every check world shares the entry's type surface: its included
+  // declaration files and scriptc's lib.dom fetch-init names.
+  const buildWorlds = (): { program: ts.Program; owns: (file: string | undefined) => boolean }[] => {
+    // The program's own files, grouped by their set's identity. The common
+    // knobs (lib, types, paths, the forced ones) are the lowering
+    // program's; only the adopted knobs differ per set.
+    const common: Record<string, unknown> = { ...options };
+    for (const key of ADOPTED_OPTIONS) delete common[key];
+    const groups = new Map<string, { set: AdoptedOptions; files: string[] }>();
+    groups.set(entryKey, { set: entrySet, files: [] });
+    const keyOfFile = (file: string): string => optionSetKey(setOf(file));
+    for (const name of program.getSourceFileNames()) {
+      const file = resolve(name);
+      if (isNodeModulesPath(file) || typeRoots.includes(file) || file.endsWith(".json")) continue;
+      if (file === overridesDtsPath() || file === fetchInitDtsPath()) continue;
+      const key = keyOfFile(file);
+      let g = groups.get(key);
+      if (g === undefined) groups.set(key, (g = { set: setOf(file), files: [] }));
+      g.files.push(file);
+    }
+    const out: { program: ts.Program; owns: (file: string | undefined) => boolean }[] = [];
+    for (const [key, g] of groups) {
+      if (g.files.length === 0) continue;
+      // skipLibCheck is FORCED beside @types/node (see above), whatever
+      // the set says. The set's own lib (beside @types/node, as the
+      // entry's) and types list replace the entry's.
+      const { [SURFACE_LIB]: setLibs, [SURFACE_TYPES]: setTypes, ...knobs } = g.set;
+      const libs = nodeTypes ? (setLibs as string[] | undefined) ?? [] : [];
+      const opts = {
+        ...common,
+        ...knobs,
+        lib: [...(FORCED_OPTIONS.lib ?? []), ...libs],
+        types: (setTypes as string[] | undefined) ?? [],
+        ...(nodeTypes ? { skipLibCheck: true } : {}),
+      } as ts.Ts7CompilerOptions;
+      const setHasDom = libs.some((l) => /^(lib\.)?dom(\.d\.ts)?$/i.test(l));
+      const surface = [...includedDts.filter((f) => !g.files.includes(f)), ...(setHasDom ? [] : [fetchInitDtsPath()])];
+      const world = ts.createProgram([...g.files, ...surface, ...typeRoots], opts, host);
+      const isEntry = key === entryKey;
+      out.push({
+        program: world,
+        owns: (file) => {
+          if (file === undefined) return isEntry;
+          const abs = resolve(file);
+          if (isNodeModulesPath(abs) || typeRoots.includes(abs)) return isEntry;
+          return keyOfFile(abs) === key;
+        },
+      });
+    }
+    return out;
+  };
   return {
     program,
     entry,
     moduleOrder: [],
     configDiags,
     projectWorld: () => (projectWorld ??= ts.createProgram(coreRoots, options, host)),
+    ...(mixed ? { packageChecks: { loweringSet, setOf, worlds: () => (worlds ??= buildWorlds()) } } : {}),
     disposeAll: () => {
       projectWorld?.dispose();
+      for (const w of worlds ?? []) w.program.dispose();
       program.dispose();
+      setPackageOptions(null);
     },
   };
 }
@@ -1846,7 +1988,28 @@ function preflight7(load: LoadResult): {
   // world errors are the ones reported: they are reproducible with the
   // project's own tsc, which is what "fix type errors first" asks for.
   const tscErrors = errorsOf(program);
-  if (tscErrors.length > 0) {
+  // Per-package checking (SEMANTICS.md S136): a mixed project's files are
+  // gated by their own set's program, always (the lowering program's
+  // relaxed knobs would let a package's own errors through). A lowering-
+  // program error in a file whose TYPE-SHAPING knobs differ from the
+  // lowering's marks a site whose static types do not hold: it refuses by
+  // name if Node evaluates that file (checked after the module order).
+  const shapingSites: ts.Diagnostic[] = [];
+  const pkg = load.packageChecks;
+  if (pkg !== undefined) {
+    const own = new Set<string>();
+    for (const w of pkg.worlds()) {
+      for (const d of errorsOf(w.program)) {
+        if (!w.owns(d.fileName)) continue;
+        own.add(`${d.fileName}:${d.pos}`);
+        diags.push(toPassthrough(d));
+      }
+    }
+    for (const d of tscErrors) {
+      if (d.fileName === undefined || own.has(`${d.fileName}:${d.pos}`)) continue;
+      if (typeShapingDiffers(pkg.setOf(d.fileName), pkg.loweringSet)) shapingSites.push(d);
+    }
+  } else if (tscErrors.length > 0) {
     for (const d of errorsOf(load.projectWorld())) diags.push(toPassthrough(d));
   }
 
@@ -2617,6 +2780,28 @@ function preflight7(load: LoadResult): {
     order.push(sf);
   };
   visit(entry);
+
+  // S136's type-shaping sites, in files Node evaluates (a file reached only
+  // through type imports never runs, so its lowering-program errors are the
+  // checker's business alone).
+  if (shapingSites.length > 0) {
+    // Modules reached only through import() evaluate too (--dynamic builds
+    // append them to the order in the lowering; the same walk here).
+    const reached = [...order];
+    appendDynamicImportModules(program, reached, () => {});
+    const evaluated = new Set(reached.map((sf) => resolve(sf.fileName)));
+    // An error the PROJECT world (no override declarations) does not
+    // report is scriptc's own tighter lib's, not the package's typing:
+    // those sites keep the checked-cast fences, as in a single-set project.
+    const projectErrs = new Set(
+      errorsOf(load.projectWorld()).map((d) => `${d.fileName}:${d.pos}:${d.code}`),
+    );
+    for (const d of shapingSites) {
+      if (!evaluated.has(resolve(d.fileName!))) continue;
+      if (!projectErrs.has(`${d.fileName}:${d.pos}:${d.code}`)) continue;
+      diags.push(packageTypingDiag(toPassthrough(d)));
+    }
+  }
 
   // The startup crash Node's RESOLUTION phase reports: modules resolve
   // their request specifiers in source order, children linking depth-first
