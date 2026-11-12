@@ -52,7 +52,7 @@ while kill -0 "$TPID" 2>/dev/null; do
   kids=$(ps -o pid=,etime=,rss=,comm= --ppid "$NPID" 2>/dev/null | tr -s ' ' | tr '\n' ';')
   echo "== t=${t}s rss=${rss}k children: $kids"
   # A JS stack sample through the inspector the compile was started with (stack-sample.mjs; no signal).
-  timeout 90 node "$H/stack-sample.mjs" "$PORT" 2>&1 | head -24
+  timeout 90 node "$H/stack-sample.mjs" "$PORT" 2>&1 | head -80
 done
 wait "$TPID"; echo "exit $?"
 cat "$OUT/driver.log" | tail -20

@@ -11090,6 +11090,18 @@ typecheck. (Joe's ruling, 2026-11-11.) Now:
   wrote it, the program's author cannot fix it, and the paths a program
   never drives cost nothing (the JS statement-fence stance of the
   npm-static doctrine).
+- (f) **Subpaths too** (rea step 10). A subpath import of such a package
+  (`import { type Many } from "stream-chain/defs.js"`, through its
+  `"./*"` exports pattern; an exact `"./x"` key; any file of a package
+  with no `"exports"`) types against the declaration file the ordinary
+  resolution answers for that subpath, as the bare specifier does, and its
+  uses reach the subpath's JavaScript by (b). The subpaths are the ones
+  the program's own files spell (found before the program loads, by the
+  same source-graph walk S130's dev-runner paths use, type-only imports
+  included). Only those subpaths' JavaScript joins the program: a file
+  of the package Node never loads — one the declarations reach only
+  through their own imports included — meets no compile-time import
+  fence.
 
 **Rationale:** the declarations are what the program's author wrote
 against and what their `tsc` checked, so the compiled program must accept
@@ -11099,6 +11111,7 @@ each claim is verified where a value crosses it, and only a false one
 stops the run, by name.
 **Tested by:** `packages/compiler/test/npm-dts-doctrine.test.ts` (synthetic
 packages, wasm and wasm-native, against Node);
+`packages/compiler/test/wasm-top10-rea-dts-subpath.test.ts` ((f));
 `tests/harness/npm-static.test.ts`; the commander workload in
 `tests/real-apps-top10/harness/workloads.json` (nico-top only).
 

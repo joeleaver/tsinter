@@ -112,6 +112,10 @@ export interface DevGraph {
   conflicts: DevGraphConflict[];
   /** Every source file the walk reached (absolute; node_modules excluded). */
   files: string[];
+  /** Every non-relative specifier the reached files name (type-only uses
+   * included), with the first file naming it — the npm subpaths a program
+   * imports (SEMANTICS.md S133 (f)). */
+  bareSpecs: Map<string, string>;
 }
 
 /** Walks the source graph from `roots` (see the header) and answers the
@@ -160,5 +164,7 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
     if (answers.size === 1 && typeof only === "string" && only !== "node") paths[spec] = [only];
     else conflicts.push({ spec, sites });
   }
-  return { paths, conflicts, files: [...seen] };
+  const bareSpecs = new Map<string, string>();
+  for (const [spec, sites] of bySpec) bareSpecs.set(spec, sites[0]!.file);
+  return { paths, conflicts, files: [...seen], bareSpecs };
 }

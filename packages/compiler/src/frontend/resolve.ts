@@ -726,7 +726,7 @@ export interface BareResolution {
 
 /** Package name prefix of a bare specifier ("@scope/pkg/sub" → "@scope/pkg",
  * "pkg/sub" → "pkg"). */
-function packagePrefixOf(specifier: string): string {
+export function packagePrefixOf(specifier: string): string {
   const parts = specifier.split("/");
   return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0]!;
 }

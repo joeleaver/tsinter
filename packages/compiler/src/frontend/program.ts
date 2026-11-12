@@ -53,7 +53,7 @@ import {
   tscPassthroughDiag,
   unsupportedDiag,
 } from "../diagnostics/diagnostic.js";
-import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
+import { isNodeModulesPath, nearestPkgJsonPath, packagePrefixOf, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { clearDevResolveCaches, devResolve } from "./dev-resolve.js";
 import { appendDynamicImportModules } from "./lowering/lower-modules.js";
@@ -411,8 +411,10 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const configDiags = [...config.diags, ...devConflictDiags(dev.conflicts)];
   if (paths !== null || Object.keys(dev.paths).length > 0) options = { ...options, paths: { ...dev.paths, ...(paths ?? {}) } };
   // The declared-surface views (npm-static.ts, SEMANTICS.md S133): each
-  // viewed package's bare specifier types against its mirrored
-  // declarations, and its JS joins as a root.
+  // viewed package's bare specifier — and each SUBPATH of it the source
+  // graph names (S133 (f)) — types against its mirrored declarations, and
+  // its JS joins as a root.
+  registerDtsSubpathViews(dev.bareSpecs);
   const dtsPaths = npmStaticDtsPaths();
   if (dtsPaths !== null) options = { ...options, paths: { ...(options.paths ?? {}), ...dtsPaths } };
   // Per-package options (SEMANTICS.md S136): each file is checked under its
@@ -624,8 +626,8 @@ export function loadProgram(
  * own (or of its @types twin): the program then types against those
  * declarations while the package's JS compiles. No view (a JS-only
  * package) keeps the inferred surface. */
-function registerDtsView(entryPath: string, pkg: string): void {
-  const declared = resolveBareModule(entryPath, pkg, "declared");
+function registerDtsView(entryPath: string, pkg: string, specifier: string = pkg): void {
+  const declared = resolveBareModule(entryPath, specifier, "declared");
   if (declared === null || !/\.d\.(ts|mts|cts)$/.test(declared.typesFile)) return;
   const typesEntry = declared.typesFile.split("\\").join("/");
   // The types root: the directory of the package (or @types twin) the
@@ -642,14 +644,34 @@ function registerDtsView(entryPath: string, pkg: string): void {
   if (typesRoot === null || !typesEntry.startsWith(`${typesRoot}/`)) return;
   const jsEntries: string[] = [];
   for (const kind of ["import", "require"] as const) {
-    const js = resolveBareModule(entryPath, pkg, undefined, kind);
+    const js = resolveBareModule(entryPath, specifier, undefined, kind);
     if (js !== null && isJsSourceFileName(js.typesFile) && !jsEntries.includes(js.typesFile)) jsEntries.push(js.typesFile);
   }
   // A DUAL package whose import and require syntaxes load different
   // implementations: one declared surface cannot name both, so it keeps
   // the inferred surface (each syntax types against its own file).
   if (jsEntries.length !== 1) return;
-  registerNpmStaticDtsView({ pkg, typesRoot, typesEntry, mirrorEntry: dtsMirrorPathOf(typesRoot, typesEntry), jsEntries });
+  registerNpmStaticDtsView({ pkg, specifier, typesRoot, typesEntry, mirrorEntry: dtsMirrorPathOf(typesRoot, typesEntry), jsEntries });
+}
+
+/** Registers a declared-surface view for each SUBPATH of an opted-in
+ * package the program's source graph names (SEMANTICS.md S133 (f); rea
+ * step 10: `import { type Many } from "stream-chain/defs.js"`): the view
+ * hides the package's real declaration files, so without a view of its
+ * own a subpath import lands on the JS and types against inference (a
+ * declared-only interface does not exist there). The specifiers come from
+ * the pre-load source-graph scan (scanDevGraph — every specifier a reached
+ * program file spells, type-only imports included), each resolved from
+ * the file naming it exactly as the bare specifier is (registerDtsView:
+ * the declared side and the JS side by the real resolvers). Only subpaths
+ * the program names join the program: a file of the package Node never
+ * loads (and the declarations' own internal imports) brings no JS in. */
+function registerDtsSubpathViews(bareSpecs: ReadonlyMap<string, string>): void {
+  for (const [spec, fromFile] of bareSpecs) {
+    const pkg = packagePrefixOf(spec);
+    if (pkg === spec || !isNpmStaticPackage(pkg)) continue;
+    registerDtsView(fromFile, pkg, spec);
+  }
 }
 
 /** tsc diagnostics (syntax + types), the supported-import fence, and the

@@ -21,10 +21,22 @@ ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.method === "Debugger.scriptParsed") scripts.set(m.params.scriptId, m.params.url);
   if (m.method === "Debugger.paused") {
-    for (const f of m.params.callFrames.slice(0, 30)) {
+    // The top frames, then — past a deep type-mapping recursion — only the
+    // frames outside frontend/types.js (who started it), with the count of
+    // the type-mapping frames between.
+    const frames = m.params.callFrames;
+    let skipped = 0;
+    let printed = 0;
+    frames.forEach((f, i) => {
       const url = (scripts.get(f.location.scriptId) ?? f.url ?? "").replace(/^.*\/packages\//, "packages/");
+      if (i >= 12 && url.includes("frontend/types.js")) { skipped++; return; }
+      if (printed >= 60) return;
+      if (skipped > 0) { console.log(`  … ${skipped} frames in frontend/types.js`); skipped = 0; }
       console.log(`  ${f.functionName || "(anon)"}  ${url}:${f.location.lineNumber + 1}`);
-    }
+      printed++;
+    });
+    if (skipped > 0) console.log(`  … ${skipped} frames in frontend/types.js`);
+    console.log(`  (${frames.length} frames)`);
     send("Debugger.resume");
     send("Debugger.disable");
     clearTimeout(done);

@@ -94,7 +94,8 @@ export function setNpmStaticPackages(packages: Iterable<string>): void {
  *   - a MIRROR of its declaration tree is served under
  *     `<types root>/__tsinter_dts__/…` (same bytes, read through the fs
  *     shadow), with tsconfig "paths" sending the package's bare specifier
- *     to the mirrored types entry. The mirror sits inside the real types
+ *     (and each subpath the program's source graph names, program.ts
+ *     registerDtsSubpathViews) to the mirrored types entry. The mirror sits inside the real types
  *     root, so the nearest package.json, the node_modules walk-up of the
  *     declarations' own bare imports, and their relative edges all answer
  *     what they answer at the real location;
@@ -107,35 +108,43 @@ export function setNpmStaticPackages(packages: Iterable<string>): void {
  * declaration it describes (dts-bridge.ts); where the two types differ the
  * crossing is a checked conversion. */
 
-/** One opted-in package's declared-surface view. */
+/** One declared-surface view: an opted-in package's bare specifier, or one
+ * of its subpaths (its "exports" keys and patterns, rea step 10), each
+ * typed against the declaration the ordinary resolution answers for it. */
 export interface NpmStaticDtsView {
   pkg: string;
+  /** The specifier the view answers: `pkg` itself, or `pkg/<subpath>`. */
+  specifier: string;
   /** Real directory the declaration tree lives under (the package dir, or
    * its @types twin's). */
   typesRoot: string;
   /** The types entry the ordinary (types-first) resolution answers for the
-   * bare specifier, real path. */
+   * specifier, real path. */
   typesEntry: string;
   /** The same entry under the mirror. */
   mirrorEntry: string;
-  /** The package's runtime JS entries (import and require syntax) — the
+  /** The specifier's runtime JS entries (import and require syntax) — the
    * program roots that bring the compiled JS into the tsgo program. */
   jsEntries: string[];
 }
 
 const DTS_MIRROR_SEGMENT = "/__tsinter_dts__";
+/** Keyed by specifier (a package's bare name and its subpaths). */
 const dtsViews = new Map<string, NpmStaticDtsView>();
 
 export function registerNpmStaticDtsView(view: NpmStaticDtsView): void {
-  if (activePackages.has(view.pkg)) dtsViews.set(view.pkg, view);
+  if (activePackages.has(view.pkg)) dtsViews.set(view.specifier, view);
 }
 
 export function npmStaticDtsViews(): ReadonlyMap<string, NpmStaticDtsView> {
   return dtsViews;
 }
 
+/** Does the package have a declared-surface view (its bare specifier or
+ * any subpath)? */
 export function npmStaticHasDtsView(pkg: string): boolean {
-  return dtsViews.has(pkg);
+  for (const v of dtsViews.values()) if (v.pkg === pkg) return true;
+  return false;
 }
 
 /** The mirror path of a real path under a view's types root. */
@@ -163,16 +172,19 @@ export function isDtsMirrorPath(path: string): boolean {
   return dtsMirrorTargetOf(path) !== null;
 }
 
-/** tsconfig "paths" sending each viewed package's bare specifier to its
- * mirrored types entry (null when no view is registered). */
+/** tsconfig "paths" sending each viewed specifier (a bare package name or
+ * one of its subpaths, exactly) to its mirrored types entry (null when no
+ * view is registered). */
 export function npmStaticDtsPaths(): Record<string, string[]> | null {
   if (dtsViews.size === 0) return null;
   const paths: Record<string, string[]> = {};
-  for (const v of dtsViews.values()) paths[v.pkg] = [v.mirrorEntry];
+  for (const v of dtsViews.values()) paths[v.specifier] = [v.mirrorEntry];
   return paths;
 }
 
-/** The JS roots the viewed packages add to the program. */
+/** The JS roots the viewed specifiers add to the program (the program
+ * imports each one: a bare opted-in package, or a subpath its source graph
+ * names). */
 export function npmStaticDtsRoots(): string[] {
   const out: string[] = [];
   for (const v of dtsViews.values()) for (const j of v.jsEntries) if (!out.includes(j)) out.push(j);
