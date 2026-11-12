@@ -296,6 +296,32 @@ export class VecBuilder {
     });
   }
 
+  /** %w.vec.getUi — getOrUndef with an i32 index (perf unit P1: an index
+   * the emitter proved int32-valued). The same answer as getOrUndef for
+   * that integer: in [0, len) reads, anything else is undefined. */
+  getOrUndefI32(v: VecInfo): number {
+    return this.cached(`${v.key}:getUi`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.vecRef(v), I32], [v.elemVal]), `%w.vec.getUi:${v.key}`);
+      const c = new Code();
+      const V = 0;
+      const I = 1;
+      c.localGet(I);
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.i32LtU();
+      c.ifResult(v.elemVal);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(I);
+      this.emitElemRead(c, v);
+      c.else_();
+      this.emitUndef(c, v);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
   /** Validates the f64 index in local X: an integer, ≥ 0, and ≤ the limit
    * `pushLimitF64` pushes. Traps otherwise (S003); leaves the i32 index
    * in local I. */

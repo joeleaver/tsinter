@@ -170,6 +170,9 @@ const LIVE = 6;
 const BUCKETS = 7;
 
 const EMPTY = -1;
+/** Perf unit P1: SCRIPTC_WASM_NO_MAPMEMO=1 drops the string-key lookup
+ * memo (A/B). */
+const NO_MAPMEMO = process.env["SCRIPTC_WASM_NO_MAPMEMO"] === "1";
 /** The map struct's identity-hash slot (MapBuilder.idSlot). */
 export const MAP_IDH = 8;
 
@@ -232,6 +235,17 @@ export class MapBuilder {
       // Object keys: the identity-hash slot (MAP_IDH) when the module has
       // identity-keyed containers — a Map/Set can itself be a key.
       ...(this.idSlot ? [{ storage: I32, mutable: true } as FieldType] : []),
+      // A string-keyed map's lookup memo (perf unit P1, find): the last
+      // probe key reference found, its entry index, the key reference
+      // that entry held then, and a miss count.
+      ...(keyKind === "str" && !NO_MAPMEMO
+        ? [
+            { storage: { kind: "ref", nullable: true, typeIndex: this.deps.strType() }, mutable: true } as FieldType,
+            { storage: I32, mutable: true } as FieldType,
+            { storage: { kind: "ref", nullable: true, typeIndex: this.deps.strType() }, mutable: true } as FieldType,
+            { storage: I32, mutable: true } as FieldType,
+          ]
+        : []),
     ];
     const struct = this.mb.structType(fields);
     const made: MapInfo = {
@@ -254,6 +268,12 @@ export class MapBuilder {
 
   mapRef(m: MapInfo): ValType {
     return { kind: "ref", nullable: true, typeIndex: m.struct };
+  }
+
+  /** The lookup memo's field indices (string keys only): after MAP_IDH
+   * when the module has it. */
+  private memoKeyField(): number {
+    return this.idSlot ? MAP_IDH + 1 : MAP_IDH;
   }
 
   /** valsBuf[i] with the storage-appropriate get — bool values pack into
@@ -536,6 +556,12 @@ export class MapBuilder {
       c.i32Const(0);
       c.arrayNewDefault(m.bucketsBufType);
       if (this.idSlot) c.i32Const(0);
+      if (m.keyKind === "str" && !NO_MAPMEMO) {
+        c.refNull(this.deps.strType()); // memo probe key
+        c.i32Const(0); // memo index
+        c.refNull(this.deps.strType()); // memo stored key
+        c.i32Const(0); // memo misses
+      }
       c.structNew(m.struct);
       this.mb.setBody(idx, [], c.bytes());
       return idx;
@@ -593,6 +619,48 @@ export class MapBuilder {
       c.return_();
       c.end();
 
+      const memo = m.keyKind === "str" && !NO_MAPMEMO;
+      const MK = this.memoKeyField();
+      if (memo) {
+        // Perf unit P1: the lookup memo. The key reference this map found
+        // last time answers its entry with no hash and no compare — when
+        // that entry is live and still holds the key reference it held
+        // then (a delete, a compaction or a rebuild fails the check, and
+        // the probe below runs). Strings are immutable and keys unique by
+        // content, so that entry IS the probe's.
+        c.localGet(K);
+        c.localGet(M);
+        c.structGet(m.struct, MK);
+        c.refEq();
+        c.ifVoid();
+        c.localGet(M);
+        c.structGet(m.struct, MK + 1);
+        c.localTee(B);
+        c.localGet(M);
+        c.structGet(m.struct, NENTRIES);
+        c.i32LtU();
+        c.ifVoid();
+        c.localGet(M);
+        c.structGet(m.struct, LIVE);
+        c.localGet(B);
+        c.arrayGetU(m.liveBufType);
+        c.ifVoid();
+        c.localGet(M);
+        c.structGet(m.struct, KEYS);
+        c.localGet(B);
+        c.arrayGet(m.keysBufType);
+        c.localGet(M);
+        c.structGet(m.struct, MK + 2);
+        c.refEq();
+        c.ifVoid();
+        c.localGet(B);
+        c.return_();
+        c.end();
+        c.end();
+        c.end();
+        c.end();
+      }
+
       this.emitHashKey(c, m, K, TMP, L, SI, ACC);
       c.localSet(HASH);
 
@@ -633,6 +701,36 @@ export class MapBuilder {
       c.localSet(S);
       this.emitKeyEq(c, m, S, K);
       c.ifVoid();
+      if (memo) {
+        // Found: remember the probe's reference, the entry, and the key
+        // reference the entry holds (the entry's array is never written)
+        // — on the first miss and then every 8th, so a map probed with a
+        // fresh key each time (a concatenation) does not pay two
+        // reference writes per lookup.
+        c.localGet(M);
+        c.localGet(M);
+        c.structGet(m.struct, MK + 3);
+        c.i32Const(1);
+        c.i32Add();
+        c.localTee(HASH); // the hash is spent: reused as scratch
+        c.structSet(m.struct, MK + 3);
+        c.localGet(HASH);
+        c.i32Const(7);
+        c.i32And();
+        c.i32Const(1);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(M);
+        c.localGet(S);
+        c.structSet(m.struct, MK + 2);
+        c.localGet(M);
+        c.localGet(K);
+        c.structSet(m.struct, MK);
+        c.localGet(M);
+        c.localGet(B);
+        c.structSet(m.struct, MK + 1);
+        c.end();
+      }
       c.localGet(B);
       c.return_();
       c.end();

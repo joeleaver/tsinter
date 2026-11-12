@@ -322,6 +322,8 @@ import {
   type WType,
 } from "./statemachine.js";
 import { WasmUnsupportedError } from "./unsupported.js";
+import { exprRange, inInt32, planI32, type I32Plan, type Range } from "./i32.js";
+import { inlineArrayCallbacks } from "./inline-hof.js";
 
 export { WasmUnsupportedError } from "./unsupported.js";
 
@@ -611,6 +613,13 @@ function accumulatingIds(roots: unknown, ids: ReadonlySet<string>, views = false
  * also re-flattens the binding and traps unless the two agree — the
  * debug check that no write skipped the bindingSet funnel. */
 const FLAT_CHECK = process.env["TSINTER_WASM_FLAT_CHECK"] === "1";
+/** Perf unit P1: SCRIPTC_WASM_NO_LITPOOL=1 builds each string literal at
+ * every evaluation again (A/B). */
+const NO_LITPOOL = process.env["SCRIPTC_WASM_NO_LITPOOL"] === "1";
+/** Perf unit P1: SCRIPTC_WASM_NO_I32=1 turns integer lowering off (A/B). */
+const NO_I32 = process.env["SCRIPTC_WASM_NO_I32"] === "1";
+/** Perf unit P1's pooled-literal audit (pushStrLitInto). */
+const LIT_CHECK = process.env["SCRIPTC_WASM_LIT_CHECK"] === "1";
 
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
@@ -2019,7 +2028,7 @@ export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, 
   };
   fenceSourceTexts = sourceTexts ?? null;
   try {
-    const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
+    const asm = new Assembler(inlineArrayCallbacks(lowerResumableFunctions(mod, refuse)), refuse);
     asm.run();
     return asm.finish();
   } finally {
@@ -2040,7 +2049,7 @@ export function surveyWasmModule(mod: IrModule): string[] {
     seen.add(kind);
   };
   try {
-    new Assembler(lowerResumableFunctions(mod, refuse), refuse).run();
+    new Assembler(inlineArrayCallbacks(lowerResumableFunctions(mod, refuse)), refuse).run();
   } finally {
     setFlatCrossing(null);
     setCharsType(null);
@@ -2059,6 +2068,9 @@ type TypedDynResolution = Extract<IrExpr, { kind: "dynCheck" | "jsExit" }>;
 interface FnState {
   fn: WFunction;
   code: Code;
+  /** Perf unit P1: the unboxed f64 locals held in i32 slots (i32.ts),
+   * with their proven ranges. */
+  i32Locals: Map<string, Range>;
   /** IR local id → wasm local index (params first, then the rest in
    * locals[] order — wasm's required layout). */
   localIndex: Map<string, number>;
@@ -2972,6 +2984,8 @@ const DYN_TEST_KINDS: Record<Exclude<DynTestKind, "truthy" | "error">, readonly 
 class Assembler {
   private readonly mb = new ModuleBuilder();
   private readonly globalById = new Map<string, IrGlobal>();
+  /** Perf unit P1: integer lowering's plan (i32.ts). */
+  private i32Plan: I32Plan = { locals: new Map(), globals: new Map(), guardedSteps: new Set() };
   private readonly unionsById = new Map<string, IrUnionDef>();
   private readonly globalWasmIndex = new Map<string, number>();
   /** Strings unit S1: a string global's FLAT SHADOW global (the local
@@ -3592,6 +3606,11 @@ class Assembler {
     });
     if (this.engineLive) this.attachIslandEngine();
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
+    if (!NO_I32) this.i32Plan = planI32(asIrModule(mod));
+    if (process.env["SCRIPTC_WASM_P1_DEBUG"] === "1") {
+      for (const [fn, m] of this.i32Plan.locals) for (const [id, r] of m) process.stderr.write(`i32 ${fn} ${id} [${r.lo}, ${r.hi}]\n`);
+      for (const [id, r] of this.i32Plan.globals) process.stderr.write(`i32 global ${id} [${r.lo}, ${r.hi}]\n`);
+    }
     for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
     for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
     // The native backends' may-throw analysis is a pure function of the
@@ -21215,10 +21234,11 @@ class Assembler {
         localIndex.set(p.localId, i + 1);
       }
     });
+    const i32Locals = this.i32Plan.locals.get(fn.name) ?? new Map<string, Range>();
     for (const l of fn.locals) {
       if (localIndex.has(l.id)) continue; // a param — already indexed
       localIndex.set(l.id, fn.params.length + 1 + localsOut.length);
-      localsOut.push(l.boxed === true ? this.boxRefForLocal(l) : this.mapTypeSoft(l.type));
+      localsOut.push(l.boxed === true ? this.boxRefForLocal(l) : i32Locals.has(l.id) ? I32 : this.mapTypeSoft(l.type));
     }
     // Flat shadows (strings unit S1) for every unboxed string binding,
     // params included — all start null ("not yet flattened").
@@ -21247,6 +21267,7 @@ class Assembler {
     this.fn = {
       fn,
       code: new Code(),
+      i32Locals,
       localIndex,
       localById,
       localsOut,
@@ -22370,6 +22391,18 @@ class Assembler {
    * slot lazily, right here at first use; a boxed local writes THROUGH
    * its box (the shared binding every capture sees). */
   private storeVar(localId: string, value: WExpr, loc: SrcLoc): void {
+    if (this.isI32Binding(localId)) {
+      // Perf unit P1: an i32 binding's every write is a proven int32 —
+      // a guarded loop update by its loop test (i32.ts).
+      if (this.i32Plan.guardedSteps.has(value) && value.kind === "bin") {
+        this.walkI32Exact(value.left);
+        this.walkI32Exact(value.right);
+        if (value.op === "+") this.fn.code.i32Add();
+        else this.fn.code.i32Sub();
+      } else this.walkI32Exact(value);
+      this.bindingSetValue(localId, loc, false, false);
+      return;
+    }
     const local = this.fn.localById.get(localId);
     if (local?.boxed === true) {
       const box = this.boxTypeForLocal(local);
@@ -22889,6 +22922,12 @@ class Assembler {
         const global = this.globalById.get(e.localId);
         if (global !== undefined) {
           code.globalGet(this.globalIndex(global, e.loc));
+          if (this.i32Plan.globals.has(e.localId)) code.f64ConvertI32S();
+          return;
+        }
+        if (this.fn.i32Locals.has(e.localId)) {
+          code.localGet(this.localIndex(e.localId));
+          code.f64ConvertI32S();
           return;
         }
         const local = this.fn.localById.get(e.localId);
@@ -23107,8 +23146,7 @@ class Assembler {
             code.i32Eqz();
             return;
           case "~":
-            this.walkExpr(e.operand);
-            code.call(this.toInt32Helper());
+            this.walkI32(e.operand);
             code.i32Const(-1);
             code.i32Xor();
             code.f64ConvertI32S();
@@ -23117,6 +23155,27 @@ class Assembler {
         return;
 
       case "incDec": {
+        if (this.isI32Binding(e.localId)) {
+          // Perf unit P1: an i32 binding (its range proves no overflow).
+          const g = this.globalById.get(e.localId);
+          const slot = g !== undefined ? this.globalIndex(g, e.loc) : this.localIndex(e.localId);
+          const get = (): void => (g !== undefined ? code.globalGet(slot) : code.localGet(slot));
+          if (!e.prefix) {
+            get();
+            code.f64ConvertI32S(); // the result: the old value
+          }
+          get();
+          code.i32Const(1);
+          if (e.op === "+") code.i32Add();
+          else code.i32Sub();
+          if (g !== undefined) code.globalSet(slot);
+          else code.localSet(slot);
+          if (e.prefix) {
+            get();
+            code.f64ConvertI32S();
+          }
+          return;
+        }
         // Read, write ±1, yield old (postfix) or new (prefix). Locals use
         // tee / a stacked pre-read; globals re-read after the set (nothing
         // else can write between — single-threaded).
@@ -23192,6 +23251,12 @@ class Assembler {
       }
 
       case "assignExpr": {
+        if (this.isI32Binding(e.localId)) {
+          this.walkI32Exact(e.value);
+          this.bindingSetValue(e.localId, e.loc, false, true);
+          code.f64ConvertI32S();
+          return;
+        }
         // A string is assigned as a VALUE (strings unit S2); walkExpr
         // flattens the result only where it is read flat.
         if (this.nodesLive) this.walkValue(e.value);
@@ -23557,6 +23622,47 @@ class Assembler {
         const info = this.vecInfoFor(at, e.loc);
         if (info === null) {
           code.unreachable();
+          return;
+        }
+        if (this.undefSlots && e.index.type.kind === "f64" && inInt32(this.rangeOf(e.index))) {
+          // Perf unit P1: an int32-valued index, read as an i32.
+          this.walkExpr(e.arr);
+          this.walkI32Exact(e.index);
+          const mark = (e.arr as { undefRecv?: string }).undefRecv;
+          if ((mark === undefined || mark === "\0") && !this.recvProven(e.arr as WExpr)) {
+            const vr = this.mapType(at, e.loc);
+            if (vr !== null) {
+              const ai = this.acquireScratch(I32);
+              const ar = this.acquireScratch(vr);
+              code.localSet(ai);
+              code.localTee(ar);
+              code.refIsNull();
+              this.openIf();
+              code.localGet(ai);
+              code.f64ConvertI32S();
+              code.call(this.undefIndexThrowHelper());
+              this.emitUnwind();
+              this.close();
+              code.localGet(ar);
+              code.localGet(ai);
+              this.releaseScratch(vr, ar);
+              this.releaseScratch(I32, ai);
+            }
+          }
+          code.call(this.vecs.getOrUndefI32(info));
+          if (at.elem.kind === "union" && this.undefinedArmTag(at.elem.unionId) >= 0) {
+            const u = this.acquireScratch(this.unions.baseRef());
+            code.localTee(u);
+            code.structGet(this.unions.base(), 0);
+            code.i32Const(UNDEF_UNION_TAG);
+            code.i32Eq();
+            this.openIfResult(this.unions.baseRef());
+            this.emitSlotUndef(at.elem, e.loc);
+            code.else_();
+            code.localGet(u);
+            this.close();
+            this.releaseScratch(this.unions.baseRef(), u);
+          }
           return;
         }
         this.walkExpr(e.arr);
@@ -34506,7 +34612,7 @@ class Assembler {
     if (existing !== undefined) return existing;
     // Zero-value init per representation; the frontend's %init functions
     // perform the real initialization, exactly like the native backends.
-    const type = this.mapType(g.type, loc) ?? I32; // placeholder en route to the refusal
+    const type = this.i32Plan.globals.has(g.id) ? I32 : (this.mapType(g.type, loc) ?? I32); // placeholder en route to the refusal
     const index = this.mb.addGlobal(type, true, (w) => {
       switch (type.kind) {
         case "i32":
@@ -37628,6 +37734,17 @@ class Assembler {
     this.pushStrLitInto(this.fn.code, value);
   }
 
+  /** Pooled string literals (perf unit P1): one lazily built array per
+   * distinct literal VALUE, held in a module global, so a literal
+   * evaluated in a loop allocates once and equal literals share a
+   * reference (strEq's ref.eq fast path). Sound because string identity
+   * is unobservable in JS and no helper writes into an array it did not
+   * allocate itself (strings.ts's header invariant; SCRIPTC_WASM_LIT_CHECK=1
+   * re-verifies a pooled literal's units at every use and traps on a
+   * mismatch). */
+  private readonly litGlobals = new Map<string, number>();
+  private litCheckFunc: number | null = null;
+
   private pushStrLitInto(c: Code, value: string): void {
     // UTF-16LE code units, raw — charCodeAt preserves lone surrogates
     // (TextEncoder would replace them and break identity, S002). The
@@ -37641,9 +37758,59 @@ class Assembler {
       units[i * 2 + 1] = u >> 8;
     }
     const offset = this.mb.internData(units);
+    if (NO_LITPOOL) {
+      c.i32Const(offset);
+      c.i32Const(value.length);
+      c.arrayNewData(this.strType, 0);
+      return;
+    }
+    let g = this.litGlobals.get(value);
+    if (g === undefined) {
+      const strType = this.strType;
+      g = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: strType }, true, (w) => {
+        w.u8(0xd0); // ref.null
+        w.sleb(strType);
+      });
+      this.litGlobals.set(value, g);
+    }
+    // block (result (ref $chars)): the cached array, or build and cache it.
+    c.blockResult({ kind: "ref", nullable: false, typeIndex: this.strType });
+    c.globalGet(g);
+    c.brOnNonNull(0);
     c.i32Const(offset);
     c.i32Const(value.length);
     c.arrayNewData(this.strType, 0);
+    c.globalSet(g);
+    c.globalGet(g);
+    c.refAsNonNull();
+    c.end();
+    if (LIT_CHECK) {
+      c.i32Const(offset);
+      c.i32Const(value.length);
+      c.call(this.litCheckHelper());
+    }
+  }
+
+  /** SCRIPTC_WASM_LIT_CHECK=1: %w.litCheck(s, off, len) → s, trapping
+   * unless the pooled array still holds the segment's units. */
+  private litCheckHelper(): number {
+    if (this.litCheckFunc !== null) return this.litCheckFunc;
+    const sref: ValType = { kind: "ref", nullable: false, typeIndex: this.strType };
+    const idx = this.mb.declareFunc(this.mb.funcType([sref, I32, I32], [sref]), "%w.litCheck");
+    this.litCheckFunc = idx;
+    const c = new Code();
+    c.localGet(1);
+    c.localGet(2);
+    c.arrayNewData(this.strType, 0);
+    c.localGet(0);
+    c.call(this.strEqHelper());
+    c.i32Eqz();
+    c.ifVoid();
+    c.unreachable();
+    c.end();
+    c.localGet(0);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   /* ── operators ──────────────────────────────────────────────────────── */
@@ -37652,6 +37819,206 @@ class Assembler {
    * every lane, float-fold.ts. */
   private tryFoldFloatConst(e: IrExpr): number | undefined {
     return foldFloatConst(e);
+  }
+
+  /* ── integer lowering (perf unit P1, i32.ts) ─────────────────────── */
+
+  /** Is this binding (a local of the current function, or a global) held
+   * in an i32 slot? */
+  private isI32Binding(localId: string): boolean {
+    return this.fn.i32Locals.has(localId) || this.i32Plan.globals.has(localId);
+  }
+
+  private readonly i32Lookup = (id: string): Range | null => this.fn.i32Locals.get(id) ?? this.i32Plan.globals.get(id) ?? null;
+
+  /** The expression's exact-integer range (i32.ts), or null. */
+  private rangeOf(e: WExpr): Range | null {
+    if (NO_I32) return null;
+    return exprRange(e as IrExpr, this.i32Lookup);
+  }
+
+  /** Emits an f64 expression proven int32-valued (rangeOf within int32)
+   * as that same value in an i32. */
+  private walkI32Exact(e: WExpr): void {
+    const code = this.fn.code;
+    const r = this.rangeOf(e);
+    if (!inInt32(r)) throw new Error(`wasm emitter bug: walkI32Exact on an expression not proven int32 (${e.kind})`);
+    switch (e.kind) {
+      case "numLit":
+        code.i32Const(e.value);
+        return;
+      case "varRef":
+        if (this.isI32Binding(e.localId)) {
+          const g = this.globalById.get(e.localId);
+          if (g !== undefined) code.globalGet(this.globalIndex(g, e.loc));
+          else code.localGet(this.localIndex(e.localId));
+          return;
+        }
+        break;
+      case "assignExpr":
+        if (this.isI32Binding(e.localId)) {
+          this.walkI32Exact(e.value);
+          this.bindingSetValue(e.localId, e.loc, false, true);
+          return;
+        }
+        break;
+      case "ternary":
+        this.walkCond(e.cond);
+        this.openIfResult(I32);
+        this.walkI32Exact(e.then);
+        code.else_();
+        this.walkI32Exact(e.else_);
+        this.close();
+        return;
+      case "arrIntrinsic":
+      case "strIntrinsic":
+        if (e.method === "length" && this.emitLengthI32(e)) return;
+        break;
+      case "unary":
+        if (e.op === "~") {
+          this.walkI32(e.operand);
+          code.i32Const(-1);
+          code.i32Xor();
+          return;
+        }
+        if (e.op === "-" && inInt32(this.rangeOf(e.operand))) {
+          code.i32Const(0);
+          this.walkI32Exact(e.operand);
+          code.i32Sub();
+          return;
+        }
+        break;
+      case "bin":
+        switch (e.op) {
+          case "&":
+          case "|":
+          case "^":
+          case "<<":
+          case ">>":
+          case ">>>":
+            this.emitBitwiseI32(e);
+            return;
+          case "+":
+          case "-":
+          case "*":
+          case "%":
+            if (inInt32(this.rangeOf(e.left)) && inInt32(this.rangeOf(e.right))) {
+              // The exact result is an int32 (its range): no wrap.
+              this.walkI32Exact(e.left);
+              this.walkI32Exact(e.right);
+              if (e.op === "+") code.i32Add();
+              else if (e.op === "-") code.i32Sub();
+              else if (e.op === "*") code.i32Mul();
+              else code.i32RemS(); // dividend ≥ 0, divisor ≥ 1 (the range)
+              return;
+            }
+            break;
+          default:
+            break;
+        }
+        break;
+      default:
+        break;
+    }
+    // Any other int32-valued expression: its f64 truncates exactly.
+    this.walkExpr(e);
+    code.i32TruncSatF64S();
+  }
+
+  /** Emits ToInt32 of an f64 expression as an i32 (a bitwise operand). */
+  private walkI32(e: WExpr): void {
+    const code = this.fn.code;
+    const r = this.rangeOf(e);
+    if (inInt32(r)) {
+      this.walkI32Exact(e);
+      return;
+    }
+    if (e.kind === "bin" && !NO_I32) {
+      if (e.op === "&" || e.op === "|" || e.op === "^" || e.op === "<<" || e.op === ">>" || e.op === ">>>") {
+        // the result's bits ARE its ToInt32 (>>>'s uint32 included)
+        this.emitBitwiseI32(e);
+        return;
+      }
+      if ((e.op === "+" || e.op === "-" || e.op === "*") && r !== null) {
+        // Integer operands and an exact (≤ 2^53) result: ToInt32 of the
+        // sum/difference/product is the wrapping i32 operation on the
+        // operands' ToInt32 (arithmetic mod 2^32).
+        this.walkI32(e.left);
+        this.walkI32(e.right);
+        if (e.op === "+") code.i32Add();
+        else if (e.op === "-") code.i32Sub();
+        else code.i32Mul();
+        return;
+      }
+    }
+    if (e.kind === "unary" && e.op === "~" && !NO_I32) {
+      this.walkI32(e.operand);
+      code.i32Const(-1);
+      code.i32Xor();
+      return;
+    }
+    this.walkExpr(e);
+    this.emitToInt32();
+  }
+
+  /** ToInt32 of the f64 on the stack, inline: |x| < 2^63 (NaN fails)
+   * truncates through i64 and wraps — exactly ToInt32's modular
+   * truncation; anything else takes %w.toInt32. */
+  private emitToInt32(): void {
+    const code = this.fn.code;
+    if (NO_I32) {
+      code.call(this.toInt32Helper());
+      return;
+    }
+    const x = this.acquireScratch(F64);
+    code.localTee(x);
+    code.f64Abs();
+    code.f64Const(9223372036854775808);
+    code.f64Lt();
+    this.openIfResult(I32);
+    code.localGet(x);
+    code.i64TruncSatF64S();
+    code.i32WrapI64();
+    code.else_();
+    code.localGet(x);
+    code.call(this.toInt32Helper());
+    this.close();
+    this.releaseScratch(F64, x);
+  }
+
+  /** A bitwise operator over its operands' ToInt32, as an i32 (the bits;
+   * `>>>`'s are its uint32 value's). */
+  private emitBitwiseI32(e: Extract<IrExpr, { kind: "bin" }>): void {
+    const code = this.fn.code;
+    this.walkI32(e.left);
+    this.walkI32(e.right);
+    if (e.op === "&") code.i32And();
+    else if (e.op === "|") code.i32Or();
+    else if (e.op === "^") code.i32Xor();
+    else if (e.op === "<<") code.i32Shl();
+    else if (e.op === ">>") code.i32ShrS();
+    else code.i32ShrU();
+  }
+
+  /** `.length` of an array or string as an i32 (no f64 round trip). */
+  private emitLengthI32(e: WExpr): boolean {
+    const code = this.fn.code;
+    if (e.kind === "arrIntrinsic") {
+      const rt = e.receiver.type;
+      if (rt.kind !== "array") return false;
+      const info = this.vecInfoFor(rt, e.loc);
+      if (info === null) return false;
+      if (this.undefSlots) this.emitMarkedRecvCheck(e);
+      this.walkExpr(e.receiver);
+      code.structGet(info.struct, 0);
+      return true;
+    }
+    if (e.kind === "strIntrinsic") {
+      if (this.undefSlots) this.emitMarkedRecvCheck(e);
+      this.emitStrValueLength(e.receiver);
+      return true;
+    }
+    return false;
   }
 
   private emitBin(e: Extract<IrExpr, { kind: "bin" }>): void {
@@ -37676,6 +38043,21 @@ class Assembler {
         code.f64Const(Number.isNaN(folded) ? CANONICAL_NAN : folded);
         return;
       }
+    }
+    if (
+      (e.op === "<" || e.op === "<=" || e.op === ">" || e.op === ">=" || e.op === "===" || e.op === "!==") &&
+      e.left.type.kind === "f64" && inInt32(this.rangeOf(e.left)) && inInt32(this.rangeOf(e.right))
+    ) {
+      // Perf unit P1: both sides proven int32 — compare as i32.
+      this.walkI32Exact(e.left);
+      this.walkI32Exact(e.right);
+      if (e.op === "<") code.i32LtS();
+      else if (e.op === "<=") code.i32LeS();
+      else if (e.op === ">") code.i32GtS();
+      else if (e.op === ">=") code.i32GeS();
+      else if (e.op === "===") code.i32Eq();
+      else code.i32Ne();
+      return;
     }
     switch (e.op) {
       case "+":
@@ -37876,16 +38258,7 @@ class Assembler {
         // 5 bits in wasm, which IS the JS `& 31`. The interleaved
         // evaluate-left/coerce-left order is unobservable: operands are
         // statically f64 and ToInt32 on f64 has no effects.
-        this.walkExpr(e.left);
-        code.call(this.toInt32Helper());
-        this.walkExpr(e.right);
-        code.call(this.toInt32Helper());
-        if (e.op === "&") code.i32And();
-        else if (e.op === "|") code.i32Or();
-        else if (e.op === "^") code.i32Xor();
-        else if (e.op === "<<") code.i32Shl();
-        else if (e.op === ">>") code.i32ShrS();
-        else code.i32ShrU();
+        this.emitBitwiseI32(e);
         if (e.op === ">>>") code.f64ConvertI32U();
         else code.f64ConvertI32S();
         return;

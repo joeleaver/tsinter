@@ -367,8 +367,10 @@ describe("board #139: emitCheckpointCore drains a fixed point — a listener-que
     // f9825769 (GH #155/#156: the shared throw and inspect helpers). Both
     // programs' output is unchanged across them (S082 orders the second's
     // nextTick against the rejection handler, as before).
-    expect(hashA).toBe("922b621c9f6ea49c47e6ccd0a5618f97c9f855fc6652db12d85075d73b40180c");
-    expect(hashB).toBe("edde44d06577857959e2ccee070e7d3389a897736e3bec399531a4bf6d36c640");
+    // Re-pinned by perf unit P1 (string literals pooled in globals, the
+    // lookup memo's map fields, integer lowering); output unchanged.
+    expect(hashA).toBe("89d5eaec9e3aecd2db8488c70e2be1e210179fa27e823052ee91b0e66a96c840");
+    expect(hashB).toBe("32dba5f5b63ddb30001990b4719f71b61e22e6408a729cc4bb377689ccce2083");
   });
 
   // R139-g's oracle: rev-27's probe, rev27/probes/b1/139g-two-function-timer.cjs

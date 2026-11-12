@@ -6827,8 +6827,17 @@ test("bin: a variable-sourced division is NOT folded away — proves no over-fol
               case 0x40: // memory.grow
               case 0xd0: // ref.null (sleb heaptype; byte-skip identical to uleb)
               case 0xd2: // ref.func
+              case 0xd5: // br_on_null (label)
+              case 0xd6: // br_on_non_null (label) — perf unit P1's pooled literals
                 uleb();
                 break;
+              case 0xfc: {
+                // perf unit P1: the saturating truncations (sub 0–7) carry
+                // no immediate beyond the sub-opcode.
+                const sub = uleb();
+                if (sub > 7) throw new Error(`countF64Div: unmodeled 0xfc sub-opcode ${sub} at byte ${p - 2}`);
+                break;
+              }
               case 0x0e: {
                 // br_table: vec(label) + one default label.
                 const labelCount = uleb();

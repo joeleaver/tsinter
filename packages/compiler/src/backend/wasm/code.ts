@@ -99,6 +99,17 @@ export class Code {
     this.w.u8(0x02);
     this.w.u8(0x40);
   }
+  /** A block with one result of any value type (the if-result encoding). */
+  blockResult(t: ValType): void {
+    this.w.u8(0x02);
+    this.blockTypeOf(t);
+  }
+  /** br_on_non_null: branch with the non-null reference, else fall
+   * through with nothing left (the null is dropped). */
+  brOnNonNull(depth: number): void {
+    this.w.u8(0xd6);
+    this.w.uleb(depth);
+  }
   /** A block with one f64 result. */
   blockF64(): void {
     this.w.u8(0x02);
@@ -116,6 +127,9 @@ export class Code {
    * the blocktype grammar alongside 0x40 and s33 type indices). */
   ifResult(t: ValType): void {
     this.w.u8(0x04);
+    this.blockTypeOf(t);
+  }
+  private blockTypeOf(t: ValType): void {
     switch (t.kind) {
       case "i32":
         this.w.u8(0x7f);
@@ -375,6 +389,11 @@ export class Code {
   i32TruncSatF64S(): void {
     this.w.u8(0xfc);
     this.w.uleb(2);
+  }
+  /** i64.trunc_sat_f64_s — saturating (never traps; NaN gives 0). */
+  i64TruncSatF64S(): void {
+    this.w.u8(0xfc);
+    this.w.uleb(6);
   }
   /** i64.trunc_sat_f64_u — saturating (never traps). */
   i64TruncSatF64U(): void {
