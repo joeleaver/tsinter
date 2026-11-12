@@ -1,10 +1,9 @@
 #!/bin/bash
 # phase-probe.sh <project> [minutes=20] [interval-seconds=60] : where a slow top-10 wasm compile spends its time.
 # Compiles the project's entry once (backend wasm, its npmStatic) with packages/compiler/dist under a hard
-# timeout, and every <interval> seconds asks Node for a diagnostic report (--report-on-signal), printing the
-# top JS frames of each. On nico-top through nico.sh (third-party code only runs there):
+# timeout, and every <interval> seconds takes one JS stack sample through the inspector (stack-sample.mjs). On nico-top through nico.sh (third-party code only runs there):
 #   nico.sh <worktree> -- bash tests/real-apps-top10/harness/phase-probe.sh rea 20
-# Reports land in ${SURVEY_TOP10_RES:-~/.cache/tsinter-dl/top10/res}/<project>/phase/.
+# Output lands in ${SURVEY_TOP10_RES:-~/.cache/tsinter-dl/top10/res}/<project>/phase/.
 H=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$H/../../.." && pwd)
 P=$1; MIN=${2:-20}; EVERY=${3:-60}
@@ -38,30 +37,22 @@ if (!r.ok) {
 }
 EOF
 cd "$CWD" || exit 2
-timeout -s KILL "$((MIN * 60))" node --max-old-space-size="${SURVEY_HEAP_MB:-11000}" --report-on-signal --report-signal=SIGUSR2 \
-  --report-directory="$OUT" --report-compact "$OUT/driver.mjs" "$ENTRY" "$NPM" > "$OUT/driver.log" 2>&1 &
+PORT=$((9300 + RANDOM % 600))
+timeout -s KILL "$((MIN * 60))" node --max-old-space-size="${SURVEY_HEAP_MB:-11000}" --inspect-port="127.0.0.1:$PORT" \
+  "$OUT/driver.mjs" "$ENTRY" "$NPM" > "$OUT/driver.log" 2>&1 &
 TPID=$!
 sleep 2
-NPID=$(pgrep -P "$TPID" -x node || echo "")
+# The child of `timeout` (Node names its main thread MainThread, so match by parent, not by name).
+NPID=$(pgrep -P "$TPID" | head -1)
 t=0
 while kill -0 "$TPID" 2>/dev/null; do
   sleep "$EVERY"; t=$((t + EVERY))
   [ -n "$NPID" ] && kill -0 "$NPID" 2>/dev/null || break
-  before=$(ls "$OUT"/report*.json 2>/dev/null | wc -l)
-  kill -USR2 "$NPID" 2>/dev/null
-  for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(ls "$OUT"/report*.json 2>/dev/null | wc -l)" -gt "$before" ] && break; sleep 1; done
-  rep=""; [ "$(ls "$OUT"/report*.json 2>/dev/null | wc -l)" -gt "$before" ] && rep=$(ls -t "$OUT"/report*.json | head -1)
   rss=$(ps -o rss= -p "$NPID" 2>/dev/null | tr -d ' ')
   kids=$(ps -o pid=,etime=,rss=,comm= --ppid "$NPID" 2>/dev/null | tr -s ' ' | tr '\n' ';')
   echo "== t=${t}s rss=${rss}k children: $kids"
-  [ -z "$rep" ] && echo "  no report within 10s (the main thread is blocked outside JS: a synchronous checker call into tsgo, or GC)"
-  [ -n "$rep" ] && python3 -I -c "
-import json,sys
-r=json.load(open(sys.argv[1]))
-st=r.get('javascriptStack',{}).get('stack',[])
-print('  ' + r.get('javascriptStack',{}).get('message','')[:120])
-for f in st[:14]: print('   ', f.strip()[:200])
-" "$rep"
+  # A JS stack sample through the inspector (stack-sample.mjs; SIGUSR1 to the NODE pid only).
+  timeout 90 node "$H/stack-sample.mjs" "$NPID" "$PORT" 2>&1 | head -24
 done
 wait "$TPID"; echo "exit $?"
 cat "$OUT/driver.log" | tail -20

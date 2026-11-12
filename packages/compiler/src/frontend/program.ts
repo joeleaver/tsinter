@@ -1810,7 +1810,50 @@ export function checkPreflightTs7(
     }
   } finally {
     if (!sharedHost) host.close();
+    clearImportEdgeMemo();
   }
+}
+
+/** A file's import-edge specifiers (import/export declarations, dynamic
+ * import("literal"), require("literal")), in source order, memoized by file
+ * name and text. One compile loads the program several times
+ * (--npm-static's scout, fallback and probe loads), each a new checker
+ * program over the same files; the full-AST walk ran again every time
+ * (minutes on a large project), though a file's edges are a function of its
+ * text alone. */
+const importEdgeMemo = new Map<string, { text: string; specs: readonly string[] }>();
+
+function importEdgeSpecs(sf: ts.SourceFile): readonly string[] {
+  const hit = importEdgeMemo.get(sf.fileName);
+  if (hit !== undefined && hit.text === sf.text) return hit.specs;
+  const specs: string[] = [];
+  ts.walkPreorder(sf, (n) => {
+    if (
+      (ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) &&
+      n.moduleSpecifier !== undefined &&
+      ts.isStringLiteral(n.moduleSpecifier)
+    ) {
+      specs.push(n.moduleSpecifier.text);
+      return "skip";
+    }
+    if (ts.isCallExpression(n)) {
+      const arg = n.arguments[0];
+      const isImportCall = n.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequireCall = ts.isIdentifier(n.expression) && n.expression.text === "require";
+      if ((isImportCall || isRequireCall) && arg !== undefined && ts.isStringLiteralLike(arg)) {
+        specs.push(arg.text);
+      }
+    }
+    return undefined;
+  });
+  importEdgeMemo.set(sf.fileName, { text: sf.text, specs });
+  return specs;
+}
+
+/** Drops the import-edge memo (a compile's start: it holds every file's
+ * text, so it lives one compile, not the process). */
+export function clearImportEdgeMemo(): void {
+  importEdgeMemo.clear();
 }
 
 function preflight7(load: LoadResult): {
@@ -1857,25 +1900,7 @@ function preflight7(load: LoadResult): {
     };
     for (const sf of program.getSourceFiles()) {
       if (sf.isDeclarationFile || sf.fileName.endsWith(".json")) continue;
-      ts.walkPreorder(sf, (n) => {
-        if (
-          (ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) &&
-          n.moduleSpecifier !== undefined &&
-          ts.isStringLiteral(n.moduleSpecifier)
-        ) {
-          probe(sf.fileName, n.moduleSpecifier.text);
-          return "skip";
-        }
-        if (ts.isCallExpression(n)) {
-          const arg = n.arguments[0];
-          const isImportCall = n.expression.kind === ts.SyntaxKind.ImportKeyword;
-          const isRequireCall = ts.isIdentifier(n.expression) && n.expression.text === "require";
-          if ((isImportCall || isRequireCall) && arg !== undefined && ts.isStringLiteralLike(arg)) {
-            probe(sf.fileName, arg.text);
-          }
-        }
-        return undefined;
-      });
+      for (const spec of importEdgeSpecs(sf)) probe(sf.fileName, spec);
     }
   }
 

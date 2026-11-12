@@ -118,7 +118,7 @@ import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, 
 import { orderNoteCopy } from "./record-order.js";
 import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
-import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
+import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
 
 /** Entry function name. '%' cannot appear in a TS identifier, so a user
@@ -2546,7 +2546,7 @@ export class Lowerer {
     // generic classes, generic methods calling generic functions) — the
     // index loops run to the joint fixpoint. Same-key recursion re-uses
     // its own entry; polymorphic recursion is cut off by
-    // MAX_GENERIC_INSTANCES.
+    // MAX_GENERIC_DEPTH (lower-calls.ts).
     {
       let ec = 0;
       let gc = 0;
@@ -7771,7 +7771,7 @@ export class Lowerer {
   }
 
   lowerGenericInstance(info: GenericFnInfo, inst: GenericInstance): IrFunction {
-    return lowerGenericInstance(this, info, inst);
+    return withInstanceDepth(info, inst, () => lowerGenericInstance(this, info, inst));
   }
 
   /* ── classes ──────────────────────────────────────────────────────── */

@@ -1,7 +1,7 @@
 /* Call lowering: the lowerCall dispatch chain, parameter-shape analysis and
  * argument completion (optional/default/rest, explicit-undefined ≡ omission),
  * function/lambda lowering and signature collection, and monomorphizing
- * generic instantiation (bounded by MAX_GENERIC_INSTANCES). */
+ * generic instantiation (bounded by MAX_GENERIC_DEPTH and MAX_GENERIC_FN_INSTANCES). */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
@@ -70,11 +70,59 @@ export interface FnSig {
   generator?: { yieldT: IrType; nextT: IrType };
 }
 
-/** Instantiation cap per generic function: same-key recursion (`len<T>`
+/** Instantiation cap per generic CLASS (generic functions use MAX_GENERIC_DEPTH
+ * below): same-key recursion (`len<T>`
  * calling itself) converges, but POLYMORPHIC recursion (`f<T>` calling
  * `f<T[]>`) would request new instances forever — the cap turns that into a
  * diagnostic instead of a hang. */
 export const MAX_GENERIC_INSTANCES = 100;
+
+/** Generic FUNCTIONS are bounded by RECURSION through instantiation, not
+ * by count: each instance records the instance whose body created it (its
+ * parent), and a new instance of a function that already appears
+ * MAX_GENERIC_DEPTH times among its ancestors refuses. Polymorphic
+ * recursion (`f<T>` calling `f<T[]>`, or mutually through other generics)
+ * repeats the same function down one ancestor chain, while a helper called
+ * from many places at many types (an `ok = <T>(v: T)` Result constructor
+ * used across a large program: hundreds of instances, each a child of a
+ * different caller) and a long chain of DISTINCT generics never repeat. The
+ * count cap stays as a backstop against runaway programs. */
+export const MAX_GENERIC_DEPTH = 64;
+export const MAX_GENERIC_FN_INSTANCES = 4096;
+
+/** The instance whose body is lowering now (null: none). */
+let loweringInstance: { info: GenericFnInfo; inst: GenericInstance } | null = null;
+
+/** Runs `body` as the lowering of `inst` (instances it creates are its
+ * children). */
+export function withInstanceDepth<T>(info: GenericFnInfo, inst: GenericInstance, body: () => T): T {
+  const prev = loweringInstance;
+  loweringInstance = { info, inst };
+  try {
+    return body();
+  } finally {
+    loweringInstance = prev;
+  }
+}
+
+/** The parent link a new instance records (spread into the instance). */
+function instanceParent(): Pick<GenericInstance, "parent"> {
+  return loweringInstance === null ? {} : { parent: loweringInstance };
+}
+
+/** The SC1090 for a new instance of `info` past either bound, or null. */
+function instanceBoundExceeded(info: GenericFnInfo, kind: string): string | null {
+  let same = 0;
+  for (let p = loweringInstance; p !== null; p = p.inst.parent ?? null) {
+    if (p.info === info && ++same >= MAX_GENERIC_DEPTH) {
+      return `unbounded ${kind} instantiation ('${info.baseName}' instantiated recursively ${MAX_GENERIC_DEPTH} levels deep at ever-new types — polymorphic recursion)`;
+    }
+  }
+  if (info.instances.size >= MAX_GENERIC_FN_INSTANCES) {
+    return `unbounded ${kind} instantiation ('${info.baseName}' exceeded ${MAX_GENERIC_FN_INSTANCES} instances)`;
+  }
+  return null;
+}
 
 /** A generic function-like declaration, collected instead of an FnSig —
  * top-level generic function declarations, class GENERIC METHODS (own type
@@ -133,6 +181,10 @@ export interface GenericInstance {
    * statements count toward coverage stats (re-instantiations re-visit the
    * same source lines). */
   ordinal: number;
+  /** The instance whose body created this one (MAX_GENERIC_DEPTH counts a
+   * function's repeats along this chain); absent for one a non-instance
+   * body creates. */
+  parent?: { info: GenericFnInfo; inst: GenericInstance };
   params: ParamShape[];
   returnType: IrType;
   /** Type-parameter symbol → concrete IR type, consulted by mapType (via
@@ -1134,14 +1186,8 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     const key = `${params.map((s) => typeKey(s.type)).join(",")}=>${typeKey(returnType)}${opts?.extraKey ?? ""}`;
     let inst = info.instances.get(key);
     if (!inst) {
-      if (info.instances.size >= MAX_GENERIC_INSTANCES) {
-        L.unsupported(
-          "SC1090",
-          blame,
-          `unbounded generic instantiation ('${info.baseName}' exceeded ` +
-            `${MAX_GENERIC_INSTANCES} instances — polymorphic recursion?)`,
-        );
-      }
+      const bound = instanceBoundExceeded(info, "generic");
+      if (bound !== null) L.unsupported("SC1090", blame, bound);
       const tsBindings = opts?.tsBindings ?? new Map<ts.Symbol, ts.Type>();
       const bindings = makeBindings(tsBindings);
       const rendered = info.typeParams
@@ -1161,6 +1207,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       inst = {
         name: `${info.qualifiedName}%${info.instances.size}`,
         ordinal: info.instances.size,
+        ...instanceParent(),
         params,
         returnType,
         bindings,
@@ -1813,7 +1860,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
  *      return from the lowered return statements; same-key recursion
  *      observes the checker-fallback type ("pinned") and the post-pass
  *      coerces every return to the settled type — per-return fences where
- *      a value cannot ride it. Bounded: MAX_GENERIC_INSTANCES per
+ *      a value cannot ride it. Bounded: MAX_GENERIC_DEPTH and MAX_GENERIC_FN_INSTANCES per
  *      function, the polymorphic-recursion cap.
  *
  * Bindings are SOUND by construction: the bound type is the argument's own
@@ -2019,19 +2066,14 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       if (inst.implicitState === "lowering") inst.returnPinned = true;
       return inst;
     }
-    if (info.instances.size >= MAX_GENERIC_INSTANCES) {
-      L.unsupported(
-        "SC1090",
-        blame,
-        `unbounded implicit-any instantiation ('${info.baseName}' exceeded ` +
-          `${MAX_GENERIC_INSTANCES} instances — polymorphic recursion?)`,
-      );
-    }
+    const bound = instanceBoundExceeded(info, "implicit-any");
+    if (bound !== null) L.unsupported("SC1090", blame, bound);
     const rendered = shapes.map((s) => L.fmt(s.type)).join(", ");
     const declared = implicitDeclaredReturn(L, info);
     inst = {
       name: `${info.qualifiedName}%${info.instances.size}`,
       ordinal: info.instances.size,
+      ...instanceParent(),
       params: shapes,
       // The promise callers rely on before the body settles it: the
       // declared truth when it maps, else DYN (the recursion pin — and
@@ -2159,13 +2201,14 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
     if (existing.implicitState === "lowering") existing.returnPinned = true;
     return existing;
   }
-  if (info.instances.size >= MAX_GENERIC_INSTANCES) return null;
+  if (instanceBoundExceeded(info, "width") !== null) return null;
   const rendered = shapes.map((s) => L.fmt(s.type)).join(", ");
   const declared = implicitDeclaredReturn(L, info);
   if (declared === null) return null;
   const inst: GenericInstance = {
     name: `${info.qualifiedName}%${info.instances.size}`,
     ordinal: info.instances.size,
+    ...instanceParent(),
     params: shapes,
     returnType: declared,
     bindings: new Map(),

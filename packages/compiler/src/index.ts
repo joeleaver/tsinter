@@ -28,8 +28,8 @@ import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.
 import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
-import { EntryLoadError, canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath } from "./frontend/npm-static.js";
+import { EntryLoadError, canonicalBuiltinModule, checkPreflight, clearImportEdgeMemo, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
@@ -382,6 +382,18 @@ function ts7IsImportWithStringSpec(stmt: unknown): stmt is { moduleSpecifier: { 
   return typeof s.moduleSpecifier?.text === "string";
 }
 
+/** One diagnostic's identity across loads of the same program (a type error
+ * the base program and a probe load both report has the same anchor and
+ * text). */
+function diagKey(d: ScrDiagnostic): string {
+  return `${d.code} ${d.loc.file}:${d.loc.start}:${d.loc.end} ${d.message}`;
+}
+
+/** The SC0001 (type-check) diagnostics of one load, as diagKeys. */
+function sc0001Keys(diags: readonly ScrDiagnostic[]): Set<string> {
+  return new Set(diags.filter((d) => d.code === "SC0001").map(diagKey));
+}
+
 /** The opted-in packages a consumer-anchored tsc message NAMES: module
  * specifiers in `Module '"spec"'` phrasings, and resolved file paths in
  * `import("…")` type spellings — the two ways the checker points at an
@@ -420,14 +432,27 @@ function frontendOrGate(entryPath: string, npmStatic?: readonly string[] | "auto
 }
 
 function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
+  clearImportEdgeMemo();
+  try {
+    return runFrontendLoads(entryPath, npmStatic);
+  } finally {
+    // The reloads are over: the memo's file texts need not outlive them.
+    clearImportEdgeMemo();
+  }
+}
+
+function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
   const statuses: NpmStaticStatus[] = [];
   const npmSites = new Map<string, SrcLoc>();
   const judged = new Set<string>();
   let requested: string[] = [];
+  // The base program's own type errors (SC0001 keys, no package opted in):
+  // the scout's, or loaded once if the solo probes need it.
+  let baseSC0001: Set<string> | null = null;
   if (npmStatic === "auto" || npmStatic === "lib") {
     const scout = loadProgram(entryPath);
     try {
-      checkPreflight(scout);
+      baseSC0001 = sc0001Keys(checkPreflight(scout));
       requested =
         npmStatic === "lib"
           ? detectAutoPackages(scout, statuses, "lib", judged, npmSites)
@@ -526,8 +551,26 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
   // program against its shipped declarations, exactly as the project's own
   // tsc does: a program error against them is the program's own, never a
   // reason to drop the package (the island would type it the same way).
+  //
+  // Attribution is measured against the BASE program (no package opted
+  // in; the scout's load when there was one): a type error the base has
+  // too is the program's own, so it neither drops a package nor needs a
+  // probe. A probe drops its package only for SC0001s the base lacks, and
+  // when every remaining SC0001 is the base's, nothing is attributable and
+  // no probe runs (each probe is a full load).
   const inferredOnly = [...effective].filter((p) => !npmStaticHasDtsView(p));
-  if (inferredOnly.length > 0 && preflight.some((d) => d.code === "SC0001")) {
+  const beyondBase = (diags: readonly ScrDiagnostic[], base: ReadonlySet<string>): ScrDiagnostic[] =>
+    diags.filter((d) => d.code === "SC0001" && !base.has(diagKey(d)));
+  if (inferredOnly.length > 0 && preflight.some((d) => d.code === "SC0001") && baseSC0001 === null) {
+    const baseLoad = loadProgram(entryPath, { npmStatic: [] });
+    try {
+      baseSC0001 = sc0001Keys(checkPreflight(baseLoad));
+    } finally {
+      baseLoad.dispose();
+    }
+  }
+  const base = baseSC0001 ?? new Set<string>();
+  if (inferredOnly.length > 0 && beyondBase(preflight, base).length > 0) {
     const dropWithNote = (p: string): void => {
       effective.delete(p);
       statuses.push({
@@ -545,24 +588,20 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
     // always independent — each package's inferred surface breaks its own
     // import sites), then reload with the survivors; interaction effects
     // that still fail drop everything left.
-    // A probe is measured against the no-opt-in load: errors the program
-    // has against declarations (a viewed package's, or its own) are not
-    // the probed package's.
-    const errorsOf = (pkgs: string[]): number => {
+    const newErrorsOf = (pkgs: string[]): number => {
       const probe = loadProgram(entryPath, { npmStatic: pkgs });
-      const n = checkPreflight(probe).filter((d) => d.code === "SC0001").length;
+      const n = beyondBase(checkPreflight(probe), base).length;
       probe.dispose();
       return n;
     };
-    const baseline = errorsOf([]);
     for (const p of inferredOnly) {
-      if (errorsOf([p]) > baseline) dropWithNote(p);
+      if (newErrorsOf([p]) > 0) dropWithNote(p);
     }
     load.dispose();
     load = loadProgram(entryPath, { npmStatic: effective });
     preflight = checkPreflight(load);
     const left = inferredOnly.filter((p) => effective.has(p));
-    if (preflight.filter((d) => d.code === "SC0001").length > baseline && left.length > 0) {
+    if (beyondBase(preflight, base).length > 0 && left.length > 0) {
       for (const p of left) dropWithNote(p);
       load.dispose();
       load = loadProgram(entryPath, { npmStatic: effective });
