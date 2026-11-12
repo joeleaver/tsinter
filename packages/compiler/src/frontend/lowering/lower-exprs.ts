@@ -8,7 +8,7 @@ import { wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
-import { isDynClassDecl, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
+import { builtinBoxOperand, isDynClassDecl, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
@@ -11242,7 +11242,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // jsvalIn's honest fences.
     if (L.isIslandExpr(expr.right) && !L.caughtLocalOf(expr.left)) {
       const left = L.jsvalIn(L.lowerExpr(expr.left), expr.left);
-      const right = L.lowerExpr(expr.right);
+      // Units U3 + U4: `Error` here is its dynamic value (lower-objmodel.ts).
+      const right = builtinBoxOperand(L, expr.right) ?? L.lowerExpr(expr.right);
       return { kind: "jsOp", op: "instanceOf", args: [left, right], type: BOOL, loc };
     }
     const rhsSymbol = ts.isIdentifier(expr.right) ? L.resolveValueSymbol(expr.right) : null;

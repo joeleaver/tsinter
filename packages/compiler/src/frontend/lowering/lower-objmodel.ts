@@ -921,10 +921,26 @@ export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null
 export function lowerBuiltinBox(L: Lowerer, id: ts.Identifier): IrExpr | null {
   const name = builtinBoxPosition(L, id);
   if (name === null) return null;
+  return builtinBoxValue(L, id, name);
+}
+
+/** The right side of `v instanceof Error` on the dynamic path: the Error
+ * value (objmodel.ts instanceOf answers isError for it). */
+export function builtinBoxOperand(L: Lowerer, right: ts.Expression): IrExpr | null {
+  const r = strip(right);
+  if (!omActive(L) || !ts.isIdentifier(r) || r.text !== "Error" || !L.isStdlibGlobal(r, "Error")) return null;
+  return builtinBoxValue(L, r, "Error");
+}
+
+function builtinBoxValue(L: Lowerer, id: ts.Identifier, name: string): IrExpr {
   const loc = locOf(id);
   // globalThis: the globals the standard library declares (read through
   // the value, each stops by name)
-  const globals = name === "globalThis" ? L.checker.getPropertiesOfType(L.checker.getTypeAtLocation(id)).map((p) => p.name).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n)).join("\n") : "";
+  // (the fallback ambient declares `console` block-scoped, so it is no
+  // property of the type there; Node's global object carries it)
+  const names = name === "globalThis" ? L.checker.getPropertiesOfType(L.checker.getTypeAtLocation(id)).map((p) => p.name).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n)) : [];
+  if (name === "globalThis" && !names.includes("console")) names.push("console");
+  const globals = names.join("\n");
   return lib("om.builtinValue", [{ kind: "strLit", value: name, type: STRING, loc } as IrExpr, { kind: "strLit", value: globals, type: STRING, loc } as IrExpr], loc);
 }
 
@@ -937,7 +953,10 @@ export function lowerBuiltinBoxCall(L: Lowerer, call: ts.CallExpression): IrExpr
   if (box === null) return null;
   if (call.arguments.some((a) => ts.isSpreadElement(a))) return null;
   const loc = locOf(call);
-  return { kind: "jsOp", op: "callMethod", name: callee.name.text, args: [box, ...call.arguments.map((a) => js(L, a))], type: JSVAL, loc } as IrExpr;
+  // the member read off the value, then called (these statics ignore
+  // their receiver)
+  const fn: IrExpr = { kind: "jsOp", op: "getProp", name: callee.name.text, args: [box], type: JSVAL, loc } as IrExpr;
+  return { kind: "jsOp", op: "callFn", args: [fn, ...call.arguments.map((a) => js(L, a))], type: JSVAL, loc, spelling: callee.getText() } as IrExpr;
 }
 
 /** `class X extends <dynamic> {}` (no members) in a JavaScript function
