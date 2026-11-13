@@ -36,7 +36,7 @@ import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
 import { lowerToIr, type LowerOptions, type LowerResult } from "./frontend/lowering/lowerer.js";
 import { LibHostState, setLibHost } from "./frontend/lib-host.js";
 import { DEFAULT_MAX_DEPTH, loadWasmProfile, type WasmLibProfile } from "./library/wasm-profile.js";
-import { wasmLibAsyncExportDiag, wasmLibCapabilityDiag, wasmLibExportUnresolvedDiag, wasmLibGenericExportDiag, wasmLibSignatureDiag } from "./diagnostics/diagnostic.js";
+import { wasmLibArityDiag, wasmLibAsyncExportDiag, wasmLibCapabilityDiag, wasmLibExportUnresolvedDiag, wasmLibGenericExportDiag, wasmLibSignatureDiag } from "./diagnostics/diagnostic.js";
 import { typeEquals, wasmLibClassType, type IrWasmLib, type IrWasmLibClass } from "./ir/nodes.js";
 import type { CoverageInput, NpmStaticStatus } from "./coverage/report.js";
 import { loadFfiProfile, type FfiProfile } from "./ffi/profile.js";
@@ -1793,7 +1793,7 @@ async function compileWasmLibrary(entryPath: string, opts: CompileOptions, lib: 
         if (info.generic) diags.push(wasmLibGenericExportDiag(name, info.loc));
         else if (info.async || info.generator) diags.push(wasmLibAsyncExportDiag(name, info.async ? "async" : "generator", info.loc));
       }
-      for (const reserved of ["_initialize", "memory", "tsinter_error_ptr", "tsinter_error_len"]) {
+      for (const reserved of ["_initialize", "memory", "tsinter_error_ptr", "tsinter_error_len", "tsinter_alloc", ...(profile?.alloc != null ? [profile.alloc] : [])]) {
         if (exportNames.includes(reserved)) diags.push(wasmLibExportUnresolvedDiag(reserved, "the name is the module's own (reserved in library mode)", entryInfo.get(reserved)?.loc ?? entryLoc));
       }
       if (diags.length > 0) return fail(diags);
@@ -1877,6 +1877,33 @@ async function compileWasmLibrary(entryPath: string, opts: CompileOptions, lib: 
         maxDepth: profile?.maxDepth ?? DEFAULT_MAX_DEPTH,
         initialize: profile === null,
       };
+      // SC4025: the wasm-level arity cap (wasm-bindgen's JS closures take at
+      // most 8), counted on every import a call reaches; a pointer class is
+      // two wasm parameters.
+      if (profile?.maxImportParams != null) {
+        const limit = profile.maxImportParams;
+        const seenArity = new Set<string>();
+        const visit = (node: unknown): void => {
+          if (Array.isArray(node)) {
+            for (const n of node) visit(n);
+            return;
+          }
+          if (node === null || typeof node !== "object") return;
+          const o = node as { kind?: unknown; module?: string; name?: string; loc?: SrcLoc };
+          if (o.kind === "hostCall" && o.module !== "tsinter:memory") {
+            const key = `${o.module}.${o.name}`;
+            const imp = mod.wasmLib!.imports.find((i) => i.module === o.module && i.name === o.name);
+            if (imp !== undefined && !seenArity.has(key)) {
+              seenArity.add(key);
+              const arity = imp.params.reduce((n, c) => n + (c === "string" || c.startsWith("list<") ? 2 : 1), 0);
+              if (arity > limit) diags.push(wasmLibArityDiag(key, arity, limit, o.loc ?? entryLoc));
+            }
+          }
+          for (const v of Object.values(o)) if (v !== null && typeof v === "object") visit(v);
+        };
+        for (const f of mod.functions) visit(f.body);
+        if (diags.length > 0) return fail(diags);
+      }
       const validation = validateModule(mod);
       if (validation.length > 0) return fail(validation.map((v) => iceDiag(v.message, v.loc)));
       sourceTexts = fe.sourceTexts();
@@ -1913,7 +1940,7 @@ async function compileWasmLibrary(entryPath: string, opts: CompileOptions, lib: 
         ...w.exports.map((e) => ({ name: e.name, params: [...e.params], result: e.result, ...(e.constant !== undefined ? { constant: true as const } : {}) })),
       ],
       imports: w.imports.map((i) => ({ module: i.module, name: i.name, params: [...i.params], result: i.result, ...(i.role !== null ? { role: i.role } : {}) })),
-      alloc: w.alloc,
+      alloc: w.alloc ?? (w.exports.some((e) => e.params.some((p) => p === "string" || p.startsWith("list<"))) ? "tsinter_alloc" : null),
       report: w.report,
       maxDepth: w.maxDepth,
   };

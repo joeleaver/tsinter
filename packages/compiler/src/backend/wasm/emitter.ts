@@ -827,6 +827,17 @@ const LIB_FRESH = 0; // module evaluation has not run
 const LIB_IDLE = 1; // evaluated, no export call running
 const LIB_IN_CALL = 2; // an export call is running (seen at entry: it trapped)
 const LIB_STOPPED = 3; // a failure reported and trapped
+/** S147: the library contract's memory limit (1 GiB) and the heap's block
+ * tags. */
+const LIB_MEM_CAP_PAGES = 16384;
+const LIB_TAG_LIVE = 0xa110c8ed | 0;
+const LIB_TAG_FREE = 0xf4eeb10c | 0;
+/** The module name of the linear-memory intrinsics (design §3.2). */
+const MEMORY_MODULE = "tsinter:memory";
+
+function isPointerCls(cls: IrWasmLibClass): boolean {
+  return cls === "string" || cls.startsWith("list<");
+}
 
 /** The wasm parameters of one library class (a pointer class is two). */
 function wasmLibValTypes(cls: IrWasmLibClass): ValType[] {
@@ -4300,6 +4311,7 @@ class Assembler {
     if (this.lib !== null) {
       c.i32Const(LIB_CODE_FENCE);
       c.globalSet(this.libCodeG);
+      this.libResetScratch(c);
     }
     this.pushStrLitInto(c, FENCE_FATAL_PREFIX);
     c.call(out.stage);
@@ -4753,6 +4765,7 @@ class Assembler {
     if (this.lib !== null) {
       c.i32Const(LIB_CODE_UNCAUGHT);
       c.globalSet(this.libCodeG);
+      this.libResetScratch(c);
     }
     c.call(this.renderUncaughtHelper());
     c.unreachable();
@@ -8354,6 +8367,8 @@ class Assembler {
       out: () => this.ensureHelpers(),
       lit: (c, s) => this.pushStrLitInto(c, s),
       exitDrainFatal: (c) => {
+        // library mode: the failure text starts on a clean scratch arena
+        if (this.lib !== null) this.libResetScratch(c);
         if (!this.needsExitDrain) return;
         c.i32Const(1);
         c.call(this.proc.exitDrainHelper());
@@ -54062,6 +54077,11 @@ class Assembler {
   private libErrLenG = -1;
   private libDepthG = -1;
   private libReportingG = -1;
+  /** The scratch arena's base (the persistent heap sits below it and
+   * moves it up as it grows), the heap's top, the free list's head. */
+  private libStageBaseG = -1;
+  private libHeapTopG = -1;
+  private libFreeHeadG = -1;
   private libTrapFunc = -1;
   private libDepthFailFunc: number | null = null;
   private libFenceFunc: number | null = null;
@@ -54080,6 +54100,9 @@ class Assembler {
     this.libErrLenG = g(0);
     this.libDepthG = g(0);
     this.libReportingG = g(0);
+    this.libStageBaseG = g(LIB_STAGE_BASE);
+    this.libHeapTopG = g(LIB_STAGE_BASE);
+    this.libFreeHeadG = g(0);
     this.libTrapFunc = this.mb.declareFunc(this.mb.funcType([], []), "%lib.trap");
     setTrapHook(this.libTrapFunc);
     // SEMANTICS.md S146: one NaN payload wherever bits are observable.
@@ -54201,6 +54224,7 @@ class Assembler {
     }
     c.i32Const(code);
     c.globalSet(this.libCodeG);
+    this.libResetScratch(c);
     push(() => c.call(out.stage));
     c.i32Const(FD_STDERR);
     c.call(out.flush);
@@ -54345,6 +54369,17 @@ class Assembler {
         this.pushStrLitInto(c, site);
         c.call(this.libToI64(cls === "s64"));
         return;
+      case "string":
+        // UTF-8 at the cursor (lone surrogates become U+FFFD: S144)
+        this.emitFlat(c);
+        c.call(this.libStageStr());
+        return;
+      case "list<u8>":
+      case "list<s32>":
+      case "list<u32>":
+      case "list<f32>":
+        c.call(this.libStageList(cls === "list<u8>" ? 1 : 4));
+        return;
       default:
         this.refuse(`library:class:${cls}`, loc);
     }
@@ -54372,24 +54407,820 @@ class Assembler {
       case "u64":
         c.call(this.big.fromBits(cls === "s64"));
         return;
+      case "string":
+        c.i32Const(1);
+        c.call(this.libMemToBytes());
+        c.call(this.bytesB.toStrHelper("utf8"));
+        return;
+      case "list<u8>":
+      case "list<s32>":
+      case "list<u32>":
+      case "list<f32>":
+        c.i32Const(cls === "list<u8>" ? 1 : 4);
+        c.call(this.libMemToBytes());
+        return;
       default:
         this.refuse(`library:class:${cls}`, loc);
     }
   }
 
-  /** A host import call (IR hostCall). */
+  /** A host import call (IR hostCall). Pointer-class arguments are staged
+   * into the scratch arena, valid until the import returns: the cursor is
+   * restored after the call, so a loop of calls does not grow memory. */
   private walkHostCall(e: Extract<WExpr, { kind: "hostCall" }>): void {
+    if (e.module === MEMORY_MODULE) {
+      this.walkMemCall(e);
+      return;
+    }
     const code = this.fn.code;
     const key = `${e.module}.${e.name}`;
     const imp = this.lib?.imports.find((i) => i.module === e.module && i.name === e.name);
     const idx = this.libImports.get(key);
     if (imp === undefined || idx === undefined) throw new Error(`emitter bug: host call ${key} with no import`);
+    const pointers = imp.params.some((p) => isPointerCls(p));
+    let saved = -1;
+    if (pointers) {
+      saved = this.acquireScratch(I32);
+      code.globalGet(this.cursorGlobal);
+      code.localSet(saved);
+    }
     e.args.forEach((a, i) => {
       this.walkValue(a);
       this.libOutbound(code, imp.params[i]!, `argument ${i + 1} of ${key}`, e.loc);
     });
     code.call(idx);
+    if (pointers) {
+      code.localGet(saved);
+      code.globalSet(this.cursorGlobal);
+      this.releaseScratch(I32, saved);
+    }
     if (imp.result !== null) this.libInbound(code, imp.result, e.loc);
+  }
+
+
+  /** cursor = the scratch arena's base: the arena's contents are dead. */
+  private libResetScratch(c: Code): void {
+    c.globalGet(this.libStageBaseG);
+    c.globalSet(this.cursorGlobal);
+  }
+
+  private libMemFenceFunc: number | null = null;
+  /** `%lib.memFence(what, p)` — a linear-memory access outside memory
+   * (tsinter:memory, a host-supplied pointer): a fence (S143). */
+  private libMemFence(): number {
+    if (this.libMemFenceFunc !== null) return this.libMemFenceFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef, F64], []), "%lib.memFence");
+    this.libMemFenceFunc = idx;
+    const c = new Code();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: ");
+      stage();
+      c.localGet(0);
+      stage();
+      this.pushStrLitInto(c, " is outside the module's memory: ");
+      stage();
+      c.localGet(1);
+      c.call(this.f64ToStrHelper());
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private libCheckRangeFunc: number | null = null;
+  /** `%lib.checkRange(p, n, what) → p`: [p, p+n) inside memory, p an
+   * integral number ≥ 0; else the memory fence. */
+  private libCheckRange(): number {
+    if (this.libCheckRangeFunc !== null) return this.libCheckRangeFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64, this.strRef], [I32]), "%lib.checkRange");
+    this.libCheckRangeFunc = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.localGet(0);
+    c.f64Trunc();
+    c.f64Eq();
+    c.localGet(0);
+    c.f64Const(0);
+    c.f64Ge();
+    c.i32And();
+    c.localGet(1);
+    c.f64Const(0);
+    c.f64Ge();
+    c.i32And();
+    c.localGet(0);
+    c.localGet(1);
+    c.f64Add();
+    c.memorySize();
+    c.f64ConvertI32U();
+    c.f64Const(65536);
+    c.f64Mul();
+    c.f64Le();
+    c.i32And();
+    c.ifVoid();
+    c.localGet(0);
+    c.i32TruncF64U();
+    c.return_();
+    c.end();
+    c.localGet(2);
+    c.localGet(0);
+    c.call(this.libMemFence());
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private libMemToBytesFunc: number | null = null;
+  /** `%lib.memToBytes(ptr, len, esize) → bytes`: a fresh typed array holding
+   * a copy of `len` elements at ptr (host-written inbound data). */
+  private libMemToBytes(): number {
+    if (this.libMemToBytesFunc !== null) return this.libMemToBytesFunc;
+    const bt = this.bytesB.bytesType();
+    const buf = this.bytesB.bufType();
+    const idx = this.mb.declareFunc(this.mb.funcType([I32, I32, I32], [this.bytesB.bytesRef()]), "%lib.memToBytes");
+    this.libMemToBytesFunc = idx;
+    const c = new Code();
+    const P = 0, LEN = 1, ES = 2, N = 3, I = 4, B = 5;
+    c.localGet(LEN);
+    c.localGet(ES);
+    c.i32Mul();
+    c.localSet(N);
+    // inside memory (unsigned: a pointer near 2^32 wraps negative)
+    c.localGet(P);
+    c.i64ExtendI32U();
+    c.localGet(N);
+    c.i64ExtendI32U();
+    c.i64Add();
+    c.memorySize();
+    c.i64ExtendI32U();
+    c.i64Const(16n);
+    c.i64Shl();
+    c.i64GtU();
+    c.ifVoid();
+    this.pushStrLitInto(c, "an inbound buffer");
+    c.localGet(P);
+    c.f64ConvertI32U();
+    c.call(this.libMemFence());
+    c.end();
+    c.localGet(N);
+    c.arrayNewDefault(buf);
+    c.localSet(B);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(B);
+    c.localGet(I);
+    c.localGet(P);
+    c.localGet(I);
+    c.i32Add();
+    c.i32Load8U();
+    c.arraySet(buf);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(B);
+    c.refAsNonNull();
+    c.i32Const(0);
+    c.localGet(LEN);
+    c.structNew(bt);
+    this.mb.setBody(idx, [I32, I32, { kind: "ref", nullable: true, typeIndex: buf }], c.bytes());
+    return idx;
+  }
+
+  private libStageStrFunc: number | null = null;
+  /** `%lib.stageStr(str) → (ptr, len)`: the string's UTF-8 at the cursor. */
+  private libStageStr(): number {
+    if (this.libStageStrFunc !== null) return this.libStageStrFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [I32, I32]), "%lib.stageStr");
+    this.libStageStrFunc = idx;
+    const c = new Code();
+    const out = this.ensureHelpers();
+    c.globalGet(this.cursorGlobal);
+    c.localSet(1);
+    c.localGet(0);
+    c.call(out.stage);
+    c.localGet(1);
+    c.globalGet(this.cursorGlobal);
+    c.localGet(1);
+    c.i32Sub();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private readonly libStageListFns = new Map<number, number>();
+  /** `%lib.stageList(bytes) → (ptr, len)`: a typed array's elements at the
+   * cursor, aligned to the element size; len in elements. */
+  private libStageList(esize: number): number {
+    const hit = this.libStageListFns.get(esize);
+    if (hit !== undefined) return hit;
+    const bt = this.bytesB.bytesType();
+    const buf = this.bytesB.bufType();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.bytesB.bytesRef()], [I32, I32]), `%lib.stageList${esize}`);
+    this.libStageListFns.set(esize, idx);
+    const c = new Code();
+    const B = 0, N = 1, I = 2, P = 3, OFF = 4;
+    // align the cursor
+    c.globalGet(this.cursorGlobal);
+    c.i32Const(esize - 1);
+    c.i32Add();
+    c.i32Const(-esize);
+    c.i32And();
+    c.globalSet(this.cursorGlobal);
+    c.localGet(B);
+    c.structGet(bt, 2);
+    c.i32Const(esize);
+    c.i32Mul();
+    c.localSet(N);
+    this.emitEnsureCapacity(c, () => c.localGet(N));
+    c.globalGet(this.cursorGlobal);
+    c.localSet(P);
+    c.localGet(B);
+    c.structGet(bt, 1);
+    c.localSet(OFF);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(P);
+    c.localGet(I);
+    c.i32Add();
+    c.localGet(B);
+    c.structGet(bt, 0);
+    c.localGet(OFF);
+    c.localGet(I);
+    c.i32Add();
+    c.arrayGetU(buf);
+    c.i32Store8();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(P);
+    c.localGet(N);
+    c.i32Add();
+    c.globalSet(this.cursorGlobal);
+    c.localGet(P);
+    c.localGet(B);
+    c.structGet(bt, 2);
+    this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private libAllocFunc: number | null = null;
+  private libFreeFunc: number | null = null;
+  private libGrowFunc: number | null = null;
+  private libCorruptFunc: number | null = null;
+
+  /** `%lib.grow(top: i64)`: linear memory reaches at least `top` bytes, or
+   * the named stop: past the library contract's limit (S147) or a failed
+   * memory.grow. Never a wrap. */
+  private libGrow(): number {
+    if (this.libGrowFunc !== null) return this.libGrowFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I64], []), "%lib.grow");
+    this.libGrowFunc = idx;
+    const c = new Code();
+    const fail = (): void => {
+      this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+        this.pushStrLitInto(c, `tsinter: the module's memory would pass its ${LIB_MEM_CAP_PAGES / 16384} GiB limit`);
+        stage();
+      });
+      c.unreachable();
+    };
+    c.localGet(0);
+    c.i64Const(BigInt(LIB_MEM_CAP_PAGES) * 65536n);
+    c.i64GtU();
+    c.ifVoid();
+    fail();
+    c.end();
+    c.localGet(0);
+    c.memorySize();
+    c.i64ExtendI32U();
+    c.i64Const(16n);
+    c.i64Shl();
+    c.i64GtU();
+    c.ifVoid();
+    // pages = ceil((top - size) / 64 KiB)
+    c.localGet(0);
+    c.memorySize();
+    c.i64ExtendI32U();
+    c.i64Const(16n);
+    c.i64Shl();
+    c.i64Sub();
+    c.i64Const(0xffffn);
+    c.i64Add();
+    c.i64Const(16n);
+    c.i64ShrU();
+    c.i32WrapI64();
+    c.memoryGrow();
+    c.i32Const(-1);
+    c.i32Eq();
+    c.ifVoid();
+    fail();
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.corrupt()`: a block header the heap did not write (S147). */
+  private libCorrupt(): number {
+    if (this.libCorruptFunc !== null) return this.libCorruptFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%lib.corrupt");
+    this.libCorruptFunc = idx;
+    const c = new Code();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: the tsinter:memory heap is corrupted (a write past the end of a block?)");
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.alloc(n) → p` (SEMANTICS.md S147): the persistent heap, at
+   * [LIB_STAGE_BASE, heapTop), below the scratch arena. A block is an
+   * 8-byte header [payload size, tag] and its payload (8-aligned, at least
+   * 8 bytes); a free block's payload starts with the next free block. The
+   * free list is searched first fit, in free order (the last freed first);
+   * else the heap grows at its top, moving the scratch arena's base up,
+   * which needs the arena empty (a fence otherwise: its pointers would
+   * move). The payload is handed out zeroed. tsinter:memory's shim in the
+   * harness is a line-for-line model of this. */
+  private libAlloc(): number {
+    if (this.libAllocFunc !== null) return this.libAllocFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%lib.alloc");
+    this.libAllocFunc = idx;
+    const c = new Code();
+    const N = 0, SZ = 1, B = 2, PREV = 3, TOP = 4;
+    // the payload size, 8-aligned, at least 8 (n < 2^31: no overflow)
+    c.localGet(N);
+    c.i32Const(7);
+    c.i32Add();
+    c.i32Const(-8);
+    c.i32And();
+    c.localSet(SZ);
+    c.localGet(SZ);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(8);
+    c.localSet(SZ);
+    c.end();
+    c.globalGet(this.libFreeHeadG);
+    c.localSet(B);
+    c.block();
+    c.loop();
+    c.localGet(B);
+    c.i32Eqz();
+    c.brIf(1);
+    // a free block's header must be the heap's own
+    c.localGet(B);
+    c.i32Const(LIB_STAGE_BASE);
+    c.i32LtU();
+    c.localGet(B);
+    c.globalGet(this.libHeapTopG);
+    c.i32GeU();
+    c.i32Or();
+    c.localGet(B);
+    c.i32Const(7);
+    c.i32And();
+    c.i32Or();
+    c.ifVoid();
+    c.call(this.libCorrupt());
+    c.end();
+    c.localGet(B);
+    c.load32At(4);
+    c.i32Const(LIB_TAG_FREE);
+    c.i32Ne();
+    c.ifVoid();
+    c.call(this.libCorrupt());
+    c.end();
+    c.localGet(B);
+    c.load32At(0);
+    c.localGet(SZ);
+    c.i32GeU();
+    c.ifVoid();
+    // unlink: prev.next (or the head) = this.next
+    c.localGet(PREV);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(B);
+    c.load32At(8);
+    c.globalSet(this.libFreeHeadG);
+    c.else_();
+    c.localGet(PREV);
+    c.localGet(B);
+    c.load32At(8);
+    c.store32At(8);
+    c.end();
+    c.localGet(B);
+    c.i32Const(LIB_TAG_LIVE);
+    c.store32At(4);
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.i32Const(0);
+    c.localGet(B);
+    c.load32At(0);
+    c.memoryFill();
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.return_();
+    c.end();
+    c.localGet(B);
+    c.localSet(PREV);
+    c.localGet(B);
+    c.load32At(8);
+    c.localSet(B);
+    c.br(0);
+    c.end();
+    c.end();
+    // grow at the top: the scratch arena must be empty
+    c.globalGet(this.cursorGlobal);
+    c.globalGet(this.libStageBaseG);
+    c.i32Ne();
+    c.ifVoid();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: mem.alloc needs to grow the heap while this call's scratch is in use; allocate before using mem.scratch in the call");
+      stage();
+    });
+    c.unreachable();
+    c.end();
+    c.globalGet(this.libHeapTopG);
+    c.localSet(B);
+    c.localGet(B);
+    c.i64ExtendI32U();
+    c.i64Const(8n);
+    c.i64Add();
+    c.localGet(SZ);
+    c.i64ExtendI32U();
+    c.i64Add();
+    c.call(this.libGrow());
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.localGet(SZ);
+    c.i32Add();
+    c.localSet(TOP);
+    c.localGet(B);
+    c.localGet(SZ);
+    c.store32At(0);
+    c.localGet(B);
+    c.i32Const(LIB_TAG_LIVE);
+    c.store32At(4);
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.i32Const(0);
+    c.localGet(SZ);
+    c.memoryFill();
+    c.localGet(TOP);
+    c.globalSet(this.libHeapTopG);
+    c.localGet(TOP);
+    c.globalSet(this.libStageBaseG);
+    c.localGet(TOP);
+    c.globalSet(this.cursorGlobal);
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.free(p)` (S147): p must start a live block — the heap is walked
+   * block by block from its base to find it (an interior pointer, a
+   * pointer mem.alloc never returned and a double free stop by name, as
+   * does a header the walk cannot follow); 0 is a no-op. The block goes on
+   * the free list's head. */
+  private libFree(): number {
+    if (this.libFreeFunc !== null) return this.libFreeFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], []), "%lib.free");
+    this.libFreeFunc = idx;
+    const c = new Code();
+    const P = 0, B = 1, SZ = 2;
+    c.localGet(P);
+    c.i32Eqz();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.i32Const(LIB_STAGE_BASE);
+    c.localSet(B);
+    c.block();
+    c.loop();
+    c.localGet(B);
+    c.globalGet(this.libHeapTopG);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(B);
+    c.load32At(0);
+    c.localSet(SZ);
+    // a header the walk cannot follow
+    c.localGet(SZ);
+    c.i32Eqz();
+    c.localGet(SZ);
+    c.i32Const(7);
+    c.i32And();
+    c.i32Or();
+    c.localGet(SZ);
+    c.globalGet(this.libHeapTopG);
+    c.localGet(B);
+    c.i32Sub();
+    c.i32Const(8);
+    c.i32Sub();
+    c.i32GtU();
+    c.i32Or();
+    c.ifVoid();
+    c.call(this.libCorrupt());
+    c.end();
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.localGet(P);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(B);
+    c.load32At(4);
+    c.i32Const(LIB_TAG_LIVE);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(B);
+    c.i32Const(LIB_TAG_FREE);
+    c.store32At(4);
+    c.localGet(B);
+    c.globalGet(this.libFreeHeadG);
+    c.store32At(8);
+    c.localGet(B);
+    c.globalSet(this.libFreeHeadG);
+    c.return_();
+    c.end();
+    c.br(2);
+    c.end();
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.localGet(SZ);
+    c.i32Add();
+    c.localSet(B);
+    c.br(0);
+    c.end();
+    c.end();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: mem.free(");
+      stage();
+      c.localGet(P);
+      c.f64ConvertI32U();
+      c.call(this.f64ToStrHelper());
+      stage();
+      this.pushStrLitInto(c, ") is not a live block: an interior pointer, a pointer mem.alloc did not return, or a double free");
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [I32, I32], c.bytes());
+    return idx;
+  }
+
+  /** tsinter:memory (design §3.2): reads, writes, scratch, the heap, UTF-8
+   * and typed-array copies over the module's linear memory, little-endian
+   * and bounds-checked. */
+  private walkMemCall(e: Extract<WExpr, { kind: "hostCall" }>): void {
+    const code = this.fn.code;
+    const name = e.name;
+    const what = `mem.${name}`;
+    const range = (size: number | null): void => {
+      // stack: p (f64) [, n (f64) when size is null]
+      if (size !== null) code.f64Const(size);
+      this.pushStrLitInto(code, what);
+      code.call(this.libCheckRange());
+    };
+    const sizes: Record<string, number> = { u8: 1, i32: 4, u32: 4, f32: 4, f64: 8 };
+    if (name in sizes) {
+      this.walkValue(e.args[0]!);
+      range(sizes[name]!);
+      switch (name) {
+        case "u8":
+          code.i32Load8U();
+          code.f64ConvertI32U();
+          break;
+        case "i32":
+          code.load32At(0);
+          code.f64ConvertI32S();
+          break;
+        case "u32":
+          code.load32At(0);
+          code.f64ConvertI32U();
+          break;
+        case "f32":
+          code.load32At(0);
+          code.f32ReinterpretI32();
+          code.f64PromoteF32();
+          break;
+        default:
+          code.f64Load();
+      }
+      return;
+    }
+    const setters: Record<string, string> = { setU8: "u8", setI32: "s32", setU32: "u32", setF32: "f32", setF64: "f64" };
+    if (name in setters) {
+      const cls = setters[name]!;
+      this.walkValue(e.args[0]!);
+      range(cls === "u8" ? 1 : cls === "f64" ? 8 : 4);
+      this.walkValue(e.args[1]!);
+      switch (cls) {
+        case "u8": {
+          code.f64Const(0);
+          code.f64Const(255);
+          this.pushStrLitInto(code, `the value of ${what}`);
+          this.pushStrLitInto(code, "u8");
+          code.call(this.libToI32());
+          code.i32Store8();
+          break;
+        }
+        case "s32":
+        case "u32":
+          this.libOutbound(code, cls, `the value of ${what}`, e.loc);
+          code.store32At(0);
+          break;
+        case "f32":
+          code.canonNaN();
+          code.f32DemoteF64();
+          code.i32ReinterpretF32();
+          code.store32At(0);
+          break;
+        default: {
+          code.canonNaN();
+          const v = this.acquireScratch(F64);
+          code.localSet(v);
+          const p = this.acquireScratch(I32);
+          code.localSet(p);
+          code.localGet(p);
+          code.localGet(v);
+          code.i64ReinterpretF64();
+          code.store64At(0);
+          this.releaseScratch(I32, p);
+          this.releaseScratch(F64, v);
+        }
+      }
+      return;
+    }
+    switch (name) {
+      case "scratch": {
+        // n bytes at the cursor, 8-aligned; valid until this export call
+        // returns
+        this.walkValue(e.args[0]!);
+        code.f64Const(0);
+        code.f64Const(2147483647);
+        this.pushStrLitInto(code, `the size of ${what}`);
+        this.pushStrLitInto(code, "u32");
+        code.call(this.libToI32());
+        code.call(this.libScratch());
+        code.f64ConvertI32U();
+        return;
+      }
+      case "alloc":
+        this.walkValue(e.args[0]!);
+        code.f64Const(0);
+        code.f64Const(2147483647);
+        this.pushStrLitInto(code, `the size of ${what}`);
+        this.pushStrLitInto(code, "u32");
+        code.call(this.libToI32());
+        code.call(this.libAlloc());
+        code.f64ConvertI32U();
+        return;
+      case "free":
+        this.walkValue(e.args[0]!);
+        code.f64Const(0);
+        code.f64Const(4294967295);
+        this.pushStrLitInto(code, `the pointer of ${what}`);
+        this.pushStrLitInto(code, "u32");
+        code.call(this.libToI32());
+        code.call(this.libFree());
+        return;
+      case "utf8":
+      case "copyU8":
+      case "copyI32":
+      case "copyU32":
+      case "copyF32": {
+        const es = name === "utf8" || name === "copyU8" ? 1 : 4;
+        const p = this.acquireScratch(F64);
+        const n = this.acquireScratch(F64);
+        this.walkValue(e.args[0]!);
+        code.localSet(p);
+        this.walkValue(e.args[1]!);
+        code.localSet(n);
+        // the count must be a u32; the range is checked in bytes
+        code.localGet(n);
+        code.f64Const(0);
+        code.f64Const(2147483647);
+        this.pushStrLitInto(code, `the length of ${what}`);
+        this.pushStrLitInto(code, "u32");
+        code.call(this.libToI32());
+        code.drop();
+        code.localGet(p);
+        code.localGet(n);
+        code.f64Const(es);
+        code.f64Mul();
+        this.pushStrLitInto(code, what);
+        code.call(this.libCheckRange());
+        code.localGet(n);
+        code.i32TruncF64U();
+        code.i32Const(es);
+        code.call(this.libMemToBytes());
+        if (name === "utf8") code.call(this.bytesB.toStrHelper("utf8"));
+        this.releaseScratch(F64, n);
+        this.releaseScratch(F64, p);
+        return;
+      }
+      default:
+        throw new Error(`emitter bug: tsinter:memory has no ${name}`);
+    }
+  }
+
+  private libBytesToMemFunc: number | null = null;
+  /** `%lib.bytesToMem(bytes, dst)`: a typed array's storage bytes at dst. */
+  private libBytesToMem(): number {
+    if (this.libBytesToMemFunc !== null) return this.libBytesToMemFunc;
+    const bt = this.bytesB.bytesType();
+    const buf = this.bytesB.bufType();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.bytesB.bytesRef(), I32, I32], []), "%lib.bytesToMem");
+    this.libBytesToMemFunc = idx;
+    const c = new Code();
+    const B = 0, D = 1, ES = 2, N = 3, I = 4, OFF = 5;
+    // the elements' bytes only (a view may sit inside a longer buffer)
+    c.localGet(B);
+    c.structGet(bt, 2);
+    c.localGet(ES);
+    c.i32Mul();
+    c.localSet(N);
+    c.localGet(B);
+    c.structGet(bt, 1);
+    c.localSet(OFF);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(D);
+    c.localGet(I);
+    c.i32Add();
+    c.localGet(B);
+    c.structGet(bt, 0);
+    c.localGet(OFF);
+    c.localGet(I);
+    c.i32Add();
+    c.arrayGetU(buf);
+    c.i32Store8();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private libScratchFunc: number | null = null;
+  /** `%lib.scratch(n) → p`: n bytes of the scratch arena, 8-aligned. */
+  private libScratch(): number {
+    if (this.libScratchFunc !== null) return this.libScratchFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%lib.scratch");
+    this.libScratchFunc = idx;
+    const c = new Code();
+    c.globalGet(this.cursorGlobal);
+    c.i32Const(7);
+    c.i32Add();
+    c.i32Const(-8);
+    c.i32And();
+    c.globalSet(this.cursorGlobal);
+    this.emitEnsureCapacity(c, () => c.localGet(0));
+    // handed out zeroed (S147)
+    c.globalGet(this.cursorGlobal);
+    c.i32Const(0);
+    c.localGet(0);
+    c.memoryFill();
+    c.globalGet(this.cursorGlobal);
+    c.globalGet(this.cursorGlobal);
+    c.localGet(0);
+    c.i32Add();
+    c.globalSet(this.cursorGlobal);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   /** The poisoned-instance check at an export's entry. */
@@ -54427,8 +55258,8 @@ class Assembler {
       this.emitFirstCheckpoint(c);
       this.mb.setBody(evalIdx, [], c.bytes());
     }
-    const enter = (c: Code, name: string): void => {
-      this.libPoisonCheck(c, name);
+    const enter = (c: Code, name: string, checked = false): void => {
+      if (!checked) this.libPoisonCheck(c, name);
       c.globalGet(this.libStateG);
       c.i32Eqz();
       c.ifVoid();
@@ -54438,8 +55269,6 @@ class Assembler {
       c.end();
       c.i32Const(LIB_IN_CALL);
       c.globalSet(this.libStateG);
-      c.i32Const(LIB_STAGE_BASE);
-      c.globalSet(this.cursorGlobal);
       c.i32Const(0);
       c.globalSet(this.libDepthG);
     };
@@ -54451,6 +55280,7 @@ class Assembler {
       const idx = this.mb.declareFunc(this.mb.funcType([], []), "%lib._initialize");
       const c = new Code();
       enter(c, "_initialize");
+      this.libResetScratch(c);
       leave(c);
       this.mb.setBody(idx, [], c.bytes());
       this.mb.exportFunc("_initialize", idx);
@@ -54461,7 +55291,7 @@ class Assembler {
       if (fn === undefined || fidx === undefined) throw new Error(`emitter bug: library export ${ex.name} has no function`);
       const params: ValType[] = [];
       for (const p of ex.params) params.push(...wasmLibValTypes(p));
-      const results = ex.result === null ? [] : wasmLibValTypes(ex.result);
+      const results = ex.result === null || isPointerCls(ex.result) ? [] : wasmLibValTypes(ex.result);
       const idx = this.mb.declareFunc(this.mb.funcType(params, results), `%lib.export.${ex.name}`);
       const c = new Code();
       const extraLocals: ValType[] = [];
@@ -54487,15 +55317,26 @@ class Assembler {
         this.mb.exportFunc(ex.name, idx);
         continue;
       }
-      enter(c, ex.name);
-      c.refNull(this.fnClosPair(fn).clos);
+      // The arguments are decoded first, before module evaluation can run:
+      // an inbound buffer (the alloc export's, in the scratch arena) is
+      // copied out, and the arena is this call's from then on.
+      this.libPoisonCheck(c, ex.name);
+      const argLocals: number[] = [];
       let k = 0;
-      for (const p of ex.params) {
+      for (const [i, p] of ex.params.entries()) {
         const n = wasmLibValTypes(p).length;
         for (let j = 0; j < n; j++) c.localGet(k + j);
         k += n;
         this.libInbound(c, p, fn.loc);
+        const l = params.length + extraLocals.length;
+        extraLocals.push(this.mapTypeSoft(fn.params[i]!.type));
+        c.localSet(l);
+        argLocals.push(l);
       }
+      this.libResetScratch(c);
+      enter(c, ex.name, true);
+      c.refNull(this.fnClosPair(fn).clos);
+      for (const l of argLocals) c.localGet(l);
       c.call(fidx);
       let resLocal = -1;
       if (ex.result !== null) {
@@ -54510,7 +55351,64 @@ class Assembler {
         c.end();
       }
       this.emitCheckpoint(c);
-      if (ex.result !== null) {
+      if (ex.result !== null && isPointerCls(ex.result)) {
+        // the result buffer: <name>_result_ptr / _result_len, valid until
+        // the next call of this export
+        const ptrG = this.mb.addGlobal(I32, true, (w) => {
+          w.u8(0x41);
+          w.sleb(0);
+        });
+        const capG = this.mb.addGlobal(I32, true, (w) => {
+          w.u8(0x41);
+          w.sleb(0);
+        });
+        const lenG = this.mb.addGlobal(I32, true, (w) => {
+          w.u8(0x41);
+          w.sleb(0);
+        });
+        const es = ex.result === "list<u8>" || ex.result === "string" ? 1 : 4;
+        const bl = params.length + extraLocals.length;
+        extraLocals.push(this.bytesB.bytesRef(), I32);
+        c.localGet(resLocal);
+        if (ex.result === "string") {
+          this.emitFlat(c);
+          c.call(this.bytesB.fromStrHelper("utf8"));
+        }
+        c.localSet(bl);
+        c.localGet(bl);
+        c.structGet(this.bytesB.bytesType(), 2);
+        c.i32Const(es);
+        c.i32Mul();
+        c.localSet(bl + 1);
+        this.libResetScratch(c);
+        c.localGet(bl + 1);
+        c.globalGet(capG);
+        c.i32GtU();
+        c.ifVoid();
+        c.globalGet(ptrG);
+        c.call(this.libFree());
+        c.localGet(bl + 1);
+        c.call(this.libAlloc());
+        c.globalSet(ptrG);
+        c.localGet(bl + 1);
+        c.globalSet(capG);
+        c.end();
+        c.localGet(bl);
+        c.globalGet(ptrG);
+        c.i32Const(es);
+        c.call(this.libBytesToMem());
+        c.localGet(bl);
+        c.structGet(this.bytesB.bytesType(), 2);
+        c.globalSet(lenG);
+        leave(c);
+        for (const [suffix, g] of [["_result_ptr", ptrG], ["_result_len", lenG]] as const) {
+          const gi = this.mb.declareFunc(this.mb.funcType([], [I32]), `%lib.export.${ex.name}${suffix}`);
+          const gc = new Code();
+          gc.globalGet(g);
+          this.mb.setBody(gi, [], gc.bytes());
+          this.mb.exportFunc(`${ex.name}${suffix}`, gi);
+        }
+      } else if (ex.result !== null) {
         c.localGet(resLocal);
         this.libOutbound(c, ex.result, `the result of ${ex.name}`, fn.loc);
         const rl = params.length + extraLocals.length;
@@ -54523,6 +55421,18 @@ class Assembler {
       }
       this.mb.setBody(idx, extraLocals, c.bytes());
       this.mb.exportFunc(ex.name, idx);
+    }
+    // The inbound-buffer export: n bytes of the scratch arena for the host
+    // to write a string or list argument into, valid until the next export
+    // call has copied its arguments.
+    const allocName = lib.alloc ?? (lib.exports.some((e) => e.params.some(isPointerCls)) ? "tsinter_alloc" : null);
+    if (allocName !== null) {
+      const ai = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%lib.allocExport");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.libScratch());
+      this.mb.setBody(ai, [], c.bytes());
+      this.mb.exportFunc(allocName, ai);
     }
     // The error buffer, readable after a trap (memory survives it).
     {
@@ -54976,14 +55886,16 @@ class Assembler {
     {
       const c = new Code();
       c.localGet(0);
-      c.i32Const(this.lib !== null ? LIB_STAGE_BASE : 0);
+      if (this.lib !== null) c.globalGet(this.libStageBaseG);
+      else c.i32Const(0);
       c.globalGet(this.cursorGlobal);
       if (this.lib !== null) {
-        c.i32Const(LIB_STAGE_BASE);
+        c.globalGet(this.libStageBaseG);
         c.i32Sub();
       }
       c.call(this.writeFunc);
-      c.i32Const(this.lib !== null ? LIB_STAGE_BASE : 0);
+      if (this.lib !== null) c.globalGet(this.libStageBaseG);
+      else c.i32Const(0);
       c.globalSet(this.cursorGlobal);
       this.mb.setBody(flush, [], c.bytes());
     }
@@ -59363,6 +60275,16 @@ class Assembler {
    * pages, trapping on allocation failure (grow answers -1). `need` must
    * push one i32 and is emitted twice. */
   private emitEnsureCapacity(c: Code, need: () => void): void {
+    if (this.lib !== null) {
+      // library mode: the contract's memory limit, a named stop (S147)
+      c.globalGet(this.cursorGlobal);
+      c.i64ExtendI32U();
+      need();
+      c.i64ExtendI32U();
+      c.i64Add();
+      c.call(this.libGrow());
+      return;
+    }
     const bytesInPages = () => {
       c.memorySize();
       c.i32Const(16);

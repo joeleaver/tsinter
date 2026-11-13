@@ -424,6 +424,11 @@ export class Code {
     this.w.u8(0x36);
     this.memarg(0, off, mem);
   }
+  /** i64.store in our memory (library mode's setF64). */
+  store64At(off: number): void {
+    this.w.u8(0x37);
+    this.memarg(0, off);
+  }
   store64In(mem: number, off: number): void {
     this.w.u8(0x37);
     this.memarg(0, off, mem);

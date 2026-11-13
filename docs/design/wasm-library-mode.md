@@ -869,6 +869,38 @@ Where this differs from §2, this section wins.
   continuation runs in that export's drain (Node-checkable).
 - **wasm-native:** library mode builds for `--backend wasm` only; other
   backends refuse by name.
+- **Linear memory (P2):** `[0, 256)` the report prefix area, `[256, 4352)`
+  the error buffer, then the persistent heap (8-byte headers, a first-fit
+  free list), then the scratch arena (the output stage), whose base moves up
+  as the heap grows. Growing the heap while the call's scratch is in use is
+  a fence (`mem.alloc` after `mem.scratch` in one call needs a free block).
+- **Pointer classes (P2):** an import's `string`/`list<…>` argument is
+  staged in the scratch arena and the cursor is restored after the import
+  returns, so a loop of calls does not grow memory. An export's pointer
+  argument is written by the host into a buffer from the **alloc export**
+  (the profile's `alloc`, default `tsinter_alloc`; it hands out scratch
+  between calls) and copied before the body runs. A pointer result goes to
+  a per-export persistent buffer, read with `<export>_result_ptr()` /
+  `<export>_result_len()` (length in bytes for a string, elements for a
+  list), valid until that export is called again. An export's arguments
+  are decoded before module evaluation runs on a first call, so a top level
+  may allocate. Lists: `list<u8>` (Uint8Array), `list<s32>` (Int32Array),
+  `list<u32>` (Uint32Array), `list<f32>` (Float32Array). `list<f64>`
+  refuses by name, and cannot be tested yet: the tier has no Float64Array
+  (its typed arrays are u8/i32/u32/f32 views of one byte storage, IR
+  `bytes`), which is a separate language gap for the general queue.
+- **The memory model (S147):** a fixed layout, a first-fit heap with
+  headers checked when walked, zeroed blocks and scratch, a 1 GiB limit;
+  out-of-block access is the program's to get right, as in C.
+- **tsinter:memory (P2):** the program types it (`declare module
+  "tsinter:memory" { export const mem: {...} }`, the bridge's
+  tsinter-memory.d.ts); tsinter recognizes `mem.<fn>(...)` by name: scratch,
+  alloc, free, u8, i32, u32, f32, f64, setU8, setI32, setU32, setF32,
+  setF64, utf8, copyU8, copyI32, copyU32, copyF32. Little-endian, byte
+  addresses, bounds-checked (outside memory: a fence); a value that does not
+  fit a setter's width is a fence (S143).
+- **Arity (P2):** `max_import_params` counts wasm parameters (a pointer class
+  is two), SC4025.
 
 ### 9.3 Risks
 
@@ -886,7 +918,12 @@ Where this differs from §2, this section wins.
   Mitigations: P5's restore into a fresh store compacts the heap; Playweft
   watches heap size and recycles the instance at a tick boundary through
   snapshot and restore; and wasmtime's copying collector when it lands. P0
-  measures growth on the sample games over 100k ticks. Speed: Playweft measured
+  measures growth on the sample games over 100k ticks. **Measured (§10 w7,
+  w8):** wasmtime 47's default collector is already the copying one, and it
+  collects cycles (28 MB vs DRC's 656 MB on 4M cyclic objects); the coin
+  sample's heap is flat over 100,000 ticks (~700,000 export calls: RSS
+  57 → 54 MB on wasmtime, a 4.5 MB JS heap on V8). The risk now is only a
+  host that selects DRC. Speed: Playweft measured
   4–10× faster than QuickJS on both engines, and that is the baseline to keep.
 - **R3, size.** Measured: 55 KB raw / 27 KB gzip for the small sample, and
   13.6 KB per extra 53 lines. Playweft's 51–70 KB is in range. Library mode
@@ -943,5 +980,10 @@ MemoryMax=16G -p MemorySwapMax=0`, with `compile()` from this worktree's
 - **w8 (P0/P1, 2026-11-12):** heap growth over ticks, the forest sample
   (`tests/library-wasm/game-forest`) under the harness's wasmtime 47 C host
   (default config): max RSS 33.6 MB at 1,000 ticks, 34.7 MB at 10,000,
-  37.5 MB at 100,000. The coin sample (closures, Maps, promises across
-  ticks) is measured once P2 runs it.
+  37.5 MB at 100,000. The coin sample (`game-coin`: closures, Maps,
+  promises and a task across ticks, ~700,000 export calls): max RSS 57.2 MB
+  at 1,000 ticks, 57.6 MB at 10,000, 54.0 MB at 100,000 under wasmtime 47;
+  on V8 the JS heap after a full GC stays at 4.4–4.5 MB and linear memory
+  at one page throughout. No growth: the copying collector keeps up, and the
+  scratch arena does not creep. (A first measurement showed growth; it was
+  the harness host leaking query cursors, fixed in host.mjs/host.c.)

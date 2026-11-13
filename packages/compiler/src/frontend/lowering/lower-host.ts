@@ -8,9 +8,9 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { typeEquals, VOID, wasmLibClassType, type IrExpr, type IrType, type IrWasmLibClass } from "../../ir/nodes.js";
+import { typeEquals, VOID, WASMLIB_MEMORY_FNS, wasmLibClassType, type IrExpr, type IrType, type IrWasmLibClass } from "../../ir/nodes.js";
 import { wasmLibSignatureDiag, wasmLibUnboundDiag } from "../../diagnostics/diagnostic.js";
-import { libHost, type HostImport } from "../lib-host.js";
+import { libHost, MEMORY_MODULE, type HostImport } from "../lib-host.js";
 
 /** The host module and function a callee resolves to, or null. */
 function hostTargetOf(L: Lowerer, callee: ts.Expression): { module: string; decl: ts.FunctionDeclaration; name: string } | null {
@@ -27,7 +27,7 @@ function hostTargetOf(L: Lowerer, callee: ts.Expression): { module: string; decl
   if (block === undefined || !ts.isModuleBlock(block)) return null;
   const md = block.parent;
   if (md === undefined || !ts.isModuleDeclaration(md) || !ts.isStringLiteral(md.name)) return null;
-  if (!host.isHostModule(md.name.text, L.program)) return null;
+  if (md.name.text === MEMORY_MODULE || !host.isHostModule(md.name.text, L.program)) return null;
   return { module: md.name.text, decl, name: decl.name.text };
 }
 
@@ -110,7 +110,40 @@ function resolveHostImport(L: Lowerer, module: string, name: string, decl: ts.Fu
   return imp;
 }
 
+/** `mem.<fn>(...)` where `mem` is tsinter:memory's export. */
+function memTargetOf(L: Lowerer, callee: ts.Expression): string | null {
+  if (libHost() === null || !ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.expression) || !ts.isIdentifier(callee.name)) return null;
+  const sym = L.resolveValueSymbol(callee.expression);
+  if (sym === null) return null;
+  const decl = L.checker.declarationsOf(sym)[0];
+  if (decl === undefined || !ts.isVariableDeclaration(decl)) return null;
+  let n: ts.Node | undefined = decl.parent;
+  while (n !== undefined && !ts.isModuleBlock(n)) n = n.parent;
+  const md = n?.parent;
+  if (md === undefined || !ts.isModuleDeclaration(md) || !ts.isStringLiteral(md.name) || md.name.text !== MEMORY_MODULE) return null;
+  return callee.name.text;
+}
+
+function lowerMemCall(L: Lowerer, expr: ts.CallExpression, name: string): IrExpr {
+  const loc = locOf(expr);
+  const m = WASMLIB_MEMORY_FNS.get(name);
+  const fail = (detail: string): never => {
+    L.pushDiag(wasmLibSignatureDiag(`tsinter:memory's mem.${name}`, detail, loc));
+    throw new PoisonError();
+  };
+  if (m === undefined) fail(`is not a tsinter:memory function (${[...WASMLIB_MEMORY_FNS.keys()].join(", ")})`);
+  if (expr.questionDotToken !== undefined || expr.arguments.some(ts.isSpreadElement) || expr.arguments.length !== m!.params.length) {
+    fail(`takes exactly ${m!.params.length} argument(s), called directly`);
+  }
+  const t = L.mapTypeOf(L.typeOf(expr));
+  if (m!.result.kind === "void" ? false : t === null || !typeEquals(t, m!.result)) fail(`is declared to return '${t ? L.fmt(t) : "?"}', not '${L.fmt(m!.result)}'`);
+  const args = expr.arguments.map((a, i) => L.lowerExprExpecting(a, m!.params[i]!));
+  return { kind: "hostCall", module: MEMORY_MODULE, name, args, type: m!.result, loc };
+}
+
 export function lowerHostCall(L: Lowerer, expr: ts.CallExpression): IrExpr | null {
+  const memFn = memTargetOf(L, expr.expression);
+  if (memFn !== null) return lowerMemCall(L, expr, memFn);
   const target = hostTargetOf(L, expr.expression);
   if (target === null) return null;
   const loc = locOf(expr);

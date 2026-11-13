@@ -1,7 +1,7 @@
 // The game module's entry. The profile names pw_setup as init: a pw_setup
 // call evaluates every module first, then runs this body.
 import * as pw from "pw";
-import { runSystem } from "./std.ts";
+import { runSystem, systemCount } from "./std.ts";
 import { placeAll, points, player, setup } from "./coin.ts";
 import { Obj } from "./std.ts";
 
@@ -19,8 +19,10 @@ export function pw_setup(): void {
   pw.log("setup: " + ducks.length + " ducks");
 }
 
+// The host's system ids count up across ticks here (the harness's drive
+// passes the call number); the game dispatches them round-robin.
 export function pw_run(sys: number, tick: bigint, dt: number): void {
-  runSystem(sys, dt);
+  runSystem(sys % systemCount(), dt);
 }
 
 export function pw_score(who: number): string {

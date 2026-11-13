@@ -12,7 +12,8 @@
  *   repeat <n> <export> [<cls>:<value> ...] [-> <cls>]   ($i is the 0-based round)
  *   dump                                                 (the host's state)
  * Values: numbers in JS syntax (NaN, -0, Infinity, 0x..), bigints as
- * decimal, bool as true/false, string as a JSON string literal.
+ * decimal, bool as true/false, string as a JSON string literal, a list as
+ * a JSON array of numbers.
  *
  * The boundary contract the node column reproduces (and the module emits):
  *   - the first export call (whichever) runs module evaluation and a drain
@@ -26,6 +27,7 @@ import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHost, defaultClass, render, roundTrip } from "./host.mjs";
+import { createMemory } from "./memory.mjs";
 
 export const CODE_UNCAUGHT = 1;
 export const CODE_FENCE = 2;
@@ -81,6 +83,14 @@ export function argValue(cls, text, round) {
       return t === "true";
     case "string":
       return JSON.parse(t);
+    case "list<u8>":
+      return new Uint8Array(JSON.parse(t));
+    case "list<s32>":
+      return new Int32Array(JSON.parse(t));
+    case "list<u32>":
+      return new Uint32Array(JSON.parse(t));
+    case "list<f32>":
+      return new Float32Array(JSON.parse(t));
     default:
       throw new Error(`drive: class ${cls} has no literal form`);
   }
@@ -124,7 +134,7 @@ const ERR_CAP = 4096;
 export function bufferText(line) {
   const bytes = new TextEncoder().encode(line.toWellFormed() + "\n").subarray(0, ERR_CAP);
   const end = bytes.length > 0 && bytes[bytes.length - 1] === 0x0a ? bytes.length - 1 : bytes.length;
-  return new TextDecoder().decode(bytes.subarray(0, end));
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(0, end));
 }
 
 class Failure {
@@ -193,7 +203,9 @@ async function runNode(rowDir, entry, drivePath, contract) {
     const here = new URL(".", import.meta.url).href;
     const script =
       `const { createHost } = await import(${JSON.stringify(here + "host.mjs")});` +
-      `const h = createHost(() => {}, () => null);` +
+      `const { createMemory } = await import(${JSON.stringify(here + "memory.mjs")});` +
+      `globalThis.__libmem = createMemory((t) => { throw new Error(t); });` +
+      `const h = createHost(() => {}, () => globalThis.__libmem.bytes);` +
       `globalThis.__libhost = { bind: (m, n) => (...a) => (h.table[n].params[0] === "*" ? h.table[n].fn("f64", a[0]) : h.table[n].fn(...a)) };` +
       `Math.random = () => 0.5;` +
       `const m = await import(${JSON.stringify(pathToFileURL(resolve(entry)).href)}); const v = m[${JSON.stringify(e.name)}]();` +
@@ -205,9 +217,11 @@ async function runNode(rowDir, entry, drivePath, contract) {
   const constantChecks = [];
   const profile = loadProfile(rowDir);
   const report = profile?.report ?? null;
-  const host = createHost(out, () => {
-    throw new Error("node column: no linear memory (tsinter:memory is P2)");
+  const memory = createMemory((text) => {
+    throw new Failure(CODE_FENCE, text);
   });
+  globalThis.__libmem = memory;
+  const host = createHost(out, () => memory.bytes);
   const classesOf = (mod, name) => profile?.imports?.[mod]?.[name] ?? null;
   // The boundary in JS: each import checks what leaves TypeScript and hands
   // back what the module's view of the host's answer would be.
@@ -221,9 +235,11 @@ async function runNode(rowDir, entry, drivePath, contract) {
           const cls = decl !== null ? decl.params[i][1] : defaultClass(a);
           const bad = outboundMisfit(cls, a);
           if (bad !== null) throw new Failure(CODE_FENCE, `tsinter: argument ${i + 1} of ${mod}.${name} is not a ${cls}: ${bad}`);
-          // SEMANTICS.md S146: a NaN crosses as the canonical NaN
+          // SEMANTICS.md S146: a NaN crosses as the canonical NaN; S144: the
+          // host sees UTF-8, so a lone surrogate arrives as U+FFFD
           const v = (cls === "f64" || cls === "f32") && Number.isNaN(a) ? NaN : a;
-          return { cls, v: cls === "f32" ? Math.fround(v) : v };
+          if (cls === "list<f32>" || cls === "list<f64>") return { cls, v: Array.from(v, (x) => (Number.isNaN(x) ? NaN : x)) };
+          return { cls, v: cls === "f32" ? Math.fround(v) : cls === "string" ? v.toWellFormed() : v };
         });
         const r = imp.params[0] === "*" ? imp.fn(conv[0].cls, conv[0].v) : imp.fn(...conv.map((c) => c.v));
         if (imp.result === null) return undefined;
@@ -276,6 +292,9 @@ async function runNode(rowDir, entry, drivePath, contract) {
       // Module evaluation runs at the start of the FIRST export call,
       // whichever export it is — under Node the module is evaluated before
       // any export can be called.
+      // The scratch arena is this call's before module evaluation runs (the
+      // module decodes its arguments first, then resets it).
+      memory.reset();
       if (mod === null) {
         mod = await importEntry(entry);
         await drain();
@@ -287,7 +306,7 @@ async function runNode(rowDir, entry, drivePath, contract) {
       let r;
       if (fn !== undefined) {
         try {
-          r = fn(...args);
+          r = fn(...args.map((a) => (typeof a === "string" ? a.toWellFormed() : a)));
         } catch (e) {
           if (e instanceof Failure) throw e;
           throw new Failure(CODE_UNCAUGHT, uncaughtText(e));
@@ -300,6 +319,9 @@ async function runNode(rowDir, entry, drivePath, contract) {
         const bad = outboundMisfit(resCls, r);
         if (bad !== null) throw new Failure(CODE_FENCE, `tsinter: the result of ${name} is not a ${resCls}: ${bad}`);
         out(`${name} -> ${render(resCls, roundTrip(resCls, r))}`);
+        // a pointer result's buffer comes from the heap (S147)
+        if (resCls === "string") memory.putResult(name, new TextEncoder().encode(r.toWellFormed()).length);
+        else if (resCls.startsWith("list<")) memory.putResult(name, r.byteLength);
       }
     } catch (e) {
       if (!(e instanceof Failure)) throw e;
@@ -330,7 +352,7 @@ async function runV8(wasmPath, drivePath, contract) {
   let inst = null;
   const mem = () => new Uint8Array(inst.exports.memory.buffer);
   const host = createHost(out, mem);
-  const dec = new TextDecoder();
+  const dec = new TextDecoder("utf-8", { ignoreBOM: true });
   const imports = {};
   for (const imp of contract.imports) {
     const impl = host.table[imp.name];
@@ -368,7 +390,16 @@ async function runV8(wasmPath, drivePath, contract) {
     for (let i = 0; i < cmd.times; i++) {
       const fn = ex[cmd.name];
       if (typeof fn !== "function") throw new Error(`v8 column: the module exports no ${cmd.name}`);
-      const args = cmd.args.map((a) => toWasm(a.cls, argValue(a.cls, a.text, i)));
+      const args = [];
+      for (const a of cmd.args) {
+        const v = argValue(a.cls, a.text, i);
+        if (a.cls === "string" || a.cls.startsWith("list<")) {
+          const b = a.cls === "string" ? new TextEncoder().encode(v) : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+          const p = ex[contract.alloc](b.length) >>> 0;
+          mem().set(b, p);
+          args.push(p, a.cls === "string" ? b.length : v.length);
+        } else args.push(toWasm(a.cls, v));
+      }
       let r;
       try {
         r = fn(...args);
@@ -381,7 +412,15 @@ async function runV8(wasmPath, drivePath, contract) {
         out(`error ${render("string", errorText())}`);
         continue;
       }
-      if (cmd.result !== null) out(`${cmd.name} -> ${render(cmd.result, fromWasm(cmd.result, r))}`);
+      if (cmd.result === "string") {
+        const p = ex[`${cmd.name}_result_ptr`]() >>> 0;
+        const n = ex[`${cmd.name}_result_len`]() >>> 0;
+        out(`${cmd.name} -> ${render("string", dec.decode(mem().subarray(p, p + n)))}`);
+      } else if (cmd.result !== null && cmd.result.startsWith("list<")) {
+        const p = ex[`${cmd.name}_result_ptr`]() >>> 0;
+        const n = ex[`${cmd.name}_result_len`]() >>> 0;
+        out(`${cmd.name} -> ${render(cmd.result, readList(mem(), cmd.result, p, n))}`);
+      } else if (cmd.result !== null) out(`${cmd.name} -> ${render(cmd.result, fromWasm(cmd.result, r))}`);
     }
   }
   flushOut();

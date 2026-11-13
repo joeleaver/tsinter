@@ -115,7 +115,7 @@ static int nents, capents;
 static uint64_t next_id = 1;
 typedef struct { uint64_t *list; int n, i; } Cursor;
 static Cursor *cursors;
-static int ncursors;
+static int next_cursor;
 static uint64_t rand_state = 0x2545f4914f6cdd1dULL;
 static char *names[256];
 static size_t name_len[256];
@@ -206,18 +206,20 @@ static V call_import(const Import *im, const V *a) {
     if (e != NULL) e->alive = 0;
     r = vi(e != NULL);
   } else if (strcmp(n, "query_begin") == 0) {
+    /* a ring of 64 cursors (host.mjs) */
     uint32_t m = (uint32_t)(int64_t)a[0].d;
-    cursors = realloc(cursors, sizeof(Cursor) * (ncursors + 1));
-    Cursor *c = &cursors[ncursors++];
-    c->list = malloc(sizeof(uint64_t) * (nents + 1));
+    if (cursors == NULL) cursors = calloc(64, sizeof(Cursor));
+    int slot = next_cursor++ % 64;
+    Cursor *c = &cursors[slot];
+    c->list = realloc(c->list, sizeof(uint64_t) * (nents + 1));
     c->n = 0;
     c->i = 0;
     for (int i = 0; i < nents; i++)
       if (ents[i].alive && (ents[i].kind & m) == m) c->list[c->n++] = ents[i].id;
-    r = vu((uint64_t)ncursors);
+    r = vu((uint64_t)slot + 1);
   } else if (strcmp(n, "query_next") == 0) {
     int k = (int)a[0].d;
-    if (k < 1 || k > ncursors || cursors[k - 1].i >= cursors[k - 1].n) r = vu(0);
+    if (k < 1 || k > 64 || cursors == NULL || cursors[k - 1].i >= cursors[k - 1].n) r = vu(0);
     else r = vu(cursors[k - 1].list[cursors[k - 1].i++]);
   } else if (strcmp(n, "get_f32") == 0) {
     Ent *e = find(a[0].u);
@@ -415,17 +417,24 @@ static uint32_t call_u32(const char *name) {
 /* The export-side marshalling of one argument (P2: strings and lists go
  * through the module's alloc export). */
 static char alloc_name[64] = "";
+static int marshal_text(Cls c, const char *buf, wasmtime_val_t *w);
 static char result_ptr_suffix[] = "_result_ptr";
 
 static int marshal(Cls c, const char *text, int round, wasmtime_val_t *w) {
-  char buf[512];
-  /* $i substitution */
-  size_t bn = 0;
-  for (const char *p = text; *p && bn < sizeof buf - 24; p++) {
-    if (p[0] == '$' && p[1] == 'i') { bn += (size_t)snprintf(buf + bn, sizeof buf - bn, "%d", round); p++; }
+  /* $i substitution, into a buffer sized for the line (no truncation) */
+  size_t cap = strlen(text) * 6 + 32, bn = 0;
+  char *buf = malloc(cap);
+  for (const char *p = text; *p; p++) {
+    if (p[0] == '$' && p[1] == 'i') { bn += (size_t)snprintf(buf + bn, cap - bn, "%d", round); p++; }
     else buf[bn++] = *p;
   }
   buf[bn] = 0;
+  int r = marshal_text(c, buf, w);
+  free(buf);
+  return r;
+}
+
+static int marshal_text(Cls c, const char *buf, wasmtime_val_t *w) {
   switch (c) {
     case C_F64: w->kind = WASMTIME_F64; w->of.f64 = strtod(buf, NULL); return 1;
     case C_F32: w->kind = WASMTIME_F32; w->of.f32 = (float)strtod(buf, NULL); return 1;
@@ -444,6 +453,37 @@ static int marshal(Cls c, const char *text, int round, wasmtime_val_t *w) {
       if (err != NULL || trap != NULL) die("alloc", err, trap);
       memcpy(memp() + (uint32_t)r.of.i32, s, n);
       free(s);
+      w[0].kind = WASMTIME_I32;
+      w[0].of.i32 = r.of.i32;
+      w[1].kind = WASMTIME_I32;
+      w[1].of.i32 = (int32_t)n;
+      return 2;
+    }
+    case C_LU8: case C_LS32: case C_LU32: case C_LF32: {
+      /* a JSON array of numbers */
+      size_t es = c == C_LU8 ? 1 : 4, n = 0, capn = 16;
+      uint8_t *bytes = malloc(capn * es);
+      for (const char *p = buf + 1; *p && *p != ']';) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']' || !*p) break;
+        char *end;
+        double d = strtod(p, &end);
+        p = end;
+        if (n == capn) { capn *= 2; bytes = realloc(bytes, capn * es); }
+        if (c == C_LU8) bytes[n] = (uint8_t)d;
+        else if (c == C_LF32) { float f = (float)d; memcpy(bytes + 4 * n, &f, 4); }
+        else if (c == C_LU32) { uint32_t u = (uint32_t)d; memcpy(bytes + 4 * n, &u, 4); }
+        else { int32_t i = (int32_t)d; memcpy(bytes + 4 * n, &i, 4); }
+        n++;
+      }
+      wasmtime_func_t f;
+      if (alloc_name[0] == 0 || !get_func(alloc_name, &f)) { fprintf(stderr, "host: a list argument needs the alloc export\n"); exit(70); }
+      wasmtime_val_t a = {.kind = WASMTIME_I32, .of.i32 = (int32_t)(n * es)}, r;
+      wasm_trap_t *trap = NULL;
+      wasmtime_error_t *err = wasmtime_func_call(ctx, &f, &a, 1, &r, 1, &trap);
+      if (err != NULL || trap != NULL) die("alloc", err, trap);
+      memcpy(memp() + (uint32_t)r.of.i32, bytes, n * es);
+      free(bytes);
       w[0].kind = WASMTIME_I32;
       w[0].of.i32 = r.of.i32;
       w[1].kind = WASMTIME_I32;
@@ -480,7 +520,7 @@ static void run_call(char **toks, int ntok, int round) {
   if (!get_func(name, &f)) { fprintf(stderr, "host: the module exports no %s\n", name); exit(70); }
   wasmtime_val_t r[1];
   wasm_trap_t *trap = NULL;
-  wasmtime_error_t *err = wasmtime_func_call(ctx, &f, args, na, r, res == C_NONE ? 0 : (res == C_STRING ? 0 : 1), &trap);
+  wasmtime_error_t *err = wasmtime_func_call(ctx, &f, args, na, r, res == C_NONE || is_ptr_cls(res) ? 0 : 1, &trap);
   if (err != NULL) die(name, err, NULL);
   if (trap != NULL) {
     wasm_trap_delete(trap);
@@ -489,12 +529,18 @@ static void run_call(char **toks, int ntok, int round) {
   }
   if (res == C_NONE) return;
   printf("%s -> ", name);
-  if (res == C_STRING) {
+  if (is_ptr_cls(res)) {
     char pn[160], ln[160];
     snprintf(pn, sizeof pn, "%s%s", name, result_ptr_suffix);
     snprintf(ln, sizeof ln, "%s_result_len", name);
     uint32_t p = call_u32(pn), n = call_u32(ln);
-    json_string(stdout, (const char *)memp() + p, n);
+    if (res == C_STRING) json_string(stdout, (const char *)memp() + p, n);
+    else {
+      V v = {0};
+      v.s = (const char *)memp() + p;
+      v.n = n;
+      render(stdout, res, v, memp());
+    }
   } else {
     V v = {0};
     switch (res) {

@@ -518,3 +518,371 @@ report 4 "tsinter: clone: the instance stopped at an earlier failure"
 clone trapped
 error "tsinter: clone: the instance stopped at an earlier failure"
 ''')
+# ── P2: pointer classes, tsinter:memory, result buffers, arity ────────────
+PW_ALL.update({
+ "emit_command": ([["cmd","string"]], None), "register_component": ([["name","string"]], "u32"),
+ "put_bytes": ([["b","list<u8>"]], None), "put_u32s": ([["b","list<u32>"]], None), "put_f32s": ([["b","list<f32>"]], None),
+ "read_text": ([["ptr","u32"],["cap","u32"]], "u32"), "get_vec3": ([["e","u64"],["c","u32"],["f","u32"],["out","u32"]], None),
+})
+TS.update({"list<u8>": "Uint8Array", "list<u32>": "Uint32Array", "list<f32>": "Float32Array"})
+MEMDTS = '''// The program types tsinter:memory itself (the module is tsinter's; the
+// Node column's shim implements the same names).
+declare module "tsinter:memory" {
+  export const mem: {
+    scratch(n: number): number;
+    alloc(n: number): number;
+    free(p: number): void;
+    u8(p: number): number;
+    i32(p: number): number;
+    u32(p: number): number;
+    f32(p: number): number;
+    f64(p: number): number;
+    setU8(p: number, v: number): void;
+    setI32(p: number, v: number): void;
+    setU32(p: number, v: number): void;
+    setF32(p: number, v: number): void;
+    setF64(p: number, v: number): void;
+    utf8(p: number, len: number): string;
+    copyU8(p: number, n: number): Uint8Array;
+    copyI32(p: number, n: number): Int32Array;
+    copyU32(p: number, n: number): Uint32Array;
+    copyF32(p: number, n: number): Float32Array;
+  };
+}
+'''
+
+STRS = ["log","emit_command","register_component","note_f64","report"]
+row("p2-strings", {
+ "pw.d.ts": dts(STRS),
+ "main.ts": '''// Strings across the boundary (design §3.2): UTF-8 both ways, lone
+// surrogates become U+FFFD (SEMANTICS.md S144), a string result lands in
+// the result buffer (<name>_result_ptr/_len).
+import * as pw from "pw";
+
+export function say(s: string): string {
+  pw.log(s);
+  pw.log("len " + s.length);
+  pw.emit_command("spawn " + s.toUpperCase());
+  pw.note_f64(pw.register_component(s));
+  return "<" + s + ">";
+}
+
+export function odd(): void {
+  pw.log("lone \\ud800 high, lone \\udc00 low, pair \\ud83d\\ude00");
+  pw.log("");
+  pw.log("x".repeat(20000).length + " " + "y".repeat(3000));
+}
+
+export function many(n: number): void {
+  for (let i = 0; i < n; i++) pw.register_component("c" + (i % 7));
+  pw.log("done " + n);
+}
+
+export function echo(s: string): string {
+  return s;
+}
+'''}, '''call say string:"hello" -> string
+call say string:"h\\u00e9llo w\\u00f6rld \\u2603 \\ud834\\udd1e" -> string
+call say string:"hello" -> string
+call odd
+call many f64:50000
+call echo string:"a long result, longer than the next one" -> string
+call echo string:"short" -> string
+call echo string:"lone \\udc00 inbound" -> string
+call echo string:"" -> string
+dump
+''', profile(STRS, {"say": {"params": [["s","string"]], "result": "string"}, "odd": {"params": []}, "many": {"params": [["n","f64"]]}, "echo": {"params": [["s","string"]], "result": "string"}}))
+
+row("p2-strings-noprofile", {
+ "pw.d.ts": dts(["log"]),
+ "main.ts": '''// No profile: string crosses as (ptr, len); the alloc export is
+// tsinter_alloc.
+import { log } from "pw";
+
+export function greet(name: string): string {
+  log("hi " + name);
+  return name + "!";
+}
+'''}, '''call greet string:"you" -> string
+call greet string:"\\u00fcber" -> string
+''')
+
+LISTS = ["put_bytes","put_u32s","put_f32s","report"]
+row("p2-lists", {
+ "pw.d.ts": dts(LISTS),
+ "main.ts": '''// Typed arrays to the host: copied element by element, little-endian;
+// a view sends only its own elements.
+import * as pw from "pw";
+
+export function send(): void {
+  const b = new Uint8Array([1, 2, 3, 250, 255]);
+  pw.put_bytes(b);
+  pw.put_bytes(b.subarray(1, 3));
+  pw.put_bytes(new Uint8Array(0));
+  pw.put_u32s(new Uint32Array([0, 1, 4294967295, 123456789]));
+  pw.put_f32s(new Float32Array([0.5, -0, 1e-45, 3.4e38, 0.1]));
+  const big = new Uint32Array(1000);
+  for (let i = 0; i < big.length; i++) big[i] = i * 3;
+  pw.put_u32s(big.subarray(995));
+}
+'''}, "call send\ncall send\n", profile(LISTS, {"send": {"params": []}}))
+
+MEMS = ["read_text","get_vec3","spawn","set_f32","note_f64","log","report"]
+row("p2-memory", {
+ "pw.d.ts": dts(MEMS), "memory.d.ts": MEMDTS,
+ "main.ts": '''// tsinter:memory: an out-buffer (get_vec3), the hostStr retry shape
+// (read_text), reads and writes of every width, the heap and the copies.
+import * as pw from "pw";
+import { mem } from "tsinter:memory";
+
+let e = 0n;
+let heap = 0;
+
+export function setup(): void {
+  e = pw.spawn(1);
+  pw.set_f32(e, 2, 0, 1.5);
+  pw.set_f32(e, 2, 1, -2.25);
+  pw.set_f32(e, 2, 2, 1e10);
+  heap = mem.alloc(64);
+  mem.setF64(heap, Math.PI);
+}
+
+export function vec(): void {
+  const p = mem.scratch(12);
+  pw.get_vec3(e, 2, 0, p);
+  pw.note_f64(mem.f32(p));
+  pw.note_f64(mem.f32(p + 4));
+  pw.note_f64(mem.f32(p + 8));
+}
+
+export function text(): void {
+  let cap = 4;
+  let p = mem.scratch(cap);
+  let n = pw.read_text(p, cap);
+  if (n > cap) {
+    cap = n;
+    p = mem.scratch(cap);
+    n = pw.read_text(p, cap);
+  }
+  pw.log(mem.utf8(p, n));
+  const bytes = mem.copyU8(p, n);
+  pw.note_f64(bytes.length);
+  pw.note_f64(bytes[1]!);
+}
+
+export function widths(): void {
+  const p = mem.scratch(32);
+  mem.setU8(p, 200);
+  mem.setI32(p + 4, -5);
+  mem.setU32(p + 8, 4000000000);
+  mem.setF32(p + 12, 0.1);
+  mem.setF64(p + 16, -0.5);
+  pw.note_f64(mem.u8(p));
+  pw.note_f64(mem.i32(p + 4));
+  pw.note_f64(mem.u32(p + 4));
+  pw.note_f64(mem.u32(p + 8));
+  pw.note_f64(mem.i32(p + 8));
+  pw.note_f64(mem.f32(p + 12));
+  pw.note_f64(mem.f64(p + 16));
+  const f = mem.copyF32(p + 12, 1);
+  pw.note_f64(f[0]!);
+  const u = mem.copyU32(p + 4, 2);
+  pw.note_f64(u[0]! + u[1]!);
+  const i = mem.copyI32(p + 4, 1);
+  pw.note_f64(i[0]!);
+  pw.note_f64(mem.f64(heap));
+}
+
+export function heapChurn(): void {
+  // free then alloc: the block comes back; a fresh one grows the heap
+  for (let k = 0; k < 100; k++) {
+    const a = mem.alloc(100 + k);
+    mem.setU8(a, k);
+    mem.free(a);
+  }
+  const big = mem.alloc(200000);
+  mem.setU32(big + 199996, 77);
+  pw.note_f64(mem.u32(big + 199996));
+  mem.free(big);
+  pw.note_f64(mem.f64(heap));
+}
+'''}, '''call setup
+call vec
+call text
+call widths
+call heapChurn
+call vec
+call widths
+''', profile(MEMS, {"setup": {"params": []}, "vec": {"params": []}, "text": {"params": []}, "widths": {"params": []}, "heapChurn": {"params": []}}))
+
+for nm, body, ex in [
+  ("p2-mem-fence-read", "pw.note_f64(mem.u8(2147483647));", "read"),
+  ("p2-mem-fence-u8", "mem.setU8(mem.scratch(4), 300);", "u8"),
+  ("p2-mem-fence-neg", "pw.note_f64(mem.f64(-8));", "neg"),
+  ("p2-mem-fence-len", "pw.log(mem.utf8(mem.scratch(4), 1.5));", "len"),
+]:
+    row(nm, {"pw.d.ts": dts(["note_f64","log","report"]), "memory.d.ts": MEMDTS,
+             "main.ts": f'''// tsinter:memory's checks: a fence, never a silent wrap or an engine trap.
+import * as pw from "pw";
+import {{ mem }} from "tsinter:memory";
+
+export function run(): void {{
+  pw.note_f64(1);
+  {body}
+}}
+'''}, "call run\ncall run\n", profile(["note_f64","log","report"], {"run": {"params": []}}))
+
+row("p2-heap-scratch-fence", {"pw.d.ts": dts(["note_f64","report"]), "memory.d.ts": MEMDTS,
+ "main.ts": '''// The heap grows below the scratch arena, so a heap block that must grow it
+// while this call's scratch is live is a fence (a tsinter limit, S122):
+// Node's shim has no such limit, so this row's output is recorded.
+import * as pw from "pw";
+import { mem } from "tsinter:memory";
+
+export function ok(): void {
+  const a = mem.alloc(16);
+  const s = mem.scratch(16);
+  mem.setU8(s, 1);
+  mem.free(a);
+  const b = mem.alloc(16);
+  pw.note_f64(mem.u8(s));
+  mem.free(b);
+}
+
+export function bad(): void {
+  const s = mem.scratch(16);
+  mem.setU8(s, 1);
+  mem.alloc(100000);
+}
+'''}, "call ok\ncall ok\ncall bad\n", profile(["note_f64","report"], {"ok": {"params": []}, "bad": {"params": []}}),
+ expect='''note_f64 1
+note_f64 1
+report 2 "tsinter: mem.alloc needs to grow the heap while this call's scratch is in use; allocate before using mem.scratch in the call"
+bad trapped
+error "tsinter: mem.alloc needs to grow the heap while this call's scratch is in use; allocate before using mem.scratch in the call"
+''')
+
+row("p2-refuse-arity", {"pw.d.ts": dts(["get_vec3","report"]),
+ "main.ts": 'import * as pw from "pw";\nexport function run(): void {\n  pw.get_vec3(1n, 2, 3, 4);\n}\n'},
+ "call run\n", profile(["get_vec3","report"], {"run": {"params": []}}, extra={"max_import_params": 3}),
+ refuse="SC4025 pw.get_vec3 has 4 wasm parameters; this profile's limit is 3")
+row("p2-refuse-mem-name", {"pw.d.ts": dts(["report"]), "memory.d.ts": MEMDTS.replace("    free(p: number): void;", "    free(p: number): void;\n    zap(p: number): void;"),
+ "main.ts": 'import { mem } from "tsinter:memory";\nexport function run(): void {\n  mem.zap(1);\n}\n'},
+ "call run\n", None, refuse="SC4003 is not a tsinter:memory function")
+
+# ── review round 1 (unit 2): the heap, scratch, BOM, lists ──────────────
+HEAPROW = '''// SEMANTICS.md S147: tsinter:memory's heap, modelled byte for byte by the
+// Node column: zeroed blocks, first-fit reuse in free order, the same
+// addresses, and named stops for bad frees, corrupted headers and the 1 GiB
+// limit.
+import * as pw from "pw";
+import { mem } from "tsinter:memory";
+
+const keep = mem.alloc(16);
+mem.setU32(keep, 1234);
+
+export function addrs(): void {
+  const a = mem.alloc(24);
+  const b = mem.alloc(8);
+  pw.note_f64(a);
+  pw.note_f64(b - a);
+  mem.setU32(a, 99);
+  mem.setU32(a + 8, 77);
+  mem.free(a);
+  const c = mem.alloc(16);
+  pw.note_f64(c === a ? 1 : 0);
+  pw.note_f64(mem.u32(c) + mem.u32(c + 8));
+  mem.free(c);
+  mem.free(b);
+  const s = mem.scratch(32);
+  pw.note_f64(mem.u32(s + 4));
+  pw.note_f64(mem.u32(keep));
+}
+
+export function bad(k: number): void {
+  const a = mem.alloc(16);
+  if (k === 1) mem.free(a + 8);
+  if (k === 2) {
+    mem.free(a);
+    mem.free(a);
+  }
+  if (k === 3) mem.free(12);
+  if (k === 4) {
+    mem.free(a);
+    mem.setU32(a - 4, 7);
+    mem.alloc(8);
+  }
+  if (k === 5) mem.alloc(2147483647);
+  if (k === 6) mem.alloc(1073741824);
+  pw.note_f64(k);
+}
+'''
+for k in range(1, 7):
+    row(f"p2-heap-{k}", {"pw.d.ts": dts(["note_f64","report"]), "memory.d.ts": MEMDTS, "main.ts": HEAPROW},
+        f"call addrs\ncall addrs\ncall bad f64:{k}\ncall addrs\n",
+        profile(["note_f64","report"], {"addrs": {"params": []}, "bad": {"params": [["k","f64"]]}}))
+
+row("p2-first-call-arg", {"pw.d.ts": dts(["log","report"]), "memory.d.ts": MEMDTS, "main.ts": '''// The first call carries a string while the module's top level allocates:
+// the argument is decoded before module evaluation, so the heap can grow.
+import * as pw from "pw";
+import { mem } from "tsinter:memory";
+
+const table = mem.alloc(4096);
+mem.setU32(table, 5);
+
+export function echo(s: string): string {
+  pw.log(s + " " + mem.u32(table));
+  return "<" + s + ">";
+}
+
+export function two(s: string, t: string): string {
+  const p = mem.alloc(70000);
+  mem.setU8(p, 1);
+  return s + "|" + t;
+}
+'''}, 'call echo string:"hello" -> string\ncall two string:"aa" string:"bbb" -> string\ncall echo string:"' + "y" * 3000 + '" -> string\ncall two string:"q" string:"r" -> string\ncall echo string:"x" -> string\n',
+ profile(["log","report"], {"echo": {"params": [["s","string"]], "result": "string"}, "two": {"params": [["s","string"],["t","string"]], "result": "string"}}))
+
+row("p2-bom", {"pw.d.ts": dts(["log","report"]), "memory.d.ts": MEMDTS, "main.ts": '''// SEMANTICS.md S144: a leading byte-order mark is kept, as bytes and as text.
+import * as pw from "pw";
+import { mem } from "tsinter:memory";
+
+export function bom(s: string): string {
+  pw.log(s);
+  pw.log(String(s.length) + " " + String(s.charCodeAt(0)));
+  const p = mem.scratch(6);
+  mem.setU8(p, 0xef);
+  mem.setU8(p + 1, 0xbb);
+  mem.setU8(p + 2, 0xbf);
+  mem.setU8(p + 3, 0x41);
+  pw.log(String(mem.utf8(p, 4).length));
+  return s;
+}
+'''}, 'call bom string:"\\ufeffhi" -> string\n', profile(["log","report"], {"bom": {"params": [["s","string"]], "result": "string"}}))
+
+row("p2-lists-inout", {"pw.d.ts": dts(["put_bytes","put_u32s","put_f32s","report"]), "main.ts": '''// Lists both ways: views send their own elements, NaN elements are
+// canonical (S146), a list result lands in the result buffer.
+import * as pw from "pw";
+
+export function send(): void {
+  const f = new Float32Array([Math.asin(2), -(0 / 0), 1.5, NaN]);
+  pw.put_f32s(f);
+  pw.put_f32s(f.subarray(1, 3));
+  const u8 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  pw.put_bytes(u8.subarray(1, 8));
+  const u = new Uint32Array([1, 2, 3, 4]);
+  pw.put_u32s(u.subarray(1));
+}
+
+export function echoB(b: Uint8Array): Uint8Array {
+  pw.put_bytes(b);
+  return b.subarray(1);
+}
+
+export function sumU(b: Uint32Array): number {
+  let t = 0;
+  for (const x of b) t += x;
+  return t;
+}
+'''}, "call send\ncall echoB list<u8>:[9,8,7,6] -> list<u8>\ncall echoB list<u8>:[1] -> list<u8>\ncall sumU list<u32>:[1,2,4294967295] -> f64\n",
+ profile(["put_bytes","put_u32s","put_f32s","report"], {"send": {"params": []}, "echoB": {"params": [["b","list<u8>"]], "result": "list<u8>"}, "sumU": {"params": [["b","list<u32>"]], "result": "f64"}}))

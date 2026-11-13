@@ -1,0 +1,4 @@
+call send
+call echoB list<u8>:[9,8,7,6] -> list<u8>
+call echoB list<u8>:[1] -> list<u8>
+call sumU list<u32>:[1,2,4294967295] -> f64

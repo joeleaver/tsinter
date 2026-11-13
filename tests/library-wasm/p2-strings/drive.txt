@@ -1,0 +1,10 @@
+call say string:"hello" -> string
+call say string:"h\u00e9llo w\u00f6rld \u2603 \ud834\udd1e" -> string
+call say string:"hello" -> string
+call odd
+call many f64:50000
+call echo string:"a long result, longer than the next one" -> string
+call echo string:"short" -> string
+call echo string:"lone \udc00 inbound" -> string
+call echo string:"" -> string
+dump

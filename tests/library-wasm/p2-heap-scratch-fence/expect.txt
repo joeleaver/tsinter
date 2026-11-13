@@ -1,0 +1,5 @@
+note_f64 1
+note_f64 1
+report 2 "tsinter: mem.alloc needs to grow the heap while this call's scratch is in use; allocate before using mem.scratch in the call"
+bad trapped
+error "tsinter: mem.alloc needs to grow the heap while this call's scratch is in use; allocate before using mem.scratch in the call"

@@ -19,6 +19,10 @@ import type { WasmLibProfile } from "../library/wasm-profile.js";
 
 export type HostImport = IrWasmLib["imports"][number];
 
+/** The linear-memory intrinsics' module (design §3.2): the program types it
+ * (a `declare module "tsinter:memory"` of its own, as for the Node shim). */
+export const MEMORY_MODULE = "tsinter:memory";
+
 export class LibHostState {
   /** Host functions in first-resolution order (profile-less builds), keyed
    * "module.name". */
@@ -30,6 +34,8 @@ export class LibHostState {
   /** Is `spec` a host module? `program` supplies the ambient declarations
    * for a profile-less build. */
   isHostModule(spec: string, program: ts.Program | null): boolean {
+    // the linear-memory intrinsics: the module's own, never an import
+    if (spec === MEMORY_MODULE) return true;
     if (this.profile !== null) return this.profile.imports.has(spec);
     if (spec.startsWith("node:") || spec.startsWith("tsinter:")) return false;
     if (this.declared === null) {

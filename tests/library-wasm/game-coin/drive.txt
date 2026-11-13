@@ -1,7 +1,10 @@
-# pw_run(u32, u64, f64), one call per system per tick (7 systems).
+# pw_run(u32, u64, f64), one call per system per tick (7 systems a tick).
 call pw_abi_version -> u32
 call pw_setup
-repeat 1400 pw_run u32:$i u64:0 f64:0.016666666666666666
+repeat 7000 pw_run u32:$i u64:0 f64:0.016666666666666666
+call pw_score u32:1 -> string
+call pw_score u32:2 -> string
+repeat 21000 pw_run u32:$i u64:0 f64:0.016666666666666666
 call pw_score u32:1 -> string
 call pw_score u32:2 -> string
 dump

@@ -143,6 +143,10 @@ export function runSystem(index: number, dt: number): void {
   if (index === systems.length - 1) said = [];
 }
 
+export function systemCount(): number {
+  return systems.length;
+}
+
 export function command(name: string, ...args: number[]): void {
   pw.emit_command(name + " " + args.map((a) => a.toFixed(2)).join(" "));
 }
