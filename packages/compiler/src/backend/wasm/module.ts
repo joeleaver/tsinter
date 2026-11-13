@@ -489,10 +489,20 @@ export class ModuleBuilder {
         }
       }
     }
+    // The stop's own path (the fail function and all it calls: staging the
+    // text, the reporter) is never counted, or the stop would recurse.
+    const failPath = new Set<number>();
+    const todo = [fail - base];
+    while (todo.length > 0) {
+      const f = todo.pop()!;
+      if (f < 0 || failPath.has(f)) continue;
+      failPath.add(f);
+      for (const g of edges[f] ?? []) todo.push(g);
+    }
     let wrapped = 0;
     for (const i of [...cyclic].sort((a, b) => a - b)) {
       const idx = base + i;
-      if (counted.has(idx) || idx === fail) continue;
+      if (counted.has(idx) || idx === fail || failPath.has(i)) continue;
       const decl = this.funcs[i]!;
       if (decl.body === null) continue;
       const t = this.types[decl.typeIndex]!;

@@ -417,17 +417,24 @@ static uint32_t call_u32(const char *name) {
 /* The export-side marshalling of one argument (P2: strings and lists go
  * through the module's alloc export). */
 static char alloc_name[64] = "";
+static int marshal_text(Cls c, const char *buf, wasmtime_val_t *w);
 static char result_ptr_suffix[] = "_result_ptr";
 
 static int marshal(Cls c, const char *text, int round, wasmtime_val_t *w) {
-  char buf[512];
-  /* $i substitution */
-  size_t bn = 0;
-  for (const char *p = text; *p && bn < sizeof buf - 24; p++) {
-    if (p[0] == '$' && p[1] == 'i') { bn += (size_t)snprintf(buf + bn, sizeof buf - bn, "%d", round); p++; }
+  /* $i substitution, into a buffer sized for the line (no truncation) */
+  size_t cap = strlen(text) * 6 + 32, bn = 0;
+  char *buf = malloc(cap);
+  for (const char *p = text; *p; p++) {
+    if (p[0] == '$' && p[1] == 'i') { bn += (size_t)snprintf(buf + bn, cap - bn, "%d", round); p++; }
     else buf[bn++] = *p;
   }
   buf[bn] = 0;
+  int r = marshal_text(c, buf, w);
+  free(buf);
+  return r;
+}
+
+static int marshal_text(Cls c, const char *buf, wasmtime_val_t *w) {
   switch (c) {
     case C_F64: w->kind = WASMTIME_F64; w->of.f64 = strtod(buf, NULL); return 1;
     case C_F32: w->kind = WASMTIME_F32; w->of.f32 = (float)strtod(buf, NULL); return 1;
@@ -446,6 +453,37 @@ static int marshal(Cls c, const char *text, int round, wasmtime_val_t *w) {
       if (err != NULL || trap != NULL) die("alloc", err, trap);
       memcpy(memp() + (uint32_t)r.of.i32, s, n);
       free(s);
+      w[0].kind = WASMTIME_I32;
+      w[0].of.i32 = r.of.i32;
+      w[1].kind = WASMTIME_I32;
+      w[1].of.i32 = (int32_t)n;
+      return 2;
+    }
+    case C_LU8: case C_LS32: case C_LU32: case C_LF32: {
+      /* a JSON array of numbers */
+      size_t es = c == C_LU8 ? 1 : 4, n = 0, capn = 16;
+      uint8_t *bytes = malloc(capn * es);
+      for (const char *p = buf + 1; *p && *p != ']';) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']' || !*p) break;
+        char *end;
+        double d = strtod(p, &end);
+        p = end;
+        if (n == capn) { capn *= 2; bytes = realloc(bytes, capn * es); }
+        if (c == C_LU8) bytes[n] = (uint8_t)d;
+        else if (c == C_LF32) { float f = (float)d; memcpy(bytes + 4 * n, &f, 4); }
+        else if (c == C_LU32) { uint32_t u = (uint32_t)d; memcpy(bytes + 4 * n, &u, 4); }
+        else { int32_t i = (int32_t)d; memcpy(bytes + 4 * n, &i, 4); }
+        n++;
+      }
+      wasmtime_func_t f;
+      if (alloc_name[0] == 0 || !get_func(alloc_name, &f)) { fprintf(stderr, "host: a list argument needs the alloc export\n"); exit(70); }
+      wasmtime_val_t a = {.kind = WASMTIME_I32, .of.i32 = (int32_t)(n * es)}, r;
+      wasm_trap_t *trap = NULL;
+      wasmtime_error_t *err = wasmtime_func_call(ctx, &f, &a, 1, &r, 1, &trap);
+      if (err != NULL || trap != NULL) die("alloc", err, trap);
+      memcpy(memp() + (uint32_t)r.of.i32, bytes, n * es);
+      free(bytes);
       w[0].kind = WASMTIME_I32;
       w[0].of.i32 = r.of.i32;
       w[1].kind = WASMTIME_I32;
@@ -482,7 +520,7 @@ static void run_call(char **toks, int ntok, int round) {
   if (!get_func(name, &f)) { fprintf(stderr, "host: the module exports no %s\n", name); exit(70); }
   wasmtime_val_t r[1];
   wasm_trap_t *trap = NULL;
-  wasmtime_error_t *err = wasmtime_func_call(ctx, &f, args, na, r, res == C_NONE ? 0 : (res == C_STRING ? 0 : 1), &trap);
+  wasmtime_error_t *err = wasmtime_func_call(ctx, &f, args, na, r, res == C_NONE || is_ptr_cls(res) ? 0 : 1, &trap);
   if (err != NULL) die(name, err, NULL);
   if (trap != NULL) {
     wasm_trap_delete(trap);
@@ -491,12 +529,18 @@ static void run_call(char **toks, int ntok, int round) {
   }
   if (res == C_NONE) return;
   printf("%s -> ", name);
-  if (res == C_STRING) {
+  if (is_ptr_cls(res)) {
     char pn[160], ln[160];
     snprintf(pn, sizeof pn, "%s%s", name, result_ptr_suffix);
     snprintf(ln, sizeof ln, "%s_result_len", name);
     uint32_t p = call_u32(pn), n = call_u32(ln);
-    json_string(stdout, (const char *)memp() + p, n);
+    if (res == C_STRING) json_string(stdout, (const char *)memp() + p, n);
+    else {
+      V v = {0};
+      v.s = (const char *)memp() + p;
+      v.n = n;
+      render(stdout, res, v, memp());
+    }
   } else {
     V v = {0};
     switch (res) {

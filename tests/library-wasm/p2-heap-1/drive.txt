@@ -1,0 +1,4 @@
+call addrs
+call addrs
+call bad f64:1
+call addrs

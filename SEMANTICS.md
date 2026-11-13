@@ -11409,8 +11409,11 @@ string can hold and UTF-8 cannot, becomes U+FFFD on the way out (the
 coming in decodes with replacement (the `TextDecoder` rule). Node passing
 the string to a JS function would keep the surrogate. The oracle (the
 harness's Node column) applies `toWellFormed()` where the module encodes.
+A leading byte-order mark is not stripped: U+FEFF's bytes decode to U+FEFF,
+as `Buffer.toString` keeps it (`TextDecoder`'s default would drop it; the
+Node column decodes with `ignoreBOM: true`).
 **Tested by:** tests/harness/wasm-library.test.ts rows `p2-strings`,
-`p2-strings-noprofile`.
+`p2-strings-noprofile`, `p2-bom`.
 
 ## S146 — Library mode: every NaN whose bits are observable is the canonical NaN *(wasm, library mode)*
 
@@ -11430,3 +11433,32 @@ column) canonicalizes at the same points it can reach (the boundary,
 no hook for, have recorded expected output.
 **Tested by:** tests/harness/wasm-library.test.ts rows `p1-nan`, `p1-math`,
 `p1-nan-typed`.
+
+## S147 — Library mode: tsinter:memory is C-like memory with a fixed layout and a 1 GiB limit *(wasm, library mode)*
+
+Linear memory has one layout on every engine: the report prefix and error
+buffer below 4,352, then the persistent heap, then the scratch arena.
+`mem.alloc(n)` hands out a zeroed block of `n` bytes rounded up to 8 (an
+8-byte header [size, tag] in front), reusing freed blocks first fit in free
+order before growing the heap at its top; `mem.scratch(n)` hands out zeroed
+bytes valid until the export returns; every address is the same on every
+engine. Node has no linear memory, so this is tsinter's model, and the
+harness's Node column implements it line for line.
+
+**What is the program's to get right, as in C:** reads and writes outside a
+block or a scratch region the program owns are unspecified. They are
+bounds-checked against the whole memory (outside it: a named stop), not
+against the block, so a write past a block's end can damage the next
+block's header. The heap checks its headers wherever it walks them (every
+`mem.free`, and the free list on `mem.alloc`) and stops by name ("the
+tsinter:memory heap is corrupted") when one is not its own. `mem.free` of
+anything but the start of a live block (an interior pointer, an address
+`mem.alloc` did not return, a double free) stops by name.
+
+**The limits:** growing the heap while the call's scratch is in use stops by
+name (the arena's addresses would move; allocate first). Memory may not grow
+past 1 GiB, the library contract's limit, and asking for more (or an engine
+that cannot grow) stops by name, never wraps.
+**Tested by:** tests/harness/wasm-library.test.ts rows `p2-memory`,
+`p2-heap-1`..`p2-heap-6`, `p2-heap-scratch-fence`, `p2-first-call-arg`,
+`p2-mem-fence-*`.

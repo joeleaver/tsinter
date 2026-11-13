@@ -882,10 +882,16 @@ Where this differs from §2, this section wins.
   between calls) and copied before the body runs. A pointer result goes to
   a per-export persistent buffer, read with `<export>_result_ptr()` /
   `<export>_result_len()` (length in bytes for a string, elements for a
-  list), valid until that export is called again. Lists: `list<u8>`
-  (Uint8Array), `list<s32>` (Int32Array), `list<u32>` (Uint32Array),
-  `list<f32>` (Float32Array); `list<f64>` refuses (no Float64Array in the
-  tier yet).
+  list), valid until that export is called again. An export's arguments
+  are decoded before module evaluation runs on a first call, so a top level
+  may allocate. Lists: `list<u8>` (Uint8Array), `list<s32>` (Int32Array),
+  `list<u32>` (Uint32Array), `list<f32>` (Float32Array). `list<f64>`
+  refuses by name, and cannot be tested yet: the tier has no Float64Array
+  (its typed arrays are u8/i32/u32/f32 views of one byte storage, IR
+  `bytes`), which is a separate language gap for the general queue.
+- **The memory model (S147):** a fixed layout, a first-fit heap with
+  headers checked when walked, zeroed blocks and scratch, a 1 GiB limit;
+  out-of-block access is the program's to get right, as in C.
 - **tsinter:memory (P2):** the program types it (`declare module
   "tsinter:memory" { export const mem: {...} }`, the bridge's
   tsinter-memory.d.ts); tsinter recognizes `mem.<fn>(...)` by name: scratch,

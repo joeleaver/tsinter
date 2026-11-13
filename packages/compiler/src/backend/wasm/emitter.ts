@@ -820,6 +820,11 @@ const LIB_FRESH = 0; // module evaluation has not run
 const LIB_IDLE = 1; // evaluated, no export call running
 const LIB_IN_CALL = 2; // an export call is running (seen at entry: it trapped)
 const LIB_STOPPED = 3; // a failure reported and trapped
+/** S147: the library contract's memory limit (1 GiB) and the heap's block
+ * tags. */
+const LIB_MEM_CAP_PAGES = 16384;
+const LIB_TAG_LIVE = 0xa110c8ed | 0;
+const LIB_TAG_FREE = 0xf4eeb10c | 0;
 /** The module name of the linear-memory intrinsics (design §3.2). */
 const MEMORY_MODULE = "tsinter:memory";
 
@@ -54171,18 +54176,91 @@ class Assembler {
 
   private libAllocFunc: number | null = null;
   private libFreeFunc: number | null = null;
-  /** `%lib.alloc(n) → p`: the persistent heap (tsinter:memory alloc, the
-   * result buffers). Blocks carry an 8-byte header [payload size, next
-   * free]; a free block that fits is reused first, else the heap grows at
-   * its top, which moves the scratch arena's base up — allowed only while
-   * the arena is empty (a fence otherwise: the arena's live pointers would
-   * move). */
+  private libGrowFunc: number | null = null;
+  private libCorruptFunc: number | null = null;
+
+  /** `%lib.grow(top: i64)`: linear memory reaches at least `top` bytes, or
+   * the named stop: past the library contract's limit (S147) or a failed
+   * memory.grow. Never a wrap. */
+  private libGrow(): number {
+    if (this.libGrowFunc !== null) return this.libGrowFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I64], []), "%lib.grow");
+    this.libGrowFunc = idx;
+    const c = new Code();
+    const fail = (): void => {
+      this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+        this.pushStrLitInto(c, `tsinter: the module's memory would pass its ${LIB_MEM_CAP_PAGES / 16384} GiB limit`);
+        stage();
+      });
+      c.unreachable();
+    };
+    c.localGet(0);
+    c.i64Const(BigInt(LIB_MEM_CAP_PAGES) * 65536n);
+    c.i64GtU();
+    c.ifVoid();
+    fail();
+    c.end();
+    c.localGet(0);
+    c.memorySize();
+    c.i64ExtendI32U();
+    c.i64Const(16n);
+    c.i64Shl();
+    c.i64GtU();
+    c.ifVoid();
+    // pages = ceil((top - size) / 64 KiB)
+    c.localGet(0);
+    c.memorySize();
+    c.i64ExtendI32U();
+    c.i64Const(16n);
+    c.i64Shl();
+    c.i64Sub();
+    c.i64Const(0xffffn);
+    c.i64Add();
+    c.i64Const(16n);
+    c.i64ShrU();
+    c.i32WrapI64();
+    c.memoryGrow();
+    c.i32Const(-1);
+    c.i32Eq();
+    c.ifVoid();
+    fail();
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.corrupt()`: a block header the heap did not write (S147). */
+  private libCorrupt(): number {
+    if (this.libCorruptFunc !== null) return this.libCorruptFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%lib.corrupt");
+    this.libCorruptFunc = idx;
+    const c = new Code();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: the tsinter:memory heap is corrupted (a write past the end of a block?)");
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.alloc(n) → p` (SEMANTICS.md S147): the persistent heap, at
+   * [LIB_STAGE_BASE, heapTop), below the scratch arena. A block is an
+   * 8-byte header [payload size, tag] and its payload (8-aligned, at least
+   * 8 bytes); a free block's payload starts with the next free block. The
+   * free list is searched first fit, in free order (the last freed first);
+   * else the heap grows at its top, moving the scratch arena's base up,
+   * which needs the arena empty (a fence otherwise: its pointers would
+   * move). The payload is handed out zeroed. tsinter:memory's shim in the
+   * harness is a line-for-line model of this. */
   private libAlloc(): number {
     if (this.libAllocFunc !== null) return this.libAllocFunc;
     const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%lib.alloc");
     this.libAllocFunc = idx;
     const c = new Code();
     const N = 0, SZ = 1, B = 2, PREV = 3, TOP = 4;
+    // the payload size, 8-aligned, at least 8 (n < 2^31: no overflow)
     c.localGet(N);
     c.i32Const(7);
     c.i32Add();
@@ -54195,7 +54273,6 @@ class Assembler {
     c.i32Const(8);
     c.localSet(SZ);
     c.end();
-    // first fit in the free list
     c.globalGet(this.libFreeHeadG);
     c.localSet(B);
     c.block();
@@ -54203,30 +54280,56 @@ class Assembler {
     c.localGet(B);
     c.i32Eqz();
     c.brIf(1);
+    // a free block's header must be the heap's own
+    c.localGet(B);
+    c.i32Const(LIB_STAGE_BASE);
+    c.i32LtU();
+    c.localGet(B);
+    c.globalGet(this.libHeapTopG);
+    c.i32GeU();
+    c.i32Or();
+    c.localGet(B);
+    c.i32Const(7);
+    c.i32And();
+    c.i32Or();
+    c.ifVoid();
+    c.call(this.libCorrupt());
+    c.end();
+    c.localGet(B);
+    c.load32At(4);
+    c.i32Const(LIB_TAG_FREE);
+    c.i32Ne();
+    c.ifVoid();
+    c.call(this.libCorrupt());
+    c.end();
     c.localGet(B);
     c.load32At(0);
     c.localGet(SZ);
     c.i32GeU();
     c.ifVoid();
-    // unlink
+    // unlink: prev.next (or the head) = this.next
     c.localGet(PREV);
     c.i32Eqz();
     c.ifVoid();
     c.localGet(B);
-    c.i32Const(4);
-    c.i32Add();
-    c.load32At(0);
+    c.load32At(8);
     c.globalSet(this.libFreeHeadG);
     c.else_();
     c.localGet(PREV);
-    c.i32Const(4);
-    c.i32Add();
     c.localGet(B);
-    c.i32Const(4);
-    c.i32Add();
-    c.load32At(0);
-    c.store32At(0);
+    c.load32At(8);
+    c.store32At(8);
     c.end();
+    c.localGet(B);
+    c.i32Const(LIB_TAG_LIVE);
+    c.store32At(4);
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.i32Const(0);
+    c.localGet(B);
+    c.load32At(0);
+    c.memoryFill();
     c.localGet(B);
     c.i32Const(8);
     c.i32Add();
@@ -54235,9 +54338,7 @@ class Assembler {
     c.localGet(B);
     c.localSet(PREV);
     c.localGet(B);
-    c.i32Const(4);
-    c.i32Add();
-    c.load32At(0);
+    c.load32At(8);
     c.localSet(B);
     c.br(0);
     c.end();
@@ -54256,20 +54357,31 @@ class Assembler {
     c.globalGet(this.libHeapTopG);
     c.localSet(B);
     c.localGet(B);
+    c.i64ExtendI32U();
+    c.i64Const(8n);
+    c.i64Add();
+    c.localGet(SZ);
+    c.i64ExtendI32U();
+    c.i64Add();
+    c.call(this.libGrow());
+    c.localGet(B);
     c.i32Const(8);
     c.i32Add();
     c.localGet(SZ);
     c.i32Add();
     c.localSet(TOP);
-    // memory for the block (the cursor sits at the old top)
-    this.emitEnsureCapacity(c, () => {
-      c.localGet(TOP);
-      c.globalGet(this.cursorGlobal);
-      c.i32Sub();
-    });
     c.localGet(B);
     c.localGet(SZ);
     c.store32At(0);
+    c.localGet(B);
+    c.i32Const(LIB_TAG_LIVE);
+    c.store32At(4);
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.i32Const(0);
+    c.localGet(SZ);
+    c.memoryFill();
     c.localGet(TOP);
     c.globalSet(this.libHeapTopG);
     c.localGet(TOP);
@@ -54283,43 +54395,95 @@ class Assembler {
     return idx;
   }
 
-  /** `%lib.free(p)`: back on the free list (0 is a no-op). */
+  /** `%lib.free(p)` (S147): p must start a live block — the heap is walked
+   * block by block from its base to find it (an interior pointer, a
+   * pointer mem.alloc never returned and a double free stop by name, as
+   * does a header the walk cannot follow); 0 is a no-op. The block goes on
+   * the free list's head. */
   private libFree(): number {
     if (this.libFreeFunc !== null) return this.libFreeFunc;
     const idx = this.mb.declareFunc(this.mb.funcType([I32], []), "%lib.free");
     this.libFreeFunc = idx;
     const c = new Code();
-    c.localGet(0);
+    const P = 0, B = 1, SZ = 2;
+    c.localGet(P);
     c.i32Eqz();
     c.ifVoid();
     c.return_();
     c.end();
-    // a pointer the heap never handed out is a fence
-    c.localGet(0);
-    c.i32Const(LIB_STAGE_BASE + 8);
-    c.i32LtU();
-    c.localGet(0);
+    c.i32Const(LIB_STAGE_BASE);
+    c.localSet(B);
+    c.block();
+    c.loop();
+    c.localGet(B);
     c.globalGet(this.libHeapTopG);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(B);
+    c.load32At(0);
+    c.localSet(SZ);
+    // a header the walk cannot follow
+    c.localGet(SZ);
+    c.i32Eqz();
+    c.localGet(SZ);
+    c.i32Const(7);
+    c.i32And();
+    c.i32Or();
+    c.localGet(SZ);
+    c.globalGet(this.libHeapTopG);
+    c.localGet(B);
+    c.i32Sub();
+    c.i32Const(8);
+    c.i32Sub();
     c.i32GtU();
     c.i32Or();
     c.ifVoid();
-    this.pushStrLitInto(c, "mem.free of a pointer the heap did not allocate");
-    c.localGet(0);
-    c.f64ConvertI32U();
-    c.call(this.libMemFence());
+    c.call(this.libCorrupt());
     c.end();
-    c.localGet(0);
+    c.localGet(B);
     c.i32Const(8);
-    c.i32Sub();
-    c.i32Const(4);
     c.i32Add();
+    c.localGet(P);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(B);
+    c.load32At(4);
+    c.i32Const(LIB_TAG_LIVE);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(B);
+    c.i32Const(LIB_TAG_FREE);
+    c.store32At(4);
+    c.localGet(B);
     c.globalGet(this.libFreeHeadG);
-    c.store32At(0);
-    c.localGet(0);
-    c.i32Const(8);
-    c.i32Sub();
+    c.store32At(8);
+    c.localGet(B);
     c.globalSet(this.libFreeHeadG);
-    this.mb.setBody(idx, [], c.bytes());
+    c.return_();
+    c.end();
+    c.br(2);
+    c.end();
+    c.localGet(B);
+    c.i32Const(8);
+    c.i32Add();
+    c.localGet(SZ);
+    c.i32Add();
+    c.localSet(B);
+    c.br(0);
+    c.end();
+    c.end();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: mem.free(");
+      stage();
+      c.localGet(P);
+      c.f64ConvertI32U();
+      c.call(this.f64ToStrHelper());
+      stage();
+      this.pushStrLitInto(c, ") is not a live block: an interior pointer, a pointer mem.alloc did not return, or a double free");
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [I32, I32], c.bytes());
     return idx;
   }
 
@@ -54541,6 +54705,11 @@ class Assembler {
     c.i32And();
     c.globalSet(this.cursorGlobal);
     this.emitEnsureCapacity(c, () => c.localGet(0));
+    // handed out zeroed (S147)
+    c.globalGet(this.cursorGlobal);
+    c.i32Const(0);
+    c.localGet(0);
+    c.memoryFill();
     c.globalGet(this.cursorGlobal);
     c.globalGet(this.cursorGlobal);
     c.localGet(0);
@@ -54585,8 +54754,8 @@ class Assembler {
       this.emitFirstCheckpoint(c);
       this.mb.setBody(evalIdx, [], c.bytes());
     }
-    const enter = (c: Code, name: string): void => {
-      this.libPoisonCheck(c, name);
+    const enter = (c: Code, name: string, checked = false): void => {
+      if (!checked) this.libPoisonCheck(c, name);
       c.globalGet(this.libStateG);
       c.i32Eqz();
       c.ifVoid();
@@ -54644,18 +54813,26 @@ class Assembler {
         this.mb.exportFunc(ex.name, idx);
         continue;
       }
-      enter(c, ex.name);
-      c.refNull(this.fnClosPair(fn).clos);
+      // The arguments are decoded first, before module evaluation can run:
+      // an inbound buffer (the alloc export's, in the scratch arena) is
+      // copied out, and the arena is this call's from then on.
+      this.libPoisonCheck(c, ex.name);
+      const argLocals: number[] = [];
       let k = 0;
-      for (const p of ex.params) {
+      for (const [i, p] of ex.params.entries()) {
         const n = wasmLibValTypes(p).length;
         for (let j = 0; j < n; j++) c.localGet(k + j);
         k += n;
         this.libInbound(c, p, fn.loc);
+        const l = params.length + extraLocals.length;
+        extraLocals.push(this.mapTypeSoft(fn.params[i]!.type));
+        c.localSet(l);
+        argLocals.push(l);
       }
-      // the inbound buffers (the alloc export's, in the scratch arena) are
-      // copied now: the arena is this call's from here
       this.libResetScratch(c);
+      enter(c, ex.name, true);
+      c.refNull(this.fnClosPair(fn).clos);
+      for (const l of argLocals) c.localGet(l);
       c.call(fidx);
       let resLocal = -1;
       if (ex.result !== null) {
@@ -59594,6 +59771,16 @@ class Assembler {
    * pages, trapping on allocation failure (grow answers -1). `need` must
    * push one i32 and is emitted twice. */
   private emitEnsureCapacity(c: Code, need: () => void): void {
+    if (this.lib !== null) {
+      // library mode: the contract's memory limit, a named stop (S147)
+      c.globalGet(this.cursorGlobal);
+      c.i64ExtendI32U();
+      need();
+      c.i64ExtendI32U();
+      c.i64Add();
+      c.call(this.libGrow());
+      return;
+    }
     const bytesInPages = () => {
       c.memorySize();
       c.i32Const(16);
