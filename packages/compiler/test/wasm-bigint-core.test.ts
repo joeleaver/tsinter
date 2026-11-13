@@ -297,7 +297,7 @@ describe("the legacy C/LLVM lanes refuse BigInt by name (SC3003), never an inter
       const res = await compile(file, { outPath: join(dir, "out"), outDir: dir, backend });
       expect(res.ok).toBe(false);
       expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3003"]);
-      expect(res.diagnostics[0]!.message).toContain("bigint values are not supported on the legacy C and LLVM backends");
+      expect(res.diagnostics[0]!.message).toContain("are not supported on the legacy C and LLVM backends");
       expect(res.diagnostics[0]!.loc.start).toBeGreaterThan(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });

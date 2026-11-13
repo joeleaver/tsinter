@@ -220,7 +220,7 @@ function legacyBigintRefusal(mod: IrModule, entryPath: string): ScrDiagnostic | 
   if (loc === null && !moduleUsesBigint(mod)) return null;
   return {
     code: "SC3003",
-    message: "bigint values are not supported on the legacy C and LLVM backends; build with --backend wasm or --backend wasm-native",
+    message: "bigint values and the full fs.Stats record are not supported on the legacy C and LLVM backends; build with --backend wasm or --backend wasm-native",
     loc: loc ?? { file: entryPath, start: 0, end: 0 },
   };
 }

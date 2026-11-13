@@ -6038,6 +6038,19 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2949-fs-bigint-stats.ts": {
+   "order": [
+    "<repo>/tests/corpus/2949-fs-bigint-stats.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2950-bigint-any-arith/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2950-bigint-any-arith/arith.js",
+    "<repo>/tests/corpus/2950-bigint-any-arith/main.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

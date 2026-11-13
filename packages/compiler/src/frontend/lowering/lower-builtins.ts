@@ -2,6 +2,7 @@
  * crypto, child_process spawn/spawnSync and child/stats/spawn-result
  * methods), JSON.parse/stringify, process properties/methods and
  * process.env access, and console.log detection. */
+import { isBigIntStatsType, lowerBigIntStatsProperty, lowerStatCall } from "./lower-bigint.js";
 import { readFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, resolve } from "node:path";
@@ -1408,6 +1409,12 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         type: VOID,
         loc,
       }));
+    }
+    // statSync/lstatSync/fstatSync and fs/promises stat/lstat with an
+    // options bag, plain fstatSync, fs/promises lstat (lower-bigint.ts).
+    {
+      const st = lowerStatCall(L, expr, bi.module, bi.member);
+      if (st !== null) return st;
     }
     // accessSync(p, mode?): an omitted mode is Node's F_OK (0). The mode
     // is an ordinary number — fs.constants.* reads bake to literals.
@@ -4666,6 +4673,16 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (L.mapTypeOf(L.typeOf(access.expression))?.kind !== "stats") return null;
     if (!L.isStdlibMember(access)) return null;
     const name = access.name.text;
+    // The remaining type predicates read the full record's mode: a
+    // BigIntStats receiver (lower-bigint.ts).
+    if (
+      (name === "isBlockDevice" || name === "isCharacterDevice" || name === "isFIFO" || name === "isSocket") &&
+      call.arguments.length === 0 && isBigIntStatsType(L, access.expression)
+    ) {
+      const receiver = L.lowerExpr(access.expression);
+      const k = name === "isBlockDevice" ? "block" : name === "isCharacterDevice" ? "char" : name === "isFIFO" ? "fifo" : "socket";
+      return { kind: "libCall", fn: "stats.isKind", args: [receiver, { kind: "strLit", value: k, type: STRING, loc: locOf(call) }], type: BOOL, loc: locOf(call) };
+    }
     if (
       (name === "isFile" || name === "isDirectory" || name === "isSymbolicLink") &&
       call.arguments.length === 0
@@ -4680,7 +4697,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     L.noLowering(
       `Stats.${name}`,
       call,
-      "isFile(), isDirectory(), isSymbolicLink(), size, and mtimeMs are the supported Stats members",
+      "isFile(), isDirectory(), isSymbolicLink(), size, and mtimeMs are the supported Stats members (a BigIntStats — { bigint: true } — adds every numeric field and type predicate)",
       L.checker.getSymbolAtLocation(access.name),
     );
   }
@@ -4834,6 +4851,10 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
       return L.maybeNarrow(read, expr);
     }
     if (kind === "child") return null; // pid/exitCode/killed live in lowerIntrinsicProperty
+    if (kind === "stats") {
+      const full = lowerBigIntStatsProperty(L, expr);
+      if (full !== null) return full;
+    }
     if (kind === "stats" && name === "mtimeMs") {
       const receiver = L.lowerExpr(expr.expression);
       return { kind: "libCall", fn: "stats.mtimeMs", args: [receiver], type: F64, loc };

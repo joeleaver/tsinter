@@ -1724,7 +1724,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // fs.Stats: @types/node's `class Stats` (module "fs") or the fallback
   // declarations' interface. Provenance-checked like URL.
   if (
-    psym?.name === "Stats" &&
+    (psym?.name === "Stats" || psym?.name === "BigIntStats") &&
     checker.declarationsOf(psym).some(
       (d) =>
         (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) &&

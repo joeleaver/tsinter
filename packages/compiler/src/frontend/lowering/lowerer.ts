@@ -95,6 +95,7 @@ import {
 } from "../types.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
+import { bigWidenTypeOf, programHoldsBigint } from "./big-widen.js";
 import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
@@ -1534,6 +1535,24 @@ export class Lowerer {
     if (k !== undefined) this.dynArmExitNodes.set(result, k);
     return result;
   }
+  /** GH #187 (big-widen.ts): the program can hold a bigint, so arithmetic
+   * over `any` answers `any`; its memo tables. */
+  private bigWidenGate: boolean | null = null;
+  get bigWiden(): boolean {
+    if (this.bigWidenGate === null) this.bigWidenGate = this.sharedDynamic && programHoldsBigint(this.program, this.moduleOrder);
+    return this.bigWidenGate;
+  }
+  private readonly bigWidenTop = new Map<ts.Node, boolean>();
+  private readonly bigWidenBound = new WeakMap<object, Map<ts.Node, boolean>>();
+  /** Per binding context: an implicit-any instance body answers its own. */
+  get bigWidenMemo(): Map<ts.Node, boolean> {
+    const k = this.implicitParamTypes;
+    if (k === null) return this.bigWidenTop;
+    let m = this.bigWidenBound.get(k);
+    if (m === undefined) this.bigWidenBound.set(k, (m = new Map()));
+    return m;
+  }
+  readonly bigWidenFnMemo = new Map<ts.Node, boolean>();
   /** The dynamic arm is in play in this pass (typeOf's override runs). */
   get dynArmActive(): boolean {
     return this.dynArmSites.size > 0 || this.dynArmSyms.size > 0;
@@ -3496,6 +3515,10 @@ export class Lowerer {
         }
         return bound;
       }
+    }
+    if (this.bigWiden) {
+      const wide = bigWidenTypeOf(this, node, t);
+      if (wide !== null) return wide;
     }
     return t;
   }

@@ -954,8 +954,45 @@ declare module "node:fs" {
     readonly size: number;
     readonly mtimeMs: number;
   }
-  export function statSync(path: string): Stats;
-  export function lstatSync(path: string): Stats;
+  /* The `{ bigint: true }` snapshot: every numeric field a bigint, the
+   * times also in nanoseconds (the *Ms fields are *Ns / 1000000n). The
+   * birthtime fields and the Date-valued times are declared for parity and
+   * refuse by name where read. */
+  export interface BigIntStats {
+    isFile(): boolean;
+    isDirectory(): boolean;
+    isSymbolicLink(): boolean;
+    isBlockDevice(): boolean;
+    isCharacterDevice(): boolean;
+    isFIFO(): boolean;
+    isSocket(): boolean;
+    readonly dev: bigint;
+    readonly ino: bigint;
+    readonly mode: bigint;
+    readonly nlink: bigint;
+    readonly uid: bigint;
+    readonly gid: bigint;
+    readonly rdev: bigint;
+    readonly size: bigint;
+    readonly blksize: bigint;
+    readonly blocks: bigint;
+    readonly atimeMs: bigint;
+    readonly mtimeMs: bigint;
+    readonly ctimeMs: bigint;
+    readonly atimeNs: bigint;
+    readonly mtimeNs: bigint;
+    readonly ctimeNs: bigint;
+    readonly birthtimeMs: bigint;
+    readonly birthtimeNs: bigint;
+    readonly atime: Date;
+    readonly mtime: Date;
+    readonly ctime: Date;
+    readonly birthtime: Date;
+  }
+  export function statSync(path: string, options: { bigint: true; throwIfNoEntry?: boolean }): BigIntStats;
+  export function statSync(path: string, options?: { bigint?: false; throwIfNoEntry?: boolean }): Stats;
+  export function lstatSync(path: string, options: { bigint: true; throwIfNoEntry?: boolean }): BigIntStats;
+  export function lstatSync(path: string, options?: { bigint?: false; throwIfNoEntry?: boolean }): Stats;
   /* The fd pair behind spawn's fd-stdio form: openSync(path, flags) →
    * the raw fd (string flags only — "r", "w", "a" and the +/x/s
    * variants), closeSync(fd). */
@@ -966,7 +1003,8 @@ declare module "node:fs" {
    * answers the byte count, 0 at EOF. */
   export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position?: number | null): number;
   /* statSync over an open fd — the same Stats snapshot. */
-  export function fstatSync(fd: number): Stats;
+  export function fstatSync(fd: number, options: { bigint: true; throwIfNoEntry?: boolean }): BigIntStats;
+  export function fstatSync(fd: number, options?: { bigint?: false; throwIfNoEntry?: boolean }): Stats;
   /* realpath(3) — resolves symlinks, `.`/`..`, throwing Node's fs error
    * shapes for missing paths. */
   export function realpathSync(path: string): string;
@@ -1032,7 +1070,10 @@ declare module "fs/promises" {
   export function mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<void>;
   export function readdir(path: string): Promise<string[]>;
   export function rm(path: string): Promise<void>;
-  export function stat(path: string): Promise<import("node:fs").Stats>;
+  export function stat(path: string, options: { bigint: true }): Promise<import("node:fs").BigIntStats>;
+  export function stat(path: string, options?: { bigint?: false }): Promise<import("node:fs").Stats>;
+  export function lstat(path: string, options: { bigint: true }): Promise<import("node:fs").BigIntStats>;
+  export function lstat(path: string, options?: { bigint?: false }): Promise<import("node:fs").Stats>;
   export function unlink(path: string): Promise<void>;
   export function chmod(path: string, mode: number): Promise<void>;
 }

@@ -7083,7 +7083,8 @@ result and its timing relative to ITS OWN later statements are Node-exact), but 
 fs/promises call against a timer, an immediate, or another concurrently-pending promise CAN — the sync
 call runs to completion, and everything else queued for that same turn waits behind it, where Node would
 have let them interleave. The wasm lane's own fsp twins (`fs.readFile`/`writeFile`/`rm`/`stat`/`mkdir`/
-`mkdirRecursiveMode`/`unlink`/`chmod`/`readdir`/`readFileBytes`, P5's own construct) share this exact
+`mkdirRecursiveMode`/`unlink`/`chmod`/`readdir`/`readFileBytes`, P5's own construct; and
+`lstat`, and `stat`/`lstat` with `{ bigint }`: the full stat record of op 24, `fsp.statBig`) share this exact
 stance — `emitFspSettled` wraps the SAME sync fs.ts helpers the ordinary `fs.*Sync` calls use, via the
 module's own already-settled-promise minting (`this.proms.mint()`/`this.proms.settle()`), never new async
 machinery (design §6.5) — so one entry covers both lanes rather than a per-lane split.

@@ -2,6 +2,7 @@
  * declarations including destructuring patterns, scoped blocks, control
  * flow (if/while/for/for-of/do, switch, try/catch, jumps with the
  * finally-crossing fence), and blocked-binding poisoning. */
+import { wideIndex } from "./big-widen.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js";
@@ -6581,7 +6582,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         if (arr.type.kind === "array") {
           const recv = L.declareHiddenLocal("%dtRecv", arr.type);
           out.push({ kind: "varDecl", localId: recv.id, init: arr, loc });
-          const index = L.lowerExpr(t.argumentExpression);
+          const index = wideIndex(L, L.lowerExpr(t.argumentExpression));
           if (index.type.kind !== "f64") {
             L.unsupported("SC1090", t.argumentExpression, "indexing with non-number keys");
           }

@@ -343,3 +343,144 @@ export function lowerBigIntMethodCall(L: Lowerer, call: ts.CallExpression, acces
   }
   return null;
 }
+
+/* ── fs BigIntStats (the full stat record, fsCall op 24) ─────────────── */
+
+const STAT_BIG_FIELDS = new Set(["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs"]);
+
+/** Is `node`'s checker type @types/node's BigIntStats? */
+export function isBigIntStatsType(L: Lowerer, node: ts.Expression): boolean {
+  const arms = statsArms(L, node);
+  return arms.big && !arms.plain;
+}
+
+/** Which record kinds the receiver's type admits (null and undefined
+ * aside): a BigIntStats, a plain Stats, or both (a `Stats | BigIntStats`
+ * union, whose member reads cannot know statically which one it holds). */
+function statsArms(L: Lowerer, node: ts.Expression): { big: boolean; plain: boolean } {
+  return statsArmsOf(L, L.typeOf(node));
+}
+
+function statsArmsOf(L: Lowerer, type: ts.Type): { big: boolean; plain: boolean } {
+  const t = L.checker.getNonNullableType(type);
+  const parts = t.isUnionType() ? t.getTypes() : [t];
+  let big = false;
+  let plain = false;
+  for (const p of parts) {
+    const n = p.getSymbol()?.name;
+    if (n === "BigIntStats") big = true;
+    else if (n === "Stats") plain = true;
+  }
+  return { big, plain };
+}
+
+/** A receiver that may hold a BigIntStats but is not one for certain: the
+ * plain Stats reader must never serve it (it would answer numbers where
+ * Node answers bigints), so the read refuses by name. */
+export function refuseMixedStats(L: Lowerer, receiver: ts.Expression, member: string, at: ts.Node): void {
+  const arms = statsArms(L, receiver);
+  if (arms.big && arms.plain) {
+    L.noLowering(
+      `${member} on a Stats | BigIntStats receiver`,
+      at,
+      "the member reads lower on a receiver typed Stats or BigIntStats alone (narrow it, or keep the two in separate bindings)",
+    );
+  }
+}
+
+/** A member read on a BigIntStats receiver: the numeric fields as bigints
+ * (the *Ms times are the *Ns ones / 1000000n, BigInt division, as Node
+ * computes them); the birthtime fields and the Date-valued atime/mtime/
+ * ctime/birthtime refuse by name. Null for any other receiver. */
+export function lowerBigIntStatsProperty(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+  // An optional read (`b?.size`) reads the same record: the chain guards
+  // the nullish receiver, this lowers the member.
+  refuseMixedStats(L, expr.expression, `.${expr.name.text}`, expr);
+  if (!isBigIntStatsType(L, expr.expression)) return null;
+  const name = expr.name.text;
+  const loc = locOf(expr);
+  const field = name.endsWith("Ms") ? name.slice(0, -2) + "Ns" : name;
+  if (!STAT_BIG_FIELDS.has(field)) {
+    return L.noLowering(
+      `BigIntStats.${name}`,
+      expr,
+      "the numeric fields (dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks, atimeMs/Ns, mtimeMs/Ns, ctimeMs/Ns) and the is*() predicates are the lowered BigIntStats members",
+    );
+  }
+  const receiver = L.lowerExpr(expr.expression);
+  const raw = bigCallStats(receiver, field, loc);
+  if (field === name) return raw;
+  return bigCall("big.div", [raw, bigLitOf(1000000n, loc)], loc);
+}
+
+function bigCallStats(receiver: IrExpr, field: string, loc: SrcLoc): IrExpr {
+  return { kind: "libCall", fn: "stats.big", args: [receiver, { kind: "strLit", value: field, type: STRING, loc }], type: BIGINT_T, loc };
+}
+
+/** statSync/lstatSync(path, { bigint }), fstatSync(fd[, { bigint }]),
+ * and fs/promises stat/lstat(path[, { bigint }]): the full record (op 24)
+ * wherever an options bag or one of the forms the 7/8 ops never served
+ * appears. Only a literal `bigint` boolean is lowered; any other option
+ * (throwIfNoEntry, a computed bag) refuses by name. Null for every other
+ * call (the existing one-argument statSync/lstatSync/stat keep ops 7/8). */
+export function lowerStatCall(L: Lowerer, call: ts.CallExpression, module: string, member: string): IrExpr | null {
+  const sync = module === "fs" && (member === "statSync" || member === "lstatSync" || member === "fstatSync");
+  const prom = module === "fs/promises" && (member === "stat" || member === "lstat");
+  if (!sync && !prom) return null;
+  const args = call.arguments;
+  if (args.some((a) => ts.isSpreadElement(a)) || args.length < 1 || args.length > 2) {
+    return L.noLowering(`${member} with ${args.length} arguments`, call);
+  }
+  // the one-argument forms ops 7/8 already serve stay as they are
+  if (args.length === 1 && member !== "fstatSync" && member !== "lstat") return null;
+  const loc = locOf(call);
+  if (args.length === 2) {
+    const optNode = args[1]!;
+    const okBag =
+      ts.isObjectLiteralExpression(optNode) &&
+      optNode.properties.every(
+        (p) => ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === "bigint" &&
+          (p.initializer.kind === ts.SyntaxKind.TrueKeyword || p.initializer.kind === ts.SyntaxKind.FalseKeyword),
+      );
+    if (!okBag) {
+      return L.noLowering(
+        `${member} with this options argument`,
+        optNode,
+        "a literal { bigint: true } or { bigint: false } is the lowered options bag (throwIfNoEntry and computed bags have no lowering)",
+      );
+    }
+  }
+  const kindLit: IrExpr = { kind: "strLit", value: member.startsWith("l") ? "lstat" : "stat", type: STRING, loc };
+  if (member === "fstatSync") {
+    const fd = L.lowerExprExpecting(args[0]!, F64);
+    if (fd.type.kind !== "f64") return L.noLowering(`fstatSync of a '${L.fmt(fd.type)}' descriptor`, args[0]!);
+    return { kind: "libCall", fn: "fs.fstatBig", args: [fd], type: { kind: "stats" }, loc };
+  }
+  const path = L.lowerExprExpecting(args[0]!, STRING);
+  if (path.type.kind !== "string") {
+    return L.noLowering(`${member} of a '${L.fmt(path.type)}' path`, args[0]!, "a string path is the lowered form");
+  }
+  if (prom) {
+    return { kind: "libCall", fn: "fsp.statBig", args: [path, kindLit], type: { kind: "promise", inner: { kind: "stats" } }, loc };
+  }
+  return { kind: "libCall", fn: "fs.statBig", args: [path, kindLit], type: { kind: "stats" }, loc };
+}
+
+/** `b as unknown as Stats` over a BigIntStats (or the reverse): one record
+ * representation serves both, so the recast value would be read by the
+ * other kind's member reader (numbers where Node answers bigints). The
+ * lying cast refuses by name. */
+export function refuseStatsRecast(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion): void {
+  const target = statsArmsOf(L, L.checker.getTypeFromTypeNode(expr.type));
+  if (!target.big && !target.plain) return;
+  let inner: ts.Expression = expr.expression;
+  while (ts.isAsExpression(inner) || ts.isTypeAssertion(inner) || ts.isParenthesizedExpression(inner) || ts.isNonNullExpression(inner)) inner = inner.expression;
+  const source = statsArms(L, inner);
+  if ((source.big && target.plain && !target.big) || (source.plain && !source.big && target.big)) {
+    L.noLowering(
+      source.big ? "a BigIntStats cast to Stats" : "a Stats cast to BigIntStats",
+      expr,
+      "the value keeps its own kind: read it through its own type",
+    );
+  }
+}

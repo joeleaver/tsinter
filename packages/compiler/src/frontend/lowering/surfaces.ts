@@ -630,6 +630,9 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     // statSync's no-follow sibling; stats.isSymbolicLink answers what the
     // follow-free snapshot saw.
     lstatSync: { fn: "fs.lstatSync", params: [STRING], result: STATS_T },
+    // Entirely special-cased (lower-bigint.ts lowerStatCall: the full
+    // record, op 24); the entry only routes the dispatch.
+    fstatSync: { fn: "fs.fstatBig", params: [F64], result: STATS_T },
     // realpath(3) — Node's realpathSync (failures spell syscall "lstat",
     // Node's own message shape).
     realpathSync: { fn: "fs.realpathSync", params: [STRING], result: STRING },
@@ -658,6 +661,8 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     readdir: { fn: "fsp.readdir", params: [STRING], result: { kind: "promise", inner: arrayOf(STRING) } },
     rm: { fn: "fsp.rm", params: [STRING], result: { kind: "promise", inner: VOID } },
     stat: { fn: "fsp.stat", params: [STRING], result: { kind: "promise", inner: STATS_T } },
+    // Special-cased like fstatSync (lowerStatCall).
+    lstat: { fn: "fsp.statBig", params: [STRING], result: { kind: "promise", inner: STATS_T } },
     unlink: { fn: "fsp.unlink", params: [STRING], result: { kind: "promise", inner: VOID } },
     chmod: { fn: "fsp.chmod", params: [STRING, F64], result: { kind: "promise", inner: VOID } },
   },

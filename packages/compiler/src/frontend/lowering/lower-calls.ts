@@ -2,6 +2,7 @@
  * argument completion (optional/default/rest, explicit-undefined ≡ omission),
  * function/lambda lowering and signature collection, and monomorphizing
  * generic instantiation (bounded by MAX_GENERIC_DEPTH and MAX_GENERIC_FN_INSTANCES). */
+import { returnWidens } from "./big-widen.js";
 import * as ts from "../ts7/adapter.js";
 import { lowerObjModelStatic } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
@@ -840,6 +841,10 @@ export interface GenericInstance {
     // `() => void`), and throw-only callbacks are ordinary code
     // (`.action(() => { throw ... })`). `never` VALUES stay unmapped.
     if (retTsType.flags & ts.TypeFlags.Never) return VOID;
+    // GH #187 (big-widen.ts): an un-annotated function returning
+    // arithmetic over `any`, in a program that can hold a bigint, returns
+    // the dynamic value (number or bigint).
+    if (returnWidens(L, decl)) return L.mapTypeOf(L.checker.getAnyType())!;
     // A JS function whose UNANNOTATED return infers a FUNCTION type
     // (test/common's mustCall — tsc infers `() => any` from the wrapper
     // it returns): the inferred arity is the wrapper's spelling, not a
@@ -4078,6 +4083,21 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
             `${name} with ${expr.arguments.length} argument${expr.arguments.length === 1 ? "" : "s"}`,
             expr,
           );
+        }
+        // GH #187: in a program that can hold a bigint, an `any` argument
+        // takes the global's own coercion: ToNumber (a bigint's
+        // TypeError), ToString (a bigint's decimal text).
+        const wideArg = L.bigWiden && (L.typeOf(expr.arguments[0]!).flags & ts.TypeFlags.Any) !== 0
+          ? L.lowerExpr(expr.arguments[0]!) : null;
+        if (wideArg !== null && wideArg.type.kind === "jsval") {
+          if (name === "isNaN") {
+            const num: IrExpr = { kind: "jsOp", op: "plus", args: [wideArg], type: JSVAL, loc };
+            return { kind: "libCall", fn: "num.isNaN", args: [{ kind: "dynCheck", value: asDynOperand(num), type: F64, loc }], type: BOOL, loc };
+          }
+          const radix: IrExpr = expr.arguments[1]
+            ? L.lowerExprExpecting(expr.arguments[1], F64)
+            : { kind: "numLit", value: 0, type: F64, loc };
+          return { kind: "libCall", fn: "num.parseInt", args: [{ kind: "jsOp", op: "toStr", args: [wideArg], type: STRING, loc }, radix], type: F64, loc };
         }
         if (name === "isNaN") {
           const x = L.lowerExprExpecting(expr.arguments[0]!, F64);

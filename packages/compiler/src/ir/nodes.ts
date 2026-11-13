@@ -2531,6 +2531,20 @@ export type IrLibFn =
   /** fs.statSync → a Stats value (may throw, like the other sync fs
    * calls); the stats.* getters are pure reads on it. */
   | "fs.statSync"
+  /** The full stat record (fsCall op 24): fs.statBig(path, "stat" |
+   * "lstat") and fs.fstatBig(fd) build a Stats whose every field reads
+   * (statSync/lstatSync/fstatSync with `{ bigint: true }`, and plain
+   * fstatSync); fsp.statBig is fs/promises' stat/lstat twin (a rejected
+   * promise on failure). stats.big(stats, field) answers a BigIntStats
+   * field as a bigint (dev ino mode nlink uid gid rdev size blksize
+   * blocks atimeNs mtimeNs ctimeNs), stats.isKind(stats, "block" | "char"
+   * | "fifo" | "socket") the remaining type predicates, both over a
+   * full-record Stats only. */
+  | "fs.statBig"
+  | "fs.fstatBig"
+  | "fsp.statBig"
+  | "stats.big"
+  | "stats.isKind"
   | "stats.isFile"
   | "stats.isDirectory"
   | "stats.size"
@@ -6987,6 +7001,10 @@ export function moduleUsesSymbol(mod: IrModule): boolean {
   return found;
 }
 
+/** The full stat record's keys: WasmGC-only like BigInt, refused on the
+ * legacy lanes with it (SC3003). */
+const LEGACY_REFUSED_FNS: ReadonlySet<string> = new Set(["fs.statBig", "fs.fstatBig", "fsp.statBig", "stats.big", "stats.isKind"]);
+
 /** The source location of the first bigint-carrying node (a bigint-kind
  * type or a big.* libCall) — the legacy C/LLVM lanes' SC3003 refusal
  * anchor — or null when the module has none. */
@@ -6997,7 +7015,7 @@ export function firstBigintSite(mod: IrModule): SrcLoc | null {
     if (Array.isArray(v)) return v.some((item) => visit(item, loc));
     const node = v as { kind?: unknown; fn?: unknown; loc?: SrcLoc };
     const here = node.loc !== undefined && typeof node.loc === "object" ? node.loc : loc;
-    if (node.kind === "bigint" || (node.kind === "libCall" && typeof node.fn === "string" && node.fn.startsWith("big."))) {
+    if (node.kind === "bigint" || (node.kind === "libCall" && typeof node.fn === "string" && (node.fn.startsWith("big.") || LEGACY_REFUSED_FNS.has(node.fn)))) {
       found = here;
       return true;
     }
@@ -7596,6 +7614,9 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "om.instanceOf",
   "om.bind",
   "num.toFixed",
+  // The full stat record's syscall errors (fs.ts statFullHelper).
+  "fs.statBig",
+  "fs.fstatBig",
   // BigInt's RangeErrors/SyntaxErrors/TypeErrors (bigint.ts)
   "big.mul",
   "big.div",

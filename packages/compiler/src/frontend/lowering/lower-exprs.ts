@@ -4,6 +4,7 @@
  * comparisons, nullish coalescing and optional chains, conditions and
  * ToBoolean/ToString coercion helpers, and field/element reads and writes
  * (FieldTarget). */
+import { wideIndex } from "./big-widen.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
 import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
@@ -34,7 +35,7 @@ import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
-import { bigArith, bigLitOf, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
+import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
@@ -5105,6 +5106,8 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       );
     }
     if (kind === "stats") {
+      const full = lowerBigIntStatsProperty(L, expr);
+      if (full !== null) return full;
       if (name === "size") {
         const receiver = L.lowerExpr(expr.expression);
         return { kind: "libCall", fn: "stats.size", args: [receiver], type: F64, loc: locOf(expr) };
@@ -7890,7 +7893,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
       // exit primitives eagerly): the engine element read, exiting at the
       // declared number type.
       if (recv.type.kind === "jsval") return islandElementRead(L, expr, recv);
-      const index = L.lowerExpr(expr.argumentExpression);
+      const index = wideIndex(L, L.lowerExpr(expr.argumentExpression));
       if (index.type.kind !== "f64") {
         L.unsupported("SC1090", expr.argumentExpression, "indexing with non-number keys");
       }
@@ -8124,7 +8127,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         );
       }
     }
-    let index = L.lowerExpr(expr.argumentExpression);
+    let index = wideIndex(L, L.lowerExpr(expr.argumentExpression));
     if (index.type.kind === "string" && forInArrayKey(L, expr.argumentExpression)) {
       index = { kind: "libCall", fn: "num.fromString", args: [index], type: F64, loc: index.loc };
     }
@@ -8494,7 +8497,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         const loc = locOf(expr);
         return { kind: "exprStmt", expr: { kind: "jsOp", op: "setIdx", args: [recv, key, value], type: VOID, loc }, loc };
       }
-      const index = L.lowerExpr(target.argumentExpression);
+      const index = wideIndex(L, L.lowerExpr(target.argumentExpression));
       if (index.type.kind !== "f64") {
         L.unsupported("SC1090", target.argumentExpression, "indexing with non-number keys");
       }
@@ -8723,7 +8726,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
       const loc = locOf(expr);
       return { kind: "exprStmt", expr: { kind: "jsOp", op: "setIdx", args: [arr, key, value], type: VOID, loc }, loc };
     }
-    const index = L.lowerExpr(target.argumentExpression);
+    const index = wideIndex(L, L.lowerExpr(target.argumentExpression));
     if (index.type.kind !== "f64") {
       L.unsupported("SC1090", target.argumentExpression, "indexing with non-number keys");
     }
@@ -8934,6 +8937,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
   /** `e as T` and the old-style assertion `<T>e` — one node shape (both
    * carry `.type` and `.expression`), one lowering. */
   export function lowerAsExpression(L: Lowerer, expr: ts.AsExpression | ts.TypeAssertion): IrExpr {
+    refuseStatsRecast(L, expr);
     // `[] as const` — tsgo panics computing the expression's `readonly []`
     // type (the facade's fence answers `any`), but the syntax pins the
     // value exactly: the empty tuple, ridden as the unit-element array
@@ -9318,6 +9322,12 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
         const operand = L.lowerExpr(expr.operand);
         if (operand.type.kind === "jsval") {
           return { kind: "jsOp", op: "neg", args: [operand], type: JSVAL, loc };
+        }
+        // GH #187 (big-widen.ts): a checked-dynamic operand (a JavaScript
+        // source's `any`) where the program can hold a bigint negates in
+        // the island: a bigint stays one.
+        if (operand.type.kind === "dyn" && L.sharedDynamic && L.bigWiden) {
+          return { kind: "jsOp", op: "neg", args: [L.jsvalIn(operand, expr.operand)], type: JSVAL, loc };
         }
         if (operand.type.kind === "bigint") return lowerBigUnary("-", operand, loc);
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
@@ -9911,6 +9921,37 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // (SEMANTICS.md). tsc rejects these forms on real `unknown`, so only
       // any-typed JS reaches this; when BOTH sides are dyn a number
       // context is the only honest guess for arithmetic — both check.
+      // GH #187 (big-widen.ts): where the program can hold a bigint, the
+      // arithmetic the checker typed `any` is the island's own (a bigint
+      // operand computes a bigint, as in Node), and so is a JavaScript
+      // source's ordering over a dynamic operand (bigints compare).
+      if (L.sharedDynamic && L.bigWiden && isJsSourceFile(expr.getSourceFile())) {
+        const ORDER: Partial<Record<ts.SyntaxKind, IrJsOp>> = {
+          [ts.SyntaxKind.LessThanToken]: "lt",
+          [ts.SyntaxKind.LessThanEqualsToken]: "le",
+          [ts.SyntaxKind.GreaterThanToken]: "gt",
+          [ts.SyntaxKind.GreaterThanEqualsToken]: "ge",
+        };
+        const cop = ORDER[op];
+        const other = left.type.kind === "dyn" ? right : left;
+        if (cop !== undefined && (other.type.kind === "f64" || other.type.kind === "dyn" || other.type.kind === "bigint")) {
+          return { kind: "jsOp", op: cop, args: [L.jsvalIn(left, expr.left), L.jsvalIn(right, expr.right)], type: BOOL, loc };
+        }
+      }
+      if (L.sharedDynamic && L.bigWiden && (L.typeOf(expr).flags & ts.TypeFlags.Any) !== 0) {
+        const WIDE: Partial<Record<ts.SyntaxKind, IrJsOp>> = {
+          [ts.SyntaxKind.PlusToken]: "add",
+          [ts.SyntaxKind.MinusToken]: "sub",
+          [ts.SyntaxKind.AsteriskToken]: "mul",
+          [ts.SyntaxKind.SlashToken]: "div",
+          [ts.SyntaxKind.PercentToken]: "mod",
+          [ts.SyntaxKind.AsteriskAsteriskToken]: "pow",
+        };
+        const jop = WIDE[op];
+        if (jop !== undefined) {
+          return { kind: "jsOp", op: jop, args: [L.jsvalIn(left, expr.left), L.jsvalIn(right, expr.right)], type: JSVAL, loc };
+        }
+      }
       if (isJsSourceFile(expr.getSourceFile())) {
         const checkNum = (e: IrExpr): IrExpr =>
           e.type.kind === "dyn" ? { kind: "dynCheck", value: e, type: F64, loc: e.loc } : e;

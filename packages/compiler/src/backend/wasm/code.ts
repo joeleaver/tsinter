@@ -327,6 +327,11 @@ export class Code {
     this.w.u8(0x2b);
     this.memarg(0, 0);
   }
+  /** i64.load — an 8-byte little-endian read, alignment hint 0. */
+  i64Load(): void {
+    this.w.u8(0x29);
+    this.memarg(0, 0);
+  }
   /** i32.store — a 4-byte little-endian write to linear memory. INC-26
    * P5 3C-1: op 14's retry record (maxRetries, retryDelay), written by
    * the MODULE for the HOST to read back through a DataView (cp1b, M-24

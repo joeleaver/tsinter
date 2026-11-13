@@ -90,7 +90,7 @@
  * builder/generator/adapter code is added by this edit; it exists solely
  * to mark the pass boundary in this file ahead of the CP1 plan. */
 import { Code } from "./code.js";
-import { I32, ModuleBuilder, type ValType } from "./module.js";
+import { I32, I64, ModuleBuilder, type ValType } from "./module.js";
 
 export interface FsDeps {
   strRef: () => ValType;
@@ -244,6 +244,12 @@ export const OP_TABLE: readonly FsOpTableEntry[] = [
   { op: 21, keys: ["openSync"], syscall: "open", shape: "one", codeOverrides: {} },
   { op: 22, keys: ["readFdSyncBytes"], syscall: "fstat", shape: "no", codeOverrides: {} },
   { op: 23, keys: ["readFdSyncBytes"], syscall: "read", shape: "no", codeOverrides: {} },
+];
+
+/** op 24's full stat record, slot by slot (abi.ts). */
+export const STAT_RAW: readonly string[] = [
+  "dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks",
+  "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs",
 ];
 
 export class FsBuilder {
@@ -1961,9 +1967,16 @@ export class FsBuilder {
       { storage: I32, mutable: false },
       { storage: { kind: "f64" }, mutable: false },
       { storage: { kind: "f64" }, mutable: false },
+      // 5 raw: op 24's whole record (STAT_RAW below), null for ops 7/8
+      { storage: { kind: "ref", nullable: true, typeIndex: this.rawStatType() }, mutable: false },
     ]);
     this.statsTypeCache = idx;
     return idx;
+  }
+
+  /** The full stat record's i64 array (op 24): STAT_RAW's fourteen slots. */
+  rawStatType(): number {
+    return this.mb.arrayType(I64, false);
   }
   statsRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.statsType() };
@@ -2047,6 +2060,7 @@ export class FsBuilder {
       c.i32Const(12);
       c.i32Add();
       c.f64Load(); // mtimeMs @ +12
+      c.refNull(this.rawStatType()); // raw: ops 7/8 carry no full record
       c.structNew(this.statsType());
       c.localSet(RESULT);
       c.localGet(RESULT);
@@ -2057,6 +2071,159 @@ export class FsBuilder {
   }
   statSyncHelper(): number {
     return this.buildStatOp("statSync", 7, "stat");
+  }
+
+  /** `%w.fs.statFull:<stat|lstat|fstat>` — op 24, the whole stat record
+   * (BigIntStats, fstatSync): (path) -> stats, or (fd i32) -> stats for
+   * fstat. Slot B receives STAT_RAW.length i64s, little-endian (the host
+   * writes them through a DataView setBigInt64 / memcpy); the five fields
+   * ops 7/8 fill are derived from them (the type bits of mode, size,
+   * mtimeMs = sec * 1e3 + nsec / 1e6 as Node's msFromTimeSpec), and the
+   * record itself rides `raw` for the stats.big / stats.isKind readers.
+   * Failures render Node's message for the syscall ("fstat" has no path). */
+  statFullHelper(kind: "stat" | "lstat" | "fstat"): number {
+    const fd = kind === "fstat";
+    return this.cached(`statFull:${kind}`, [fd ? I32 : this.strRef()], [this.statsRef()], (idx) => {
+      const c = new Code();
+      if (!fd) this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.statsType()));
+      const ARG = 0;
+      const A_LEN = 1;
+      const A_BASE = 2;
+      const B_BASE = 3;
+      const STATUS = 4;
+      const MATCHED = 5;
+      const N = 6;
+      const RAW = 7;
+      const MODE = 8;
+      const NS = 9;
+      const recBytes = STAT_RAW.length * 8;
+      if (fd) {
+        c.i32Const(0);
+        c.localSet(A_LEN);
+      } else {
+        c.localGet(ARG);
+        c.arrayLen();
+        c.localSet(A_LEN);
+      }
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(A_LEN);
+        c.i32Const(2);
+        c.i32Mul();
+        this.emitRoundUp2(c);
+        c.i32Const(recBytes);
+        c.i32Add();
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      if (!fd) {
+        c.localGet(ARG);
+        c.localGet(A_BASE);
+        c.call(this.stageStrUtf16AtHelper());
+        c.drop();
+      }
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.i32Const(2);
+      c.i32Mul();
+      this.emitRoundUp2(c);
+      c.i32Add();
+      c.localSet(B_BASE);
+      c.i32Const(24);
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.localGet(B_BASE);
+      c.i32Const(recBytes);
+      c.i32Const(kind === "stat" ? 0 : kind === "lstat" ? 1 : 2);
+      if (fd) c.localGet(ARG);
+      else c.i32Const(0);
+      c.call(this.deps.fsCallFunc(24));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, ARG, MATCHED, N, kind, fd ? "no" : "one", {});
+      c.refNull(this.statsType());
+      c.return_();
+      c.end();
+      for (let i = 0; i < STAT_RAW.length; i++) {
+        c.localGet(B_BASE);
+        c.i32Const(i * 8);
+        c.i32Add();
+        c.i64Load();
+      }
+      c.arrayNewFixed(this.rawStatType(), STAT_RAW.length);
+      c.localSet(RAW);
+      const raw = (name: string): void => {
+        c.localGet(RAW);
+        c.i32Const(STAT_RAW.indexOf(name));
+        c.arrayGet(this.rawStatType());
+      };
+      raw("mode");
+      c.i64Const(0o170000n);
+      c.i64And();
+      c.localSet(MODE);
+      for (const t of [0o100000n, 0o040000n, 0o120000n]) {
+        c.localGet(MODE);
+        c.i64Const(t);
+        c.i64Eq();
+      }
+      raw("size");
+      c.f64ConvertI64S();
+      // mtimeMs: sec * 1e3 + nsec / 1e6, sec/nsec the floor split of ns
+      raw("mtimeNs");
+      c.localSet(NS);
+      c.localGet(NS);
+      c.call(this.nsSecHelper());
+      c.f64ConvertI64S();
+      c.f64Const(1e3);
+      c.f64Mul();
+      c.localGet(NS);
+      c.localGet(NS);
+      c.call(this.nsSecHelper());
+      c.i64Const(1000000000n);
+      c.i64Mul();
+      c.i64Sub();
+      c.f64ConvertI64S();
+      c.f64Const(1e6);
+      c.f64Div();
+      c.f64Add();
+      c.localGet(RAW);
+      c.structNew(this.statsType());
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32, { kind: "ref", nullable: true, typeIndex: this.rawStatType() }, I64, I64], c.bytes());
+    });
+  }
+
+  /** floor(ns / 1e9) for an i64 ns (the seconds of a timespec). */
+  private nsSecHelper(): number {
+    return this.cached("nsSec", [I64], [I64], (idx) => {
+      const c = new Code();
+      // q = ns / 1e9 truncated; one less when ns is negative and inexact
+      c.localGet(0);
+      c.i64Const(1000000000n);
+      c.i64DivS();
+      c.localGet(0);
+      c.i64Const(1000000000n);
+      c.i64RemS();
+      c.i64Const(0n);
+      c.i64LtS();
+      c.i64ExtendI32U();
+      c.i64Sub();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** A raw record slot as an i64 (stats.big's source); the receiver was
+   * built by statFullHelper (the frontend admits only those). */
+  statsRawHelper(): number {
+    return this.cached("statsRaw", [this.statsRef(), I32], [I64], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.statsType(), 5);
+      c.localGet(1);
+      c.arrayGet(this.rawStatType());
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
   lstatSyncHelper(): number {
     return this.buildStatOp("lstatSync", 8, "lstat");

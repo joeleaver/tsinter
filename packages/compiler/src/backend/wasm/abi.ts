@@ -365,6 +365,13 @@
  *       HANDLE-SHAPED (P5): 21 open(pathA,flags=x,mode=y)->fd or -errno
  *       op 5's two sub-ops (P5): 22 fstatFd(fd=x)->byte size or -errno;
  *         23 readFdInto(fd=x,ptr,cap)->byte count or -errno.
+ *       FULL STAT (BigIntStats, fstatSync): 24 statFull(pathA, x = 0 stat
+ *         / 1 lstat / 2 fstat with fd = y) -> 0 or -errno, slot B the
+ *         FIXED 112-byte record of fourteen little-endian i64s (fs.ts
+ *         STAT_RAW): dev ino mode nlink uid gid rdev size blksize blocks,
+ *         then atime/mtime/ctime/birthtime as nanoseconds since the epoch
+ *         (the host writes them through a DataView / memcpy, never a
+ *         BigInt64Array: slot B is only 2-byte aligned).
  *     P4 BUILDS: 1, 2, 3, 9, 10, 11, 12, 13, 14, 19, 20. The rest are P5's.
  *     `x`/`y` carry integer options (mode, flags, fd, offset, length,
  *     recursive, force, maxRetries, retryDelay) per op.

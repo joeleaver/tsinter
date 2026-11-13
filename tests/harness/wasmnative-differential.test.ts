@@ -1027,6 +1027,8 @@ const CLAIM_FLOOR: string[] = [
   "2946-fn-decl-duplicates-ts.ts",
   "2947-cjs-export-duplicate-fn/main.ts",
   "2948-fn-decl-binding-review.cjs",
+  "2949-fs-bigint-stats.ts",
+  "2950-bigint-any-arith/main.ts",
   "300-if-else.ts",
   "301-while.ts",
   "302-for.ts",

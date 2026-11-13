@@ -947,7 +947,7 @@ static char *path_arg(uint32_t ptr, uint32_t len, const char *what) {
 
 int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_t bLen, int32_t x, int32_t y) {
   uint32_t B = (uint32_t)bPtr, BL = (uint32_t)bLen;
-  char *path = (op == 5 || op == 6 || op == 18 || op == 22 || op == 23) ? NULL : path_arg((uint32_t)aPtr, (uint32_t)aLen, "an fs path");
+  char *path = (op == 5 || op == 6 || op == 18 || op == 22 || op == 23 || (op == 24 && x == 2)) ? NULL : path_arg((uint32_t)aPtr, (uint32_t)aLen, "an fs path");
   int32_t rc = 0;
   switch (op) {
     case 1: {
@@ -1109,6 +1109,28 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       double sz = (double)st.st_size, mt = (double)st.st_mtim.tv_sec * 1e3 + (double)st.st_mtim.tv_nsec / 1e6;
       memcpy(p + 4, &sz, 8);
       memcpy(p + 12, &mt, 8);
+      break;
+    }
+    case 24: {
+      /* the full stat record (abi.ts op 24): x = 0 stat, 1 lstat (path),
+       * 2 fstat (fd = y); fourteen little-endian i64s. The birth time is
+       * not read (BigIntStats.birthtime* refuse at compile time): 0. */
+      struct stat st;
+      int r = x == 2 ? fstat((int)y, &st) : x == 1 ? lstat(path, &st) : stat(path, &st);
+      if (r != 0) {
+        rc = wn_fs_err(errno);
+        break;
+      }
+      int64_t v[14] = {
+        (int64_t)st.st_dev, (int64_t)st.st_ino, (int64_t)st.st_mode, (int64_t)st.st_nlink,
+        (int64_t)st.st_uid, (int64_t)st.st_gid, (int64_t)st.st_rdev, (int64_t)st.st_size,
+        (int64_t)st.st_blksize, (int64_t)st.st_blocks,
+        (int64_t)st.st_atim.tv_sec * 1000000000LL + st.st_atim.tv_nsec,
+        (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec,
+        (int64_t)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec,
+        0,
+      };
+      memcpy(w_hostmem + B, v, sizeof v);
       break;
     }
     case 9:

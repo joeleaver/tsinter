@@ -3718,6 +3718,8 @@ const TIER_FLOOR: string[] = [
   "2946-fn-decl-duplicates-ts.ts",
   "2947-cjs-export-duplicate-fn/main.ts",
   "2948-fn-decl-binding-review.cjs",
+  "2949-fs-bigint-stats.ts",
+  "2950-bigint-any-arith/main.ts",
 ];
 
 interface RunResult {
@@ -6357,6 +6359,16 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
               const view = new Uint8Array(memory!.buffer, bPtr, n);
               for (let i = 0; i < n; i++) view[i] = buf[i]!;
               return n;
+            }
+            case 24: {
+              // the full stat record (BigIntStats / fstatSync): x = 0 stat,
+              // 1 lstat (pathA), 2 fstat (fd = y); fourteen i64s,
+              // little-endian, through a DataView (slot B is 2-byte aligned)
+              const st = x === 2 ? fstatSync(y, { bigint: true }) : x === 1 ? lstatSync(pathA, { bigint: true }) : statSync(pathA, { bigint: true });
+              const vals = [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.rdev, st.size, st.blksize, st.blocks, st.atimeNs, st.mtimeNs, st.ctimeNs, st.birthtimeNs];
+              const dv = new DataView(memory!.buffer, bPtr, vals.length * 8);
+              vals.forEach((v, i) => dv.setBigInt64(i * 8, BigInt.asIntN(64, v), true));
+              return 0;
             }
             default:
               throw new Error(`fsCall: unhandled op ${op} for ${modulePath}`);

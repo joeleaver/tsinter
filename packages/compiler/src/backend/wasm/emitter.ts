@@ -193,7 +193,7 @@ import { DateBuilder } from "./date.js";
 import { OsTablesBuilder } from "./ostables.js";
 import { ProcessBuilder } from "./process.js";
 import { PathBuilder, type PathHostMember } from "./path.js";
-import { FsBuilder } from "./fs.js";
+import { FsBuilder, STAT_RAW } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, CP_CODES, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { errnoIndex } from "./os-names.js";
@@ -1369,6 +1369,9 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fs.rmRetrySync" ||
         node === "fs.statSync" ||
         node === "fs.lstatSync" ||
+        node === "fs.statBig" ||
+        node === "fs.fstatBig" ||
+        node === "fsp.statBig" ||
         node === "fs.realpathSync" ||
         // The ten fsp promise twins (design §6.5): SYNCHRONOUS syscall +
         // an already-settled promise, so they mint fsCall exactly like
@@ -13838,7 +13841,7 @@ class Assembler {
   /** validateInt32(value, name, 1) over the f64 `push` pushes: Node's
    * ERR_OUT_OF_RANGE for a non-integer and for one outside [1, 2^31 - 1]
    * (the caller's pending check unwinds). */
-  private emitNetInt32Check(c: Code, push: () => void, name: string): void {
+  private emitNetInt32Check(c: Code, push: () => void, name: string, min = 1): void {
     // !NumberIsInteger: NaN, +-Infinity, or a fraction.
     push();
     c.f64Trunc();
@@ -13860,7 +13863,7 @@ class Assembler {
     this.emitUnwind();
     c.else_();
     push();
-    c.f64Const(1);
+    c.f64Const(min);
     c.f64Lt();
     push();
     c.f64Const(2147483647);
@@ -13868,7 +13871,7 @@ class Assembler {
     c.i32Or();
     this.openIf();
     this.emitSetCellError(c, "%RangeError", "RangeError", (c2) => {
-      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be >= 1 && <= 2147483647. Received `);
+      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be >= ${min} && <= 2147483647. Received `);
       push();
       c2.call(this.bytesB.numReceivedHelper());
       c2.call(this.concatHelper());
@@ -29609,6 +29612,60 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             code.call(this.fs.statSyncHelper());
           });
+          return;
+        }
+        // The full stat record (fs.ts statFullHelper, op 24).
+        if (e.fn === "fs.statBig" || e.fn === "fsp.statBig") {
+          const k = e.args[1];
+          if (k?.kind !== "strLit" || (k.value !== "stat" && k.value !== "lstat")) throw new Error(`emitter bug: ${e.fn} kind`);
+          const helper = this.fs.statFullHelper(k.value);
+          if (e.fn === "fsp.statBig") {
+            this.emitFspSettled(code, this.fs.statsRef(), () => {
+              this.walkExpr(e.args[0]!);
+              code.call(helper);
+            });
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.call(helper);
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.fstatBig") {
+          // Node's getValidatedFd: an integer in [0, 2^31 - 1]
+          const fdl = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(fdl);
+          this.emitNetInt32Check(code, () => code.localGet(fdl), "fd", 0);
+          code.localGet(fdl);
+          this.releaseScratch(F64, fdl);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.statFullHelper("fstat"));
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "stats.big") {
+          const f = e.args[1];
+          const slot = f?.kind === "strLit" ? STAT_RAW.indexOf(f.value) : -1;
+          if (slot < 0) throw new Error("emitter bug: stats.big field");
+          this.walkExpr(e.args[0]!);
+          code.i32Const(slot);
+          code.call(this.fs.statsRawHelper());
+          // BigInt64Array: signed
+          code.call(this.big.fromBits(true));
+          return;
+        }
+        if (e.fn === "stats.isKind") {
+          const f = e.args[1];
+          const want = f?.kind === "strLit" ? ({ block: 0o060000n, char: 0o020000n, fifo: 0o010000n, socket: 0o140000n } as Record<string, bigint>)[f.value] : undefined;
+          if (want === undefined) throw new Error("emitter bug: stats.isKind kind");
+          this.walkExpr(e.args[0]!);
+          code.i32Const(STAT_RAW.indexOf("mode"));
+          code.call(this.fs.statsRawHelper());
+          code.i64Const(0o170000n);
+          code.i64And();
+          code.i64Const(want);
+          code.i64Eq();
           return;
         }
         if (e.fn === "fsp.mkdir") {
