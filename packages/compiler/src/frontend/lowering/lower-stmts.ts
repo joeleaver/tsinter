@@ -7997,7 +7997,19 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     idx.mutable = true;
     const packRef = (): IrExpr => ({ kind: "varRef", localId: pack.id, type: DYN, loc });
     const iRef = (): IrExpr => ({ kind: "varRef", localId: idx.id, type: F64, loc });
-    const elemInit = (): IrExpr => ({ kind: "libCall", fn: "dyn.arrAt", args: [packRef(), iRef()], type: DYN, loc });
+    // GH #183/#185: an untyped Map is walked LIVE (dyn.iterLive answers the
+    // Map itself; arrLen/arrAt read its table each step, a deleted slot
+    // answering the hole the loop skips), as is `m.keys()` / `m.values()` /
+    // `m.entries()` — the Map with the pair's half to bind.
+    let half: 0 | 1 | null = null;
+    if (iterable.kind === "dynInvoke" && /^%(keys|values|entries)$/.test(iterable.method)) {
+      half = iterable.method === "%keys" ? 0 : iterable.method === "%values" ? 1 : null;
+      iterable = iterable.recv;
+    }
+    const rawLocal = L.declareHiddenLocal("%dofraw", DYN);
+    const rawRef = (): IrExpr => ({ kind: "varRef", localId: rawLocal.id, type: DYN, loc });
+    const elemInit = (): IrExpr =>
+      half === null ? rawRef() : { kind: "libCall", fn: "dyn.arrAt", args: [rawRef(), { kind: "numLit", value: half, type: F64, loc }], type: DYN, loc };
     L.scopes.push(new Map());
     try {
       const binds: IrStmt[] = [];
@@ -8100,10 +8112,20 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
               value: { kind: "bin", op: "+", left: iRef(), right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc },
               loc,
             },
-            body: [...binds, ...body],
+            body: [
+              { kind: "varDecl", localId: rawLocal.id, init: { kind: "libCall", fn: "dyn.arrAt", args: [packRef(), iRef()], type: DYN, loc }, loc },
+              {
+                kind: "if",
+                cond: { kind: "libCall", fn: "dyn.iterHole", args: [rawRef()], type: BOOL, loc },
+                then: [],
+                else_: [...binds, ...body],
+                loc,
+              },
+            ],
             ...(labels && { labels }),
             loc,
           },
+          { kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.iterDone", args: [packRef()], type: VOID, loc }, loc },
         ],
         loc,
       };

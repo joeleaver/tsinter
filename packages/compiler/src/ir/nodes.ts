@@ -2000,6 +2000,10 @@ export type IrLibFn =
    * throws. */
   | "dyn.arrLen"
   | "dyn.arrAt"
+  /** GH #183/#185: a live untyped-Map walk's deleted-slot test (bool) and its
+   * end (void; releases the table to compact). wasm lanes only. */
+  | "dyn.iterHole"
+  | "dyn.iterDone"
   /** `key in v` with a RUNTIME (string) key on a checked-dynamic
    * receiver (args: value dyn, key string; result bool): OBJ answers
    * own-member presence, ARR answers 'length'/a valid index — exactly

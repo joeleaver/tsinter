@@ -859,6 +859,26 @@ function cjsScalarLiteral(e: ts.Expression): boolean {
  * an expando class member constructs a TYPED instance — corpus 2032), as
  * does everything else (object/array literals have their own rules;
  * typed-but-unmappable initializers keep the %init-local adoption). */
+/** GH #183/#185: an untyped `new Map()` / `new WeakMap()` / `new WeakSet()`
+ * (no arguments, the standard library's class): the dynamic container
+ * object lower-classes builds. */
+function untypedContainerNew(L: Lowerer, init: ts.Expression | undefined): boolean {
+  if (init === undefined) return false;
+  let e: ts.Expression = init;
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (!ts.isNewExpression(e) || !ts.isIdentifier(e.expression) || (e.arguments?.length ?? 0) !== 0 || e.typeArguments !== undefined) return false;
+  const name = e.expression.text;
+  if (name !== "Map" && name !== "WeakMap" && name !== "WeakSet") return false;
+  const sym = L.resolveValueSymbol(e.expression);
+  if (!sym || !L.isStdlibSymbol(sym)) return false;
+  // Only where the value lowers as the container object: the type does
+  // not map (an annotated or contextually typed one keeps its typed Map).
+  return L.mapTypeOf(L.typeOf(e)) === null && (() => {
+    const ctx = L.checker.getContextualType(e);
+    return !ctx || L.mapTypeOf(ctx) === null;
+  })();
+}
+
 function jsDynHoldableInitializer(L: Lowerer, init: ts.Expression | undefined): boolean {
   if (init === undefined) return true;
   let e: ts.Expression = init;
@@ -1533,6 +1553,18 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // and closures created in the init body capture it normally.
             // References from separately-declared functions cascade to
             // their own per-site runtime fences.
+            // GH #183/#185: an untyped `new Map()` / `new WeakMap()` / `new
+            // WeakSet()` is a dynamic container object: its binding is a
+            // dynamic global, so every function reaches it.
+            if (isJsSourceFile(sf) && ts.isIdentifier(decl.name) && nameNode === decl.name && untypedContainerNew(L, decl.initializer)) {
+              const symbol = L.checker.getSymbolAtLocation(nameNode);
+              if (symbol && !L.globalsBySymbol.has(symbol)) {
+                const g: IrGlobal = { id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet };
+                L.globalsBySymbol.set(symbol, g);
+                L.globalsList.push(g);
+              }
+              continue;
+            }
             if (isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode))) continue;
             // `var p1 = import("./m")` at file scope: the global holds the
             // island promise/handle — the import expression's only
@@ -1757,8 +1789,10 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         for (const nameNode of boundIdentifiersOf(decl.name)) {
           const diagsBefore = L.diags.length;
           try {
-            if (isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode))) continue;
-            let type = L.irTypeOf(nameNode);
+            // GH #183/#185: an untyped container's var is a dynamic global.
+            const container = isJsSourceFile(sf) && ts.isIdentifier(decl.name) && nameNode === decl.name && untypedContainerNew(L, decl.initializer);
+            if (!container && isJsSourceFile(sf) && L.jsUnmapped(L.typeOf(nameNode))) continue;
+            let type = container ? DYN : L.irTypeOf(nameNode);
             // Nested-var unit-only bindings take the unit-only union too
             // (the top-level registration's rule).
             if (type.kind === "void" && isUnitOnlyTsType(L.typeOf(nameNode))) {

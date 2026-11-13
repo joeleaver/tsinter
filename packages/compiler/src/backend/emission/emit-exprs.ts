@@ -6375,6 +6375,12 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "big.dvGet":
           case "big.dvSet":
             throw new Error("bigint values are not supported on the legacy C/LLVM lanes (use --backend wasm)");
+          case "dyn.iterHole":
+            // GH #183/#185: no live Map walk on the legacy lanes (their
+            // packs are arrays): never a hole.
+            return finish("0");
+          case "dyn.iterDone":
+            return finish("((void)0)");
           default: {
             const _exhaustive: never = fn;
             void _exhaustive;

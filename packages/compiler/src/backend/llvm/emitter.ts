@@ -538,6 +538,8 @@ const LIB_FN_SYMS: Record<string, string> = {
   "dyn.iterLive": "scr_dyn_iter_pack", // legacy lane: the snapshot
   "dyn.arrLen": "scr_dyn_arr_len",
   "dyn.arrAt": "scr_dyn_arr_at",
+  "dyn.iterHole": "scr_dyn_iter_hole",
+  "dyn.iterDone": "scr_dyn_iter_done",
   "dyn.hasKey": "scr_dyn_has_key",
   "dyn.defineProps": "scr_dyn_define_props",
   "dyn.typeof": "scr_dyn_typeof",

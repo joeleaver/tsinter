@@ -823,10 +823,39 @@ the box is built from a known function; a box that lost it ends
 instead of answering false.) The same holds for the class
 prototype of an untyped JavaScript `new Map()`, `new WeakMap()` or
 `new WeakSet()`, which the wasm tier builds as a dyn object tagged with its
-class (board #218): `typeof m.get` is `"undefined"`, `"size" in m` is
-`false`, `m.constructor === Map` is `false`, and `m.size` read into a typed
-slot is the checked read's TypeError, while conversion, inspection,
-cloning, deep equality and iteration answer as the class. (`Object.hasOwn` is own-only by
+class (board #218): `m.constructor === Map` is not `true`, while
+conversion, inspection, cloning, deep equality and iteration answer as the
+class. *(Amended 2026-11-12, GH
+#183/#185, wasm and wasm-native: that object now carries a typed table of
+dynamic keys and values. Its methods answer as Node's — called as methods
+(`get`, `set`, `has`, `delete`, `clear`, `forEach` with its thisArg, a
+WeakSet's `add`), through a computed key (`m[name](k)`), or read as values,
+which are one function per class and name (`m.get === n.get`, `typeof m.get`
+is `"function"`; `const s = m.set; s.call(m, k, v)` runs where the
+binding stays a dynamic value, while in program shapes where the method
+value is compiled as a typed function `.call` / `.apply` / `.bind` on it
+stop by name, SC1090); one called on a
+receiver of another class stops by name where Node throws a TypeError, and
+an own property of a method's name shadows it as in Node; `in` finds the
+class prototype's members (`"size" in m`, `"get" in m`, `"constructor" in
+m`), while own-key tests (`Object.hasOwn`, `hasOwnProperty`) do not, as in
+Node. A Map's `size` reads its table. Iteration walks it live, Node's ordered list with deleted
+slots: a for-of over the Map or over its `keys()` / `values()` /
+`entries()`, and `forEach`, see entries added during the walk (after a
+`clear()` too) and skip entries deleted before they are reached. Inspection
+prints the entries (`Map(2) { 'a' => 1, … }`, past 100 of them `... n more
+items`), `structuredClone` clones them, and deep equality compares them;
+before, the object had no entries and every method call threw a catchable
+`TypeError: m.set is not a function`. What still stops by name: an iterator
+from `keys()` / `values()` / `entries()` used other than by a spread or a
+for-of (an iterator object has no dynamic form yet); a showHidden preview of
+a non-empty WeakMap or WeakSet (S114 (d)); deep equality of two Maps whose
+object keys are not the same objects, where Node matches them deeply; and a
+failing assertion whose message would render an untyped Map, WeakMap or
+WeakSet (`assert.deepStrictEqual`'s diff), as before. A sloppy-mode
+`forEach` callback with no thisArg sees `this` undefined, S042's plain-call
+residue.)*
+(`Object.hasOwn` is own-only by
 definition, so it agrees with Node wherever the member genuinely exists,
 string receivers included; it parts company only where S016's padding
 invents members Node left as holes.) The named forms that DO work are
@@ -3644,9 +3673,14 @@ wrapper object. Here the sloppy function sees the value itself:
 `f.call(null)` prints `[ true, 'object' ]` where Node prints
 `[ false, 'object' ]`, and `f.call(5)` gives `typeof this` `'number'`
 where Node gives `'object'`. Strict code, which ES modules and classes
-always are, is unaffected.
+always are, is unaffected. *(GH #183/#185:)* the same holds for the
+`thisArg` of an untyped Map's or WeakMap's `forEach`: a sloppy callback
+given `null` sees `null` (Node: `globalThis`) and given `5` sees the number
+(Node: a `Number` object).
 **Tested by:** `packages/compiler/test/wasm-u3u4-es5.test.ts` (U4-CALL-01..03
-pass a real object as `thisArg`, where the two agree).
+pass a real object as `thisArg`, where the two agree);
+`packages/compiler/test/wasm-js-map-untyped.test.ts` (JSMAP-18, forEach's
+primitive and null `thisArg` in sloppy code).
 
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 

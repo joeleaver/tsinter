@@ -112,6 +112,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "dyn.iterLive": { argTypes: [DYN, STRING], result: DYN },
   "dyn.arrLen": { argTypes: [DYN], result: F64 },
   "dyn.arrAt": { argTypes: [DYN, F64], result: DYN },
+  "dyn.iterHole": { argTypes: [DYN], result: BOOL },
+  "dyn.iterDone": { argTypes: [DYN], result: VOID },
   "dyn.hasKey": { argTypes: [DYN, STRING], result: BOOL },
   "dyn.argStr": { argTypes: [DYN, STRING, STRING, F64], result: STRING },
   "dyn.toString": { argTypes: [DYN, STRING, STRING], result: STRING },

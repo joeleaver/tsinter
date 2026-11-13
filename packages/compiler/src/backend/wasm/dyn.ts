@@ -327,6 +327,18 @@ export interface DynHandleDeps {
   toStringTags?: boolean;
 }
 
+/** GH #183/#185: maps.ts's helpers over the two tables an untyped
+ * container stores (keys and values dynamic). `map*` take the map<dyn,
+ * dyn> struct, `set*` the set<dyn> struct. get answers (found i32, value);
+ * size / iterCount answer f64; iterLive answers i32; set takes (m, k, v) and
+ * a set's add is its set with value 0. */
+export interface BuiltinTableDeps {
+  mapT(): number;
+  setT(): number;
+  mapFn(op: "new" | "size" | "get" | "set" | "has" | "delete" | "clear" | "iterCount" | "iterLive" | "iterKey" | "iterValue" | "iterEnter" | "iterExit"): number;
+  setFn(op: "new" | "set" | "has" | "delete" | "size"): number;
+}
+
 export interface DynDeps {
   /** Object keys (docs/design/object-keys.md): `$dynObj` carries the
    * identity-hash slot (OBJ_IDH). */
@@ -531,6 +543,11 @@ export interface DynDeps {
    * proto codes 2-4) — the emitter's static prescan — so every OBJ_PROTO
    * reader is byte-identical everywhere else. */
   builtinObjs?: true;
+  /** GH #183/#185: the typed tables an untyped Map / WeakMap / WeakSet
+   * stores its entries in (`$dynObjBuiltin`'s table): the map<dyn, dyn>
+   * and set<dyn> structs and their helpers (maps.ts), by operation.
+   * Present wherever builtinObjs is. */
+  builtinTables?: BuiltinTableDeps;
   /** Unit H (SEMANTICS.md S115): present ONLY in a module that shares a
    * typed composite with dynamic code as a live VIEW (jsView — the
    * emitter's static prescan), so every reader is byte-identical
@@ -901,10 +918,10 @@ export class DynBuilder {
     });
   }
 
-  /** %w.dyn.iterSrc(d) → d, or a fresh empty array when d is an untyped
-   * Map stand-in: its entries are always empty (every Map method use is
-   * fenced), so iterating it is iterating `[]` (board #218). The WeakMap
-   * and WeakSet stand-ins stay OBJ, which is not iterable, as in Node. */
+  /** %w.dyn.iterSrc(d) → d, or, when d is an untyped Map, a fresh array
+   * of its [key, value] entries in insertion order (GH #183/#185; board
+   * #218's stand-in iterated nothing). The WeakMap and WeakSet stay OBJ,
+   * which is not iterable, as in Node. */
   private iterSrc(): number {
     return this.cached("iterSrc", [this.dynRef()], [this.dynRef()], (idx) => {
       const c = new Code();
@@ -913,13 +930,536 @@ export class DynBuilder {
       c.i32Const(OBJ_PROTO_MAP);
       c.i32Eq();
       c.ifResult(this.dynRef());
-      this.pushNewArr(c);
-      c.localSet(1);
-      this.boxArr(c, (x) => x.localGet(1));
+      if (this.builtinTablesLive) {
+        c.localGet(0);
+        c.call(this.builtinMapEntries());
+      } else {
+        this.pushNewArr(c);
+        c.localSet(1);
+        this.boxArr(c, (x) => x.localGet(1));
+      }
       c.else_();
       c.localGet(0);
       c.end();
       this.mb.setBody(idx, [this.arrRef()], c.bytes());
+    });
+  }
+
+  private readonly builtinMethodFns = new Map<string, number>();
+
+  private static readonly BUILTIN_ARITY: Readonly<Record<string, number>> = {
+    get: 1, set: 2, has: 1, delete: 1, add: 1, clear: 0, forEach: 1, keys: 0, values: 0, entries: 0,
+  };
+
+  /** %w.dyn.bmethod:<Class>.<name>() → the interned FUNC box an untyped
+   * container's method reads as (`const s = m.set`, `m[name]`): Node's
+   * name, length and native-code text, one box per class and name (so
+   * `m.get === n.get`), whose thunk calls the method on its `this` — a
+   * receiver of another class stops by name. */
+  builtinMethodFn(cls: number, method: string): number {
+    const clsName = BUILTIN_OBJ_NAMES.find(([tag]) => tag === cls)![1];
+    const key = `${clsName}.${method}`;
+    const hit = this.builtinMethodFns.get(key);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal(this.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.dynT());
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [this.dynRef()]), `%w.dyn.bmethod:${key}`);
+    this.builtinMethodFns.set(key, idx);
+    const thunk = this.mb.declareFunc(this.thunkSig(), `%w.dyn.bthunk:${key}`);
+    this.mb.declareFuncRef(thunk);
+    {
+      const c = new Code();
+      const R = 2;
+      c.call(this.thisGet());
+      c.localTee(R);
+      c.call(this.builtinOf());
+      c.i32Const(cls);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(R);
+      c.localGet(1);
+      this.deps.lit(c, `${clsName}.prototype.${method}`);
+      c.call(this.invoke(method));
+      c.return_();
+      c.end();
+      this.deps.fence(c, (x) => this.deps.lit(x, `${clsName}.prototype.${method} called on a receiver that is not an untyped ${clsName}`));
+      c.refNull(this.dynT());
+      this.mb.setBody(thunk, [this.dynRef()], c.bytes());
+    }
+    const c = new Code();
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.boxFn(
+      c,
+      (x) => this.deps.lit(x, `${clsName}.prototype.${method}`),
+      (x) => x.refFunc(thunk),
+      -1,
+      (x) => this.deps.lit(x, method),
+      DynBuilder.BUILTIN_ARITY[method] ?? 0,
+      (x) => this.deps.lit(x, `function ${method}() { [native code] }`),
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** %w.dyn.builtinMember(d, key) → the method function an untyped
+   * container's class has under `key` (an own property of that name
+   * shadows it), or null. */
+  builtinMember(): number {
+    return this.cached("builtinMember", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const P = 2;
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.localTee(P);
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32LtU();
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      // An own property shadows the prototype's.
+      this.objPayload(c, (x) => x.localGet(0));
+      c.localGet(1);
+      c.call(this.objGet());
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      for (const [method, classes] of DynBuilder.BUILTIN_METHODS) {
+        if (method.startsWith("%")) continue;
+        c.localGet(1);
+        this.deps.lit(c, method);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        for (const cls of classes) {
+          c.localGet(P);
+          c.i32Const(cls);
+          c.i32Eq();
+          c.ifVoid();
+          c.call(this.builtinMethodFn(cls, method));
+          c.return_();
+          c.end();
+        }
+        c.end();
+      }
+      c.refNull(this.dynT());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** The names `in` finds on an untyped container's prototype chain (its
+   * class's own prototype; Object.prototype's keep their S015 answers),
+   * per class. */
+  static readonly BUILTIN_PROTO_NAMES_BY_CLASS: ReadonlyMap<number, readonly string[]> = new Map([
+    [OBJ_PROTO_MAP, ["size", "get", "set", "has", "delete", "clear", "forEach", "keys", "values", "entries", "constructor"]],
+    [OBJ_PROTO_WEAKMAP, ["get", "set", "has", "delete", "constructor"]],
+    [OBJ_PROTO_WEAKSET, ["add", "has", "delete", "constructor"]],
+  ]);
+
+  static readonly BUILTIN_PROTO_NAMES: ReadonlySet<string> = new Set(
+    [...DynBuilder.BUILTIN_PROTO_NAMES_BY_CLASS.values()].flat(),
+  );
+
+  /** %w.dyn.builtinProtoHas(d, key) → i32: is `key` a member of the
+   * untyped container `d`'s class prototype (0 for anything else)? */
+  builtinProtoHas(): number {
+    return this.cached("builtinProtoHas", [this.dynRef(), this.deps.strRef()], [I32], (idx) => {
+      const c = new Code();
+      const P = 2;
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.localSet(P);
+      for (const [cls, names] of DynBuilder.BUILTIN_PROTO_NAMES_BY_CLASS) {
+        c.localGet(P);
+        c.i32Const(cls);
+        c.i32Eq();
+        c.ifVoid();
+        for (const name of names) {
+          c.localGet(1);
+          this.deps.lit(c, name);
+          c.call(this.deps.strEq());
+          c.ifVoid();
+          c.i32Const(1);
+          c.return_();
+          c.end();
+        }
+        c.end();
+      }
+      c.i32Const(0);
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  private holeG: number | null = null;
+
+  /** %w.dyn.iterHoleBox() → the interned box a live Map walk answers for
+   * a deleted entry's slot (the for-of loop skips it; no program value is
+   * ever it). */
+  iterHoleBox(): number {
+    return this.cached("iterHoleBox", [], [this.dynRef()], (idx) => {
+      this.holeG ??= this.mb.addGlobal(this.dynRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.dynT());
+      });
+      const c = new Code();
+      c.globalGet(this.holeG);
+      c.refIsNull();
+      c.ifVoid();
+      this.boxObj(c, (x) => this.pushNewObj(x, false));
+      c.globalSet(this.holeG);
+      c.end();
+      c.globalGet(this.holeG);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.forOfLen(pack) → f64: the for-of walk's bound, re-read every
+   * step — an ARR's length, or an untyped Map's entry span (deleted
+   * slots included: the walk skips them). */
+  forOfLen(): number {
+    return this.cached("forOfLen", [this.dynRef()], [F64], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifResult(F64);
+      this.builtinMapOf(c, 0);
+      c.call(this.deps.builtinTables!.mapFn("iterCount"));
+      c.else_();
+      this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(0)));
+      c.f64ConvertI32U();
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.forOfAt(pack, i) → the walk's element `i`: an ARR's element
+   * (undefined past the end), or an untyped Map's live entry as a fresh
+   * [key, value] pair, the hole box for a deleted slot. */
+  forOfAt(): number {
+    return this.cached("forOfAt", [this.dynRef(), F64], [this.dynRef()], (idx) => {
+      const t = this.deps.builtinTables!;
+      const c = new Code();
+      const P = 2;
+      const A = 3;
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifResult(this.dynRef());
+      this.builtinMapOf(c, 0);
+      c.localGet(1);
+      c.call(t.mapFn("iterLive"));
+      c.ifResult(this.dynRef());
+      this.pushNewArr(c);
+      c.localSet(P);
+      c.localGet(P);
+      this.builtinMapOf(c, 0);
+      c.localGet(1);
+      c.call(t.mapFn("iterKey"));
+      c.call(this.arrPush());
+      c.localGet(P);
+      this.builtinMapOf(c, 0);
+      c.localGet(1);
+      c.call(t.mapFn("iterValue"));
+      c.call(this.arrPush());
+      this.boxArr(c, (x) => x.localGet(P));
+      c.else_();
+      c.call(this.iterHoleBox());
+      c.end();
+      c.else_();
+      this.arrPayload(c, (x) => x.localGet(0));
+      c.localSet(A);
+      c.localGet(1);
+      c.f64Const(0);
+      c.f64Ge();
+      c.localGet(1);
+      this.arrLen(c, (x) => x.localGet(A));
+      c.f64ConvertI32U();
+      c.f64Lt();
+      c.i32And();
+      c.ifResult(this.dynRef());
+      this.arrAt(c, (x) => x.localGet(A), (x) => {
+        x.localGet(1);
+        x.i32TruncF64S();
+      });
+      c.else_();
+      c.globalGet(this.undefinedGlobal());
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.arrRef(), this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.forOfDone(pack): the walk is over — an untyped Map's table
+   * may compact again. */
+  forOfDone(): number {
+    return this.cached("forOfDone", [this.dynRef()], [], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifVoid();
+      this.builtinMapOf(c, 0);
+      c.call(this.deps.builtinTables!.mapFn("iterExit"));
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.builtinMapSize(d) → f64: an untyped Map's entry count (0 for
+   * anything else). */
+  builtinMapSize(): number {
+    return this.cached("builtinMapSize", [this.dynRef()], [F64], (idx) => {
+      const t = this.deps.builtinTables!;
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifResult(F64);
+      this.builtinMapOf(c, 0);
+      c.localTee(1);
+      c.refIsNull();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(1);
+      c.call(t.mapFn("size"));
+      c.end();
+      c.else_();
+      c.f64Const(0);
+      c.end();
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: t.mapT() }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.builtinMapDeepEq(a, b) → i32: do two untyped Maps hold deeply
+   * equal entries (Node's mapEquiv): the same size, and for each entry of
+   * `a` an entry of `b` under the same key (SameValueZero) whose value is
+   * deeply equal. An object key `b` lacks by identity, which Node would
+   * match by deep equality against `b`'s other object keys, stops by
+   * name. */
+  builtinMapDeepEq(): number {
+    return this.cached("builtinMapDeepEq", [this.dynRef(), this.dynRef()], [I32], (idx) => {
+      const t = this.deps.builtinTables!;
+      const c = new Code();
+      const TB = 2;
+      const V = 3;
+      const I = 4;
+      const N = 5;
+      const P = 6;
+      const K = 7;
+      const BV = 8;
+      c.localGet(0);
+      c.call(this.builtinMapSize());
+      c.localGet(1);
+      c.call(this.builtinMapSize());
+      c.f64Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.builtinMapOf(c, 1);
+      c.localSet(TB);
+      c.localGet(0);
+      c.call(this.builtinMapEntries());
+      c.localSet(K);
+      this.arrPayload(c, (x) => x.localGet(K));
+      c.localSet(V);
+      this.arrLen(c, (x) => x.localGet(V));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+      c.localSet(K);
+      this.arrPayload(c, (x) => x.localGet(K));
+      c.localSet(P);
+      this.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+      c.localSet(K);
+      c.localGet(TB);
+      c.localGet(K);
+      c.call(t.mapFn("get"));
+      c.localSet(BV);
+      c.ifVoid();
+      this.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+      c.localGet(BV);
+      c.call(this.deepEqDyn());
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.else_();
+      // Missing under that key: a primitive key decides (unequal); an
+      // object key would need Node's deep key matching.
+      c.localGet(K);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.localTee(N);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.localGet(N);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.i32Or();
+      c.localGet(N);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "deep equality of Maps whose object keys are not the same objects"));
+      c.end();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.i32Const(1);
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: t.mapT() }, this.arrRef(), I32, I32, this.arrRef(), this.dynRef(), this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.builtinWeakSize(d) → f64: a WeakMap's or WeakSet's entry
+   * count (0 for anything else) — what a showHidden inspection would
+   * preview. */
+  builtinWeakSize(): number {
+    return this.cached("builtinWeakSize", [this.dynRef()], [F64], (idx) => {
+      const t = this.deps.builtinTables!;
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.localTee(1);
+      c.i32Const(OBJ_PROTO_WEAKMAP);
+      c.i32Eq();
+      c.ifResult(F64);
+      this.builtinMapOf(c, 0);
+      c.localTee(2);
+      c.refIsNull();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(2);
+      c.call(t.mapFn("size"));
+      c.end();
+      c.else_();
+      c.localGet(1);
+      c.i32Const(OBJ_PROTO_WEAKSET);
+      c.i32Eq();
+      c.ifResult(F64);
+      this.builtinSetOf(c, 0);
+      c.localTee(3);
+      c.refIsNull();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(3);
+      c.call(t.setFn("size"));
+      c.end();
+      c.else_();
+      c.f64Const(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [I32, { kind: "ref", nullable: true, typeIndex: t.mapT() }, { kind: "ref", nullable: true, typeIndex: t.setT() }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.builtinMapEntries(d) → a fresh ARR box of [key, value] ARR
+   * pairs: the untyped Map `d`'s live entries in insertion order (the
+   * snapshot a for-of, a spread or Array.from reads). */
+  builtinMapEntries(): number {
+    return this.builtinMapWalk("builtinMapEntries", "entries");
+  }
+
+  /** The same walk answering the keys, or the values. */
+  builtinMapWalk(name: string, what: "entries" | "keys" | "values"): number {
+    return this.cached(name, [this.dynRef()], [this.dynRef()], (idx) => {
+      const t = this.deps.builtinTables!;
+      const mapRef: ValType = { kind: "ref", nullable: true, typeIndex: t.mapT() };
+      const c = new Code();
+      const M = 1;
+      const OUT = 2;
+      const I = 3;
+      const N = 4;
+      const P = 5;
+      this.builtinMapOf(c, 0);
+      c.localSet(M);
+      this.pushNewArr(c);
+      c.localSet(OUT);
+      c.localGet(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(M);
+      c.call(t.mapFn("iterCount"));
+      c.localSet(N);
+      c.f64Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.f64Ge();
+      c.brIf(1);
+      c.localGet(M);
+      c.localGet(I);
+      c.call(t.mapFn("iterLive"));
+      c.ifVoid();
+      if (what === "entries") {
+        this.pushNewArr(c);
+        c.localSet(P);
+        c.localGet(P);
+        c.localGet(M);
+        c.localGet(I);
+        c.call(t.mapFn("iterKey"));
+        c.call(this.arrPush());
+        c.localGet(P);
+        c.localGet(M);
+        c.localGet(I);
+        c.call(t.mapFn("iterValue"));
+        c.call(this.arrPush());
+        c.localGet(OUT);
+        this.boxArr(c, (x) => x.localGet(P));
+        c.call(this.arrPush());
+      } else {
+        c.localGet(OUT);
+        c.localGet(M);
+        c.localGet(I);
+        c.call(t.mapFn(what === "keys" ? "iterKey" : "iterValue"));
+        c.call(this.arrPush());
+      }
+      c.end();
+      c.localGet(I);
+      c.f64Const(1);
+      c.f64Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      this.boxArr(c, (x) => x.localGet(OUT));
+      this.mb.setBody(idx, [mapRef, this.arrRef(), F64, F64, this.arrRef()], c.bytes());
     });
   }
 
@@ -1599,6 +2139,120 @@ export class DynBuilder {
     c.refNull(this.entriesArrayType());
     c.i32Const(0);
     c.i32Const(0);
+  }
+
+  /* ── GH #183/#185: untyped Map / WeakMap / WeakSet ───────────────────
+   *
+   * An untyped JavaScript `new Map()` / `new WeakMap()` / `new WeakSet()`
+   * is the board #218 container object (an OBJ payload whose proto code
+   * names the class; its own entries are the program's own properties)
+   * carrying the typed table that holds its entries: `$dynObjBuiltin`, a
+   * subtype of the module's OBJ payload (the linked one where the object
+   * model is live) with one more field, the table (a map<dyn, dyn> for a
+   * Map or WeakMap, a set<dyn> for a WeakSet). Its methods dispatch on it
+   * (invoke), `size` reads it (keyGet), and the readers that show a Map's
+   * entries — iteration, inspection, structuredClone — walk it. */
+
+  private objBuiltinType: number | null = null;
+
+  get builtinTablesLive(): boolean {
+    return this.deps.builtinTables !== undefined;
+  }
+
+  objBuiltinT(): number {
+    if (this.objBuiltinType !== null) return this.objBuiltinType;
+    const entries = this.entriesArrayType();
+    const linked = this.objModelLive;
+    const base = linked ? this.objLinkedT() : this.objT();
+    this.objBuiltinType = this.mb.subStructType(
+      "dyn:objBuiltin",
+      [
+        { storage: I32, mutable: true },
+        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
+        { storage: I32, mutable: false },
+        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        ...(linked
+          ? [
+              { storage: this.dynRef(), mutable: true } as FieldType,
+              { storage: { kind: "ref" as const, nullable: true, typeIndex: entries }, mutable: true } as FieldType,
+              { storage: I32, mutable: true } as FieldType,
+              { storage: I32, mutable: true } as FieldType,
+            ]
+          : []),
+        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+      ],
+      base,
+    );
+    return this.objBuiltinType;
+  }
+
+  /** The table field of `$dynObjBuiltin`. */
+  private builtinTableField(): number {
+    return 3 + (this.deps.idSlot === true ? 1 : 0) + (this.objModelLive ? 4 : 0);
+  }
+
+  /** A fresh container OBJ payload with proto code `proto` over the table
+   * the caller pushes. */
+  pushNewBuiltinObj(c: Code, proto: number, pushTable: (c: Code) => void): void {
+    c.i32Const(0);
+    c.refNull(this.entriesArrayType());
+    c.i32Const(proto);
+    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
+    if (this.objModelLive) {
+      c.refNull(this.dynT());
+      this.pushOmTail(c);
+    }
+    pushTable(c);
+    c.structNew(this.objBuiltinT());
+  }
+
+  /** From the `$dyn` box in local `d`, the map<dyn, dyn> table of an
+   * untyped Map or WeakMap, or null (not one). */
+  builtinMapOf(c: Code, d: number): void {
+    c.localGet(d);
+    c.call(this.builtinTableFn());
+    c.refCastNull(this.deps.builtinTables!.mapT());
+  }
+
+  /** ... the set<dyn> table of an untyped WeakSet, or null. */
+  builtinSetOf(c: Code, d: number): void {
+    c.localGet(d);
+    c.call(this.builtinTableFn());
+    c.refCastNull(this.deps.builtinTables!.setT());
+  }
+
+  /** The proto code of the container in local `d` (0 when `d` is no
+   * untyped container). */
+  builtinProtoOf(c: Code, d: number): void {
+    c.localGet(d);
+    c.call(this.builtinOf());
+  }
+
+  /** %w.dyn.builtinTable(d) → eqref: the container's table, or null. */
+  private builtinTableFn(): number {
+    return this.cached("builtinTable", [this.dynRef()], [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifResult({ kind: "ref", nullable: true, typeIndex: EQ_HEAP });
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refTest(this.objBuiltinT());
+      c.ifResult({ kind: "ref", nullable: true, typeIndex: EQ_HEAP });
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.objBuiltinT());
+      c.structGet(this.objBuiltinT(), this.builtinTableField());
+      c.else_();
+      c.refNull(EQ_HEAP);
+      c.end();
+      c.else_();
+      c.refNull(EQ_HEAP);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
 
   /** `$dynTpl <: $dyn` — an ARR box with its `raw` companion. */
@@ -4017,7 +4671,302 @@ export class DynBuilder {
    * still holds the snapshot afterwards (a callback that wrote the array
    * while the method walked it refuses by name — the walk saw the
    * snapshot, Node's sees each write). */
+  /** The methods an untyped Map, WeakMap or WeakSet answers from its
+   * table (GH #183/#185), per class. */
+  static readonly BUILTIN_METHODS: ReadonlyMap<string, readonly number[]> = new Map([
+    ["get", [OBJ_PROTO_MAP, OBJ_PROTO_WEAKMAP]],
+    ["set", [OBJ_PROTO_MAP, OBJ_PROTO_WEAKMAP]],
+    ["has", [OBJ_PROTO_MAP, OBJ_PROTO_WEAKMAP, OBJ_PROTO_WEAKSET]],
+    ["delete", [OBJ_PROTO_MAP, OBJ_PROTO_WEAKMAP, OBJ_PROTO_WEAKSET]],
+    ["add", [OBJ_PROTO_WEAKSET]],
+    ["clear", [OBJ_PROTO_MAP]],
+    ["forEach", [OBJ_PROTO_MAP]],
+    ["keys", [OBJ_PROTO_MAP]],
+    ["values", [OBJ_PROTO_MAP]],
+    ["entries", [OBJ_PROTO_MAP]],
+    // The lowering's iterated-only forms: the snapshot arrays.
+    ["%keys", [OBJ_PROTO_MAP]],
+    ["%values", [OBJ_PROTO_MAP]],
+    ["%entries", [OBJ_PROTO_MAP]],
+  ]);
+
+  /** %w.dyn.invoke:<method>(recv, args, calleeName): the receiver-kind
+   * dispatch. An untyped Map / WeakMap / WeakSet answers its own methods
+   * from its table first (GH #183/#185); everything else is invokeInner's. */
   invoke(method: string): number {
+    const classes = DynBuilder.BUILTIN_METHODS.get(method);
+    if (!this.builtinTablesLive || classes === undefined) return this.invokeInner(method);
+    return this.cached(`invokeB:${method}`, [this.dynRef(), this.arrRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const t = this.deps.builtinTables!;
+      const mapRef: ValType = { kind: "ref", nullable: true, typeIndex: t.mapT() };
+      const setRef: ValType = { kind: "ref", nullable: true, typeIndex: t.setT() };
+      const c = new Code();
+      const P = 3; // proto code
+      const M = 4;
+      const S = 5;
+      const ARGC = 6;
+      const I = 7;
+      const N = 8;
+      const CB = 9;
+      const ARGS = 10;
+      const R = 11;
+      const MSG = 12;
+      const argAt = (i: number): void => {
+        c.i32Const(i);
+        c.localGet(ARGC);
+        c.i32LtU();
+        c.ifResult(this.dynRef());
+        this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(i));
+        c.else_();
+        c.globalGet(this.undefinedGlobal());
+        c.end();
+      };
+      /** Pushes i32: is argument 0 a primitive (no valid weak key)? */
+      const arg0Primitive = (): void => {
+        argAt(0);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.localTee(I);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        for (const k of [DK.BOOL, DK.NUM, DK.STR, DK.UNDEF, DK.BIGINT]) {
+          c.localGet(I);
+          c.i32Const(k);
+          c.i32Eq();
+          c.i32Or();
+        }
+      };
+      this.builtinProtoOf(c, 0);
+      c.localSet(P);
+      // Which classes answer this method.
+      c.i32Const(0);
+      for (const k of classes) {
+        c.localGet(P);
+        c.i32Const(k);
+        c.i32Eq();
+        c.i32Or();
+      }
+      c.ifVoid();
+      // ...and only a container that carries its table (every one this
+      // module builds does).
+      c.localGet(0);
+      c.call(this.builtinTableFn());
+      c.refIsNull();
+      c.i32Eqz();
+      // An own property of the method's name shadows the prototype's (the
+      // own-member call below answers it).
+      if (!method.startsWith("%")) {
+        this.objPayload(c, (x) => x.localGet(0));
+        this.deps.lit(c, method);
+        c.call(this.objGet());
+        c.refIsNull();
+        c.i32And();
+      }
+      c.ifVoid();
+      this.arrLen(c, (x) => x.localGet(1));
+      c.localSet(ARGC);
+      // The table, cast by the class (a WeakSet holds a set<dyn>, the
+      // others a map<dyn, dyn>).
+      c.localGet(P);
+      c.i32Const(OBJ_PROTO_WEAKSET);
+      c.i32Eq();
+      c.ifVoid();
+      if (classes.includes(OBJ_PROTO_WEAKSET)) {
+        this.builtinSetOf(c, 0);
+        c.localSet(S);
+      }
+      c.else_();
+      if (classes.includes(OBJ_PROTO_MAP) || classes.includes(OBJ_PROTO_WEAKMAP)) {
+        this.builtinMapOf(c, 0);
+        c.localSet(M);
+      }
+      c.end();
+      const isWeakSet = (): void => {
+        c.localGet(P);
+        c.i32Const(OBJ_PROTO_WEAKSET);
+        c.i32Eq();
+      };
+      const weakKeyGate = (text: string, ans: "undefined" | "false" | "throw"): void => {
+        // A WeakMap/WeakSet key must be an object: set/add throw Node's
+        // TypeError, get/has/delete answer undefined/false.
+        c.localGet(P);
+        c.i32Const(OBJ_PROTO_MAP);
+        c.i32Ne();
+        arg0Primitive();
+        c.i32And();
+        c.ifVoid();
+        if (ans === "throw") {
+          this.deps.lit(c, text);
+          c.localSet(MSG);
+          this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+          c.refNull(this.dynT());
+        } else if (ans === "false") {
+          this.boxBool(c, (x) => x.i32Const(0));
+        } else {
+          c.globalGet(this.undefinedGlobal());
+        }
+        c.return_();
+        c.end();
+      };
+      switch (method) {
+        case "get":
+          weakKeyGate("", "undefined");
+          c.localGet(M);
+          argAt(0);
+          c.call(t.mapFn("get"));
+          c.localSet(R);
+          c.ifResult(this.dynRef());
+          c.localGet(R);
+          c.else_();
+          c.globalGet(this.undefinedGlobal());
+          c.end();
+          c.return_();
+          break;
+        case "set":
+          weakKeyGate("Invalid value used as weak map key", "throw");
+          c.localGet(M);
+          argAt(0);
+          argAt(1);
+          c.call(t.mapFn("set"));
+          c.localGet(0);
+          c.return_();
+          break;
+        case "add":
+          weakKeyGate("Invalid value used in weak set", "throw");
+          c.localGet(S);
+          argAt(0);
+          c.f64Const(0);
+          c.call(t.setFn("set"));
+          c.localGet(0);
+          c.return_();
+          break;
+        case "has":
+        case "delete": {
+          weakKeyGate("", "false");
+          isWeakSet();
+          c.ifResult(I32);
+          c.localGet(S);
+          argAt(0);
+          c.call(t.setFn(method === "has" ? "has" : "delete"));
+          c.else_();
+          c.localGet(M);
+          argAt(0);
+          c.call(t.mapFn(method === "has" ? "has" : "delete"));
+          c.end();
+          c.localSet(I);
+          this.boxBool(c, (x) => x.localGet(I));
+          c.return_();
+          break;
+        }
+        case "clear":
+          c.localGet(M);
+          c.call(t.mapFn("clear"));
+          c.globalGet(this.undefinedGlobal());
+          c.return_();
+          break;
+        case "forEach": {
+          // forEach(cb): cb(value, key, map) for each live entry, in
+          // insertion order, entries the callback adds visited too (the
+          // count is re-read each step, as Node's iteration does).
+          c.localGet(1);
+          c.call(this.cbGate());
+          c.i32Eqz();
+          c.ifVoid();
+          c.refNull(this.dynT());
+          c.return_();
+          c.end();
+          this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+          c.localSet(CB);
+          // The walk holds the table still (no compaction while it runs,
+          // Node's ordered list with tombstones: entries a callback adds,
+          // after a clear() too, are visited; a key deleted and re-added
+          // is visited again).
+          c.localGet(M);
+          c.call(t.mapFn("iterEnter"));
+          c.f64Const(0);
+          c.localSet(N);
+          c.block();
+          c.loop();
+          c.localGet(N);
+          c.localGet(M);
+          c.call(t.mapFn("iterCount"));
+          c.f64Ge();
+          c.brIf(1);
+          c.localGet(M);
+          c.localGet(N);
+          c.call(t.mapFn("iterLive"));
+          c.ifVoid();
+          this.pushNewArr(c);
+          c.localSet(ARGS);
+          c.localGet(ARGS);
+          c.localGet(M);
+          c.localGet(N);
+          c.call(t.mapFn("iterValue"));
+          c.call(this.arrPush());
+          c.localGet(ARGS);
+          c.localGet(M);
+          c.localGet(N);
+          c.call(t.mapFn("iterKey"));
+          c.call(this.arrPush());
+          c.localGet(ARGS);
+          c.localGet(0);
+          c.call(this.arrPush());
+          // `this` is forEach's thisArg (undefined when absent).
+          argAt(1);
+          c.call(this.thisPush());
+          c.localGet(CB);
+          c.localGet(ARGS);
+          this.deps.lit(c, "callback");
+          c.call(this.callFn());
+          c.localSet(R);
+          c.call(this.thisPop());
+          c.localGet(R);
+          c.refIsNull();
+          c.ifVoid();
+          c.localGet(M);
+          c.call(t.mapFn("iterExit"));
+          c.refNull(this.dynT());
+          c.return_();
+          c.end();
+          c.end();
+          c.localGet(N);
+          c.f64Const(1);
+          c.f64Add();
+          c.localSet(N);
+          c.br(0);
+          c.end();
+          c.end();
+          c.localGet(M);
+          c.call(t.mapFn("iterExit"));
+          c.globalGet(this.undefinedGlobal());
+          c.return_();
+          break;
+        }
+        case "%keys":
+        case "%values":
+        case "%entries":
+          c.localGet(0);
+          c.call(method === "%entries" ? this.builtinMapEntries() : this.builtinMapWalk(`builtinMap${method.slice(1)}`, method === "%keys" ? "keys" : "values"));
+          c.return_();
+          break;
+        default:
+          // keys / values / entries answer Map iterators, which a dynamic
+          // value cannot carry yet: a named fence, never an array that
+          // would print and step differently.
+          this.deps.fence(c, (x) => this.deps.lit(x, `Map.prototype.${method}() on an untyped Map (an iterator through a dynamic value)`));
+          c.refNull(this.dynT());
+          c.return_();
+      }
+      c.end();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.invokeInner(method.replace(/^%/, "")));
+      this.mb.setBody(idx, [I32, mapRef, setRef, I32, I32, F64, this.dynRef(), this.arrRef(), this.dynRef(), this.deps.strRef()], c.bytes());
+    });
+  }
+
+  private invokeInner(method: string): number {
     // An index name reads through the view-aware keyed read (GH #133).
     if (!this.viewsLive || DynBuilder.isIndexName(method)) return this.invokeRaw(method);
     const S = 3;
@@ -4951,6 +5900,24 @@ export class DynBuilder {
       c.i32Const(0);
       c.return_();
       c.end();
+      if (this.builtinTablesLive) {
+        // GH #183/#185: two untyped Maps compare their entries too.
+        c.localGet(OBJA);
+        c.structGet(objT, OBJ_PROTO);
+        c.i32Const(OBJ_PROTO_MAP);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(A);
+        c.localGet(B);
+        c.call(this.builtinMapDeepEq());
+        c.i32Eqz();
+        c.ifVoid();
+        c.call(deqLeave);
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.end();
+      }
       c.localGet(OBJA);
       c.structGet(objT, OBJ_LEN);
       c.localSet(ON);
@@ -6496,6 +7463,44 @@ export class DynBuilder {
             c.end();
             c.end();
           }
+          if (this.builtinTablesLive) {
+            // GH #183/#185: an untyped Map's `size` getter reads its table.
+            c.localGet(0);
+            c.call(this.builtinOf());
+            c.i32Const(OBJ_PROTO_MAP);
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(1);
+            this.deps.lit(c, "size");
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            c.localGet(0);
+            c.call(this.builtinTableFn());
+            c.refIsNull();
+            c.i32Eqz();
+            c.ifVoid();
+            this.boxNum(c, (x) => {
+              x.localGet(0);
+              x.call(this.builtinTableFn());
+              x.refCastNull(this.deps.builtinTables!.mapT());
+              x.call(this.deps.builtinTables!.mapFn("size"));
+            });
+            c.return_();
+            c.end();
+            c.end();
+            c.end();
+            // ...and its prototype methods read as their function values.
+            c.localGet(0);
+            c.localGet(1);
+            c.call(this.builtinMember());
+            c.localTee(M);
+            c.refIsNull();
+            c.i32Eqz();
+            c.ifVoid();
+            c.localGet(M);
+            c.return_();
+            c.end();
+          }
           if (this.urlLive) {
             // Unit I: a URL's modeled getters, and its fenced members.
             this.objPayload(c, (x) => x.localGet(0));
@@ -7786,6 +8791,16 @@ export class DynBuilder {
         });
       }
       this.arm(c, K, [DK.OBJ], () => {
+        if (this.builtinTablesLive) {
+          // GH #183/#185: an untyped container's prototype members.
+          c.localGet(0);
+          c.localGet(1);
+          c.call(this.builtinProtoHas());
+          c.ifVoid();
+          c.i32Const(1);
+          c.return_();
+          c.end();
+        }
         // A class-instance view: its prototype's methods and getters are
         // `in` it, as in Node (the snapshot holds the own fields only).
         this.classViewHasMember(c, 0, 1);
@@ -9270,6 +10285,21 @@ export class DynBuilder {
     return this.cached("iterLive", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
       const c = new Code();
       const S = 2;
+      if (this.builtinTablesLive) {
+        // GH #183/#185: an untyped Map is walked itself, live (iterLen /
+        // iterAt read its table each step; holes are skipped by the loop),
+        // its table held still while the walk runs (iterDone releases it).
+        c.localGet(0);
+        c.call(this.builtinOf());
+        c.i32Const(OBJ_PROTO_MAP);
+        c.i32Eq();
+        c.ifVoid();
+        this.builtinMapOf(c, 0);
+        c.call(this.deps.builtinTables!.mapFn("iterEnter"));
+        c.localGet(0);
+        c.return_();
+        c.end();
+      }
       c.localGet(0);
       c.localSet(S);
       this.emitIterSrc(c, S);

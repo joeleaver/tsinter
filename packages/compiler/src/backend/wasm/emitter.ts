@@ -6114,9 +6114,58 @@ class Assembler {
       c.i32Const(OBJ_PROTO_MAP);
       c.i32Eq();
       c.ifVoid();
-      dyn.boxObj(c, (x) => dyn.pushNewObj(x, OBJ_PROTO_MAP));
+      // GH #183/#185: a Map clones its entries (each key and value cloned
+      // in turn, in insertion order), never its own properties.
+      const info = this.builtinTableInfo(false);
+      const T = 14;
+      const KC = 15;
+      c.call(this.maps.new_(info));
+      c.localSet(T);
+      dyn.boxObj(c, (x) => dyn.pushNewBuiltinObj(x, OBJ_PROTO_MAP, (y) => y.localGet(T)));
       c.localSet(R);
       remember();
+      c.localGet(0);
+      c.call(dyn.builtinMapEntries());
+      c.localSet(V);
+      dyn.arrPayload(c, (x) => x.localGet(V));
+      c.localSet(SA);
+      dyn.arrLen(c, (x) => x.localGet(SA));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      dyn.arrAt(c, (x) => x.localGet(SA), (x) => x.localGet(I));
+      c.localSet(V);
+      dyn.arrPayload(c, (x) => x.localGet(V));
+      c.localSet(A);
+      for (const half of [0, 1]) {
+        dyn.arrAt(c, (x) => x.localGet(A), (x) => x.i32Const(half));
+        c.localGet(1);
+        c.localGet(2);
+        c.call(idx);
+        c.localTee(half === 0 ? KC : V);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        ret();
+        c.end();
+      }
+      c.localGet(T);
+      c.localGet(KC);
+      c.localGet(V);
+      c.call(this.maps.set(info));
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
       c.localGet(R);
       ret();
       c.end();
@@ -6271,7 +6320,11 @@ class Assembler {
     c.localGet(R);
     this.mb.setBody(
       idx,
-      [I32, I32, I32, dyn.dynRef(), errRef, dyn.objRef(), dyn.objRef(), dyn.entryRef(), dyn.dynRef(), arrRef, arrRef],
+      [
+        I32, I32, I32, dyn.dynRef(), errRef, dyn.objRef(), dyn.objRef(), dyn.entryRef(), dyn.dynRef(), arrRef, arrRef,
+        // GH #183/#185: a Map clone's table and cloned key.
+        ...(this.builtinObjLive ? [this.maps.mapRef(this.builtinTableInfo(false)), dyn.dynRef()] : []),
+      ],
       c.bytes(),
     );
     return idx;
@@ -11303,6 +11356,22 @@ class Assembler {
           }
         : {}),
       ...(this.builtinObjLive ? { builtinObjs: true as const } : {}),
+      ...(this.builtinObjLive
+        ? {
+            builtinTables: {
+              mapT: (): number => this.builtinTableInfo(false).struct,
+              setT: (): number => this.builtinTableInfo(true).struct,
+              mapFn: (op: "new" | "size" | "get" | "set" | "has" | "delete" | "clear" | "iterCount" | "iterLive" | "iterKey" | "iterValue" | "iterEnter" | "iterExit"): number => {
+                const i = this.builtinTableInfo(false);
+                return op === "new" ? this.maps.new_(i) : op === "delete" ? this.maps.deleteM(i) : this.maps[op](i);
+              },
+              setFn: (op: "new" | "set" | "has" | "delete" | "size"): number => {
+                const i = this.builtinTableInfo(true);
+                return op === "new" ? this.maps.new_(i) : op === "delete" ? this.maps.deleteM(i) : this.maps[op](i);
+              },
+            },
+          }
+        : {}),
       ...(this.viewsLive ? { views: true as const } : {}),
       ...(this.nullProtoLive
         ? {
@@ -25675,6 +25744,31 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (this.builtinObjLive && (e.fn === "dyn.arrLen" || e.fn === "dyn.arrAt")) {
+          // GH #183/#185: the pack may be an untyped Map walked live.
+          this.walkExpr(e.args[0]!);
+          if (e.fn === "dyn.arrAt") this.walkExpr(e.args[1]!);
+          code.call(e.fn === "dyn.arrLen" ? this.dyn.forOfLen() : this.dyn.forOfAt());
+          return;
+        }
+        if (e.fn === "dyn.iterHole") {
+          // GH #183/#185: a live Map walk's deleted slot (never otherwise).
+          this.walkExpr(e.args[0]!);
+          if (this.builtinObjLive) {
+            code.call(this.dyn.iterHoleBox());
+            code.refEq();
+          } else {
+            code.drop();
+            code.i32Const(0);
+          }
+          return;
+        }
+        if (e.fn === "dyn.iterDone") {
+          this.walkExpr(e.args[0]!);
+          if (this.builtinObjLive) code.call(this.dyn.forOfDone());
+          else code.drop();
+          return;
+        }
         if (e.fn === "dyn.arrLen") {
           // The pack's length and element reads: an ARR by construction
           // (the defensive arms in C cover nothing this lowering reaches).
@@ -30363,6 +30457,14 @@ class Assembler {
         code.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
         code.refIsNull();
         code.i32Eqz();
+        if (this.builtinObjLive && DynBuilder.BUILTIN_PROTO_NAMES.has(e.key)) {
+          // GH #183/#185: an untyped container's prototype members are `in`
+          // it, as in Node.
+          code.localGet(d);
+          this.pushStrLit(e.key);
+          code.call(this.dyn.builtinProtoHas());
+          code.i32Or();
+        }
         if (this.regexIslandLive && e.key === "lastIndex") {
           // Unit F1: an island RegExp's lastIndex is an own data property.
           this.dyn.objPayload(code, (c) => c.localGet(d));
@@ -30603,7 +30705,15 @@ class Assembler {
 
       case "dynObjLit": {
         const o = this.acquireScratch(this.dyn.objRef());
-        this.dyn.pushNewObj(code, e.builtin !== undefined ? BUILTIN_OBJ_PROTO[e.builtin] : false);
+        if (e.builtin !== undefined) {
+          // GH #183/#185: an untyped Map / WeakMap / WeakSet carries the
+          // typed table its entries live in.
+          const weakSet = e.builtin === "WeakSet";
+          const info = this.builtinTableInfo(weakSet);
+          this.dyn.pushNewBuiltinObj(code, BUILTIN_OBJ_PROTO[e.builtin], (c) => c.call(this.maps.new_(info)));
+        } else {
+          this.dyn.pushNewObj(code, false);
+        }
         code.localSet(o);
         // Entries evaluate KEY then VALUE in SOURCE order (JS's
         // object-literal evaluation order); later duplicate keys win,
@@ -30744,7 +30854,7 @@ class Assembler {
         this.walkExpr(e.recv);
         code.localSet(d);
         code.localGet(d);
-        code.call(this.dyn.nullishRecv(e.method));
+        code.call(this.dyn.nullishRecv(e.method.replace(/^%/, "")));
         this.emitPendingCheck();
         code.f64Const(0);
         code.call(this.vecs.newLen(this.dynVecInfo()));
@@ -37035,6 +37145,15 @@ class Assembler {
    * helper family when their keys agree — maps.ts's "ONE representation"
    * thesis taken one layer tighter than scr_map.c, which still keeps a
    * distinct `scr_set_new_ref` entry point C doesn't need to share. */
+  /** GH #183/#185: the table an untyped Map / WeakMap (map<jsval, jsval>)
+   * or WeakSet (set<jsval>) stores its entries in. */
+  private builtinTableInfo(set: boolean): MapInfo {
+    const t: IrType = set ? { kind: "set", elem: JSVAL } : { kind: "map", key: JSVAL, value: JSVAL };
+    const info = this.mapInfoFor(t, undefined, false);
+    if (info === null) throw new Error("wasm emitter: the untyped container table has no map representation");
+    return info;
+  }
+
   private mapInfoFor(t: IrType, loc: SrcLoc | undefined, soft: boolean): MapInfo | null {
     if (t.kind !== "map" && t.kind !== "set") {
       throw new Error(`mapInfoFor on a non-map/set type ${t.kind}`);

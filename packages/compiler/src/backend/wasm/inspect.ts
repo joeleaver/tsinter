@@ -4609,6 +4609,14 @@ export class InspectBuilder {
           c.i32Const(OBJ_PROTO_WEAKMAP);
           c.i32LtU();
           c.i32And();
+          if (dyn.builtinTablesLive) {
+            // GH #183/#185: an untyped Map with entries is no empty form.
+            c.localGet(D);
+            c.call(dyn.builtinMapSize());
+            c.f64Const(0);
+            c.f64Eq();
+            c.i32And();
+          }
         }
         c.ifVoid();
         byProto((name) => `${name}(0) {}`, npOr(`${NULL_PROTO} {}`, "{}"));
@@ -4657,6 +4665,100 @@ export class InspectBuilder {
           this.deps.lit(c, "<items unknown>");
           c.i32Const(0);
           c.call(this.entry());
+          c.end();
+          if (this.deps.showHidden === true && dyn.builtinTablesLive) {
+            // GH #183/#185: with showHidden Node previews a weak
+            // collection's entries, which S114 (d) fences by name — the
+            // stand-in's were always empty, its table's need not be.
+            c.globalGet(this.hidden());
+            c.ifVoid();
+            c.localGet(D);
+            c.call(dyn.builtinWeakSize());
+            c.f64Const(0);
+            c.f64Gt();
+            c.ifVoid();
+            c.localGet(NP);
+            c.i32Const(OBJ_PROTO_WEAKMAP);
+            c.i32Eq();
+            c.ifVoid();
+            this.deps.fence(c, (x) => this.deps.lit(x, "util.inspect of a WeakMap inside the scriptc island is not supported yet (SEMANTICS.md S114)"));
+            c.end();
+            this.deps.fence(c, (x) => this.deps.lit(x, "util.inspect of a WeakSet inside the scriptc island is not supported yet (SEMANTICS.md S114)"));
+            c.end();
+            c.end();
+          }
+        }
+        if (builtins && dyn.builtinTablesLive) {
+          // GH #183/#185: an untyped Map's entries, `key => value` in
+          // insertion order, before its own properties (Node's formatMap).
+          c.localGet(NP);
+          c.i32Const(OBJ_PROTO_MAP);
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(D);
+          c.call(dyn.builtinMapEntries());
+          c.localSet(ENTS);
+          dyn.arrPayload(c, (x) => x.localGet(ENTS));
+          c.localSet(V);
+          dyn.arrLen(c, (x) => x.localGet(V));
+          c.localSet(N);
+          c.i32Const(0);
+          c.localSet(I);
+          c.block();
+          c.loop();
+          c.localGet(I);
+          c.localGet(N);
+          c.i32GeS();
+          c.brIf(1);
+          // Node's maxArrayLength: past 100 entries, "... n more items".
+          c.localGet(I);
+          c.i32Const(MAX_ARRAY_LENGTH);
+          c.i32GeS();
+          c.ifVoid();
+          c.localGet(N);
+          c.localGet(I);
+          c.i32Sub();
+          c.f64ConvertI32S();
+          c.call(this.moreItems());
+          c.i32Const(0);
+          c.call(this.entry());
+          c.br(2);
+          c.end();
+          dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+          c.localSet(E);
+          dyn.arrPayload(c, (x) => x.localGet(E));
+          c.localSet(P);
+          dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+          deeper();
+          c.localGet(DEPTH);
+          c.call(idx);
+          c.localSet(KS);
+          bailIfPending();
+          dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+          deeper();
+          c.localGet(DEPTH);
+          c.call(idx);
+          c.localSet(VS);
+          bailIfPending();
+          c.globalGet(this.len());
+          c.localSet(MARK);
+          c.localGet(KS);
+          c.call(this.ibPuts());
+          this.deps.lit(c, " => ");
+          c.call(this.ibPuts());
+          c.localGet(VS);
+          c.call(this.ibPuts());
+          c.localGet(MARK);
+          c.call(this.ibTake());
+          c.i32Const(0);
+          c.call(this.entry());
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+          c.br(0);
+          c.end();
+          c.end();
           c.end();
         }
         // Own-key ORDER, through the one helper that defines it. The
@@ -4722,7 +4824,30 @@ export class InspectBuilder {
         // (braces[0] = "Map(0) {" or "[Object: null prototype] {", base
         // ''), which is what its line-width test counts.
         this.deps.lit(c, "");
-        byProto((name) => (name === "Map" ? "Map(0) {" : `${name} {`), npOr(`${NULL_PROTO} {`, "{"));
+        if (builtins && dyn.builtinTablesLive) {
+          // GH #183/#185: the Map's own size in its brace.
+          c.localGet(NP);
+          c.i32Const(OBJ_PROTO_MAP);
+          c.i32Eq();
+          c.ifResult(strRef);
+          c.globalGet(this.len());
+          c.localSet(MK2);
+          this.deps.lit(c, "Map(");
+          c.call(this.ibPuts());
+          c.localGet(D);
+          c.call(dyn.builtinMapSize());
+          c.call(this.deps.f64ToStr());
+          c.call(this.ibPuts());
+          this.deps.lit(c, ") {");
+          c.call(this.ibPuts());
+          c.localGet(MK2);
+          c.call(this.ibTake());
+          c.else_();
+          byProto((name) => `${name} {`, npOr(`${NULL_PROTO} {`, "{"));
+          c.end();
+        } else {
+          byProto((name) => (name === "Map" ? "Map(0) {" : `${name} {`), npOr(`${NULL_PROTO} {`, "{"));
+        }
         this.deps.lit(c, "}");
         deeper();
         c.i32Const(0); // no array extras: properties never grid-group

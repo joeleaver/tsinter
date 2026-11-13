@@ -5041,7 +5041,18 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // unimplemented methods throw a LOUD not-supported Error; names the
     // kind's prototype lacks throw Node's "x.y is not a function"; OBJ
     // receivers call the own member.
-    if (DYN_DISPATCH_METHODS.has(access.name.text) && !call.questionDotToken && !access.questionDotToken) {
+    // GH #183/#185: an untyped Map / WeakMap / WeakSet (the checker types
+    // it Map<any, any>, ...) answers its own methods from its table through
+    // the same runtime dispatch.
+    const containerMethod = BUILTIN_CONTAINER_METHODS.has(access.name.text) && builtinContainerType(L, access.expression);
+    // keys() / values() / entries() whose iterator is only iterated (a
+    // spread, a for-of, Array.from): the entries' snapshot array, which
+    // iterates exactly as the iterator does. Any other use keeps the
+    // runtime's named fence (an iterator object has no dynamic form).
+    if (containerMethod && /^(keys|values|entries)$/.test(access.name.text) && call.arguments.length === 0 && onlyIterated(call)) {
+      return { kind: "dynInvoke", recv, method: `%${access.name.text}`, calleeName: access.getText(), args: [], type: DYN, loc: locOf(call) };
+    }
+    if ((containerMethod || DYN_DISPATCH_METHODS.has(access.name.text)) && !call.questionDotToken && !access.questionDotToken) {
       if (call.arguments.some((a) => ts.isSpreadElement(a))) {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
       }
@@ -5121,6 +5132,34 @@ const DYN_PROTO_METHOD_NAMES = new Set([
  * runtime runs the real method for the receiver's kind, throws Node's
  * is-not-a-function where the kind's prototype lacks the name, and
  * fences LOUDLY on real-but-unimplemented pairs. */
+/** GH #183/#185: the methods an untyped Map, WeakMap or WeakSet answers
+ * from its table (dyn.ts's BUILTIN_METHODS). */
+const BUILTIN_CONTAINER_METHODS = new Set(["get", "set", "has", "delete", "add", "clear", "forEach", "keys", "values", "entries"]);
+
+/** Is the call's value only iterated: spread (`[...x]`, `f(...x)`), a
+ * for-of's iterable, or `Array.from(x)`'s one argument? */
+function onlyIterated(call: ts.CallExpression): boolean {
+  let n: ts.Node = call;
+  while (ts.isParenthesizedExpression(n.parent)) n = n.parent;
+  const p = n.parent;
+  if (ts.isSpreadElement(p)) return true;
+  if (ts.isForOfStatement(p) && p.expression === n) return true;
+  return ts.isCallExpression(p) && p.arguments.length === 1 && p.arguments[0] === n &&
+    ts.isPropertyAccessExpression(p.expression) && ts.isIdentifier(p.expression.expression) &&
+    p.expression.expression.text === "Array" && p.expression.name.text === "from";
+}
+
+/** Is the expression's checker type the standard library's Map, WeakMap
+ * or WeakSet (a receiver whose dynamic value may be an untyped
+ * container)? */
+function builtinContainerType(L: Lowerer, node: ts.Expression): boolean {
+  const t = L.typeOf(node);
+  const sym = t.getSymbol() ?? t.getAliasSymbol();
+  if (!sym || !["Map", "WeakMap", "WeakSet"].includes(sym.name)) return false;
+  const decls = L.checker.declarationsOf(sym);
+  return decls.length > 0 && decls.every((d) => d.getSourceFile().isDeclarationFile);
+}
+
 export const DYN_DISPATCH_METHODS = new Set([
   "apply", "call",
   "push", "pop", "shift", "unshift", "slice", "at",
@@ -5146,6 +5185,12 @@ export const DYN_DISPATCH_METHODS = new Set([
   // The Agent handle's own member (no other dyn prototype declares it,
   // so the remainder keeps the stored-member answers).
   "getName",
+  // GH #183/#185: an untyped Map / WeakMap / WeakSet (a dynamic container
+  // object) answers these from its table wherever it is reached through a
+  // dynamic value (`holder.m.set(k, v)`); on every other kind they answer
+  // exactly what the stored-member path did (OBJ own members call; the
+  // rest throw Node's is-not-a-function).
+  "get", "set", "has", "delete", "add", "clear",
   // The netServer half of the handle surface (`let server; server =
   // createServer(...)` — the handle lives in a dyn binding whose
   // closures the checker cannot narrow): listen/close dispatch onto the
