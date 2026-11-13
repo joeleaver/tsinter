@@ -155,5 +155,7 @@ describe("library mode: rows match Node on V8 and wasmtime", () => {
       if (WASMTIME !== null) expect(runWasmtime(row, res.binaryPath, contract, dir)).toBe(want);
     });
   }
-  it.skipIf(WASMTIME !== null)(`wasmtime column: ${NO_WASMTIME}`, () => {});
+  // Shown as a skipped row, with its reason, exactly when the wasmtime
+  // column did not run.
+  if (WASMTIME === null) it.skip(`wasmtime column: ${NO_WASMTIME}`, () => {});
 });
