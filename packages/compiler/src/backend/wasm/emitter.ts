@@ -681,6 +681,13 @@ function reachableFunctionNames(mod: WModule): Set<string> {
   const roots = [mod.entry, ...((mod as { wasmLib?: { exports: { fnName: string }[] } }).wasmLib?.exports.map((e) => e.fnName) ?? [])];
   const reachable = new Set<string>(roots);
   const queue = [...roots];
+  // GH #191: the error-mirror helpers — the error encoding calls them.
+  for (const n of Object.values(mod.errViews ?? {})) {
+    if (names.has(n) && !reachable.has(n)) {
+      reachable.add(n);
+      queue.push(n);
+    }
+  }
   const edge = (name: string): void => {
     if (names.has(name) && !reachable.has(name)) {
       reachable.add(name);
@@ -4303,7 +4310,7 @@ class Assembler {
     if (this.errDataPresMemo !== null) return this.errDataPresMemo;
     const out: number[] = [];
     for (const meta of this.classes.errorClasses()) {
-      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name) || meta.def.errView === true) continue;
       for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
         if (m.def.dynLossyMembers?.data === true) {
           out.push(meta.pre);
@@ -4321,7 +4328,7 @@ class Assembler {
     if (this.errProtoMemo !== null) return this.errProtoMemo;
     const out = new Map<number, readonly string[]>();
     for (const meta of this.classes.errorClasses()) {
-      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name) || meta.def.errView === true) continue;
       const names = new Set<string>();
       for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
         for (const n of m.def.dynLossyMembers?.proto ?? []) names.add(n);
@@ -4340,7 +4347,7 @@ class Assembler {
     if (this.errNamePresMemo !== null) return this.errNamePresMemo;
     const out: number[] = [];
     for (const meta of this.classes.errorClasses()) {
-      if (RUNTIME_ERROR_CLASSES.has(meta.def.name)) continue;
+      if (RUNTIME_ERROR_CLASSES.has(meta.def.name) || meta.def.errView === true) continue;
       for (let m: typeof meta | undefined = meta; m !== undefined && !RUNTIME_ERROR_CLASSES.has(m.def.name); m = m.def.base !== undefined ? this.classes.meta(m.def.base) : undefined) {
         if (m.def.dynLossyMembers?.name === true) {
           out.push(meta.pre);
@@ -4366,6 +4373,27 @@ class Assembler {
       c.i32Eq();
       c.i32Or();
     }
+  }
+
+  /** GH #191: does a write of `field` on a `className` receiver change a
+   * mirrored error's own member (errView classes; errT's name and message
+   * are read live instead)? */
+  private errMirrorField(className: string, field: string): boolean {
+    if (this.mod.errViews === undefined || field === "name" || field === "message") return false;
+    return this.classes.meta(className)?.def.errView === true;
+  }
+
+  /** GH #191: calls one of the frontend's error-mirror helpers
+   * (IrModule.errViews) — the uniform ABI's null closure, then the
+   * arguments `pushArgs` leaves. */
+  private errViewCall(c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void): void {
+    const name = this.mod.errViews![op];
+    const fn = this.funcByName.get(name);
+    const idx = this.funcIndexByName.get(name);
+    if (fn === undefined || idx === undefined) throw new Error(`emitter bug: the error-mirror helper ${name} is not emitted`);
+    c.refNull(this.fnClosPair(fn).clos);
+    pushArgs(c);
+    c.call(idx);
   }
 
   private errProtoDeclaresFn: number | null = null;
@@ -11398,6 +11426,7 @@ class Assembler {
         this.emitSetCellError(c, className, name, pushMessage, null),
       fence: (c, pushMessage, code) => this.emitFenceFatal(c, pushMessage, code ?? null),
       errStopTest: (c, pushErr) => this.emitErrStopTest(c, pushErr),
+      ...(this.mod.errViews !== undefined ? { errView: (c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void) => this.errViewCall(c, op, pushArgs) } : {}),
       ...(this.errNamePres().length > 0 ? { errNameTest: (c: Code, pushErr: (c: Code) => void) => this.emitErrStopTest(c, pushErr, true) } : {}),
       ...(this.errProtoNames().size > 0 ? { errProtoDeclares: () => this.errProtoDeclares() } : {}),
       ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
@@ -22085,14 +22114,31 @@ class Assembler {
             this.releaseScratch(errRef, o);
             return;
           }
+          // GH #191: `name` written from outside a mirrored error's class
+          // becomes own (dyn.ts errNameOwned).
+          const ownName = slot === 1 && this.mod.errViews !== undefined;
+          const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+          const nv = ownName ? this.acquireScratch(errRef) : -1;
           this.walkExpr(s.obj);
+          if (nv >= 0) code.localTee(nv);
           this.walkExpr(s.value);
           code.structSet(this.exc().errT, slot);
+          if (nv >= 0) {
+            code.localGet(nv);
+            code.call(this.dyn.errNameOwned());
+            this.releaseScratch(errRef, nv);
+          }
           return;
         }
         const field = this.classField(s.className, s.field, s.loc);
         if (field === null) return;
+        // GH #191: a field of an error whose encoding mirrors it — the
+        // encoding's entry follows the write (errFieldSync).
+        const mirror = this.errMirrorField(s.className, s.field) || (s.field === "name" && this.mod.errViews !== undefined && this.classes.errorRooted(s.className))
+          ? this.acquireScratch(this.classes.ref(field.info))
+          : -1;
         this.walkExpr(s.obj);
+        if (mirror >= 0) code.localTee(mirror);
         // A class field holds a string VALUE (`this.buf += x` stays a node)
         // — except an error-rooted class's `name` and `message`, which are
         // errT's own flat-string slots (GH #144: a node there was an
@@ -22101,6 +22147,16 @@ class Assembler {
         if (this.nodesLive && !errSlot) this.walkValue(s.value);
         else this.walkExpr(s.value);
         code.structSet(field.info.struct, field.index);
+        if (mirror >= 0) {
+          code.localGet(mirror);
+          if (s.field === "name") {
+            code.call(this.dyn.errNameOwned());
+          } else {
+            this.pushStrLit(s.field);
+            code.call(this.dyn.errFieldSync());
+          }
+          this.releaseScratch(this.classes.ref(field.info), mirror);
+        }
         return;
       }
 
@@ -30590,6 +30646,25 @@ class Assembler {
           code.i32Const(1);
           code.else_();
         }
+        // GH #191: a mirrored error's prototype method or accessor is `in`
+        // it (its own members are entries).
+        const mirrored = this.dyn.errViewLive;
+        if (mirrored) {
+          this.dyn.objPayload(code, (c) => c.localGet(d));
+          this.pushStrLit(e.key);
+          code.call(this.dyn.errViewKind());
+          code.f64Const(3);
+          code.f64Eq();
+          this.dyn.objPayload(code, (c) => c.localGet(d));
+          this.pushStrLit(e.key);
+          code.call(this.dyn.errViewKind());
+          code.f64Const(5);
+          code.f64Eq();
+          code.i32Or();
+          this.openIfResult(I32);
+          code.i32Const(1);
+          code.else_();
+        }
         // SEMANTICS.md S138: a prototype member an Error subclass declares
         // is `in` it in Node; its encoding lacks it — a named stop.
         if (this.errProtoNames().size > 0) {
@@ -30619,6 +30694,7 @@ class Assembler {
           code.refTest(this.dyn.objRegexT());
           code.i32Or();
         }
+        if (mirrored) this.close();
         if (viewKey >= 0) {
           this.close();
           this.releaseScratch(this.strRef, viewKey);
@@ -31411,6 +31487,12 @@ class Assembler {
         else code.f64Sub();
         code.localTee(next);
         code.structSet(field.info.struct, field.index);
+        if (this.errMirrorField(e.className, e.field)) {
+          // GH #191 (errFieldSync, as fieldSet)
+          code.localGet(o);
+          this.pushStrLit(e.field);
+          code.call(this.dyn.errFieldSync());
+        }
         code.localGet(e.prefix ? next : old);
         this.releaseScratch(F64, next);
         this.releaseScratch(F64, old);

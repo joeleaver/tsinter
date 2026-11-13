@@ -854,6 +854,9 @@ export interface IrModule {
   unions?: IrUnionDef[];
   /** Name of the synthetic function holding top-level statements. */
   entry: string;
+  /** GH #191: the error-mirror helpers (class-views.ts buildErrorViews),
+   * roots of reachability: the backend's error encoding calls them. */
+  errViews?: { kind: string; get: string; set: string; keys: string };
   /** Outbound native FFI declarations used by `ffiCall` expressions.
    * These are link-time C ABI imports, not runtime dynamic-library handles:
    * executable builds resolve their symbols from the manifest's archive
@@ -1054,6 +1057,9 @@ export interface IrClassDef {
    * stop (Node lists it). `proto`: the instance method and accessor names:
    * a dynamic read, call or `in` of one of them stops. */
   dynLossyMembers?: { data?: true; name?: true; proto?: string[] };
+  /** GH #191: an instance's dynamic error encoding mirrors its own members
+   * (frontend class-views.ts buildErrorViews; IrModule.errViews). */
+  errView?: true;
   /** The class declares no constructor of its own (GH #135): its
    * constructor's `length` is 0 in Node, whatever the synthesized one
    * forwards to its base. */
@@ -4602,6 +4608,16 @@ export type IrLibFn =
  * truncate, wrap mod 2^32), the operation runs in 32-bit space (shift
  * counts mask to 5 bits), and the result returns to f64 (`>>>` as Uint32,
  * the rest as Int32) — backends emit the scr_bit_* runtime helpers. */
+/** GH #191: the key whose `%errv.kind` answer (9) says the error is one
+ * the mirror helpers cover — a lone surrogate first, which no listing
+ * shows. */
+export const ERRV_PROBE = "\uD800%errv";
+
+/** GH #191: the encoding entry marking where a mirrored error's `name`
+ * became own through a write from outside its class (dyn.ts errNameOwned);
+ * the symbol-key prefix keeps it out of every walker but the listing's. */
+export const ERR_OWN_NAME = "\uD800@@ownName";
+
 export type IrNumBinOp =
   | "+" | "-" | "*" | "/" | "%" | "**"
   | "&" | "|" | "^" | "<<" | ">>" | ">>>"

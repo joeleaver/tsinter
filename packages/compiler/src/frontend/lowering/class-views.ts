@@ -31,7 +31,7 @@ import * as ts from "../ts7/adapter.js";
 import { isUndefExpr } from "./lower-exprs.js";
 import { emitterRooted } from "./lower-emitter.js";
 import { EMITTER_API_MEMBERS, type ClassInfo } from "./lower-classes.js";
-import { BOOL, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 
 const str = (value: string, loc: SrcLoc): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
 const undef = (loc: SrcLoc): IrExpr => ({ kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc });
@@ -591,4 +591,474 @@ export function classViewFactory(L: Lowerer, className: string, loc: SrcLoc): st
     loc,
   });
   return name;
+}
+
+/* ── GH #191: a user Error subclass's own members in its dynamic encoding ──
+ *
+ * An error crossing into a dynamic value becomes the `%error` encoding
+ * (dyn.ts fromError). For an instance of a program's own `extends Error`
+ * class the encoding MIRRORS the instance: its own keys are entries in
+ * Node's order, values read live, writes go through to the typed fields.
+ * Four program-wide helpers over any error answer for the classes here
+ * (the backend calls them; 0 / undefined for every other error):
+ *   - kind(e, k): 0 not the instance's, 1 an own property present, 2 one
+ *     not yet present, 3 a prototype method or accessor, 4 an own property
+ *     whose presence or place in a listing is unknown;
+ *   - get(e, k): the member's value (a field lifted, a method bound to the
+ *     instance, a getter's answer);
+ *   - set(e, k, v): 1 when `k` is the instance's (a checked store into the
+ *     field, a setter's call), 0 for any other key (an expando);
+ *   - keys(e): the own keys present, in Node's order — an array, or
+ *     undefined for an error none of these classes built.
+ * Node's order (define semantics, measured under the top-10 loader and
+ * `--experimental-transform-types`): per class, root first — parameter
+ * properties, then every field declaration (present from construction,
+ * undefined when uninitialized), then what the constructor's top level
+ * assigns, in statement order. A key first assigned anywhere else (a
+ * `declare` field, a method, a conditional) is "late": present once
+ * assigned. */
+
+interface ErrKey {
+  name: string;
+  late: boolean;
+  /** A late key provably first assigned after construction (nowhere in a
+   * constructor or field initializer of the chain, and no constructor lets
+   * `this` escape): when present at the crossing it is the last own key. */
+  afterCtor?: boolean;
+}
+
+/** Does `n` contain a `return` or `throw` (outside nested functions and
+ * classes) — a statement after which a constructor may have left? */
+function canLeave(n: ts.Node): boolean {
+  let found = false;
+  const visit = (x: ts.Node): void => {
+    if (found) return;
+    if (ts.isReturnStatement(x) || ts.isThrowStatement(x)) {
+      found = true;
+      return;
+    }
+    if (ts.isFunctionLike(x) || (ts.isClassDeclaration(x) || ts.isClassExpression(x))) return;
+    x.forEachChild(visit);
+  };
+  visit(n);
+  return found;
+}
+
+/** Does constructor-time code `n` let `this` escape (a method call on it, a
+ * `super.m()` call, `this` passed, stored or returned, or a read or write
+ * of `this.<m>` where `m` is a method or accessor on the chain — a getter
+ * or setter runs code) — so code outside the constructor may run before
+ * construction ends? */
+function thisEscapes(n: ts.Node, members: ReadonlySet<string>): boolean {
+  let found = false;
+  const visit = (x: ts.Node): void => {
+    if (found) return;
+    if (x.kind === ts.SyntaxKind.ThisKeyword) {
+      const p = x.parent;
+      const member = p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === x;
+      const called = member && p.parent !== undefined && ts.isCallExpression(p.parent) && p.parent.expression === p;
+      if (!member || called || members.has(p.name.text)) found = true;
+      return;
+    }
+    if (ts.isPropertyAccessExpression(x) && x.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      found = true;
+      return;
+    }
+    if (ts.isCallExpression(x) && ts.isPropertyAccessExpression(x.expression) && x.expression.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      found = true;
+      return;
+    }
+    if (ts.isFunctionDeclaration(x) || ts.isFunctionExpression(x) || (ts.isClassDeclaration(x) || ts.isClassExpression(x))) return;
+    x.forEachChild(visit);
+  };
+  visit(n);
+  return found;
+}
+
+/** The keys an error class's instances own, in Node's order, or null when
+ * one of them has no field this view can read. */
+function errOwnKeys(info: ClassInfo): ErrKey[] | null {
+  const out: ErrKey[] = [];
+  const seen = new Set<string>();
+  // the chain index of the class giving each static key; per class, where
+  // its constructor's last top-level key assignment ends
+  let ci = -1;
+  let lastStaticClass = -1;
+  const lastStaticEnd = new Map<number, number>();
+  const add = (name: string, late: boolean): void => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push({ name, late });
+    if (!late) lastStaticClass = Math.max(lastStaticClass, ci);
+  };
+  // a late key's constructor-time assignment sites: the one class whose
+  // constructor body holds them all and the earliest, or "mixed" (several
+  // constructors, a field initializer)
+  const ctorSites = new Map<string, { ci: number; pos: number } | "mixed">();
+  const nameOf = (nm: ts.PropertyName | undefined): string | undefined =>
+    nm === undefined ? undefined : ts.isIdentifier(nm) || ts.isStringLiteralLike(nm) ? nm.text : undefined;
+  const lateNames: string[] = [];
+  // late keys some constructor-time code assigns, and whether any
+  // constructor-time code lets `this` escape
+  const ctorAssigned = new Set<string>();
+  let escapes = false;
+  // every method and accessor name on the chain (a read or write of one
+  // through `this` during construction runs code)
+  const members = new Set<string>();
+  for (const c of chainOf(info)) {
+    for (const key of c.methods.keys()) members.add(key.startsWith("get:") || key.startsWith("set:") ? key.slice(4) : key);
+  }
+  for (const c of chainOf(info)) {
+    ci++;
+    const decl = c.decl;
+    if (decl === null) continue;
+    const ctor = (decl.members as ts.NodeArray<ts.ClassElement>).find((m) => ts.isConstructorDeclaration(m)) as ts.ConstructorDeclaration | undefined;
+    if (ctor?.body !== undefined && thisEscapes(ctor.body, members)) escapes = true;
+    for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+      if (ts.isPropertyDeclaration(m) && m.initializer !== undefined && !(ts.getCombinedModifierFlags(m as unknown as ts.Declaration) & ts.ModifierFlags.Static) && thisEscapes(m.initializer, members)) escapes = true;
+    }
+    for (const p of ctor?.parameters ?? []) {
+      const pf = ts.getCombinedModifierFlags(p);
+      if ((pf & (ts.ModifierFlags.Public | ts.ModifierFlags.Private | ts.ModifierFlags.Protected | ts.ModifierFlags.Readonly)) && ts.isIdentifier(p.name)) add(p.name.text, false);
+    }
+    for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+      if (!ts.isPropertyDeclaration(m)) continue;
+      const flags = ts.getCombinedModifierFlags(m as unknown as ts.Declaration);
+      if (flags & (ts.ModifierFlags.Static | ts.ModifierFlags.Abstract)) continue;
+      const n = nameOf(m.name);
+      if (n === undefined) {
+        if (ts.isPrivateIdentifier(m.name)) continue;
+        return null;
+      }
+      if (flags & ts.ModifierFlags.Ambient) lateNames.push(n);
+      else add(n, false);
+    }
+    const isThisAssign = (e: ts.Node, eqOnly: boolean): string | null => {
+      if (!ts.isBinaryExpression(e)) return null;
+      const op = e.operatorToken.kind;
+      if (eqOnly ? op !== ts.SyntaxKind.EqualsToken : op < ts.SyntaxKind.FirstAssignment || op > ts.SyntaxKind.LastAssignment) return null;
+      const l = e.left;
+      if (ts.isPropertyAccessExpression(l) && l.expression.kind === ts.SyntaxKind.ThisKeyword) return ts.isPrivateIdentifier(l.name) ? "%private" : l.name.text;
+      if (ts.isElementAccessExpression(l) && l.expression.kind === ts.SyntaxKind.ThisKeyword) return "%computed";
+      return null;
+    };
+    // The constructor's top-level `this.x = …` statements, up to the first
+    // statement that can leave it (a `return` or `throw`): past that, an
+    // assignment may not have run — late.
+    const topLevel = new Set<ts.Node>();
+    for (const st of ctor?.body?.statements ?? []) {
+      if (canLeave(st)) break;
+      if (!ts.isExpressionStatement(st)) continue;
+      const n = isThisAssign(st.expression, true);
+      if (n === null || n === "%private") continue;
+      if (n === "%computed") return null;
+      topLevel.add(st.expression);
+      add(n, false);
+      lastStaticEnd.set(ci, st.end);
+    }
+    // every other `this.x <op>= …` in the class body: late
+    let computed = false;
+    let inCtor = false;
+    let inCtorBody = false;
+    const visit = (n: ts.Node): void => {
+      if (computed) return;
+      if (!topLevel.has(n)) {
+        const a = isThisAssign(n, false);
+        if (a === "%computed") {
+          computed = true;
+          return;
+        }
+        if (a !== null && a !== "%private") {
+          lateNames.push(a);
+          if (inCtor) {
+            ctorAssigned.add(a);
+            const prev = ctorSites.get(a);
+            if (!inCtorBody || prev === "mixed" || (prev !== undefined && prev.ci !== ci)) ctorSites.set(a, "mixed");
+            else if (prev === undefined || n.pos < prev.pos) ctorSites.set(a, { ci, pos: n.pos });
+          }
+        }
+      }
+      if (ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) return;
+      n.forEachChild(visit);
+    };
+    for (const m of decl.members as ts.NodeArray<ts.ClassElement>) {
+      const flags = ts.canHaveModifiers(m) ? ts.getCombinedModifierFlags(m as unknown as ts.Declaration) : 0;
+      if (flags & ts.ModifierFlags.Static) continue;
+      inCtor = ts.isConstructorDeclaration(m) || ts.isPropertyDeclaration(m);
+      inCtorBody = ts.isConstructorDeclaration(m);
+      m.forEachChild(visit);
+    }
+    if (computed) return null;
+    for (const f of c.fieldOrder) if (f.late === true) lateNames.push(f.name);
+  }
+  for (const n of lateNames) add(n, true);
+  for (const k of out) {
+    if (!k.late || escapes) continue;
+    // provably the last own key: assigned only after construction, or only
+    // in the constructor of the deepest class that gives keys, after that
+    // constructor's last top-level key assignment
+    const site = ctorSites.get(k.name);
+    if (!ctorAssigned.has(k.name)) k.afterCtor = true;
+    else if (site !== undefined && site !== "mixed" && site.ci >= lastStaticClass && site.pos >= (lastStaticEnd.get(site.ci) ?? -1)) k.afterCtor = true;
+  }
+  // every key must be a field the struct holds (name and message: errT's)
+  for (const k of out) if (!info.fields.has(k.name)) return null;
+  return out;
+}
+
+type ErrMember = { name: string; kind: "method" | "getter" | "setterOnly" | "unsupported" };
+
+/** The prototype member names of an error class's chain (nearest first):
+ * methods and getters it can answer, and the rest (setter-only accessors,
+ * generator methods) by name. */
+function errProtoMembers(info: ClassInfo): ErrMember[] {
+  const out: ErrMember[] = [];
+  const seen = new Set<string>();
+  for (let c: ClassInfo | null = info; c && !c.builtinError; c = c.base) {
+    const names = new Map<string, Set<string>>();
+    for (const [key, sig] of c.methods) {
+      if (key.includes("#") || key === "constructor") continue;
+      const getter = key.startsWith("get:");
+      const setter = key.startsWith("set:");
+      const name = getter || setter ? key.slice(4) : key;
+      const s = names.get(name) ?? new Set<string>();
+      s.add(sig.gen !== undefined ? "gen" : getter ? "get" : setter ? "set" : "method");
+      names.set(name, s);
+    }
+    for (const [name, s] of names) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, kind: s.has("gen") ? "unsupported" : s.has("method") ? "method" : s.has("get") ? "getter" : "setterOnly" });
+    }
+  }
+  return out;
+}
+
+/** The user Error classes whose instances mirror into their encoding,
+ * deepest first, each with its own keys. A class whose keys this view
+ * cannot read is left out (its crossing keeps SEMANTICS.md S138's stop). */
+function errViewClasses(L: Lowerer): { info: ClassInfo; keys: ErrKey[] }[] {
+  const out: { info: ClassInfo; keys: ErrKey[]; depth: number }[] = [];
+  for (const info of L.classes.values()) {
+    // (an abstract class has no instances of its own: its concrete
+    // subclasses, deeper, answer first)
+    if (info.decl === null || info.builtinError || info.def.abstract === true || info.generic !== undefined) continue;
+    let depth = 0;
+    let isErr = false;
+    for (let b = info.base; b; b = b.base) {
+      depth++;
+      if (b.builtinError) isErr = true;
+    }
+    if (!isErr) continue;
+    const keys = errOwnKeys(info);
+    if (keys === null) continue;
+    out.push({ info, keys, depth });
+  }
+  return out.sort((a, b) => b.depth - a.depth);
+}
+
+/** GH #191, discovery (Lowerer.discover): the methods and accessors the
+ * mirror helpers call, for every mirrored class something constructs —
+ * their bodies are reachable through any error crossing. */
+export function noteErrorViewEdges(L: Lowerer, reachable: ReadonlySet<string>): void {
+  if (!L.sharedDynamic) return;
+  for (const { info } of errViewClasses(L)) {
+    if (!reachable.has(`%${info.def.name}.constructor`)) continue;
+    for (const m of errProtoMembers(info)) {
+      for (const key of [m.name, `get:${m.name}`, `set:${m.name}`]) {
+        if (L.findMethodOn(info, key)) L.noteVirtualEdge(info, key);
+      }
+    }
+  }
+}
+
+/** GH #191: builds the four helpers (see above) and marks each class they
+ * cover (IrClassDef.errView); null when the program has no such class. */
+export function buildErrorViews(L: Lowerer): { kind: string; get: string; set: string; keys: string } | null {
+  if (!L.sharedDynamic) return null;
+  const classes = errViewClasses(L);
+  if (classes.length === 0) return null;
+  const root = [...L.classes.values()].find((c) => c.builtinError && c.base === null);
+  if (root === undefined) return null;
+  const loc = classes[0]!.info.def.loc;
+  const rootT: IrType = { kind: "object", className: root.def.name };
+  const e = (): IrExpr => ({ kind: "varRef", localId: "e.0", type: rootT, loc });
+  const k = (): IrExpr => ({ kind: "varRef", localId: "k.0", type: STRING, loc });
+  const v = (): IrExpr => ({ kind: "varRef", localId: "v.0", type: JSVAL, loc });
+  const keyIs = (n: string): IrExpr => ({ kind: "strEq", negated: false, left: k(), right: str(n, loc), type: BOOL, loc });
+  const num = (n: number): IrExpr => ({ kind: "numLit", value: n, type: F64, loc });
+  const ret = (value: IrExpr | null): IrStmt => ({ kind: "return", value, loc });
+  const iff = (cond: IrExpr, then: IrStmt[]): IrStmt => ({ kind: "if", cond, then, else_: null, loc });
+  const names = { kind: "%errv.kind", get: "%errv.get", set: "%errv.set", keys: "%errv.keys" };
+  type Op = keyof typeof names;
+  type Local = { id: string; name: string; type: IrType; mutable: boolean; boxed?: true };
+  const bodies: Record<Op, IrStmt[]> = { kind: [], get: [], set: [], keys: [] };
+  const locals: Record<Op, Local[]> = { kind: [], get: [], set: [], keys: [] };
+  classes.forEach(({ info, keys }, ci) => {
+    const t: IrType = { kind: "object", className: info.def.name };
+    const label = info.def.name.replace(/^%m\d+\./, "").replace(/^%/, "");
+    const xid = `x.${ci}`;
+    const x = (): IrExpr => ({ kind: "varRef", localId: xid, type: t, loc });
+    const cap = { localId: xid, name: "x", type: t };
+    const capLocal = { id: xid, name: "x", type: t, mutable: false as const, boxed: true as const };
+    const enter = (op: Op, inner: IrStmt[]): void => {
+      locals[op].push(capLocal);
+      bodies[op].push(iff({ kind: "instanceOf", value: e(), className: info.def.name, type: BOOL, loc }, [
+        { kind: "varDecl", localId: xid, init: { kind: "downcast", value: e(), type: t, loc }, loc },
+        ...inner,
+      ]));
+    };
+    const fieldRead = (name: string): IrExpr => ({ kind: "fieldGet", obj: x(), className: info.def.name, field: name, type: info.fields.get(name)!, loc });
+    const members = errProtoMembers(info).filter((m) => !keys.some((kk) => kk.name === m.name));
+    const lateUnknown = (name: string): boolean => mayBeWrittenUndefined(L, name);
+    // kind
+    {
+      const inner: IrStmt[] = [iff(keyIs(ERRV_PROBE), [ret(num(9))])];
+      for (const key of keys) {
+        if (key.name === "name" || key.name === "message") {
+          // errT's own slots always hold a value: a late assignment's
+          // presence is unknown; `message` is own (and enumerable) as
+          // Node has it only depending on what super() was given.
+          inner.push(iff(keyIs(key.name), [ret(num(key.late || key.name === "message" ? 4 : 1))]));
+          continue;
+        }
+        if (!key.late) {
+          inner.push(iff(keyIs(key.name), [ret(num(1))]));
+          continue;
+        }
+        inner.push(iff(keyIs(key.name), [
+          { kind: "if", cond: isUndefExpr(fieldRead(key.name), false, loc), then: [ret(num(lateUnknown(key.name) ? 4 : 2))], else_: [ret(num(1))], loc },
+        ]));
+      }
+      // 5: a method — called through the value it runs; read as a value
+      // (a function Node hands out unbound) it stops by name
+      for (const m of members) inner.push(iff(keyIs(m.name), [ret(num(m.kind === "method" ? 5 : 3))]));
+      inner.push(ret(num(0)));
+      enter("kind", inner);
+    }
+    // get
+    {
+      const inner: IrStmt[] = [];
+      for (const key of keys) inner.push(iff(keyIs(key.name), [ret(liftOut(L, fieldRead(key.name), loc))]));
+      for (const m of members) {
+        let stmts: IrStmt[];
+        if (m.kind === "method" && L.findMethodOn(info, m.name)?.sig.abstract !== true) {
+          stmts = [ret(boundMethodFn(L, `%errv.${ci}`, info, m.name, x, cap, capLocal, loc))];
+        } else if (m.kind === "method") {
+          stmts = [fence(`reading the method '${m.name}' of a '${label}' error held in a dynamic value is not supported yet`, loc), ret(undef(loc))];
+        } else if (m.kind === "getter") {
+          const call = methodCall(L, info, `get:${m.name}`, x(), [], loc);
+          stmts = call === null
+            ? [fence(`reading the accessor '${m.name}' of a '${label}' error held in a dynamic value is not supported yet`, loc), ret(undef(loc))]
+            : [ret(liftOut(L, call, loc))];
+        } else if (m.kind === "setterOnly") {
+          stmts = [ret(undef(loc))];
+        } else {
+          stmts = [fence(`reading the generator method '${m.name}' of a '${label}' error held in a dynamic value is not supported yet`, loc), ret(undef(loc))];
+        }
+        inner.push(iff(keyIs(m.name), stmts));
+      }
+      inner.push(ret(undef(loc)));
+      enter("get", inner);
+    }
+    // set
+    {
+      const inner: IrStmt[] = [];
+      keys.forEach((key, j) => {
+        if (key.name === "name" || key.name === "message") return; // the slots' own write-through
+        const ft = info.fields.get(key.name)!;
+        const conv = exitArg(L, v(), ft);
+        const cid = `c.${ci}.${j}`;
+        if (conv !== null) locals.set.push({ id: cid, name: "c", type: ft, mutable: true });
+        inner.push(iff(keyIs(key.name), conv === null
+          ? [fence(`storing into the '${key.name}' field ('${L.fmt(ft)}') of a '${label}' error from dynamic code is not supported yet`, loc), ret(num(1))]
+          : [
+            { kind: "varDecl", localId: cid, init: conv, loc },
+            { kind: "fieldSet", obj: x(), className: info.def.name, field: key.name, value: { kind: "varRef", localId: cid, type: ft, loc }, loc },
+            ret(num(1)),
+          ]));
+      });
+      for (const m of members) {
+        const setter = L.findMethodOn(info, `set:${m.name}`);
+        if (setter && setter.sig.params.length === 1) {
+          const a = exitArg(L, v(), setter.sig.params[0]!.type);
+          const call = a === null ? null : methodCall(L, info, `set:${m.name}`, x(), [a], loc);
+          if (call !== null) {
+            inner.push(iff(keyIs(m.name), [{ kind: "exprStmt", expr: call, loc }, ret(num(1))]));
+            continue;
+          }
+        }
+        inner.push(iff(keyIs(m.name), [fence(`assigning '${m.name}' (a method or accessor of its class) on a '${label}' error held in a dynamic value is not supported yet`, loc), ret(num(1))]));
+      }
+      inner.push(ret(num(0)));
+      enter("set", inner);
+    }
+    // keys
+    {
+      const oid = `o.${ci}`;
+      const nid = `n.${ci}`;
+      const o = (): IrExpr => ({ kind: "varRef", localId: oid, type: JSVAL, loc });
+      const n = (): IrExpr => ({ kind: "varRef", localId: nid, type: F64, loc });
+      locals.keys.push({ id: oid, name: "o", type: JSVAL, mutable: true }, { id: nid, name: "n", type: F64, mutable: true });
+      const push = (name: string): IrStmt => ({
+        kind: "exprStmt",
+        expr: { kind: "jsOp", op: "callMethod", name: "push", args: [o(), { kind: "jsMarshal", value: str(name, loc), type: JSVAL, loc }], type: JSVAL, loc },
+        loc,
+      });
+      const inner: IrStmt[] = [
+        { kind: "varDecl", localId: oid, init: { kind: "jsOp", op: "arrLit", args: [], type: JSVAL, loc }, loc },
+        { kind: "varDecl", localId: nid, init: num(0), loc },
+      ];
+      for (const key of keys) {
+        // `message`, and a late `name`: the encoding's own entry (kind 4)
+        if (key.name === "message" || (key.name === "name" && key.late)) continue;
+        if (!key.late) {
+          inner.push(push(key.name));
+          continue;
+        }
+        inner.push({
+          kind: "if",
+          cond: isUndefExpr(fieldRead(key.name), false, loc),
+          then: lateUnknown(key.name)
+            ? [fence(`an error of class '${label}' crossing into a dynamic value while its property '${key.name}' (first assigned outside the constructor's top level) holds undefined: whether it exists is unknown (SEMANTICS.md S138)`, loc)]
+            : [],
+          else_: key.afterCtor === true
+            ? [
+              push(key.name),
+              { kind: "assign", localId: nid, value: { kind: "bin", op: "+", left: n(), right: num(1), type: F64, loc }, loc },
+            ]
+            : [fence(`an error of class '${label}' crossing into a dynamic value after its property '${key.name}' was assigned during construction where its place among the own properties is unknown (SEMANTICS.md S138)`, loc)],
+          loc,
+        });
+      }
+      inner.push(iff({ kind: "bin", op: ">=", left: n(), right: num(2), type: BOOL, loc }, [
+        fence(`an error of class '${label}' crossing into a dynamic value with two or more properties first assigned outside the constructor's top level: their order is unknown (SEMANTICS.md S138)`, loc),
+      ]));
+      inner.push(ret(o()));
+      enter("keys", inner);
+    }
+    info.def.errView = true;
+  });
+  bodies.kind.push(ret(num(0)));
+  bodies.get.push(ret(undef(loc)));
+  bodies.set.push(ret(num(0)));
+  bodies.keys.push(ret(undef(loc)));
+  const ek = [{ localId: "e.0", name: "e", type: rootT }, { localId: "k.0", name: "k", type: STRING }];
+  const sig: Record<Op, { params: { localId: string; name: string; type: IrType }[]; ret: IrType }> = {
+    kind: { params: ek, ret: F64 },
+    get: { params: ek, ret: JSVAL },
+    set: { params: [...ek, { localId: "v.0", name: "v", type: JSVAL }], ret: F64 },
+    keys: { params: [ek[0]!], ret: JSVAL },
+  };
+  for (const op of ["kind", "get", "set", "keys"] as const) {
+    L.liftedFns.push({
+      name: names[op],
+      params: sig[op].params,
+      returnType: sig[op].ret,
+      locals: [...sig[op].params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: false })), ...locals[op]],
+      body: bodies[op],
+      loc,
+    });
+  }
+  return names;
 }

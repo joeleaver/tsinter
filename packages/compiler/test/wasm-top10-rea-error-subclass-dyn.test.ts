@@ -3,13 +3,11 @@
  * carries errT's name, message and stamped code only, so a subclass's own
  * members were LOST where Node keeps them (`a.code` undefined, JSON `{}`): a
  * silent miscompile on main, found while lifting rea's catch idiom.
- * SEMANTICS.md S138 (until #191 carries the members):
- *  - a class with OWN data (fields, parameter properties, `this.x = …`
- *    anywhere, an own `name`/`code`) stops by name when an instance
- *    crosses into a dynamic value;
- *  - a class with only prototype members (methods, accessors) crosses; a
- *    dynamic read, call or `in` of a name its chain declares stops, every
- *    other name answers as in Node.
+ * SEMANTICS.md S138 stopped those by name; since GH #191 the encoding
+ * mirrors the instance (own members in Node's order, read live; prototype
+ * methods and accessors through the class), and the rows that pinned the
+ * stops are exact rows. The remaining stops are S138's GH #191 amendment
+ * (wasm-gh191-error-mirror.test.ts).
  * Also GH #193: a program's key listing or Object.assign of an error held
  * in a dynamic value no longer shows the encoding's internal entries.
  *
@@ -49,24 +47,20 @@ const FS =
 
 const ROWS: Row[] = [
   {
-    id: "REA-ERRDYN-01 a parameter-property subclass into any stops at the crossing",
+    id: "REA-ERRDYN-01 a parameter-property subclass into any reads its own members (GH #191)",
     src: FS + 'console.log("start");\nconst a: any = new FsError("own", "EOWN");\nconsole.log(a.code);',
-    stops: { before: "start\n" },
   },
   {
-    id: "REA-ERRDYN-02 a field-bearing subclass into unknown stops at the crossing (before JSON)",
+    id: "REA-ERRDYN-02 a field-bearing subclass into unknown: its JSON lists the fields (GH #191)",
     src: 'class FieldErr extends Error { detail = 3; }\nconsole.log("start");\nconst u: unknown = new FieldErr("x");\nconsole.log(JSON.stringify(u));',
-    stops: { before: "start\n" },
   },
   {
-    id: "REA-ERRDYN-03 a caught field-bearing subclass read as any stops at the crossing",
+    id: "REA-ERRDYN-03 a caught field-bearing subclass read as any reads its fields (GH #191)",
     src: FS + 'console.log("start");\ntry { throw new FsError("own", "EOWN"); } catch (e: any) { console.log(e.code); }',
-    stops: { before: "start\n" },
   },
   {
-    id: "REA-ERRDYN-04 a getter-only subclass: a dynamic read of its getter stops by name",
+    id: "REA-ERRDYN-04 a getter-only subclass: a dynamic read of its getter calls it (GH #191)",
     src: 'class GetErr extends Error { get code(): string { return "G"; } }\nconst a: any = new GetErr("g");\nconsole.log(a.message, a.other);\nconsole.log(a.code);',
-    stops: { before: "g undefined\n" },
   },
   {
     id: "REA-ERRDYN-05 a subclass with nothing of its own keeps crossing (any, unknown, JSON, catch)",
@@ -84,11 +78,10 @@ const ROWS: Row[] = [
       'try { new URL("not a url"); } catch (e: any) { console.log(e.name, e.code); }',
   },
   {
-    id: "REA-ERRDYN-07 (review) a declare field assigned inside an if stops at the crossing",
+    id: "REA-ERRDYN-07 (review) a declare field assigned inside an if is listed once present (GH #191)",
     src:
       'class CondErr extends Error { declare detail: string; constructor(m: string, d?: string) { super(m); if (d !== undefined) { this.detail = d; } } }\n' +
       'console.log("start");\nconst a: any = new CondErr("m", "D");\nconsole.log(a.detail);',
-    stops: { before: "start\n" },
   },
   {
     id: "REA-ERRDYN-08 (review F2) a declare-only field nothing assigns: reads through any equal Node",
@@ -98,21 +91,19 @@ const ROWS: Row[] = [
       "console.log(a.message, a.code, JSON.stringify(a));",
   },
   {
-    id: "REA-ERRDYN-09 (review) a subclass setting its own name stops at the crossing",
+    id: "REA-ERRDYN-09 (review) a subclass setting its own name lists it (GH #191)",
     src:
       'class MyErr extends Error { constructor(m: string) { super(m); this.name = "MyErr"; } }\n' +
       'console.log("start");\nconst a: any = new MyErr("m");\nconsole.log(Object.keys(a), JSON.stringify(a));',
-    stops: { before: "start\n" },
   },
   {
-    id: "REA-ERRDYN-10 a method-only subclass: message, JSON and keys equal Node; a dynamic call of its method stops",
+    id: "REA-ERRDYN-10 a method-only subclass: message, JSON and keys equal Node; a dynamic call of its method runs it (GH #191)",
     src:
       'class MErr extends Error { describe(): string { return "d:" + this.message; } }\n' +
       'const a: any = new MErr("m");\n' +
       "console.log(a.message);\n" +
       "console.log(JSON.stringify(a), Object.keys(a));\n" +
       "console.log(a.describe());",
-    stops: { before: "m\n{} []\n" },
   },
   {
     id: "REA-ERRDYN-11 (review) a method-only subclass in the catch idiom: e.code on an undeclared name equals Node",
@@ -121,13 +112,12 @@ const ROWS: Row[] = [
       'try { throw new MErr("m"); } catch (e: any) { console.log(e.code === "ENOENT" ? "enoent" : "other", e.message); }',
   },
   {
-    id: "REA-ERRDYN-12 (review) a method-only subclass: in/hasOwn of undeclared names and hasOwn of its method equal Node; in of its method stops",
+    id: "REA-ERRDYN-12 (review) a method-only subclass: in/hasOwn equal Node, its method included (GH #191)",
     src:
       'class MErr extends Error { describe(): string { return "d"; } }\n' +
       'const a: any = new MErr("m");\n' +
       'console.log("code" in a, Object.hasOwn(a, "describe"), Object.hasOwn(a, "code"));\n' +
       'console.log("describe" in a);',
-    stops: { before: "false false false\n" },
   },
   {
     id: "REA-ERRDYN-13 (GH #193) keys, entries and Object.assign of a plain error in any list no internal entries; an expando lists",

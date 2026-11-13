@@ -1725,6 +1725,7 @@ export class ObjModel {
       [I32],
       [I32, this.k.fnPropsRef()],
       (c) => {
+      this.d.errMirrorGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "Object.defineProperty (or defineProperties, or an assignment through it) on a member");
         const K = 6;
         const FP = 7;
         // A well-known symbol's property is modeled only non-enumerable
@@ -2403,6 +2404,7 @@ export class ObjModel {
       [I32],
       [I32, this.d.objRef(), I32, this.k.fnPropsRef(), I32],
       (c) => {
+      this.d.errMirrorGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "'delete' of a member");
         const K = 2;
         const O = 3;
         const IDX = 4;
@@ -2579,6 +2581,7 @@ export class ObjModel {
     const dynT = this.d.dynT();
     const L = this.d.objLinkedT();
     return this.fn("setProto", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), I32], (c) => {
+      this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.setPrototypeOf");
       const PK = 2;
       const W = 3;
       const G = 4;
@@ -2825,7 +2828,8 @@ export class ObjModel {
         c.brIf(1);
         c.localGet(P);
         c.i32Const(0);
-        c.call(this.d.objWalk());
+        // GH #191 / #193: an error's encoding lists as the program sees it
+        c.call(this.d.objWalkUser());
         c.localTee(KEYS);
         c.refIsNull();
         c.ifVoid();
@@ -2902,6 +2906,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.objRef(), I32, this.d.entryRef(), I32, I32],
       (c) => {
+      this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.freeze, seal or preventExtensions");
         const O = 2;
         const I = 3;
         const E = 4;

@@ -132,14 +132,14 @@ test("A1-OSPREAD-02 a function source spreads its own ENUMERABLE members (define
   expect(exitCode).toBe(0);
 });
 
-test("A1-OSPREAD-03 spreading a caught error into an island literal refuses by name", async () => {
-  const { stdout, stderr } = await runRowTrap("A1-OSPREAD-03", "// @dynamic\n\"use strict\";\n// a caught error spread into an island literal\ntry {\n  throw new TypeError(\"boom\");\n} catch (e) {\n  /** @type {*} */\n  const any = e;\n  try {\n    /** @type {*} */\n    const o = { ...any, extra: 1 };\n    console.log(JSON.stringify(o));\n  } catch (e2) {\n    console.log(`${e2.name}: ${e2.message}`);\n  }\n}", "js");
-  // Node prints {"extra":1}: an Error's members are non-enumerable. The
-  // dyn error encoding's would copy, marker included (S021/S025), so the
-  // spread refuses by name (SEMANTICS.md S043's unit-A1 amendment) — and,
-  // GH #86 (SEMANTICS.md S122): a fence ends the program, so the program's own catch never sees it.
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet [SC1090]\n");
+test("A1-OSPREAD-03 spreading a caught error into an island literal copies its enumerable members (none), as Node", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A1-OSPREAD-03", "// @dynamic\n\"use strict\";\n// a caught error spread into an island literal\ntry {\n  throw new TypeError(\"boom\");\n} catch (e) {\n  /** @type {*} */\n  const any = e;\n  try {\n    /** @type {*} */\n    const o = { ...any, extra: 1 };\n    console.log(JSON.stringify(o));\n  } catch (e2) {\n    console.log(`${e2.name}: ${e2.message}`);\n  }\n}", "js");
+  // Node prints {"extra":1}: an Error's members are non-enumerable. Since
+  // GH #191 the spread copies the encoding's program-visible listing
+  // (SEMANTICS.md S043's unit-A1 amendment, as amended).
+  expect(stdout).toBe('{"extra":1}\n');
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("A1-SPREAD-03 the nullish spread text names the source as V8 renders it", async () => {

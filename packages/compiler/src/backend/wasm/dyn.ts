@@ -133,6 +133,7 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
+import { ERR_OWN_NAME, ERRV_PROBE } from "../../ir/nodes.js";
 import { ObjModel } from "./objmodel.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
@@ -428,6 +429,12 @@ export interface DynDeps {
    * that sets an own `name`? JSON, key listings and Object.assign of its
    * encoding stop (Node lists the own name; the encoding hides it). */
   errNameTest?: (c: Code, pushErr: (c: Code) => void) => void;
+  /** GH #191: calls one of the frontend's error-mirror helpers over a user
+   * Error subclass's instance (class-views.ts buildErrorViews): `kind
+   * (err, key) -> f64`, `get(err, key) -> dyn`, `set(err, key, v) -> f64`,
+   * `keys(err) -> dyn`. `pushArgs` leaves the arguments. Absent: the
+   * program has no such class. */
+  errView?: (c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void) => void;
   /** Unit U (SEMANTICS.md S119 (b)): the module's "a hole was made" i32
    * global, when the module was lowered with undefSlots — an array that
    * crossed in from typed storage holds the element's `undefined` where
@@ -7063,10 +7070,6 @@ export class DynBuilder {
       const c = new Code();
       const L = 3;
       c.localGet(0);
-      c.localGet(1);
-      c.localGet(2);
-      c.call(this.objPut());
-      c.localGet(0);
       c.call(this.errLinkOf());
       c.localTee(L);
       c.refIsNull();
@@ -7076,7 +7079,16 @@ export class DynBuilder {
       c.localGet(1);
       c.localGet(2);
       c.call(this.errWriteThrough());
+      // GH #191: the instance's own member took it (its field, whose
+      // entry the store mirrored, or its setter).
+      c.ifVoid();
+      c.return_();
       c.end();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.objPut());
       this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
     });
   }
@@ -7104,7 +7116,7 @@ export class DynBuilder {
    * A non-string `name` or `message` cannot live in the slot and is a
    * named fence. Any other key marks errExtraGlobal. */
   errWriteThrough(): number {
-    return this.cached("errWriteThrough", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef(), this.dynRef()], [], (idx) => {
+    return this.cached("errWriteThrough", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef(), this.dynRef()], [I32], (idx) => {
       const dynT = this.dynT();
       const errT = this.deps.errT();
       const c = new Code();
@@ -7120,6 +7132,7 @@ export class DynBuilder {
         c.ifVoid();
         this.deps.fence(c, (x) =>
           this.deps.lit(x, `assigning a non-string '${key}' to an error held in a dynamic value is not supported yet`));
+        c.i32Const(0);
         c.return_();
         c.end();
         c.localGet(0);
@@ -7127,11 +7140,32 @@ export class DynBuilder {
         c.structGet(dynT, DYN_REF);
         emitFlatCast(c, this.deps.strType());
         c.structSet(errT, slot);
+        if (key === "name" && this.deps.errView !== undefined) {
+          c.localGet(0);
+          c.call(this.errNameOwned());
+        }
+        c.i32Const(0);
+        c.return_();
+        c.end();
+      }
+      const view = this.deps.errView;
+      if (view !== undefined) {
+        // GH #191: a user Error subclass's own field or accessor.
+        view(c, "set", (x) => {
+          x.localGet(0);
+          x.localGet(1);
+          x.localGet(2);
+        });
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifVoid();
+        c.i32Const(1);
         c.return_();
         c.end();
       }
       c.i32Const(1);
       c.globalSet(this.errExtraGlobal());
+      c.i32Const(0);
       this.mb.setBody(idx, [], c.bytes());
     });
   }
@@ -7172,8 +7206,269 @@ export class DynBuilder {
         c.return_();
         c.end();
       }
+      const view = this.deps.errView;
+      if (view !== undefined) {
+        // GH #191: a user Error subclass's own field, method or accessor,
+        // read live off the instance (an expando: the entries, below).
+        const KD = 4;
+        view(c, "kind", (x) => {
+          x.localGet(L);
+          x.localGet(1);
+        });
+        c.localTee(KD);
+        c.f64Const(0);
+        c.f64Gt();
+        c.localGet(KD);
+        c.f64Const(5);
+        c.f64Lt();
+        c.i32And();
+        c.ifVoid();
+        view(c, "get", (x) => {
+          x.localGet(L);
+          x.localGet(1);
+        });
+        c.return_();
+        c.end();
+        // a method read as a value: Node hands out the prototype's own,
+        // unbound function (identity, `this` from the call site); a call
+        // through the read runs (errLiveMemberCall)
+        c.localGet(KD);
+        c.f64Const(5);
+        c.f64Eq();
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "reading a method of an Error subclass instance held in a dynamic value as a value (not calling it) is not supported yet (SEMANTICS.md S138)"));
+        c.refNull(this.dynT());
+        c.return_();
+        c.end();
+      }
       c.refNull(this.dynT());
-      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: errT }, this.deps.strRef()], c.bytes());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: errT }, this.deps.strRef(), F64], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errLiveMemberCall(obj, key) → errLiveMember for a read that is
+   * called at once (`e.m(...)`, JSON's toJSON): a mirrored error's method
+   * answers, bound to the instance, the call's own receiver (GH #191). */
+  errLiveMemberCall(): number {
+    return this.cached("errLiveMemberCall", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const L = 2;
+      if (this.deps.errView !== undefined) {
+        c.localGet(0);
+        this.deps.lit(c, ERRV_PROBE);
+        c.call(this.errViewKind());
+        c.f64Const(9);
+        c.f64Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.localGet(1);
+        c.call(this.errViewKind());
+        c.f64Const(5);
+        c.f64Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.call(this.errLinkOf());
+        c.localSet(L);
+        this.deps.errView(c, "get", (x) => {
+          x.localGet(L);
+          x.localGet(1);
+        });
+        c.return_();
+        c.end();
+        c.end();
+      }
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.errLiveMember());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errFieldSync(err, key): after a typed write of the field `key`
+   * of an error whose encoding mirrors it (GH #191): the encoding's entry
+   * takes the new value (and, for a property first assigned now, its
+   * place). Nothing before the error first crosses. */
+  errFieldSync(): number {
+    return this.cached("errFieldSync", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.deps.strRef()], [], (idx) => {
+      const c = new Code();
+      const B = 2;
+      const V = 3;
+      c.localGet(0);
+      c.structGet(this.deps.errT(), this.deps.errBox());
+      c.refCastNull(this.dynT());
+      c.localTee(B);
+      c.refIsNull();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.deps.errView!(c, "get", (x) => {
+        x.localGet(0);
+        x.localGet(1);
+      });
+      c.localSet(V);
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(B));
+      c.localGet(1);
+      c.localGet(V);
+      c.call(this.objPut());
+      this.mb.setBody(idx, [this.dynRef(), this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errNameOwned(err): after a write of `name` from outside the
+   * class (typed or dynamic) to a mirrored error whose class does not own
+   * `name`: the property is own from now on in Node, listed in the place
+   * this write gives it — a marker entry (ERR_OWN_NAME) in its encoding,
+   * which is built now if the error has not crossed yet (GH #191). */
+  errNameOwned(): number {
+    return this.cached("errNameOwned", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [], (idx) => {
+      const c = new Code();
+      const view = this.deps.errView!;
+      view(c, "kind", (x) => {
+        x.localGet(0);
+        this.deps.lit(x, ERRV_PROBE);
+      });
+      c.f64Const(9);
+      c.f64Ne();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      view(c, "kind", (x) => {
+        x.localGet(0);
+        this.deps.lit(x, "name");
+      });
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => {
+        x.localGet(0);
+        x.call(this.fromError());
+      });
+      this.deps.lit(c, ERR_OWN_NAME);
+      c.globalGet(this.boolGlobal(true));
+      c.call(this.objPut());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errViewKind(obj, key) -> f64: GH #191's kind (class-views.ts)
+   * of `key` on the error `obj` encodes; 0 for any other object or for an
+   * error no mirrored class built. */
+  errViewKind(): number {
+    return this.cached("errViewKind", [this.objRef(), this.deps.strRef()], [F64], (idx) => {
+      const c = new Code();
+      const ERR = 2;
+      c.localGet(0);
+      c.call(this.errLinkOf());
+      c.localTee(ERR);
+      c.refIsNull();
+      c.ifVoid();
+      c.f64Const(0);
+      c.return_();
+      c.end();
+      this.deps.errView!(c, "kind", (x) => {
+        x.localGet(ERR);
+        x.localGet(1);
+      });
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+    });
+  }
+
+  /** GH #191: an object-model change (`delete`, defineProperty, freeze,
+   * setPrototypeOf) to a mirrored error's encoding stops by name — of one
+   * of the instance's own members or `message` when `pushKey` is given, of
+   * anything otherwise: its typed fields (and the struct's name and
+   * message slots) keep no absent, non-writable or non-enumerable state. */
+  errMirrorGuard(c: Code, pushDyn: (c: Code) => void, pushKey: ((c: Code) => void) | null, what: string): void {
+    if (this.deps.errView === undefined) return;
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    this.objPayload(c, pushDyn);
+    this.deps.lit(c, ERRV_PROBE);
+    c.call(this.errViewKind());
+    c.f64Const(9);
+    c.f64Eq();
+    if (pushKey !== null) {
+      this.objPayload(c, pushDyn);
+      pushKey(c);
+      c.call(this.errViewKind());
+      c.f64Const(0);
+      c.f64Ne();
+      pushKey(c);
+      this.deps.lit(c, "message");
+      c.call(this.deps.strEq());
+      c.i32Or();
+      c.i32And();
+    }
+    c.ifVoid();
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, `${what} of an Error subclass instance held in a dynamic value is not supported yet: its typed fields keep no such state (SEMANTICS.md S138)`));
+    c.end();
+    c.end();
+  }
+
+  /** GH #191: does this module mirror any user Error subclass? */
+  get errViewLive(): boolean {
+    return this.deps.errView !== undefined;
+  }
+
+  /** %w.dyn.errListBox(d) → d, or for a mirrored error's encoding its
+   * listing copy boxed (errListView): what JSON's member walk takes. */
+  errListBox(): number {
+    return this.cached("errListBox", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const P = 1;
+      const V = 2;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(0));
+      c.localTee(P);
+      c.call(this.errListView());
+      c.localTee(V);
+      c.localGet(P);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      this.boxObj(c, (x) => x.localGet(V));
+      this.mb.setBody(idx, [this.objRef(), this.objRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.errListView(obj) → obj, or for the encoding of an error whose
+   * class mirrors it (GH #191) the listing copy (errUserView): what JSON
+   * walks. */
+  errListView(): number {
+    return this.cached("errListView", [this.objRef()], [this.objRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      this.deps.lit(c, ERRV_PROBE);
+      c.call(this.errViewKind());
+      c.f64Const(9);
+      c.f64Eq();
+      c.ifResult(this.objRef());
+      c.localGet(0);
+      c.call(this.errUserView());
+      c.else_();
+      c.localGet(0);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
     });
   }
 
@@ -7421,16 +7716,21 @@ export class DynBuilder {
           c.end();
           // GH #137: an error's encoding reads `name` / `message` off the
           // error itself (errWriteThrough keeps the two in step): a typed
-          // write lands there without touching the encoding.
-          c.localGet(1);
-          c.arrayLen();
-          c.i32Const(4);
-          c.i32Eq();
-          c.localGet(1);
-          c.arrayLen();
-          c.i32Const(7);
-          c.i32Eq();
-          c.i32Or();
+          // write lands there without touching the encoding. GH #191: a
+          // mirrored error's every own member reads live too.
+          if (this.deps.errView !== undefined) {
+            c.i32Const(1);
+          } else {
+            c.localGet(1);
+            c.arrayLen();
+            c.i32Const(4);
+            c.i32Eq();
+            c.localGet(1);
+            c.arrayLen();
+            c.i32Const(7);
+            c.i32Eq();
+            c.i32Or();
+          }
           c.ifVoid();
           this.objPayload(c, (x) => x.localGet(0));
           c.localGet(1);
@@ -8808,6 +9108,31 @@ export class DynBuilder {
         c.i32Const(1);
         c.return_();
         c.end();
+        // GH #191: a mirrored error's prototype method or accessor (and
+        // an own member) is `in` it.
+        if (this.deps.errView !== undefined) {
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.errViewKind());
+          c.f64Const(1);
+          c.f64Eq();
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.errViewKind());
+          c.f64Const(3);
+          c.f64Eq();
+          c.i32Or();
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.errViewKind());
+          c.f64Const(5);
+          c.f64Eq();
+          c.i32Or();
+          c.ifVoid();
+          c.i32Const(1);
+          c.return_();
+          c.end();
+        }
         // S138: an Error subclass's prototype member, which its encoding
         // lacks (Node: true).
         if (this.deps.errProtoDeclares !== undefined) {
@@ -9224,6 +9549,106 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(objT, OBJ_LEN);
       c.localSet(N);
+      const view = this.deps.errView;
+      if (view !== undefined) {
+        // GH #191: an error whose class mirrors it lists its own keys in
+        // the encoding's order (Node's: errFieldSync places a property
+        // first assigned after the crossing), values live, then the
+        // program's expandos; errT's `name` and `message` only where the
+        // class makes them own (kind 1), a place unknown (kind 4) stops.
+        const KD = 6;
+        c.localGet(0);
+        this.deps.lit(c, ERRV_PROBE);
+        c.call(this.errViewKind());
+        c.f64Const(9);
+        c.f64Eq();
+        c.ifVoid();
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(0);
+        c.structGet(objT, OBJ_ENTRIES);
+        c.localGet(I);
+        c.arrayGet(entries);
+        c.localSet(E);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        this.deps.lit(c, "%error");
+        c.call(this.deps.strEq());
+        c.brIf(0);
+        // an own `name` a write from outside the class made (errNameOwned)
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        this.deps.lit(c, ERR_OWN_NAME);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        c.localGet(CP);
+        this.deps.lit(c, "name");
+        this.boxStr(c, (x) => {
+          x.localGet(ERR);
+          x.structGet(this.deps.errT(), this.deps.errName());
+        });
+        c.call(this.objPut());
+        c.br(1);
+        c.end();
+        view(c, "kind", (x) => {
+          x.localGet(ERR);
+          x.localGet(E);
+          x.structGet(entryT, ENTRY_KEY);
+        });
+        c.localTee(KD);
+        c.f64Const(4);
+        c.f64Eq();
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "JSON, a key listing or Object.assign of an instance of an Error subclass held in a dynamic value (unknown, any, a catch binding) whose own 'name' or 'message' is set where its place or presence is unknown (SEMANTICS.md S138)"));
+        c.end();
+        // errT's own members, unless the class owns them
+        c.localGet(KD);
+        c.f64Const(1);
+        c.f64Ne();
+        c.ifVoid();
+        c.i32Const(0);
+        for (const key of ["name", "message", "code"]) {
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          this.deps.lit(c, key);
+          c.call(this.deps.strEq());
+          c.i32Or();
+        }
+        c.brIf(1);
+        c.end();
+        c.localGet(CP);
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        c.localGet(KD);
+        c.f64Const(1);
+        c.f64Eq();
+        c.ifResult(this.dynRef());
+        view(c, "get", (x) => {
+          x.localGet(ERR);
+          x.localGet(E);
+          x.structGet(entryT, ENTRY_KEY);
+        });
+        c.else_();
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_VALUE);
+        c.end();
+        c.call(this.objPut());
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(CP);
+        c.return_();
+        c.end();
+      }
       c.i32Const(0);
       c.localSet(I);
       c.block();
@@ -9262,7 +9687,7 @@ export class DynBuilder {
       c.end();
       c.end();
       c.localGet(CP);
-      this.mb.setBody(idx, [this.objRef(), I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
+      this.mb.setBody(idx, [this.objRef(), I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: this.deps.errT() }, F64], c.bytes());
     });
   }
 
@@ -9875,6 +10300,20 @@ export class DynBuilder {
       c.i32Const(DK.OBJ);
       c.i32Eq();
       c.ifVoid();
+      // GH #191: an error's own encoding copies what Node's
+      // CopyDataProperties would — its listing (errUserView: a mirrored
+      // class's own members, a program's expandos).
+      this.objPayload(c, (x) => x.localGet(0));
+      c.call(this.errLinkOf());
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      this.boxObj(c, (x) => {
+        this.objPayload(x, (y) => y.localGet(0));
+        x.call(this.errUserView());
+      });
+      c.return_();
+      c.end();
       this.objPayload(c, (x) => x.localGet(0));
       this.deps.lit(c, "%error");
       c.call(this.objGet());
@@ -11018,6 +11457,16 @@ export class DynBuilder {
         // A first crossing builds the encoding.
         this.pushNewObj(c, false);
         c.localSet(O);
+        const view = this.deps.errView;
+        const KS = 5;
+        if (view !== undefined) {
+          // GH #191: an instance of a user Error subclass the frontend
+          // mirrors: its own keys present now, in Node's order (keys()
+          // stops by name where that order is unknown). Taken before the
+          // encoding exists, so a stop leaves nothing half-built.
+          view(c, "keys", (x) => x.localGet(0));
+          c.localSet(KS);
+        }
         const put = (key: string, pushValue: () => void): void => {
           c.localGet(O);
           this.deps.lit(c, key);
@@ -11040,6 +11489,53 @@ export class DynBuilder {
           c.structNew(this.errLinkT());
           c.structNew(this.dynT());
         });
+        // GH #191: the mirrored keys' places, ahead of errT's own members
+        // (an own `name` listed where the class sets it); their values
+        // follow once the encoding is published (below).
+        const KA = 6;
+        const KN = 7;
+        const KI = 8;
+        const KK = 9;
+        const eachKey = (body: () => void): void => {
+          c.localGet(KS);
+          c.structGet(this.dynT(), DYN_KIND);
+          c.i32Const(DK.ARR);
+          c.i32Eq();
+          c.ifVoid();
+          this.arrPayload(c, (x) => x.localGet(KS));
+          c.localSet(KA);
+          this.arrLen(c, (x) => x.localGet(KA));
+          c.localSet(KN);
+          c.i32Const(0);
+          c.localSet(KI);
+          c.block();
+          c.loop();
+          c.localGet(KI);
+          c.localGet(KN);
+          c.i32GeU();
+          c.brIf(1);
+          this.arrAt(c, (x) => x.localGet(KA), (x) => x.localGet(KI));
+          c.structGet(this.dynT(), DYN_REF);
+          emitFlatCast(c, this.deps.strType());
+          c.localSet(KK);
+          body();
+          c.localGet(KI);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(KI);
+          c.br(0);
+          c.end();
+          c.end();
+          c.end();
+        };
+        if (view !== undefined) {
+          eachKey(() => {
+            c.localGet(O);
+            c.localGet(KK);
+            c.globalGet(this.undefinedGlobal());
+            c.call(this.objPut());
+          });
+        }
         const strSlot = (slot: number): void => {
           this.boxStr(c, (x) => {
             x.localGet(0);
@@ -11075,6 +11571,19 @@ export class DynBuilder {
         c.localGet(0);
         c.localGet(D);
         c.structSet(errT, this.deps.errBox());
+        if (view !== undefined) {
+          // GH #191: the own members' values, after publishing (a field
+          // holding the error itself finds this encoding).
+          eachKey(() => {
+            c.localGet(O);
+            c.localGet(KK);
+            view(c, "get", (x) => {
+              x.localGet(0);
+              x.localGet(KK);
+            });
+            c.call(this.objPut());
+          });
+        }
         c.localGet(D);
         this.mb.setBody(
           idx,
@@ -11083,6 +11592,7 @@ export class DynBuilder {
             this.objRef(),
             this.dynRef(),
             this.deps.strRef(),
+            ...(this.deps.errView !== undefined ? [this.dynRef(), this.arrRef(), I32, I32, this.deps.strRef()] : []),
           ],
           c.bytes(),
         );
@@ -12971,7 +13481,19 @@ export class DynBuilder {
           } else {
             c.call(this.objGet());
           }
-          c.localTee(M);
+          c.localSet(M);
+          // GH #191: a mirrored error's own method (or member) of that name.
+          if (this.deps.errView !== undefined) {
+            c.localGet(M);
+            c.refIsNull();
+            c.ifVoid();
+            this.objPayload(c, (x) => x.localGet(0));
+            this.deps.lit(c, method);
+            c.call(this.errLiveMemberCall());
+            c.localSet(M);
+            c.end();
+          }
+          c.localGet(M);
           c.refIsNull();
           c.i32Eqz();
           c.ifVoid();

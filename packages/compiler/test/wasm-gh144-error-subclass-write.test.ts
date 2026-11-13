@@ -70,8 +70,6 @@ const t = new TypeError("t");
 t.message += "?" + t.name;
 t.name = "R" + t.message;
 console.log(String(t));`,
-    // SEMANTICS.md S138: the class has own data the dynamic error encoding drops; #191 lifts this.
-    fence: { text: /an instance of an Error subclass with own properties .* crossing into a dynamic value .*SEMANTICS\.md S138/, stdout: "x!x ex x!x+ Nx: x!x+ Nx\n" }
   },
   {
     id: "GH144-TS-04 a user error class keeps its own fields beside the error slots, crossed or thrown",
@@ -88,8 +86,6 @@ for (const e of errs) console.log(String(e), e.code2, e.label, e instanceof AppE
 const again: any = errs[1];
 console.log(crossed.name, String(crossed), crossed === again);
 try { throw errs[0]!; } catch (x) { const c = x as AppError; console.log(c.code2, c.label, c.message, c === errs[0]); }`,
-    // SEMANTICS.md S138: the class has own data the dynamic error encoding drops; #191 lifts this.
-    fence: { text: /an instance of an Error subclass with own properties .* crossing into a dynamic value .*SEMANTICS\.md S138/, stdout: "" }
   },
 ];
 

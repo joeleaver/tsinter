@@ -5310,11 +5310,28 @@ export class JsonBuilder {
         c.i32Eqz();
         c.ifVoid();
         {
-          c.localGet(0);
-          this.deps.lit(c, "toJSON");
-          c.i32Const(0); // opt=false
-          c.call(dyn.keyGet());
-          c.localSet(TJ);
+          if (dyn.errViewLive) {
+            // GH #191: a mirrored error's toJSON method is called here (the
+            // call-mode read; reading a method as a value stops)
+            dyn.objPayload(c, (x) => x.localGet(0));
+            this.deps.lit(c, "toJSON");
+            c.call(dyn.errLiveMemberCall());
+            c.localTee(TJ);
+            c.refIsNull();
+            c.ifVoid();
+            c.localGet(0);
+            this.deps.lit(c, "toJSON");
+            c.i32Const(0); // opt=false
+            c.call(dyn.keyGet());
+            c.localSet(TJ);
+            c.end();
+          } else {
+            c.localGet(0);
+            this.deps.lit(c, "toJSON");
+            c.i32Const(0); // opt=false
+            c.call(dyn.keyGet());
+            c.localSet(TJ);
+          }
           c.localGet(TJ);
           c.structGet(dynT, DYN_KIND);
           c.i32Const(DK.FUNC);
@@ -5401,6 +5418,8 @@ export class JsonBuilder {
           c.globalGet(this.circHit());
           c.localSet(SAVEDCIRC);
           c.localGet(0);
+          // GH #191: a mirrored error lists its own keys (errListBox)
+          if (dyn.errViewLive) c.call(dyn.errListBox());
           c.i32Const(2); // Object.entries mode
           c.call(dyn.objWalk());
           c.localSet(ENTS);
@@ -5436,12 +5455,15 @@ export class JsonBuilder {
         c.call(this.jbPutc());
         if (hideErr) {
           c.localGet(0);
+          if (dyn.errViewLive) c.call(dyn.errListBox());
           c.call(dyn.isError());
           c.localSet(ISERR);
         }
         if (!dyn.accessorsLive) {
           // Own-key ORDER, through the one helper that defines it.
           c.localGet(0);
+          // GH #191: a mirrored error lists its own keys (errListBox)
+          if (dyn.errViewLive) c.call(dyn.errListBox());
           c.i32Const(2); // Object.entries mode
           c.call(dyn.objWalk());
           c.localSet(ENTS);

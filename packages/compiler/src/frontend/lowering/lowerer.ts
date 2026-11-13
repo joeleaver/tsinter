@@ -17,7 +17,7 @@ import { isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
-import { classFuncBox, classLiftIn, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
+import { buildErrorViews, classFuncBox, classLiftIn, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
 import { collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
@@ -2633,6 +2633,8 @@ export class Lowerer {
     // implicit-any instances lowered eagerly at their first call sites.
     // Unit H: typed composites cross into the island as VIEWS, and every
     // composite exit not proven fresh refuses (SEMANTICS.md S115).
+    // GH #191: the error-mirror helpers (class-views.ts).
+    const errViews = buildErrorViews(this);
     islandViewPass(this, [...functions, ...this.implicitFns]);
     functions.push(...this.liftedFns);
     functions.push(...this.implicitFns);
@@ -2769,6 +2771,7 @@ export class Lowerer {
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
             ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
+            ...(errViews !== null ? { errViews } : {}),
           };
     return {
       module,
@@ -3000,17 +3003,27 @@ export class Lowerer {
     // seed the worklist beside the init bodies. Unknown names are inert
     // (the export-map resolution reports them as SC4002 later).
     for (const root of extraRoots ?? []) this.onEdge?.(root);
-    while (queue.length > 0) {
-      // A body-level poison outside the per-statement catches (a fenced
-      // constructor/method parameter default lowered by declareParams):
-      // discovery only needs the edges the body fired before poisoning —
-      // the emit pass re-records the diagnostic and skips the member.
-      try {
-        units.get(queue.shift()!)!();
-      } catch (e) {
-        if (!(e instanceof PoisonError)) throw e;
+    const drainQueue = (): void => {
+      while (queue.length > 0) {
+        // A body-level poison outside the per-statement catches (a fenced
+        // constructor/method parameter default lowered by declareParams):
+        // discovery only needs the edges the body fired before poisoning —
+        // the emit pass re-records the diagnostic and skips the member.
+        try {
+          units.get(queue.shift()!)!();
+        } catch (e) {
+          if (!(e instanceof PoisonError)) throw e;
+        }
+        drainInstances();
       }
-      drainInstances();
+    };
+    drainQueue();
+    // GH #191: the error-mirror helpers call the members of every mirrored
+    // class constructed (a pass: those bodies can construct more).
+    for (let before = -1; before !== reachable.size;) {
+      before = reachable.size;
+      noteErrorViewEdges(this, reachable);
+      drainQueue();
     }
     return reachable;
   }

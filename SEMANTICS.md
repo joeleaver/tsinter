@@ -3800,6 +3800,10 @@ name, measured against Node v24.18.1:
   keys for the user object): the encoding's members would copy, marker
   included, and make the copy an error (S021; S025 is the user-data side
   of the same key). `Object.assign` keeps S021's registered answer.
+  *(GH #191: an error's own encoding now spreads as Node's
+  CopyDataProperties does — its program-visible listing, nothing for an
+  Error, a user subclass's own members (S138's GH #191 amendment); only an
+  object spelling the key itself keeps this refusal.)*
 - **`Object.defineProperties` with a function as a descriptor**, or a
   descriptor the front end could not hold as a dynamic value (an accessor
   `{ get() {...} }`, a record with function fields), throws a named Error
@@ -11252,6 +11256,75 @@ loss was reachable on main through any `unknown`/`any` crossing.
 `wasm-top10-rea-error-code-in.test.ts`, and the re-pinned rows of
 `wasm-gh144-error-subclass-write.test.ts`
 (wasm and wasm-native, against Node).
+
+**GH #191 amendment (2026-11-12): the own members cross.** An instance of a
+program's own Error subclass now shows its own members through a dynamic
+value as Node does: reads, writes, `in`, `Object.hasOwn`, key listings,
+`Object.assign`, spread, for-in and JSON (a `toJSON` method included). The
+encoding mirrors the instance. Its own keys are entries in Node's order:
+per class, root first, the parameter properties, then every field
+declaration (uninitialized ones are present, holding undefined), then the
+constructor's top-level assignments in statement order (an own `name`
+where it is first set). That is Node's define semantics, measured under
+the top-10 loader and `--experimental-transform-types`. Values are read
+live off the instance, and a typed write after the crossing updates the
+entry. A property first assigned outside the constructor's top level (a
+`declare` field, a method, a conditional) takes its place when it is
+assigned. A dynamic write of an own field is a checked store into it: a
+value its type cannot hold stops by name, because typed storage stays
+typed (S128 a1); any other key is an expando. Prototype methods and
+accessors answer through the class: a bound method, the getter's value, a
+setter's call, `in` true, `Object.hasOwn` false. The stops this entry keeps
+are only these:
+- **a place or presence no struct records.** A property first assigned
+  outside the constructor's top level (in a method, a conditional, a
+  nested block, after a statement that can leave the constructor, in a
+  nested assignment) is listed last, which is exact only when it is
+  provably the last own key: no constructor or field initializer in the
+  chain assigns it, or only the constructor of the deepest class that
+  gives keys does, after that constructor's last top-level key assignment;
+  and no constructor or field initializer lets `this` escape (a method
+  call on it, any `super` member, `this` passed or stored, or a read or
+  write of `this.<m>` where `m` is a method or accessor on the chain: a
+  getter or setter runs code). The crossing stops when such a
+  property is present and not provably last. It also stops when two or more of them are present,
+  because their relative order is unknown, and when one holds `undefined`
+  while a write elsewhere can store `undefined`, because it is unknown
+  whether it exists. A property first assigned after the crossing takes
+  its exact place.
+  If `name` is set only conditionally, or `message` is set in the class at
+  all, a listing (JSON, keys, `Object.assign`, spread, for-in) stops,
+  because whether Node owns it depends on what ran. Reads of both still
+  match Node.
+- **state a typed field cannot hold.** `delete` of one of the instance's
+  own members or of `message`, `Object.defineProperty`/`defineProperties`
+  of one of them, `Object.freeze`/`seal`/`preventExtensions` and
+  `Object.setPrototypeOf` of such an error stop by name. A field has no
+  absent, non-writable or non-enumerable state.
+- **a method read as a value.** A call through the read runs, bound to the
+  instance (`e.m()`, JSON's `toJSON`). Reading the method otherwise
+  (`const f = e.m`, `typeof e.m`, `e.m.call(o)`) stops by name: Node hands
+  out the prototype's own unbound function, which has an identity and
+  takes `this` from its call site.
+- **classes the mirror cannot read.** A computed `this[k]` assignment (a
+  symbol key) keeps this entry's stops above. So does a member type with
+  no dynamic form: reading it stops by name (a `Self | null` field, for
+  instance). Generator methods read through the value also stop by name.
+A `name` written from outside the class (typed or dynamic, before or after
+the crossing) becomes own where it is written, as in Node: the encoding
+records the place, building itself early if the error has not crossed yet.
+Inspecting such an error (`console.log`) follows S027's stackless rendering
+where the encoding already printed (`[FsError: own] { code: 'EOWN' }`; Node
+adds its stack frames) and keeps that rendering's named stop for any member
+beyond name, message and code. Separately, a program's `for…in` over any error held in a dynamic
+value no longer lists the encoding's `%error` marker or its `message`
+(GH #193's rule now covers for-in), and spreading one copies its listing
+instead of stopping.
+**Tested by:** `packages/compiler/test/wasm-gh191-error-mirror.test.ts`;
+the rows of `wasm-top10-rea-error-subclass-dyn.test.ts` and
+`wasm-gh144-error-subclass-write.test.ts` (GH144-TS-03/04) that pinned
+this entry's stops are exact rows now (wasm and wasm-native, against
+Node).
 
 ## S132 — Code generation from strings is disallowed: the `Function` constructor and `eval` of a string throw Node's `--disallow-code-generation-from-strings` EvalError *(wasm and wasm-native)*
 
