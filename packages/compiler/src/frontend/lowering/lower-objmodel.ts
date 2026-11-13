@@ -914,6 +914,9 @@ export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null
   if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === child) return null;
   if (ts.isTypeOfExpression(p) || ts.isExpressionWithTypeArguments(p) || ts.isHeritageClause(p) || ts.isDecorator(p)) return null;
   if (ts.isShorthandPropertyAssignment(p) || ts.isExportSpecifier(p) || ts.isImportSpecifier(p)) return null;
+  // `const { crypto } = globalThis`: destructuring a builtin keeps its own
+  // member-token lowering (the standard globals read through it)
+  if (ts.isVariableDeclaration(p) && p.initializer === child && !ts.isIdentifier(p.name)) return null;
   return id.text;
 }
 
