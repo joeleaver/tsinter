@@ -6824,6 +6824,10 @@ class LlEmitter {
         // (compile() sets the option for --backend wasm / wasm-native);
         // the native lanes keep SEMANTICS.md S003/S006/S032.
         throw new Error(`${e.kind} reached a native backend (undefSlots is a WasmGC-lane module flag)`);
+      case "hostCall":
+        // Library mode on the WasmGC lane only (compileWasmLibrary refuses
+        // every other backend).
+        throw new Error("hostCall reached a native backend (library mode is --backend wasm only)");
       default: {
         // Exhaustive: phase 6 claimed the last IR expression kinds.
         const _exhaustive: never = e;

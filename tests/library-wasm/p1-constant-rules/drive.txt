@@ -1,0 +1,6 @@
+call sidefx -> f64
+call negz -> f64
+call asserted -> f64
+call bump
+call ver -> u32
+call asserted -> f64

@@ -69,6 +69,26 @@ export function addZeroTailType(t: number): void {
 /** The engine's memory (memory 0 of an engine-carrying module). */
 export const ENGINE_MEMORY = 0;
 
+/** Library mode (docs/design/wasm-library-mode.md §2.5): every trap the
+ * module emits first calls the failure reporter (`%lib.trap`, which hands
+ * the failure's text to the profile's report import and marks the instance
+ * stopped). Null outside library mode — the bytes are then unchanged. */
+let trapHook: number | null = null;
+
+export function setTrapHook(funcIndex: number | null): void {
+  trapHook = funcIndex;
+}
+
+/** Library mode (SEMANTICS.md S146): `%lib.canonNaN(f64) → f64`, called
+ * where a float's bits become observable (a typed-array or DataView store,
+ * the boundary), so every NaN has the one payload 0x7ff8000000000000 on
+ * every engine. Null outside library mode — nothing is emitted. */
+let canonNaNFunc: number | null = null;
+
+export function setCanonNaNFunc(funcIndex: number | null): void {
+  canonNaNFunc = funcIndex;
+}
+
 export class Code {
   readonly w = new ByteWriter();
 
@@ -88,7 +108,24 @@ export class Code {
     return this.w.bytes();
   }
 
+  /** A Code whose traps must not call the reporter (the reporter itself). */
+  noTrapHook = false;
+  /** Library mode's call-depth counter (SEMANTICS.md S142): code run
+   * before every `return` of a user function's body. */
+  returnHook: ((c: Code) => void) | null = null;
+
+  /** [f64] → [f64] with a NaN made canonical (library mode only). */
+  canonNaN(): void {
+    if (canonNaNFunc === null) return;
+    this.w.u8(0x10);
+    this.w.uleb(canonNaNFunc);
+  }
+
   unreachable(): void {
+    if (trapHook !== null && !this.noTrapHook) {
+      this.w.u8(0x10);
+      this.w.uleb(trapHook);
+    }
     this.w.u8(0x00);
   }
   loop(): void {
@@ -172,6 +209,7 @@ export class Code {
     this.w.uleb(defaultLabel);
   }
   return_(): void {
+    if (this.returnHook !== null) this.returnHook(this);
     this.w.u8(0x0f);
   }
   call(funcIndex: number): void {

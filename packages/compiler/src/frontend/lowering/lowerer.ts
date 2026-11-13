@@ -12,6 +12,7 @@
  * - Lexical scoping is resolved here: locals get function-unique ids
  *   ("x.0", "x.1" for shadowing); the IR is scope-flat.
  */
+import { lowerHostCall } from "./lower-host.js";
 import { isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
@@ -9167,6 +9168,7 @@ export class Lowerer {
     // have no lowering for a promise-returning ambient global, and
     // `import` is a keyword callee no identifier path matches).
     return (
+      lowerHostCall(this, expr) ??
       lowerFfiCall(this, expr) ??
       lowerFetchCall(this, expr) ??
       lowerDynamicImportCall(this, expr) ??

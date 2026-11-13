@@ -1,0 +1,51 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "n": {
+      "params": [
+        [
+          "x",
+          "f64"
+        ]
+      ],
+      "result": "s32"
+    },
+    "big": {
+      "params": [
+        [
+          "x",
+          "s64"
+        ]
+      ]
+    }
+  },
+  "imports": {
+    "pw": {
+      "note_s64": {
+        "params": [
+          [
+            "x",
+            "s64"
+          ]
+        ]
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  }
+}

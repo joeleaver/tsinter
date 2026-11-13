@@ -1,0 +1,6 @@
+call div f64:0 f64:0 -> f64
+call sub f64:Infinity f64:Infinity -> f64
+call sq f64:-1 -> f64
+call div f64:NaN f64:1 -> f64
+call bytes f64:0 f64:0
+call bytes f64:Infinity f64:Infinity

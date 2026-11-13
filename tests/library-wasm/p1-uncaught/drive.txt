@@ -1,0 +1,5 @@
+call step f64:1 -> f64
+call step f64:2 -> f64
+call step f64:3 -> f64
+call step f64:4 -> f64
+call other

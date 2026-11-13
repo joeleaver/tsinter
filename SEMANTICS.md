@@ -11295,3 +11295,124 @@ probe's `try` would end the program, and compiling the string is out of
 tier.
 **Tested by:** `packages/compiler/test/wasm-u3u4-eval.test.ts` (wasm and
 wasm-native, against `node --disallow-code-generation-from-strings`).
+
+## S140 — Library mode: a failure that escapes an export stops the instance for good *(wasm, library mode)*
+
+In library mode (docs/design/wasm-library-mode.md) a host calls the module's
+exports one at a time. Three things can end a call abnormally: an exception
+that escapes the export's body or a microtask in its drain (including an
+unhandled rejection, as Node treats it: fatal), a fence (a tsinter limit or
+a failed check, S122 and S143), and the depth limit (S142). Each one writes
+its text into the module's error buffer (read through the
+`tsinter_error_ptr`/`tsinter_error_len` exports, which work after a trap),
+hands the profile's report import `prefix + text` (with its code when the
+import takes `(u32, string)`: 1 an uncaught exception or rejection, 2 a
+fence, 3 the depth limit, 4 a call after the stop), and traps.
+
+**The divergence:** Node, calling an exported function that throws, lets the
+caller catch the error and call again. The module does not continue: every
+later export call reports code 4 ("tsinter: <export>: the instance stopped at
+an earlier failure") and traps, because the heap may be half-updated and
+peers that continue differently diverge silently (Joe's ruling 3, §9.2a).
+A call that finds the previous one still running (it trapped without a
+report: an engine trap such as a native stack overflow) stops the same way.
+Recovery is the host's: restore a snapshot or reload. A game that wants to
+survive a failing system catches in its own TypeScript dispatcher, which is
+ordinary code with Node's semantics. A constant export (one `return` of a
+literal or of a module `const` with a literal initializer) still answers
+after the stop: it reads no state.
+
+**The text** is the failure's line as the wasm lane renders an uncaught value
+(S007): `Uncaught ` + `String(e)` for an Error and for a primitive,
+`[object Object]` for a class instance, `[object]` for a value of the
+dynamic world (an object literal, an array); `Unhandled promise rejection: `
++ the same for a rejection. It is UTF-8 (a lone surrogate becomes U+FFFD),
+**cut at the error buffer's 4,096 bytes** (a longer text is truncated there,
+possibly inside a multi-byte character, which then decodes as U+FFFD), and
+one trailing newline is dropped. Node's own report differs (a stack, the
+full text); the oracle formats the same way.
+**Tested by:** tests/harness/wasm-library.test.ts (rows `p1-uncaught`,
+`p1-uncaught-noprofile`, `p1-rejection`, `p1-eval-throws`, `p1-fences`,
+`p1-depth`); the Node column's driver (tests/harness/libmode/driver.mjs)
+applies the same stop, so the rows are checked against Node on V8 and
+wasmtime 47.
+
+## S141 — Library mode: `Math.random` is the host's stream *(wasm, library mode)*
+
+With a profile import whose role is `"random"` (`rand_u64() -> u64`),
+`Math.random()` draws that import on every call and maps the 64 bits `x`
+(unsigned) to `(x >>> 11) × 2^-53`, exactly as Playweft's QuickJS guest maps
+its `rand_u64` (pw-guest-spin-js, SIM_RANDOM_PRELUDE), so seeds and replays
+carry over. No generator state stays in the module. The sequence is the
+host's, not V8's xorshift128+ (S068 does not apply). Without such an import a
+library build refuses `Math.random` by name (SC4026).
+**Tested by:** tests/harness/wasm-library.test.ts row `p1-random` (the Node
+column installs the same mapping over the same stream).
+
+## S142 — Library mode: a fixed call-depth limit, and its stop is uncatchable *(wasm, library mode)*
+
+On the wasm lane a stack overflow happens wherever the engine's native stack
+ends, and V8 and wasmtime end at different depths (§10 w6), so two peers on
+different engines would overflow at different points. In library mode every
+compiled function counts its depth: past the profile's `max_depth` (default
+2,000) the call stops the instance (S140, code 3) with the text "Uncaught
+RangeError: Maximum call stack size exceeded".
+
+**The divergences:** Node's limit depends on frame sizes and is about 10,800
+simple frames; here it is the profile's number on every engine. Node's
+RangeError is catchable; this stop is not (a catchable stop would let
+`try { recurse() } catch {}` loop forever and lets peers diverge on what
+they caught). The counter counts compiled functions and the runtime's own
+recursive helpers (structured clone, dynamic checks and copies, inspect,
+JSON, ...: every module function on a cycle of direct calls, found from the
+finished call graph), so a `JSON.stringify` or `structuredClone` of a value
+nested deeper than the limit stops here, where Node goes on to thousands of
+levels more.
+
+**The library contract requires wasmtime's `max_wasm_stack` of at least
+1 MiB** (wasmtime's default is 512 KiB): the default 2,000 sits below the
+weakest column measured with that setting (V8 at its default stack, 4,478
+moderately heavy frames; wasmtime at 1 MiB, 6,541), and the harness's
+wasmtime host sets it. A profile that raises `max_depth` needs a larger
+`max_wasm_stack`, and V8 in a browser cannot be raised. If the engine's own
+stack still runs out first (very large frames), there is no report: wasmtime
+traps, and V8 raises a JS `RangeError` that leaves the export to the host
+(this tier emits no wasm exception handling, so the module cannot catch it);
+either way the instance stops at its next call (S140, code 4).
+**Tested by:** tests/harness/wasm-library.test.ts rows `p1-depth`,
+`p1-heavy` and `p1-deep-clone` (expected outputs, since Node is not the oracle here; they check
+that the counter unwinds through returns and caught exceptions, and that a
+heavy frame at the default depth stays inside both engines).
+
+## S143 — Library mode: values cross the boundary checked, never wrapped *(wasm, library mode)*
+
+A value leaving TypeScript in a narrower class (an import argument, an
+export's result) must fit it: `s32`/`u32` an integral number in range
+(`-0` passes as 0), `s64`/`u64` a bigint in range. A misfit is a fence that
+stops the instance (S140, code 2) with "tsinter: <argument N of
+module.name | the result of export> is not a <class>: <value>"; it is never
+a silent ToInt32/ToBigInt64 wrap. `f32` rounds as `Math.fround` (no check).
+Inbound values are exact: `u32`/`u64` arrive unsigned, `bool` is nonzero.
+Node has no boundary, so the oracle (the harness's Node column) applies the
+same checks in JS.
+**Tested by:** tests/harness/wasm-library.test.ts rows `p1-classes`,
+`p1-defaults`, `p1-fences`, `p1-fence-result`, `p1-fence-nan`.
+
+## S146 — Library mode: every NaN whose bits are observable is the canonical NaN *(wasm, library mode)*
+
+WebAssembly leaves the sign and payload of a NaN that arithmetic produces to
+the engine and the CPU (V8, wasmtime with or without Cranelift's NaN
+canonicalization, x86 or ARM), and the module's own Math produces its own
+NaNs (`Math.asin(2)` is `0x7ff4…` there, `0x7ffc…` from Node on x86). Two
+peers must agree on every byte, so in library mode a NaN is made the
+canonical `0x7ff8000000000000` wherever its bits become observable: an
+`f64`/`f32` value crossing the boundary (an import argument, an export
+result), a typed-array element store, a `DataView` or `Buffer` float write,
+and `tsinter:memory`'s `setF32`/`setF64`. **The divergence:** Node keeps the
+payload its arithmetic produced, so where Node would show a non-canonical
+payload the module shows the canonical one. The oracle (the harness's Node
+column) canonicalizes at the same points it can reach (the boundary,
+`DataView` and `Buffer` writes); typed-array element stores, which Node gives
+no hook for, have recorded expected output.
+**Tested by:** tests/harness/wasm-library.test.ts rows `p1-nan`, `p1-math`,
+`p1-nan-typed`.

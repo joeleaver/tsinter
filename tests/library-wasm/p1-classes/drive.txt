@@ -1,0 +1,19 @@
+# Every scalar class in and out (profile).
+call echo u32:0
+call echo u32:1
+call echo u32:2
+call echo u32:3
+call echo u32:4
+call echo u32:5
+call echo u32:6
+call echo u32:7
+call echo u32:8
+call f32Round f64:0.1
+call f32Round f64:16777217
+call f32Round f64:-0
+call mix s32:-5 u64:18446744073709551615 bool:true f64:2.5 s64:-9223372036854775808 f32:1.5 -> f64
+call back u32:2 -> u64
+call back u32:3 -> u64
+call neg -> s32
+call flag bool:false -> bool
+call flag bool:true -> bool

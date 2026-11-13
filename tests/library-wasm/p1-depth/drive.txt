@@ -1,0 +1,4 @@
+call deep f64:45
+call deep f64:45
+call noCatch f64:60
+call deep f64:1

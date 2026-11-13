@@ -1,0 +1,26 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "name": "coin-rush-sample",
+  "report": { "module": "pw", "name": "report" },
+  "exports": {
+    "pw_abi_version": { "params": [], "result": "u32" },
+    "pw_setup": { "params": [] },
+    "pw_run": { "params": [["sys", "u32"], ["tick", "u64"], ["dt", "f64"]] },
+    "pw_score": { "params": [["player", "u32"]], "result": "string" }
+  },
+  "imports": {
+    "pw": {
+      "spawn": { "params": [["kind", "u32"]], "result": "u64" },
+      "query_begin": { "params": [["mask", "u32"]], "result": "u32" },
+      "query_next": { "params": [["cursor", "u32"]], "result": "u64" },
+      "get_f32": { "params": [["entity", "u64"], ["comp", "u32"], ["field", "u32"]], "result": "f32" },
+      "set_f32": { "params": [["entity", "u64"], ["comp", "u32"], ["field", "u32"], ["v", "f32"]] },
+      "rand_u64": { "params": [], "result": "u64", "role": "random" },
+      "register_component": { "params": [["name", "string"]], "result": "u32" },
+      "emit_command": { "params": [["cmd", "string"]] },
+      "log": { "params": [["msg", "string"]] },
+      "report": { "params": [["code", "u32"], ["text", "string"]] }
+    }
+  }
+}

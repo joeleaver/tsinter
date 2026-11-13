@@ -1213,6 +1213,7 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   call: [{ list: "args" }],
   callValue: ["callee", { list: "args" }],
   ffiCall: [{ list: "args" }],
+  hostCall: [{ list: "args" }],
   intrinsic: [{ list: "args" }],
   libCall: [{ list: "args" }],
   new: [{ list: "args" }],

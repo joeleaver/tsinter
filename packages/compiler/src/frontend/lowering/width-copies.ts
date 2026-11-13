@@ -88,7 +88,7 @@ const ARG_MUTATOR = /^%arr\.(sort|reverse|fill|copyWithin|unshift|splice|push|po
 const PURE_LIB = /^(math|num|number|string|str|insp|json|path|date|sym|buffer|bytes|error|undef|os|regex|regexp|text|intl|strdec|url)\./;
 /** Node kinds that cross into the runtime, the host or the embedded engine
  * with a program value that may be (or hold) a function. */
-const RUNTIME_KINDS = new Set(["dynCall", "dynInvoke", "jsMarshal", "jsExit", "jsView", "jsUnview", "jsBridgePromise", "ffiCall", "newPromise", "promiseWithResolvers", "dynFrom", "dynCheck"]);
+const RUNTIME_KINDS = new Set(["dynCall", "dynInvoke", "jsMarshal", "jsExit", "jsView", "jsUnview", "jsBridgePromise", "ffiCall", "hostCall", "newPromise", "promiseWithResolvers", "dynFrom", "dynCheck"]);
 /** Pass-through checks: they answer their argument unchanged. */
 const PASS_THROUGH = /^%(undef\.(fence|recv|iter)|in\.undefrecv|u2\.exact)\./;
 /** Helpers that only read: printing and formatting (which shows a class's

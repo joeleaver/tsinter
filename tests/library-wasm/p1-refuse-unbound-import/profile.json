@@ -1,0 +1,29 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "run": {
+      "params": []
+    }
+  },
+  "imports": {
+    "pw": {
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  }
+}

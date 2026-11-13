@@ -1,0 +1,6 @@
+call u f64:4294967295
+call u f64:-0
+call s f64:-2147483648
+call result f64:7 -> u32
+call u f64:1.5
+call u f64:1

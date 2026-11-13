@@ -1,0 +1,3 @@
+call ok
+call bad
+call ok

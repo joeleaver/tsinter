@@ -1,0 +1,1 @@
+SC3001 library:class:string

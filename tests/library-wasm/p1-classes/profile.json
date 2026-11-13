@@ -1,0 +1,212 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "echo": {
+      "params": [
+        [
+          "k",
+          "u32"
+        ]
+      ]
+    },
+    "f32Round": {
+      "params": [
+        [
+          "x",
+          "f64"
+        ]
+      ]
+    },
+    "mix": {
+      "params": [
+        [
+          "a",
+          "s32"
+        ],
+        [
+          "b",
+          "u64"
+        ],
+        [
+          "c",
+          "bool"
+        ],
+        [
+          "d",
+          "f64"
+        ],
+        [
+          "e",
+          "s64"
+        ],
+        [
+          "f",
+          "f32"
+        ]
+      ],
+      "result": "f64"
+    },
+    "back": {
+      "params": [
+        [
+          "k",
+          "u32"
+        ]
+      ],
+      "result": "u64"
+    },
+    "neg": {
+      "params": [],
+      "result": "s32"
+    },
+    "flag": {
+      "params": [
+        [
+          "x",
+          "bool"
+        ]
+      ],
+      "result": "bool"
+    }
+  },
+  "imports": {
+    "pw": {
+      "note_f64": {
+        "params": [
+          [
+            "x",
+            "f64"
+          ]
+        ]
+      },
+      "note_f32": {
+        "params": [
+          [
+            "x",
+            "f32"
+          ]
+        ]
+      },
+      "note_s32": {
+        "params": [
+          [
+            "x",
+            "s32"
+          ]
+        ]
+      },
+      "note_u32": {
+        "params": [
+          [
+            "x",
+            "u32"
+          ]
+        ]
+      },
+      "note_s64": {
+        "params": [
+          [
+            "x",
+            "s64"
+          ]
+        ]
+      },
+      "note_u64": {
+        "params": [
+          [
+            "x",
+            "u64"
+          ]
+        ]
+      },
+      "note_bool": {
+        "params": [
+          [
+            "x",
+            "bool"
+          ]
+        ]
+      },
+      "give_f64": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "f64"
+      },
+      "give_f32": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "f32"
+      },
+      "give_s32": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "s32"
+      },
+      "give_u32": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "u32"
+      },
+      "give_s64": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "s64"
+      },
+      "give_u64": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "u64"
+      },
+      "give_bool": {
+        "params": [
+          [
+            "k",
+            "u32"
+          ]
+        ],
+        "result": "bool"
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  }
+}

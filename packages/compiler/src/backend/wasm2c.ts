@@ -2923,3 +2923,25 @@ ${P.toUpperCase()}API void ${P}free_all(void) {
   ${P}reset_globals();
 }`;
 }
+
+/** The functions a function body calls directly (`call`), for library
+ * mode's recursion audit (wasm/module.ts countRecursion): every instruction
+ * the whole-program set has is decoded, so a body outside it throws. */
+export function directCallees(code: Uint8Array): number[] {
+  const r = new Reader(code);
+  const out: number[] = [];
+  while (r.pos < code.length) {
+    const op = r.u8();
+    if (op === 0x10) {
+      out.push(r.uleb());
+      continue;
+    }
+    if (op === 0x02 || op === 0x03 || op === 0x04) {
+      readBlockType(r);
+      continue;
+    }
+    if (op === 0x05 || op === 0x0b) continue;
+    skipImmediates(op, r, true);
+  }
+  return out;
+}

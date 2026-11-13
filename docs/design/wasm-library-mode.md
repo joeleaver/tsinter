@@ -811,6 +811,65 @@ on every peer, and rewinds without the QuickJS guest.
 7. **Yes:** pipeline speedups first, then a warm compile server, then the stdlib cache.
 8. **Yes:** i64/u64 are `bigint`.
 
+### 9.2b The contract as built (P1, with the lead's rulings of 2026-11-12)
+
+Where this differs from §2, this section wins.
+
+- **Profile, format 2** (`library/wasm-profile.ts`): optional and
+  engine-generated. Classes are WIT's: `bool s8 u8 s16 u16 s32 u32 s64 u64
+  f32 f64 string list<u8|s32|u32|f32|f64>`; parameters are `[name, class]`
+  pairs. Keys: `profile_format`, `emission`, `name`, `report` (`module`,
+  `name`, `prefix`), `alloc`, `max_import_params`, `max_depth`, `exports`,
+  `imports`. There is **no `init` key**. Without a profile: every
+  non-generic `export function` of the entry is exported, every exact-name
+  `declare module "x"` in the program's own .d.ts files is a host module,
+  number is f64, bigint s64, boolean bool; the module also exports an empty
+  `_initialize`.
+- **Evaluation runs at the first export call**, whichever export it is:
+  module evaluation, a drain, the body, a drain. Every later call: the body,
+  a drain. This is Node's order (a module is evaluated before its exports can
+  be called) and lets a host call `pw_abi_version()` first.
+- **Constant exports** do not evaluate: an `export function` whose body is a
+  single `return <expr>` where `<expr>` is a literal (a number, a negated
+  number, a string, true/false) or an identifier bound to a module-level
+  `const` with such a literal initializer, followed through imports
+  (`return ABI_VERSION` with `export const ABI_VERSION = 47`). Syntax only:
+  `return n as 5` or a call is an ordinary export. It answers its constant
+  on any instance, fresh or stopped; a constant that does not fit its
+  integer class refuses at compile time (S143). The build's contract
+  (`<module>.lib.json` beside the module, and `CompileResult.library`)
+  marks them `"constant": true`.
+- **P5 note (restore):** restoring a snapshot marks the module evaluated and
+  never re-runs top levels. Playweft's rewind instantiates a fresh module,
+  calls `pw_abi_version`, restores, and does not call `pw_setup`.
+- **Failures** (S140): text in the error buffer (`tsinter_error_ptr`,
+  `tsinter_error_len`, readable after the trap), then the report import with
+  `prefix + text` and no trailing newline (Playweft: `"E Uncaught TypeError:
+  msg"`), codes 1 uncaught or unhandled rejection, 2 fence, 3 depth, 4 a
+  call after the stop. Code 5 (init order) is retired with the first-call
+  rule.
+- **Depth** (S142): `max_depth` defaults to 2,000 (§10 w6), and the contract
+  **requires wasmtime `max_wasm_stack` ≥ 1 MiB** of every host.
+- **NaN** (S146): every NaN whose bits are observable (the boundary, typed
+  array / DataView / Buffer float stores, tsinter:memory) is canonical.
+- **Node's modules** (`node:*`, `crypto`, ...) refuse at the import (SC4026);
+  `queueMicrotask` refuses by its own name for now.
+- **Random** (S141): Playweft's mapping, `(x >>> 11) × 2^-53`.
+- **Closed import world** (SC4026): a clock, `performance.now`, timers, the
+  console (unless the program puts its own `console` on globalThis, P1b),
+  process, `node:*`, crypto randomness, the local time zone, top-level
+  await, the dynamic engine. `Math.random` needs a role:"random" import.
+- **Globals (P1b):** `globalThis` lowers to one dynamic object holding the
+  program's own writes plus the modelled builtins; an ambient `declare
+  function` / `declare const` reads its name from it at the use site (absent:
+  Node's ReferenceError), and a program write (`G.console = …`) wins over a
+  builtin. Reading any other Node global through it stops by name (S145).
+- **Tasks across ticks:** no synchronous-drain intrinsic. Playweft's bridge
+  exports a `pw_task_step()` the host calls per woken task; each step's
+  continuation runs in that export's drain (Node-checkable).
+- **wasm-native:** library mode builds for `--backend wasm` only; other
+  backends refuse by name.
+
 ### 9.3 Risks
 
 - **R1, Safari WasmGC.** Safari has shipped WasmGC since 18.2 (Dec 2024; verify
@@ -866,3 +925,23 @@ MemoryMax=16G -p MemorySwapMax=0`, with `compile()` from this worktree's
   counter 370 ms, local-cached 316 ms. Call per iteration: 382 vs 381 ms.
 - **w5:** compile time at 53, 1,061 and 3,181 lines (renamed copies of w1), and
   a `--cpu-prof` of the 1,061-line compile aggregated by source area (§7).
+- **w6 (P0, 2026-11-12):** the stack limit, wasm lane, tsinter-compiled
+  recursion, binary-searched maximum depth. A small frame (one parameter, no
+  allocation): V8 (Node 24.18.1, default stack) 12,550, wasmtime 47 (default
+  `max_wasm_stack`, 512 KiB) 16,334. A heavier frame (four parameters including
+  an object and a closure call, locals, an array): V8 4,478; wasmtime 3,273 at
+  512 KiB, 6,541 at 1 MiB, 13,080 at 2 MiB (about 160 bytes a frame). Ruling
+  (lead, 2026-11-12): `max_depth` defaults to 2,000, below the weakest column
+  with margin; the profile may raise it, which needs wasmtime `max_wasm_stack`
+  of at least 1 MiB (S142).
+- **w7 (P0, 2026-11-12):** wasmtime 47's collectors on cyclic garbage (a
+  `_start` program making 2,000,000 two-object cycles, wasmtime 47.0.0 CLI,
+  `-C collector=…`): the copying collector (47's default; the C API cannot
+  choose another) peaks at 28 MB RSS in 0.45 s; DRC at 656 MB in 1.8 s,
+  because it cannot collect cycles (R2). Hosts on wasmtime 47 should keep the
+  copying collector.
+- **w8 (P0/P1, 2026-11-12):** heap growth over ticks, the forest sample
+  (`tests/library-wasm/game-forest`) under the harness's wasmtime 47 C host
+  (default config): max RSS 33.6 MB at 1,000 ticks, 34.7 MB at 10,000,
+  37.5 MB at 100,000. The coin sample (closures, Maps, promises across
+  ticks) is measured once P2 runs it.

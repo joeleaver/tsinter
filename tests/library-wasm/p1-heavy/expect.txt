@@ -1,0 +1,5 @@
+note_f64 13507
+jsonDeep trapped
+error "Uncaught RangeError: Maximum call stack size exceeded"
+jsonDeep trapped
+error "tsinter: jsonDeep: the instance stopped at an earlier failure"

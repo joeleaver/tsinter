@@ -865,6 +865,9 @@ export interface IrModule {
    * emissions stay conformance-identical by construction. Absent on every
    * executable build (the backends emit main() exactly as always). */
   lib?: IrLibSection;
+  /** Library mode on the WasmGC lane (docs/design/wasm-library-mode.md):
+   * the module's boundary. Absent on every executable build. */
+  wasmLib?: IrWasmLib;
   /** Unit U: typed slots carry `undefined` (slotUndef / isUndef may
    * appear, and the backend answers a read past an array's end, a pop of
    * an empty array and a missing record key with the slot's undefined
@@ -877,6 +880,58 @@ export interface IrModule {
    * tools observe which world a build took); the wasm backend reads it for
    * one choice, the miss of a dynamic `x.constructor` read (GH #135). */
   sharedDynamic?: true;
+}
+
+/** Library mode on the WasmGC lane: the module's boundary, resolved from
+ * the optional format-2 profile (library/wasm-profile.ts) or the defaults.
+ * Classes are the profile's WIT vocabulary. */
+export type IrWasmLibClass =
+  | "bool" | "s8" | "u8" | "s16" | "u16" | "s32" | "u32" | "s64" | "u64" | "f32" | "f64"
+  | "string" | "list<u8>" | "list<s32>" | "list<u32>" | "list<f32>" | "list<f64>";
+
+export interface IrWasmLib {
+  /** The exported TS functions: wasm export `name` wraps IR function
+   * `fnName` (an entry-module `export function`). */
+  exports: { name: string; fnName: string; params: IrWasmLibClass[]; result: IrWasmLibClass | null; constant?: number | string | boolean }[];
+  /** Every host import the program may call, in a stable order; the backend
+   * imports exactly the ones reachable code calls. */
+  imports: { module: string; name: string; params: IrWasmLibClass[]; result: IrWasmLibClass | null; role: "random" | null }[];
+  /** The failure sink: an import taking (string) or (u32, string); it
+   * receives `prefix` + the failure text. */
+  report: { module: string; name: string; prefix: string } | null;
+  /** The synthesized inbound-buffer export (pointer classes; P2). */
+  alloc: string | null;
+  /** SEMANTICS.md S142. */
+  maxDepth: number;
+  /** A profile-less build exports an empty `_initialize` (the WASI
+   * reactor name) that only runs module evaluation. */
+  initialize: boolean;
+}
+
+/** The IR type a library class's TS value has; null where the tier has no
+ * such value (list<f64>: no Float64Array representation yet). */
+export function wasmLibClassType(cls: IrWasmLibClass): IrType | null {
+  switch (cls) {
+    case "bool":
+      return BOOL;
+    case "s64":
+    case "u64":
+      return BIGINT_T;
+    case "string":
+      return STRING;
+    case "list<u8>":
+      return BYTES_U8;
+    case "list<s32>":
+      return { kind: "bytes", elem: "i32" };
+    case "list<u32>":
+      return { kind: "bytes", elem: "u32" };
+    case "list<f32>":
+      return { kind: "bytes", elem: "f32" };
+    case "list<f64>":
+      return null;
+    default:
+      return F64;
+  }
 }
 
 /** One outbound native FFI declaration, copied from the validated format-1
@@ -4936,6 +4991,11 @@ export type IrExpr =
    * against it. Native code is outside scriptc's exception protocol: it
    * must return normally and must not retain or mutate borrowed storage. */
   | { kind: "ffiCall"; import: string; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  /** Library mode (WasmGC): a call of a host import, `module`.`name`, one
+   * of IrModule.wasmLib.imports. The arguments are TS values in the IR
+   * types of the import's classes (wasmLibClassType); the backend applies
+   * the boundary conversions (checked where SEMANTICS.md S143 says). */
+  | { kind: "hostCall"; module: string; name: string; args: IrExpr[]; type: IrType; loc: SrcLoc }
   /** Closure creation: a function value over `fnName` (a module function),
    * capturing the listed boxed locals of the CREATING function (localIds,
    * in the callee's captures[] order). The result is owned (+1); the closure

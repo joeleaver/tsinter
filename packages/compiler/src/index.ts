@@ -23,7 +23,7 @@ import {
   type SidecarIntegerSlotFacts,
 } from "./library/sidecar.js";
 import { validateSidecar } from "./library/sidecar-validate.js";
-import { entryFunctionExports, type EntryExportInfo } from "./frontend/lib-exports.js";
+import { entryConstantExports, entryFunctionExports, type EntryExportInfo } from "./frontend/lib-exports.js";
 import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.js";
 import { firstBigintSite, moduleUsesBigint, moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
@@ -34,6 +34,10 @@ import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
 import { lowerToIr, type LowerOptions, type LowerResult } from "./frontend/lowering/lowerer.js";
+import { LibHostState, setLibHost } from "./frontend/lib-host.js";
+import { DEFAULT_MAX_DEPTH, loadWasmProfile, type WasmLibProfile } from "./library/wasm-profile.js";
+import { wasmLibAsyncExportDiag, wasmLibCapabilityDiag, wasmLibExportUnresolvedDiag, wasmLibGenericExportDiag, wasmLibSignatureDiag } from "./diagnostics/diagnostic.js";
+import { typeEquals, wasmLibClassType, type IrWasmLib, type IrWasmLibClass } from "./ir/nodes.js";
 import type { CoverageInput, NpmStaticStatus } from "./coverage/report.js";
 import { loadFfiProfile, type FfiProfile } from "./ffi/profile.js";
 
@@ -157,6 +161,23 @@ export interface CompileOptions {
    * lower to direct C ABI calls, and its archive/system-library inputs are
    * appended to the executable link. */
   ffiProfilePath?: string;
+  /** Library mode on the WasmGC lane (docs/design/wasm-library-mode.md):
+   * the module exports the entry's `export function`s and imports its host
+   * modules instead of running a program. The profile (format 2) is
+   * optional; without one, number crosses as f64 and bigint as s64. */
+  library?: { profilePath?: string };
+}
+
+/** A library-mode build's boundary, as the host sees it (classes in the
+ * profile's WIT vocabulary). */
+export interface WasmLibContract {
+  /** `constant`: the export answers its constant without running module
+   * evaluation, on any instance (a constant export — lib-exports.ts). */
+  exports: { name: string; params: string[]; result: string | null; constant?: true }[];
+  imports: { module: string; name: string; params: string[]; result: string | null; role?: "random" }[];
+  alloc: string | null;
+  report: { module: string; name: string; prefix: string } | null;
+  maxDepth: number;
 }
 
 export type CompileResult =
@@ -169,7 +190,7 @@ export type CompileResult =
    * Under the wasm backend the module IS the artifact: `binaryPath` and
    * `cPath` name the same .wasm file (no separate TU, no link step), which
    * is also how `--no-keep-c` knows there is nothing to delete. */
-  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm" | "wasm" | "wasm-native"; llvmRefusal?: string }
+  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm" | "wasm" | "wasm-native"; llvmRefusal?: string; library?: WasmLibContract }
   /** `wasmSurvey` rides a wasm tier refusal only: EVERY distinct construct
    * the program needs from that backend, not just the first one the
    * refusal names. The diagnostic answers "does it compile?"; the survey
@@ -287,6 +308,8 @@ interface Frontend {
   /** Library mode's resolution input: the entry file's exported function
    * declarations (call before dispose — it reads the ts7 AST). */
   entryExports: () => Map<string, EntryExportInfo>;
+  /** Library mode (WasmGC): the entry's constant exports (lib-exports.ts). */
+  entryConstantExports: () => Map<string, number | string | boolean>;
   /** The contract sidecar's projection input: the entry file's exported
    * function signatures and convention consts, plus the whole graph's
    * exported type declarations, in declaration order (call before
@@ -634,6 +657,7 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
     preflight,
     entryText: () => finalLoad.entry.text,
     entryExports: () => entryFunctionExports(finalLoad.entry),
+    entryConstantExports: () => entryConstantExports(finalLoad.entry, finalLoad.program.getTypeChecker()),
     // The contract scans the PROGRAM's source files, not the runtime
     // module order: a type-only module (nothing but exported types) has no
     // runtime edge and never joins moduleOrder, yet its declarations are
@@ -771,6 +795,7 @@ export function analyze(entryPath: string, opts: AnalyzeOptions = {}): AnalyzeRe
 
 /** The whole pipeline: load → preflight → lower → validate → emit C → clang. */
 export async function compile(entryPath: string, opts: CompileOptions): Promise<CompileResult> {
+  if (opts.library !== undefined) return compileWasmLibrary(entryPath, opts, opts.library);
   let ffi: FfiProfile | null = null;
   if (opts.ffiProfilePath !== undefined) {
     const loaded = loadFfiProfile(opts.ffiProfilePath);
@@ -1652,4 +1677,265 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
     ...(irPath !== undefined ? { irPath } : {}),
     ...(sidecarPath !== undefined ? { sidecarPath } : {}),
   };
+}
+
+/* ── library mode on the WasmGC lane ───────────────────────────────────────
+ * docs/design/wasm-library-mode.md. The module exports the entry's
+ * `export function`s (the profile's, when it has one) and imports the host
+ * modules the program calls; everything else a program could reach outside
+ * the module (a clock, entropy, the console, process, node:*) refuses by
+ * name (SC4026): the closed import world. */
+
+/** The wasm-level capabilities the closed import world refuses, by the
+ * runtime import the module would otherwise need. */
+const WASMLIB_IMPORT_CAPABILITY: Record<string, [string, string]> = {
+  now: ["a clock (Date.now, new Date(), performance.now, timers)", "game time comes in as export parameters (tick, dt)"],
+  wallClock: ["the wall clock (Date.now, new Date())", "game time comes in as export parameters (tick, dt)"],
+  seed: ["Math.random", "the randomness is the host's: a profile import with role \"random\" supplies it"],
+  tzCall: ["the local time zone (Date's local-time methods)", "a module's answers must not depend on the machine it runs on"],
+  hostStr: ["process (argv, env, cwd, platform, ...)", "a library module has no process"],
+  hostNum: ["process (argv, env, cwd, platform, ...)", "a library module has no process"],
+  exit: ["process.exit", "a library module has no process"],
+  kill: ["process.kill", "a library module has no process"],
+  chdir: ["process.chdir", "a library module has no process"],
+  umask: ["process.umask", "a library module has no process"],
+  fsCall: ["the file system (node:fs)", "the host owns every resource"],
+  cpCall: ["child processes", "the host owns every resource"],
+  evPoll: ["the event loop", "the host drives the module through its exports"],
+  netCall: ["the network", "the host owns every resource"],
+  tlsCall: ["TLS", "the host owns every resource"],
+  random: ["crypto randomness (getRandomValues, randomUUID, randomBytes)", "the randomness is the host's: a profile import with role \"random\" supplies it"],
+  sleep: ["blocking sleeps", "the host drives the module through its exports"],
+  sigCall: ["signals", "a library module has no process"],
+  watchCall: ["file watching", "the host owns every resource"],
+  stdinCall: ["stdin", "a library module has no process"],
+  fetch: ["fetch", "the host owns every resource"],
+};
+
+const WASMLIB_KIND_RE = /^library:(?:import:(\w+)|(tla))$/;
+
+/** Constructs refused in library mode before emission, found in the IR. */
+function wasmLibIrRefusals(mod: IrModule, profile: WasmLibProfile | null): ScrDiagnostic[] {
+  const out: ScrDiagnostic[] = [];
+  const seen = new Set<string>();
+  const refuse = (cap: string, why: string, loc: SrcLoc): void => {
+    if (seen.has(cap)) return;
+    seen.add(cap);
+    out.push(wasmLibCapabilityDiag(cap, why, loc));
+  };
+  const hasRandom = profile !== null && [...profile.imports.values()].some((t) => [...t.values()].some((s) => s.role === "random"));
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const n of node) walk(n);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    const o = node as { kind?: unknown; name?: unknown; fn?: unknown; loc?: SrcLoc };
+    if (o.kind === "intrinsic" && (o.name === "console.log" || o.name === "console.error") && o.loc !== undefined) {
+      refuse("the console", "a library module writes through its host's imports (a log import, or a console object the program puts on globalThis)", o.loc);
+    }
+    if (o.kind === "intrinsic" && o.name === "module.await" && o.loc !== undefined) {
+      refuse("top-level await", "module evaluation must finish inside the first export call", o.loc);
+    }
+    if (o.kind === "libCall" && typeof o.fn === "string" && o.loc !== undefined) {
+      const fn = o.fn;
+      if (fn === "math.random" && !hasRandom) refuse("Math.random", "the randomness is the host's: a profile import with role \"random\" supplies it", o.loc);
+      else if (fn === "date.now" || fn.startsWith("date.local")) refuse("the wall clock (Date.now, new Date())", "game time comes in as export parameters (tick, dt)", o.loc);
+      else if (fn === "perf.now") refuse("performance.now", "game time comes in as export parameters (tick, dt)", o.loc);
+      else if (fn === "timers.queueMicrotask") refuse("queueMicrotask", "not yet; a resolved promise's then() queues the same microtask", o.loc);
+      else if (fn.startsWith("timers.")) refuse("timers (setTimeout, setInterval, setImmediate)", "the host drives the module through its exports; tick-driven waits are ordinary promises", o.loc);
+      else if (fn.startsWith("process.") || fn.startsWith("stdout.") || fn.startsWith("stderr.")) refuse("process", "a library module has no process", o.loc);
+      else if (fn === "island.eval") refuse("the dynamic engine", "a library module is static code only", o.loc);
+    }
+    for (const v of Object.values(o)) if (v !== null && typeof v === "object") walk(v);
+  };
+  for (const fn of mod.functions) walk(fn.body);
+  for (const g of mod.globals ?? []) walk(g);
+  return out;
+}
+
+async function compileWasmLibrary(entryPath: string, opts: CompileOptions, lib: { profilePath?: string }): Promise<CompileResult> {
+  const entryLoc = { file: entryPath, start: 0, end: 0 };
+  if (opts.backend !== "wasm") {
+    return {
+      ok: false,
+      diagnostics: [wasmLibCapabilityDiag(`library mode on --backend ${opts.backend ?? "llvm"}`, "library mode builds one WebAssembly module for --backend wasm; the same module runs on every host", entryLoc)],
+      sourceTexts: new Map(),
+    };
+  }
+  let profile: WasmLibProfile | null = null;
+  if (lib.profilePath !== undefined) {
+    const loaded = loadWasmProfile(resolve(lib.profilePath));
+    if (!loaded.ok) return { ok: false, diagnostics: loaded.diagnostics, sourceTexts: new Map() };
+    profile = loaded.profile;
+  }
+  const host = new LibHostState(profile);
+  setLibHost(host);
+  let lowered: LowerResult;
+  let sourceTexts: Map<string, string>;
+  try {
+    const fe = frontendOrGate(entryPath, opts.npmStatic);
+    if (!("preflight" in fe)) return { ok: false, diagnostics: [fe], sourceTexts: new Map() };
+    try {
+      const fail = (diagnostics: ScrDiagnostic[]): CompileResult => ({ ok: false, diagnostics, sourceTexts: fe.sourceTexts() });
+      if (fe.preflight.length > 0) return fail(fe.preflight);
+      const entryInfo = fe.entryExports();
+      const constants = fe.entryConstantExports();
+      // The exported functions: the profile's, or every `export function`.
+      const exportNames = profile !== null ? [...profile.exports.keys()] : [...entryInfo.keys()];
+      const diags: ScrDiagnostic[] = [];
+      for (const name of exportNames) {
+        const info = entryInfo.get(name);
+        if (info === undefined) {
+          diags.push(wasmLibExportUnresolvedDiag(name, "the entry module has no `export function` by that name", entryLoc));
+          continue;
+        }
+        if (info.generic) diags.push(wasmLibGenericExportDiag(name, info.loc));
+        else if (info.async || info.generator) diags.push(wasmLibAsyncExportDiag(name, info.async ? "async" : "generator", info.loc));
+      }
+      for (const reserved of ["_initialize", "memory", "tsinter_error_ptr", "tsinter_error_len"]) {
+        if (exportNames.includes(reserved)) diags.push(wasmLibExportUnresolvedDiag(reserved, "the name is the module's own (reserved in library mode)", entryInfo.get(reserved)?.loc ?? entryLoc));
+      }
+      if (diags.length > 0) return fail(diags);
+      try {
+        lowered = fe.lower({
+          dynamic: false,
+          targetPlatform: "host",
+          hostFetch: true,
+          undefSlots: true,
+          sharedDynamic: true,
+          libRoots: exportNames,
+        });
+      } catch (e) {
+        if (!isCheckerPanic(e)) throw e;
+        return fail([checkerPanicDiag(e.message.split("\n", 1)[0]!, entryLoc)]);
+      }
+      if (lowered.module === null) return fail(lowered.diagnostics);
+      const mod = lowered.module;
+      // The exports' IR functions and classes.
+      const fnByName = new Map(mod.functions.map((f) => [f.name, f]));
+      const exports: IrWasmLib["exports"] = [];
+      for (const name of exportNames) {
+        const info = entryInfo.get(name)!;
+        const fn = fnByName.get(name);
+        if (fn === undefined) {
+          diags.push(wasmLibExportUnresolvedDiag(name, "the export did not lower to a compiled function", info.loc));
+          continue;
+        }
+        const what = `library export '${name}'`;
+        const declared = profile?.exports.get(name);
+        const params: IrWasmLibClass[] = [];
+        if (declared !== undefined && declared.params.length !== fn.params.length) {
+          diags.push(wasmLibSignatureDiag(what, `has ${fn.params.length} parameter(s), the profile ${declared.params.length}`, info.loc));
+          continue;
+        }
+        let bad = false;
+        fn.params.forEach((p, i) => {
+          const cls = declared !== undefined ? (declared.params[i]!.cls as IrWasmLibClass) : wasmLibDefaultClass(p.type);
+          const t = cls === null ? null : wasmLibClassType(cls);
+          if (cls === null || t === null || !typeEquals(t, p.type)) {
+            bad = true;
+            diags.push(wasmLibSignatureDiag(what, `parameter ${i + 1} ('${p.name}') is '${p.type.kind}', which ${cls === null ? "has no class" : `does not fit class ${cls}`}`, info.loc));
+          } else params.push(cls);
+        });
+        const rt = fn.returnType;
+        let result: IrWasmLibClass | null = null;
+        if (declared !== undefined ? declared.result !== null : rt.kind !== "void") {
+          result = declared !== undefined ? (declared.result as IrWasmLibClass) : wasmLibDefaultClass(rt);
+          const t = result === null ? null : wasmLibClassType(result);
+          if (result === null || t === null || !typeEquals(t, rt)) {
+            bad = true;
+            diags.push(wasmLibSignatureDiag(what, `the result is '${rt.kind}', which ${result === null ? "has no class" : `does not fit class ${result}`}`, info.loc));
+          }
+        } else if (rt.kind !== "void") {
+          bad = true;
+          diags.push(wasmLibSignatureDiag(what, `returns '${rt.kind}', but the profile declares no result`, info.loc));
+        }
+        if (bad) continue;
+        let constant = constants.get(name);
+        if (constant !== undefined && result !== null) {
+          // SEMANTICS.md S143 at compile time: a constant that does not fit
+          // its integer class refuses (it would be the fence on every call).
+          if (result === "s64" || result === "u64" || typeof constant === "string") constant = undefined;
+          else if (result === "s32" || result === "u32") {
+            const [lo, hi] = result === "s32" ? [-2147483648, 2147483647] : [0, 4294967295];
+            if (typeof constant !== "number" || !Number.isInteger(constant) || constant < lo || constant > hi) {
+              diags.push(wasmLibSignatureDiag(what, `returns the constant ${String(constant)}, which is not a ${result} (SEMANTICS.md S143)`, info.loc));
+              continue;
+            }
+          }
+        }
+        exports.push({ name, fnName: name, params, result, ...(constant !== undefined && result !== null ? { constant } : {}) });
+      }
+      diags.push(...wasmLibIrRefusals(mod, profile));
+      if (diags.length > 0) return fail(diags);
+      mod.wasmLib = {
+        exports,
+        imports: host.imports(),
+        report: profile?.report ?? null,
+        alloc: profile?.alloc ?? null,
+        maxDepth: profile?.maxDepth ?? DEFAULT_MAX_DEPTH,
+        initialize: profile === null,
+      };
+      const validation = validateModule(mod);
+      if (validation.length > 0) return fail(validation.map((v) => iceDiag(v.message, v.loc)));
+      sourceTexts = fe.sourceTexts();
+    } finally {
+      fe.dispose();
+    }
+  } finally {
+    setLibHost(null);
+  }
+  const mod = lowered.module!;
+  await mkdir(opts.outDir, { recursive: true });
+  const wasmPath = opts.outPath.endsWith(".wasm") ? opts.outPath : `${opts.outPath.replace(/\.exe$/i, "")}.wasm`;
+  let bytes: Uint8Array;
+  try {
+    bytes = emitWasmModule(mod, sourceTexts);
+  } catch (err) {
+    if (!(err instanceof WasmUnsupportedError)) throw err;
+    const m = WASMLIB_KIND_RE.exec(err.kind ?? "");
+    if (m !== null) {
+      const [cap, why] =
+        m[2] !== undefined
+          ? ["top-level await", "module evaluation must finish inside the first export call"]
+          : (WASMLIB_IMPORT_CAPABILITY[m[1]!] ?? [`the '${m[1]}' runtime import`, "a library module imports only its host modules"]);
+      return { ok: false, diagnostics: [wasmLibCapabilityDiag(cap, why, err.loc ?? entryLoc)], sourceTexts };
+    }
+    return { ok: false, diagnostics: [backendRefusalDiag(err, entryPath)], sourceTexts, wasmSurvey: surveyWasmModule(mod) };
+  }
+  await mkdir(dirname(wasmPath), { recursive: true });
+  await writeFile(wasmPath, bytes);
+  const w = mod.wasmLib!;
+  const contract: WasmLibContract = {
+      exports: [
+        ...(w.initialize ? [{ name: "_initialize", params: [], result: null }] : []),
+        ...w.exports.map((e) => ({ name: e.name, params: [...e.params], result: e.result, ...(e.constant !== undefined ? { constant: true as const } : {}) })),
+      ],
+      imports: w.imports.map((i) => ({ module: i.module, name: i.name, params: [...i.params], result: i.result, ...(i.role !== null ? { role: i.role } : {}) })),
+      alloc: w.alloc,
+      report: w.report,
+      maxDepth: w.maxDepth,
+  };
+  // The boundary as the host sees it, beside the module (a host's tests
+  // can assert it: which exports are constant, every class, the limits).
+  await writeFile(wasmPath.replace(/\.wasm$/, "") + ".lib.json", JSON.stringify({ format: 1, ...contract }, null, 2) + "\n");
+  return { ok: true, binaryPath: wasmPath, cPath: wasmPath, backend: "wasm", library: contract };
+}
+
+function wasmLibDefaultClass(t: IrType): IrWasmLibClass | null {
+  switch (t.kind) {
+    case "f64":
+      return "f64";
+    case "bool":
+      return "bool";
+    case "bigint":
+      return "s64";
+    case "string":
+      return "string";
+    case "bytes":
+      return t.elem === "u8" ? "list<u8>" : t.elem === "u32" ? "list<u32>" : t.elem === "i32" ? "list<s32>" : "list<f32>";
+    default:
+      return null;
+  }
 }

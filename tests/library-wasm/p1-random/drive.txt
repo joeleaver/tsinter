@@ -1,0 +1,2 @@
+call draw f64:5
+call draw f64:2

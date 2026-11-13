@@ -328,6 +328,7 @@ export class BytesBuilder {
     }
     if (elem === "f32") {
       c.localGet(VAL);
+      c.canonNaN();
       c.f32DemoteF64();
       c.i32ReinterpretF32();
     } else {
@@ -2249,13 +2250,17 @@ export class BytesBuilder {
       c.localSet(BUFL);
       if (width === 4) {
         c.localGet(VALUE);
+        if (!bits) c.canonNaN();
         c.f32DemoteF64();
         c.i32ReinterpretF32();
         c.localSet(BITS32);
         this.emitScatterI32(c, BUFL, ADDR, 4, le, BITS32);
       } else {
         c.localGet(VALUE);
-        if (!bits) c.i64ReinterpretF64();
+        if (!bits) {
+          c.canonNaN();
+          c.i64ReinterpretF64();
+        }
         c.localSet(BITS64);
         this.emitScatterI64(c, BUFL, ADDR, 8, le, BITS64);
       }
@@ -6661,6 +6666,7 @@ export class BytesBuilder {
       c.localSet(BUFL);
       if (width === 4) {
         c.localGet(VALUE);
+        if (!bits) c.canonNaN();
         c.f32DemoteF64();
         c.i32ReinterpretF32();
         c.localSet(BITS32);
@@ -6672,7 +6678,10 @@ export class BytesBuilder {
         c.end();
       } else {
         c.localGet(VALUE);
-        if (!bits) c.i64ReinterpretF64();
+        if (!bits) {
+          c.canonNaN();
+          c.i64ReinterpretF64();
+        }
         c.localSet(BITS64);
         c.localGet(LE);
         c.ifVoid();

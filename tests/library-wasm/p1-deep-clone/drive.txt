@@ -1,0 +1,3 @@
+call clone f64:100
+call clone f64:5500
+call clone f64:1

@@ -1,0 +1,8 @@
+note_f64 45
+note_f64 45
+report 3 "Uncaught RangeError: Maximum call stack size exceeded"
+noCatch trapped
+error "Uncaught RangeError: Maximum call stack size exceeded"
+report 4 "tsinter: deep: the instance stopped at an earlier failure"
+deep trapped
+error "tsinter: deep: the instance stopped at an earlier failure"

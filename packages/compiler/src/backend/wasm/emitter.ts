@@ -80,8 +80,11 @@ import {
   REF_TRUTHY_KINDS,
   keyedReadRecv,
   moduleUsesBigint,
+  type IrWasmLib,
+  type IrWasmLibClass,
 } from "../../ir/nodes.js";
 import { computeMayThrow, presentLocals, provenPresent } from "../emission/may-throw.js";
+import { directCallees } from "../wasm2c.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import {
   CI_POST,
@@ -304,13 +307,13 @@ import { SymBuilder } from "./symbols.js";
 import { BigBuilder } from "./bigint.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { UNDEF_BOOL, UNDEF_F64_BITS, UNDEF_UNION_TAG } from "./undef.js";
-import { Code, ENGINE_MEMORY, addZeroTailType, resetZeroTailTypes, setCharsType } from "./code.js";
+import { Code, ENGINE_MEMORY, addZeroTailType, resetZeroTailTypes, setCanonNaNFunc, setCharsType, setTrapHook } from "./code.js";
 import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { buildPowCore } from "./pow.js";
 import { foldFloatConst, foldNegation } from "../float-fold.js";
 import { Ieee754, IEEE754_MEMBERS } from "./ieee754.js";
-import { F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
+import { F32, F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import {
   asIrModule,
   lowerResumableFunctions,
@@ -674,8 +677,10 @@ function reachableFunctionNames(mod: WModule): Set<string> {
     walk(root);
     return out;
   };
-  const reachable = new Set<string>([mod.entry]);
-  const queue = [mod.entry];
+  // Library mode: the exported functions are called from outside.
+  const roots = [mod.entry, ...((mod as { wasmLib?: { exports: { fnName: string }[] } }).wasmLib?.exports.map((e) => e.fnName) ?? [])];
+  const reachable = new Set<string>(roots);
+  const queue = [...roots];
   const edge = (name: string): void => {
     if (names.has(name) && !reachable.has(name)) {
       reachable.add(name);
@@ -796,6 +801,66 @@ function timerSurfaceReachable(mod: WModule): boolean {
  * (INC-25 P1, design-number-v6.txt §8.1), and under-approximating would be
  * an emitter bug the runtime should say so by name for, not a silent
  * miscompile. */
+/* ── library mode (docs/design/wasm-library-mode.md) ─────────────────────
+ * Linear memory, library mode: [0, LIB_ERR_BASE) holds the report prefix
+ * (written right below the text when a failure reports), [LIB_ERR_BASE,
+ * LIB_ERR_BASE + LIB_ERR_CAP) the failure text (the error buffer the
+ * `tsinter_error_ptr/len` exports point at), and the output stage — the
+ * scratch arena — starts at LIB_STAGE_BASE. */
+const LIB_ERR_BASE = 256;
+const LIB_ERR_CAP = 4096;
+const LIB_STAGE_BASE = LIB_ERR_BASE + LIB_ERR_CAP;
+/** The failure codes (the report import's first argument). */
+const LIB_CODE_UNCAUGHT = 1;
+const LIB_CODE_FENCE = 2;
+const LIB_CODE_DEPTH = 3;
+const LIB_CODE_POISONED = 4;
+/** The instance's state (the `%lib.state` global). */
+const LIB_FRESH = 0; // module evaluation has not run
+const LIB_IDLE = 1; // evaluated, no export call running
+const LIB_IN_CALL = 2; // an export call is running (seen at entry: it trapped)
+const LIB_STOPPED = 3; // a failure reported and trapped
+
+/** The wasm parameters of one library class (a pointer class is two). */
+function wasmLibValTypes(cls: IrWasmLibClass): ValType[] {
+  switch (cls) {
+    case "f64":
+      return [F64];
+    case "f32":
+      return [F32];
+    case "s64":
+    case "u64":
+      return [I64];
+    case "string":
+    case "list<u8>":
+    case "list<s32>":
+    case "list<u32>":
+    case "list<f32>":
+    case "list<f64>":
+      return [I32, I32];
+    default:
+      return [I32];
+  }
+}
+
+/** The host imports reachable code calls ("module.name"). */
+function hostCallsReachable(mod: WModule): Set<string> {
+  const reachable = reachableFunctionNames(mod);
+  const out = new Set<string>();
+  const scan = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    const o = node as { kind?: unknown; module?: unknown; name?: unknown };
+    if (o.kind === "hostCall") out.add(`${String(o.module)}.${String(o.name)}`);
+    for (const v of Object.values(node)) if (v !== null && typeof v === "object") scan(v);
+  };
+  for (const fn of mod.functions) if (reachable.has(fn.name)) scan(fn.body);
+  return out;
+}
+
 function mathRandomReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
@@ -2035,6 +2100,8 @@ export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, 
     return asm.finish();
   } finally {
     fenceSourceTexts = null;
+    setTrapHook(null);
+    setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
     resetZeroTailTypes();
@@ -2053,6 +2120,8 @@ export function surveyWasmModule(mod: IrModule): string[] {
   try {
     new Assembler(inlineArrayCallbacks(lowerResumableFunctions(mod, refuse)), refuse).run();
   } finally {
+    setTrapHook(null);
+    setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
     resetZeroTailTypes();
@@ -3023,6 +3092,12 @@ class Assembler {
   private readonly strViewsLive: boolean;
   private readonly cursorGlobal: number;
   private readonly writeFunc: number;
+  /** Library mode: the module's boundary (null on an executable build). */
+  private readonly lib: IrWasmLib | null;
+  /** Library mode: host import function indices by "module.name". */
+  private readonly libImports = new Map<string, number>();
+  private libRandomFunc: number | null = null;
+  private libWriteFunc: number | null = null;
   /** `tsinter.now`'s index, or null in a module that cannot arm a timer
    * (see the prescan in the constructor). */
   private readonly nowFunc: number | null;
@@ -3308,6 +3383,43 @@ class Assembler {
     this.engineLive = libCallWhere(mod, (fn) => fn === "island.eval");
     if (this.engineLive) this.mb.reserveEngineMemory();
     // ── begin INC-26 host-import block (the ONE prescan-guarded importFunc site; wasm-host-fs-p5 (f) anchors here) ──
+    // Library mode (docs/design/wasm-library-mode.md §2.6): the closed
+    // import world. The host imports the program reaches come first (imports
+    // occupy the front of the function index space), then `write` becomes
+    // a function of the module's own (its bytes are the failure text, never
+    // output), and any other `tsinter` import the program would need is the
+    // named refusal library:import:<name>.
+    setTrapHook(null);
+    setCanonNaNFunc(null);
+    this.lib = (mod as { wasmLib?: IrWasmLib }).wasmLib ?? null;
+    if (this.lib !== null) {
+      const lib = this.lib;
+      const reached = hostCallsReachable(mod);
+      const randomReached = mathRandomReachable(mod);
+      for (const imp of lib.imports) {
+        const key = `${imp.module}.${imp.name}`;
+        const isRandom = imp.role === "random" && randomReached;
+        const isReport = lib.report !== null && lib.report.module === imp.module && lib.report.name === imp.name;
+        if (!reached.has(key) && !isRandom && !isReport) continue;
+        const params: ValType[] = [];
+        for (const c of imp.params) params.push(...wasmLibValTypes(c));
+        const idx = this.mb.importFunc(imp.module, imp.name, this.mb.funcType(params, imp.result === null ? [] : wasmLibValTypes(imp.result)));
+        this.libImports.set(key, idx);
+        if (imp.role === "random") this.libRandomFunc = idx;
+      }
+      const libWrite = this.mb.declareFunc(this.mb.funcType([I32, I32, I32], []), "%lib.write");
+      this.libWriteFunc = libWrite;
+      this.libInit();
+      const realImport = this.mb.importFunc.bind(this.mb);
+      this.mb.importFunc = (module: string, name: string, type: number): number => {
+        if (module === IMPORT_MODULE && name === IMPORT_WRITE) return libWrite;
+        if (module === IMPORT_MODULE) {
+          this.refuse(`library:import:${name}`);
+          return libWrite;
+        }
+        return realImport(module, name, type);
+      };
+    }
     this.writeFunc = this.mb.importFunc(
       IMPORT_MODULE,
       IMPORT_WRITE,
@@ -3348,7 +3460,7 @@ class Assembler {
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
     // modules that reach Math.random, minted by the same front-of-the-
     // function-index-space prescan `now` uses.
-    this.seedFunc = mathRandomReachable(mod) || this.engineLive
+    this.seedFunc = (mathRandomReachable(mod) && this.lib === null) || this.engineLive
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SEED, this.mb.funcType([], [I64]))
       : null;
     // `wallClock`'s decision (INC-25 P6, D3/D6, C-1): present only in
@@ -3603,8 +3715,8 @@ class Assembler {
     }
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
-      w.u8(0x41); // i32.const 0
-      w.sleb(0);
+      w.u8(0x41); // i32.const 0 (library mode: above the error buffer)
+      w.sleb(this.lib !== null ? LIB_STAGE_BASE : 0);
     });
     if (this.engineLive) this.attachIslandEngine();
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
@@ -4164,6 +4276,10 @@ class Assembler {
     this.fenceFatalFunc = idx;
     const out = this.ensureHelpers();
     const c = new Code();
+    if (this.lib !== null) {
+      c.i32Const(LIB_CODE_FENCE);
+      c.globalSet(this.libCodeG);
+    }
     this.pushStrLitInto(c, FENCE_FATAL_PREFIX);
     c.call(out.stage);
     c.localGet(0);
@@ -4591,6 +4707,10 @@ class Assembler {
     if (this.needsExitDrain) {
       c.i32Const(1);
       c.call(this.proc.exitDrainHelper());
+    }
+    if (this.lib !== null) {
+      c.i32Const(LIB_CODE_UNCAUGHT);
+      c.globalSet(this.libCodeG);
     }
     c.call(this.renderUncaughtHelper());
     c.unreachable();
@@ -6566,6 +6686,10 @@ class Assembler {
       this.jsonField.hideErrorMembers();
     }
 
+    if (this.lib !== null) {
+      this.runLibrary(this.lib);
+      return;
+    }
     const entry = this.funcIndexByName.get(this.mod.entry);
     const entryFn = this.funcByName.get(this.mod.entry);
     if (entry === undefined || entryFn === undefined) {
@@ -21362,6 +21486,29 @@ class Assembler {
       topStmtIndex: -1,
     };
 
+    // Library mode: the call-depth counter (SEMANTICS.md S142) — one up at
+    // entry (past max_depth: the uncatchable RangeError stop), one down
+    // before every return and at the fall-through end.
+    if (this.lib !== null) {
+      const code = this.fn.code;
+      code.globalGet(this.libDepthG);
+      code.i32Const(1);
+      code.i32Add();
+      code.globalSet(this.libDepthG);
+      code.globalGet(this.libDepthG);
+      code.i32Const(this.lib.maxDepth);
+      code.i32GtU();
+      code.ifVoid();
+      code.call(this.libDepthFail());
+      code.end();
+      const depthG = this.libDepthG;
+      code.returnHook = (c) => {
+        c.globalGet(depthG);
+        c.i32Const(1);
+        c.i32Sub();
+        c.globalSet(depthG);
+      };
+    }
     // Prologue 1: re-box captured params.
     for (const init of boxedParamInits) {
       this.fn.code.localGet(init.argIndex);
@@ -21426,6 +21573,7 @@ class Assembler {
     // IS the fall-through point: validation passes on the guarantee's
     // strength, and a frontend that ever breaks it traps loudly here.
     if (fn.returnType.kind !== "void") this.fn.code.unreachable();
+    else if (this.fn.code.returnHook !== null) this.fn.code.returnHook(this.fn.code);
 
     // The signature gate, AFTER the body: the census should surface the
     // body's constructs (the real work items), not the types they imply —
@@ -34743,6 +34891,10 @@ class Assembler {
         code.call(this.vecs.hasUndef(info, undefTag));
         return;
       }
+
+      case "hostCall":
+        this.walkHostCall(e);
+        return;
 
       default: {
         const rest: never = e;
@@ -53389,8 +53541,534 @@ class Assembler {
    * mirroring math.tq's MathRandom builtin exactly. The cache's nullness
    * doubles as the "not yet seeded" sentinel, so no separate flag global
    * is needed: allocated once, on the same branch that seeds. */
+
+  /* ── library mode (docs/design/wasm-library-mode.md) ────────────────────
+   * The module's exports are the entry's exported functions; module
+   * evaluation runs at the start of the FIRST export call (whichever it
+   * is), then a drain; every call runs its body, then a drain. A failure —
+   * an uncaught exception, an unhandled rejection, a fence, the depth limit
+   * — writes its text into the error buffer, hands it to the profile's
+   * report import, and traps; the instance is then stopped for good
+   * (SEMANTICS.md S140): every later call reports code 4 and traps. A call
+   * that finds the state still IN_CALL knows the previous call trapped
+   * without reporting (an engine trap), so the rule covers every trap. */
+
+  private libStateG = -1;
+  private libCodeG = -1;
+  private libErrLenG = -1;
+  private libDepthG = -1;
+  private libReportingG = -1;
+  private libTrapFunc = -1;
+  private libDepthFailFunc: number | null = null;
+  private libFenceFunc: number | null = null;
+  private libToI32Func: number | null = null;
+  private libToI64S: number | null = null;
+  private libToI64U: number | null = null;
+
+  /** Set up from the constructor (before any Code can trap). */
+  private libInit(): void {
+    const g = (v: number): number => this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(v);
+    });
+    this.libStateG = g(LIB_FRESH);
+    this.libCodeG = g(LIB_CODE_UNCAUGHT);
+    this.libErrLenG = g(0);
+    this.libDepthG = g(0);
+    this.libReportingG = g(0);
+    this.libTrapFunc = this.mb.declareFunc(this.mb.funcType([], []), "%lib.trap");
+    setTrapHook(this.libTrapFunc);
+    // SEMANTICS.md S146: one NaN payload wherever bits are observable.
+    const canon = this.mb.declareFunc(this.mb.funcType([F64], [F64]), "%lib.canonNaN");
+    const cc = new Code();
+    cc.localGet(0);
+    cc.f64Const(NaN);
+    cc.localGet(0);
+    cc.localGet(0);
+    cc.f64Eq();
+    cc.select();
+    this.mb.setBody(canon, [], cc.bytes());
+    setCanonNaNFunc(canon);
+  }
+
+  /** `%lib.write(fd, ptr, len)`: what the runtime writes (only failure text
+   * reaches it: the console and process refuse) is appended to the error
+   * buffer, truncated at its capacity. */
+  private libBuildWrite(): void {
+    const c = new Code();
+    const N = 3;
+    c.i32Const(LIB_ERR_CAP);
+    c.globalGet(this.libErrLenG);
+    c.i32Sub();
+    c.localSet(N);
+    c.localGet(2);
+    c.localGet(N);
+    c.i32LtU();
+    c.ifVoid();
+    c.localGet(2);
+    c.localSet(N);
+    c.end();
+    c.globalGet(this.libErrLenG);
+    c.i32Const(LIB_ERR_BASE);
+    c.i32Add();
+    c.localGet(1);
+    c.localGet(N);
+    c.memoryCopy();
+    c.globalGet(this.libErrLenG);
+    c.localGet(N);
+    c.i32Add();
+    c.globalSet(this.libErrLenG);
+    this.mb.setBody(this.libWriteFunc!, [I32], c.bytes());
+  }
+
+  /** `%lib.trap()`: every trap of a library module runs it first (code.ts
+   * setTrapHook). Report, mark stopped, trap. */
+  private libBuildTrap(lib: IrWasmLib): void {
+    const c = new Code();
+    c.noTrapHook = true;
+    c.i32Const(LIB_STOPPED);
+    c.globalSet(this.libStateG);
+    c.globalGet(this.libReportingG);
+    c.ifVoid();
+    c.unreachable();
+    c.end();
+    // one trailing newline is the rendering's, not the text's
+    c.globalGet(this.libErrLenG);
+    c.ifVoid();
+    c.globalGet(this.libErrLenG);
+    c.i32Const(LIB_ERR_BASE - 1);
+    c.i32Add();
+    c.i32Load8U();
+    c.i32Const(0x0a);
+    c.i32Eq();
+    c.ifVoid();
+    c.globalGet(this.libErrLenG);
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(this.libErrLenG);
+    c.end();
+    c.end();
+    const storeBytes = (at: number, bytes: Uint8Array): void => {
+      bytes.forEach((b, i) => {
+        c.i32Const(at + i);
+        c.i32Const(b);
+        c.i32Store8();
+      });
+    };
+    // A trap with no text (an emitter-internal stop) still says something.
+    c.globalGet(this.libErrLenG);
+    c.i32Eqz();
+    c.ifVoid();
+    const dflt = new TextEncoder().encode("tsinter: the module trapped");
+    storeBytes(LIB_ERR_BASE, dflt);
+    c.i32Const(dflt.length);
+    c.globalSet(this.libErrLenG);
+    c.end();
+    if (lib.report !== null) {
+      const rep = this.libImports.get(`${lib.report.module}.${lib.report.name}`);
+      const imp = lib.imports.find((i) => i.module === lib.report!.module && i.name === lib.report!.name)!;
+      if (rep !== undefined) {
+        const prefix = new TextEncoder().encode(lib.report.prefix);
+        if (prefix.length > LIB_ERR_BASE) throw new Error("library report prefix longer than its area");
+        storeBytes(LIB_ERR_BASE - prefix.length, prefix);
+        c.i32Const(1);
+        c.globalSet(this.libReportingG);
+        if (imp.params.length === 2) c.globalGet(this.libCodeG);
+        c.i32Const(LIB_ERR_BASE - prefix.length);
+        c.globalGet(this.libErrLenG);
+        c.i32Const(prefix.length);
+        c.i32Add();
+        c.call(rep);
+        c.i32Const(0);
+        c.globalSet(this.libReportingG);
+      }
+    }
+    c.unreachable();
+    this.mb.setBody(this.libTrapFunc, [], c.bytes());
+  }
+
+  /** Stage a failure's text into the error buffer (via the stderr flush)
+   * with its code; the caller traps. `push` stages the text's pieces. */
+  private libStageFailure(c: Code, code: number, push: (stage: () => void) => void, reset = false): void {
+    const out = this.ensureHelpers();
+    if (reset) {
+      c.i32Const(0);
+      c.globalSet(this.libErrLenG);
+    }
+    c.i32Const(code);
+    c.globalSet(this.libCodeG);
+    push(() => c.call(out.stage));
+    c.i32Const(FD_STDERR);
+    c.call(out.flush);
+  }
+
+  /** `%lib.depthFail()` — SEMANTICS.md S142: past max_depth. */
+  private libDepthFail(): number {
+    if (this.libDepthFailFunc !== null) return this.libDepthFailFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%lib.depthFail");
+    this.libDepthFailFunc = idx;
+    const c = new Code();
+    this.libStageFailure(c, LIB_CODE_DEPTH, (stage) => {
+      this.pushStrLitInto(c, "Uncaught RangeError: Maximum call stack size exceeded");
+      stage();
+    }, true);
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.fence(site, cls, value)` — SEMANTICS.md S143: a value that does
+   * not fit its boundary class. */
+  private libFence(): number {
+    if (this.libFenceFunc !== null) return this.libFenceFunc;
+    const S = this.strRef;
+    const idx = this.mb.declareFunc(this.mb.funcType([S, S, S], []), "%lib.fence");
+    this.libFenceFunc = idx;
+    const c = new Code();
+    this.libStageFailure(c, LIB_CODE_FENCE, (stage) => {
+      this.pushStrLitInto(c, "tsinter: ");
+      stage();
+      c.localGet(0);
+      stage();
+      this.pushStrLitInto(c, " is not a ");
+      stage();
+      c.localGet(1);
+      stage();
+      this.pushStrLitInto(c, ": ");
+      stage();
+      c.localGet(2);
+      stage();
+    });
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.toI32(x, lo, hi, site, cls) → i32`: an integral f64 in [lo, hi],
+   * else the fence. */
+  private libToI32(): number {
+    if (this.libToI32Func !== null) return this.libToI32Func;
+    const S = this.strRef;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64, F64, S, S], [I32]), "%lib.toI32");
+    this.libToI32Func = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.localGet(0);
+    c.f64Trunc();
+    c.f64Eq();
+    c.localGet(0);
+    c.localGet(1);
+    c.f64Ge();
+    c.i32And();
+    c.localGet(0);
+    c.localGet(2);
+    c.f64Le();
+    c.i32And();
+    c.ifVoid();
+    c.localGet(0);
+    c.i64TruncF64S();
+    c.i32WrapI64();
+    c.return_();
+    c.end();
+    c.localGet(3);
+    c.localGet(4);
+    c.localGet(0);
+    c.call(this.f64ToStrHelper());
+    c.call(this.libFence());
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%lib.toI64{S,U}(big, site) → i64`: a bigint in s64 / u64 range, else
+   * the fence. */
+  private libToI64(signed: boolean): number {
+    const memo = signed ? this.libToI64S : this.libToI64U;
+    if (memo !== null) return memo;
+    const S = this.strRef;
+    const bigRef: ValType = { kind: "ref", nullable: true, typeIndex: this.big.bigType };
+    const idx = this.mb.declareFunc(this.mb.funcType([bigRef, S], [I64]), signed ? "%lib.toI64S" : "%lib.toI64U");
+    if (signed) this.libToI64S = idx;
+    else this.libToI64U = idx;
+    const c = new Code();
+    const W = 2;
+    // fits ⟺ fromBits(wrap(x)) == x
+    c.localGet(0);
+    c.call(this.big.toBitsWrap());
+    c.localSet(W);
+    c.localGet(W);
+    c.call(this.big.fromBits(signed));
+    c.localGet(0);
+    c.call(this.big.eq());
+    c.ifVoid();
+    c.localGet(W);
+    c.return_();
+    c.end();
+    c.localGet(1);
+    this.pushStrLitInto(c, signed ? "s64" : "u64");
+    c.localGet(0);
+    c.call(this.big.toStr10());
+    c.call(this.libFence());
+    c.unreachable();
+    this.mb.setBody(idx, [I64], c.bytes());
+    return idx;
+  }
+
+  /** TS value (on the stack) → its wasm value(s) for a boundary class,
+   * checked where SEMANTICS.md S143 says. */
+  private libOutbound(c: Code, cls: IrWasmLibClass, site: string, loc: SrcLoc | undefined): void {
+    switch (cls) {
+      case "bool":
+        return;
+      case "f64":
+        c.canonNaN();
+        return;
+      case "f32":
+        c.canonNaN();
+        c.f32DemoteF64();
+        return;
+      case "s32":
+      case "u32": {
+        c.f64Const(cls === "s32" ? -2147483648 : 0);
+        c.f64Const(cls === "s32" ? 2147483647 : 4294967295);
+        this.pushStrLitInto(c, site);
+        this.pushStrLitInto(c, cls);
+        c.call(this.libToI32());
+        return;
+      }
+      case "s64":
+      case "u64":
+        this.pushStrLitInto(c, site);
+        c.call(this.libToI64(cls === "s64"));
+        return;
+      default:
+        this.refuse(`library:class:${cls}`, loc);
+    }
+  }
+
+  /** wasm value(s) (on the stack) of a boundary class → its TS value. */
+  private libInbound(c: Code, cls: IrWasmLibClass, loc: SrcLoc | undefined): void {
+    switch (cls) {
+      case "f64":
+        return;
+      case "f32":
+        c.f64PromoteF32();
+        return;
+      case "s32":
+        c.f64ConvertI32S();
+        return;
+      case "u32":
+        c.f64ConvertI32U();
+        return;
+      case "bool":
+        c.i32Const(0);
+        c.i32Ne();
+        return;
+      case "s64":
+      case "u64":
+        c.call(this.big.fromBits(cls === "s64"));
+        return;
+      default:
+        this.refuse(`library:class:${cls}`, loc);
+    }
+  }
+
+  /** A host import call (IR hostCall). */
+  private walkHostCall(e: Extract<WExpr, { kind: "hostCall" }>): void {
+    const code = this.fn.code;
+    const key = `${e.module}.${e.name}`;
+    const imp = this.lib?.imports.find((i) => i.module === e.module && i.name === e.name);
+    const idx = this.libImports.get(key);
+    if (imp === undefined || idx === undefined) throw new Error(`emitter bug: host call ${key} with no import`);
+    e.args.forEach((a, i) => {
+      this.walkValue(a);
+      this.libOutbound(code, imp.params[i]!, `argument ${i + 1} of ${key}`, e.loc);
+    });
+    code.call(idx);
+    if (imp.result !== null) this.libInbound(code, imp.result, e.loc);
+  }
+
+  /** The poisoned-instance check at an export's entry. */
+  private libPoisonCheck(c: Code, name: string): void {
+    c.globalGet(this.libStateG);
+    c.i32Const(LIB_IN_CALL);
+    c.i32GeU();
+    c.ifVoid();
+    this.libStageFailure(c, LIB_CODE_POISONED, (stage) => {
+      this.pushStrLitInto(c, `tsinter: ${name}: the instance stopped at an earlier failure`);
+      stage();
+    }, true);
+    c.unreachable();
+    c.end();
+  }
+
+  private runLibrary(lib: IrWasmLib): void {
+    const entry = this.funcIndexByName.get(this.mod.entry);
+    const entryFn = this.funcByName.get(this.mod.entry);
+    if (entry === undefined || entryFn === undefined) throw new Error(`entry function "${this.mod.entry}" not in module`);
+    if (this.rootGlobal() !== null) this.refuse("library:tla");
+    // Module evaluation: every module's top level, then a drain (Node's
+    // order: the evaluation finishes, its microtasks run, then the call).
+    const evalIdx = this.mb.declareFunc(this.mb.funcType([], []), "%lib.eval");
+    {
+      const c = new Code();
+      c.refNull(this.fnClosPair(entryFn).clos);
+      c.call(entry);
+      if (this.mayThrow.has(this.mod.entry)) {
+        c.globalGet(this.exc().kindG);
+        c.ifVoid();
+        c.call(this.reportUncaughtHelper());
+        c.end();
+      }
+      this.emitFirstCheckpoint(c);
+      this.mb.setBody(evalIdx, [], c.bytes());
+    }
+    const enter = (c: Code, name: string): void => {
+      this.libPoisonCheck(c, name);
+      c.globalGet(this.libStateG);
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(LIB_IN_CALL);
+      c.globalSet(this.libStateG);
+      c.call(evalIdx);
+      c.end();
+      c.i32Const(LIB_IN_CALL);
+      c.globalSet(this.libStateG);
+      c.i32Const(LIB_STAGE_BASE);
+      c.globalSet(this.cursorGlobal);
+      c.i32Const(0);
+      c.globalSet(this.libDepthG);
+    };
+    const leave = (c: Code): void => {
+      c.i32Const(LIB_IDLE);
+      c.globalSet(this.libStateG);
+    };
+    if (lib.initialize) {
+      const idx = this.mb.declareFunc(this.mb.funcType([], []), "%lib._initialize");
+      const c = new Code();
+      enter(c, "_initialize");
+      leave(c);
+      this.mb.setBody(idx, [], c.bytes());
+      this.mb.exportFunc("_initialize", idx);
+    }
+    for (const ex of lib.exports) {
+      const fn = this.funcByName.get(ex.fnName);
+      const fidx = this.funcIndexByName.get(ex.fnName);
+      if (fn === undefined || fidx === undefined) throw new Error(`emitter bug: library export ${ex.name} has no function`);
+      const params: ValType[] = [];
+      for (const p of ex.params) params.push(...wasmLibValTypes(p));
+      const results = ex.result === null ? [] : wasmLibValTypes(ex.result);
+      const idx = this.mb.declareFunc(this.mb.funcType(params, results), `%lib.export.${ex.name}`);
+      const c = new Code();
+      const extraLocals: ValType[] = [];
+      if (ex.constant !== undefined && ex.result !== null && typeof ex.constant !== "string") {
+        // A constant export answers without evaluating anything.
+        const v = typeof ex.constant === "boolean" ? (ex.constant ? 1 : 0) : ex.constant;
+        switch (ex.result) {
+          case "f64":
+            c.f64Const(v);
+            break;
+          case "f32":
+            c.f64Const(v);
+            c.f32DemoteF64();
+            break;
+          case "s64":
+          case "u64":
+            c.i64Const(BigInt(v));
+            break;
+          default:
+            c.i32Const(v | 0);
+        }
+        this.mb.setBody(idx, [], c.bytes());
+        this.mb.exportFunc(ex.name, idx);
+        continue;
+      }
+      enter(c, ex.name);
+      c.refNull(this.fnClosPair(fn).clos);
+      let k = 0;
+      for (const p of ex.params) {
+        const n = wasmLibValTypes(p).length;
+        for (let j = 0; j < n; j++) c.localGet(k + j);
+        k += n;
+        this.libInbound(c, p, fn.loc);
+      }
+      c.call(fidx);
+      let resLocal = -1;
+      if (ex.result !== null) {
+        resLocal = params.length + extraLocals.length;
+        extraLocals.push(this.mapTypeSoft(fn.returnType));
+        c.localSet(resLocal);
+      }
+      if (this.mayThrow.has(ex.fnName)) {
+        c.globalGet(this.exc().kindG);
+        c.ifVoid();
+        c.call(this.reportUncaughtHelper());
+        c.end();
+      }
+      this.emitCheckpoint(c);
+      if (ex.result !== null) {
+        c.localGet(resLocal);
+        this.libOutbound(c, ex.result, `the result of ${ex.name}`, fn.loc);
+        const rl = params.length + extraLocals.length;
+        extraLocals.push(...results);
+        c.localSet(rl);
+        leave(c);
+        c.localGet(rl);
+      } else {
+        leave(c);
+      }
+      this.mb.setBody(idx, extraLocals, c.bytes());
+      this.mb.exportFunc(ex.name, idx);
+    }
+    // The error buffer, readable after a trap (memory survives it).
+    {
+      const p = this.mb.declareFunc(this.mb.funcType([], [I32]), "%lib.errorPtr");
+      const c = new Code();
+      c.i32Const(LIB_ERR_BASE);
+      this.mb.setBody(p, [], c.bytes());
+      this.mb.exportFunc("tsinter_error_ptr", p);
+      const l = this.mb.declareFunc(this.mb.funcType([], [I32]), "%lib.errorLen");
+      const d = new Code();
+      d.globalGet(this.libErrLenG);
+      this.mb.setBody(l, [], d.bytes());
+      this.mb.exportFunc("tsinter_error_len", l);
+    }
+    for (let i = 0; i < this.lateBuilds.length; i++) this.lateBuilds[i]!();
+    this.lateBuildsDone = true;
+    this.libBuildWrite();
+    this.libBuildTrap(lib);
+    // SEMANTICS.md S142: the runtime's own recursive helpers (structured
+    // clone, dynamic checks and copies, inspect, JSON, comparators, ...)
+    // count depth like compiled functions do; the IR functions already
+    // count in their prologue. Audited from the finished call graph, so a
+    // helper added later is covered without a list to maintain.
+    this.mb.countRecursion(this.libDepthG, lib.maxDepth, this.libDepthFail(), new Set(this.funcIndexByName.values()), directCallees);
+    this.mb.exportMemory(EXPORT_MEMORY);
+  }
+
+  /** `%w.math.random` in library mode (SEMANTICS.md S141): one draw of the
+   * host's stream per call, mapped exactly as Playweft's QuickJS guest maps
+   * it: (x >>> 11) * 2^-53, x unsigned. */
+  private libRandomBody(idx: number): void {
+    const c = new Code();
+    c.call(this.libRandomFunc!);
+    c.i64Const(11n);
+    c.i64ShrU();
+    c.f64ConvertI64U();
+    c.f64Const(1 / 2 ** 53);
+    c.f64Mul();
+    this.mb.setBody(idx, [], c.bytes());
+  }
+
   private randomHelper(): number {
     if (this.randomHelperFuncIdx !== null) return this.randomHelperFuncIdx;
+    if (this.lib !== null) {
+      if (this.libRandomFunc === null) throw new Error("emitter bug: Math.random in a library module with no role:random import");
+      const idx = this.mb.declareFunc(this.mb.funcType([], [F64]), "%w.math.random");
+      this.randomHelperFuncIdx = idx;
+      this.libRandomBody(idx);
+      return idx;
+    }
     const seedFuncIdx = this.seedFunc;
     if (seedFuncIdx === null) {
       throw new Error(
@@ -53794,10 +54472,14 @@ class Assembler {
     {
       const c = new Code();
       c.localGet(0);
-      c.i32Const(0);
+      c.i32Const(this.lib !== null ? LIB_STAGE_BASE : 0);
       c.globalGet(this.cursorGlobal);
+      if (this.lib !== null) {
+        c.i32Const(LIB_STAGE_BASE);
+        c.i32Sub();
+      }
       c.call(this.writeFunc);
-      c.i32Const(0);
+      c.i32Const(this.lib !== null ? LIB_STAGE_BASE : 0);
       c.globalSet(this.cursorGlobal);
       this.mb.setBody(flush, [], c.bytes());
     }

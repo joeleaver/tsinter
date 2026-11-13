@@ -1,0 +1,7 @@
+note_f64 99
+report 3 "Uncaught RangeError: Maximum call stack size exceeded"
+clone trapped
+error "Uncaught RangeError: Maximum call stack size exceeded"
+report 4 "tsinter: clone: the instance stopped at an earlier failure"
+clone trapped
+error "tsinter: clone: the instance stopped at an earlier failure"

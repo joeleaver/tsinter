@@ -1,0 +1,1 @@
+SC4027 'emission' must be "wasm"

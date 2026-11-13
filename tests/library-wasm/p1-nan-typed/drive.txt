@@ -1,0 +1,1 @@
+call store f64:2

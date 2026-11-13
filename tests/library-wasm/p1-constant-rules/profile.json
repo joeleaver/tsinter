@@ -1,0 +1,54 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "sidefx": {
+      "params": [],
+      "result": "f64"
+    },
+    "negz": {
+      "params": [],
+      "result": "f64"
+    },
+    "asserted": {
+      "params": [],
+      "result": "f64"
+    },
+    "bump": {
+      "params": []
+    },
+    "ver": {
+      "params": [],
+      "result": "u32"
+    }
+  },
+  "imports": {
+    "pw": {
+      "note_f64": {
+        "params": [
+          [
+            "x",
+            "f64"
+          ]
+        ]
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report",
+    "prefix": "E "
+  }
+}

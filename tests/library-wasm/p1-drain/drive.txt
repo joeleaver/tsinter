@@ -1,0 +1,2 @@
+call start
+repeat 4 tick u64:$i

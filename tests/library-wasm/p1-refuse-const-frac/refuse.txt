@@ -1,0 +1,1 @@
+SC4003 returns the constant 1.5, which is not a s32

@@ -41,6 +41,8 @@
  *    JSON.parse's wording rather than tsc's, the one message-text delta on
  *    that path (no snapshot pins it). */
 
+import { libHost } from "./lib-host.js";
+import { wasmLibCapabilityDiag } from "../diagnostics/diagnostic.js";
 import { builtinModules } from "node:module";
 import { existsSync, statSync } from "node:fs";
 import { dirname, extname, resolve } from "node:path";
@@ -2376,6 +2378,14 @@ function preflight7(load: LoadResult): {
       const specNode: ts.Expression | undefined = stmt.moduleSpecifier;
       if (specNode === undefined || !ts.isStringLiteral(specNode)) continue;
       const spec = specNode.text;
+      // Library mode: a host module is the host's, not a module of the
+      // program — no edge, no fences (its calls lower to wasm imports).
+      if (libHost()?.isHostModule(spec, program) === true) continue;
+      // ...and Node's own modules are outside its closed import world.
+      if (libHost() !== null && canonicalBuiltinModule(spec) !== null) {
+        diags.push(wasmLibCapabilityDiag(`the '${spec}' module`, "a library module imports only its host modules (Node's modules reach the process, the clock, entropy or the file system)", locOf7(stmt)));
+        continue;
+      }
       const isRelative = isRelativeSpecifier(spec);
       const isBare = !isRelative && !ambientModules.has(spec);
       // R2 (SEMANTICS.md S129): an unsupported builtin whose load Node

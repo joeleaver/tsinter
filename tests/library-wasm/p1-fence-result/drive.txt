@@ -1,0 +1,4 @@
+call result f64:3 -> u32
+call wide u64:9223372036854775807 -> u64
+call result f64:2147483648 -> u32
+call result f64:1 -> u32

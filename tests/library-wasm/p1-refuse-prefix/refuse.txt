@@ -1,0 +1,1 @@
+SC4027 'report.prefix' is longer than 256 bytes

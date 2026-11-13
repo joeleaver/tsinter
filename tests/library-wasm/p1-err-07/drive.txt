@@ -1,0 +1,2 @@
+call step f64:7 -> f64
+call other

@@ -1,0 +1,1 @@
+SC4003 does not fit class s64

@@ -14,6 +14,12 @@ Usage:
   scriptc run <file.ts|.js> [options]       compile and run
   scriptc coverage <file.ts|.js>            how much compiles statically, and why not
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
+  scriptc build <entry.ts> --backend wasm --lib [--profile <p.json>]
+                                            library mode on the WasmGC lane: a
+                                            module whose exports are the entry's
+                                            export functions and whose imports
+                                            are its host modules, plus its
+                                            contract (<module>.lib.json)
   scriptc build --lib --profile <p.json>    library mode: compile the profile's entry
                                             module to a linkable static archive
                                             (<name>.lib.a) exporting the
@@ -145,6 +151,46 @@ async function main(): Promise<number> {
   const [command, inputArg] = positionals;
   if (command !== "build" && command !== "run" && command !== "coverage") {
     fail(`unknown command "${command}"\n\n${USAGE}`);
+  }
+  // A format-2 profile is the WasmGC library mode's, whatever --backend says
+  // (absent included); format 1 stays the legacy C-archive mode's.
+  const wasmProfile = values.lib && values.profile !== undefined && (() => {
+    try {
+      return (JSON.parse(readFileSync(resolve(values.profile!), "utf8")) as { profile_format?: unknown }).profile_format === 2;
+    } catch {
+      return false;
+    }
+  })();
+  if (values.lib && (values.backend === "wasm" || (values.backend === undefined && wasmProfile))) {
+    // LIBRARY mode on the WasmGC lane (docs/design/wasm-library-mode.md):
+    // the entry's `export function`s become the module's exports and its
+    // host modules its imports; the format-2 profile is optional. The
+    // module's boundary contract is written beside it as <module>.lib.json.
+    if (command !== "build") fail(`--lib is a build mode (scriptc build <entry.ts> --backend wasm --lib [--profile <p.json>])\n\n${USAGE}`);
+    if (!inputArg) fail(`scriptc build --backend wasm --lib needs the entry module\n\n${USAGE}`);
+    if (values.dynamic || values.ffi !== undefined) fail("scriptc build --backend wasm --lib takes no --dynamic/--ffi: a library module is static code with a closed import world");
+    const input = resolve(inputArg);
+    const stem = basename(input).replace(/\.(ts|js|mjs|cjs)$/, "");
+    const outPath = values.out ? resolve(values.out) : join(dirname(input), ".scriptc", `${stem}.wasm`);
+    const result = await compile(input, {
+      backend: "wasm",
+      outPath,
+      outDir: dirname(outPath),
+      emitIr: values["emit-ir"],
+      library: values.profile !== undefined ? { profilePath: resolve(values.profile) } : {},
+    });
+    if (!result.ok) {
+      const color = process.stderr.isTTY ?? false;
+      process.stderr.write(renderAll(result.diagnostics, result.sourceTexts, { color }) + "\n");
+      const n = result.diagnostics.length;
+      process.stderr.write(`\n${n} error${n === 1 ? "" : "s"}.\n`);
+      return 1;
+    }
+    process.stdout.write(`${result.binaryPath}\n`);
+    return 0;
+  }
+  if (values.lib && values.backend !== undefined && values.backend !== "wasm") {
+    fail(`SC4026 library mode on --backend ${values.backend} is not available in library mode: library mode builds one WebAssembly module for --backend wasm; the same module runs on every host`);
   }
   if (values.lib) {
     // LIBRARY mode: the profile names the entry module and pins the

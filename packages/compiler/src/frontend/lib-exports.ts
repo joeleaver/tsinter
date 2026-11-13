@@ -43,3 +43,53 @@ export function entryFunctionExports(entry: ts.SourceFile): Map<string, EntryExp
   }
   return out;
 }
+
+/** Library mode on the WasmGC lane (docs/design/wasm-library-mode.md, the
+ * lead's rulings of 2026-11-12): an exported function whose body is ONE
+ * `return <expr>` where <expr> is a literal (a number, a negated number, a
+ * string, true/false) or an identifier bound to a module-level `const`
+ * initialized by such a literal (followed through imports) is a CONSTANT
+ * export. It answers its value without running module evaluation, so a host
+ * may ask a fresh instance (pw_abi_version before a restore). Syntax only:
+ * a type assertion, a call or a computed value is an ordinary export. */
+export function entryConstantExports(entry: ts.SourceFile, checker: ts.TypeChecker): Map<string, number | string | boolean> {
+  const out = new Map<string, number | string | boolean>();
+  for (const stmt of entry.statements) {
+    if (!ts.isFunctionDeclaration(stmt) || stmt.name === undefined || stmt.body === undefined) continue;
+    const mods = ts.canHaveModifiers(stmt) ? ts.getModifiers(stmt) : undefined;
+    if (mods?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) !== true) continue;
+    if (mods.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) || stmt.asteriskToken !== undefined || stmt.parameters.length > 0) continue;
+    const body = stmt.body.statements;
+    if (body.length !== 1) continue;
+    const ret = body[0]!;
+    if (!ts.isReturnStatement(ret) || ret.expression === undefined) continue;
+    const v = constantValueOf(ret.expression, checker);
+    if (v !== null) out.set(stmt.name.text, v);
+  }
+  return out;
+}
+
+/** A literal's value, or (one hop) a module `const`'s literal initializer. */
+function constantValueOf(e: ts.Expression, checker: ts.TypeChecker): number | string | boolean | null {
+  const lit = literalValueOf(e);
+  if (lit !== null || !ts.isIdentifier(e)) return lit;
+  let sym = checker.getSymbolAtLocation(e);
+  if (sym !== undefined && (sym.flags & ts.SymbolFlags.Alias) !== 0) sym = checker.getAliasedSymbol(sym);
+  const decl = sym !== undefined ? checker.declarationsOf(sym)[0] : undefined;
+  if (decl === undefined || !ts.isVariableDeclaration(decl) || decl.initializer === undefined) return null;
+  const list = decl.parent;
+  if (list === undefined || !ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return null;
+  const vs = list.parent;
+  if (vs === undefined || !ts.isVariableStatement(vs) || vs.parent === undefined || !ts.isSourceFile(vs.parent)) return null;
+  if (!ts.isIdentifier(decl.name)) return null;
+  return literalValueOf(decl.initializer);
+}
+
+function literalValueOf(e: ts.Expression): number | string | boolean | null {
+  if (ts.isNumericLiteral(e)) return Number(e.text);
+  if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) return e.text;
+  if (e.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (e.kind === ts.SyntaxKind.FalseKeyword) return false;
+  if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(e.operand)) return -Number(e.operand.text);
+  return null;
+}

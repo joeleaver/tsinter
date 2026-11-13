@@ -1,0 +1,3 @@
+call go f64:1990
+call jsonDeep f64:3000
+call jsonDeep f64:20000

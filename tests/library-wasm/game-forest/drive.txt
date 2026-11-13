@@ -1,0 +1,6 @@
+# No profile: the init export is _initialize; number is f64, bigint is s64.
+call _initialize
+repeat 300 pw_run f64:0 s64:$i f64:0.016666666666666666
+dump
+repeat 2100 pw_run f64:0 s64:$i f64:0.016666666666666666
+dump

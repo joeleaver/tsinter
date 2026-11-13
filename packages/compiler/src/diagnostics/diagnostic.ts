@@ -48,6 +48,14 @@
  *            (SC4022 — may-be-NaN or may-be-fractional at a declared
  *            i64/u64 slot), and range (SC4023 — the proven interval does
  *            not fit ±(2^53 − 1), or is negative at a u64 slot)
+ *            Library mode on the WasmGC lane (docs/design/wasm-library-
+ *            mode.md) reuses SC4002/SC4003/SC4004/SC4007 with its own texts
+ *            (wasmLib* below) and adds: an ambient binding nothing defines
+ *            (SC4024), an import over the profile's wasm-arity cap
+ *            (SC4025), a capability the closed import world refuses
+ *            (SC4026 — a clock, entropy, timers, process, node:*, the
+ *            console, GC-timed surface, top-level await, the dynamic
+ *            engine), and a malformed format-2 profile (SC4027)
  *   SC5xxx  native FFI: malformed manifests (SC5001), a configured
  *            binding that is not an ambient function declaration
  *            (SC5002), and a TypeScript signature that does not match its
@@ -1073,5 +1081,71 @@ export function iceDiag(message: string, loc: SrcLoc): ScrDiagnostic {
     code: "SC9001",
     message: `internal compiler error: ${message} — please report this`,
     loc,
+  };
+}
+
+/* ── library mode on the WasmGC lane (docs/design/wasm-library-mode.md) ── */
+
+const WASMLIB_HINT = "library mode builds a module a host embeds: its exports are the entry's `export function`s, its imports the host modules the program declares (docs/design/wasm-library-mode.md)";
+
+/** SC4002 (wasm library mode) — a profile export names no `export function`
+ * of the entry module. */
+export function wasmLibExportUnresolvedDiag(name: string, detail: string, loc: SrcLoc): ScrDiagnostic {
+  return { code: "SC4002", message: `library export '${name}' cannot be resolved: ${detail}`, loc, hint: WASMLIB_HINT };
+}
+
+/** SC4003 (wasm library mode) — a boundary signature does not fit its
+ * classes, or has no class. */
+export function wasmLibSignatureDiag(what: string, detail: string, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC4003",
+    message: `${what}: ${detail}`,
+    loc,
+    hint: "classes and their TypeScript types: f64 f32 s8 u8 s16 u16 s32 u32 (number), s64 u64 (bigint), bool (boolean), string (string), list<u8> (Uint8Array), list<s32> (Int32Array), list<u32> (Uint32Array), list<f32> (Float32Array); without a profile number is f64 and bigint is s64",
+  };
+}
+
+/** SC4004 (wasm library mode) — an exported function is async or a
+ * generator: the ABI has no promise. */
+export function wasmLibAsyncExportDiag(name: string, kind: "async" | "generator", loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC4004",
+    message: `library export '${name}' is ${kind === "async" ? "an async function" : "a generator"}, and an export is a synchronous call`,
+    loc,
+    hint: "export a synchronous function that starts the async work (`void task()`); its continuations run in the drain at the end of each export call",
+  };
+}
+
+/** SC4007 (wasm library mode) — an exported function is generic. */
+export function wasmLibGenericExportDiag(name: string, loc: SrcLoc): ScrDiagnostic {
+  return { code: "SC4007", message: `library export '${name}' is generic, and an export needs one concrete signature`, loc, hint: WASMLIB_HINT };
+}
+
+/** SC4024 — an ambient declaration (a host module function, a `declare
+ * function`, a `declare const`) that nothing binds: not in the profile, and
+ * not assigned on globalThis. */
+export function wasmLibUnboundDiag(what: string, detail: string, loc: SrcLoc): ScrDiagnostic {
+  return { code: "SC4024", message: `${what} has no binding in library mode: ${detail}`, loc, hint: WASMLIB_HINT };
+}
+
+/** SC4025 — an import's wasm-level arity (pointer classes count two) is
+ * over the profile's max_import_params. */
+export function wasmLibArityDiag(name: string, arity: number, limit: number, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC4025",
+    message: `${name} has ${arity} wasm parameters; this profile's limit is ${limit}`,
+    loc,
+    hint: "each string or list parameter is two wasm parameters (pointer, length); the limit is the host's (wasm-bindgen's JS closures take at most 8)",
+  };
+}
+
+/** SC4026 — the closed import world: a capability a library-mode module
+ * cannot have, named. */
+export function wasmLibCapabilityDiag(capability: string, why: string, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC4026",
+    message: `${capability} is not available in library mode: ${why}`,
+    loc,
+    hint: "a library module imports only its host modules; time comes in as export parameters (tick, dt), randomness from the profile's role:\"random\" import",
   };
 }

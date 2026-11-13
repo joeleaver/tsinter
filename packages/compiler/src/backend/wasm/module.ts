@@ -34,13 +34,15 @@
  * later entry may still reference a group member freely — the backward
  * rule is unchanged outside the span. */
 import { ByteWriter } from "./bytes.js";
-import { currentOurMemoryIndex, setOurMemoryIndex } from "./code.js";
+import { Code, currentOurMemoryIndex, setOurMemoryIndex } from "./code.js";
 import { writeUleb5, type EngineImage } from "./engine.js";
 
 export type ValType =
   | { kind: "i32" }
   | { kind: "i64" }
   | { kind: "f64" }
+  /** Library mode only: an f32 import parameter or result (a host class). */
+  | { kind: "f32" }
   | { kind: "ref"; nullable: boolean; typeIndex: number };
 
 export const I32: ValType = { kind: "i32" };
@@ -48,6 +50,7 @@ export const I32: ValType = { kind: "i32" };
  * double-bit manipulation locals (toInt32, fmod). */
 export const I64: ValType = { kind: "i64" };
 export const F64: ValType = { kind: "f64" };
+export const F32: ValType = { kind: "f32" };
 
 /** Array element storage: a packed byte/code-unit or a full valtype. i16
  * is what strings use (UTF-16 code units — SEMANTICS.md S002), i8 the
@@ -64,6 +67,9 @@ function writeValType(w: ByteWriter, t: ValType): void {
       break;
     case "f64":
       w.u8(0x7c);
+      break;
+    case "f32":
+      w.u8(0x7d);
       break;
     case "ref":
       w.u8(t.nullable ? 0x63 : 0x64);
@@ -423,6 +429,97 @@ export class ModuleBuilder {
   declareFunc(typeIndex: number, name: string): number {
     this.funcs.push({ typeIndex, name, body: null });
     return this.imports.length + this.funcs.length - 1;
+  }
+
+  /** Library mode (SEMANTICS.md S142): every defined function that can
+   * recurse (it sits on a cycle of direct calls) and is not in `counted`
+   * gets the call-depth counter: its body moves to a new function and it
+   * becomes a wrapper that counts one level in, stops past `maxDepth`
+   * (`fail`), calls the body and counts one level out. Returns how many were
+   * wrapped. `callees` decodes a body's direct calls. */
+  countRecursion(depthGlobal: number, maxDepth: number, fail: number, counted: ReadonlySet<number>, callees: (code: Uint8Array) => number[]): number {
+    const base = this.imports.length;
+    const n = this.funcs.length;
+    const edges: number[][] = [];
+    for (let i = 0; i < n; i++) {
+      const b = this.funcs[i]!.body;
+      edges.push(b === null ? [] : callees(b.code).filter((c) => c >= base).map((c) => c - base));
+    }
+    // Tarjan's strongly connected components, iteratively
+    const index = new Int32Array(n).fill(-1);
+    const low = new Int32Array(n);
+    const onStack = new Uint8Array(n);
+    const stack: number[] = [];
+    const cyclic = new Set<number>();
+    let next = 0;
+    for (let root = 0; root < n; root++) {
+      if (index[root] !== -1) continue;
+      const work: [number, number][] = [[root, 0]];
+      index[root] = low[root] = next++;
+      stack.push(root);
+      onStack[root] = 1;
+      while (work.length > 0) {
+        const top = work[work.length - 1]!;
+        const [v, ei] = top;
+        if (ei < edges[v]!.length) {
+          top[1]++;
+          const w = edges[v]![ei]!;
+          if (index[w] === -1) {
+            index[w] = low[w] = next++;
+            stack.push(w);
+            onStack[w] = 1;
+            work.push([w, 0]);
+          } else if (onStack[w]) low[v] = Math.min(low[v]!, index[w]!);
+          continue;
+        }
+        work.pop();
+        if (work.length > 0) {
+          const u = work[work.length - 1]![0];
+          low[u] = Math.min(low[u]!, low[v]!);
+        }
+        if (low[v] === index[v]) {
+          const comp: number[] = [];
+          let w: number;
+          do {
+            w = stack.pop()!;
+            onStack[w] = 0;
+            comp.push(w);
+          } while (w !== v);
+          if (comp.length > 1 || edges[v]!.includes(v)) for (const c of comp) cyclic.add(c);
+        }
+      }
+    }
+    let wrapped = 0;
+    for (const i of [...cyclic].sort((a, b) => a - b)) {
+      const idx = base + i;
+      if (counted.has(idx) || idx === fail) continue;
+      const decl = this.funcs[i]!;
+      if (decl.body === null) continue;
+      const t = this.types[decl.typeIndex]!;
+      if (t.kind !== "func") continue;
+      const inner = this.declareFunc(decl.typeIndex, `${decl.name}%counted`);
+      this.funcs[inner - base]!.body = decl.body;
+      const c = new Code();
+      c.globalGet(depthGlobal);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(depthGlobal);
+      c.globalGet(depthGlobal);
+      c.i32Const(maxDepth);
+      c.i32GtU();
+      c.ifVoid();
+      c.call(fail);
+      c.end();
+      for (let p = 0; p < t.params.length; p++) c.localGet(p);
+      c.call(inner);
+      c.globalGet(depthGlobal);
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(depthGlobal);
+      decl.body = { locals: [], code: c.bytes() };
+      wrapped++;
+    }
+    return wrapped;
   }
 
   setBody(funcIndex: number, locals: ValType[], code: Uint8Array): void {

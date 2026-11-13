@@ -1,0 +1,42 @@
+{
+  "profile_format": 2,
+  "emission": "wasm",
+  "exports": {
+    "store": {
+      "params": [
+        [
+          "x",
+          "f64"
+        ]
+      ]
+    }
+  },
+  "imports": {
+    "pw": {
+      "note_f64": {
+        "params": [
+          [
+            "x",
+            "f64"
+          ]
+        ]
+      },
+      "report": {
+        "params": [
+          [
+            "code",
+            "u32"
+          ],
+          [
+            "text",
+            "string"
+          ]
+        ]
+      }
+    }
+  },
+  "report": {
+    "module": "pw",
+    "name": "report"
+  }
+}

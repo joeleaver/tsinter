@@ -18,6 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
+import { wasmLibClassType } from "./nodes.js";
 import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
@@ -1279,7 +1280,12 @@ function ffiClassType(cls: string): IrType {
   }
 }
 
+/** Library mode's host imports, by "module.name" (validateModule sets it
+ * for the duration of one validation). */
+let hostImports = new Map<string, NonNullable<IrModule["wasmLib"]>["imports"][number]>();
+
 export function validateModule(mod: IrModule): IrValidationError[] {
+  hostImports = new Map((mod.wasmLib?.imports ?? []).map((i) => [`${i.module}.${i.name}`, i]));
   const errors: IrValidationError[] = [];
   const functionsByName = new Map<string, IrFunction>();
   for (const fn of mod.functions) {
@@ -2745,6 +2751,23 @@ function validateFunction(
         if (!typeEquals(e.type, expected)) {
           err(`call ${e.callee} type ${e.type.kind} != return ${expected.kind}`, e.loc);
         }
+        break;
+      }
+      case "hostCall": {
+        for (const arg of e.args) checkExpr(arg);
+        const imp = hostImports.get(`${e.module}.${e.name}`);
+        if (imp === undefined) {
+          err(`host call to undeclared import "${e.module}.${e.name}"`, e.loc);
+          break;
+        }
+        if (imp.params.length !== e.args.length) err(`host call ${e.module}.${e.name}: ${e.args.length} args, expected ${imp.params.length}`, e.loc);
+        e.args.forEach((arg, i) => {
+          const cls = imp.params[i];
+          const t = cls !== undefined ? wasmLibClassType(cls) : null;
+          if (t !== null) expectType(arg, t, `host call ${e.module}.${e.name} arg ${i}`);
+        });
+        const want = imp.result === null ? VOID : wasmLibClassType(imp.result);
+        if (want === null || !typeEquals(e.type, want)) err(`host call ${e.module}.${e.name} type ${e.type.kind} != its result class`, e.loc);
         break;
       }
       case "ffiCall": {

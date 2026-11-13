@@ -1,0 +1,8 @@
+# Defaults; big() returns 2^63, out of s64: the boundary fence, then every call is poisoned.
+call _initialize
+call _initialize
+repeat 6 round f64:$i
+call add f64:0.5 s64:41 bool:true -> s64
+call add f64:-0 s64:-9223372036854775808 bool:false -> s64
+call big -> s64
+call round f64:1

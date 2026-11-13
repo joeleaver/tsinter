@@ -1,0 +1,3 @@
+call a f64:1
+call a f64:2
+call a f64:3
