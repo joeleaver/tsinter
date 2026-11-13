@@ -912,6 +912,14 @@ export function collectClassShape(L: Lowerer, decl: ts.ClassDeclaration): void {
     }
   }
 
+/** `export default class {}`: an anonymous class declaration whose JS name
+ * is "default" (NamedEvaluation of the default export). */
+function isAnonymousDefaultClass(decl: ts.ClassLikeDeclaration): boolean {
+  if (decl.name !== undefined || !ts.isClassDeclaration(decl)) return false;
+  const flags = ts.getCombinedModifierFlags(decl as unknown as ts.Declaration);
+  return (flags & ts.ModifierFlags.Default) !== 0;
+}
+
 export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration, jsNameOverride?: string,
     inst?: { family: ClassInfo; name: string; bindings: Map<ts.Symbol, IrType>; typeArgsText: string; ordinal: number },
     /** MIXIN instantiation mode (lower-mixins.ts): the class inside a
@@ -973,7 +981,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
               const info: ClassInfo = {
                 def: {
                   name: className,
-                  jsName: jsNameOverride ?? decl.name?.text ?? "",
+                  jsName: jsNameOverride ?? decl.name?.text ?? (isAnonymousDefaultClass(decl) ? "default" : ""),
                   fields: [],
                   loc: locOf(decl),
                 },
@@ -2461,7 +2469,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // what `C.name` folds to): the declared name, or NamedEvaluation's
           // answer for class expressions ("" when truly anonymous). An
           // INSTANTIATION prints its family's name — JS has one `Box`.
-          jsName: jsNameOverride ?? decl.name?.text ?? "",
+          jsName: jsNameOverride ?? decl.name?.text ?? (isAnonymousDefaultClass(decl) ? "default" : ""),
           ...(declaresStaticNameOrLength(decl) ? { staticNameOrLength: true as const } : {}),
           ...((): { dynLossyMembers?: { data?: true; name?: true; proto?: string[] } } => { const k = errorDynLossy(decl); return k !== null ? { dynLossyMembers: k } : {}; })(),
           ...(ctor === null ? { implicitCtor: true as const } : {}),
@@ -3214,6 +3222,8 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
     if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(p.left)) return p.left.text;
     if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) return p.name.text;
     if (ts.isParameter(p) && ts.isIdentifier(p.name)) return p.name.text;
+    // `export default (class {})`: NamedEvaluation names it "default"
+    if (ts.isExportAssignment(p) && p.isExportEquals !== true) return "default";
     return "";
   }
 

@@ -7357,6 +7357,36 @@ export class DynBuilder {
     });
   }
 
+  /** %w.dyn.errStackReset(err): `Error.captureStackTrace` over a typed
+   * error — a `stack` a dynamic write gave its encoding reads as undefined
+   * again (any error's unread stack, GH #135). Nothing before a crossing. */
+  errStackReset(): number {
+    return this.cached("errStackReset", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [], (idx) => {
+      const c = new Code();
+      const B = 1;
+      c.localGet(0);
+      c.structGet(this.deps.errT(), this.deps.errBox());
+      c.refCastNull(this.dynT());
+      c.localTee(B);
+      c.refIsNull();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(B));
+      this.deps.lit(c, "stack");
+      c.call(this.objGet());
+      c.refIsNull();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(B));
+      this.deps.lit(c, "stack");
+      c.globalGet(this.undefinedGlobal());
+      c.call(this.objPut());
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
+  }
+
   /** %w.dyn.errViewKind(obj, key) -> f64: GH #191's kind (class-views.ts)
    * of `key` on the error `obj` encodes; 0 for any other object or for an
    * error no mirrored class built. */
@@ -7378,6 +7408,31 @@ export class DynBuilder {
       });
       this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], c.bytes());
     });
+  }
+
+  /** `delete` or defineProperty of `stack` on any error's encoding stops
+   * by name: Node's own `stack` is non-enumerable (listings hide it here),
+   * but deleting it or redefining it can make an own enumerable `stack`
+   * the listings would then miss. */
+  errStackGuard(c: Code, pushDyn: (c: Code) => void, pushKey: (c: Code) => void, what: string): void {
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    this.objPayload(c, pushDyn);
+    c.call(this.errLinkOf());
+    c.refIsNull();
+    c.i32Eqz();
+    pushKey(c);
+    this.deps.lit(c, "stack");
+    c.call(this.deps.strEq());
+    c.i32And();
+    c.ifVoid();
+    this.deps.fence(c, (x) =>
+      this.deps.lit(x, `${what} 'stack' of an error held in a dynamic value is not supported yet (its listing keeps Node's non-enumerable stack hidden)`));
+    c.end();
+    c.end();
   }
 
   /** GH #191: an object-model change (`delete`, defineProperty, freeze,
@@ -9616,7 +9671,7 @@ export class DynBuilder {
         c.f64Ne();
         c.ifVoid();
         c.i32Const(0);
-        for (const key of ["name", "message", "code"]) {
+        for (const key of ["name", "message", "code", "stack"]) {
           c.localGet(E);
           c.structGet(entryT, ENTRY_KEY);
           this.deps.lit(c, key);
@@ -9663,7 +9718,7 @@ export class DynBuilder {
       c.arrayGet(entries);
       c.localSet(E);
       c.i32Const(0);
-      for (const key of ["%error", "name", "message", "code"]) {
+      for (const key of ["%error", "name", "message", "code", "stack"]) {
         c.localGet(E);
         c.structGet(entryT, ENTRY_KEY);
         this.deps.lit(c, key);

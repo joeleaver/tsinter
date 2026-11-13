@@ -25850,14 +25850,22 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
-        if (e.fn === "dyn.errInstanceof") {
+        if (e.fn === "error.stackReset") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.dyn.errStackReset());
+          return;
+        }
+        if (e.fn === "dyn.errInstanceof" || e.fn === "dyn.errInstanceofClass") {
           // `x instanceof <builtin error class>` on a dyn value: only a
           // value that came from an error (the identity cache) is one,
           // and it is an instance when its class sits inside the tested
-          // class's preorder interval.
+          // class's preorder interval. `dyn.errInstanceofClass` names a
+          // program's own Error subclass (its IR class name).
           const kindArg = e.args[1]!;
           const entry =
-            kindArg.kind === "numLit" ? [...RUNTIME_ERROR_CLASSES].find(([, v]) => v.kind === kindArg.value) : undefined;
+            e.fn === "dyn.errInstanceofClass"
+              ? kindArg.kind === "strLit" ? [kindArg.value] : undefined
+              : kindArg.kind === "numLit" ? [...RUNTIME_ERROR_CLASSES].find(([, v]) => v.kind === kindArg.value) : undefined;
           const meta = entry === undefined ? undefined : this.classes.meta(entry[0]);
           if (meta === undefined) {
             this.refuse(`libCall:${e.fn}`, e.loc);

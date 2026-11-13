@@ -16,7 +16,7 @@ import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { ARRAYBUFFER_T, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
-import { viewableClass } from "./class-views.js";
+import { lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -615,6 +615,15 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (ts.isPropertyAccessExpression(expr)) {
       const op = lowerObjectPrototypeRead(L, expr);
       if (op !== null) return op;
+    }
+    // `x.constructor.name` over a typed program-class instance: the run-time
+    // class's name (class-views.ts).
+    if (
+      ts.isPropertyAccessExpression(expr) && !expr.questionDotToken && expr.name.text === "name" &&
+      ts.isPropertyAccessExpression(expr.expression) && !expr.expression.questionDotToken && expr.expression.name.text === "constructor"
+    ) {
+      const cn = lowerConstructorName(L, expr.expression.expression, loc);
+      if (cn !== null) return cn;
     }
     if (ts.isDeleteExpression(expr)) {
       const del = lowerObjModelDelete(L, expr);
@@ -11396,6 +11405,13 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         type: BOOL,
         loc,
       };
+    }
+    // A program's own Error subclass on a dynamic value: an error's encoding
+    // answers through its error's class (the vtable's interval); any other
+    // value is no instance.
+    if ((left.type.kind === "dyn" || left.type.kind === "jsval") && L.sharedDynamic && target.decl !== null && (() => { for (let b = target.base; b; b = b.base) if (b.builtinError) return true; return false; })()) {
+      const d: IrExpr = left.type.kind === "dyn" ? left : { kind: "dynFromJsval", value: left, type: DYN, loc } as IrExpr;
+      return { kind: "libCall", fn: "dyn.errInstanceofClass", args: [d, { kind: "strLit", value: target.def.name, type: STRING, loc }], type: BOOL, loc };
     }
     // A dynamic value against a program class: is it a view of an instance
     // of that class (class-views.ts)? Everything else is no instance.

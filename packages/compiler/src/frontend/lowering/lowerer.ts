@@ -17,7 +17,7 @@ import { isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
-import { buildErrorViews, classFuncBox, classLiftIn, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
+import { buildErrorViews, classFuncBox, classLiftIn, finishConstructorNames, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
 import { collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
@@ -2664,6 +2664,7 @@ export class Lowerer {
     // composite exit not proven fresh refuses (SEMANTICS.md S115).
     // GH #191: the error-mirror helpers (class-views.ts).
     const errViews = buildErrorViews(this);
+    finishConstructorNames(this);
     islandViewPass(this, [...functions, ...this.implicitFns]);
     functions.push(...this.liftedFns);
     functions.push(...this.implicitFns);

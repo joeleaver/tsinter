@@ -6336,6 +6336,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "om.integrity":
           case "om.isIntegrity":
           case "om.delete":
+          case "dyn.errInstanceofClass":
+          case "error.stackReset":
           case "om.forInKeys":
           case "om.objectProto":
           case "om.codegenFn":

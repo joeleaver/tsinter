@@ -27,6 +27,8 @@ export interface Row {
   /** The program compiles, prints Node's stdout up to the check, and
    * stops at the named fence (S122). */
   fence?: { text: RegExp; stdout: string };
+  /** The program refuses at compile time with a diagnostic matching this. */
+  refused?: RegExp;
 }
 
 interface Out {
@@ -63,6 +65,11 @@ export function defineRows(title: string, rows: Row[]): void {
     const entry = join(dir, row.entry ?? "main.js");
     writeFileSync(entry, row.src + "\n");
     const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+    if (row.refused !== undefined) {
+      expect(res.ok).toBe(false);
+      expect(res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")).toMatch(row.refused);
+      return;
+    }
     if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
     const node = nodeRun(entry, row.nodeArgs ?? []);
     const got: Out = backend === "wasm"

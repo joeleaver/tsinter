@@ -926,6 +926,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "error.domCause": { argTypes: [null], result: DYN },
   "error.domClone": { argTypes: [null, DYN], result: VOID },
   "dyn.errInstanceof": { argTypes: [DYN, F64], result: BOOL },
+  "dyn.errInstanceofClass": { argTypes: [DYN, STRING], result: BOOL },
+  "error.stackReset": { argTypes: [null], result: VOID },
   "dyn.objKeys": { argTypes: [DYN], result: DYN },
   "dyn.hasOwn": { argTypes: [DYN, STRING], result: BOOL },
   "dyn.assign": { argTypes: [DYN, DYN], result: DYN },

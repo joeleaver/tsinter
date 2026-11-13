@@ -206,6 +206,65 @@ export function classFuncBox(L: Lowerer, e: IrExpr, loc: SrcLoc, force = false):
   return { kind: "call", callee: name, args: [e], type: JSVAL, loc };
 }
 
+/** `x.constructor.name` over a statically typed instance of a program class
+ * (commander's `this.name = this.constructor.name`): the run-time class's
+ * JS name — the instance's own class, tested deepest first. Null (the
+ * existing lowering decides) for a class with no declaration, an instance
+ * with its own `constructor` member, or a class in the family declaring a
+ * static `name` (the constructor's name is then no class name). */
+export function lowerConstructorName(L: Lowerer, recv: ts.Expression, loc: SrcLoc): IrExpr | null {
+  const t = L.mapTypeOf(L.typeOf(recv));
+  if (t?.kind !== "object") return null;
+  const info = L.classes.get(t.className);
+  if (!info || info.decl === null || info.generic !== undefined) return null;
+  if (info.fields.has("constructor")) return null;
+  if (info.def.staticNameOrLength === true) return null;
+  const key = `cname:${info.def.name}`;
+  let name = L.jsinHelpers.get(key);
+  if (!name) {
+    name = `%cname.${L.jsinHelpers.size}`;
+    L.jsinHelpers.set(key, name);
+    // the body waits for every class (finishConstructorNames): a subclass
+    // registered later (a class expression) is a possible run-time class
+    const fn: IrFunction = {
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: STRING,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body: [],
+      loc,
+    };
+    L.liftedFns.push(fn);
+    const pending = cnamePending.get(L) ?? [];
+    pending.push({ fn, info, t, loc });
+    cnamePending.set(L, pending);
+  }
+  return { kind: "call", callee: name, args: [L.lowerExpr(recv)], type: STRING, loc };
+}
+
+const cnamePending = new WeakMap<Lowerer, { fn: IrFunction; info: ClassInfo; t: IrType; loc: SrcLoc }[]>();
+
+/** The `%cname` helpers' bodies, once every class is registered: the
+ * instance's class tested deepest first, each answering its JS name. A
+ * subclass declaring a static `name` (or `length`), or one with no
+ * declaration, makes the helper stop by name instead. */
+export function finishConstructorNames(L: Lowerer): void {
+  for (const { fn, info, t, loc } of cnamePending.get(L) ?? []) {
+    const subs = L.inHierarchy(info) ? subclassesOf(L, info.def.name) : [];
+    const x = (): IrExpr => ({ kind: "varRef", localId: "x.0", type: t, loc });
+    const body: IrStmt[] = [];
+    for (const s of subs) {
+      const answer: IrStmt[] = s.def.staticNameOrLength === true || s.decl === null
+        ? [fence(`reading 'constructor.name' of an instance whose class declares a static 'name' or 'length' is not supported yet`, loc), { kind: "return", value: str("", loc), loc }]
+        : [{ kind: "return", value: str(s.def.jsName ?? "", loc), loc }];
+      body.push({ kind: "if", cond: { kind: "instanceOf", value: x(), className: s.def.name, type: BOOL, loc }, then: answer, else_: null, loc });
+    }
+    body.push({ kind: "return", value: str(info.def.jsName ?? "", loc), loc });
+    fn.body = body;
+  }
+  cnamePending.delete(L);
+}
+
 /** Every registered class strictly below `className`, deepest first. */
 function subclassesOf(L: Lowerer, className: string): ClassInfo[] {
   const out: { info: ClassInfo; depth: number }[] = [];

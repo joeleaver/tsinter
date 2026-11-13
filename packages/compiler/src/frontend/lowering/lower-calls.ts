@@ -4602,6 +4602,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // methods, but only iterator-typed receivers reach this).
         lowerIteratorHelperCall(L, expr, expr.expression) ??
         lowerIteratorStaticFence(L, expr, expr.expression) ??
+        lowerErrorCaptureStackTrace(L, expr, expr.expression) ??
         lowerObjectStaticCall(L, expr, expr.expression) ??
         lowerObjectFromEntriesCall(L, expr, expr.expression) ??
         lowerArrayFromCall(L, expr, expr.expression) ??
@@ -8342,6 +8343,51 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const answer: IrExpr = { kind: "boolLit", value: false, type: BOOL, loc };
     if (stmts.length === 0) return answer;
     return { kind: "seqExpr", stmts, result: answer, type: BOOL, loc };
+  }
+
+  /** `Error.captureStackTrace(target, ctor?)` over a statically typed class
+   * instance (commander's error constructors): Node gives the target a
+   * fresh `stack`. A typed error's stack is never readable here (a typed
+   * `.stack` read refuses by name; through a dynamic value it reads as any
+   * error's does): the call evaluates its target and resets a `stack` a
+   * dynamic write gave it (error.stackReset). Only error-class instances
+   * (any other instance gains an own `stack` a dynamic view would show) and
+   * a second argument that is a plain reference (it only trims frames);
+   * a class that declares its own `stack` member is refused by name (Node
+   * overwrites it). Dynamic targets are left to the other lowerings. */
+  function lowerErrorCaptureStackTrace(L: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression): IrExpr | null {
+    if (call.questionDotToken || access.questionDotToken || access.name.text !== "captureStackTrace") return null;
+    if (!ts.isIdentifier(access.expression) || !L.isStdlibGlobal(access.expression, "Error")) return null;
+    const args = call.arguments;
+    if (args.length < 1 || args.length > 2 || args.some((a) => ts.isSpreadElement(a))) return null;
+    const t = L.mapTypeOf(L.typeOf(args[0]!));
+    if (t?.kind !== "object") return null;
+    const info = L.classes.get(t.className);
+    if (info === undefined) return null;
+    // an error only: on any other instance Node makes an own `stack` the
+    // instance's dynamic view would show (the existing refusal stands)
+    {
+      let err = false;
+      for (let c: typeof info | null = info; c; c = c.base) if (c.builtinError) err = true;
+      if (!err) return null;
+    }
+    const loc = locOf(call);
+    if (info.fields.has("stack") || L.findMethodOn(info, "stack") || L.findMethodOn(info, "get:stack") || L.findMethodOn(info, "set:stack")) {
+      L.unsupported("SC1090", call, `Error.captureStackTrace on an instance whose class declares its own 'stack' member (Node overwrites it with a captured trace)`);
+    }
+    // The second argument only trims frames; a plain reference to it (an
+    // identifier, `this.constructor`) has no effect of its own.
+    const pure = (e: ts.Expression): boolean => {
+      let x = e;
+      while (ts.isParenthesizedExpression(x)) x = x.expression;
+      if (ts.isIdentifier(x) || x.kind === ts.SyntaxKind.ThisKeyword) return true;
+      return ts.isPropertyAccessExpression(x) && x.name.text === "constructor" && pure(x.expression);
+    };
+    // a second argument with effects of its own keeps the existing refusal
+    if (args.length > 1 && !pure(args[1]!)) return null;
+    // the target: a `stack` a dynamic write gave it is replaced (it reads
+    // as any error's unread stack does — GH #135's registered undefined)
+    return { kind: "libCall", fn: "error.stackReset", args: [L.lowerExpr(args[0]!)], type: VOID, loc } as IrExpr;
   }
 
   function lowerObjectStaticCall(L: Lowerer, call: ts.CallExpression,

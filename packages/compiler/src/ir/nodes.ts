@@ -3745,6 +3745,15 @@ export type IrLibFn =
    * answer). args are the borrowed dyn and the SCR_ERR_* kind literal.
    * Never throws. */
   | "dyn.errInstanceof"
+  /** `x instanceof C` for a program's own Error subclass C on a dyn value
+   * (WasmGC lanes): a value that came from an error (its encoding's link)
+   * is one when its class sits inside C's preorder interval. args are the
+   * dyn and C's IR class name as a string literal. Never throws. */
+  | "dyn.errInstanceofClass"
+  /** `Error.captureStackTrace(e)` over a typed error (WasmGC lanes): a
+   * `stack` a dynamic write gave its encoding reads as undefined again.
+   * Never throws. */
+  | "error.stackReset"
   /** Object.keys/values/entries over a CHECKED-DYNAMIC receiver
    * (scr_json.c): the runtime walks the dyn node's own members in JS
    * own-key order (array-index keys ascending first, then insertion

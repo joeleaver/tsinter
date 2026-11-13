@@ -1726,6 +1726,7 @@ export class ObjModel {
       [I32, this.k.fnPropsRef()],
       (c) => {
       this.d.errMirrorGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "Object.defineProperty (or defineProperties, or an assignment through it) on a member");
+      this.d.errStackGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "Object.defineProperty (or defineProperties) of");
         const K = 6;
         const FP = 7;
         // A well-known symbol's property is modeled only non-enumerable
@@ -2405,6 +2406,7 @@ export class ObjModel {
       [I32, this.d.objRef(), I32, this.k.fnPropsRef(), I32],
       (c) => {
       this.d.errMirrorGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "'delete' of a member");
+      this.d.errStackGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "'delete' of");
         const K = 2;
         const O = 3;
         const IDX = 4;
