@@ -3512,6 +3512,12 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       ctx.es5EmptyDyn === true &&
       checker.getCallSignatures(widened).length === 0 && checker.getConstructSignatures(widened).length === 0 &&
       anonSym !== undefined && checker.declarationsOf(anonSym).length > 0 &&
+      // GH #213: a CommonJS module's namespace (`const m = require("./x.js")`,
+      // the symbol declared by the source file itself) is not an object
+      // the program built: the module machinery owns it (`m.k` resolves
+      // to the exporter's binding), so it keeps its record.
+      (anonSym.flags & (ts.SymbolFlags.ValueModule | ts.SymbolFlags.NamespaceModule)) === 0 &&
+      !checker.declarationsOf(anonSym).some((d) => ts.isSourceFile(d)) &&
       // the JavaScript of an npm package compiled statically (--npm-static):
       // (the program's own JavaScript keeps its records, an empty one aside)
       checker.declarationsOf(anonSym).every((d) => /\.[cm]?jsx?$/.test(d.getSourceFile().fileName) && (props.length === 0 || d.getSourceFile().fileName.includes("/node_modules/")) && !isCjsExportLiteral(d)) &&
