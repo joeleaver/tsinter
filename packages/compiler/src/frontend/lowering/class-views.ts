@@ -360,6 +360,16 @@ function methodCall(L: Lowerer, info: ClassInfo, key: string, recv: IrExpr, args
   return { kind: "call", callee: `%${found.declarer.def.name}.${key}`, args: [L.upcastTo(recv, found.declarer.def.name), ...args], type: found.sig.ret, loc };
 }
 
+/** A STATIC call of the method `key` as `info` looks it up (its nearest
+ * declarer's body, whatever the receiver's runtime class overrides) — a
+ * prototype method called with another `this` (`G.prototype.a.call(h)`). */
+function declarerCall(L: Lowerer, info: ClassInfo, key: string, recv: IrExpr, args: IrExpr[], loc: SrcLoc): IrExpr | null {
+  const found = L.findMethodOn(info, key);
+  if (!found || found.sig.abstract === true) return null;
+  L.noteEdge(`%${found.declarer.def.name}.${key}`);
+  return { kind: "call", callee: `%${found.declarer.def.name}.${key}`, args: [L.upcastTo(recv, found.declarer.def.name), ...args], type: found.sig.ret, loc };
+}
+
 /** `value`, but the program stops by name when this expression runs: an
  * interned identity helper whose body is the runtime fence (a fence is a
  * statement, which an expression position cannot hold directly). */
@@ -455,7 +465,13 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
         loc,
       });
       if (receiverFromThis) body.push({ kind: "varDecl", localId: "r.0", init: classUnview(L, th(), t, loc), loc });
-      const call = methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!;
+      // Through `this`, the call runs THIS factory's method body — the
+      // declarer the view's own class looks up (Node's `G.prototype.a`),
+      // never a virtual dispatch on the receiver: `g.a.call(h)` with h a
+      // subclass instance overriding `a` still runs G's `a` (GH #186).
+      const call = receiverFromThis
+        ? declarerCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!
+        : methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!;
       if (call.type.kind === "void") {
         body.push({ kind: "exprStmt", expr: call, loc }, { kind: "return", value: undef(loc), loc });
       } else {

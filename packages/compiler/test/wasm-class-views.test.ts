@@ -171,6 +171,21 @@ console.log(m.call(xs[1], "x"), xs[0].a("y"), typeof m);
 console.log(m.apply(xs[0], ["z"]));`,
   },
   {
+    id: "CV-CALL-04 a base method called with a subclass instance as this runs the base body, not the override (GH #186 review)",
+    src: `class G {
+  n = 1;
+  a(): string { return "G" + this.n; }
+}
+class H2 extends G {
+  n = 2;
+  a(): string { return "H" + this.n; }
+}
+const g: any = new G(), h: any = new H2();
+console.log(g.a.call(h), g.a.apply(h, []), h.a(), g.a());
+const ms: any[] = [new H2(), new G()];
+console.log(ms[1].a.call(ms[0]), ms[0].a.call(ms[0]));`,
+  },
+  {
     id: "CV-CALL-03 a method read off a view and called detached stops by name (Node runs it with this undefined; GH #186)",
     src: `class G {
   n = 3;
