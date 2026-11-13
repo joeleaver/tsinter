@@ -14,6 +14,7 @@ Usage:
   scriptc run <file.ts|.js> [options]       compile and run
   scriptc coverage <file.ts|.js>            how much compiles statically, and why not
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
+  scriptc coverage <file> --backend wasm    the same analysis for a WasmGC lane
   scriptc build <entry.ts> --backend wasm --lib [--profile <p.json>]
                                             library mode on the WasmGC lane: a
                                             module whose exports are the entry's
@@ -275,8 +276,12 @@ async function main(): Promise<number> {
   }
 
   if (command === "coverage") {
+    // --backend picks the lane the analysis lowers for (the WasmGC lanes
+    // lower ArrayBuffer values, undefined slots and the shared dynamic
+    // world the default llvm lane does not).
     const { coverage, sourceTexts } = analyze(input, {
       dynamic: values.dynamic,
+      ...(backend === "wasm" || backend === "wasm-native" ? { backend } : {}),
       ...(npmStatic !== undefined ? { npmStatic } : {}),
       ...(ffiProfilePath !== undefined ? { ffiProfilePath } : {}),
     });

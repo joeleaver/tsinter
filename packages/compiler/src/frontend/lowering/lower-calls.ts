@@ -20,7 +20,7 @@ import { blockedBindingUseDiag, ffiBindingDiag, ffiSignatureDiag, requiresDynami
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { lowerBigIntGlobalCall, lowerBigIntMethodCall, lowerBigIntStaticCall } from "./lower-bigint.js";
-import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
+import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerTypedArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
@@ -4606,6 +4606,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         lowerObjectStaticCall(L, expr, expr.expression) ??
         lowerObjectFromEntriesCall(L, expr, expr.expression) ??
         lowerArrayFromCall(L, expr, expr.expression) ??
+        lowerTypedArrayFromCall(L, expr, expr.expression) ??
         L.lowerArrayMethodCall(expr, expr.expression) ??
         // Read-only array methods (slice/map) on TUPLE receivers — the
         // positions snapshot into a fresh array (the for-of stance).
@@ -5340,7 +5341,18 @@ const DYN_STRING_ONLY_METHODS = new Set([
     if (L.stdlibGlobalMember(access, "ArrayBuffer") !== "isView") return null;
     if (call.arguments.length !== 1 || ts.isSpreadElement(call.arguments[0]!)) return null;
     const argNode = call.arguments[0]!;
-    return staticKindTest(L, L.lowerExpr(argNode), argNode, (t) => t.kind === "bytes", "ArrayBuffer.isView", locOf(call));
+    const arg = L.lowerExpr(argNode);
+    // A dynamic ('any'/'unknown') value: the checked-dynamic tree's bytes
+    // kind or a dynamic typed array of any element kind (an ArrayBuffer
+    // never enters it — that crossing refuses). An
+    // island value reads through the by-reference jsval→dyn wrap (the
+    // Array.isArray rule).
+    if (arg.type.kind === "dyn") return { kind: "dynTest", test: "view", value: arg, type: BOOL, loc: locOf(call) };
+    if (arg.type.kind === "jsval") {
+      const loc = locOf(call);
+      return { kind: "dynTest", test: "view", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: BOOL, loc };
+    }
+    return staticKindTest(L, arg, argNode, (t) => t.kind === "bytes", "ArrayBuffer.isView", locOf(call));
   }
 
 /** A test answered by the operand's STATIC kind (`pred` over each kind):

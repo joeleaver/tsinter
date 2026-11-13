@@ -3223,6 +3223,89 @@ function indexOfHelper(L: Lowerer, elem: IrType, arrT: IrType, loc: SrcLoc): str
     return { kind: "call", callee: name, args: [receiver, index], type: resultT, loc };
   }
 
+/** `Uint8Array.from(src, mapfn?)` (and the other typed-array classes,
+ * stdlib provenance): %TypedArray%.from collects the source's values
+ * first, then maps and stores them — so the source is snapshotted (a
+ * number[] or a string's code points; a typed array of the same kind
+ * copies) and the mapper `(v, k) => number` runs over the snapshot,
+ * each result stored with the element kind's coercion. Other sources keep
+ * the fence. Null when the callee isn't a typed-array `from`. */
+export function lowerTypedArrayFromCall(L: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression): IrExpr | null {
+  if (call.questionDotToken || access.questionDotToken || access.name.text !== "from") return null;
+  const ctor = (["Uint8Array", "Uint32Array", "Int32Array", "Float32Array"] as const)
+    .find((n) => L.isStdlibGlobal(access.expression, n));
+  if (!ctor) return null;
+  const elem = own(BYTES_CTORS, ctor)!;
+  const type = bytesOf(elem);
+  const loc = locOf(call);
+  const args = call.arguments;
+  if (args.length < 1 || args.length > 2 || args.some(ts.isSpreadElement)) {
+    L.noLowering(`${ctor}.from with ${args.length} arguments`, call, `${ctor}.from(source) and ${ctor}.from(source, (v, k) => n) are the lowered forms`);
+  }
+  const srcNode = args[0]!;
+  const src = L.lowerExpr(srcNode);
+  if (args.length === 1) {
+    if (src.type.kind === "array" && src.type.elem.kind === "f64") return { kind: "bytesNew", source: src, type, loc };
+    if (typeEquals(src.type, type)) return { kind: "bytesNew", source: src, type, loc };
+    L.noLowering(
+      `${ctor}.from over '${L.fmt(src.type)}' values`,
+      srcNode,
+      `a number[] or a ${ctor} source is the lowered form (with a mapper, a string or any array)`,
+    );
+  }
+  const arr: IrExpr = src.type.kind === "string" ? strCharsCall(L, src, loc)
+    : src.type.kind === "array" ? { kind: "arrIntrinsic", method: "slice", receiver: src, args: [], type: src.type, loc }
+    : L.noLowering(`${ctor}.from over '${L.fmt(src.type)}' values with a mapper`, srcNode, "an array or a string source is the lowered form");
+  const fn = L.lowerExpr(args[1]!);
+  if (fn.type.kind !== "func" || fn.type.params.length > 2 || fn.type.ret.kind !== "f64" || fn.type.rest === true ||
+      (fn.type.params.length === 2 && fn.type.params[1]!.kind !== "f64")) {
+    L.noLowering(`${ctor}.from with this mapper`, args[1]!, "a mapper (v, k) => number is the lowered form");
+  }
+  const arrT = arr.type as IrType & { kind: "array" };
+  const fnT = fn.type;
+  if (fnT.params.length >= 1 && !typeEquals(fnT.params[0]!, arrT.elem)) {
+    L.noLowering(`${ctor}.from with a mapper over '${L.fmt(fnT.params[0]!)}' values`, args[1]!, "the mapper's first parameter takes the source's elements");
+  }
+  const key = `typedFrom:${elem}:${typeKey(arrT)}:${typeKey(fnT)}`;
+  let helper = L.arrHofHelpers.get(key);
+  if (!helper) {
+    helper = `%typed.from.${L.arrHofHelpers.size}`;
+    L.arrHofHelpers.set(key, helper);
+    const ref = (id: string, t: IrType): IrExpr => ({ kind: "varRef", localId: id, type: t, loc });
+    const a = ref("a.0", arrT), f = ref("f.0", fnT), r = ref("r.0", type), n = ref("n.0", F64), i = ref("i.0", F64);
+    const callArgs: IrExpr[] = [];
+    if (fnT.params.length >= 1) callArgs.push({ kind: "arrayGet", arr: a, index: i, type: arrT.elem, loc });
+    if (fnT.params.length >= 2) callArgs.push(i);
+    L.liftedFns.push({
+      name: helper,
+      params: [{ localId: "a.0", name: "a", type: arrT }, { localId: "f.0", name: "f", type: fnT }],
+      returnType: type,
+      locals: [
+        { id: "a.0", name: "a", type: arrT, mutable: false },
+        { id: "f.0", name: "f", type: fnT, mutable: false },
+        { id: "n.0", name: "n", type: F64, mutable: false },
+        { id: "r.0", name: "r", type, mutable: false },
+        { id: "i.0", name: "i", type: F64, mutable: true },
+      ],
+      body: [
+        { kind: "varDecl", localId: "n.0", init: { kind: "arrIntrinsic", method: "length", receiver: a, args: [], type: F64, loc }, loc },
+        { kind: "varDecl", localId: "r.0", init: { kind: "bytesNew", source: n, type, loc }, loc },
+        {
+          kind: "for",
+          init: { kind: "varDecl", localId: "i.0", init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+          cond: { kind: "bin", op: "<", left: i, right: n, type: BOOL, loc },
+          update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i, right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc }, loc },
+          body: [{ kind: "bytesSet", arr: r, index: i, value: { kind: "callValue", callee: f, args: callArgs, type: F64, loc }, loc }],
+          loc,
+        },
+        { kind: "return", value: r, loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: helper, args: [arr, fn], type, loc };
+}
+
 /** `Array.from({ length: n }, mapfn)` — the counted-generation idiom — on
    * THE stdlib Array global. The source must be an OBJECT LITERAL whose
    * single property is `length` (the shape the idiom always spells; the
