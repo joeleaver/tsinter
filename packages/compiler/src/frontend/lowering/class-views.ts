@@ -407,7 +407,7 @@ function exitArg(L: Lowerer, v: IrExpr, t: IrType): IrExpr | null {
 /** The bound-method FUNC for `name` on the instance captured as `x.0`:
  * every parameter takes a dynamic value (checked into the method's own
  * parameter types), the result crosses back lifted. */
-function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: string, x: () => IrExpr, cap: { localId: string; name: string; type: IrType }, capLocal: { id: string; name: string; type: IrType; mutable: false; boxed: true }, loc: SrcLoc): IrExpr {
+function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: string, x: () => IrExpr, cap: { localId: string; name: string; type: IrType }, capLocal: { id: string; name: string; type: IrType; mutable: false; boxed: true }, loc: SrcLoc, receiverFromThis = true): IrExpr {
   const found = L.findMethodOn(info, name)!;
   const fnName = `${factory}.m.${name.replace(/[^A-Za-z0-9_$]/g, "_")}`;
   const shapes = found.sig.params;
@@ -436,11 +436,15 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
       // A detached call (`const f = o.m; f(x)`, `this` undefined) — or a
       // `this` that is no instance of the class — stops by name where
       // Node runs the method with that `this` (SEMANTICS.md S115 (iv)).
+      // GH #191's error views keep the captured instance: their dynamic
+      // value is the error encoding, never a class view, and a method
+      // read as a value stops by name before any call (errv `kind` 5).
       const t = x().type as IrType & { kind: "object" };
       const label = t.className.replace(/^%m\d+\./, "").replace(/^%/, "");
       const th = (): IrExpr => ({ kind: "varRef", localId: "th.0", type: JSVAL, loc });
-      body.push({ kind: "varDecl", localId: "th.0", init: { kind: "jsMarshal", value: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, type: JSVAL, loc } as IrExpr, loc });
-      body.push({
+      if (!receiverFromThis) body.push({ kind: "varDecl", localId: "r.0", init: x(), loc });
+      else body.push({ kind: "varDecl", localId: "th.0", init: { kind: "jsMarshal", value: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, type: JSVAL, loc } as IrExpr, loc });
+      if (receiverFromThis) body.push({
         kind: "if",
         cond: { kind: "unary", op: "!", operand: { kind: "jsViewOfClass", value: th(), className: t.className, type: BOOL, loc }, type: BOOL, loc },
         then: [
@@ -450,7 +454,7 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
         else_: null,
         loc,
       });
-      body.push({ kind: "varDecl", localId: "r.0", init: classUnview(L, th(), t, loc), loc });
+      if (receiverFromThis) body.push({ kind: "varDecl", localId: "r.0", init: classUnview(L, th(), t, loc), loc });
       const call = methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!;
       if (call.type.kind === "void") {
         body.push({ kind: "exprStmt", expr: call, loc }, { kind: "return", value: undef(loc), loc });
@@ -1017,7 +1021,7 @@ export function buildErrorViews(L: Lowerer): { kind: string; get: string; set: s
       for (const m of members) {
         let stmts: IrStmt[];
         if (m.kind === "method" && L.findMethodOn(info, m.name)?.sig.abstract !== true) {
-          stmts = [ret(boundMethodFn(L, `%errv.${ci}`, info, m.name, x, cap, capLocal, loc))];
+          stmts = [ret(boundMethodFn(L, `%errv.${ci}`, info, m.name, x, cap, capLocal, loc, false))];
         } else if (m.kind === "method") {
           stmts = [fence(`reading the method '${m.name}' of a '${label}' error held in a dynamic value is not supported yet`, loc), ret(undef(loc))];
         } else if (m.kind === "getter") {
