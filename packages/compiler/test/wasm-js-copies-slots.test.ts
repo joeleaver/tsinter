@@ -244,6 +244,50 @@ console.log(cache);`,
     refused: true,
   },
   {
+    id: "JSC-UNION-01 moment relativeTime: `(c && ['m']) || (c2 && ['mm', n])` widens fresh literals into the union's array, then writes it (the copy is the only reference); a bool arm only `c && X` forms contribute holds only false and is not a result arm of `||`",
+    src: `function rel(x, withoutSuffix, thresholds) {
+  var seconds = Math.round(x),
+    minutes = Math.round(x / 60),
+    a =
+      (seconds <= thresholds.ss && ["s", seconds]) ||
+      (seconds < thresholds.s && ["ss", seconds]) ||
+      (minutes <= 1 && ["m"]) ||
+      (minutes < thresholds.m && ["mm", minutes]) ||
+      ["yy", minutes];
+  a[2] = String(withoutSuffix);
+  a[3] = seconds * 2;
+  a[4] = "loc";
+  return a.join("|");
+}
+const th = { ss: 44, s: 45, m: 45 };
+console.log(rel(10, true, th), rel(50, false, th), rel(100, true, th), rel(3000, false, th), rel(99999, true, th));`,
+  },
+  {
+    id: "JSC-UNION-02 (review) TypeScript: a value only TYPED false (a flag a call flipped) is no proof: `u || d` keeps its bool arm (no falseArm) and answers true as Node, never an illegal cast",
+    entry: "main.ts",
+    src: `let ok = false;
+function flip(): void { ok = true; }
+flip();
+const u = Math.random() < 2 ? ok : ["x"];
+console.log(u || ["d"]);`,
+  },
+  {
+    id: "JSC-UNION-03 (review) JavaScript: the same flipped flag answers true as Node",
+    src: `let ok = false;
+function flip() { ok = true; }
+flip();
+const u = Math.random() < 2 ? ok : ["x"];
+console.log(u || ["d"]);`,
+  },
+  {
+    id: "JSC-UNION-04 (review) TypeScript: an `as false` cast is no proof either, inline in the || chain: true as Node",
+    entry: "main.ts",
+    src: `let ok = false;
+function flip(): void { ok = true; }
+flip();
+console.log((Math.random() < 2 ? (ok as false) : ["x"]) || ["d"]);`,
+  },
+  {
     id: "JSC-ARM-04 TypeScript: an annotated function literal stored on an 'any' object returns the shared value",
     entry: "main.ts",
     src: `const holder: any = JSON.parse("{}");

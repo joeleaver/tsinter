@@ -9949,13 +9949,24 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           left.type.kind === "union"
         ) {
           const def = L.unions.get(left.type.unionId);
-          const rest = def ? def.arms.filter((a) => !isUnitType(a)) : [];
+          // A boolean arm only `c && X` forms contribute (moment's
+          // relativeTime chain, `(c && [x]) || (c2 && [y]) || d`) holds
+          // only `false`: `c && X` yields c only when c is falsy, and X is
+          // no boolean. It is falsy like a unit arm, so the default
+          // replaces it and it never reaches the result. Proved from the
+          // syntax alone: a value merely TYPED `false` (narrowing can be
+          // wrong: a flag a call flipped) keeps the bool arm and refuses.
+          const hasBool = def?.arms.some((a) => a.kind === "bool") === true;
+          const falseArm = hasBool && boolArmOnlyFalse(L, expr.left);
+          const rest = def ? def.arms.filter((a) => !isUnitType(a) && !(falseArm && a.kind === "bool")) : [];
           const funcArmDefault =
             rest[0]?.kind === "func" && (target === null || target.kind === "func");
           if (rest.length === 1 && ((target !== null && typeEquals(target, rest[0]!)) || funcArmDefault)) {
             L.requireTruthyUnion(left.type.unionId, expr);
             const dflt = L.lowerExprExpecting(expr.right, rest[0]!);
-            return { kind: "orDefault", left, right: dflt, type: rest[0]!, loc };
+            return falseArm
+              ? { kind: "orDefault", left, right: dflt, falseArm: true, type: rest[0]!, loc }
+              : { kind: "orDefault", left, right: dflt, type: rest[0]!, loc };
           }
         }
         L.unsupported(
@@ -13768,4 +13779,26 @@ function realSourcePath(file: string): string {
   } catch {
     return file;
   }
+}
+
+/** Does every value `e` can produce that is a boolean equal `false`,
+ * proved from the syntax: `c && X` yields `c` only when it is falsy (a
+ * boolean `c` is then `false`) and otherwise X's values; `A || B` yields
+ * A only when truthy (so A must yield no `true`) and otherwise B's
+ * values; `t ? A : B` either branch's. Any other expression must be of no
+ * boolean type at all: a value merely TYPED `false` is not proof, since
+ * narrowing can be wrong (a flag a call flipped). Used by the `u || d`
+ * orDefault's `falseArm`. */
+function boolArmOnlyFalse(L: Lowerer, e: ts.Expression): boolean {
+  let x = e;
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  if (ts.isBinaryExpression(x)) {
+    const k = x.operatorToken.kind;
+    if (k === ts.SyntaxKind.AmpersandAmpersandToken) return boolArmOnlyFalse(L, x.right);
+    if (k === ts.SyntaxKind.BarBarToken) return boolArmOnlyFalse(L, x.left) && boolArmOnlyFalse(L, x.right);
+  }
+  if (ts.isConditionalExpression(x)) return boolArmOnlyFalse(L, x.whenTrue) && boolArmOnlyFalse(L, x.whenFalse);
+  const t = L.typeOf(x);
+  const parts = t.isUnionType() ? t.getTypes() : [t];
+  return !parts.some((p) => (p.flags & (ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLiteral | ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0);
 }

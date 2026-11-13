@@ -1537,6 +1537,68 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         return false;
     }
   };
+  /** A value nothing else holds, through the union-building forms a
+   * logical or conditional expression lowers to: a fresh literal or
+   * builder, a scalar, or `&&` / `||` / `??` / `?:` of such values. */
+  const freshUnionArg = (e: IrExpr | undefined, depth = 0): boolean => {
+    if (!e || depth > 8) return false;
+    if (deepFresh(e) || fresh(e)) return true;
+    switch (e.kind) {
+      case "unionWrap":
+      case "upcast":
+        return freshUnionArg(e.value, depth + 1);
+      case "ternary":
+        return freshUnionArg(e.then, depth + 1) && freshUnionArg(e.else_, depth + 1);
+      case "logical":
+      case "nullish":
+      case "orDefault": {
+        const r = e as unknown as { left: IrExpr; right: IrExpr };
+        return freshUnionArg(r.left, depth + 1) && freshUnionArg(r.right, depth + 1);
+      }
+      case "bin":
+      case "unary":
+        return !hasRef(e.type);
+      default:
+        return !hasRef(e.type);
+    }
+  };
+  /** A `%union.retag.N` helper every call of which (they are all direct)
+   * passes a value nothing else holds. */
+  const retagMemo = new Map<string, boolean>();
+  const retagArgsFresh = (name: string): boolean => {
+    if (!/^%union\.retag\.\d+$/.test(name)) return false;
+    const memo = retagMemo.get(name);
+    if (memo !== undefined) return memo;
+    let ok = true;
+    let seen = 0;
+    const scan = (n: unknown): void => {
+      if (!ok || n === null || typeof n !== "object") return;
+      if (Array.isArray(n)) {
+        for (const x of n) scan(x);
+        return;
+      }
+      const r = n as Record<string, unknown>;
+      if (r["kind"] === "call" && r["callee"] === name) {
+        seen++;
+        const args = r["args"] as IrExpr[];
+        if (args.length !== 1 || !freshUnionArg(args[0])) ok = false;
+      } else if (r["kind"] === "orDefault" && r["retag"] === name) {
+        // `u || d` retags its truthy left through the helper.
+        seen++;
+        if (!freshUnionArg(r["left"] as IrExpr)) ok = false;
+      } else if (r["kind"] === "funcRef" && r["name"] === name) {
+        ok = false;
+      }
+      for (const key of Object.keys(r)) {
+        if (key === "type" || key === "loc") continue;
+        scan(r[key]);
+      }
+    };
+    for (const f of byName.values()) scan(f.body);
+    const res = ok && seen > 0;
+    retagMemo.set(name, res);
+    return res;
+  };
   /** GH #118 (chess.js history()): does every `return` of this program
    * function answer a value no one else holds after the call — a fresh
    * value, a fresh-returning call, or a local of its own that it built
@@ -1831,7 +1893,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // The copy is the ONLY reference left: the source is fresh, or a sole
     // binding this copy is the one use of. Writes and identity cannot
     // tell then; only the copy's keys can.
-    const unique = fresh(s.arg) || (sole && sourceBinding(s)?.uses.length === 1);
+    const unique = fresh(s.arg) || (sole && sourceBinding(s)?.uses.length === 1) ||
+      // A union retag helper's arm, when every caller hands it a fresh
+      // value (moment's `(minutes <= 1 && ['m']) || ...`): the copy of the
+      // narrowed arm is the only reference left.
+      (s.arg?.kind === "unionNarrow" && s.arg.value.kind === "varRef" && retagArgsFresh(s.where));
     // A literal built only of literals and scalars (`[undefined, {}, {
     // t: [] }]`): no part has another reference, so a nested copy is as
     // unobservable to writes and identity as the top one (U1b — the JS

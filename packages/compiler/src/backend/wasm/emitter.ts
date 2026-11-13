@@ -6546,6 +6546,49 @@ class Assembler {
         this.releaseScratch(ref, o);
         return;
       }
+      case "dyn":
+      case "jsval": {
+        // GH #200: a dyn holding an Error (an `unknown` caught earlier and
+        // rethrown, a stored rejection reason) must reach the catch as the
+        // Error it is — EXC_OBJ with its class interval, exactly what
+        // `throw err` of an Error-typed value writes — or `e instanceof
+        // Error` answers false and `(e as Error)` fails its checked cast.
+        // toError reads the encoding's own error back (no copy), so the
+        // catch's caughtToDyn hands the SAME dyn back (`e === u` holds).
+        // Anything else keeps the generic ref slot.
+        const errInfo = this.classInfo("%Error", v.loc);
+        if (errInfo === null) {
+          code.unreachable();
+          return;
+        }
+        const dynRef = this.dyn.dynRef();
+        const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+        const d = this.acquireScratch(dynRef);
+        const er = this.acquireScratch(errRef);
+        this.walkExpr(v);
+        code.localTee(d);
+        code.call(this.dyn.toError());
+        code.localTee(er);
+        code.refIsNull();
+        code.ifVoid();
+        code.localGet(d);
+        code.globalSet(exc.refG);
+        code.i32Const(EXC_REF);
+        code.globalSet(exc.kindG);
+        code.else_();
+        code.localGet(er);
+        code.structGet(errInfo.struct, CLASS_VT);
+        code.structGet(this.classes.ci(), CI_PRE);
+        code.globalSet(exc.preG);
+        code.localGet(er);
+        code.globalSet(exc.refG);
+        code.i32Const(EXC_OBJ);
+        code.globalSet(exc.kindG);
+        code.end();
+        this.releaseScratch(errRef, er);
+        this.releaseScratch(dynRef, d);
+        return;
+      }
       default: {
         // Any other representation rides the generic ref slot (union,
         // record, array, closure — the scr_throw_ref family). mapType

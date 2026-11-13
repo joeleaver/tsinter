@@ -2226,7 +2226,15 @@ function validateFunction(
           }
           break;
         }
-        const rest = def.arms.filter((a) => !isUnitType(a));
+        // A bool arm the frontend proved only ever false (`falseArm`: every
+        // contributor is a `c && X` form) is falsy like a unit arm: the
+        // node's type is the one other arm. Without the flag a bool arm
+        // counts, so the node is rejected.
+        const rest0 = def.arms.filter((a) => !isUnitType(a));
+        const rest = e.falseArm === true ? rest0.filter((a) => a.kind !== "bool") : rest0;
+        if (e.falseArm === true && !rest0.some((a) => a.kind === "bool")) {
+          err("orDefault falseArm set on a left union with no bool arm", e.loc);
+        }
         if (rest.length !== 1 || !typeEquals(e.type, rest[0]!)) {
           err("orDefault type must be the left union's single non-unit arm", e.loc);
         }

@@ -4795,7 +4795,10 @@ export type IrExpr =
    * the checker built by DROPPING them. The helper consumes its argument
    * (the ordinary call convention), so the truthy side must not also
    * release the left. */
-  | { kind: "orDefault"; left: IrExpr; right: IrExpr; retag?: string; type: IrType; loc: SrcLoc }
+  /** `falseArm`: the left union's bool arm is proved (syntactically, by the
+   * frontend) to hold only `false`, so it is falsy like a unit arm and the
+   * node's type is the one other arm. */
+  | { kind: "orDefault"; left: IrExpr; right: IrExpr; retag?: string; falseArm?: true; type: IrType; loc: SrcLoc }
   /** Optional chaining `a?.b` / `a?.m(...)` / `f?.()` / `a?.[i]` — the
    * `nullish` test inverted: `receiver` is a unit-armed union with exactly
    * ONE non-unit arm, evaluated exactly once; when its runtime tag is a
