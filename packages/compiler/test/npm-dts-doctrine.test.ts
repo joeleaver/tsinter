@@ -239,8 +239,37 @@ class Opt {
     if (this.long) return this.long.replace(/^--/, '');
     return this.short.replace(/^-/, '');
   }
+  /** @param {string} arg */
+  is(arg) {
+    return this.short === arg || this.long === arg;
+  }
+}
+class Reg {
+  constructor() {
+    this.options = [];
+  }
+  /** @param {string} arg */
+  _findOption(arg) {
+    return this.options.find((option) => option.is(arg));
+  }
+  /** @param {Opt} option */
+  register(option) {
+    const matchingOption =
+      (option.short && this._findOption(option.short)) ||
+      (option.long && this._findOption(option.long));
+    if (matchingOption) return 'clash with ' + matchingOption.flags;
+    this.options.push(option);
+    return 'ok';
+  }
+  /** @param {Opt} a @param {Opt} b */
+  either(a, b) {
+    const picked = (a.long && a) || b;
+    picked.negate = true;
+    return picked === a;
+  }
 }
 exports.Opt = Opt;
+exports.Reg = Reg;
 `,
   "index.d.ts": `export declare class Opt {
   constructor(flags: string);
@@ -249,6 +278,11 @@ exports.Opt = Opt;
   long?: string;
   negate: boolean;
   name(): string;
+  is(arg: string): boolean;
+}
+export declare class Reg {
+  register(option: Opt): string;
+  either(a: Opt, b: Opt): boolean;
 }
 `,
 };
@@ -288,6 +322,21 @@ for (const flags of ["--no-color", "-v, --verbose", "-q"]) {
   const o = new Opt(flags);
   console.log(flags, o.negate, o.long ?? "-", o.short ?? "-", o.name());
 }`,
+  },
+  {
+    id: "DTS-OPT-03 a logical operator over declared union fields the checker saw as any runs in the dynamic world (commander's _registerOption)",
+    pkgs: { optflags: OPTFLAGS },
+    src: `import { Opt, Reg } from "optflags";
+const r = new Reg();
+for (const flags of ["-v, --verbose", "--color", "-v", "--color", "-q"]) console.log(flags, r.register(new Opt(flags)));
+// The result is the operand itself (a view, never a copy): identity holds
+// and a write through it lands on the original.
+const a = new Opt("--alpha");
+const b = new Opt("-b");
+console.log(r.either(a, b), a.negate, b.negate);
+const c = new Opt("-c");
+const d = new Opt("--delta");
+console.log(r.either(c, d), c.negate, d.negate);`,
   },
   {
     id: "DTS-READ-01 a field the declarations type narrower than inference reads as declared",
