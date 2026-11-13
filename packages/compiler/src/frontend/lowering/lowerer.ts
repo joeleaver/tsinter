@@ -87,6 +87,8 @@ import {
   ISLAND_AMBIENT_TYPES,
   isUnitOnlyTsType,
   mapType,
+  MAP_TYPE_STEP_BUDGET,
+  MapTypeBudgetError,
   ShapeRegistry,
   typeKey,
   type TypeMapperCtx,
@@ -149,6 +151,23 @@ export type WidthLift =
   | { how: "arityWiden" };
 
 export class PoisonError extends Error {}
+
+/** `Class.member`, `name`, or the source line, for a mapping site (the
+ * budget refusal's naming). */
+function mappingSiteName(site: ts.Node): string {
+  let member: string | null = null;
+  for (let n: ts.Node | undefined = site; n !== undefined; n = n.parent) {
+    if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) return `${n.name?.text ?? "(anonymous class)"}${member !== null ? `.${member}` : ""}`;
+    if (member === null && (ts.isPropertyDeclaration(n) || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n) || ts.isPropertySignature(n)) && n.name !== undefined) {
+      member = ts.isIdentifier(n.name) || ts.isPrivateIdentifier(n.name) || ts.isStringLiteral(n.name) ? n.name.text : n.name.getText();
+    }
+    if ((ts.isVariableDeclaration(n) || ts.isFunctionDeclaration(n) || ts.isParameter(n)) && n.name !== undefined && ts.isIdentifier(n.name)) {
+      return member !== null ? `${n.name.text}.${member}` : n.name.text;
+    }
+    if (ts.isSourceFile(n)) break;
+  }
+  return member ?? site.getSourceFile().fileName;
+}
 
 /** Own-property lookup for the surface tables. They are plain object
  * literals, so a bare `table[name]` would also find Object.prototype
@@ -3292,7 +3311,7 @@ export class Lowerer {
       if (
         !this.engine &&
         !(widened.flags & ts.TypeFlags.Any) &&
-        mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
+        this.mapTypeAt(widened, node, { ...this.typeCtx, dynamic: true, engine: true }) !== null
       ) {
         this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
         throw new PoisonError();
@@ -3345,7 +3364,7 @@ export class Lowerer {
     if (
       !this.engine &&
       !(widened.flags & ts.TypeFlags.Any) &&
-      mapType(widened, { ...this.typeCtx, dynamic: true, engine: true }) !== null
+      this.mapTypeAt(widened, node, { ...this.typeCtx, dynamic: true, engine: true }) !== null
     ) {
       this.pushDiag(requiresDynamicTypeDiag(this.checker.typeToString(type), locOf(node)));
       throw new PoisonError();
@@ -3537,7 +3556,37 @@ export class Lowerer {
   /** mapType with this Lowerer's registries and (while a generic instance
    * body lowers) type-parameter bindings threaded through. */
   mapTypeOf(t: ts.Type): IrType | null {
-    return mapType(t, this.typeCtx);
+    return this.mapTypeAt(t, null);
+  }
+
+  /** mapType, with a mapping that exceeds MAP_TYPE_STEP_BUDGET (rea step
+   * 11: a large recursive type graph re-expanding per path) refused by
+   * name: at `site` when the caller has the node it maps for (irTypeOf),
+   * else at the declaration of the type itself (a bare-type request — its
+   * caller's node is not known here, and naming an unrelated binding
+   * would mislead). */
+  mapTypeAt(t: ts.Type, site: ts.Node | null, ctx: TypeMapperCtx = this.typeCtx): IrType | null {
+    try {
+      return mapType(t, ctx);
+    } catch (e) {
+      if (!(e instanceof MapTypeBudgetError)) throw e;
+      let at: ts.Node | null = site;
+      let where: string;
+      if (site !== null) {
+        where = mappingSiteName(site);
+      } else {
+        const sym = t.getSymbol();
+        const decl = sym === undefined ? undefined : this.checker.declarationsOf(sym)[0];
+        at = decl ?? null;
+        where = `the type ${sym === undefined || sym.name.startsWith("__") ? this.checker.typeToString(t).slice(0, 80) : `'${sym.name}'`}`;
+      }
+      at ??= this.program.getSourceFiles().find((sf) => !sf.isDeclarationFile) ?? null;
+      const feature =
+        `a type whose static mapping expands past ${MAP_TYPE_STEP_BUDGET} steps (${where}: ${e.path}) — ` +
+        `the mapping re-expands record types once per path through them (a large recursive type graph, such as an AST's node interfaces)`;
+      if (at === null) throw new Error(`tsinter: unsupported: ${feature}`);
+      this.unsupported("SC1090", at, feature);
+    }
   }
 
   /** The one position where a contextual UNION must not be adopted over the
@@ -4082,7 +4131,7 @@ export class Lowerer {
     // A never-tainted JS type (neverTaintedJsType) maps — never rides as
     // f64 — but must not: pre-empt the mapping so the JS fallback below
     // answers instead.
-    let mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeOf(t);
+    let mapped = neverTaintedJsType(this, node, t) ? null : this.mapTypeAt(t, node);
     // One world in JavaScript sources (U1b): a composite whose pieces map
     // only because `any` maps now (a JSDoc type with an island-typed
     // member) keeps the JS lane's checked-dynamic storage — the value is

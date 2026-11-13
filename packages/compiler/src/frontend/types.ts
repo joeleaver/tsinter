@@ -798,8 +798,107 @@ let mapTypeDepth = 0;
  * stay fenced instead of interning a per-context-wrong shape). */
 let contextResolutions = 0;
 
+/* ── the mapping step budget (rea step 11) ───────────────────────────────
+ * MAP_TYPE_MAX_DEPTH bounds a mapping's depth, not its breadth: record
+ * types cut a cycle only at a type ON the walk's stack (mapRecordType's
+ * inProgress), so a large strongly-connected type graph — an AST's node
+ * interfaces, each reaching the node union again through its fields
+ * (Babel's ~250, rea's `Set<Node>`) — re-expands once per path, and the
+ * paths are exponential: the compile ran for hours. One top-level mapping
+ * request may take MAP_TYPE_STEP_BUDGET mapType steps; past it the request
+ * throws MapTypeBudgetError (the lowerer turns it into a named SC1090 at
+ * the site), and the type is remembered so every later request for it
+ * refuses at once. Every mapping that finishes under the budget is
+ * untouched. */
+export const MAP_TYPE_STEP_BUDGET = 200_000;
+let mapTypeSteps = 0;
+/** Bumped at every back-reference to a record type ON the walk's stack
+ * (mapRecordType's recursive knot) and at every MAP_TYPE_MAX_DEPTH cut:
+ * a record mapping during which neither moved answers the same wherever
+ * it is asked (see mapRecordMemo). */
+let mapRecordBackRefs = 0;
+let mapTypeDepthCuts = 0;
+/** Within ONE top-level request: completed record mappings whose walk was
+ * stack-, depth- and context-insensitive (no back-reference to an
+ * in-progress type, no depth cut, no contextResolutions bump) — remapping
+ * such a type walks the same members to the same answer, so a finite
+ * shared sub-type (a DAG: a binary tree of interfaces 17 deep, a 10-way
+ * fan 5 deep) maps once per request instead of once per path. Recursive
+ * knots keep their own registry (recursiveShapeFor). */
+const mapRecordMemo = new Map<ts.Type, { ctx: TypeMapperCtx; answer: IrType | null }>();
+let mapTypeBudgetTripped = false;
+/** The record types the walk is inside, outermost first (the path the
+ * refusal names). */
+const mapRecordStack: ts.Type[] = [];
+/** Top-level types whose mapping exceeded the budget → the path named. */
+const mapTypeExhausted = new WeakMap<ts.Type, string>();
+/** The record types a budget-exceeding walk was inside when it tripped →
+ * the path named. A later mapping entering one refuses at once: the type
+ * graph that re-expands is the same one (an AST's node interfaces reach
+ * each other within a few steps), and a program in which one site refused
+ * already fails its build — every other site naming it costs nothing. */
+const mapRecordExhausted = new WeakMap<ts.Type, string>();
+
+/** A mapping request exceeded MAP_TYPE_STEP_BUDGET; `path` names the
+ * record types it was inside when it did. */
+export class MapTypeBudgetError extends Error {
+  constructor(readonly path: string) {
+    super(`type mapping exceeded ${MAP_TYPE_STEP_BUDGET} steps (${path})`);
+  }
+}
+
+function describeRecordStack(ctx: TypeMapperCtx): string {
+  const names: string[] = [];
+  for (const t of mapRecordStack) {
+    const sym = t.getSymbol();
+    const name = sym === undefined ? "{…}" : sym.name === "__type" || sym.name === "__object" ? "{…}" : sym.name;
+    if (names[names.length - 1] !== name) names.push(name);
+  }
+  void ctx;
+  const shown = names.length > 12 ? [...names.slice(0, 6), "…", ...names.slice(-5)] : names;
+  return shown.length === 0 ? "no record type" : shown.join(" > ");
+}
+
 export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
-  if (mapTypeDepth >= MAP_TYPE_MAX_DEPTH) return null;
+  if (mapTypeDepth === 0) {
+    const known = mapTypeExhausted.get(type);
+    if (known !== undefined) throw new MapTypeBudgetError(known);
+    mapTypeSteps = 0;
+    mapRecordMemo.clear();
+    mapTypeBudgetTripped = false;
+    mapRecordStack.length = 0;
+    let answer: IrType | null;
+    try {
+      answer = mapTypeStep(type, ctx);
+    } catch (e) {
+      if (e instanceof MapTypeBudgetError) mapTypeExhausted.set(type, e.path);
+      throw e;
+    }
+    // A budget error something below swallowed still refuses by name: the
+    // answer it left behind is a truncated walk's.
+    if (mapTypeBudgetTripped) {
+      const path = "the mapping was cut short";
+      mapTypeExhausted.set(type, path);
+      throw new MapTypeBudgetError(path);
+    }
+    return answer;
+  }
+  return mapTypeStep(type, ctx);
+}
+
+function mapTypeStep(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
+  if (++mapTypeSteps > MAP_TYPE_STEP_BUDGET) {
+    const first = !mapTypeBudgetTripped;
+    mapTypeBudgetTripped = true;
+    if (!first) throw new MapTypeBudgetError("the mapping was cut short");
+    const path = describeRecordStack(ctx);
+    for (const t of mapRecordStack) if (!mapRecordExhausted.has(t)) mapRecordExhausted.set(t, path);
+    throw new MapTypeBudgetError(path);
+  }
+  if (mapTypeDepth >= MAP_TYPE_MAX_DEPTH) {
+    mapTypeDepthCuts++;
+    return null;
+  }
   mapTypeDepth++;
   try {
     return mapTypeInner(type, ctx);
@@ -3320,10 +3419,33 @@ function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // frame completes (finalizeRecursive below). Backends represent records
   // as heap references, so the self-reference is an ordinary pointer.
   if (shapes.inProgress.has(widened)) {
+    mapRecordBackRefs++;
     return { kind: "record", shapeId: shapes.recursiveRef(widened) };
   }
-  shapes.inProgress.add(widened);
+  {
+    const exhausted = mapRecordExhausted.get(widened);
+    if (exhausted !== undefined) {
+      mapTypeBudgetTripped = true;
+      throw new MapTypeBudgetError(exhausted);
+    }
+  }
+  const memo = mapRecordMemo.get(widened);
+  if (memo !== undefined && memo.ctx === ctx) return memo.answer;
+  const backRefsAtEntry = mapRecordBackRefs;
+  const depthCutsAtEntry = mapTypeDepthCuts;
   const sensitivityAtEntry = contextResolutions;
+  const answer = mapRecordTypeWalk(widened, ctx, sensitivityAtEntry);
+  if (mapRecordBackRefs === backRefsAtEntry && mapTypeDepthCuts === depthCutsAtEntry && contextResolutions === sensitivityAtEntry) {
+    mapRecordMemo.set(widened, { ctx, answer });
+  }
+  return answer;
+}
+
+/** mapRecordType's walk of a record type not on the stack. */
+function mapRecordTypeWalk(widened: ts.Type, ctx: TypeMapperCtx, sensitivityAtEntry: number): IrType | null {
+  const { shapes } = ctx;
+  shapes.inProgress.add(widened);
+  mapRecordStack.push(widened);
   try {
     const inner = mapRecordTypeInner(widened, ctx);
     if (inner === null) return null; // a pending placeholder, if minted, stays unfinalized (prunes as unreachable)
@@ -3348,6 +3470,7 @@ function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
     return { kind: "record", shapeId: shapes.intern(inner.fields, false, inner.indexValue, inner.declaredOrder) };
   } finally {
     shapes.inProgress.delete(widened);
+    mapRecordStack.pop();
   }
 }
 
