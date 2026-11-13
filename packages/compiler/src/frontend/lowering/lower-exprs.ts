@@ -9,6 +9,9 @@ import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-
 import * as ts from "../ts7/adapter.js";
 import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
@@ -391,7 +394,7 @@ export function isBuiltinTokenExpr(L: Lowerer, e: ts.Expression, depth = 0): boo
 
 /** Every reference to the binding `name` declares (in its own file) meets
  * `ok`; false when the binding has no symbol. */
-function everyLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): boolean {
+export function everyLocalRef(L: Lowerer, name: ts.Identifier, ok: (ref: ts.Identifier) => boolean): boolean {
   const sym = L.checker.getSymbolAtLocation(name);
   if (!sym) return false;
   let good = true;
@@ -451,6 +454,55 @@ function tokenSafeSetBinding(L: Lowerer, recv: ts.Expression): boolean {
 }
 
 /** builtinTokenUseOk or a named refusal (GH #74). */
+/** String / Number / Boolean read as a VALUE where no builtin-token use
+ * covers the site (picocolors' `() => String`): on the WasmGC lanes the
+ * conversion function itself — the ONE interned function value the
+ * backend answers for a primitive's `constructor` (so `"".constructor ===
+ * String` and every read of `String` is the same function), callable with
+ * JS argument-count semantics (ctorPlaceholderHelper's conversion thunk).
+ * The IR spells it as exactly that read: the `constructor` of a boxed
+ * primitive of the kind. Null for every other name, site or lane. */
+function builtinConvFnValue(L: Lowerer, expr: ts.Expression, name: string): IrExpr | null {
+  if (L.sharedDynamic !== true) return null;
+  if (name !== "String" && name !== "Number" && name !== "Boolean") return null;
+  if (builtinTokenUseOk(L, expr) && !convTokenMeetsDyn(L, expr)) return null;
+  const loc = locOf(expr);
+  const prim: IrExpr =
+    name === "String"
+      ? { kind: "strLit", value: "", type: STRING, loc }
+      : name === "Number"
+        ? { kind: "numLit", value: 0, type: F64, loc }
+        : { kind: "boolLit", value: false, type: BOOL, loc };
+  return {
+    kind: "dynKeyGet",
+    key: { kind: "strLit", value: "constructor", type: STRING, loc },
+    value: { kind: "dynFrom", value: prim, type: DYN, loc },
+    type: DYN,
+    loc,
+  };
+}
+
+/** A builtin-token equality whose OTHER side is a const that holds the
+ * conversion FUNCTION (`const S = String; use(S); S === String` — S's
+ * own initializer is a value use, so S stores the function): the token
+ * side must be the function too, or identity would compare a function
+ * with a token. */
+function convTokenMeetsDyn(L: Lowerer, expr: ts.Expression): boolean {
+  let outer: ts.Node = expr;
+  while (outer.parent !== undefined && ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+  const p = outer.parent;
+  if (p === undefined || !ts.isBinaryExpression(p)) return false;
+  let other = p.left === outer ? p.right : p.left;
+  while (ts.isParenthesizedExpression(other)) other = other.expression;
+  if (!ts.isIdentifier(other) || stdlibGlobalNameOf(L, other) !== null) return false;
+  const sym = L.checker.getSymbolAtLocation(other);
+  const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (decl === undefined || !ts.isVariableDeclaration(decl) || decl.initializer === undefined) return false;
+  const name = stdlibGlobalNameOf(L, decl.initializer);
+  if (name !== "String" && name !== "Number" && name !== "Boolean") return false;
+  return !builtinTokenUseOk(L, decl.initializer);
+}
+
 function requireBuiltinTokenUse(L: Lowerer, expr: ts.Expression, name: string): void {
   if (builtinTokenUseOk(L, expr)) return;
   L.unsupported(
@@ -1525,7 +1577,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             `'${expr.text}' in an ES module (Node defines the CJS module globals only in CommonJS modules)`,
           );
         }
-        const value = expr.text === "__dirname" ? dirname(sf.fileName) : sf.fileName;
+        // Node's CJS loader names the module by its REAL path (symlinks
+        // resolved), so the constants do too.
+        const real = realSourcePath(sf.fileName);
+        const value = expr.text === "__dirname" ? dirname(real) : real;
         return { kind: "strLit", value, type: STRING, loc };
       }
       const sig = L.fnSigOf(expr);
@@ -1711,6 +1766,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       {
         const sym = L.checker.getSymbolAtLocation(expr);
         if (L.isStdlibSymbol(sym) || expr.text === "globalThis") {
+          {
+            const conv = builtinConvFnValue(L, expr, stdlibGlobalNameOf(L, expr) ?? expr.text);
+            if (conv !== null) return conv;
+          }
           if (isJsSourceFile(expr.getSourceFile())) {
             const canonical = stdlibGlobalNameOf(L, expr) ?? expr.text;
             requireBuiltinTokenUse(L, expr, canonical);
@@ -2085,6 +2144,33 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // property read lands here.
       if (expr.expression.kind === ts.SyntaxKind.SuperKeyword) {
         return L.lowerSuperAccessorRead(expr);
+      }
+      // `import.meta.url` / `.filename` / `.dirname`: per-MODULE
+      // compile-time constants, the module's SOURCE location at build time,
+      // symlinks resolved as Node's loader resolves them (SEMANTICS.md
+      // S139: Node's exact values when the binary runs beside the tree it
+      // was built from; they do not follow a moved binary). In a CommonJS
+      // module Node refuses the whole file at parse ("Cannot use
+      // 'import.meta' outside a module"), so the build refuses by name.
+      // The rest of import.meta (resolve, the object itself) keeps the
+      // module-loader fence.
+      if (
+        ts.isMetaProperty(expr.expression) &&
+        expr.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+        expr.expression.name.text === "meta" &&
+        (expr.name.text === "url" || expr.name.text === "filename" || expr.name.text === "dirname")
+      ) {
+        if (!isNodeEsmFile(expr.getSourceFile())) {
+          L.unsupported(
+            "SC1090",
+            expr,
+            "'import.meta' in a CommonJS module (Node refuses the file: SyntaxError: Cannot use 'import.meta' outside a module)",
+          );
+        }
+        const file = realSourcePath(expr.getSourceFile().fileName);
+        const value =
+          expr.name.text === "url" ? pathToFileURL(file).href : expr.name.text === "filename" ? file : dirname(file);
+        return { kind: "strLit", value, type: STRING, loc: locOf(expr) };
       }
       // Enum member reads (`E.A`) fold to their compile-time constants —
       // claimed FIRST so no receiver-shaped path (records, islands, the
@@ -4251,6 +4337,22 @@ export function isGlobalUndefined(L: Lowerer, e: ts.Expression): boolean {
   return sym === undefined || L.checker.declarationsOf(sym).length === 0;
 }
 
+/** An operand that cannot hold a missing (undefined) value whatever its
+ * lowered form: a construction, a literal, a function, or a member of
+ * the process global (`process.argv`, `process.env` — Node always
+ * defines them; picocolors' `p.argv || []` through a process alias). */
+function provablyPresentOperand(L: Lowerer, e: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (
+    ts.isNewExpression(e) || ts.isArrayLiteralExpression(e) || ts.isObjectLiteralExpression(e) ||
+    ts.isFunctionExpression(e) || ts.isArrowFunction(e) || ts.isClassExpression(e) ||
+    ts.isRegularExpressionLiteral(e)
+  ) {
+    return true;
+  }
+  return ts.isPropertyAccessExpression(e) && !e.questionDotToken && L.stdlibGlobalMember(e, "process") !== null;
+}
+
 /** Unit U: `isUndef(e)` (negated: its `!`). */
 export function isUndefExpr(e: IrExpr, negated: boolean, loc: SrcLoc): IrExpr {
   const test: IrExpr = { kind: "isUndef", operand: e, type: BOOL, loc };
@@ -5047,13 +5149,20 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         const receiver = L.lowerExpr(expr.expression);
         return { kind: "libCall", fn: "child.killed", args: [receiver], type: BOOL, loc };
       }
-      if (name === "on" || name === "kill" || name === "unref") {
+      // signalCode: the terminating signal's name (`Signals | null`, a
+      // string | null union here) once a signal death was delivered.
+      if (name === "signalCode") {
+        const receiver = L.lowerExpr(expr.expression);
+        const type: IrType = { kind: "union", unionId: L.unions.intern([STRING, NULL_T]) };
+        return L.maybeNarrow({ kind: "libCall", fn: "child.signalCode", args: [receiver], type, loc }, expr);
+      }
+      if (name === "on" || name === "once" || name === "kill" || name === "unref") {
         L.unsupported("SC1090", expr, `child methods as values (call '${name}' directly)`);
       }
       L.noLowering(
         `ChildProcess.${name}`,
         expr,
-        "on(\"exit\" | \"error\", cb), pid, exitCode, killed, kill(signal?), and unref() are the supported ChildProcess members",
+        "on(\"exit\" | \"error\", cb), once(\"exit\", cb), pid, exitCode, signalCode, killed, kill(signal?), and unref() are the supported ChildProcess members",
         L.checker.getSymbolAtLocation(expr.name),
       );
     }
@@ -5155,7 +5264,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       // host field verbatim (Node would keep IPv6 brackets here, but the
       // parser rejects IPv6 hosts — documented divergence — so the getter
       // never sees one).
-      if (name === "protocol" || name === "pathname" || name === "href" || name === "host" || name === "hostname" || name === "search") {
+      if (name === "protocol" || name === "pathname" || name === "href" || name === "host" || name === "hostname" || name === "search" || name === "hash") {
         const receiver = L.lowerExpr(expr.expression);
         const fn =
           name === "protocol"
@@ -5168,7 +5277,9 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
                   ? "url.hostname"
                   : name === "search"
                     ? "url.search"
-                    : "url.href";
+                    : name === "hash"
+                      ? "url.hash"
+                      : "url.href";
         return { kind: "libCall", fn, args: [receiver], type: STRING, loc: locOf(expr) };
       }
       // `u.searchParams`: the LIVE cached view (one identity per URL —
@@ -5184,7 +5295,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       L.noLowering(
         `URL.${name}`,
         expr,
-        "protocol, pathname, href, host, hostname, search, searchParams, and toString() are the supported URL members",
+        "protocol, pathname, href, host, hostname, search, hash, searchParams, and toString() are the supported URL members",
         L.checker.getSymbolAtLocation(expr.name),
       );
     }
@@ -9356,8 +9467,16 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
       }
       case ts.SyntaxKind.TildeToken: {
         // `~x`: ToInt32, complement, back to f64 (JS-exact, incl. NaN → -1).
-        const operand = L.lowerExpr(expr.operand);
+        let operand = L.lowerExpr(expr.operand);
         if (operand.type.kind === "bigint") return lowerBigUnary("~", operand, loc);
+        // An implicit-any JS operand (picocolors' `~index`): the binary
+        // operators' checked-number stance (SEMANTICS.md S015's amendment)
+        // — the value CHECKS as a number and computes natively; any other
+        // kind stops at the SC1100 "expected number" fence (not
+        // catchable), never a silent ToNumber.
+        if (operand.type.kind === "dyn" && isJsSourceFile(expr.getSourceFile())) {
+          operand = { kind: "dynCheck", value: operand, type: F64, loc: operand.loc };
+        }
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
         return { kind: "unary", op: "~", operand, type: F64, loc };
       }
@@ -9673,6 +9792,56 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // also what tsc's type says, modulo literal-union collapsing that
       // mapType already handles). Mixed kinds (`n && s`) stay rejected.
       const left = L.lowerExpr(expr.left);
+      // An OBJECT left operand (an array, record, class instance, map, ...
+      // — REF_TRUTHY_KINDS). An object is always truthy, but a plain-typed
+      // READ can still hold undefined at run time (S119: `m["x"]`, `arr[5]`,
+      // a `!` field, `mp.get(k)!`):
+      //   - a value that cannot be missing (a `new`, a literal, a process
+      //     member — picocolors' `p.argv || []`) folds JS-exactly: `obj ||
+      //     X` IS obj (X never runs, so it is not even lowered: `p.env ||
+      //     {}`), `obj && X` evaluates obj, then IS X;
+      //   - a read that may be missing, under `||` with a default of the
+      //     same type, tests it at run time (undefined takes the default);
+      //   - anything else takes the paths below (a union result, or the
+      //     named refusal).
+      // (Lanes without typed-slot undefined — c, llvm — have no run-time
+      // test for a missing read: only the provably present operands fold
+      // there, and the rest take the paths below.)
+      if (REF_TRUTHY_KINDS.has(left.type.kind) && (L.undefSlots || provablyPresentOperand(L, expr.left))) {
+        if (!mayHoldSlotUndef(L, left) || provablyPresentOperand(L, expr.left)) {
+          if (op === ts.SyntaxKind.BarBarToken) return left;
+          const r = L.lowerExpr(expr.right);
+          return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: left, loc }], result: r, type: r.type, loc };
+        }
+        const target = L.mapTypeOf(L.typeOf(expr));
+        if (op === ts.SyntaxKind.BarBarToken && target !== null && typeEquals(target, left.type)) {
+          const dflt = L.lowerExprExpecting(expr.right, left.type);
+          return bindOnce(L, left, loc, (read) => ({
+            kind: "ternary",
+            cond: isUndefExpr(read, false, loc),
+            then: dflt,
+            else_: read,
+            type: left.type,
+            loc,
+          }));
+        }
+        // `read && X`: a missing read IS the result (undefined, held in the
+        // right side's plain slot — S119), else X; X runs only when the
+        // read is present.
+        if (op === ts.SyntaxKind.AmpersandAmpersandToken) {
+          const r = L.lowerExpr(expr.right);
+          if (r.type.kind !== "void" && !isUnitType(r.type) && r.type.kind !== "dyn" && r.type.kind !== "jsval") {
+            return bindOnce(L, left, loc, (read) => ({
+              kind: "ternary",
+              cond: isUndefExpr(read, false, loc),
+              then: { kind: "slotUndef", type: r.type, loc },
+              else_: r,
+              type: r.type,
+              loc,
+            }));
+          }
+        }
+      }
       const right = L.lowerExpr(expr.right);
       // A LITERAL-unit left operand (a compile-time undefined/null — the
       // capability-probe members: `process.features.inspector ||
@@ -13573,4 +13742,14 @@ function arraySpreadSpelling(e: ts.Expression): string {
   }
   const head = print(x);
   return head !== null ? `${head} is not iterable` : "";
+}
+
+/** A source file's real path (symlinks resolved), as Node's module loader
+ * names the module; the path as given when it cannot be resolved. */
+function realSourcePath(file: string): string {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
 }

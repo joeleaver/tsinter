@@ -35,6 +35,9 @@ export interface Row {
   links?: Record<string, string>;
   /** No tsconfig.json at the project root (only the files' own). */
   noTsconfig?: boolean;
+  /** The entry's path when it is not the `main.*` file written (e.g. the
+   * same file reached through a symlinked directory). */
+  entry?: string;
 }
 
 export function scratchDir(tag: string): string {
@@ -58,7 +61,7 @@ function write(scratch: string, row: Row, backend: string): string {
     mkdirSync(join(dir, link, ".."), { recursive: true });
     symlinkSync(target, join(dir, link));
   }
-  return entry;
+  return row.entry !== undefined ? join(dir, row.entry) : entry;
 }
 
 function nodeRun(file: string, args: string[]): Out {

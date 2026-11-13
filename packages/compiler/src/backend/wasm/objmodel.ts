@@ -3262,6 +3262,24 @@ export class ObjModel {
         c.call(this.construct());
         c.return_();
         c.end();
+        // A builtin's stand-in (SIG -2/-3: a constructor read from a
+        // dynamic value, String/Number/Boolean as function values): `new`
+        // would build Node's wrapper object or class instance, which this
+        // tier does not model.
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.d.fnT(), FN_SIG);
+        c.i32Const(-2);
+        c.i32Eq();
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.d.fnT(), FN_SIG);
+        c.i32Const(-3);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        this.k.deps.fence(c, (x) => this.lit(x, "constructing a builtin read as a function value (`new String(...)` builds a wrapper object) is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
         c.localGet(0);
         c.call(this.fnPrototypeRaw());
         c.localTee(PR);

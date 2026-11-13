@@ -692,10 +692,19 @@ export interface GenericInstance {
     // completed-signature contract), so omitted trailing args complete with
     // the undefined arm like any direct call.
     const target = contextual ? L.checker.getContextualType(contextual) : undefined;
+    // A JS binding whose own type has no static mapping (picocolors'
+    // `let createColors = (enabled = isColorSupported) => ({ red: … })`,
+    // whose result holds implicit-any closures) types every later read by
+    // the JS checked-dynamic fallback — the same per-piece answer judges
+    // the value here.
+    const ownType = (e: ts.Expression): IrType | null => {
+      const t = L.typeOf(e);
+      return L.mapTypeOf(t) ?? (isJsSourceFile(e.getSourceFile()) ? dynFallbackType(L, e, t) : null);
+    };
     const mapped = target
       ? L.mapTypeOf(target)
       : contextual
-        ? L.mapTypeOf(L.typeOf(contextual))
+        ? ownType(contextual)
         : null;
     if (mapped && typeEquals(mapped, funcType)) return;
     // A union-typed slot (`runner || defaultRunner` under a
@@ -5072,7 +5081,11 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     if (containerMethod && /^(keys|values|entries)$/.test(access.name.text) && call.arguments.length === 0 && onlyIterated(call)) {
       return { kind: "dynInvoke", recv, method: `%${access.name.text}`, calleeName: access.getText(), args: [], type: DYN, loc: locOf(call) };
     }
-    if ((containerMethod || DYN_DISPATCH_METHODS.has(access.name.text)) && !call.questionDotToken && !access.questionDotToken) {
+    // String.prototype's legacy HTML methods (`pc.bold(s)` over picocolors'
+    // color table) join the dispatch on the WasmGC lanes, whose ladder
+    // fences a STR receiver by name and calls an OBJ's own member.
+    const legacyHtml = L.sharedDynamic === true && STR_LEGACY_HTML_METHODS.has(access.name.text);
+    if ((containerMethod || legacyHtml || DYN_DISPATCH_METHODS.has(access.name.text)) && !call.questionDotToken && !access.questionDotToken) {
       if (call.arguments.some((a) => ts.isSpreadElement(a))) {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
       }
@@ -5145,6 +5158,12 @@ const DYN_PROTO_METHOD_NAMES = new Set([
   "anchor", "big", "blink", "bold", "codePointAt", "fixed", "fontcolor", "fontsize", "isWellFormed", "italics", "link", "localeCompare", "normalize", "small", "strike", "sub", "sup", "toLocaleLowerCase", "toLocaleUpperCase", "toWellFormed",
   // Number.prototype
   "toExponential", "toFixed", "toPrecision",
+]);
+
+/** String.prototype's Annex B HTML methods — the wasm dyn ladder's
+ * STR_UNSUPPORTED set (backend/wasm/dyn.ts). */
+const STR_LEGACY_HTML_METHODS = new Set([
+  "anchor", "big", "blink", "bold", "fixed", "fontcolor", "fontsize", "italics", "link", "small", "strike", "sub", "sup",
 ]);
 
 /** The SHARED prototype names scr_dyn_invoke dispatches at runtime (the

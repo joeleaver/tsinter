@@ -12476,6 +12476,14 @@ export class DynBuilder {
     });
   }
 
+  /** String.prototype's legacy HTML methods (Annex B): a STR receiver
+   * takes the loud named fence, never the is-not-a-function tail. Every
+   * other kind (an OBJ owning the member — picocolors' `pc.bold`) takes
+   * its ordinary rung. */
+  static readonly STR_UNSUPPORTED = new Set([
+    "anchor", "big", "blink", "bold", "fixed", "fontcolor", "fontsize", "italics", "link", "small", "strike", "sub", "sup",
+  ]);
+
   /** String.prototype names with an arm — implemented or fenced. */
   private static readonly STR_METHODS = new Set([
     "slice", "at", "concat", "indexOf", "lastIndexOf", "includes",
@@ -14985,6 +14993,9 @@ export class DynBuilder {
 
         if (DynBuilder.ARR_UNSUPPORTED.has(method)) {
           this.arm(c, K, [DK.ARR], () => throwUnsupported("Array"));
+        }
+        if (DynBuilder.STR_UNSUPPORTED.has(method)) {
+          this.arm(c, K, [DK.STR], () => throwUnsupported("String"));
         }
 
         if (DynBuilder.STR_METHODS.has(method)) {

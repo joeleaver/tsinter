@@ -355,6 +355,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "sp.with": { argTypes: [SEARCH_PARAMS_T, STRING, STRING], result: SEARCH_PARAMS_T },
   "url.searchParams": { argTypes: [URL_T], result: SEARCH_PARAMS_T },
   "url.search": { argTypes: [URL_T], result: STRING },
+  "url.hash": { argTypes: [URL_T], result: STRING },
   // Result is the interned `string | null` union — the libCall case
   // checks the arms (the spawnRes.signal pattern).
   "sp.get": { argTypes: [SEARCH_PARAMS_T, STRING], result: VOID },
@@ -794,6 +795,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // checks the arms, the spawnRes.status pattern).
   "child.pid": { argTypes: [CHILD_T], result: VOID },
   "child.exitCode": { argTypes: [CHILD_T], result: VOID },
+  "child.signalCode": { argTypes: [CHILD_T], result: VOID },
   // The close-override pair: the bound close's result func type and the
   // override's func argument are program-dependent (the callback union's
   // tags) — the slots pin the server receiver; the libCall case checks
@@ -3609,6 +3611,23 @@ function validateFunction(
           if (e.type.kind !== "void") err("module.await must be void", e.loc);
           break;
         }
+        if (e.name === "promise.allSettled") {
+          // ONE argument: an array of promises. The result is a promise of
+          // the `PromiseSettledResult<T>` union-record array, or of void
+          // (a result the program never reads).
+          if (e.args.length !== 1) err("promise.allSettled takes exactly one argument", e.loc);
+          for (const a of e.args) {
+            checkExpr(a);
+            if (a.type.kind !== "array" || a.type.elem.kind !== "promise") {
+              err(`${a.type.kind} argument to promise.allSettled (needs an array of promises)`, a.loc);
+            }
+          }
+          if (e.type.kind !== "promise") err("promise.allSettled must be promise-typed", e.loc);
+          else if (e.type.inner.kind !== "void" && !(e.type.inner.kind === "array" && e.type.inner.elem.kind === "union")) {
+            err("promise.allSettled result must be a promise of a union array (or void)", e.loc);
+          }
+          break;
+        }
         if (e.name === "promise.all") {
           // ONE argument: an array of promises whose inner type is the
           // result's array element (or void, collapsing to promise<void>).
@@ -4370,6 +4389,17 @@ function validateFunction(
               e.loc,
             );
           }
+          break;
+        }
+        if (e.fn === "child.signalCode") {
+          // the interned `string | null` (Signals | null).
+          const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
+          const ok =
+            def &&
+            def.arms.length === 2 &&
+            def.arms.some((a) => a.kind === "string") &&
+            def.arms.some((a) => a.kind === "nullT");
+          if (!ok) err("libCall child.signalCode must return the 'string | null' union", e.loc);
           break;
         }
         if (e.fn === "net.serverCloseBind") {

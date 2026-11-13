@@ -878,6 +878,27 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // union dropped the arm, so there is no representation to read through:
   // a use refuses by name instead of reading a record of the other arm.
   if (flags & ts.TypeFlags.Object && isUninhabitedRecordArm(widened, checker)) return null;
+  // PromiseSettledResult<T> whose T has no record-field representation
+  // (void, an unresolved parameter — the manual pMap shape): BOTH arms
+  // take the honest subset { status } (SEMANTICS.md 46), so the union
+  // stays the one record it always was (the full two-record mapping below
+  // is Promise.allSettled's, for a T that maps).
+  if (flags & ts.TypeFlags.Union) {
+    const alias = widened.getAliasSymbol();
+    if (
+      alias?.name === "PromiseSettledResult" &&
+      checker.declarationsOf(alias).some((d) => ctx.isStdlibFile(d.getSourceFile()))
+    ) {
+      const t0 = widened.getAliasTypeArguments()?.[0];
+      const valueT = t0 === undefined ? null : mapType(t0, ctx);
+      if (valueT === null || valueT.kind === "void") {
+        return {
+          kind: "record",
+          shapeId: ctx.shapes.intern([{ name: "status", type: STRING }], false, undefined, ["status"]),
+        };
+      }
+    }
+  }
 
   if (flags & ts.TypeFlags.Number) return F64;
   if (flags & ts.TypeFlags.String) return STRING;
@@ -1488,6 +1509,38 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       kind: "record",
       shapeId: ctx.shapes.intern([{ name: "%enc", type: STRING, internal: true }]),
     };
+  }
+  // Promise.allSettled's elements (lib.es2020.promise): PromiseFulfilledResult<T>
+  // is `{ status: "fulfilled", value: T }` and PromiseRejectedResult
+  // `{ status: "rejected", reason: any }` — plain data records the
+  // combinator builds fresh (Node's own objects carry exactly these two
+  // keys, in this order). Their declarations live in the lib, which
+  // recordProvenanceOk refuses, so they map here; the PromiseSettledResult
+  // union of the two then maps as an ordinary union of records.
+  if (
+    (psym?.name === "PromiseFulfilledResult" || psym?.name === "PromiseRejectedResult") &&
+    checker.declarationsOf(psym).some((d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()))
+  ) {
+    const fulfilled = psym.name === "PromiseFulfilledResult";
+    const prop = checker.getPropertiesOfType(widened).find((p) => p.name === (fulfilled ? "value" : "reason"));
+    if (prop === undefined) return null;
+    const mappedPt = mapType(checker.getTypeOfSymbol(prop), ctx);
+    // `reason: any` holds the rejection reason as the checked-dynamic
+    // value (records store dyn, never the island handle).
+    const pt = !fulfilled && mappedPt?.kind === "jsval" ? DYN : mappedPt;
+    // A value with no record-field representation (`void`, an unresolved
+    // type parameter — the manual pMap shape's PromiseSettledResult<R>)
+    // falls through to the HONEST SUBSET record { status } below
+    // (SEMANTICS.md 46).
+    if (pt !== null && pt.kind !== "void") {
+      const fields = fulfilled
+        ? [{ name: "status", type: STRING }, { name: "value", type: pt }]
+        : [{ name: "reason", type: pt }, { name: "status", type: STRING }];
+      return {
+        kind: "record",
+        shapeId: ctx.shapes.intern(fields, false, undefined, fulfilled ? ["status", "value"] : ["status", "reason"]),
+      };
+    }
   }
   // Promise.withResolvers's return type — `{ promise, resolve, reject }`
   // from the overrides declaration (or es2024's PromiseWithResolvers,

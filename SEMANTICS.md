@@ -996,6 +996,15 @@ JSON.parse'd object is the SC1100 "expected number" fence), unchanged.
 **Tested by:** `packages/compiler/test/wasm-gh134-tostring.test.ts`
 (GH134-JS-01..14, GH134-TS-01..19), both lanes.
 
+**Amendment (paperclip step 16, wasm and wasm-native): unary `~` joins
+the checked-number stance.** In a JavaScript source, `~x` over a dynamic
+value (picocolors' `~index` over an implicit-any parameter) checks the
+value as a number and complements it natively: a number answers Node's
+value exactly; any other kind stops at the SC1100 "expected number"
+fence where Node would ToNumber-coerce (`~"x"` is -1 there), as the
+binary operators do. It used to refuse the whole function (SC1043). **Tested by:**
+`packages/compiler/test/wasm-top10-paperclip-bitnot-dyn.test.ts`.
+
 **Amendment (GH #135, wasm and wasm-native): `x.constructor` answers for
 errors, primitives and arrays.** A dot read of `constructor` (or the
 literal keyed spelling in a JavaScript source) on a dynamic value with no
@@ -1067,6 +1076,25 @@ as S022's empty object, so its `constructor` reads `undefined` there too;
 that is S022's divergence, not this one. **Tested by:**
 `packages/compiler/test/wasm-gh135-error-constructor.test.ts` (wasm and
 wasm-native, JavaScript and TypeScript, against Node).
+
+**Amendment (builtin conversion functions as values, wasm and
+wasm-native).** `Number`, `String` and `Boolean`, the three answers above
+for a primitive, are now CALLABLE: `JSON.parse("5").constructor(" 9 ")`
+is 9, as in Node. The same one function per builtin is what a JavaScript
+source reads for `String` / `Number` / `Boolean` as a value wherever no
+builtin-token use covers the site (picocolors' `() => String`, a member
+assignment `h.s = String`), so `x.constructor === Number` and every read
+agree on identity. A call through it follows JS's argument count —
+`String()` is "", `Number()` 0, `Boolean()` false — and otherwise converts
+the first argument (ToString with a symbol's description rule; ToNumber,
+where a BigInt converts as the Number function converts it; ToBoolean),
+ignoring the rest. `new` through it stops at the fence "constructing a
+builtin read as a function value (`new String(...)` builds a wrapper
+object) is not supported yet", and so does `new` through any other
+constructor read from a dynamic value. A binding the checker types as the constructor itself
+keeps the typed coercion closure's one signature `(value: string) =>
+primitive` (types.ts), so a call with no argument refuses by name there.
+**Tested by:** `packages/compiler/test/wasm-builtin-conv-fn.test.ts`.
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -1686,6 +1714,17 @@ divergent texts beside a comment giving Node's answers);
 its thrown plain object and non-Error class instance print
 `"[object Object]"` in Node too, so no corpus program pins the
 divergence itself.
+
+**Amendment (Promise.allSettled, paperclip step 13):** a rejected
+entry's `reason` in `Promise.allSettled`'s `{ status: "rejected", reason }`
+record is the same crossing: the promise's rejection payload converts to
+the dynamic value by this walk (`boxPromiseReasonToDyn`). A rejection with
+an Error, a scalar or a dynamic value reads back exactly; a promise
+rejected with a plain object, an array, a closure or a non-error class
+instance yields the EMPTY object (`console.log(r.reason)` prints `{}`
+where Node prints the object). **Tested by:**
+`packages/compiler/test/wasm-top10-paperclip-all-settled.test.ts` (the
+Error reasons, wasm and wasm-native).
 
 ## S023 — The dyn INVOKE surface fences unmodeled (kind, method) pairs at RUNTIME *(inherited)*
 
@@ -11490,3 +11529,34 @@ column) canonicalizes at the same points it can reach (the boundary,
 no hook for, have recorded expected output.
 **Tested by:** tests/harness/wasm-library.test.ts rows `p1-nan`, `p1-math`,
 `p1-nan-typed`.
+
+## S139 — `import.meta.url`, `import.meta.filename` and `import.meta.dirname` are the module's SOURCE location at build time *(every lane; tested on wasm and wasm-native)*
+
+Node's ESM loader gives each module its own location when it loads it:
+`import.meta.url` is the module file's `file:` URL, `import.meta.filename`
+and `import.meta.dirname` its path and directory. A compiled binary has no
+module files to load, so each of the three reads is a per-module
+compile-time constant: the REAL path of the module's source file as the
+compiler read it, symlinks resolved as Node's loader resolves them (its
+URL via `pathToFileURL`), the same location Node reports when it runs the
+same tree in place. CommonJS's `__filename`/`__dirname` follow the same
+rule (the real path, as Node's CJS loader names the module).
+
+- (a) Run in place (the binary built from the tree it is run beside), the
+  values are Node's, byte for byte, and so are paths derived from them
+  (`fileURLToPath(new URL("../package.json", import.meta.url))`).
+- (b) The values do NOT follow the binary: moved or copied elsewhere, or
+  built on another machine, it still answers the build-time source paths,
+  where Node would answer wherever the source then is. A program that
+  reads files relative to them reads them from the build-time tree.
+- (c) `import.meta.resolve(...)` and the `import.meta` object itself (as a
+  value) keep the module-loader fence.
+- (d) `import.meta` in a CommonJS module (a `.cts` file, or `.ts`/`.js`
+  under `"type": "commonjs"`): Node refuses the whole file at parse
+  (`SyntaxError: Cannot use 'import.meta' outside a module`); the build
+  refuses it by name.
+
+**Tested by:** `packages/compiler/test/wasm-top10-paperclip-import-meta.test.ts`
+(wasm and wasm-native against Node: two modules, an entry reached
+through a symlinked directory with `import.meta` and `__dirname`; the
+resolve and CommonJS refusals).

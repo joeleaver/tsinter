@@ -6304,6 +6304,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "stream.hostDefaultHwm":
           case "url.pathToFileURLHost":
           case "num.toRadix":
+          // url.hash and child.signalCode are lowered for the WasmGC lanes only.
+          case "url.hash":
+          case "child.signalCode":
           // writeFileSync's flag "wx" (exclusive create) is lowered for the
           // WasmGC lanes only; the legacy C runtime has no exclusive open.
           case "fs.writeFileExclModeSync":

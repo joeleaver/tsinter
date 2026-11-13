@@ -20,7 +20,7 @@ import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRe
 import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
-import { stdlibGlobalAliasDecl } from "./surfaces.js";
+import { bindingNeverWritten, stdlibGlobalAliasDecl } from "./surfaces.js";
 import { collectNamespaceStmt, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
 import { collectExpandoMembers } from "./lower-expando.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
@@ -1114,11 +1114,24 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
           // included); unmappable pieces take the JS checked-dynamic
           // fallback like every JS binding.
           const fnValued = ts.isFunctionExpression(rhs) || ts.isArrowFunction(rhs);
-          if (cjsScalarLiteral(rhs) || fnValued) {
+          // `module.exports = createColors()` (picocolors' shape — the
+          // export IS a computed value): the same const export global,
+          // assigned at the statement; an unmappable value takes the JS
+          // checked-dynamic fallback like every JS binding.
+          // A module that ALSO adds members to it later (`module.exports.k
+          // = v` after the replacement — picocolors' createColors expando)
+          // keeps the load-time fence: the typed value has no slot for them.
+          const computed =
+            ts.isCallExpression(rhs) &&
+            !sf.statements.some((s) => {
+              const other = cjsExportAssignmentOf(s);
+              return other?.kind === "member" && s.pos > stmt.pos;
+            });
+          if (cjsScalarLiteral(rhs) || fnValued || computed) {
             const diagsBefore = L.diags.length;
             try {
               const strict = L.typeOf(rhs);
-              const t = L.mapTypeOf(strict) ?? (fnValued ? dynFallbackType(L, rhs, strict) : null);
+              const t = L.mapTypeOf(strict) ?? (fnValued || computed ? dynFallbackType(L, rhs, strict) : null);
               if (t && t.kind !== "void") {
                 const g: IrGlobal = { id: `%g.${tag}exports`, name: "exports", type: t, mutable: false };
                 L.globalsByDeclNode.set(cjs.expr, g);
@@ -1431,7 +1444,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // global snapshot — alias plumbing, no global storage (see
         // stdlibGlobalAliasDecl; the statement lowering skips it by the
         // same test).
-        if (isConst && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) continue;
+        if ((isConst || bindingNeverWritten(L, decl.name)) && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) continue;
         // Destructuring declarations register EVERY bound identifier (the
         // desugar in the init function assigns the pre-registered globals,
         // exactly like plain declarations).

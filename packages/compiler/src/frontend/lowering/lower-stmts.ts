@@ -15,7 +15,7 @@ import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
 import { bigArith, bigLitOf } from "./lower-bigint.js";
-import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf } from "./surfaces.js";
+import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf, bindingNeverWritten } from "./surfaces.js";
 import { isProvenanceSourceFile } from "../provenance-registry.js";
 import { ambientUndefVarRootOf, lowerImportEquals, nsUndefRead, nsWritableTarget, trapDeclRootOf } from "./lower-namespaces.js";
 import { expandoWritableTarget, lowerExpandoAssignStmt } from "./lower-expando.js";
@@ -3481,7 +3481,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
 
     // `const process = globalThis.process` — a stdlib-global snapshot:
     // alias plumbing (see stdlibGlobalAliasDecl), no storage, no code.
-    if (!isLet && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) return null;
+    if ((!isLet || bindingNeverWritten(L, decl.name)) && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) return null;
 
     // `const f = <T>(x: T) => x` — a generic function value binding: the
     // initializer monomorphizes per call-site-resolved signature exactly

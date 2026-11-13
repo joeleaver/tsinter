@@ -1851,6 +1851,21 @@ export class UrlEngine {
     });
   }
 
+  /** url.hash: "" for no fragment and for an empty one, else "#" and
+   * the (already percent-encoded) fragment: WHATWG's hash getter. */
+  hashFn(): number {
+    return this.fn("hash", [this.urlRef()], [this.sRef], (f, $) => {
+      const F = f.local(this.sRef);
+      const O = f.local(this.obRef);
+      $.put(F, $.get(this.urlType(), U_FRAG, $.l(0)));
+      $.if($.orElse($.isNull($.l(F)), $.not($.alen($.l(F)))), () => $.ret($.anew(this.S, $.i(0))));
+      $.put(O, this.obNew($));
+      this.push($, $.l(O), $.i(35));
+      $.run(this.obAppendStrFn(), $.l(O), $.l(F));
+      $.do(this.obStr($, $.l(O)));
+    });
+  }
+
   /* ── UTF-16 buffers ───────────────────────────────────────────────── */
 
   private obT16_: number | null = null;

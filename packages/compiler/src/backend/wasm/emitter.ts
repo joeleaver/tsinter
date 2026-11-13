@@ -197,7 +197,7 @@ import { FsBuilder, STAT_RAW } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, CP_CODES, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { errnoIndex } from "./os-names.js";
-import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
+import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_SIGNAL, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
 import { HostEvBuilder } from "./hostev.js";
 import { FETCH_CLASS_NAMES, FetchBuilder } from "./fetch.js";
@@ -2834,6 +2834,17 @@ const DYNTHEN_FINALLY = 2;
  * #184): settle's adoption prologue ignores every later resolve/reject of
  * it. No payload tag uses it, and nothing reads a pending promise's kind. */
 const PROM_KIND_ADOPTING = -2;
+
+/** Promise.allSettled's per-call plan: the result union's two record arms
+ * (null for a result the program never reads). */
+interface SettledPlan {
+  key: string;
+  recs: {
+    fTag: number; rTag: number; fArm: number; rArm: number; valueT: IrType;
+    fStruct: number; fStatus: number; fValue: number;
+    rStruct: number; rStatus: number; rReason: number;
+  } | null;
+}
 /** The timer-queue libCalls whose first argument is the scheduled
  * callback closure — wrapped in an AsyncLocalStorage module (Unit B). */
 const TIMER_SCHEDULE_FNS: ReadonlySet<string> = new Set([
@@ -25196,6 +25207,9 @@ class Assembler {
           case "promise.all":
             this.emitPromiseAll(e);
             return;
+          case "promise.allSettled":
+            this.emitPromiseAllSettled(e);
+            return;
           case "promise.race":
             this.emitPromiseRace(e);
             return;
@@ -28658,6 +28672,50 @@ class Assembler {
         if (e.fn === "child.killed") {
           this.walkExpr(e.args[0]!);
           code.structGet(this.cpa.childType(), CH_KILLED);
+          return;
+        }
+        if (e.fn === "child.signalCode") {
+          // `Signals | null`: the terminating signal's name once a signal
+          // death was delivered (state 2), null otherwise: Node's
+          // signalCode, set in the same exit handling that fires 'exit'.
+          if (e.type.kind !== "union") {
+            this.refuse("libCall:child.signalCode:unexpected-result-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = e.type.unionId;
+          const def = this.unionDef(unionId);
+          const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+          const valueTag = def.arms.findIndex((a) => a.kind === "string");
+          if (nullTag < 0 || valueTag < 0 || def.arms.length !== 2) {
+            this.refuse("libCall:child.signalCode:unexpected-union-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const armSt = this.unionArmStruct(unionId, valueTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (armSt === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          const childT = this.cpa.childType();
+          const CH = this.acquireScratch(this.cpa.childRef());
+          this.walkExpr(e.args[0]!);
+          code.localSet(CH);
+          code.localGet(CH);
+          code.structGet(childT, CH_STATE);
+          code.i32Const(2);
+          code.i32Eq();
+          this.openIfResult(unionVal);
+          code.i32Const(valueTag);
+          code.localGet(CH);
+          code.structGet(childT, CH_SIGNAL);
+          code.call(this.cp.signalNameHelper());
+          code.structNew(armSt);
+          code.else_();
+          code.globalGet(this.unions.unitGlobal(nullTag));
+          this.close();
+          this.releaseScratch(this.cpa.childRef(), CH);
           return;
         }
         if (e.fn === "child.pid" || e.fn === "child.exitCode") {
@@ -40244,6 +40302,10 @@ class Assembler {
     const w = this.newWalker(0);
     const c = w.c;
     const nameLocal = this.wlocal(w, this.strRef);
+    // String / Number / Boolean are CALLABLE (the conversion functions as
+    // values): a real thunk with JS argument-count semantics. Every other
+    // constructor stand-in keeps the null thunk (callFn's named fence).
+    const conv = !isClass && (name === "String" || name === "Number" || name === "Boolean") ? this.convThunk(name) : null;
     c.globalGet(g);
     c.refIsNull();
     c.ifVoid();
@@ -40252,7 +40314,7 @@ class Assembler {
     this.dyn.boxFn(
       c,
       (x) => x.localGet(nameLocal),
-      (x) => x.refNull(this.dyn.thunkSig()),
+      (x) => (conv !== null ? x.refFunc(conv) : x.refNull(this.dyn.thunkSig())),
       isClass ? -3 : -2,
       (x) => x.localGet(nameLocal),
       arity,
@@ -40262,6 +40324,84 @@ class Assembler {
     c.globalGet(g);
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
+  }
+
+  private convThunks = new Map<string, number>();
+
+  /** The call glue of String / Number / Boolean as function values: JS
+   * argument count decides (`String()` is "", `Number()` 0, `Boolean()`
+   * false); otherwise the conversion of the first argument — String(v)
+   * (dyn.toStrUser: the string hint, a symbol's description), Number(v)
+   * (ToNumber, where a BigInt converts as the Number function converts
+   * it), Boolean(v) (ToBoolean). Extra arguments are ignored, as in JS. A
+   * throw inside leaves the cell pending and answers null (callFn's
+   * contract). */
+  private convThunk(name: "String" | "Number" | "Boolean"): number {
+    const hit = this.convThunks.get(name);
+    if (hit !== undefined) return hit;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const thunk = this.mb.declareFunc(dyn.thunkSig(), `%w.dyn.conv:${name}`);
+    this.convThunks.set(name, thunk);
+    const c = new Code();
+    const A = 2; // the first argument (dyn)
+    const S = 3; // String's answer
+    const N = 4; // Number's answer
+    const pending = (): void => {
+      c.globalGet(this.exc().kindG);
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+    };
+    dyn.arrLen(c, (x) => x.localGet(1));
+    c.i32Eqz();
+    c.ifVoid();
+    if (name === "String") dyn.boxStr(c, (x) => this.pushStrLitInto(x, ""));
+    else if (name === "Number") dyn.boxNum(c, (x) => x.f64Const(0));
+    else dyn.boxBool(c, (x) => x.i32Const(0));
+    c.return_();
+    c.end();
+    dyn.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+    c.localSet(A);
+    if (name === "String") {
+      c.localGet(A);
+      c.call(dyn.toStrUser());
+      c.localSet(S);
+      pending();
+      dyn.boxStr(c, (x) => x.localGet(S));
+    } else if (name === "Number") {
+      if (this.bigModule) {
+        // Number(5n) is 5: the Number FUNCTION converts a BigInt (only
+        // ToNumber itself — unary +, arithmetic — throws).
+        c.localGet(A);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.BIGINT);
+        c.i32Eq();
+        c.ifVoid();
+        dyn.boxNum(c, (x) => {
+          x.localGet(A);
+          x.structGet(dynT, DYN_REF);
+          x.refCast(this.big.bigType);
+          x.call(this.big.toF64());
+        });
+        c.return_();
+        c.end();
+      }
+      c.localGet(A);
+      c.call(this.dynToNumberFn());
+      c.localSet(N);
+      pending();
+      dyn.boxNum(c, (x) => x.localGet(N));
+    } else {
+      dyn.boxBool(c, (x) => {
+        x.localGet(A);
+        x.call(dyn.truthy());
+      });
+    }
+    this.mb.setBody(thunk, [dyn.dynRef(), this.strRef, F64], c.bytes());
+    this.mb.declareFuncRef(thunk);
+    return thunk;
   }
 
   private nativeMethodPlaceholderHelper(name: string, arity: number): number {
@@ -42108,6 +42248,8 @@ class Assembler {
         return simple(() => W().pathnameFn(), false);
       case "url.search":
         return simple(() => W().searchFn(), false);
+      case "url.hash":
+        return simple(() => W().hashFn(), false);
       case "url.searchParams":
         return simple(() => W().searchParamsFn(), false);
       case "url.fileURLToPathUrl":
@@ -51260,8 +51402,8 @@ class Assembler {
    * Only an EMPTY all can be complete when the loop ends: reactions are
    * microtasks, so none has run yet, which is exactly why the spec's
    * "+1 for the iteration" needs no counterpart here. */
-  private promiseAllFor(entries: VecInfo, values: VecInfo | null): number {
-    const key = `${entries.key}|${values?.key ?? "void"}`;
+  private promiseAllFor(entries: VecInfo, values: VecInfo | null, settled: SettledPlan | null = null): number {
+    const key = `${settled === null ? "" : `settled:${settled.key}|`}${entries.key}|${values?.key ?? "void"}`;
     const hit = this.allFns.get(key);
     if (hit !== undefined) return hit;
     const promRef = this.proms.promRef();
@@ -51270,7 +51412,7 @@ class Assembler {
       `%w.async.all:${key}`,
     );
     this.allFns.set(key, idx);
-    const rx = this.allReactionFor(values);
+    const rx = settled === null ? this.allReactionFor(values) : this.allSettledReactionFor(values, settled);
     const stateT = this.proms.allStateT;
     const entryT = this.proms.allEntryT;
     const closRef: ValType = { kind: "ref", nullable: true, typeIndex: this.resumeClosPair().clos };
@@ -51443,6 +51585,178 @@ class Assembler {
     this.releaseScratch(I32, i);
     this.releaseScratch(I32, n);
     this.releaseScratch(promRef, p);
+  }
+
+  /** One Promise.allSettled entry settling: the spec's onFulfilled /
+   * onRejected pair of the allSettled resolve-element functions. Either
+   * outcome stores a FRESH result record at the entry's input index:
+   * `{ status: "fulfilled", value }` or `{ status: "rejected", reason }`
+   * (the reason boxed into the dynamic value, the caughtToDyn walk), and
+   * the last one to settle fulfils the result with the array. Nothing
+   * rejects the result. A void plan (the result unused) stores nothing
+   * and only counts. Interned per plan. */
+  private allSettledReactionFor(values: VecInfo | null, plan: SettledPlan): number {
+    const key = `settled:${plan.key}|${values?.key ?? "void"}`;
+    const hit = this.allRxFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, `%w.async.allSettledRx:${key}`);
+    this.allRxFns.set(key, idx);
+    const promT = this.proms.promT;
+    const stateT = this.proms.allStateT;
+    const entryT = this.proms.allEntryT;
+    const c = new Code();
+    const E = 2, ST = 3, SRC = 4, K = 5, RF = 6, RR = 7;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, ALLE_STATE);
+    c.localSet(ST);
+    c.localGet(E);
+    c.structGet(entryT, ALLE_SRC);
+    c.localSet(SRC);
+    const recs = plan.recs;
+    if (values !== null && recs !== null) {
+      c.localGet(ST);
+      c.structGet(stateT, ALL_VALUES);
+      c.refCast(values.struct);
+      c.localGet(E);
+      c.structGet(entryT, ALLE_INDEX);
+      c.localGet(SRC);
+      c.structGet(promT, PROM_STATE);
+      c.i32Const(2);
+      c.i32Eq();
+      c.ifResult(values.elemVal);
+      // { status: "rejected", reason }
+      c.structNewDefault(recs.rStruct);
+      c.localSet(RR);
+      c.localGet(RR);
+      this.pushStrLitInto(c, "rejected");
+      c.structSet(recs.rStruct, recs.rStatus);
+      c.localGet(RR);
+      this.boxPromiseReasonToDyn(c, SRC, K);
+      c.structSet(recs.rStruct, recs.rReason);
+      c.i32Const(recs.rTag);
+      c.localGet(RR);
+      c.structNew(recs.rArm);
+      c.else_();
+      // { status: "fulfilled", value }
+      c.structNewDefault(recs.fStruct);
+      c.localSet(RF);
+      c.localGet(RF);
+      this.pushStrLitInto(c, "fulfilled");
+      c.structSet(recs.fStruct, recs.fStatus);
+      c.localGet(RF);
+      if (!this.emitSettledPayload(c, recs.valueT, () => c.localGet(SRC), "intrinsic:promise.allSettled", undefined)) {
+        c.unreachable();
+      }
+      c.structSet(recs.fStruct, recs.fValue);
+      c.i32Const(recs.fTag);
+      c.localGet(RF);
+      c.structNew(recs.fArm);
+      c.end();
+      c.call(this.vecs.set(values));
+    }
+    c.localGet(ST);
+    c.localGet(ST);
+    c.structGet(stateT, ALL_REMAINING);
+    c.i32Const(1);
+    c.i32Sub();
+    c.structSet(stateT, ALL_REMAINING);
+    c.localGet(ST);
+    c.structGet(stateT, ALL_REMAINING);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(ST);
+    c.structGet(stateT, ALL_RESULT);
+    this.pushAllFulfilment(
+      c,
+      values === null
+        ? null
+        : () => {
+            c.localGet(ST);
+            c.structGet(stateT, ALL_VALUES);
+          },
+    );
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    c.end();
+    this.mb.setBody(
+      idx,
+      [
+        { kind: "ref", nullable: true, typeIndex: entryT },
+        this.proms.allStateRef(),
+        this.proms.promRef(),
+        I32,
+        { kind: "ref", nullable: true, typeIndex: recs?.fStruct ?? entryT },
+        { kind: "ref", nullable: true, typeIndex: recs?.rStruct ?? entryT },
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** `Promise.allSettled(ps)`: Promise.all's countdown with the settled
+   * reaction (allSettledReactionFor). The result is either the array of
+   * `PromiseSettledResult<T>` union records or, for a result the program
+   * never reads, void. */
+  private emitPromiseAllSettled(e: Extract<IrExpr, { kind: "intrinsic" }>): void {
+    const code = this.fn.code;
+    const arg = e.args[0]!;
+    if (arg.type.kind !== "array" || arg.type.elem.kind !== "promise" || e.type.kind !== "promise") {
+      throw new Error("promise.allSettled outside its validated shape");
+    }
+    const entries = this.vecInfoFor(arg.type, e.loc);
+    if (entries === null) {
+      code.unreachable();
+      return;
+    }
+    let values: VecInfo | null = null;
+    let plan: SettledPlan = { key: "void", recs: null };
+    if (e.type.inner.kind === "array") {
+      const elem = e.type.inner.elem;
+      values = this.vecInfoFor(e.type.inner, e.loc);
+      if (values === null || elem.kind !== "union") {
+        if (values !== null) this.refuse("intrinsic:promise.allSettled:element", e.loc);
+        code.unreachable();
+        return;
+      }
+      const def = this.unionDef(elem.unionId);
+      const fTag = def.arms.findIndex((a) => a.kind === "record" && this.recordShapes.get(a.shapeId)?.fields.some((f) => f.name === "value"));
+      const rTag = def.arms.findIndex((a) => a.kind === "record" && this.recordShapes.get(a.shapeId)?.fields.some((f) => f.name === "reason"));
+      const fT = def.arms[fTag];
+      const rT = def.arms[rTag];
+      if (def.arms.length !== 2 || fT?.kind !== "record" || rT?.kind !== "record") {
+        this.refuse("intrinsic:promise.allSettled:element", e.loc);
+        code.unreachable();
+        return;
+      }
+      const fInfo = this.recordInfo(fT.shapeId, e.loc, false);
+      const rInfo = this.recordInfo(rT.shapeId, e.loc, false);
+      const fArm = this.unionArmStruct(elem.unionId, fTag, e.loc);
+      const rArm = this.unionArmStruct(elem.unionId, rTag, e.loc);
+      const valueT = this.recordShapes.get(fT.shapeId)!.fields.find((f) => f.name === "value")!.type;
+      if (fInfo === null || rInfo === null || fArm === null || rArm === null) {
+        code.unreachable();
+        return;
+      }
+      plan = {
+        key: `${elem.unionId}`,
+        recs: {
+          fTag, rTag, fArm, rArm, valueT,
+          fStruct: fInfo.struct, fStatus: fInfo.fieldIndex.get("status")!, fValue: fInfo.fieldIndex.get("value")!,
+          rStruct: rInfo.struct, rStatus: rInfo.fieldIndex.get("status")!, rReason: rInfo.fieldIndex.get("reason")!,
+        },
+      };
+    } else if (e.type.inner.kind !== "void") {
+      this.refuse(`intrinsic:promise.allSettled:${e.type.inner.kind}`, e.loc);
+      code.unreachable();
+      return;
+    }
+    const fn = this.promiseAllFor(entries, values, plan);
+    this.walkExpr(arg);
+    code.call(fn);
   }
 
   private emitPromiseAll(e: Extract<IrExpr, { kind: "intrinsic" }>): void {

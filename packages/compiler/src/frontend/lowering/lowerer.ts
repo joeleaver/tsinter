@@ -119,7 +119,7 @@ import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { orderNoteCopy } from "./record-order.js";
-import { asDynOperand, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { asDynOperand, bindOnce, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -920,7 +920,14 @@ export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType |
   if (sig) {
     const params = sig.getParameters().map((p): IrType => {
       const pt = L.checker.getTypeOfSymbolAtLocation(p, node);
-      return L.mapTypeOf(pt) ?? DYN;
+      const mapped = L.mapTypeOf(pt);
+      if (mapped === null) return DYN;
+      // An optional/defaulted param's ABI slot is the undefined-armed
+      // union, exactly as mapType's completed signature spells it (the
+      // function's own collected signature agrees).
+      const decl = L.checker.valueDeclarationOf(p);
+      const optional = decl !== undefined && ts.isParameter(decl) && (decl.questionToken !== undefined || decl.initializer !== undefined);
+      return optional && mapped.kind !== "dyn" && mapped.kind !== "jsval" ? (L.withUndefinedArm(mapped) ?? DYN) : mapped;
     });
     const retT = L.checker.getReturnTypeOfSignature(sig);
     const ret: IrType =
@@ -2315,6 +2322,9 @@ export class Lowerer {
           r.kind === ts.SyntaxKind.TrueKeyword || r.kind === ts.SyntaxKind.FalseKeyword ||
           (ts.isPrefixUnaryExpression(r) && r.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(r.operand));
         if (scalar) return false;
+        // A COMPUTED whole export (`module.exports = createColors()`) is
+        // one value too: member reads are reads of that value's properties.
+        if (ts.isCallExpression(r) && this.globalsByDeclNode.has(d)) return false;
       }
     }
     return true;
@@ -4294,6 +4304,37 @@ export class Lowerer {
   }
 
   coerceToExpected(expr: IrExpr, expected: IrType): IrExpr {
+    // `await Promise.all([p, q])` / `await Promise.allSettled([p, q])` over
+    // a uniform literal: the combinator builds a fresh ARRAY of the one
+    // element type (lowerPromiseStaticCall), where the checker types the
+    // awaited value as the TUPLE of that type. The array is fresh and has
+    // exactly the literal's arity, so its positions ARE the tuple: the
+    // binding gets a tuple record built from them (no one else holds the
+    // array, so the copy is unobservable).
+    if (
+      expected.kind === "record" &&
+      expr.type.kind === "array" &&
+      expr.kind === "awaitExpr" &&
+      expr.value.kind === "intrinsic" &&
+      (expr.value.name === "promise.all" || expr.value.name === "promise.allSettled") &&
+      expr.value.args[0]?.kind === "arrayLit"
+    ) {
+      const shape = this.shapes.get(expected.shapeId);
+      const elem = expr.type.elem;
+      const n = (expr.value.args[0] as Extract<IrExpr, { kind: "arrayLit" }>).elems.length;
+      if (shape?.tuple === true && shape.fields.length === n && shape.fields.every((f) => typeEquals(f.type, elem))) {
+        const loc = expr.loc;
+        return bindOnce(this, expr, loc, (read) => ({
+          kind: "recordLit",
+          fields: shape.fields.map((f, i) => ({
+            name: f.name,
+            value: { kind: "arrayGet", arr: read, index: { kind: "numLit", value: i, type: F64, loc }, type: elem, loc } as IrExpr,
+          })),
+          type: expected,
+          loc,
+        }));
+      }
+    }
     // Island boundary, both directions. IN: any static value flowing into
     // an any-typed slot marshals implicitly (tsc allows the assignment;
     // the marshal is where its semantics live). OUT: an 'any' value

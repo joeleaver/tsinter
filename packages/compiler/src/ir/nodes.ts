@@ -2423,6 +2423,7 @@ export type IrLibFn =
   | "sp.with"
   | "url.searchParams"
   | "url.search"
+  | "url.hash"
   | "sp.get"
   | "sp.getAll"
   | "sp.append"
@@ -2610,6 +2611,7 @@ export type IrLibFn =
    * the OS at exit. All receivers borrowed. */
   | "child.pid"
   | "child.exitCode"
+  | "child.signalCode"
   | "child.killed"
   | "child.kill"
   | "child.killNum"
@@ -5616,7 +5618,7 @@ export type IrExpr =
    * frontend returns them as-is, the spec's native-promise identity;
    * thenables and promise-armed unions fence); the backend mints a fresh
    * promise and fulfills it immediately per the inner kind. */
-  | { kind: "intrinsic"; name: "console.log" | "console.error" | "promise.race" | "promise.all" | "promise.reject" | "promise.resolve" | "module.await"; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  | { kind: "intrinsic"; name: "console.log" | "console.error" | "promise.race" | "promise.all" | "promise.allSettled" | "promise.reject" | "promise.resolve" | "module.await"; args: IrExpr[]; type: IrType; loc: SrcLoc }
   /** Standard-library call (`process` members, node:fs functions). `fn` is a
    * closed union; arg/result types are fixed per member (validated against
    * LIB_FN_SIGS). Property READS (`process.argv`, `process.platform`) are

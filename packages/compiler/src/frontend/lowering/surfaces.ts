@@ -9,6 +9,7 @@ import type { Lowerer } from "./lowerer.js";
 import { UNSUPPORTED } from "../../diagnostics/diagnostic.js";
 import { BOOL, BYTES_U8, CHILD_T, DYN, F64, IrExpr, IrLibFn, IrStrIntrinsicMethod, IrType, RUNTIME_ERROR_CLASSES, SPAWNRES_T, STATS_T, STRING, URL_T, VOID, arrayOf } from "../../ir/nodes.js";
 import { isNodeTypesPath, requireSpecOf } from "../program.js";
+import { everyLocalRef } from "./lower-exprs.js";
 
 /** Statement-level constructs rejected wholesale, keyed by syntax kind. */
 export const UNSUPPORTED_STMT: Partial<Record<ts.SyntaxKind, { code: keyof typeof UNSUPPORTED; feature?: string }>> = {
@@ -1408,6 +1409,18 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
     // below this fence answers, member-or-refusal ladder, so no compile
     // fence belongs here.
     if (L.mapTypeOf(L.typeOf(recv))?.kind === "dyn") return;
+    // Promise.allSettled's result records (types.ts maps the two lib
+    // interfaces to data records): their keys read as record fields.
+    if (
+      (member === "status" || member === "value" || member === "reason") &&
+      L.checker.declarationsOf(sym).some((d) => {
+        const owner = d.parent;
+        return owner !== undefined && ts.isInterfaceDeclaration(owner) &&
+          (owner.name.text === "PromiseFulfilledResult" || owner.name.text === "PromiseRejectedResult");
+      })
+    ) {
+      return;
+    }
     // Name the container the way the source reads: the global's name when
     // the receiver IS a stdlib global (Math, process), the dotted path for
     // a member of one (process.stdout — its TYPE text would be the useless
@@ -1674,11 +1687,27 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
     // globalThis.process`. Preflight admits exactly this shape
     // (processModuleAliasRequire7); commander's lib/command.js opens with
     // it.
-    const requireSpec = requireSpecOf(init);
+    // `process || {}` / `globalThis ?? {}` (picocolors opens with `let p =
+    // process || {}`): the global is an object, always truthy and never
+    // nullish, so the right side never evaluates and the value IS the
+    // global.
+    let source = init;
+    while (ts.isParenthesizedExpression(source)) source = source.expression;
+    if (
+      ts.isBinaryExpression(source) &&
+      (source.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        source.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) {
+      let left = source.left;
+      while (ts.isParenthesizedExpression(left)) left = left.expression;
+      const leftName = stdlibGlobalNameOf(L, left);
+      if (leftName === "process" || leftName === "globalThis") source = left;
+    }
+    const requireSpec = requireSpecOf(source);
     const name =
       requireSpec === "process" || requireSpec === "node:process"
         ? "process"
-        : stdlibGlobalNameOf(L, init);
+        : stdlibGlobalNameOf(L, source);
     if (name === null) return false;
     // Only alias OBJECT-shaped globals whose members lower by receiver
     // identity (process, console, globalThis itself, and perf_hooks'
@@ -1690,6 +1719,32 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
     if (!symbol) return false;
     L.stdlibGlobalAliases.set(symbol, name);
     return true;
+  }
+
+/** A `let`/`var` binding the program never writes after its
+   * initializer (no assignment, compound assignment, ++/--, or for-in/of
+   * target names it): its value is its initializer's for its whole life,
+   * so a stdlib-global snapshot through it is alias plumbing like a
+   * const's. */
+  export function bindingNeverWritten(L: Lowerer, nameNode: ts.Node): boolean {
+    if (!ts.isIdentifier(nameNode)) return false;
+    return everyLocalRef(L, nameNode, (ref) => {
+      let n: ts.Node = ref;
+      while (ts.isParenthesizedExpression(n.parent)) n = n.parent;
+      const p = n.parent;
+      if (ts.isBinaryExpression(p) && p.left === n && p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && p.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return false;
+      if ((ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) &&
+        (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken)) return false;
+      if ((ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.initializer === n) return false;
+      if (ts.isShorthandPropertyAssignment(p) || ts.isArrayLiteralExpression(p)) {
+        // a destructuring-assignment target (`({ p } = o)`, `[p] = a`)
+        let up: ts.Node = p;
+        while (ts.isObjectLiteralExpression(up.parent) || ts.isArrayLiteralExpression(up.parent) || ts.isPropertyAssignment(up.parent) || ts.isShorthandPropertyAssignment(up.parent)) up = up.parent;
+        const b = up.parent;
+        if (ts.isBinaryExpression(b) && b.left === up && b.operatorToken.kind === ts.SyntaxKind.EqualsToken) return false;
+      }
+      return true;
+    });
   }
 
 /** True iff the symbol is declared ONLY by the adopted @types/node

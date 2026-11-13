@@ -4889,12 +4889,26 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     if (!isChildSurfaceMember(L, access)) return null;
     const name = access.name.text;
     const loc = locOf(call);
-    if (name === "on" && call.arguments.length === 2) {
+    // `once("exit", cb)` registers the same listener as `on`: 'exit' is
+    // delivered at most once per child, so a once-listener and an
+    // on-listener run exactly as often, and nothing here can count or
+    // remove them. REVISIT when child listenerCount/off land: a counted or
+    // removable once-listener is observable, and this fold must become a
+    // real once registration. 'error' can fire more than once (each
+    // failed kill), so once("error") keeps the fence until then.
+    if ((name === "on" || name === "once") && call.arguments.length === 2) {
       const evT = L.typeOf(call.arguments[0]!);
       const event = evT.isStringLiteralType() ? evT.value : null;
+      if (name === "once" && event === "error") {
+        L.noLowering(
+          'child.once("error", ...)',
+          call.arguments[0]!,
+          "'error' can fire more than once (each failed kill) and a once-listener cannot be removed here — use child.on(\"error\", cb)",
+        );
+      }
       if (event !== "exit" && event !== "error") {
         L.noLowering(
-          `child.on(${event === null ? "non-literal event" : `"${event}"`}, ...)`,
+          `child.${name}(${event === null ? "non-literal event" : `"${event}"`}, ...)`,
           call.arguments[0]!,
           '"exit" and "error" are the supported child events (as literals)',
         );
@@ -4903,7 +4917,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         L.unsupported(
           "SC1090",
           call,
-          "chaining child.on(...) (the result is void here — register each listener as its own statement)",
+          `chaining child.${name}(...) (the result is void here — register each listener as its own statement)`,
         );
       }
       const receiver = L.lowerExpr(access.expression);
@@ -5019,7 +5033,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     L.noLowering(
       `ChildProcess.${name}`,
       call,
-      "on(\"exit\" | \"error\", cb), pid, exitCode, killed, kill(signal?), and unref() are the supported ChildProcess members",
+      "on(\"exit\" | \"error\", cb), once(\"exit\", cb), pid, exitCode, signalCode, killed, kill(signal?), and unref() are the supported ChildProcess members",
       L.checker.getSymbolAtLocation(access.name),
     );
   }
@@ -5369,7 +5383,19 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     const member = expr.name.text;
     if (member !== "isTTY" && member !== "columns") return null;
     let recv: ts.Expression = expr.expression;
-    while (ts.isParenthesizedExpression(recv) || ts.isAsExpression(recv) || ts.isTypeAssertion(recv)) recv = recv.expression;
+    // `(process.stdout || {}).isTTY` (picocolors' probe) is the stream
+    // too: the stream is an object, always truthy, so the default never
+    // evaluates and the read is the stream's own.
+    for (;;) {
+      if (ts.isParenthesizedExpression(recv) || ts.isAsExpression(recv) || ts.isTypeAssertion(recv)) recv = recv.expression;
+      else if (
+        ts.isBinaryExpression(recv) &&
+        (recv.operatorToken.kind === ts.SyntaxKind.BarBarToken || recv.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) &&
+        ts.isObjectLiteralExpression(recv.right) &&
+        recv.right.properties.length === 0
+      ) recv = recv.left;
+      else break;
+    }
     if (!ts.isPropertyAccessExpression(recv)) return null;
     const stream = L.stdlibGlobalMember(recv, "process");
     if (stream !== "stdin" && stream !== "stdout" && stream !== "stderr") return null;
@@ -7456,9 +7482,89 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       }
       return { kind: "intrinsic", name: "promise.all", args: [entries], type: resultT, loc };
     }
-    if (member === "allSettled" || member === "any") {
+    // `Promise.allSettled(ps)` over one promise type: Promise.all's
+    // countdown with the settled reactions (the emitter's
+    // allSettledReactionFor), microtask-exact against Node: one reaction
+    // per entry subscribed in input order, each storing a fresh
+    // `{ status, value }` / `{ status, reason }` record at its index, the
+    // last to settle fulfilling the result. A result the program never
+    // reads (`await Promise.allSettled([...])` as a barrier) settles void,
+    // so Promise<void> entries need no result record.
+    if (member === "allSettled") {
+      const argNode = call.arguments.length === 1 ? call.arguments[0]! : null;
+      if (!argNode || ts.isSpreadElement(argNode)) {
+        L.noLowering(
+          "Promise.allSettled with this argument shape",
+          call,
+          "one array of promises is the supported form: Promise.allSettled(ps) with ps: Promise<T>[]",
+        );
+      }
+      let entries: IrExpr;
+      if (ts.isArrayLiteralExpression(argNode) && !argNode.elements.some(ts.isSpreadElement) && argNode.elements.length > 0) {
+        const elems = argNode.elements.map((el) => L.lowerExpr(el));
+        const first = elems[0]!.type;
+        if (first.kind !== "promise" || first.inner.kind === "jsval" || !elems.every((e) => typeEquals(e.type, first))) {
+          L.noLowering(
+            "Promise.allSettled over this argument shape",
+            argNode,
+            "the entries must share ONE promise type — Promise.allSettled([p, q]) lowers when p and q are the same Promise<T>",
+          );
+        }
+        entries = { kind: "arrayLit", elems, type: arrayOf(first), loc };
+      } else {
+        entries = L.lowerExpr(argNode);
+      }
+      if (entries.type.kind !== "array" || entries.type.elem.kind !== "promise" || entries.type.elem.inner.kind === "jsval") {
+        L.noLowering(
+          "Promise.allSettled over this argument shape",
+          argNode,
+          "an array of promises of one static type (Promise<T>[]) is the supported form",
+        );
+      }
+      // Discarded: an expression statement, or the operand of an awaited
+      // expression statement.
+      let up: ts.Node = call.parent;
+      while (ts.isParenthesizedExpression(up)) up = up.parent;
+      if (ts.isAwaitExpression(up)) {
+        up = up.parent;
+        while (ts.isParenthesizedExpression(up)) up = up.parent;
+      }
+      if (ts.isExpressionStatement(up) || (ts.isVoidExpression(up) && ts.isExpressionStatement(up.parent))) {
+        return { kind: "intrinsic", name: "promise.allSettled", args: [entries], type: { kind: "promise", inner: VOID }, loc };
+      }
+      const mapped = L.mapTypeOf(L.typeOf(call));
+      const inner = entries.type.elem.inner;
+      // A uniform array LITERAL lands on the checker's tuple overload
+      // (Promise<[PromiseSettledResult<T>, ...]>): with one shared T the
+      // tuple IS an array of that one element record union (the
+      // Promise.all literal stance).
+      let resultT = mapped;
+      if (mapped?.kind === "promise" && mapped.inner.kind === "record") {
+        const tupleShape = L.shapes.get(mapped.inner.shapeId);
+        const f0 = tupleShape?.tuple === true ? tupleShape.fields[0]?.type : undefined;
+        if (f0 !== undefined && tupleShape!.fields.every((f) => typeEquals(f.type, f0))) {
+          resultT = { kind: "promise", inner: arrayOf(f0) };
+        }
+      }
+      const elemT = resultT?.kind === "promise" && resultT.inner.kind === "array" ? resultT.inner.elem : null;
+      const arms = elemT?.kind === "union" ? (L.unions.get(elemT.unionId)?.arms ?? []) : [];
+      const valueOk = arms.some(
+        (a) => a.kind === "record" && L.shapes.get(a.shapeId)?.fields.some((f) => f.name === "value" && typeEquals(f.type, inner)),
+      );
+      if (resultT?.kind !== "promise" || elemT === null || arms.length !== 2 || !valueOk) {
+        L.noLowering(
+          "Promise.allSettled with this result type",
+          call,
+          inner.kind === "void"
+            ? "the results of Promise<void> entries have no representation — use it as a barrier: await Promise.allSettled(ps);"
+            : "the entries must share ONE promise type — annotate the array (const ps: Promise<T>[] = [...])",
+        );
+      }
+      return { kind: "intrinsic", name: "promise.allSettled", args: [entries], type: resultT, loc };
+    }
+    if (member === "any") {
       L.noLowering(
-        `Promise.${member}`,
+        "Promise.any",
         call,
         "await each element in a loop (Promise.all compiles over a Promise<T>[] array, " +
           "Promise.race over an array literal)",
