@@ -625,7 +625,9 @@ import { regexCrossingChecked } from "./lower-regex.js";
       L.noteEdge(sig.name);
       return {
         kind: "jsMarshal",
-        value: { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc },
+        // (S125 A4: the boxed instance where its parameters are dynamic-arm
+        // slots — Lowerer.jsvalIn's dynboxClosure)
+        value: L.dynbox({ kind: "closure", fnName: sig.name, captures: [], type: funcType, loc }),
         type: JSVAL,
         loc,
       };

@@ -22,7 +22,7 @@ import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReaso
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
-import { armCast, isDynArmSite } from "./dyn-arm.js";
+import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped } from "./lower-builtins.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
@@ -9192,7 +9192,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       if (L.copiesOnCrossing(target)) {
         // Unit U2a (dyn-arm.ts): a cast S125 (c) refused is the dynamic
         // value itself — the dynamic arm.
-        if (isDynArmSite(L, expr) || armCast(L, expr)) return inner;
+        if (isDynArmSite(L, expr) || armCast(L, expr) || armRetCast(L, expr)) return inner;
         // Unit H (SEMANTICS.md S115): typed storage takes an island value
         // only as a copy of a FRESH one.
         if (exitIsConsumedCopy(L, expr, target)) {

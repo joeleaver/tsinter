@@ -106,7 +106,7 @@ import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMs
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
 import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
-import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, requireExactArityValue, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
+import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, dynboxClosure, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, requireExactArityValue, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
 import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
@@ -1211,6 +1211,25 @@ export class Lowerer {
    * them whatever the checker declared. */
   readonly widthSpecInfos = new Map<ts.Node, GenericFnInfo>();
   readonly widthBoundParams = new Set<ts.Symbol>();
+  /** S125 share-vs-copy, A4 (the boxed declared function): a declared
+   * function's declaration and signature by its IR name (lazily indexed). */
+  private declByFnNameIndex: Map<string, { decl: ts.FunctionDeclaration; sig: FnSig }> | null = null;
+  /** A declared function's boxed instances, by instance name (dynboxClosure):
+   * a refusal judged on the instance maps back to the declaration. */
+  readonly dynboxDecls = new Map<string, { decl: ts.FunctionDeclaration; sig: FnSig }>();
+  declByFnName(name: string): { decl: ts.FunctionDeclaration; sig: FnSig } | undefined {
+    const boxed = this.dynboxDecls.get(name);
+    if (boxed !== undefined) return boxed;
+    if (this.declByFnNameIndex === null || !this.declByFnNameIndex.has(name)) {
+      const idx = new Map<string, { decl: ts.FunctionDeclaration; sig: FnSig }>();
+      for (const [sym, sig] of this.fnSigsBySymbol) {
+        const decl = this.checker.declarationsOf(sym).find((d): d is ts.FunctionDeclaration => ts.isFunctionDeclaration(d) && d.body !== undefined);
+        if (decl !== undefined) idx.set(sig.name, { decl, sig });
+      }
+      this.declByFnNameIndex = idx;
+    }
+    return this.declByFnNameIndex.get(name);
+  }
   /** ALIASED-TYPEOF narrowing (npm-static JS — ms's `var type = typeof
    * val; if (type === 'string') ...`): while a branch such a test proves
    * lowers, the tested operand's symbol maps to the proven ARM's checker
@@ -1478,6 +1497,29 @@ export class Lowerer {
       // An argument of a direct call: the callee's per-call-site instance
       // takes the parameter on the arm (widthSpecializedCall).
       (up !== undefined && ts.isCallExpression(up) && ts.isIdentifier(up.expression) && up.arguments.some((a) => a === n || a === node));
+    // S125 A1 (a plain function's result): an exit at a `return` of a plain
+    // function (a declaration or a function literal; not generic, async or
+    // a generator), or at an arrow's expression body — the function's
+    // RESULT takes the dynamic arm in the next pass (a `ret:` site, as a
+    // boxed literal's result does), so every caller receives the shared
+    // value and checks only where it must enter typed storage.
+    const retFn = ((): ts.FunctionLikeDeclaration | null => {
+      let fn: ts.Node | undefined;
+      if (up !== undefined && ts.isReturnStatement(up)) {
+        fn = up.parent;
+        while (fn !== undefined && !ts.isFunctionDeclaration(fn) && !ts.isFunctionExpression(fn) && !ts.isArrowFunction(fn) && !ts.isMethodDeclaration(fn) &&
+          !ts.isConstructorDeclaration(fn) && !ts.isAccessor(fn) && !ts.isClassStaticBlockDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+      } else if (up !== undefined && ts.isArrowFunction(up) && up.body === n) {
+        fn = up;
+      }
+      if (fn === undefined || !(ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn))) return null;
+      if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined || (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
+      return fn;
+    })();
+    if (retFn !== null) {
+      this.dynArmExitNodes.set(exit, `ret:${dynArmKey(retFn)}`);
+      return exit;
+    }
     const key = dynArmKey(n);
     if (contained) this.dynArmExitNodes.set(exit, key);
     // Never a silent width copy where U2 is in play: a copy taken FROM a
@@ -4442,7 +4484,10 @@ export class Lowerer {
     };
   }
 
-  coerceToExpected(expr: IrExpr, expected: IrType): IrExpr {
+  coerceToExpected(expr0: IrExpr, expected: IrType): IrExpr {
+    // S125 A4: a declared function crossing into a dynamic slot boxes its
+    // boxed instance (dynboxClosure).
+    const expr = (expected.kind === "dyn" || expected.kind === "jsval") && expr0.kind === "closure" ? dynboxClosure(this, expr0) : expr0;
     // `await Promise.all([p, q])` / `await Promise.allSettled([p, q])` over
     // a uniform literal: the combinator builds a fresh ARRAY of the one
     // element type (lowerPromiseStaticCall), where the checker types the
@@ -7288,7 +7333,15 @@ export class Lowerer {
     return name;
   }
 
-  jsvalIn(e: IrExpr, node: ts.Node): IrExpr {
+  /** S125 A4: dynboxClosure (lower-calls.ts) for callers outside it. */
+  dynbox(e: IrExpr): IrExpr {
+    return dynboxClosure(this, e);
+  }
+
+  jsvalIn(e0: IrExpr, node: ts.Node): IrExpr {
+    // S125 A4: a declared function boxed into dynamic code boxes its boxed
+    // instance (dynboxClosure) where its parameters are dynamic-arm slots.
+    const e = dynboxClosure(this, e0);
     this.lastHostShallow = false;
     const fresh = this.dynamic && e.type.kind === "func" ? this.checkHostFunctionCopies(node, e.type) : true;
     const shallow = this.lastHostShallow;

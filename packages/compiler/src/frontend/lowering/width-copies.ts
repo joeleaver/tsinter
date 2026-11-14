@@ -3081,6 +3081,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       // The function literal's source parameters (U2a: a refused one takes
       // the dynamic arm in the next pass).
       const srcParams = L.dynArmFnParams.get(name);
+      // (S125 A4: a DECLARED function boxed into dynamic code — its refused
+      // parameter is a `dparam:` site, taken only by the function's boxed
+      // instance, so its direct calls keep the typed parameter.)
+      const declHit = srcParams === undefined ? L.declByFnName(name) : undefined;
       for (const p of f.params) {
         const refs = refsOf(p.type).refs;
         if (refs.length === 0) continue;
@@ -3090,7 +3094,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const transient = !reachFns.suspends && db !== null && !db.uses.includes("other");
         const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
         const sp = srcParams?.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
-        const param = sp !== undefined ? `param:${dynArmKey(sp)}` : undefined;
+        const dp = declHit?.decl.parameters.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken && !q.initializer);
+        const param = sp !== undefined ? `param:${dynArmKey(sp)}` : dp !== undefined ? `dparam:${dynArmKey(dp)}` : undefined;
         const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         if (typedSideWritten(ps, p.type, null)) return out(COPY_WRITTEN);
         if (anyIdentity(refs)) return out(COPY_IDENTITY);
@@ -3111,7 +3116,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // Unit U2 (dyn-arm.ts): a refused result of a function literal
         // takes the dynamic arm in the next pass, as its parameters do.
         const fnNode = L.dynArmFnNodes.get(name);
-        const param = fnNode !== undefined ? `ret:${dynArmKey(fnNode)}` : undefined;
+        // (S125 A4: a declared function's result — a `dret:` site, taken by
+        // its boxed instance only)
+        const param = fnNode !== undefined ? `ret:${dynArmKey(fnNode)}` : declHit !== undefined ? `dret:${dynArmKey(declHit.decl)}` : undefined;
         const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         for (const v0 of rets) {
           const v = unwrap(v0);
@@ -3243,7 +3250,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // (TypeScript sources only: a JavaScript source keeps U1b's
         // checked-dynamic storage wherever its program builds.)
         const k = s.dir === "out" ? L.dynArmExitNodes.get(s.node as object) : undefined;
-        if (k !== undefined && !isJsSourceFileName(k.replace(/:\d+:\d+$/, ""))) L.dynArmSoft.add(k);
+        if (k !== undefined && !k.startsWith("ret:") && !isJsSourceFileName(k.replace(/:\d+:\d+$/, ""))) L.dynArmSoft.add(k);
         continue;
       }
       // Unit U2a (dyn-arm.ts): a refused crossing at a contained slot

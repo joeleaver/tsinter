@@ -10589,6 +10589,29 @@ slot by copy. **Tested by:** `packages/compiler/test/wasm-dyn-copies.test.ts`
 and `wasm-u1-shared-dynamic.test.ts` (the rows that refused before U2 now
 equal Node), `wasm-u2-maybe-dynamic.test.ts`.
 
+**Amendment (S125 share-vs-copy, paperclip slice A — wasm and
+wasm-native): two more slots share instead of copying.** Each is a
+contained slot of S128's dynamic arm, taken only where this entry's (c)
+refused the copy, and falling back to the copy refusal when the arm does
+not build:
+- **A plain function's result.** The result of a plain function (a
+  declaration, or a function literal; not generic, async or a generator)
+  whose `return` would copy a dynamic value into its typed result (the
+  `asRecord` helper, `return value as Record<string, unknown>`) is the
+  dynamic value itself. Every direct caller receives the shared object and
+  checks it only where it must enter typed storage. A cast whose value is
+  returned there is no conversion. A caller that stores the result into a
+  field or element keeps the refusal, because fields never take the arm.
+- **A declared function handed to dynamic code.** A declared, non-generic,
+  non-async function boxed into a dynamic value (commander's
+  `.option(flag, desc, collect, [])` collector) whose composite parameters
+  or result would be copies boxes a second instance of itself. In that
+  instance those parameters, and the result, hold the dynamic values
+  themselves, so dynamic code and the body share the array. Direct calls
+  from typed code keep the typed function.
+**Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
+both lanes).
+
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
 
 Docs: `docs/design/dynamic-values.md` §4.3 (unit U2; Joe's rulings J1,
@@ -10744,6 +10767,14 @@ to Node and the (a1) fences, on wasm and wasm-native), the converted rows
 of `wasm-any-array-shared.test.ts` (H-EXIT, H-FRESH-02, H-UNK),
 `wasm-dyn-copies.test.ts`, `wasm-u1-shared-dynamic.test.ts` and (the result amendment) `wasm-js-copies-slots.test.ts`. Measured
 against Node v24.18.1.
+
+**Amendment (S125 share-vs-copy — the boxed declared function).** A
+declared function whose boxed instance carries dynamic-arm parameters or
+result (S125's amendment) is, for dynamic code, that instance: the same
+body lowered again with those slots `any`, through S125 (a)'s per-call-site
+instance machinery. Its direct calls name the typed original. Both
+instances run the same source, so the program cannot tell them apart;
+only the representation of the parameter differs.
 
 ## S129 — An import of a Node builtin this build does not serve binds stubs: the program runs until it first touches one, and stops there by name *(every lane; tested on wasm and wasm-native)*
 
