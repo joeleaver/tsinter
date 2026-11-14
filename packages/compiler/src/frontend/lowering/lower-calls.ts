@@ -854,6 +854,10 @@ export interface GenericInstance {
     // arithmetic over `any`, in a program that can hold a bigint, returns
     // the dynamic value (number or bigint).
     if (returnWidens(L, decl)) return L.mapTypeOf(L.checker.getAnyType())!;
+    // GH #204 (lower-objmodel.ts collectWidenedArrays): a JavaScript
+    // function returning a widened array binding returns that dynamic
+    // array itself, the same value, no copy.
+    if (L.es5 !== null && L.es5.rets.has(decl)) return DYN;
     // A JS function whose UNANNOTATED return infers a FUNCTION type
     // (test/common's mustCall — tsc infers `() => any` from the wrapper
     // it returns): the inferred arity is the wrapper's spelling, not a

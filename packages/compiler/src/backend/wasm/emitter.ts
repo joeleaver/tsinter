@@ -11688,6 +11688,7 @@ class Assembler {
 
   private get insp(): InspectBuilder {
     this.inspField ??= new InspectBuilder(this.mb, {
+      ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
       ...(this.bigModule ? { big: { bigType: () => this.big.bigType, inspect: () => this.big.inspect() } } : {}),
       strRef: () => this.strRef,
       strType: () => this.strType,

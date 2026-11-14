@@ -113,6 +113,8 @@ export function dynArmParam(L: Lowerer, param: ts.ParameterDeclaration): boolean
  * dynamic code, and the copy its composite result would make there was
  * refused (the result slot is contained like its parameters). */
 export function dynArmResult(L: Lowerer, fn: ts.Node): boolean {
+  // GH #204: a JavaScript function returning a widened array binding.
+  if (L.es5 !== null && L.es5.rets.has(fn)) return true;
   return L.dynArmSites.size > 0 && L.dynArmSites.has(`ret:${dynArmKey(fn)}`);
 }
 

@@ -7,7 +7,7 @@
  * `eval` throw Node's --disallow-code-generation-from-strings EvalError. */
 import * as ts from "../ts7/adapter.js";
 import { PoisonError, fnProtoOfValueNode, nodeThrowExpr, type Lowerer } from "./lowerer.js";
-import { BOOL, DYN, F64, JSVAL, STRING, type IrExpr, type IrStmt, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, JSVAL, STRING, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
 import { isJsSourceFileName } from "../shared.js";
 
@@ -346,6 +346,9 @@ export interface Es5Info {
   ctors: Set<ts.Symbol>;
   syms: Set<ts.Symbol>;
   lits: Set<ts.Node>;
+  /** GH #204: functions returning a widened array binding: their result
+   * is the dynamic value (dyn-arm.ts dynArmResult). */
+  rets: Set<ts.Node>;
 }
 
 const OM_TARGET_MEMBERS = new Set([
@@ -403,7 +406,7 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
   if (!omActive(L)) return null;
   const jsFiles = files.filter((sf) => !sf.isDeclarationFile && isJsSourceFileName(sf.fileName));
   if (jsFiles.length === 0) return null;
-  const info: Es5Info = { ctors: new Set(), syms: new Set(), lits: new Set() };
+  const info: Es5Info = { ctors: new Set(), syms: new Set(), lits: new Set(), rets: new Set() };
   const checker = L.checker;
   const symOf = (e: ts.Expression): ts.Symbol | undefined => {
     const x = strip(e);
@@ -578,8 +581,223 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
       return true;
     });
   }
+  collectWidenedArrays(L, jsFiles, info);
   if (info.ctors.size === 0 && info.syms.size === 0 && info.lits.size === 0) return null;
   return info;
+}
+
+/** GH #204: a JavaScript array binding whose program writes elements of
+ * another kind than the element type the checker inferred from its
+ * literals (moment's `a = (c && ["s", n]) || ["yy", m]; a[2] =
+ * withoutSuffix; a[3] = +x > 0; a[4] = locale`) is the dynamic array, as
+ * a JavaScript `let` assigned an `any` value is the dynamic value
+ * (jsLetAssignedUnion's top): the binding joins `syms` and the fresh
+ * values it is assigned join `lits`, so they build the dynamic array in
+ * place and every use asks the value. Only bindings every assigned value
+ * of which is FRESH (an array literal, or an `&&`/`||`/`??`/`?:` chain
+ * over them) widen: nothing else holds the typed original, so no copy
+ * exists. A binding assigned any other array (an alias) keeps its typed
+ * array and the store's named SC1100 fence. */
+function collectWidenedArrays(L: Lowerer, jsFiles: readonly ts.SourceFile[], info: Es5Info): void {
+  const checker = L.checker;
+  // Per symbol: the right-hand sides written into its elements, and every
+  // value assigned to the binding itself (initializer included).
+  const writes = new Map<ts.Symbol, ts.Expression[]>();
+  const assigned = new Map<ts.Symbol, ts.Expression[]>();
+  const symOfId = (e: ts.Expression): ts.Symbol | undefined => {
+    const x = strip(e);
+    return ts.isIdentifier(x) ? checker.getSymbolAtLocation(x) : undefined;
+  };
+  const push = <K, V>(m: Map<K, V[]>, k: K, v: V): void => {
+    const l = m.get(k);
+    if (l === undefined) m.set(k, [v]);
+    else l.push(v);
+  };
+  const ELEM_WRITERS: Record<string, number> = { push: 0, unshift: 0, fill: 0, splice: 2 };
+  const widened = new Set<ts.Symbol>();
+  let dynResultCall: (x: ts.Expression) => boolean = () => false;
+  const unseen = new Set<ts.Symbol>();
+  /** An identifier written other than by a plain `x = v`. */
+  const otherWrite = (n: ts.Identifier): boolean => {
+    let top: ts.Node = n;
+    for (;;) {
+      const q = top.parent;
+      if (q !== undefined && (ts.isParenthesizedExpression(q) || ts.isArrayLiteralExpression(q) || ts.isObjectLiteralExpression(q) ||
+        ts.isPropertyAssignment(q) || ts.isShorthandPropertyAssignment(q) || ts.isSpreadElement(q) || ts.isSpreadAssignment(q))) {
+        top = q;
+        continue;
+      }
+      break;
+    }
+    const q = top.parent;
+    if (q === undefined) return false;
+    if (ts.isBinaryExpression(q) && q.left === top && ASSIGN_OPS.has(q.operatorToken.kind)) {
+      return top !== n || q.operatorToken.kind !== ts.SyntaxKind.EqualsToken;
+    }
+    if ((ts.isPrefixUnaryExpression(q) || ts.isPostfixUnaryExpression(q)) &&
+      (q.operator === ts.SyntaxKind.PlusPlusToken || q.operator === ts.SyntaxKind.MinusMinusToken)) return true;
+    if ((ts.isForOfStatement(q) || ts.isForInStatement(q)) && q.initializer === top) return true;
+    // A binding pattern element declaring it.
+    return ts.isBindingElement(q) && q.name === top;
+  };
+  const K = ts.SyntaxKind;
+  const ASSIGN_OPS = new Set<ts.SyntaxKind>([
+    K.EqualsToken, K.PlusEqualsToken, K.MinusEqualsToken, K.AsteriskEqualsToken, K.AsteriskAsteriskEqualsToken,
+    K.SlashEqualsToken, K.PercentEqualsToken, K.LessThanLessThanEqualsToken, K.GreaterThanGreaterThanEqualsToken,
+    K.GreaterThanGreaterThanGreaterThanEqualsToken, K.AmpersandEqualsToken, K.BarEqualsToken, K.CaretEqualsToken,
+    K.AmpersandAmpersandEqualsToken, K.BarBarEqualsToken, K.QuestionQuestionEqualsToken,
+  ]);
+  for (const sf of jsFiles) {
+    walk(sf, (n) => {
+      if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind)) {
+        const left = strip(n.left);
+        if (ts.isElementAccessExpression(left)) {
+          const s = symOfId(left.expression);
+          // A compound write stores the operator's result.
+          if (s !== undefined) push(writes, s, n.operatorToken.kind === ts.SyntaxKind.EqualsToken ? n.right : n);
+        } else if (ts.isIdentifier(left) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          const s = checker.getSymbolAtLocation(left);
+          if (s !== undefined) push(assigned, s, n.right);
+        }
+      } else if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) {
+        const from = ELEM_WRITERS[n.expression.name.text];
+        if (from !== undefined) {
+          const s = symOfId(n.expression.expression);
+          if (s !== undefined) {
+            const args = n.expression.name.text === "fill" ? n.arguments.slice(0, 1) : n.arguments.slice(from);
+            for (const a of args) push(writes, s, ts.isSpreadElement(a) ? n : a);
+          }
+        }
+      } else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer !== undefined) {
+        const s = checker.getSymbolAtLocation(n.name);
+        if (s !== undefined) push(assigned, s, n.initializer);
+      } else if (ts.isIdentifier(n) && otherWrite(n)) {
+        // Written some other way (a destructuring target, a for-in/of head,
+        // `++`, a compound assignment): its values are not all seen.
+        const s = checker.getSymbolAtLocation(n);
+        if (s !== undefined) unseen.add(s);
+      }
+      return true;
+    });
+  }
+  /** Collects the fresh-array nodes of a value (the literals and the
+   * chain nodes over them) into `out`; false when the value may be an
+   * array someone else holds. A non-array operand (a `&&` test, a falsy
+   * left) adds nothing. */
+  const freshNodes = (e: ts.Expression, out: ts.Node[]): boolean => {
+    const x = strip(e);
+    if (dynResultCall(x)) return true;
+    if (x !== e) out.push(e);
+    if (ts.isArrayLiteralExpression(x)) {
+      if (x.elements.some((el) => ts.isSpreadElement(el))) return false;
+      out.push(x);
+      return true;
+    }
+    if (ts.isConditionalExpression(x)) {
+      out.push(x);
+      return freshOrScalar(x.whenTrue, out) && freshOrScalar(x.whenFalse, out);
+    }
+    if (ts.isBinaryExpression(x)) {
+      const k = x.operatorToken.kind;
+      if (k === ts.SyntaxKind.AmpersandAmpersandToken) {
+        // `t && [..]`: the left is the value only when falsy — no array.
+        out.push(x);
+        return freshOrScalar(x.right, out);
+      }
+      if (k === ts.SyntaxKind.BarBarToken || k === ts.SyntaxKind.QuestionQuestionToken) {
+        out.push(x);
+        return freshOrScalar(x.left, out) && freshOrScalar(x.right, out);
+      }
+    }
+    return false;
+  };
+  const freshOrScalar = (e: ts.Expression, out: ts.Node[]): boolean => {
+    const x = strip(e);
+    if (dynResultCall(x)) return true;
+    if (ts.isArrayLiteralExpression(x) || ts.isConditionalExpression(x) ||
+        (ts.isBinaryExpression(x) && (x.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+          x.operatorToken.kind === ts.SyntaxKind.BarBarToken || x.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken))) {
+      return freshNodes(e, out);
+    }
+    // A value of no object type is no array anyone holds.
+    const t = checker.getTypeAtLocation(x);
+    const parts = t.isUnionType() ? t.getTypes() : [t];
+    return parts.every((p) => (p.flags & (ts.TypeFlags.Object | ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) === 0);
+  };
+  const fits = (r: IrType | null, elem: IrType): boolean => {
+    if (r === null) return false;
+    if (typeEquals(r, elem)) return true;
+    if (elem.kind !== "union") return false;
+    const arms = L.unions.get(elem.unionId)?.arms ?? [];
+    const rArms = r.kind === "union" ? L.unions.get(r.unionId)?.arms ?? [] : [r];
+    return rArms.length > 0 && rArms.every((a) => arms.some((b) => typeEquals(a, b)));
+  };
+  // Returns, per binding: a function returning a widened binding returns
+  // the dynamic value (its inferred array type is no storage the value
+  // fits).
+  const returnsOf = new Map<ts.Symbol, ts.Node[]>();
+  for (const sf of jsFiles) {
+    walk(sf, (n) => {
+      if (ts.isReturnStatement(n) && n.expression !== undefined) {
+        const s = symOfId(n.expression);
+        let fn: ts.Node | undefined = n.parent;
+        while (fn !== undefined && !ts.isFunctionLike(fn)) fn = fn.parent;
+        if (s !== undefined && fn !== undefined) push(returnsOf, s, fn);
+      }
+      return true;
+    });
+  }
+  /** A call of a function whose result is already the dynamic value: the
+   * binding shares it, no copy. */
+  dynResultCall = (x: ts.Expression): boolean => ts.isCallExpression(x) && retsCall(L, info, x);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [s, vals0] of assigned) {
+      const ws = writes.get(s) ?? [];
+      if (widened.has(s) || info.syms.has(s) || info.ctors.has(s) || unseen.has(s)) continue;
+      const decls = checker.declarationsOf(s);
+      if (decls.length === 0 || !decls.every((d) => ts.isVariableDeclaration(d) && ts.isIdentifier(d.name) && isJsSourceFileName(d.getSourceFile().fileName) &&
+        ts.isVariableDeclarationList(d.parent) && (ts.isVariableStatement(d.parent.parent) || (ts.isForStatement(d.parent.parent) && d.parent.parent.initializer === d.parent)))) continue;
+      // A JSDoc `@type` is the program's own claim: it stays.
+      if (decls.some((d) => {
+        const stmt = d.parent.parent;
+        const text = stmt.getSourceFile().text;
+        return /@type\b/.test(text.slice(stmt.pos, stmt.getStart()));
+      })) continue;
+      let mapped: IrType | null = null;
+      try {
+        mapped = L.mapTypeOf(checker.getTypeAtLocation((decls[0] as ts.VariableDeclaration).name));
+      } catch {
+        mapped = null;
+      }
+      if (mapped?.kind !== "array") continue;
+      const elem = mapped.elem;
+      const widen = ws.some((w) => {
+        let r: IrType | null = null;
+        try {
+          r = L.mapTypeOf(checker.getTypeAtLocation(w));
+        } catch {
+          r = null;
+        }
+        return !fits(r, elem);
+      });
+      // A binding assigned the dynamic array a function returns holds that
+      // same value (no copy), written or not.
+      const holdsDynResult = vals0.some((v) => dynResultCall(strip(v)));
+      if (!widen && !holdsDynResult) continue;
+      const nodes: ts.Node[] = [];
+      const vals = vals0;
+      if (vals.length === 0 || !vals.every((v) => freshNodes(v, nodes))) continue;
+      info.syms.add(s);
+      // Element and member reads, calls and operators over it take the
+      // dynamic arm (dyn-arm.ts armRooted): the value is asked at run time.
+      L.dynArmSyms.add(s);
+      for (const x of nodes) info.lits.add(x);
+      widened.add(s);
+      for (const fn of returnsOf.get(s) ?? []) info.rets.add(fn);
+      changed = true;
+    }
+  }
 }
 
 /** Lowerer.typeOf's ES5 answer: `any` for a dynamic binding's references
@@ -598,6 +816,19 @@ export function es5TypeOf(L: Lowerer, info: Es5Info, node: ts.Node): ts.Type | n
     }
   }
   if (info.lits.has(node)) return L.checker.getAnyType();
+  // GH #204: the call of a function returning a widened array binding is
+  // that dynamic array, and so is a member or element read, or a method
+  // call, rooted at it (`h(true)[2]`).
+  if (info.rets.size > 0 && ts.isExpression(node)) {
+    let x: ts.Expression = node;
+    for (;;) {
+      x = strip(x);
+      if (ts.isPropertyAccessExpression(x) || ts.isElementAccessExpression(x)) x = x.expression;
+      else if (ts.isCallExpression(x) && !retsCall(L, info, x) && (ts.isPropertyAccessExpression(strip(x.expression)) || ts.isElementAccessExpression(strip(x.expression)))) x = strip(x.expression);
+      else break;
+    }
+    if (ts.isCallExpression(x) && retsCall(L, info, x)) return L.checker.getAnyType();
+  }
   // In a program the object model reaches, a JavaScript value of the
   // empty object-literal type (`{}` built and filled dynamically, or the
   // result of Object.defineProperties({}, ...)) is a dynamic object.
@@ -617,4 +848,15 @@ export function es5TypeOf(L: Lowerer, info: Es5Info, node: ts.Node): ts.Type | n
     if (sym !== undefined && info.ctors.has(sym)) return L.checker.getAnyType();
   }
   return null;
+}
+
+/** Is `call` a call of a function returning a widened array binding (by
+ * its name, a function declaration or a `var f = function` binding)? */
+export function retsCall(L: Lowerer, info: Es5Info, call: ts.CallExpression): boolean {
+  const callee = strip(call.expression);
+  if (!ts.isIdentifier(callee)) return false;
+  const fs = L.checker.getSymbolAtLocation(callee);
+  if (fs === undefined) return false;
+  return L.checker.declarationsOf(fs).some((d) => info.rets.has(d) ||
+    (ts.isVariableDeclaration(d) && d.initializer !== undefined && info.rets.has(strip(d.initializer))));
 }
