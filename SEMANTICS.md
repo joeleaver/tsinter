@@ -1282,6 +1282,34 @@ padding is a KNOWN SILENT divergence for every hole observer (`forEach`,
 own members here and holes in Node. It is to be replaced by real holes in
 unit U3. **Tested by:** the wasm emitter's S016 row.
 
+**Amendment (symbol keys, step A — wasm and wasm-native): the reserved
+symbol-key prefix.** A dynamic object stores a symbol-keyed property under
+a reserved string key: U+D800 '@' '@' '#' and the symbol's id as two code
+units (a well-known symbol's key, and the error mirror's own-name marker,
+U+D800 '@' '@' then a name). String-key listings (`Object.keys`, JSON,
+for-in, `getOwnPropertyNames`) skip these keys; symbol listings
+(`Object.getOwnPropertySymbols`, `Object.assign`, inspect) show them after
+the string keys, as Node orders them. So that no program string can alias
+a symbol's property, a program key spelled with the prefix stops by name
+("a property key beginning with U+D800 '@@' (the form this build reserves
+for symbol keys) is not supported yet"), where Node has an ordinary string
+key: a program string LITERAL beginning with it refuses at compile time,
+anywhere in the whole program (every module, npm and JavaScript sources
+included); a string the program builds at run time stops where the object
+store appends or looks up a key (every route: keyed reads and writes, `in`,
+delete, JSON.parse, `Object.defineProperty(ies)`,
+`Object.getOwnPropertyDescriptor`), which admits a reserved key only when it
+IS a key this build made (a symbol's key string itself, by identity; an
+internal named key). The check exists only in a program that uses symbols
+or holds a reserved key. A key that merely starts with a lone surrogate
+(`'\uD800abc'`) is an ordinary string key. Also still named stops, each
+pinned by a row: `Object.getOwnPropertySymbols` over an object with a
+non-enumerable symbol-keyed property; converting a symbol to a string
+(`String(sym)`, `sym.toString()`, a template); symbol reads off a copy the
+checker types as a static record; an object rest over a dynamic source; a
+symbol inside a mixed array literal. **Tested by:**
+`packages/compiler/test/wasm-symbol-keys.test.ts` (SYMK-*, both lanes).
+
 ## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
 
 V8's not-iterable TypeError names the source expression whenever it can
@@ -10744,6 +10772,16 @@ to Node and the (a1) fences, on wasm and wasm-native), the converted rows
 of `wasm-any-array-shared.test.ts` (H-EXIT, H-FRESH-02, H-UNK),
 `wasm-dyn-copies.test.ts`, `wasm-u1-shared-dynamic.test.ts` and (the result amendment) `wasm-js-copies-slots.test.ts`. Measured
 against Node v24.18.1.
+
+**Amendment (symbol keys, step A — wasm and wasm-native): a switch over a
+checked-dynamic value.** A `switch` whose discriminant is a checked-dynamic
+value (a JavaScript source's `any`) and whose cases are all string literals,
+or all number literals, switches on the typed value under the dynamic-arm
+rule above: a value of another kind takes a sentinel no case equals, so the
+default runs — exactly Node's strict equality. Other case shapes keep the
+named stop ("switch statements on 'unknown' values"). **Tested by:**
+`packages/compiler/test/wasm-symbol-keys.test.ts` (SYMK-01: stream-chain's
+normalizeMany) and SYMK-SW.
 
 ## S129 — An import of a Node builtin this build does not serve binds stubs: the program runs until it first touches one, and stops there by name *(every lane; tested on wasm and wasm-native)*
 

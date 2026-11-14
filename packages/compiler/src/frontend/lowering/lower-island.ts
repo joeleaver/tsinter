@@ -12,7 +12,7 @@ import { isDtsMirrorPath } from "../npm-static.js";
 import { classLiftIn } from "./class-views.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
-import { PoisonError, jsFuncNameOf, newFnCtx, own } from "./lowerer.js";
+import { PoisonError, esFuncNameOf, newFnCtx, own } from "./lowerer.js";
 import { regexCrossingChecked } from "./lower-regex.js";
 
 /** True iff the checker's type for this node maps to jsval ('any') —
@@ -228,7 +228,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
       L.unsupported("SC1090", node, boundaryIntoIslandMsg(L.fmt(e.type)));
     }
     // U1a: a marshaled function carries its binding's spelling (S020).
-    const fnName = L.sharedDynamic && e.type.kind === "func" ? jsFuncNameOf(node) : null;
+    const fnName = L.sharedDynamic && e.type.kind === "func" ? esFuncNameOf(L, node) : null;
     return { kind: "jsMarshal", value: e, ...(fnName !== null ? { fnName } : {}), type: JSVAL, loc: e.loc };
   }
 

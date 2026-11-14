@@ -3811,6 +3811,17 @@ export type IrLibFn =
    * is one when its class sits inside C's preorder interval. args are the
    * dyn and C's IR class name as a string literal. Never throws. */
   | "dyn.errInstanceofClass"
+  /** A symbol's property key (WasmGC lanes): its reserved string (dyn.ts /
+   * symbols.ts keyStr) — `o[sym]` reads and writes it through the string
+   * key machinery. */
+  | "sym.keyStr"
+  /** A program's runtime string property key on a dynamic receiver: a key
+   * spelled with a symbol's reserved prefix stops by name (dyn.ts
+   * keyGuard); any other key passes through. */
+  | "dyn.keyGuard"
+  /** Object.getOwnPropertySymbols over a dynamic value: its symbol-keyed
+   * own properties' symbols, in insertion order (dyn.ts ownSymbols). */
+  | "dyn.ownSymbols"
   /** `Error.captureStackTrace(e)` over a typed error (WasmGC lanes): a
    * `stack` a dynamic write gave its encoding reads as undefined again.
    * Never throws. */

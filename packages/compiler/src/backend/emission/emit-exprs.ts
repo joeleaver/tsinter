@@ -6340,6 +6340,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "om.isIntegrity":
           case "om.delete":
           case "dyn.errInstanceofClass":
+          case "sym.keyStr":
+          case "dyn.keyGuard":
+          case "dyn.ownSymbols":
           case "error.stackReset":
           case "om.forInKeys":
           case "om.objectProto":

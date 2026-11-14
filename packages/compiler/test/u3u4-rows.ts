@@ -19,6 +19,8 @@ export interface Row {
   src: string;
   /** The entry's file name (main.js unless set). */
   entry?: string;
+  /** Other modules, written beside the entry (name → source). */
+  files?: Record<string, string>;
   nodeArgs?: string[];
   /** The program ends with an uncaught error: stdout and the exit code
    * match Node, and stderr is S007's one-line rendering of the error Node
@@ -64,6 +66,7 @@ export function defineRows(title: string, rows: Row[]): void {
     mkdirSync(dir, { recursive: true });
     const entry = join(dir, row.entry ?? "main.js");
     writeFileSync(entry, row.src + "\n");
+    for (const [name, src] of Object.entries(row.files ?? {})) writeFileSync(join(dir, name), src + "\n");
     const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
     if (row.refused !== undefined) {
       expect(res.ok).toBe(false);
