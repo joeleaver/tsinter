@@ -5031,7 +5031,10 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
     // without the engine — U1b: the callee is the checked-dynamic value,
     // so construction takes the JS lane's own paths below, as on main —
     // a CJS export member's class value, the named fence otherwise.)
-    if (L.isIslandExpr(expr.expression) && !(L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile()))) {
+    // (A builtin error class keeps its own construction below, though the
+    // object model types it as a dynamic value: units U3 + U4.)
+    const builtinErrorCallee = ts.isIdentifier(expr.expression) && L.builtinErrorInfoOf(L.resolveValueSymbol(expr.expression)) !== null;
+    if (!builtinErrorCallee && L.isIslandExpr(expr.expression) && !(L.sharedDynamic && !L.engine && isJsSourceFile(expr.getSourceFile()))) {
       const callee = L.lowerExpr(expr.expression);
       const args = (expr.arguments ?? []).map((a) => L.jsvalIn(L.lowerExpr(a), a));
       return { kind: "jsOp", op: "construct", args: [callee, ...args], type: JSVAL, loc };

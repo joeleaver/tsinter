@@ -9111,6 +9111,44 @@ H-INSPECT-01, H-VIEW-INSPECT ((e) for views); `tests/harness/dyncheck.test.ts`
 ((e)); the `wasm-emitter.test.ts` jsExit pin ((d)). Measured against Node
 v24.18.1.
 
+**U3+U4 amendment (2026-11-12): `Error.captureStackTrace` in tsinter's
+own dynamic world (wasm and wasm-native).** When a JavaScript program
+takes `Error` as a value (zod 4's `"captureStackTrace" in Error ?
+Error.captureStackTrace(this) : …` shape), `Error.captureStackTrace(o)`
+gives `o` an own `stack` that is V8's header line with no frames: `name`
+(`"Error"` when undefined) and `message` (empty when undefined) joined by
+`": "` when both are non-empty, or an error's own `Name: message`. Node
+writes the same header followed by one `    at …` line per frame (up to
+`Error.stackTraceLimit`), so the two match exactly only where Node runs
+with `Error.stackTraceLimit = 0`. Code that reads the first line, tests
+`"stack" in o`, or never reads it behaves as in Node. The other
+differences:
+- (g1) Node's `stack` is an accessor that formats at its first read.
+  Here it is a writable, configurable, non-enumerable data property,
+  formatted at the capture. A descriptor read sees `value`/`writable`
+  where Node shows `get`/`set`, and a `name` or `message` changed (or a
+  getter that throws) between the capture and the first read acts at
+  the capture.
+- (g2) The second argument (`constructorOpt`, the frame to cut above)
+  has no frames to cut, so it is ignored.
+- (g3) A program that installs its own `Error.prepareStackTrace` stops
+  by name at the next capture (`Error.captureStackTrace after the
+  program set its own Error.prepareStackTrace is not supported yet`),
+  and calling the stand-in `Error.prepareStackTrace` stops by name
+  (`calling Error.prepareStackTrace is not supported yet`). Reading,
+  saving, clearing to `undefined` and restoring it run as in Node.
+  `Error.stackTraceLimit` reads 10 and takes writes, which change
+  nothing here, since no frames are written.
+- (g4) A non-object argument throws Node's `TypeError: invalid_argument`.
+  A statically typed class instance argument (`Error.captureStackTrace(this)`
+  in a TypeScript class) keeps its existing refusal; this applies only to
+  dynamic objects.
+**Why:** Joe's U3+U4 follow-up (lead, 2026-11-11): zod and the libraries
+like it capture stacks in their error constructors. No frames exist to
+print, and a fence there would stop every such library at its first error.
+**Tested by:** `packages/compiler/test/wasm-u3u4-builtins.test.ts`
+U34B-ERR-01, -02, -04 and -05 (wasm and wasm-native, against Node).
+
 ## S115 — a TYPED composite is SHARED with dynamic code (`any` and `unknown` alike) as a live view, whose writes must fit the declared types and shape; a dynamic value enters typed storage only when it is fresh or its own view — every other exit, typed callback parameters and package results included, is refused at compile time *(llvm, c and wasm under `--dynamic`; (c) per lane)*
 
 *GH #86 review amendment (S122): a write through a view that does not fit
