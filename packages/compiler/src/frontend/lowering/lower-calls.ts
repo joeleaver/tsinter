@@ -4471,6 +4471,28 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       }
       return { kind: "callValue", callee, args, type: callee.type.ret, loc };
     }
+    // A member a module added to its computed whole export after the
+    // replacement (`pc.createColors(true)` — Lowerer.computedExportExpando):
+    // a call through that member's own export storage.
+    if (ts.isPropertyAccessExpression(expr.expression) && !expr.questionDotToken && !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+      let callee = L.computedExportExpando(expr.expression);
+      if (callee !== null) {
+        if (callee.type.kind === "dyn") {
+          const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+          return { kind: "dynCall", callee, calleeName: expr.expression.getText(), args, type: DYN, loc };
+        }
+        if (callee.type.kind === "record") callee = L.hybridCallUnwrap(callee);
+        if (callee.type.kind !== "func") L.badType(expr.expression, L.typeOf(expr.expression));
+        const params = callee.type.params;
+        const args = expr.arguments.map((a, i) => L.lowerExprExpecting(a, params[i]));
+        for (let i = args.length; i < params.length; i++) {
+          const absent = omittedArgFor(L, params[i]!, loc);
+          if (!absent) L.unsupported("SC1090", expr, "calls omitting a non-optional parameter of the callee's type");
+          args.push(absent);
+        }
+        return { kind: "callValue", callee, args, type: callee.type.ret, loc };
+      }
+    }
     if (ts.isPropertyAccessExpression(expr.expression)) {
       const intrinsic =
         // Builtin namespace imports first (`fs.readFileSync(...)` where fs

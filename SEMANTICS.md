@@ -11230,6 +11230,39 @@ packages, wasm and wasm-native, against Node);
 `tests/harness/npm-static.test.ts`; the commander workload in
 `tests/real-apps-top10/harness/workloads.json` (nico-top only).
 
+**Amendment (declared values, wasm and wasm-native — picocolors).** A
+package whose declarations say `declare const x: T; export = x` while its
+JavaScript computes the module value (`module.exports = createColors()`,
+then `module.exports.createColors = createColors`):
+
+- (g) The program's binding IS the implementation's value — no crossing at
+  the read, so no copy, and identity holds (`pc === pc` through the
+  declarations). A JavaScript `require` binding of such a module that
+  adds members ((h)) is a checked copy of the value instead (S125), so an
+  identity test on it refuses by name at build time; its member reads are
+  exact. Each MEMBER read reads the value's own member (the
+  implementation's record shape, where it differs from the declared
+  record) and crosses the result into the declared member type, as every
+  property read here does; a call through it crosses its arguments and
+  result likewise.
+- (h) Members the module adds AFTER the replacement (`module.exports.k =
+  v`) keep their own export storage, assigned at that statement; a
+  member read `x.k` reads it. A later member that would OVERWRITE one of
+  the value's own properties keeps the load-time fence ("'module.exports
+  =' with a non-literal value").
+- (i) Because the added members live beside the value, not in it, a use
+  that would see the value WHOLE while its module adds members —
+  enumerating, spreading or serializing it, passing or storing it —
+  refuses by name ("the module value 'pc' used whole while its module
+  adds members to it after 'module.exports = …'"). Member reads and
+  `===`/`!==` tests are exact. A module that adds no members has no such
+  limit: its value is an ordinary typed value.
+**Tested by:** `packages/compiler/test/wasm-top10-paperclip-picocolors.test.ts`
+(the vendored picocolors 1.1.1 under NO_COLOR / FORCE_COLOR set and unset,
+piped stdout; the whole-use refusal);
+`packages/compiler/test/wasm-top10-paperclip-computed-export.test.ts`
+(PC19-03..06, untyped JavaScript requirers).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would

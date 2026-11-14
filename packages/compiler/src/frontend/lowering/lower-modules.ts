@@ -1119,13 +1119,21 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
           // assigned at the statement; an unmappable value takes the JS
           // checked-dynamic fallback like every JS binding.
           // A module that ALSO adds members to it later (`module.exports.k
-          // = v` after the replacement — picocolors' createColors expando)
-          // keeps the load-time fence: the typed value has no slot for them.
+          // = v` after the replacement — picocolors' createColors expando):
+          // each such member keeps its own export storage (assigned at its
+          // statement, the member-export rule) and requirers' `m.k` reads
+          // it (Lowerer.computedExportExpando). A later member that
+          // OVERWRITES one of the value's own properties, or one not named
+          // by a plain identifier, keeps the load-time fence: the value's
+          // field would have to change.
           const computed =
             ts.isCallExpression(rhs) &&
-            !sf.statements.some((s) => {
+            sf.statements.every((s) => {
               const other = cjsExportAssignmentOf(s);
-              return other?.kind === "member" && s.pos > stmt.pos;
+              if (other?.kind !== "member" || s.pos < stmt.pos) return true;
+              if (!ts.isIdentifier(other.name)) return false;
+              const own = L.checker.getPropertiesOfType(L.typeOf(rhs)).map((p) => p.name);
+              return !own.includes(other.name.text);
             });
           if (cjsScalarLiteral(rhs) || fnValued || computed) {
             const diagsBefore = L.diags.length;

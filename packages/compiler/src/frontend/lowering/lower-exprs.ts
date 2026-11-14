@@ -13035,6 +13035,15 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
         // all-unknown-fields cast — `(err as { code?: unknown }).code`):
         // decline, and the dyn keyed-read fallback answers.
         if (obj.type.kind !== "record") return null;
+        // The VALUE's record is not the checker's (a package value typed
+        // by its declarations while the implementation built its own
+        // record — SEMANTICS.md S133): the read uses the value's own
+        // shape; the declared-type crossing applies to the result.
+        if (obj.type.shapeId !== receiverIr.shapeId) {
+          const own = L.shapes.get(obj.type.shapeId)?.fields.find((f) => f.name === access.name.text);
+          if (!own) return null;
+          return { container: "record", obj, shapeId: obj.type.shapeId, field: access.name.text, fieldType: own.type };
+        }
         return { container: "record", obj, shapeId: receiverIr.shapeId, field: access.name.text, fieldType };
       }
       // A RECORD accessor property: either slot present makes the name an
