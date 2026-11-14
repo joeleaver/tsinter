@@ -23,6 +23,17 @@ const big = "0123456789abcdef".repeat(4096) + "é";
 beforeAll(async () => {
   scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-fetch-"));
   server = createServer((req, res) => {
+    if (req.url === "/echo") {
+      // FX-04: the request's method, one header and its body, echoed
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk: string) => { body += chunk; });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(`${req.method} ${String(req.headers["x-a"])} ${body}`);
+      });
+      return;
+    }
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
     res.end(req.url === "/big" ? big : "small");
   });
@@ -51,6 +62,17 @@ test("FX-01 a body larger than the module's first poll buffer: the module grows 
   );
   const run = await runWasm(path);
   expect(run.stdout).toBe(`${big.length} 0123 fé\n`);
+  expect(run.stderr).toBe("");
+  expect(run.exitCode).toBe(0);
+}, 60000);
+
+test("FX-04 a request init built with a leading spread and shorthand properties (`{ ...init, headers, body }`, paperclip's request helper): the spread copies first, the explicit properties win", async () => {
+  const path = await build(
+    "fx04",
+    `async function main(): Promise<void> {\n  const init: RequestInit = { method: "PUT", headers: { "x-a": "old" } };\n  const headers = { "x-a": "new" };\n  const body = "payload";\n  const r = await fetch(${JSON.stringify(base + "/echo")}, { ...init, headers, body });\n  console.log(await r.text());\n  const method = "POST";\n  const r2 = await fetch(${JSON.stringify(base + "/echo")}, { method, body });\n  console.log(await r2.text());\n}\nmain();\n`,
+  );
+  const run = await runWasm(path);
+  expect(run.stdout).toBe("PUT new payload\nPOST undefined payload\n");
   expect(run.stderr).toBe("");
   expect(run.exitCode).toBe(0);
 }, 60000);
