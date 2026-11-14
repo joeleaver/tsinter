@@ -7070,7 +7070,24 @@ export class Lowerer {
     }
     // A class instance crosses as its live view (class-views.ts).
     if (this.sharedDynamic && viewableClass(this, e.type)) return classViewOf(this, e, loc);
-    throw new Error(`lowerer bug: jsvalLiftExpr of unliftable ${e.type.kind}`);
+    // An instance of a class whose own declaration did not compile (its
+    // collection was deferred: Vue's VNode, a DOM-typed field): the class's
+    // own diagnostics say why, and the crossing refuses by name. The value
+    // is still evaluated (its effects), the slot gets a placeholder the
+    // refused build never runs.
+    if (e.type.kind === "object" && this.classes.get(e.type.className) === undefined) {
+      this.flushDeferredClass(e.type.className);
+      const name = e.type.className.replace(/^%m\d+\./, "").replace(/^%/, "");
+      this.pushDiag(unsupportedDiag("SC1090", loc,
+        `a '${name}' instance crossing into dynamic code, whose class does not compile here (its own diagnostics say why)`));
+      return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: e, loc }], result: { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, type: JSVAL, loc };
+    }
+    let why = "";
+    if (e.type.kind === "object") {
+      const info = this.classes.get(e.type.className);
+      why = ` (class ${e.type.className}: ${!this.sharedDynamic ? "not the one-world lowering" : info === undefined ? "no class info" : info.decl === null ? "no declaration" : "a builtin-backed class"})`;
+    }
+    throw new Error(`lowerer bug: jsvalLiftExpr of unliftable ${e.type.kind} '${this.fmt(e.type)}'${why} [at ${locText(this, loc)}]`);
   }
 
   /** Interned `%jsin.union.<n>(u)` — the runtime tag switch marshaling a
@@ -8936,7 +8953,11 @@ export class Lowerer {
   }
 
   lowerStmt(stmt: ts.Statement): IrStmt | IrStmt[] | null {
-    return lowerStmt(this, stmt);
+    try {
+      return lowerStmt(this, stmt);
+    } catch (err) {
+      throw tagLowererBug(err, stmt);
+    }
   }
 
   lowerVarStatement(stmt: ts.VariableStatement): IrStmt[] {
@@ -9279,6 +9300,14 @@ export class Lowerer {
   /* ── expressions ──────────────────────────────────────────────────── */
 
   lowerExpr(expr: ts.Expression): IrExpr {
+    try {
+      return this.lowerExprUntagged(expr);
+    } catch (err) {
+      throw tagLowererBug(err, expr);
+    }
+  }
+
+  private lowerExprUntagged(expr: ts.Expression): IrExpr {
     if (ts.isIdentifier(expr)) this.fenceComputedExportWholeUse(expr);
     const e = ts.isPropertyAccessExpression(expr)
       ? dtsPropertyRead(this, expr, this.computedExportExpando(expr) ?? lowerExpr(this, expr))
@@ -10382,4 +10411,28 @@ export class Lowerer {
     access: ts.PropertyAccessExpression,): IrExpr | null {
     return lowerIslandMethodCall(this, call, access);
   }
+}
+
+/** `file:line:col` of a lowering location (1-based), for internal-error
+ * messages. */
+export function locText(L: Lowerer, loc: SrcLoc): string {
+  const sf = L.program.getSourceFile(loc.file);
+  if (sf === undefined) return `${loc.file}@${loc.start}`;
+  const lc = ts.getLineAndCharacterOfPosition(sf, loc.start);
+  return `${loc.file}:${lc.line + 1}:${lc.character + 1}`;
+}
+
+/** A "lowerer bug" thrown while lowering `node`: its message gains the
+ * innermost source position being lowered (once), so an internal error
+ * names the construct that tripped it. Other errors pass unchanged. */
+function tagLowererBug(err: unknown, node: ts.Node): unknown {
+  if (!(err instanceof Error) || !err.message.startsWith("lowerer bug") || err.message.includes(" [at ")) return err;
+  try {
+    const sf = node.getSourceFile();
+    const lc = ts.getLineAndCharacterOfPosition(sf, node.getStart());
+    err.message += ` [at ${sf.fileName}:${lc.line + 1}:${lc.character + 1}]`;
+  } catch {
+    // a synthesized node: no position to add
+  }
+  return err;
 }
