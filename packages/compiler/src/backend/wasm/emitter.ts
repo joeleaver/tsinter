@@ -81,6 +81,7 @@ import {
   REF_TRUTHY_KINDS,
   keyedReadRecv,
   moduleUsesBigint,
+  moduleUsesSymbol,
   type IrWasmLib,
   type IrWasmLibClass,
 } from "../../ir/nodes.js";
@@ -643,6 +644,28 @@ function valKey(t: ValType): string {
  * set is the whole subtree. Those edges are spelled out below, off the
  * shared class graph — miss one and a constructor or an override body
  * silently never lands. */
+/** Does the IR spell a string literal with the reserved symbol-key prefix
+ * (U+D800 '@@': a well-known symbol's key, U3's Symbol.hasInstance)? */
+function irHasReservedKeyLit(mod: WModule): boolean {
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const x of v) visit(x);
+      return;
+    }
+    const n = v as { kind?: unknown; value?: unknown };
+    if (n.kind === "strLit" && typeof n.value === "string" && n.value.startsWith("\uD800@@")) {
+      found = true;
+      return;
+    }
+    for (const x of Object.values(v)) visit(x);
+  };
+  visit(mod.functions);
+  visit(mod.globals);
+  return found;
+}
+
 function reachableFunctionNames(mod: WModule): Set<string> {
   const names = new Set(mod.functions.map((f) => f.name));
   const byName = new Map(mod.functions.map((f) => [f.name, f]));
@@ -3211,6 +3234,22 @@ class Assembler {
   /** The module carries a bigint (moduleUsesBigint): the dynamic world
    * gets its BIGINT kind's arms. */
   private readonly bigModule: boolean;
+  /** The module holds a symbol (nodes.ts moduleUsesSymbol): dyn.ts boxes
+   * symbols (DK.SYMBOL) and keys properties by them. */
+  private readonly symModule: boolean;
+  /** A property key can be a symbol's reserved string here (a symbol, or
+   * a well-known symbol's reserved key such as U3's Symbol.hasInstance):
+   * every runtime key of a dynamic keyed read, write, `in` and delete is
+   * checked against the reserved prefix (dyn.ts keyGuard). */
+  private readonly reservedKeysLive: boolean;
+
+  /** After the key `k` was walked (top of stack): the reserved-prefix
+   * check, unless the key is a literal or a symbol's own key. */
+  private guardDynKeyTop(k: IrExpr, code: Code = this.fn.code): void {
+    if (!this.reservedKeysLive || k.kind === "strLit") return;
+    if (k.kind === "libCall" && k.fn === "sym.keyStr") return;
+    code.call(this.dyn.keyGuard());
+  }
   /** INC-29 U1: the module reaches cp.spawn / cp.spawnOpts (the INC-28 U2
    * event-module condition, before net joined it). */
   private readonly cpEventModule: boolean;
@@ -3592,6 +3631,8 @@ class Assembler {
     this.cpEventModule = eventModuleReachable(mod);
     this.netModule = netMod;
     this.bigModule = moduleUsesBigint(asIrModule(mod));
+    this.symModule = moduleUsesSymbol(asIrModule(mod));
+    this.reservedKeysLive = this.symModule || irHasReservedKeyLit(mod);
     this.closeOverride = closeOverrideReachable(mod);
     this.httpModule = httpModuleReachable(mod);
     // INC-29 U1: a net module is an event module too; units G1-G3: so is a
@@ -4032,6 +4073,7 @@ class Assembler {
       }
       case "om.delete":
         walk();
+        this.guardDynKeyTop(e.args[1]!, code);
         if ((e as { sloppy?: boolean }).sloppy === true) {
           code.i32Const(1);
           code.globalSet(om.sloppyGlobal());
@@ -6977,6 +7019,16 @@ class Assembler {
     c.localGet(I);
     c.arrayGet(dyn.entriesArrayType());
     c.localSet(EN);
+    // Symbol keys (SEMANTICS.md S016's symbol-keys amendment): Node's
+    // structured clone copies string keys only — a symbol-keyed property
+    // (a reserved-prefix key) is dropped, at every depth.
+    if (dyn.symLive) {
+      c.localGet(EN);
+      c.structGet(dyn.entryT(), ENTRY_KEY);
+      c.call(dyn.reservedKey());
+      c.i32Eqz();
+      c.ifVoid();
+    }
     c.localGet(EN);
     c.structGet(dyn.entryT(), ENTRY_VALUE);
     if (dyn.accessorsLive) {
@@ -7012,6 +7064,7 @@ class Assembler {
     c.structGet(dyn.entryT(), ENTRY_KEY);
     c.localGet(V);
     c.call(dyn.objPut());
+    if (dyn.symLive) c.end();
     c.localGet(I);
     c.i32Const(1);
     c.i32Add();
@@ -12010,6 +12063,18 @@ class Assembler {
   private get dyn(): DynBuilder {
     this.dynField ??= new DynBuilder(this.mb, {
       idSlot: this.idKeys,
+      ...(this.symModule
+        ? {
+            sym: {
+              symType: () => this.syms.structType(),
+              toStr: () => this.syms.toStringHelper(),
+              descField: () => this.syms.descField(),
+              keyStr: () => this.syms.keyStr(),
+              fromKey: () => this.syms.fromKey(),
+              isGenuineKey: () => this.syms.isGenuineKey(),
+            },
+          }
+        : {}),
       ...(this.bigModule
         ? {
             big: {
@@ -12241,6 +12306,8 @@ class Assembler {
         : {}),
     });
     if (this.globalBoxLive) this.dynField.globalBoxLive = true;
+    // the object store's reserved-key check (dyn.storeKeyGuard)
+    if (this.reservedKeysLive) this.dynField.storeGuardLive = true;
     return this.dynField;
   }
 
@@ -18444,6 +18511,9 @@ class Assembler {
       case "bigint":
         dyn.boxBig(c, (x) => x.localGet(0));
         return true;
+      case "symbol":
+        dyn.boxSym(c, (x) => x.localGet(0));
+        return true;
       case "bool":
         dyn.boxBool(c, (x) => x.localGet(0));
         return true;
@@ -19515,6 +19585,9 @@ class Assembler {
       case "bigint":
         this.emitKindIs(c, DK.BIGINT);
         return true;
+      case "symbol":
+        this.emitKindIs(c, DK.SYMBOL);
+        return true;
       case "string":
         this.emitKindIs(c, DK.STR);
         return true;
@@ -19785,6 +19858,9 @@ class Assembler {
         return true;
       case "bigint":
         this.emitKindIs(c, DK.BIGINT);
+        return true;
+      case "symbol":
+        this.emitKindIs(c, DK.SYMBOL);
         return true;
       case "string":
         this.emitKindIs(c, DK.STR);
@@ -20203,6 +20279,12 @@ class Assembler {
         c.localGet(0);
         c.structGet(dyn.dynT(), DYN_REF);
         c.refCast(this.big.bigType);
+        return true;
+      case "symbol":
+        kindGuard(DK.SYMBOL);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(this.syms.structType());
         return true;
       case "bool":
         kindGuard(DK.BOOL);
@@ -26295,6 +26377,7 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             code.localSet(d);
             this.walkExpr(e.args[1]!);
+            this.guardDynKeyTop(e.args[1]!);
             code.localSet(k);
             this.walkExpr(e.args[2]!);
             code.localSet(v);
@@ -26331,6 +26414,7 @@ class Assembler {
           }
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
+          this.guardDynKeyTop(e.args[1]!);
           this.walkExpr(e.args[2]!);
           code.call((e as { sloppy?: boolean }).sloppy === true ? this.dyn.sloppySet("keySet") : this.dyn.keySet());
           this.emitPendingCheck();
@@ -26339,6 +26423,7 @@ class Assembler {
         if (e.fn === "dyn.hasOwn") {
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
+          this.guardDynKeyTop(e.args[1]!);
           code.call(this.dyn.hasOwn());
           this.emitPendingCheck();
           return;
@@ -26361,6 +26446,7 @@ class Assembler {
           const d = this.acquireScratch(this.dyn.dynRef());
           const k = this.acquireScratch(this.strRef);
           this.walkExpr(e.args[1]!);
+          this.guardDynKeyTop(e.args[1]!);
           code.localSet(k);
           this.walkExpr(e.args[0]!);
           code.localSet(d);
@@ -26497,6 +26583,21 @@ class Assembler {
           );
           code.refNull(this.dyn.dynT());
           this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "sym.keyStr") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.syms.keyStr());
+          return;
+        }
+        if (e.fn === "dyn.keyGuard") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.dyn.keyGuard());
+          return;
+        }
+        if (e.fn === "dyn.ownSymbols") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.dyn.ownSymbols());
           return;
         }
         if (e.fn === "error.stackReset") {
@@ -31135,6 +31236,10 @@ class Assembler {
           case "f64":
             this.dyn.boxNum(code, () => this.walkExpr(e.value));
             return;
+          case "symbol":
+            // a symbol boxes by reference (DK.SYMBOL: identity is the $sym)
+            this.dyn.boxSym(code, () => this.walkExpr(e.value));
+            return;
           case "bool":
             // A literal boxes to the interned instance: BOOL identity is
             // by VALUE (scr_dyn_strict_eq), so sharing is unobservable.
@@ -31359,6 +31464,7 @@ class Assembler {
           return;
         }
         this.walkExpr(e.key);
+        this.guardDynKeyTop(e.key);
         code.i32Const(e.optional === true ? 1 : 0);
         code.call(this.dyn.keyGet());
         this.emitPendingCheck();
@@ -41703,7 +41809,7 @@ class Assembler {
     c.localSet(restObj);
     const keysBoxed = this.wlocal(w, dynRef);
     c.localGet(srcLocal);
-    c.i32Const(0); // objWalk mode 0: KEYS
+    c.i32Const(dyn.symLive ? 8 : 0); // objWalk mode 0: KEYS (symbol keys too: CopyDataProperties)
     c.call(dyn.objWalkUser());
     this.emitWalkerPending(c, dynRef);
     c.localSet(keysBoxed);

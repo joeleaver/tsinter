@@ -227,6 +227,274 @@ export class SymBuilder {
     return idx;
   }
 
+  /* ── symbol property keys (the dynamic objects' reserved keys) ─────── */
+
+  private keyTableG: number | null = null;
+  private keyTableType: number | null = null;
+  private keyStrFn: number | null = null;
+  private fromKeyFn: number | null = null;
+  private keyStrsG: number | null = null;
+  private keyStrsType: number | null = null;
+  private genuineFn: number | null = null;
+
+  /** A symbol property key's reserved string (dynamic objects keep every
+   * property under a string key): U+D800 '@' '@' '#' then the symbol's id
+   * as two code units (high half, low half). The lone surrogate prefix is
+   * SYM_KEY_PREFIX (objmodel.ts); program string keys spelled with it stop
+   * by name (dyn.ts keyGuard), so no string key aliases a symbol's. */
+  private tableT(): number {
+    this.keyTableType ??= this.mb.arrayType({ kind: "ref", nullable: true, typeIndex: this.symType }, true);
+    return this.keyTableType;
+  }
+
+  /** The key strings keyStr built, by id (the same length as table()):
+   * a symbol's key is always the SAME string object, so the object store
+   * tells a genuine symbol key from a program string spelled the same way
+   * by identity (isGenuineKey). */
+  private keyStrsT(): number {
+    this.keyStrsType ??= this.mb.arrayType({ kind: "ref", nullable: true, typeIndex: this.deps.strType() }, true);
+    return this.keyStrsType;
+  }
+
+  private keyStrs(): number {
+    if (this.keyStrsG !== null) return this.keyStrsG;
+    const t = this.keyStrsT();
+    this.keyStrsG = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(t);
+    });
+    return this.keyStrsG;
+  }
+
+  /** %w.sym.isGenuineKey(flat 6-unit reserved key) -> i32 — is it the very
+   * string keyStr built for the symbol its id names? */
+  isGenuineKey(): number {
+    if (this.genuineFn !== null) return this.genuineFn;
+    const s = this.deps.strType();
+    const idx = this.mb.declareFunc(this.mb.funcType([{ kind: "ref", nullable: true, typeIndex: s }], [I32]), "%w.sym.isGenuineKey");
+    this.genuineFn = idx;
+    const ks = this.keyStrs();
+    const kt = this.keyStrsT();
+    const c = new Code();
+    const ID_ = 1;
+    c.localGet(0);
+    c.i32Const(4);
+    c.arrayGetU(s);
+    c.i32Const(16);
+    c.i32Shl();
+    c.localGet(0);
+    c.i32Const(5);
+    c.arrayGetU(s);
+    c.i32Or();
+    c.localSet(ID_);
+    c.globalGet(ks);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(ID_);
+    c.globalGet(ks);
+    c.arrayLen();
+    c.i32GeU();
+    c.end();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+    c.globalGet(ks);
+    c.localGet(ID_);
+    c.arrayGet(kt);
+    c.localGet(0);
+    c.refEq();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private table(): number {
+    if (this.keyTableG !== null) return this.keyTableG;
+    const t = this.tableT();
+    this.keyTableG = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(t);
+    });
+    return this.keyTableG;
+  }
+
+  /** %w.sym.keyStr($sym) -> string — the symbol's reserved property key;
+   * the symbol is entered in the id table (fromKey's reverse lookup). */
+  keyStr(): number {
+    if (this.keyStrFn !== null) return this.keyStrFn;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.symRef()], [this.strRef()]), "%w.sym.keyStr");
+    this.keyStrFn = idx;
+    const t = this.tableT();
+    const tab = this.table();
+    const c = new Code();
+    const ID_ = 1;
+    const NT = 2;
+    const N = 3;
+    const NK = 4;
+    const K = 5;
+    const ks = this.keyStrs();
+    const kt = this.keyStrsT();
+    c.localGet(0);
+    c.structGet(this.symType, ID);
+    c.localSet(ID_);
+    // grow the table to hold index id (doubling)
+    c.globalGet(tab);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(ID_);
+    c.globalGet(tab);
+    c.arrayLen();
+    c.i32GeU();
+    c.end();
+    c.ifVoid();
+    c.i32Const(16);
+    c.localGet(ID_);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(2);
+    c.i32Mul();
+    c.localGet(ID_);
+    c.i32Const(16);
+    c.i32LtU();
+    c.select();
+    c.localTee(N);
+    c.arrayNewDefault(t);
+    c.localSet(NT);
+    c.globalGet(tab);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(NT);
+    c.i32Const(0);
+    c.globalGet(tab);
+    c.i32Const(0);
+    c.globalGet(tab);
+    c.arrayLen();
+    c.arrayCopy(t, t);
+    c.end();
+    c.localGet(NT);
+    c.globalSet(tab);
+    // the key strings grow with it (same length)
+    c.localGet(N);
+    c.arrayNewDefault(kt);
+    c.localSet(NK);
+    c.globalGet(ks);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(NK);
+    c.i32Const(0);
+    c.globalGet(ks);
+    c.i32Const(0);
+    c.globalGet(ks);
+    c.arrayLen();
+    c.arrayCopy(kt, kt);
+    c.end();
+    c.localGet(NK);
+    c.globalSet(ks);
+    c.end();
+    c.globalGet(tab);
+    c.localGet(ID_);
+    c.localGet(0);
+    c.arraySet(t);
+    // built once per symbol: the same string object every time
+    c.globalGet(ks);
+    c.localGet(ID_);
+    c.arrayGet(kt);
+    c.localTee(K);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(K);
+    c.refAsNonNull();
+    c.return_();
+    c.end();
+    c.globalGet(ks);
+    c.localGet(ID_);
+    c.i32Const(0xd800);
+    c.i32Const(0x40);
+    c.i32Const(0x40);
+    c.i32Const(0x23);
+    c.localGet(ID_);
+    c.i32Const(16);
+    c.i32ShrU();
+    c.localGet(ID_);
+    c.i32Const(0xffff);
+    c.i32And();
+    c.arrayNewFixed(this.deps.strType(), 6);
+    c.localTee(K);
+    c.arraySet(kt);
+    c.localGet(K);
+    c.refAsNonNull();
+    this.mb.setBody(idx, [I32, { kind: "ref", nullable: true, typeIndex: t }, I32, { kind: "ref", nullable: true, typeIndex: kt }, { kind: "ref", nullable: true, typeIndex: this.deps.strType() }], c.bytes());
+    return idx;
+  }
+
+  /** %w.sym.fromKey(string) -> $sym | null — the symbol a reserved key
+   * names (keyStr's reverse), null for any other string (a well-known
+   * symbol's reserved key included). */
+  fromKey(): number {
+    if (this.fromKeyFn !== null) return this.fromKeyFn;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef()], [this.symRef()]), "%w.sym.fromKey");
+    this.fromKeyFn = idx;
+    const s = this.deps.strType();
+    const tab = this.table();
+    const c = new Code();
+    const ID_ = 1;
+    c.localGet(0);
+    c.arrayLen();
+    c.i32Const(6);
+    c.i32Ne();
+    c.ifVoid();
+    c.refNull(this.symType);
+    c.return_();
+    c.end();
+    for (const [i, cu] of [[0, 0xd800], [1, 0x40], [2, 0x40], [3, 0x23]] as const) {
+      c.localGet(0);
+      c.i32Const(i);
+      c.arrayGetU(s);
+      c.i32Const(cu);
+      c.i32Ne();
+      c.ifVoid();
+      c.refNull(this.symType);
+      c.return_();
+      c.end();
+    }
+    c.localGet(0);
+    c.i32Const(4);
+    c.arrayGetU(s);
+    c.i32Const(16);
+    c.i32Shl();
+    c.localGet(0);
+    c.i32Const(5);
+    c.arrayGetU(s);
+    c.i32Or();
+    c.localSet(ID_);
+    c.globalGet(tab);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(ID_);
+    c.globalGet(tab);
+    c.arrayLen();
+    c.i32GeU();
+    c.end();
+    c.ifVoid();
+    c.refNull(this.symType);
+    c.return_();
+    c.end();
+    c.globalGet(tab);
+    c.localGet(ID_);
+    c.arrayGet(this.tableT());
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
   /* ── the `Symbol.for` registry ─────────────────────────────────────── */
 
   /* STANDING CONDITION: this registry interns purely by KEY STRING —
