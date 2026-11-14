@@ -2269,7 +2269,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                     : e.test === "function"
                       ? `(${d.name}->kind == SCR_DYN_FUNC || scr_dyn_isl_typeof_is(${d.name}, "function"))`
                       : `${d.name}->kind == ${
-                          { string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES" }[e.test]
+                          { string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES", view: "SCR_DYN_BYTES" }[e.test]
                         }`;
         return E.newTemp(e.type, e.negated ? `!(${test})` : test);
       }

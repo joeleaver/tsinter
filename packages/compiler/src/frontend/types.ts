@@ -2734,6 +2734,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         // and the helper's result would no longer re-tag into the
         // caller's `Result<T, E>`.
         if (isUninhabitedRecordArm(part, ctx.checker)) continue;
+        // A SharedArrayBuffer PART beside an ArrayBuffer one (cosmokit's
+        // `Source<ArrayBufferLike>` = ArrayBuffer | SharedArrayBuffer |
+        // ArrayBufferView, flattened by the checker) is the ArrayBuffer arm:
+        // no SharedArrayBuffer value ever exists here (the ArrayBufferLike
+        // rule above).
+        if (ctx.sharedDynamic === true && isStdlibBufferPart(part, "SharedArrayBuffer", ctx) &&
+            widened.getTypes().some((q) => isStdlibBufferPart(q, "ArrayBuffer", ctx))) {
+          byKey.set(typeKey(ARRAYBUFFER_T), ARRAYBUFFER_T);
+          continue;
+        }
         const mapped = mapType(part, ctx);
         // A jsval PART absorbs the union: `GeneratedFile | undefined` (a
         // package-declared arm) is one island handle — the engine's
@@ -3843,6 +3853,14 @@ export function dynSubsumableUnionArm(arm: IrType, ctx: TypeMapperCtx): boolean 
 
 /** Arm kinds with no home in a compiled union (mapTypeInner's union rule):
  * no runtime narrowing test exists against sibling data arms. */
+/** A union part that is the stdlib interface `name` (ArrayBuffer or
+ * SharedArrayBuffer). */
+function isStdlibBufferPart(p: ts.Type, name: string, ctx: TypeMapperCtx): boolean {
+  const sym = p.getSymbol();
+  return sym?.name === name &&
+    ctx.checker.declarationsOf(sym).some((d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()));
+}
+
 function armHasUnionHome(arm: IrType, siblingCount: number): boolean {
   switch (arm.kind) {
     case "void":
@@ -3964,6 +3982,8 @@ export function describeComponentBlocker(widened: ts.Type, ctx: TypeMapperCtx): 
       if (!mapped) {
         return `the union shape is supported, but its arm '${text(part)}' does not compile`;
       }
+      // An ArrayBufferView part flattens into the union (the view kinds).
+      if (mapped.kind === "union" && part.getSymbol()?.name === "ArrayBufferView") continue;
       if (!armHasUnionHome(mapped, dataArms.length - 1)) {
         return `the union shape is supported, but '${text(part)}' arms have no home in a compiled union yet (no runtime narrowing test exists against sibling arms)`;
       }

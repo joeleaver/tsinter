@@ -6641,6 +6641,7 @@ class LlEmitter {
               undefined: DK.UNDEF,
               null: DK.NULL,
               bytes: DK.BYTES,
+              view: DK.BYTES,
             };
             test = oneOf([kindOf[e.test]!]);
           }

@@ -3077,6 +3077,7 @@ const DYN_TEST_KINDS: Record<Exclude<DynTestKind, "truthy" | "error">, readonly 
   null: [DK.NULL],
   nullish: [DK.UNDEF, DK.NULL],
   bytes: [DK.BYTES],
+  view: [DK.BYTES],
   array: [DK.ARR],
   function: [DK.FUNC],
   object: [DK.OBJ, DK.ARR, DK.BYTES, DK.HANDLE, DK.PROMISE, DK.NULL],
@@ -31406,6 +31407,25 @@ class Assembler {
           this.walkExpr(e.value);
           code.call(this.dyn.truthy());
           if (e.negated === true) code.i32Eqz();
+          return;
+        }
+        // ArrayBuffer.isView: the bytes kind, or (where they can exist) a
+        // dynamic typed array of another element kind — JSVAL-tagged with
+        // a typedT payload (dyn.ts isTyped). The negation covers both.
+        if (e.test === "view" && this.typedDynLive) {
+          const d = this.acquireScratch(this.dyn.dynRef());
+          const k = this.acquireScratch(I32);
+          this.walkExpr(e.value);
+          code.localTee(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.localTee(k);
+          code.i32Const(DK.BYTES);
+          code.i32Eq();
+          this.dyn.isTyped(code, d, k);
+          code.i32Or();
+          if (e.negated === true) code.i32Eqz();
+          this.releaseScratch(I32, k);
+          this.releaseScratch(this.dyn.dynRef(), d);
           return;
         }
         // Unit I: a dynamic typed array is JSVAL-tagged (dyn.ts typedT);
