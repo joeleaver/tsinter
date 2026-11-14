@@ -67,6 +67,20 @@ function dagProgram(fan: number, depth: number): string {
   return lines.join("\n");
 }
 
+/** The per-path walk (TSINTER_RECURSIVE_GROUPS=off): with recursive
+ * groups (step 11 (B)) the synthetic AST maps as one group, so the budget
+ * rows exercise the per-path backstop the budget still guards. */
+async function compilePerPath(entry: string) {
+  const prev = process.env.TSINTER_RECURSIVE_GROUPS;
+  process.env.TSINTER_RECURSIVE_GROUPS = "off";
+  try {
+    return await compile(entry, { outPath: join(dirname(entry), "p.wasm"), outDir: dirname(entry), backend: "wasm" });
+  } finally {
+    if (prev === undefined) delete process.env.TSINTER_RECURSIVE_GROUPS;
+    else process.env.TSINTER_RECURSIVE_GROUPS = prev;
+  }
+}
+
 function write(id: string, src: string): string {
   const dir = join(scratch, id);
   mkdirSync(dir, { recursive: true });
@@ -80,7 +94,7 @@ describe("rea step 11: the type-mapping step budget (wasm lane vs Node)", () => 
   test("MAPBUDGET-01 a 30-interface mutually recursive AST behind a class field refuses by name, fast, naming Class.member and the record path", async () => {
     const entry = write("MAPBUDGET-01", astProgram(30));
     const t0 = Date.now();
-    const res = await compile(entry, { outPath: join(dirname(entry), "p.wasm"), outDir: dirname(entry), backend: "wasm" });
+    const res = await compilePerPath(entry);
     const secs = (Date.now() - t0) / 1000;
     expect(res.ok).toBe(false);
     if (res.ok) return;
@@ -93,7 +107,7 @@ describe("rea step 11: the type-mapping step budget (wasm lane vs Node)", () => 
   test("MAPBUDGET-03 more sites over the same graph through different container types refuse by name at once: only the first pays the budget", async () => {
     const entry = write("MAPBUDGET-03", astProgram(30, 3));
     const t0 = Date.now();
-    const res = await compile(entry, { outPath: join(dirname(entry), "p.wasm"), outDir: dirname(entry), backend: "wasm" });
+    const res = await compilePerPath(entry);
     const secs = (Date.now() - t0) / 1000;
     expect(res.ok).toBe(false);
     if (res.ok) return;

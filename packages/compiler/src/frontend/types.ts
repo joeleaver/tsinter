@@ -80,6 +80,23 @@ export class ShapeRegistry {
     return id;
   }
 
+  /** Forgets the placeholder minted for `t` (a recursive group's mapping
+   * failed): the empty entry stays pending — referenced by nothing
+   * finalized, it prunes at module assembly — and a later mapping of `t`
+   * mints afresh. */
+  abandonRecursive(t: ts.Type): void {
+    const id = this.recIds.get(t);
+    if (id !== undefined && this.pendingRec.has(id)) this.recIds.delete(t);
+  }
+
+  /** The shape for `shapeId`, or undefined while it is a PENDING
+   * recursive placeholder (empty fields until finalized): structural
+   * questions (dyn-subsumable, island-marshalable) must not read a
+   * placeholder's emptiness as the shape's. */
+  settled(shapeId: string): IrRecordShape | undefined {
+    return this.pendingRec.has(shapeId) ? undefined : this.byId.get(shapeId);
+  }
+
   /** The FINALIZED recursive shape for a checker type — undefined while
    * never mapped, mid-construction, or permanently failed. */
   recursiveShapeFor(t: ts.Type): string | undefined {
@@ -252,7 +269,31 @@ export class UnionRegistry {
  * their canonical field list, unions to their arms; `checker.typeToString`
  * can't — it never sees IR types). `seen` breaks recursive shapes/unions:
  * a back-reference renders as "..." instead of expanding forever. */
+/* The printer re-expands a shape at every occurrence (sibling occurrences
+ * print in full: the messages read as TS spells the type), so a shape
+ * reachable by many paths — a recursive group the mapper now maps whole,
+ * an AST's node interfaces — would print once per path (the same
+ * exponential the mapper had, `RangeError: Invalid string length`). One
+ * top-level request expands at most FORMAT_EXPANSION_CAP records and
+ * unions (the rest print as `…`) and its text is cut at
+ * FORMAT_LENGTH_CAP; every smaller type prints exactly as before. */
+const FORMAT_EXPANSION_CAP = 2000;
+const FORMAT_LENGTH_CAP = 4000;
+let formatDepth = 0;
+let formatExpansions = 0;
+
 export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegistry, seen: Set<string> = new Set()): string {
+  if (formatDepth === 0) formatExpansions = 0;
+  formatDepth++;
+  try {
+    const text = formatIrTypeInner(t, shapes, unions, seen);
+    return formatDepth === 1 && text.length > FORMAT_LENGTH_CAP ? `${text.slice(0, FORMAT_LENGTH_CAP)}…` : text;
+  } finally {
+    formatDepth--;
+  }
+}
+
+function formatIrTypeInner(t: IrType, shapes: ShapeRegistry, unions: UnionRegistry, seen: Set<string>): string {
   switch (t.kind) {
     case "f64":
       return "number";
@@ -301,6 +342,7 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       const shape = shapes.get(t.shapeId);
       if (!shape) return `{ /* unknown shape ${t.shapeId} */ }`;
       if (seen.has(t.shapeId)) return "..."; // the recursive knot
+      if (++formatExpansions > FORMAT_EXPANSION_CAP) return "…";
       seen.add(t.shapeId);
       try {
         if (shape.tuple) {
@@ -331,6 +373,7 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       const def = unions.get(t.unionId);
       if (!def) return `/* union ${t.unionId} */`;
       if (seen.has(t.unionId)) return "..."; // the recursive knot
+      if (++formatExpansions > FORMAT_EXPANSION_CAP) return "…";
       seen.add(t.unionId);
       try {
         return def.arms.map((a) => formatIrType(a, shapes, unions, seen)).join(" | ");
@@ -882,6 +925,7 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (known !== undefined) throw new MapTypeBudgetError(known);
     mapTypeSteps = 0;
     mapRecordMemo.clear();
+    recursiveGroupsOn = process.env.TSINTER_RECURSIVE_GROUPS !== "off";
     mapTypeBudgetTripped = false;
     mapRecordStack.length = 0;
     let answer: IrType | null;
@@ -904,7 +948,9 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
 }
 
 function mapTypeStep(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
-  if (++mapTypeSteps > MAP_TYPE_STEP_BUDGET) {
+  if (discoverState !== null) {
+    if (++discoverState.steps > DISCOVER_STEP_CAP) throw new DiscoverAbort();
+  } else if (++mapTypeSteps > MAP_TYPE_STEP_BUDGET) {
     const first = !mapTypeBudgetTripped;
     mapTypeBudgetTripped = true;
     if (!first) throw new MapTypeBudgetError("the mapping was cut short");
@@ -913,6 +959,16 @@ function mapTypeStep(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     throw new MapTypeBudgetError(path);
   }
   if (mapTypeDepth >= MAP_TYPE_MAX_DEPTH) {
+    // A cycle longer than the depth allowance never re-reaches a type on
+    // the stack (the back-reference trigger cannot fire): the cut starts
+    // the group of the innermost interface on the stack instead.
+    if (recursiveGroupsOn && discoverState === null) {
+      for (let i = mapRecordStack.length - 1; i >= 0; i--) {
+        const t = mapRecordStack[i]!;
+        if (!ctx.shapes.inProgress.has(t) || frameHookDepth.get(t) !== hookDepth) continue;
+        if (groupEligible(ctx, t)) throw new GroupSignal(t);
+      }
+    }
     mapTypeDepthCuts++;
     return null;
   }
@@ -2735,6 +2791,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     const knownRecursive = unions.recursiveUnionFor(widened);
     if (knownRecursive !== undefined) return { kind: "union", unionId: knownRecursive };
     if (unions.inProgress.has(widened)) {
+      // A back-reference (see mapRecordMemo): the answer of every record
+      // walk around it depends on the stack.
+      mapRecordBackRefs++;
       return { kind: "union", unionId: unions.recursiveRef(widened) };
     }
     unions.inProgress.add(widened);
@@ -3445,11 +3504,23 @@ interface RecordShapeParts {
 
 function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
   const { shapes } = ctx;
+  // Discovering a recursive group's edges (discoverRecordGraph): every
+  // record type the expansion reaches is an edge, answered by a stand-in.
+  if (discoverState !== null) {
+    discoverState.out.push(widened);
+    return discoverState.standIn;
+  }
   // A type whose recursive shape already finalized answers its id straight
   // off the registry (identity is per checker type; remapping would walk
   // the same members to the same answer).
   const knownRecursive = shapes.recursiveShapeFor(widened);
   if (knownRecursive !== undefined) return { kind: "record", shapeId: knownRecursive };
+  // A member of the recursive group being mapped (mapRecursiveGroup): its
+  // placeholder, whatever the stack.
+  if (groupPending.has(widened)) {
+    mapRecordBackRefs++;
+    return { kind: "record", shapeId: shapes.recursiveRef(widened) };
+  }
   // A BACK-REFERENCE to a shape currently being mapped (`interface
   // TreeNode { label: string; children: TreeNode[] }` reaching TreeNode
   // through its own field walk — directly or through arrays, unions,
@@ -3459,6 +3530,12 @@ function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // as heap references, so the self-reference is an ordinary pointer.
   if (shapes.inProgress.has(widened)) {
     mapRecordBackRefs++;
+    // The first back-reference to an INTERFACE on the stack: its frame
+    // maps the type's whole strongly-connected group at once instead
+    // (mapRecursiveGroup) — each member once, whatever the path.
+    if (recursiveGroupsOn && frameHookDepth.get(widened) === hookDepth && groupEligible(ctx, widened)) {
+      throw new GroupSignal(widened);
+    }
     return { kind: "record", shapeId: shapes.recursiveRef(widened) };
   }
   {
@@ -3473,11 +3550,286 @@ function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
   const backRefsAtEntry = mapRecordBackRefs;
   const depthCutsAtEntry = mapTypeDepthCuts;
   const sensitivityAtEntry = contextResolutions;
-  const answer = mapRecordTypeWalk(widened, ctx, sensitivityAtEntry);
+  let answer: IrType | null;
+  try {
+    answer = mapRecordTypeWalk(widened, ctx, sensitivityAtEntry);
+  } catch (e) {
+    if (!(e instanceof GroupSignal) || e.target !== widened) throw e;
+    // The walk unwound to this frame (every frame between restored its
+    // stack sets). Map the group; when it cannot be (see
+    // mapRecursiveGroup), walk this type the per-path way.
+    if (mapRecursiveGroup(widened, ctx)) {
+      return { kind: "record", shapeId: shapes.recursiveShapeFor(widened)! };
+    }
+    groupFallback.add(widened);
+    answer = mapRecordTypeWalk(widened, ctx, contextResolutions);
+    mapRecordBackRefs++; // never memoized: the answer depends on the stack
+  }
   if (mapRecordBackRefs === backRefsAtEntry && mapTypeDepthCuts === depthCutsAtEntry && contextResolutions === sensitivityAtEntry) {
     mapRecordMemo.set(widened, { ctx, answer });
   }
   return answer;
+}
+
+/* ── recursive groups (rea step 11 (B)) ──────────────────────────────────
+ * The per-path walk cuts a cycle only where it re-reaches a record type ON
+ * its stack, so which members of a mutually recursive group become knots
+ * (recursive shapes) and which structural interns depends on the path,
+ * and a large group (an AST's node interfaces) re-expands once per path.
+ * Instead, the first back-reference to an interface on the stack hands
+ * the whole group to its frame: discover the record-type graph reachable
+ * from it (the mapper's own descent, side-effect-free —
+ * discoverRecordGraph), take its strongly-connected component, mint a
+ * placeholder for every interface member (in declaration order), map each
+ * member's fields ONCE with every member answering its placeholder, and
+ * finalize them all. Every later reference, in any request, answers the
+ * finalized shape. Anonymous members (type literals) map structurally
+ * through the knots, as before. A group that cannot map as one (a member
+ * unmappable or answering a whole-type stand-in, a context-sensitive
+ * mapping, a discovery past its caps) abandons its placeholders and maps
+ * per path, exactly as before. TSINTER_RECURSIVE_GROUPS=off restores the
+ * per-path walk everywhere (the verify harness compares the two). */
+let recursiveGroupsOn = true;
+/** Thrown at a back-reference to an interface on the stack; its own frame
+ * catches it (mapRecordType). Not an Error: control flow only. */
+class GroupSignal {
+  constructor(readonly target: ts.Type) {}
+}
+/** Interfaces whose group could not map as one: they walk per path. */
+const groupFallback = new WeakSet<ts.Type>();
+/** Lowerer hook frames active (withMapperHook), and the depth each
+ * record frame on the stack entered at. A GroupSignal never crosses a
+ * hook frame (the hook's own state — a half-registered generic class
+ * instantiation — would be left behind): it is thrown only when its
+ * target's frame entered at the current hook depth; otherwise the walk
+ * takes the per-path answer. */
+let hookDepth = 0;
+const frameHookDepth = new Map<ts.Type, number>();
+
+/** Runs a Lowerer hook the type mapper calls (lowerer.ts typeCtx). */
+export function withMapperHook<T>(f: () => T): T {
+  hookDepth++;
+  try {
+    return f();
+  } finally {
+    hookDepth--;
+  }
+}
+/** The members of the group being mapped (placeholders minted). */
+const groupPending = new Set<ts.Type>();
+
+/** May `t` (on the stack) start a recursive group? */
+function groupEligible(ctx: TypeMapperCtx, t: ts.Type): boolean {
+  return !ctx.shapes.recursivePending(t) && !groupFallback.has(t) && !groupPending.has(t) && isInterfaceRecord(ctx, t);
+}
+
+function isInterfaceRecord(ctx: TypeMapperCtx, t: ts.Type): boolean {
+  const sym = t.getSymbol();
+  return sym !== undefined && (sym.flags & ts.SymbolFlags.Interface) !== 0 && ctx.checker.declarationsOf(sym).length > 0;
+}
+
+/** Declaration order (file, then position): the knot order is the same
+ * every run, never an object-identity order. */
+function declOrderKey(ctx: TypeMapperCtx, t: ts.Type): [string, number] {
+  const sym = t.getSymbol();
+  const decl = sym === undefined ? undefined : ctx.checker.declarationsOf(sym)[0];
+  return decl === undefined ? ["", 0] : [decl.getSourceFile().fileName, decl.pos];
+}
+
+function mapRecursiveGroup(root: ts.Type, ctx: TypeMapperCtx): boolean {
+  const { shapes } = ctx;
+  const graph = discoverRecordGraph(root, ctx);
+  if (graph === null) return false;
+  const group = strongComponentOf(root, graph);
+  if (group.length === 1 && !(graph.get(root) ?? []).includes(root)) return false;
+  const knots = group.filter(
+    (t) =>
+      isInterfaceRecord(ctx, t) &&
+      shapes.recursiveShapeFor(t) === undefined &&
+      !shapes.recursivePending(t) &&
+      !shapes.inProgress.has(t) &&
+      !groupPending.has(t) &&
+      !groupFallback.has(t),
+  );
+  if (!knots.includes(root)) return false;
+  knots.sort((a, b) => {
+    const [fa, pa] = declOrderKey(ctx, a);
+    const [fb, pb] = declOrderKey(ctx, b);
+    return fa < fb ? -1 : fa > fb ? 1 : pa - pb;
+  });
+  for (const k of knots) {
+    shapes.recursiveRef(k);
+    groupPending.add(k);
+  }
+  const resolutionsAtEntry = contextResolutions;
+  const depthAtEntry = mapTypeDepth;
+  // Each member maps with the full depth allowance (members never recurse
+  // into each other: they answer placeholders).
+  mapTypeDepth = 1;
+  let done = false;
+  try {
+    const parts: [ts.Type, RecordShapeParts][] = [];
+    for (const k of knots) {
+      shapes.inProgress.add(k);
+      mapRecordStack.push(k);
+      let inner: IrType | RecordShapeParts | null;
+      try {
+        inner = mapRecordTypeInner(k, ctx);
+      } finally {
+        shapes.inProgress.delete(k);
+        mapRecordStack.pop();
+      }
+      if (inner === null || !("fields" in inner)) return false;
+      parts.push([k, inner]);
+    }
+    if (contextResolutions !== resolutionsAtEntry) return false;
+    for (const [k, inner] of parts) shapes.finalizeRecursive(k, inner.fields, inner.indexValue, inner.declaredOrder);
+    done = true;
+    return true;
+  } finally {
+    mapTypeDepth = depthAtEntry;
+    for (const k of knots) {
+      groupPending.delete(k);
+      if (!done) shapes.abandonRecursive(k);
+    }
+  }
+}
+
+/** Tarjan's strongly-connected component of `root` (iterative). */
+function strongComponentOf(root: ts.Type, graph: ReadonlyMap<ts.Type, readonly ts.Type[]>): ts.Type[] {
+  const index = new Map<ts.Type, number>();
+  const low = new Map<ts.Type, number>();
+  const onStack = new Set<ts.Type>();
+  const stack: ts.Type[] = [];
+  let next = 0;
+  let found: ts.Type[] = [root];
+  const work: { v: ts.Type; i: number }[] = [{ v: root, i: 0 }];
+  index.set(root, next);
+  low.set(root, next++);
+  stack.push(root);
+  onStack.add(root);
+  while (work.length > 0) {
+    const frame = work[work.length - 1]!;
+    const succ = graph.get(frame.v) ?? [];
+    if (frame.i < succ.length) {
+      const w = succ[frame.i++]!;
+      if (!index.has(w)) {
+        index.set(w, next);
+        low.set(w, next++);
+        stack.push(w);
+        onStack.add(w);
+        work.push({ v: w, i: 0 });
+      } else if (onStack.has(w)) {
+        low.set(frame.v, Math.min(low.get(frame.v)!, index.get(w)!));
+      }
+      continue;
+    }
+    work.pop();
+    if (work.length > 0) {
+      const parent = work[work.length - 1]!.v;
+      low.set(parent, Math.min(low.get(parent)!, low.get(frame.v)!));
+    }
+    if (low.get(frame.v) === index.get(frame.v)) {
+      const comp: ts.Type[] = [];
+      let w: ts.Type;
+      do {
+        w = stack.pop()!;
+        onStack.delete(w);
+        comp.push(w);
+      } while (w !== frame.v);
+      if (comp.includes(root)) found = comp;
+    }
+  }
+  return found;
+}
+
+/* Discovery: the record-type edges the mapper's own descent follows from
+ * each type, with every reached record answered by a stand-in (no walk
+ * into it), throwaway shape/union registries, and every Lowerer hook that
+ * could register or resolve anything replaced. Nothing the real mapping
+ * reads changes: the module counters and the step budget are restored,
+ * the memo is never written (discovery returns before it). A hook that
+ * would resolve through CONTEXT (a generic body's type parameter, a JS
+ * arm's result) marks the discovery context-sensitive: no group. */
+const DISCOVER_NODE_CAP = 5000;
+const DISCOVER_STEP_CAP = 2_000_000;
+class DiscoverAbort {}
+let discoverState: { out: ts.Type[]; standIn: IrType; steps: number } | null = null;
+
+function discoverRecordGraph(root: ts.Type, ctx: TypeMapperCtx): Map<ts.Type, ts.Type[]> | null {
+  let sensitive = false;
+  const shapes = new ShapeRegistry();
+  const dctx: TypeMapperCtx = {
+    ...ctx,
+    shapes,
+    unions: new UnionRegistry(),
+    classNamer: () => "%discover",
+    genericClassInstance: () => ({ kind: "object", className: "%discover" }),
+    mixinClassInstance: () => null,
+    mixinIntersectionInstance: () => null,
+    ...(ctx.resolveTypeParam ? { resolveTypeParam: () => ((sensitive = true), null) } : {}),
+    ...(ctx.resolveTypeParamTs ? { resolveTypeParamTs: () => ((sensitive = true), null) } : {}),
+    ...(ctx.dynArmResultType ? { dynArmResultType: () => ((sensitive = true), null) } : {}),
+  };
+  const standIn: IrType = { kind: "record", shapeId: shapes.intern([], false) };
+  const saved = {
+    depth: mapTypeDepth,
+    steps: mapTypeSteps,
+    backRefs: mapRecordBackRefs,
+    cuts: mapTypeDepthCuts,
+    resolutions: contextResolutions,
+    tripped: mapTypeBudgetTripped,
+    stack: mapRecordStack.length,
+    memo: mapRecordMemo.size,
+    realShapes: ctx.shapes.shapes.length,
+  };
+  const edges = new Map<ts.Type, ts.Type[]>();
+  const queue: ts.Type[] = [root];
+  const seen = new Set<ts.Type>([root]);
+  let steps = 0;
+  // Each expansion starts with the full depth allowance, wherever the
+  // group was triggered (a deep trigger must not starve the edges).
+  mapTypeDepth = 1;
+  try {
+    while (queue.length > 0) {
+      if (edges.size >= DISCOVER_NODE_CAP) return null;
+      const t = queue.shift()!;
+      discoverState = { out: [], standIn, steps };
+      try {
+        mapRecordTypeInner(t, dctx);
+      } catch (e) {
+        if (e instanceof DiscoverAbort) return null;
+        throw e;
+      } finally {
+        steps = discoverState.steps;
+        const out = discoverState.out;
+        discoverState = null;
+        edges.set(t, out);
+        for (const o of out) {
+          if (!seen.has(o)) {
+            seen.add(o);
+            queue.push(o);
+          }
+        }
+      }
+    }
+    if (sensitive || contextResolutions !== saved.resolutions) return null;
+    return edges;
+  } finally {
+    const leaked =
+      mapTypeDepth !== 1 || mapTypeSteps !== saved.steps || mapRecordStack.length !== saved.stack ||
+      mapRecordMemo.size !== saved.memo || ctx.shapes.shapes.length !== saved.realShapes;
+    mapTypeDepth = saved.depth;
+    mapRecordBackRefs = saved.backRefs;
+    mapTypeDepthCuts = saved.cuts;
+    contextResolutions = saved.resolutions;
+    mapTypeBudgetTripped = saved.tripped;
+    // The verify harness (TSINTER_RECURSIVE_GROUPS_VERIFY) asserts the
+    // discovery left nothing behind in the real mapper's state.
+    if (leaked && process.env.TSINTER_RECURSIVE_GROUPS_VERIFY) {
+      throw new Error("tsinter internal: recursive-group discovery changed the type mapper's state");
+    }
+  }
 }
 
 /** mapRecordType's walk of a record type not on the stack. */
@@ -3485,6 +3837,7 @@ function mapRecordTypeWalk(widened: ts.Type, ctx: TypeMapperCtx, sensitivityAtEn
   const { shapes } = ctx;
   shapes.inProgress.add(widened);
   mapRecordStack.push(widened);
+  frameHookDepth.set(widened, hookDepth);
   try {
     const inner = mapRecordTypeInner(widened, ctx);
     if (inner === null) return null; // a pending placeholder, if minted, stays unfinalized (prunes as unreachable)
@@ -3510,6 +3863,7 @@ function mapRecordTypeWalk(widened: ts.Type, ctx: TypeMapperCtx, sensitivityAtEn
   } finally {
     shapes.inProgress.delete(widened);
     mapRecordStack.pop();
+    frameHookDepth.delete(widened);
   }
 }
 
@@ -3690,7 +4044,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
         if (p.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return false;
         const m = mapType(checker.getTypeOfSymbol(p), ctx);
         return m !== null && (m.kind === "jsval" || m.kind === "dyn" || m.kind === "func" ||
-          canMarshalIntoIsland(m, (id) => ctx.shapes.get(id), (id) => ctx.unions.get(id)));
+          canMarshalIntoIsland(m, (id) => ctx.shapes.settled(id), (id) => ctx.unions.get(id)));
       })
     ) {
       return ctx.sharedDynamic === true ? JSVAL : DYN;
@@ -3874,7 +4228,7 @@ export function dynSubsumableUnionArm(arm: IrType, ctx: TypeMapperCtx): boolean 
       return true;
     case "record":
     case "array":
-      return canConvertToDyn(arm, (id) => ctx.shapes.get(id), (id) => ctx.unions.get(id));
+      return canConvertToDyn(arm, (id) => ctx.shapes.settled(id), (id) => ctx.unions.get(id));
     default:
       return false;
   }

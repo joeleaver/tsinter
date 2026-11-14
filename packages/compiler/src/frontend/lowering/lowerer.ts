@@ -90,6 +90,7 @@ import {
   mapType,
   MAP_TYPE_STEP_BUDGET,
   MapTypeBudgetError,
+  withMapperHook,
   ShapeRegistry,
   typeKey,
   type TypeMapperCtx,
@@ -1843,14 +1844,20 @@ export class Lowerer {
       shapes: this.shapes,
       unions: this.unions,
       classNamer: this.classNamer,
-      resolveTypeParam: this.typeParamResolver,
-      resolveTypeParamTs: this.typeParamTsResolver,
-      genericClassInstance: (decl, ref) => this.genericClassInstanceType(decl, ref),
+      // Every hook runs inside withMapperHook (types.ts): the type mapper's
+      // recursive-group signal never unwinds through a hook frame.
+      ...(this.typeParamResolver !== undefined
+        ? { resolveTypeParam: (t: ts.Type) => withMapperHook(() => this.typeParamResolver!(t)) }
+        : {}),
+      ...(this.typeParamTsResolver !== undefined
+        ? { resolveTypeParamTs: (t: ts.Type) => withMapperHook(() => this.typeParamTsResolver!(t)) }
+        : {}),
+      genericClassInstance: (decl, ref) => withMapperHook(() => this.genericClassInstanceType(decl, ref)),
       mixinClassInstance: (decl) =>
         this.mixinTypeContext && this.mixinTypeContext.classNode === decl
           ? { kind: "object", className: this.mixinTypeContext.className }
           : null,
-      mixinIntersectionInstance: (widened) => mixinIntersectionInstanceType(this, widened),
+      mixinIntersectionInstance: (widened) => withMapperHook(() => mixinIntersectionInstanceType(this, widened)),
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
       dynamic: this.dynamic,
@@ -1860,7 +1867,7 @@ export class Lowerer {
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
       isProgramFile: (sf) => this.fileTag.has(sf),
-      dynArmResultType: (decl) => dynArmResultType(this, decl),
+      dynArmResultType: (decl) => withMapperHook(() => dynArmResultType(this, decl)),
     };
     // --dynamic: modules reachable only through dynamic import() joined
     // moduleOrder BEFORE any pass constructed — lowerToIr runs
