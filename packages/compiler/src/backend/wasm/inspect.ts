@@ -4115,6 +4115,12 @@ export class InspectBuilder {
         c.structGet(dyn.fnT(), FN_SIG);
         c.i32Const(-3);
         c.i32Eq();
+        // (units U3 + U4: a member-less class over a dynamic base, SIG -8)
+        dyn.fnPayload(c, (x) => x.localGet(D));
+        c.structGet(dyn.fnT(), FN_SIG);
+        c.i32Const(-8);
+        c.i32Eq();
+        c.i32Or();
         c.ifVoid();
         this.deps.fence(c, (x) => this.deps.lit(x, "inspecting a class read as a dynamic value's constructor (Node renders '[class …]') is not supported yet"));
         c.refNull(strT);
@@ -4517,6 +4523,8 @@ export class InspectBuilder {
       });
 
       this.kindArm(c, K, [DK.OBJ], () => {
+        // Units U3 + U4: globalThis's box (its keys are a stand-in)
+        dyn.globalReflectGuard(c, (x) => x.localGet(D));
         dyn.classViewPrintFence(c, D, (x) => {
           x.refNull(strT);
           x.return_();

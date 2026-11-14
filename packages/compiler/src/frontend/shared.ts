@@ -383,6 +383,10 @@ export const JS_RELAXED_TSC_CODES: ReadonlySet<number> = new Set([
   // `instanceof` operand kinds (a primitive left side answers false and a
   // non-callable right side throws Node's TypeError at run time)
   2358, 2359,
+  // `class X extends <dynamic value>`: Node checks the base at run time
+  2507,
+  // calling such a class without `new`: Node's TypeError at run time
+  2348,
 ]);
 
 /* Arithmetic on an `any` operand (TS2362/2363/2365 fire when the other

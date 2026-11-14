@@ -9,7 +9,9 @@ import * as ts from "../ts7/adapter.js";
 import { PoisonError, fnProtoOfValueNode, nodeThrowExpr, type Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, JSVAL, STRING, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
+import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { isJsSourceFileName } from "../shared.js";
+import { stdlibGlobalNameOf } from "./surfaces.js";
 
 /** The object model serves the one-world WasmGC lowering (not the
  * embedded engine's --dynamic island, which has its own). */
@@ -371,6 +373,13 @@ function isCjsExportTable(n: ts.Node): boolean {
   return t === "module.exports" || t.startsWith("exports.") || t.startsWith("module.exports.");
 }
 
+/** `require("x")`, or a member read off it (`require("x").C`). */
+function rootedInRequire(e: ts.Expression): boolean {
+  let x = strip(e);
+  while (ts.isPropertyAccessExpression(x) || ts.isElementAccessExpression(x)) x = strip(x.expression);
+  return ts.isCallExpression(x) && ts.isIdentifier(x.expression) && x.expression.text === "require";
+}
+
 /** A preorder walk with an explicit stack (a deeply nested expression
  * must not overflow the compiler's own stack); `visit` answers whether to
  * descend into the node's children. */
@@ -570,6 +579,58 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
       }
       p = p.parent;
     }
+  }
+  // A MODULE-SCOPE class declaration over a program function or variable
+  // (`function Base() {}` … `class D extends Base {}`) keeps main's
+  // refusal, raised eagerly: the class machinery's own refusal is deferred
+  // to the class's first use, and the declaration alone already breaks the
+  // base's prototype (review, item 8).
+  for (const sf of jsFiles) {
+    for (const st of sf.statements) {
+      if (!ts.isClassDeclaration(st)) continue;
+      const clause = (st.heritageClauses ?? []).find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
+      const base0 = clause?.types[0]?.expression;
+      if (base0 === undefined) continue;
+      const base = strip(base0);
+      // The base's own value, resolved through parentheses, aliases,
+      // imports, require bindings and member reads: its type's symbol. A
+      // function there (declared, a function expression or an arrow) and
+      // no class is an ES5 base.
+      const fnLike = (d: ts.Node): boolean => ts.isFunctionDeclaration(d) || ts.isFunctionExpression(d) || ts.isArrowFunction(d);
+      const isClassDecl = (d: ts.Node): boolean => ts.isClassDeclaration(d) || ts.isClassExpression(d);
+      const bt = checker.getTypeAtLocation(base);
+      const tsym = bt.getSymbol();
+      const tdecls = tsym !== undefined ? checker.declarationsOf(tsym) : [];
+      let es5 = tdecls.length > 0 && !tdecls.some(isClassDecl) && tdecls.some(fnLike);
+      // A bare binding the checker types loosely: its own declaration (a
+      // binding of a member read off an object holding the function).
+      if (!es5 && ts.isIdentifier(base)) {
+        const s = checker.getSymbolAtLocation(base);
+        const decls = s !== undefined ? checker.declarationsOf(s) : [];
+        es5 = decls.length > 0 && !decls.some(isClassDecl) && decls.every((d) => {
+          if (!isJsSourceFileName(d.getSourceFile().fileName)) return false;
+          if (ts.isFunctionDeclaration(d)) return true;
+          if (!ts.isVariableDeclaration(d) || d.initializer === undefined) return false;
+          const init = strip(d.initializer);
+          if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return true;
+          return (ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) && !rootedInRequire(init);
+        });
+      }
+      if (!es5) continue;
+      L.pushDiag(unsupportedDiag("SC1090", locOf(base0), `extending classes not declared in the program ('${base0.getText()}')`));
+    }
+  }
+  // `class X extends <dynamic> {}`: a dynamic value (objmodel.ts dynClass).
+  for (const sf of jsFiles) {
+    const visit = (n: ts.Node): void => {
+      if ((ts.isClassDeclaration(n) || ts.isClassExpression(n)) && isDynClassDecl(L, n)) {
+        const nameNode = n.name ?? (ts.isVariableDeclaration(n.parent) ? n.parent.name : undefined);
+        const s = nameNode !== undefined ? checker.getSymbolAtLocation(nameNode) : undefined;
+        if (s !== undefined) info.ctors.add(s);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
   }
   // A literal marked in place whose declaration binds it: the binding too.
   for (const sf of jsFiles) {
@@ -805,6 +866,12 @@ function collectWidenedArrays(L: Lowerer, jsFiles: readonly ts.SourceFile[], inf
  * ES5 constructor, and any value of an ES5 constructor's instance type. */
 export function es5TypeOf(L: Lowerer, info: Es5Info, node: ts.Node): ts.Type | null {
   if (ts.isIdentifier(node)) {
+    // the class declaration's own name is the dynamic class value
+    const p0 = node.parent;
+    if (p0 !== undefined && (ts.isClassDeclaration(p0) || ts.isClassExpression(p0)) && p0.name === node) {
+      const s0 = L.checker.getSymbolAtLocation(node);
+      if (s0 !== undefined && info.ctors.has(s0)) return L.checker.getAnyType();
+    }
     const p = node.parent;
     if (p !== undefined && ts.isPropertyAccessExpression(p) && p.name === node) return null;
     if (p !== undefined && (ts.isPropertyAssignment(p) || ts.isMethodDeclaration(p)) && p.name === node) return null;
@@ -859,4 +926,195 @@ export function retsCall(L: Lowerer, info: Es5Info, call: ts.CallExpression): bo
   if (fs === undefined) return false;
   return L.checker.declarationsOf(fs).some((d) => info.rets.has(d) ||
     (ts.isVariableDeclaration(d) && d.initializer !== undefined && info.rets.has(strip(d.initializer))));
+}
+
+/* ── builtins as dynamic values: Error, Object, globalThis ─────────── */
+
+/** Error's own statics, readable through the dynamic Error value. */
+const ERROR_STATICS = new Set(["captureStackTrace", "stackTraceLimit", "prepareStackTrace", "isError"]);
+const BOX_BUILTINS = new Set(["Error", "Object", "globalThis"]);
+/** Node v24.18.1's global object's own property names, measured on the
+ * reference host (`Object.getOwnPropertyNames(globalThis)`): what `in`
+ * answers through the globalThis value (units U3 + U4). */
+const NODE24_GLOBALS: readonly string[] = [
+  "Object", "Function", "Array", "Number", "parseFloat", "parseInt", "Infinity", "NaN",
+  "undefined", "Boolean", "String", "Symbol", "Date", "Promise", "RegExp", "Error",
+  "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError",
+  "URIError", "globalThis", "JSON", "Math", "Intl", "ArrayBuffer", "Atomics", "Uint8Array",
+  "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "BigUint64Array",
+  "BigInt64Array", "Uint8ClampedArray", "Float32Array", "Float64Array", "DataView", "Map",
+  "BigInt", "Set", "Iterator", "WeakMap", "WeakSet", "Proxy", "Reflect", "FinalizationRegistry",
+  "WeakRef", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape",
+  "unescape", "eval", "isFinite", "isNaN", "console", "process", "global", "Buffer",
+  "clearImmediate", "setImmediate", "URL", "URLSearchParams", "DOMException", "AbortController",
+  "AbortSignal", "Event", "EventTarget", "CustomEvent", "TextEncoder", "TextDecoder",
+  "TransformStream", "TransformStreamDefaultController", "WritableStream",
+  "WritableStreamDefaultController", "WritableStreamDefaultWriter", "ReadableStream",
+  "ReadableStreamDefaultReader", "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest",
+  "ReadableByteStreamController", "ReadableStreamDefaultController", "ByteLengthQueuingStrategy",
+  "CountQueuingStrategy", "TextEncoderStream", "TextDecoderStream", "CompressionStream",
+  "DecompressionStream", "clearInterval", "clearTimeout", "setInterval", "setTimeout",
+  "queueMicrotask", "structuredClone", "atob", "btoa", "BroadcastChannel", "MessageChannel",
+  "MessagePort", "Blob", "File", "Performance", "PerformanceEntry", "PerformanceMark",
+  "PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList",
+  "PerformanceResourceTiming", "performance", "URLPattern", "fetch", "FormData", "Headers",
+  "Request", "Response", "MessageEvent", "CloseEvent", "WebSocket", "crypto", "Crypto",
+  "CryptoKey", "SubtleCrypto", "SuppressedError", "DisposableStack", "AsyncDisposableStack",
+  "Float16Array", "SharedArrayBuffer", "WebAssembly", "Navigator", "navigator",
+];
+
+/** Is this identifier a standard-library `Error` / `Object` /
+ * `globalThis` in a position that takes the value itself (not a call,
+ * `new`, `instanceof`, `typeof`, a heritage clause or a static member the
+ * existing lowering serves)? */
+export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null {
+  if (!omActive(L)) return null;
+  // Node's `global` is the same object as globalThis, and so is a local
+  // alias of it (`const g = globalThis`, surfaces.ts
+  // stdlibGlobalAliasDecl): the same box.
+  const name = id.text === "Error" || id.text === "Object" || id.text === "globalThis"
+    ? id.text
+    : stdlibGlobalNameOf(L, id) === "globalThis" ? "globalThis" : null;
+  if (name === null || !BOX_BUILTINS.has(name)) return null;
+  if (!L.isStdlibGlobal(id, name)) return null;
+  let child: ts.Node = id;
+  let p = id.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) {
+    child = p;
+    p = p.parent;
+  }
+  if (p === undefined) return null;
+  if (ts.isPropertyAccessExpression(p) && p.expression === child) {
+    const m = p.name.text;
+    if (name === "Error") {
+      // `Error.captureStackTrace(this, …)` over a statically typed class
+      // instance keeps its own lowering (commander's error constructors:
+      // lowerErrorCaptureStackTrace, or its refusal) — the dynamic value's
+      // capture applies to dynamic objects only (S132 U3+U4 amendment (g4)).
+      const call = p.parent;
+      if (m === "captureStackTrace" && call !== undefined && ts.isCallExpression(call) && call.expression === p && call.arguments.length >= 1 &&
+        !ts.isSpreadElement(call.arguments[0]!) && L.mapTypeOf(L.typeOf(call.arguments[0]!))?.kind === "object") return null;
+      return ERROR_STATICS.has(m) ? name : null;
+    }
+    if (name === "globalThis") {
+      // a member the standard library declares keeps its own lowering
+      // (the object's own aliases aside: `globalThis.global` must be the
+      // box itself, so it reads through the box and stops by name)
+      if (m === "global" || m === "globalThis") return name;
+      const t = L.checker.getTypeAtLocation(id);
+      return L.checker.getPropertyOfType(t, m) === undefined ? name : null;
+    }
+    return null;
+  }
+  if (ts.isElementAccessExpression(p) && p.expression === child) return name === "globalThis" ? name : null;
+  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === child) return null;
+  if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === child) return null;
+  if (ts.isTypeOfExpression(p) || ts.isExpressionWithTypeArguments(p) || ts.isHeritageClause(p) || ts.isDecorator(p)) return null;
+  if (ts.isShorthandPropertyAssignment(p) || ts.isExportSpecifier(p) || ts.isImportSpecifier(p)) return null;
+  // `const { crypto } = globalThis`: destructuring a builtin keeps its own
+  // member-token lowering (the standard globals read through it)
+  if (ts.isVariableDeclaration(p) && p.initializer === child && !ts.isIdentifier(p.name)) return null;
+  return name;
+}
+
+/** Is `e` the globalThis box (`globalThis`, `global`) in a position that
+ * takes the value? */
+export function isGlobalBox(L: Lowerer, e: ts.Expression): boolean {
+  const x = strip(e);
+  return ts.isIdentifier(x) && builtinBoxPosition(L, x) === "globalThis";
+}
+
+/** The builtin as its dynamic value. */
+export function lowerBuiltinBox(L: Lowerer, id: ts.Identifier): IrExpr | null {
+  const name = builtinBoxPosition(L, id);
+  if (name === null) return null;
+  return builtinBoxValue(L, id, name);
+}
+
+/** The right side of `v instanceof Error` on the dynamic path: the Error
+ * value (objmodel.ts instanceOf answers isError for it). */
+export function builtinBoxOperand(L: Lowerer, right: ts.Expression): IrExpr | null {
+  const r = strip(right);
+  if (!omActive(L) || !ts.isIdentifier(r) || r.text !== "Error" || !L.isStdlibGlobal(r, "Error")) return null;
+  return builtinBoxValue(L, r, "Error");
+}
+
+function builtinBoxValue(L: Lowerer, id: ts.Identifier, name: string): IrExpr {
+  const loc = locOf(id);
+  // globalThis: Node's own global object's names (NODE24_GLOBALS, measured;
+  // not the type declarations, which name globals Node does not have —
+  // localStorage, CommonJS's module-scope names — and miss some it does —
+  // navigator, WebSocket): each is a hidden accessor that stops by name
+  // when read through the value.
+  const globals = name === "globalThis" ? NODE24_GLOBALS.join("\n") : "";
+  return lib("om.builtinValue", [{ kind: "strLit", value: name, type: STRING, loc } as IrExpr, { kind: "strLit", value: globals, type: STRING, loc } as IrExpr], loc);
+}
+
+/** `Error.captureStackTrace(o)` and the other statics the dynamic value
+ * serves, called: a method call on the value. */
+export function lowerBuiltinBoxCall(L: Lowerer, call: ts.CallExpression): IrExpr | null {
+  const callee = strip(call.expression);
+  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.expression)) return null;
+  const box = lowerBuiltinBox(L, callee.expression);
+  if (box === null) return null;
+  if (call.arguments.some((a) => ts.isSpreadElement(a))) return null;
+  const loc = locOf(call);
+  // the member read off the value, then called (these statics ignore
+  // their receiver)
+  const fn: IrExpr = { kind: "jsOp", op: "getProp", name: callee.name.text, args: [box], type: JSVAL, loc } as IrExpr;
+  return { kind: "jsOp", op: "callFn", args: [fn, ...call.arguments.map((a) => js(L, a))], type: JSVAL, loc, spelling: callee.getText() } as IrExpr;
+}
+
+/** `class X extends <dynamic> {}` (no members) in a JavaScript function
+ * or module: the class is a dynamic value (objmodel.ts dynClass). */
+export function isDynClassDecl(L: Lowerer, node: ts.ClassLikeDeclaration): boolean {
+  if (!omActive(L) || !isJsSourceFileName(node.getSourceFile().fileName)) return false;
+  if (node.members.length > 0) return false;
+  // A module-scope class DECLARATION keeps the class machinery's own
+  // refusal (its binding is a module global the dynamic class value does
+  // not yet initialize in order with ES5 prototype writes).
+  if (ts.isClassDeclaration(node) && node.parent !== undefined && ts.isSourceFile(node.parent)) return false;
+  const clauses = node.heritageClauses ?? [];
+  if (clauses.length !== 1 || clauses[0]!.token !== ts.SyntaxKind.ExtendsKeyword || clauses[0]!.types.length !== 1) return false;
+  const base = clauses[0]!.types[0]!.expression;
+  // a base the class machinery resolves (a program class, a builtin error
+  // class named directly) keeps it
+  const sym = ts.isIdentifier(base) ? L.checker.getSymbolAtLocation(base) : undefined;
+  const decl = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
+  if (decl !== undefined && (ts.isClassDeclaration(decl) || ts.isClassExpression(decl))) return false;
+  if (ts.isIdentifier(base) && (L.isStdlibGlobal(base, "Error") || L.isStdlibGlobal(base, "TypeError") || L.isStdlibGlobal(base, "RangeError"))) return false;
+  return true;
+}
+
+export function lowerDynClass(L: Lowerer, node: ts.ClassLikeDeclaration): IrExpr {
+  const base = node.heritageClauses![0]!.types[0]!.expression;
+  const loc = locOf(node);
+  const name = node.name?.text ?? namedEvaluationName(node);
+  return lib("om.dynClass", [js(L, base), { kind: "strLit", value: name, type: STRING, loc } as IrExpr], loc);
+}
+
+/** The name an anonymous class expression takes from where it is bound
+ * (ECMAScript NamedEvaluation): `const D = class …`, `D = class …`,
+ * `{ D: class … }`, a default `(D = class …)`; "" elsewhere. */
+function namedEvaluationName(node: ts.Node): string {
+  let child: ts.Node = node;
+  let p = node.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) {
+    child = p;
+    p = p.parent;
+  }
+  if (p === undefined) return "";
+  if ((ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isBindingElement(p)) && p.initializer === child) {
+    const nm = p.name as ts.Node | undefined;
+    return nm !== undefined && ts.isIdentifier(nm) ? nm.text : "";
+  }
+  if (ts.isBinaryExpression(p) && p.right === child && ts.isIdentifier(p.left) &&
+      (p.operatorToken.kind === ts.SyntaxKind.EqualsToken || p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken ||
+       p.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken || p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandEqualsToken)) return p.left.text;
+  if (ts.isPropertyAssignment(p) && p.initializer === child) {
+    const nm = p.name as ts.Node;
+    if (ts.isIdentifier(nm) || ts.isStringLiteral(nm) || ts.isNumericLiteral(nm) || ts.isPrivateIdentifier(nm)) return (nm as unknown as { text: string }).text;
+  }
+  if (ts.isShorthandPropertyAssignment(p) && p.objectAssignmentInitializer === child) return (p.name as unknown as { text: string }).text;
+  return "";
 }

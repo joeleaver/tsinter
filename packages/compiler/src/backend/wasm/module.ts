@@ -290,11 +290,11 @@ export class ModuleBuilder {
   /** A struct SUBTYPE of `superIdx` (width subtyping — the closure envs).
    * Not interned by shape: two different capture sets may share a field
    * layout yet stay distinct declarations; callers key by meaning. */
-  subStructType(key: string, fields: FieldType[], superIdx: number): number {
+  subStructType(key: string, fields: FieldType[], superIdx: number, final = true): number {
     const existing = this.typeIndex.get(key);
     if (existing !== undefined) return existing;
     const index = this.types.length;
-    this.types.push({ kind: "struct", fields, sub: { supers: [superIdx], final: true } });
+    this.types.push({ kind: "struct", fields, sub: { supers: [superIdx], final } });
     this.typeIndex.set(key, index);
     return index;
   }

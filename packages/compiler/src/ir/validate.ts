@@ -975,6 +975,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "om.instanceOf": { argTypes: [JSVAL, JSVAL], result: BOOL },
   "om.bind": { argTypes: [JSVAL, JSVAL, JSVAL], result: JSVAL },
   "om.sloppy": { argTypes: [F64], result: VOID },
+  "om.builtinValue": { argTypes: [STRING, STRING], result: JSVAL },
+  "om.dynClass": { argTypes: [JSVAL, STRING], result: JSVAL },
   "dyn.objValues": { argTypes: [DYN], result: DYN },
   "dyn.objEntries": { argTypes: [DYN], result: DYN },
   "dyn.structuredClone": { argTypes: [DYN, DYN], result: DYN },

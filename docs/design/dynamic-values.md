@@ -619,6 +619,49 @@ plan above was underspecified, these are the calls made:
   members: `Object.prototype.x` reads keep their existing paths, and only
   its identity (getPrototypeOf, setPrototypeOf, create) is modeled.
 
+**As built (U3+U4 follow-up, 2026-11-12): builtins as values.** zod 4's
+next blockers after the object model were `Error` and `Object` taken as
+values (`"captureStackTrace" in Error`, `params?.Parent ?? Object`), the
+`globalThis` it stores its registry on, and `class Definition extends
+Parent {}` over such a dynamic `Parent`. Files: `lower-objmodel.ts`
+(`builtinBoxPosition`, `lowerBuiltinBox`, `lowerBuiltinBoxCall`,
+`builtinBoxOperand`, `isDynClassDecl`/`lowerDynClass`), `emitter.ts`
+(`builtinValueHelper`) and `objmodel.ts` (`dynClass`, `instanceOf`).
+- **Where a builtin becomes a value.** It does so only in a module where
+  the object model is live, and only in a position the existing lowering
+  refuses: the bare identifier as an operand, an initializer or an
+  argument; `Error.<static>` for Error's own statics; `globalThis.<k>`
+  for a key the standard library does not declare; and the right side of
+  `instanceof` where the left is dynamic. Calls such as `new Error(m)`,
+  `Object.keys(o)` and `globalThis.console.log(…)` keep their typed
+  lowerings. In the type map, `ErrorConstructor` maps to a dynamic value;
+  `ObjectConstructor` does not, because that broke `Object.keys`.
+- **Error** is one interned FUNC (sig -6) that builds an Error when called
+  or constructed (message only; an options argument stops by name). Its
+  statics are `captureStackTrace`, `prepareStackTrace` (a stand-in that
+  stops by name when called), `isError` and `stackTraceLimit` (10).
+  `instanceof` against it is `isError`. `captureStackTrace` writes V8's
+  header line with no frames, as a non-enumerable data `stack`; that is
+  SEMANTICS.md S114's U3+U4 amendment.
+- **Object** is one FUNC (sig -7) that answers its object argument or a
+  fresh object. Its `prototype` is the Object.prototype stand-in.
+- **globalThis** is one object holding what the program writes to it.
+  Every global the standard library declares is a hidden accessor that
+  stops by name when read through the value, so `in` answers as in Node.
+  The fallback ambient declares `console` block-scoped, so it is added by
+  name.
+- **`class X extends <dynamic> {}`** in JavaScript, with no members, is a
+  dynamic class (sig -8, `om.dynClass`). Calling it throws Node's "Class
+  constructor X cannot be invoked without 'new'". Constructing it
+  constructs the base with the same arguments and relinks the result's
+  prototype to `X.prototype`, whose own prototype is the base's.
+- **Not built:**
+  - a class with members over a dynamic base (refuses as before);
+  - `globalThis` reads of library globals through the value (they stop
+    by name);
+  - `Error.captureStackTrace` on a statically typed class instance (it
+    keeps the boundary refusal).
+
 ### 4.7 Composition with S125 and existing views
 
 - S125(a)'s per-call-site instance is the vehicle for `T~` parameters. It is the
