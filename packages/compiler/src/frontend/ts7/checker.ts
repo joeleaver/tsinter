@@ -208,7 +208,8 @@ export class CheckerFacade {
   /** True when any of the symbol's declarations lives in a file whose path
    * satisfies `pred` (no node resolution — handle paths only). */
   symbolDeclaredIn(symbol: Ts7Symbol, pred: (path: string) => boolean): boolean {
-    return symbol.declarations.some((h) => pred(h.path as unknown as string));
+    // (A lowering-synthetic symbol — the this-binding — has none.)
+    return (symbol.declarations ?? []).some((h) => pred(h.path as unknown as string));
   }
 
   /** declarationsOf WITHOUT the declared-surface redirect. */
@@ -216,7 +217,7 @@ export class CheckerFacade {
     let decls = this.declsOf.get(symbol);
     if (decls === undefined) {
       const project = this.requireProject();
-      decls = symbol.declarations
+      decls = (symbol.declarations ?? [])
         .map((h) => h.resolve(project))
         .filter((n): n is Node => n !== undefined);
       const dead = deadDuplicates(decls);
@@ -249,7 +250,7 @@ export class CheckerFacade {
     let decls = this.declsOf.get(symbol);
     if (decls === undefined) {
       const project = this.requireProject();
-      decls = symbol.declarations
+      decls = (symbol.declarations ?? [])
         .map((h) => h.resolve(project))
         .filter((n): n is Node => n !== undefined);
       // GH #111: a scope that declares the same function more than once
@@ -306,7 +307,7 @@ export class CheckerFacade {
     if (symbol === undefined) return [decl];
     const project = this.requireProject();
     const scope = declScopeOf(decl);
-    return symbol.declarations
+    return (symbol.declarations ?? [])
       .map((h) => h.resolve(project))
       .filter((n): n is Node => n !== undefined && isBodiedFunctionDeclaration(n) && declScopeOf(n) === scope);
   }
