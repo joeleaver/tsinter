@@ -4341,8 +4341,19 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     if (ts.isObjectLiteralExpression(arg)) {
       let acc: IrExpr = { kind: "libCall", fn: "sp.new", args: [], type: SEARCH_PARAMS_T, loc };
       for (const prop of arg.properties) {
+        // A shorthand entry (`{ ref, path }`): the binding's value under
+        // its own name, as `ref: ref`.
+        if (ts.isShorthandPropertyAssignment(prop) && prop.objectAssignmentInitializer === undefined) {
+          const value = L.coerceInto(prop, L.lowerShorthandValue(prop), STRING);
+          if (value.type.kind !== "string") {
+            L.unsupported("SC1090", prop, "a URLSearchParams record init entry whose value is not a string");
+          }
+          const keyExpr: IrExpr = { kind: "strLit", value: (prop.name as ts.Identifier).text, type: STRING, loc: locOf(prop.name) };
+          acc = { kind: "libCall", fn: "sp.with", args: [acc, keyExpr, value], type: SEARCH_PARAMS_T, loc };
+          continue;
+        }
         if (!ts.isPropertyAssignment(prop) || prop.name === undefined) {
-          L.unsupported("SC1090", prop, "URLSearchParams record inits with spreads, accessors, or shorthand entries");
+          L.unsupported("SC1090", prop, "URLSearchParams record inits with spreads or accessors");
         }
         let key: string;
         if (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) {

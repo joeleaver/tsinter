@@ -9,6 +9,7 @@ import * as ts from "../ts7/adapter.js";
 import { PoisonError, fnProtoOfValueNode, nodeThrowExpr, type Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, JSVAL, STRING, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
+import { lowerHasOwnCall } from "./lower-calls.js";
 import { isJsSourceFileName } from "../shared.js";
 
 /** The object model serves the one-world WasmGC lowering (not the
@@ -74,7 +75,10 @@ export function lowerHasOwnPropertyCall(L: Lowerer, call: ts.CallExpression): Ir
   const isObjProto = ts.isPropertyAccessExpression(base) && base.name.text === "prototype" && L.isStdlibGlobal(base.expression, "Object");
   const isEmptyLit = ts.isObjectLiteralExpression(base) && base.properties.length === 0;
   if (!isObjProto && !isEmptyLit) return null;
-  if (!isDynNode(L, call.arguments[0]!)) return null;
+  // A typed receiver (a record): Object.hasOwn's own-key answer — the same
+  // test (portability-zip's `Object.prototype.hasOwnProperty.call(files,
+  // path)`).
+  if (!isDynNode(L, call.arguments[0]!)) return lowerHasOwnCall(L, call, call.arguments[0]!, call.arguments[1]!);
   const loc = locOf(call);
   const recv = { kind: "dynFromJsval", value: js(L, call.arguments[0]!), type: DYN, loc } as IrExpr;
   const keyNode = call.arguments[1]!;
