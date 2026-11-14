@@ -2019,6 +2019,9 @@ export class Lowerer {
     // registry (globals, fn signatures, classes) applies unchanged.
     const cjsValue = this.cjsExportValueSymbol(symbol);
     if (cjsValue) symbol = cjsValue;
+    // SEMANTICS.md S133: a namespace member of a viewed package's module
+    // (`ns.f`) names the DECLARED export — the implementation is the value.
+    symbol = this.checker.implementationOf(symbol);
     this.flushDeferred(symbol);
     return symbol;
   }

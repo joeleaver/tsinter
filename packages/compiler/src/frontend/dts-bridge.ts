@@ -32,6 +32,11 @@ import { isDtsMirrorPath, npmStaticDtsViews } from "./npm-static.js";
 type Sym = ts.Symbol;
 
 interface ViewExports {
+  /** The mirrored declaration MODULE's symbol, and the JS module symbol it
+   * describes (a namespace import, `import * as ns`, resolves to the
+   * former; its member accesses must find the program module). */
+  declaredModule: Sym | undefined;
+  jsModule: Sym | undefined;
   /** Declared export symbol (alias-resolved) → export name. */
   declared: Map<Sym, string>;
   /** JS export name → JS export symbol (as exported). */
@@ -66,6 +71,8 @@ export function installDtsBridge(program: ts.Program): void {
     for (const view of views.values()) {
       const declared = new Map<Sym, string>();
       const mirrorMod = moduleSymbolOf(program.getSourceFile(view.mirrorEntry));
+      const declaredModule = mirrorMod;
+      let jsModule: Sym | undefined;
       // `export = picocolors` (a declared const the whole module IS): the
       // const maps to the JS module's own `module.exports = …` value, and
       // its MEMBERS (which the module's exports list repeats) stay the
@@ -91,6 +98,7 @@ export function installDtsBridge(program: ts.Program): void {
         // type of module.exports); ES modules answer either way.
         const mod = moduleSymbolOf(program.getSourceFile(entry));
         if (mod === undefined) continue;
+        jsModule ??= mod;
         const jsEq = mod.getExports().get("export=" as ts.__String);
         if (jsEq !== undefined && !js.has("export=")) js.set("export=", jsEq);
         const named = exportsOf(mod);
@@ -99,7 +107,7 @@ export function installDtsBridge(program: ts.Program): void {
           if (!js.has(e.name)) js.set(e.name, e);
         }
       }
-      exportsOfViews.push({ declared, js });
+      exportsOfViews.push({ declaredModule, jsModule, declared, js });
     }
     return exportsOfViews;
   };
@@ -125,6 +133,14 @@ export function installDtsBridge(program: ts.Program): void {
   };
 
   const computeRedirect = (sym: Sym): Sym | null => {
+    // A view's declaration MODULE (`import * as ns from "pkg/x.js"`): the
+    // JS module it describes — namespace member accesses then resolve as
+    // any program module's do, each member through the export mapping.
+    if (sym.flags & ts.SymbolFlags.ValueModule) {
+      for (const v of viewExports()) {
+        if (v.declaredModule === sym) return v.jsModule ?? null;
+      }
+    }
     for (const v of viewExports()) {
       const name = v.declared.get(sym);
       if (name === undefined) continue;

@@ -236,6 +236,14 @@ export class CheckerFacade {
     return aliased;
   }
 
+  /** The implementation a symbol DECLARED in a mirrored .d.ts names (the
+   * declared-surface redirect), else the symbol itself. A namespace
+   * member read (`ns.f` over `import * as ns` of a viewed package) names
+   * the declared export directly — no alias hop applies the redirect. */
+  implementationOf(symbol: Ts7Symbol): Ts7Symbol {
+    return this.redirected(symbol, "alias") ?? symbol;
+  }
+
   private redirected(symbol: Ts7Symbol, use: "decl" | "alias"): Ts7Symbol | null {
     const r = this.symbolRedirect?.(symbol, use) ?? null;
     return r !== null && r !== symbol ? r : null;
