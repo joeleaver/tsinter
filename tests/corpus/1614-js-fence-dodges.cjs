@@ -27,12 +27,4 @@ console.log('F2', known.has(setTimeout), known.has(clearInterval));
 // that never fire here.
 const wm = new WeakMap();
 console.log('F3', wm !== null);
-
-// for-in over globalThis: nothing a compiled program can leak — the body
-// observes no scriptc-created enumerable globals (Node's own baseline
-// names are all outside this program's output).
-let sawOwnLeak = false;
-for (const k in globalThis) {
-  if (k === '__scriptc_leak__') sawOwnLeak = true;
-}
-console.log('F4', sawOwnLeak);
+// F4 (for-in over globalThis) moved to wasm-u3u4-builtins.test.ts U34B-REV-05b: it now stops by name.

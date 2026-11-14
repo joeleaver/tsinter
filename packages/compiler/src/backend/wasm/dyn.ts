@@ -2117,6 +2117,9 @@ export class DynBuilder {
           : []),
       ],
       objT,
+      // non-final: an untyped Map/WeakMap/WeakSet payload (objBuiltinT)
+      // extends the linked payload where the object model is live
+      false,
     );
     return this.objLinkedType;
   }
@@ -9806,6 +9809,43 @@ export class DynBuilder {
     });
   }
 
+  /** Units U3 + U4 (review): set by the emitter when the program takes
+   * `globalThis` as a dynamic value (om.builtinValue), before any helper
+   * is built. */
+  globalBoxLive = false;
+  private globalBoxGl: number | null = null;
+
+  /** The globalThis box (null until its builtin value is first built). */
+  globalBoxG(): number {
+    this.globalBoxGl ??= this.mb.addGlobal(this.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.dynT());
+    });
+    return this.globalBoxGl;
+  }
+
+  /** Stop by name when the value `getD` pushes is the globalThis box:
+   * its own keys are a stand-in (hidden accessors for the standard
+   * globals), so no reflection may report them. */
+  globalReflectGuard(c: Code, getD: (c: Code) => void): void {
+    if (!this.globalBoxLive) return;
+    const dynT = this.dynT();
+    c.globalGet(this.globalBoxG());
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    getD(c);
+    c.structGet(dynT, DYN_REF);
+    c.globalGet(this.globalBoxG());
+    c.structGet(dynT, DYN_REF);
+    c.refEq();
+    c.ifVoid();
+    this.deps.fence(c, (x) => this.deps.lit(x, "reflecting over globalThis held as a dynamic value (listing, copying, printing, serializing or describing its properties, or reading its prototype) is not supported yet"));
+    c.unreachable();
+    c.end();
+    c.end();
+  }
+
   objWalk(): number {
     return this.cached("objWalk", [this.dynRef(), I32], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
@@ -9828,6 +9868,7 @@ export class DynBuilder {
       const AB = 16;
       const FP = 17;
       const CELL = 18; // unit A2, only where accessors are live
+      this.globalReflectGuard(c, (x) => x.localGet(0));
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -13424,6 +13465,41 @@ export class DynBuilder {
           c.call(this.toStr());
           c.localSet(S);
           bailIfPending();
+          if (method === "propertyIsEnumerable" && this.objModelLive) {
+            // Units U3 + U4: a plain object's own property answers its
+            // own enumerable attribute (a defineProperty'd key may be
+            // hidden).
+            c.localGet(K);
+            c.i32Const(DK.OBJ);
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(0);
+            c.localGet(S);
+            c.call(this.om.ownDesc());
+            c.localTee(M);
+            c.refIsNull();
+            c.ifVoid();
+            c.refNull(dynT);
+            c.return_();
+            c.end();
+            this.boxBool(c, (x) => {
+              x.localGet(M);
+              x.structGet(dynT, DYN_KIND);
+              x.i32Const(DK.UNDEF);
+              x.i32Eq();
+              x.ifResult(I32);
+              x.i32Const(0);
+              x.else_();
+              x.localGet(M);
+              this.deps.lit(x, "enumerable");
+              x.i32Const(0);
+              x.call(this.keyGet());
+              x.call(this.truthy());
+              x.end();
+            });
+            c.return_();
+            c.end();
+          }
           this.boxBool(c, (x) => {
             x.localGet(0);
             x.localGet(S);
@@ -15660,6 +15736,37 @@ export class DynBuilder {
         // inherits (OBJ answered them in its own arm).
         if (objProto && method !== "toLocaleString" && method !== "toString") {
           this.arm(c, K, [DK.NUM, DK.BOOL, DK.STR, DK.ARR, DK.FUNC, DK.PROMISE], objProtoCall);
+        }
+
+        // Units U3 + U4: a FUNC's own member (an ES5 constructor's static,
+        // the Object value's non-enumerable statics) called with `this`
+        // bound to the function.
+        if (this.objModelLive && !DynBuilder.FN_METHODS.has(method)) {
+          this.arm(c, K, [DK.FUNC], () => {
+            c.localGet(0);
+            this.deps.lit(c, method);
+            c.i32Const(0);
+            c.call(this.keyGet());
+            c.localSet(M);
+            bailIfPending();
+            c.localGet(M);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.FUNC);
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(0);
+            c.call(this.thisPush());
+            c.localGet(M);
+            c.localGet(1);
+            c.localGet(2);
+            c.call(this.callFn());
+            c.localSet(R);
+            c.call(this.thisPop());
+            c.localGet(R);
+            c.return_();
+            c.end();
+            throwNotFn();
+          });
         }
 
         // NUM, BOOL, PROMISE, and FUNC/ARR/STR for the names their own

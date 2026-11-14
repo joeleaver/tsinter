@@ -22,7 +22,7 @@
  *    `$dynAcc` subtype (the getter in the ref slot, either half may be the
  *    `undefined` box). */
 import type { DynBuilder } from "./dyn.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, ENTRY_KEY, ENTRY_VALUE, FN_ARITY, FN_CLOS, FN_NAME, FN_PROTO, FN_SIG, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, ENTRY_KEY, ENTRY_VALUE, FN_ARITY, FN_CLOS, FN_NAME, FN_PROTO, FN_SIG, FN_SRC, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
 import { Code } from "./code.js";
 import { emitFlatCast } from "./strings.js";
 import { F64, I32, type ValType } from "./module.js";
@@ -2108,6 +2108,7 @@ export class ObjModel {
   /** %w.om.getOwnPropertyDescriptor(target, key box) → desc or undefined. */
   getOwnPropertyDescriptor(): number {
     return this.fn("gopd", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [this.strRef()], (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
       c.localGet(1);
       c.call(this.d.toPropertyKey());
       c.localTee(2);
@@ -2159,6 +2160,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [I32, this.d.objRef(), this.d.objRef(), I32, I32, this.d.entryRef(), I32, this.k.fnPropsRef(), this.d.dynRef(), this.d.arrRef()],
       (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
         const K = 1;
         const O = 2;
         const TMP = 3;
@@ -2330,6 +2332,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.dynRef(), this.d.objRef(), I32, this.d.dynRef(), this.d.dynRef()],
       (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
         const NAMES = 1;
         const OUT = 2;
         const I = 3;
@@ -2529,6 +2532,7 @@ export class ObjModel {
     const dynT = this.d.dynT();
     const L = this.d.objLinkedT();
     return this.fn("getProto", [this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef()], (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
       const K = 1;
       const P = 2;
       c.localGet(0);
@@ -2775,6 +2779,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [I32, this.d.arrRef(), this.d.objRef(), this.d.dynRef(), this.d.dynRef(), I32, this.d.dynRef(), this.d.objRef(), I32],
       (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
         const K = 1;
         const OUT = 2;
         const SEEN = 3;
@@ -2908,6 +2913,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.objRef(), I32, this.d.entryRef(), I32, I32],
       (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
       this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.freeze, seal or preventExtensions");
         const O = 2;
         const I = 3;
@@ -3013,6 +3019,7 @@ export class ObjModel {
     const entries = this.d.entriesArrayType();
     const entryT = this.d.entryT();
     return this.fn("isIntegrity", [this.d.dynRef(), I32], [I32], [this.d.objRef(), I32, this.d.entryRef()], (c) => {
+      this.d.globalReflectGuard(c, (x) => x.localGet(0));
       const O = 2;
       const I = 3;
       const E = 4;
@@ -3130,6 +3137,15 @@ export class ObjModel {
       c.i32Eq();
       c.ifVoid();
       this.k.deps.fence(c, (x) => this.lit(x, "Function.prototype read through the Function constructor taken as a value is not supported yet"));
+      c.end();
+      // Units U3 + U4: the Error value's prototype is Node's
+      // Error.prototype, which no dynamic value models
+      this.d.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.d.fnT(), FN_SIG);
+      c.i32Const(-6);
+      c.i32Eq();
+      c.ifVoid();
+      this.k.deps.fence(c, (x) => this.lit(x, "Error.prototype read through the Error constructor held as a dynamic value is not supported yet"));
       c.end();
       c.end();
       c.localGet(0);
@@ -3280,6 +3296,24 @@ export class ObjModel {
         c.ifVoid();
         this.k.deps.fence(c, (x) => this.lit(x, "constructing a builtin read as a function value (`new String(...)` builds a wrapper object) is not supported yet"));
         c.refNull(dynT);
+        c.return_();
+        c.end();
+        // The Error value (SIG -6): its thunk builds the error itself; the
+        // receiver object is never seen (and Error.prototype has no model).
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.d.fnT(), FN_SIG);
+        c.i32Const(-6);
+        c.i32Eq();
+        c.ifVoid();
+        this.d.boxObj(c, (x) => this.d.pushNewObj(x, false));
+        c.call(this.d.thisPush());
+        c.localGet(0);
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.d.callFn());
+        c.localSet(R);
+        c.call(this.d.thisPop());
+        c.localGet(R);
         c.return_();
         c.end();
         c.localGet(0);
@@ -3710,20 +3744,108 @@ export class ObjModel {
         const F = 3;
         const PR = 4;
         const PP = 5;
+        // A program function whose box does not record whether it owns
+        // `prototype` (a method or arrow read off a typed record and
+        // converted as a field): whether it constructs is not known here,
+        // so the class stops by name rather than guess.
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifResult(I32);
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_PROTO);
+        c.i32Const(3);
+        c.i32And();
+        c.i32Eqz();
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SIG);
+        c.i32Const(0);
+        c.i32GeS();
+        c.i32And();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.ifVoid();
+        this.k.deps.fence(c, (x) => this.lit(x, "a class extending a function value whose constructibility this build did not record (a method or arrow converted as a record field) is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        // not a constructor: neither a function nor null, or a function
+        // with no [[Construct]] (an arrow, a method: no own prototype)
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifResult(I32);
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_PROTO);
+        c.i32Const(3);
+        c.i32And();
+        c.i32Const(2);
+        c.i32Eq();
+        // (the Error and Object values have no prototype flag but construct)
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SIG);
+        c.i32Const(-6);
         c.i32Ne();
+        c.i32And();
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SIG);
+        c.i32Const(-7);
+        c.i32Ne();
+        c.i32And();
+        c.else_();
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.i32Const(DK.NULL);
         c.i32Ne();
-        c.i32And();
+        c.end();
         c.ifVoid();
+        // V8 renders the value without side effects: a primitive as its
+        // string, a function as its source text. A function whose source
+        // text this build does not keep, and any other object (V8's
+        // `#<Object>`-style rendering), stop by name rather than render
+        // differently.
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifResult(I32);
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SRC);
+        c.refIsNull();
+        c.else_();
+        c.i32Const(1);
+        for (const k of [DK.NUM, DK.STR, DK.BOOL, DK.UNDEF]) {
+          c.localGet(0);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(k);
+          c.i32Ne();
+          c.i32And();
+        }
+        c.end();
+        c.ifVoid();
+        this.k.deps.fence(c, (x) => this.lit(x, "a class extending a value that is not a constructor, where V8's rendering of that value (its source text) is not kept here, is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
         this.throwType(c, (x) => {
           this.lit(x, "Class extends value ");
+          // a function: its kept source text (toStr renders the
+          // native-code form, S019); a primitive: its string
+          x.localGet(0);
+          x.structGet(dynT, DYN_KIND);
+          x.i32Const(DK.FUNC);
+          x.i32Eq();
+          x.ifResult(this.strRef());
+          this.d.fnPayload(x, (y) => y.localGet(0));
+          x.structGet(fnT, FN_SRC);
+          x.refAsNonNull();
+          x.else_();
           x.localGet(0);
           x.call(this.d.toStr());
+          x.end();
           this.concat(x);
           this.lit(x, " is not a constructor or null");
           this.concat(x);
@@ -3737,6 +3859,15 @@ export class ObjModel {
         c.i32Eq();
         c.ifVoid();
         this.k.deps.fence(c, (x) => this.lit(x, "a class extending null is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SIG);
+        c.i32Const(-5);
+        c.i32Eq();
+        c.ifVoid();
+        this.k.deps.fence(c, (x) => this.lit(x, "a class extending a bound function is not supported yet"));
         c.refNull(dynT);
         c.return_();
         c.end();
@@ -3761,6 +3892,16 @@ export class ObjModel {
         c.localGet(F);
         c.call(this.fnPrototype());
         c.localSet(PR);
+        // over the Error value: instances answer instanceof Error by their
+        // error-ness (om.instanceOf), and Error.prototype has no model
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(fnT, FN_SIG);
+        c.i32Const(-6);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(F);
+        c.return_();
+        c.end();
         c.localGet(0);
         this.lit(c, "prototype");
         c.i32Const(0);
@@ -3771,16 +3912,31 @@ export class ObjModel {
         c.refNull(dynT);
         c.return_();
         c.end();
+        // the base's prototype must be an object or null (V8's TypeError)
         c.localGet(PP);
         c.structGet(dynT, DYN_KIND);
         c.i32Const(DK.OBJ);
-        c.i32Eq();
+        c.i32Ne();
+        c.localGet(PP);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NULL);
+        c.i32Ne();
+        c.i32And();
         c.ifVoid();
+        this.throwType(c, (x) => {
+          // (V8's text names no value before the property)
+          this.lit(x, "Class extends value does not have valid prototype property ");
+          x.localGet(PP);
+          x.call(this.d.toStr());
+          this.concat(x);
+        });
+        c.refNull(dynT);
+        c.return_();
+        c.end();
         c.localGet(PR);
         c.localGet(PP);
         c.call(this.setProto());
         c.drop();
-        c.end();
         c.localGet(F);
       });
   }

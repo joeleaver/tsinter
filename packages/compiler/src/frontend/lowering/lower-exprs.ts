@@ -8,7 +8,7 @@ import { wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
-import { builtinBoxOperand, isDynClassDecl, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
+import { builtinBoxOperand, isDynClassDecl, isGlobalBox, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
@@ -21,7 +21,7 @@ import { lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { PoisonError, dynUndefinedExpr, esFuncNameOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { armCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped } from "./lower-builtins.js";
@@ -591,6 +591,14 @@ function guardModuleTdz(L: Lowerer, tdz: ModuleTdz, expr: ts.Expression, lowered
   return { kind: "seqExpr", stmts: owed, result: lowered, type: lowered.type, loc };
 }
 
+/** Object statics that list, copy, describe, freeze or read the
+ * prototype of their argument (units U3 + U4: stopped over globalThis). */
+const GLOBAL_REFLECT_STATICS = new Set([
+  "assign", "keys", "values", "entries", "getOwnPropertyNames", "getOwnPropertySymbols",
+  "getOwnPropertyDescriptor", "getOwnPropertyDescriptors", "getPrototypeOf", "freeze", "seal",
+  "preventExtensions", "isFrozen", "isSealed", "isExtensible",
+]);
+
 function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     const loc = locOf(expr);
 
@@ -835,6 +843,24 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     // lowerObjectLiteral's fallback — a package call's options parameter
     // is often an unmappable intersection while the literal's own type
     // absorbs to jsval (a bare-jsval field, an npm-typed member).
+    // Units U3 + U4: spreading globalThis (`{ ...globalThis }`) copies the
+    // global object's own enumerable properties, which no value here holds
+    // (the box's keys are a stand-in): stopped by name.
+    if (ts.isObjectLiteralExpression(expr)) {
+      for (const p of expr.properties) {
+        if (ts.isSpreadAssignment(p) && isGlobalBox(L, p.expression)) {
+          L.unsupported("SC1090", p, "spreading globalThis into an object literal (copying the global object's own properties)");
+        }
+      }
+    }
+    // ... and the Object statics that list, copy, describe or seal it
+    // (`Object.assign({}, globalThis)`): some lower statically over the
+    // checker's `typeof globalThis`, so they stop here, by name.
+    if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression) && ts.isIdentifier(expr.expression.expression) &&
+        expr.expression.expression.text === "Object" && GLOBAL_REFLECT_STATICS.has(expr.expression.name.text) &&
+        expr.arguments.some((a) => isGlobalBox(L, a)) && L.isStdlibGlobal(expr.expression.expression, "Object")) {
+      L.unsupported("SC1090", expr, `Object.${expr.expression.name.text} over globalThis (reflecting over the global object's own properties)`);
+    }
     if (
       (ts.isObjectLiteralExpression(expr) || ts.isArrayLiteralExpression(expr)) &&
       (() => {
@@ -6131,6 +6157,12 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         raw = { kind: "closure", fnName, captures: [], type: funcOf([], VOID), loc: locOf(prop) };
       }
       let v = L.coerceToExpected(raw, DYN);
+      // Unit U4: a function value's box knows whether it owns `prototype`
+      // (an arrow or a method does not: `new` and `extends` reject it)
+      if (raw.type.kind === "func" && v.kind === "dynFrom") {
+        const k = fnProtoOfValueNode(L, valueExpr);
+        if (k !== null) (v as { fnProto?: number }).fnProto = k;
+      }
       if (v.type.kind !== "dyn") {
         const convDiagsBefore = L.diags.length;
         try {
@@ -7923,7 +7955,10 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     // divergence: statically-known globals are not reachable this way;
     // the PROPERTY spelling answers the identity token instead — see
     // lowerPropertyAccess's globalThis rule).
-    if (!expr.questionDotToken && stdlibGlobalNameOf(L, expr.expression) === "globalThis") {
+    // (Units U3 + U4: where globalThis is a dynamic value — the object
+    // model's box — the read goes through it: what the program wrote
+    // reads back, a standard global stops by name.)
+    if (!expr.questionDotToken && stdlibGlobalNameOf(L, expr.expression) === "globalThis" && !isGlobalBox(L, expr.expression)) {
       return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
     }
     // `req.headers["x-name"]` — the computed twin of `req.headers.host`

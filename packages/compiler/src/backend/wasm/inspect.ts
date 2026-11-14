@@ -4517,6 +4517,8 @@ export class InspectBuilder {
       });
 
       this.kindArm(c, K, [DK.OBJ], () => {
+        // Units U3 + U4: globalThis's box (its keys are a stand-in)
+        dyn.globalReflectGuard(c, (x) => x.localGet(D));
         dyn.classViewPrintFence(c, D, (x) => {
           x.refNull(strT);
           x.return_();

@@ -10,7 +10,7 @@ import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
-import { isDynClassDecl, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
+import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -8471,7 +8471,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
   export function lowerForIn(L: Lowerer, stmt: ts.ForInStatement): IrStmt {
     const labels = L.takeLabels();
     const loc = locOf(stmt);
-    if (stdlibGlobalNameOf(L, stmt.expression) === "globalThis") {
+    // (where globalThis is the object model's box, its for-in stops by
+    // name in forInKeys: the box's keys are a stand-in)
+    if (stdlibGlobalNameOf(L, stmt.expression) === "globalThis" && !isGlobalBox(L, stmt.expression)) {
       return { kind: "block", body: [], loc };
     }
     // Units U3 + U4: for-in over a dynamic value walks own and inherited

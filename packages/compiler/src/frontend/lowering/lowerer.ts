@@ -264,9 +264,20 @@ export interface FnCtx {
 /** Unit U4: FN_PROTO's prototype bits for a function value read by name
  * or member (1 an ordinary function, 2 an arrow, method or async
  * function), or null when the declaration is not known. */
-export function fnProtoOfValueNode(L: Lowerer, node: ts.Expression): number | null {
-  let x = node;
+export function fnProtoOfValueNode(L: Lowerer, node: ts.Node): number | null {
+  // an object literal's member (`{ P: o.m }`, `{ f }`): its value
+  let n: ts.Node = node;
+  if (ts.isPropertyAssignment(n)) n = n.initializer;
+  else if (ts.isShorthandPropertyAssignment(n)) n = n.name;
+  if (!ts.isExpression(n)) return null;
+  let x: ts.Expression = n;
   while (ts.isParenthesizedExpression(x)) x = x.expression;
+  // a function written in place
+  if (ts.isArrowFunction(x)) return 2;
+  if (ts.isFunctionExpression(x)) {
+    const async = (ts.getModifiers(x) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+    return async && x.asteriskToken === undefined ? 2 : 1;
+  }
   if (!ts.isIdentifier(x) && !ts.isPropertyAccessExpression(x)) return null;
   const sym = L.checker.getSymbolAtLocation(ts.isPropertyAccessExpression(x) ? x.name : x);
   const d = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
@@ -3565,7 +3576,7 @@ export class Lowerer {
   typeOf(node: ts.Node): ts.Type {
     // Units U3 + U4: Error / Object / globalThis taken as values are
     // dynamic values.
-    if (ts.isIdentifier(node) && (node.text === "Error" || node.text === "Object" || node.text === "globalThis") && builtinBoxPosition(this, node) !== null) {
+    if (ts.isIdentifier(node) && (node.text === "Error" || node.text === "Object" || node.text === "globalThis" || node.text === "global" || this.stdlibGlobalAliases.size > 0) && builtinBoxPosition(this, node) !== null) {
       return this.checker.getAnyType();
     }
     if (this.es5 !== null) {
@@ -4021,7 +4032,11 @@ export class Lowerer {
    * text (the IR function's span; `export` is not part of a function's
    * text). Other modules pay nothing. */
   private stampCloneFunctionSources(functions: IrFunction[]): void {
-    const clones = JSON.stringify(functions, (k, v) => (k === "loc" ? undefined : v)).includes('"dyn.structuredClone"');
+    // (and a module building a class over a dynamic base: V8's "Class
+    // extends value <source> is not a constructor" renders the function's
+    // source text — objmodel.ts dynClass)
+    const irText = JSON.stringify(functions, (k, v) => (k === "loc" ? undefined : v));
+    const clones = irText.includes('"dyn.structuredClone"') || irText.includes('"om.dynClass"');
     const byName = new Map(functions.map((f) => [f.name, f]));
     // the function-like nodes of a file, by start: does each own
     // `prototype` (1 yes, 2 no), plus GH #156's kind bits — FN_PROTO_ASYNC
@@ -7302,11 +7317,17 @@ export class Lowerer {
     const fresh = this.dynamic && e.type.kind === "func" ? this.checkHostFunctionCopies(node, e.type) : true;
     const shallow = this.lastHostShallow;
     const out = jsvalIn(this, e, node);
-    if (e.type.kind === "func" && out.kind === "jsMarshal" && ts.isExpression(node)) {
+    if (e.type.kind === "func" && out.kind === "jsMarshal") {
       // Unit U4: whether the function value owns `prototype` (a method or
       // an arrow read off a record does not: `new` on one throws).
       const k = fnProtoOfValueNode(this, node);
-      if (k !== null) (out as { fnProto?: number }).fnProto = k;
+      if (k !== null) {
+        (out as { fnProto?: number }).fnProto = k;
+        // the checked-dynamic box inside it builds the FUNC (its fnProto
+        // is what the emitter reads)
+        const inner = (out as { value?: IrExpr }).value;
+        if (inner !== undefined && inner.kind === "dynFrom") (inner as { fnProto?: number }).fnProto = k;
+      }
     }
     if (e.type.kind === "func" && fresh) this.checkedHostMarshals.add(out);
     if (e.type.kind === "func" && shallow) this.shallowHostMarshals.add(out);
