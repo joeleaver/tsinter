@@ -9329,7 +9329,10 @@ leaving into typed storage follows (d)). So:
   a template, `+` and `join` convert it through its own `toString` /
   `valueOf` (Object.prototype's otherwise), `JSON.stringify` through its
   own `toJSON`. A user error class (a class over `Error`) keeps the error
-  crossing and is never a view. A function over instances crossing into a
+  crossing and is never a view; a dynamic value leaving into its slot (a
+  callback's `(err: AppError) => …` parameter) is the error it holds when
+  that error is an instance of the class, and any other value ends the
+  program by name (Node lets it flow). A function over instances crossing into a
   dynamic slot is an
   adapter that unwraps its instance arguments and lifts its result. A
   dynamic value leaving into a class-typed slot unwraps the instance a view
@@ -9343,10 +9346,13 @@ leaving into typed storage follows (d)). So:
   the expando); (iii) reading `constructor` or `__proto__` through the
   view, and for an EventEmitter subclass the emitter's members (`on`,
   `emit`, ...), ends the program by name; (iv) a method read through the
-  view is a function bound to the
-  instance, a fresh one per read (Node: the one prototype function, so
-  `o.m === o.m` and `o.m.call(other)` differ), and a method with a rest
-  parameter stops by name when called through it; (v) printing the view
+  view is a fresh function per read (Node: the one prototype function, so
+  `o.m === o.m` differs) that runs on its call's own `this` — the view
+  for `o.m(x)`, another instance's view for `o.m.call(other, x)` — and a
+  call whose `this` is no instance of the class (a detached `const f =
+  o.m; f(x)`, where Node runs the method with `this` undefined) stops by
+  name, as does a method with a rest parameter called through it (GH
+  #186); (v) printing the view
   (`console.log`, `util.inspect`, an assertion message) ends the program
   by name — `printing a 'C' instance shared with dynamic code is not
   supported yet` — where Node prints `C { … }` with its cycle markers;

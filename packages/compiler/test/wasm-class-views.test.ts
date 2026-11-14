@@ -159,6 +159,62 @@ console.log(one.add(2).add(3).n, one.add(1) === one, gs[0].n);
 console.log(one.pick(null), one.pick(one));`,
   },
   {
+    id: "CV-CALL-02 a method read off a view runs on the call's own this: .call(other) on another instance (GH #186)",
+    src: `class G {
+  n: number;
+  constructor(n: number) { this.n = n; }
+  a(s: string): string { return s + this.n; }
+}
+const xs: any[] = [new G(1), new G(2)];
+const m = xs[0].a;
+console.log(m.call(xs[1], "x"), xs[0].a("y"), typeof m);
+console.log(m.apply(xs[0], ["z"]));`,
+  },
+  {
+    id: "CV-CALL-04 a base method called with a subclass instance as this runs the base body, not the override (GH #186 review)",
+    src: `class G {
+  n = 1;
+  a(): string { return "G" + this.n; }
+}
+class H2 extends G {
+  n = 2;
+  a(): string { return "H" + this.n; }
+}
+const g: any = new G(), h: any = new H2();
+console.log(g.a.call(h), g.a.apply(h, []), h.a(), g.a());
+const ms: any[] = [new H2(), new G()];
+console.log(ms[1].a.call(ms[0]), ms[0].a.call(ms[0]));`,
+  },
+  {
+    id: "CV-CALL-03 a method read off a view and called detached stops by name (Node runs it with this undefined; GH #186)",
+    src: `class G {
+  n = 3;
+  a(s: string): string { return s + this.n; }
+}
+const one: any = new G();
+const h = one.a;
+console.log(one.a("x"));
+console.log(h("2"));`,
+    fence: { text: /calling the method 'a' of a 'G' instance shared with dynamic code without that instance as 'this'/, stdout: "x3\n" },
+  },
+  {
+    id: "CV-ERR-01 a callback over a user error class crosses into dynamic code: the error it is called with arrives as itself; another error stops by name",
+    src: `class AppError extends Error {
+  describe(): string { return "AE:" + this.message; }
+}
+class Other extends Error {}
+const hooks: any[] = [];
+function onErr(cb: (err: AppError) => void): void { hooks.push(cb); }
+const seen: AppError[] = [];
+onErr((err) => { seen.push(err); console.log("got", err.describe(), err.message, err instanceof AppError); });
+const fire = (e: unknown): void => { for (const h of hooks) h(e); };
+const first = new AppError("boom");
+fire(first);
+console.log(seen[0] === first);
+fire(new Other("x"));`,
+    fence: { text: /a dynamic value that is no 'AppError' error leaving into a 'AppError' slot/, stdout: "got AE:boom boom true\ntrue\n" },
+  },
+  {
     id: "CV-PRIM-01 String(), a template, + and join convert a view through its own toString / valueOf",
     src: `class P {
   constructor(public x: number) {}

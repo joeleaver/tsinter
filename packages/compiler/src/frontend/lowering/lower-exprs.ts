@@ -9969,6 +9969,24 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
               : { kind: "orDefault", left, right: dflt, type: rest[0]!, loc };
           }
         }
+        // One world: where the checker typed the whole expression `any` (a
+        // compiled package's `(o.short && this._find(o.short)) || …` —
+        // commander's _registerOption), both operands lift into the dynamic
+        // world (a class instance as its view) and the operator runs there
+        // with JS value semantics, its result dynamic.
+        if (L.sharedDynamic && (target === null || target.kind === "jsval")) {
+          const l = L.coerceToExpected(left, JSVAL);
+          const r = L.coerceToExpected(right, JSVAL);
+          if (l.type.kind === "jsval" && r.type.kind === "jsval") {
+            return {
+              kind: "logical",
+              op: op === ts.SyntaxKind.AmpersandAmpersandToken ? "&&" : "||",
+              left: l,
+              right: r,
+              type: JSVAL, loc,
+            };
+          }
+        }
         L.unsupported(
           "SC1090",
           expr,
@@ -10081,6 +10099,26 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         // normalizePricing filter): a guarded kind test + payload compare,
         // JS-exact (strict equality never coerces; a non-matching dyn kind
         // answers false). dyn vs dyn keeps the fence below.
+        // A class instance beside a dynamic value (`picked === a`, where
+        // `picked` came out of a dynamic `a || b`): the instance is its
+        // live view (class-views.ts), one dynamic value per instance, so
+        // the whole-dyn strict equality answers identity as Node does.
+        if (L.sharedDynamic) {
+          const typedSide = left.type.kind === "dyn" ? right : left;
+          if (typedSide.type.kind !== "dyn" && viewableClass(L, typedSide.type) !== null) {
+            const asDyn = L.coerceToExpected(typedSide, DYN);
+            if (asDyn.type.kind === "dyn") {
+              return {
+                kind: "dynScalarEq",
+                left: typedSide === left ? asDyn : left,
+                right: typedSide === right ? asDyn : right,
+                ...(negated ? { negated: true as const } : {}),
+                type: BOOL,
+                loc,
+              };
+            }
+          }
+        }
         const dynSide = left.type.kind === "dyn" ? left : right;
         const scalarSide = dynSide === left ? right : left;
         if (
