@@ -21,7 +21,7 @@ import { lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, dynUndefinedExpr, esFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { armCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped } from "./lower-builtins.js";
@@ -13516,7 +13516,15 @@ export function undefWriteGuard(L: Lowerer, write: IrStmt): IrStmt {
   if (write.kind === "recordKeySet") write = { ...write, key: undefinedAsText(L, write.key, write.loc) };
   const obj = write.kind === "arraySet" ? write.arr : write.obj;
   if (!mayHoldSlotUndef(L, obj)) return write;
-  if (obj.kind === "varRef" && obj.localId === L.resolveThis()?.id) return write;
+  // The current function's OWN this-binding, looked up without
+  // resolveThis's capture threading: a write through `this` already
+  // resolved it while lowering `obj`. A speculative resolveThis from a
+  // JavaScript function instance lowered nested inside a method (commander's
+  // suggestSimilar → editDistance, first called from a Command method)
+  // walked down to the method's `this`, threaded it through the
+  // capture-less instance and reached a fence on the synthetic
+  // this-binding — a compiler crash.
+  if (obj.kind === "varRef" && obj.localId === L.bindingIn(L.ctx, THIS_BINDING)?.id) return write;
   const loc = write.loc;
   const stmts: IrStmt[] = [];
   const once = (e: IrExpr): IrExpr => {
