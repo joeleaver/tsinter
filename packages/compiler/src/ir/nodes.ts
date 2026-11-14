@@ -234,6 +234,11 @@ export type IrType =
    * header. Same container rules as child: union arms fine (the
    * `FSWatcher | null` polling-fallback local), arrays/maps/JSON fenced. */
   | { kind: "fsWatcher" }
+  /** An fs/promises FileHandle (fs/promises open): a GC struct holding the
+   * descriptor, -1 once closed (Node's own fd getter answers -1 then).
+   * WasmGC lanes only; the legacy C/LLVM lanes refuse it by name. Union
+   * arms fine; arrays/maps/JSON fenced like the other handles. */
+  | { kind: "fileHandle" }
   /** A tls.SecureContext handle (scr_tls.c): heap, refcounted, IMMUTABLE —
    * a parsed cert/key pair (tls.createSecureContext({ cert, key })) that
    * an SNI callback answers per-servername. Holds no references — never
@@ -370,7 +375,7 @@ export const REF_TRUTHY_KINDS: ReadonlySet<string> = new Set([
   "symbol",
   "array", "map", "set", "regex", "url", "searchParams", "stats", "spawnRes", "child",
   "netServer", "netSocket", "http2Session", "http2Stream", "dgramSocket", "testCtx", "httpReq", "httpRes", "httpClientReq",
-  "secureCtx", "fsWatcher", "childStream", "procStream", "bytes", "func", "object", "record", "promise",
+  "secureCtx", "fsWatcher", "fileHandle", "childStream", "procStream", "bytes", "func", "object", "record", "promise",
   // A generator object is a JS object: always truthy.
   "generator",
   // A class object is a JS object (constructors are functions): always truthy.
@@ -401,6 +406,7 @@ export const HTTPRES_T: IrType = { kind: "httpRes" };
 export const HTTPCLIENTREQ_T: IrType = { kind: "httpClientReq" };
 export const SECURECTX_T: IrType = { kind: "secureCtx" };
 export const FSWATCHER_T: IrType = { kind: "fsWatcher" };
+export const FILEHANDLE_T: IrType = { kind: "fileHandle" };
 export const CHILDSTREAM_T: IrType = { kind: "childStream" };
 export const PROCSTREAM_T: IrType = { kind: "procStream" };
 export const VOID: IrType = { kind: "void" };
@@ -611,6 +617,7 @@ export function typeKey(t: IrType): string {
     case "httpClientReq":
     case "secureCtx":
     case "fsWatcher":
+    case "fileHandle":
     case "childStream":
     case "procStream":
     case "dyn":
@@ -772,6 +779,7 @@ export function isRefCounted(t: IrType): boolean {
     // FSWatcher handles are refcounted like child (listeners drop at
     // close, so lean allocation — see the IrType comment).
     t.kind === "fsWatcher" ||
+    t.kind === "fileHandle" ||
     // Child-output streams are refcounted like child (listeners drop at
     // EOF — see the IrType comment).
     t.kind === "childStream" ||
@@ -2181,6 +2189,10 @@ export type IrLibFn =
   /** S118: args [posix literal, win32 literal] — path.sep, path.delimiter
    * and os.EOL in the WasmGC tier, the host platform's at run time. */
   | "os.hostChoice"
+  /** fs.constants.O_<name> in the WasmGC tier: args [linux, darwin, win32
+   * (-1: undefined there)] number literals, the host's own at run time
+   * (S118); an O_ flag the host's OS lacks stops by name. */
+  | "fs.oFlag"
   /** S118: stream.getDefaultHighWaterMark(false) in the WasmGC tier — the
    * host platform's (Node: 16 KiB on win32, 64 KiB elsewhere). */
   | "stream.hostDefaultHwm"
@@ -2568,6 +2580,31 @@ export type IrLibFn =
   | "fs.statBig"
   | "fs.fstatBig"
   | "fsp.statBig"
+  /** fs/promises FileHandle (WasmGC lanes; S074's already-settled
+   * promises): fsp.open(path, flagsLiteral, mode) / fsp.openNum(path,
+   * flags, mode) open; fh.fd the descriptor (-1 once closed); fh.close
+   * (a second close resolves); fh.stat the full record; fh.read(fh,
+   * buffer, offset, length, position) and fh.write(fh, buffer) /
+   * fh.writeStr(fh, text) resolve to Node's { bytesRead | bytesWritten,
+   * buffer } record (writeStr's args: the text, then its UTF-8 bytes);
+   * fh.writeFile(fh, bytes) and fh.readFile(Str) from the current
+   * position; fh.sync(fh, datasync), fh.chmod(fh, mode),
+   * fh.truncate(fh, len). Every handle op on a closed handle rejects
+   * Node's Error 'file closed' (code EBADF). */
+  | "fsp.open"
+  | "fsp.openNum"
+  | "fh.fd"
+  | "fh.close"
+  | "fh.stat"
+  | "fh.read"
+  | "fh.write"
+  | "fh.writeStr"
+  | "fh.writeFile"
+  | "fh.readFile"
+  | "fh.readFileStr"
+  | "fh.sync"
+  | "fh.chmod"
+  | "fh.truncate"
   | "stats.big"
   | "stats.isKind"
   | "stats.isFile"
@@ -4074,6 +4111,14 @@ export type IrLibFn =
    * process.kill, the spawn 'error' event), the undefined arm everywhere
    * else. Never throws. */
   | "error.code"
+  /** `err.syscall` / `err.errno` on an Error-rooted receiver (WasmGC
+   * lanes): a class:sysErr (the FileHandle's closed-handle Error) answers
+   * its syscall and no errno, as Node; an error coded with a system errno
+   * name, whose syscall/errno this tier does not carry (GH #205), stops
+   * by name; any other error answers undefined, as Node. `string |
+   * undefined` / `number | undefined`. */
+  | "error.syscall"
+  | "error.errno"
   /** node:assert (scr_assert.c; assert.match in scr_regex.c — every call
    * site carries a regex value, so the regex link switch is already on).
    * Failures throw a catchable AssertionError — a runtime %Error whose
@@ -6061,6 +6106,7 @@ function isJsonSafeAt(
     case "httpClientReq":
     case "secureCtx":
     case "fsWatcher":
+    case "fileHandle":
     case "childStream":
     case "procStream":
     case "dyn":
@@ -7043,7 +7089,7 @@ export function moduleUsesSymbol(mod: IrModule): boolean {
 
 /** The full stat record's keys: WasmGC-only like BigInt, refused on the
  * legacy lanes with it (SC3003). */
-const LEGACY_REFUSED_FNS: ReadonlySet<string> = new Set(["fs.statBig", "fs.fstatBig", "fsp.statBig", "stats.big", "stats.isKind"]);
+const LEGACY_REFUSED_FNS: ReadonlySet<string> = new Set(["fs.statBig", "fs.fstatBig", "fsp.statBig", "stats.big", "stats.isKind", "error.syscall", "error.errno", "fsp.open", "fsp.openNum", "fh.fd", "fh.close", "fh.stat", "fh.read", "fh.write", "fh.writeStr", "fh.writeFile", "fh.readFile", "fh.readFileStr", "fh.sync", "fh.chmod", "fh.truncate"]);
 
 /** The source location of the first bigint-carrying node (a bigint-kind
  * type or a big.* libCall) — the legacy C/LLVM lanes' SC3003 refusal
@@ -7055,7 +7101,7 @@ export function firstBigintSite(mod: IrModule): SrcLoc | null {
     if (Array.isArray(v)) return v.some((item) => visit(item, loc));
     const node = v as { kind?: unknown; fn?: unknown; loc?: SrcLoc };
     const here = node.loc !== undefined && typeof node.loc === "object" ? node.loc : loc;
-    if (node.kind === "bigint" || (node.kind === "libCall" && typeof node.fn === "string" && (node.fn.startsWith("big.") || LEGACY_REFUSED_FNS.has(node.fn)))) {
+    if (node.kind === "bigint" || node.kind === "fileHandle" || (node.kind === "libCall" && typeof node.fn === "string" && (node.fn.startsWith("big.") || LEGACY_REFUSED_FNS.has(node.fn)))) {
       found = here;
       return true;
     }

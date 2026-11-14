@@ -294,6 +294,9 @@ export interface InspectDeps {
    * over a dyn value), so the walker carries the showHidden arms. Absent,
    * every module keeps its bytes. */
   showHidden?: true;
+  /** fs/promises FileHandle: push the error's own `syscall` (a string,
+   * or null) — printed after `code` (Node's own key order). */
+  syscall?: (c: Code, errLocal: number) => void;
   domex?: {
     isDomex: (c: Code, slot: number) => void;
     hasCause: (c: Code, slot: number) => void;
@@ -3827,6 +3830,27 @@ export class InspectBuilder {
       c.call(this.ibTake());
       c.i32Const(0);
       c.call(this.entry());
+      if (this.deps.syscall !== undefined) {
+        this.deps.syscall(c, E);
+        c.localTee(CODE);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        this.deps.lit(c, "syscall: ");
+        c.call(this.ibPuts());
+        c.localGet(CODE);
+        c.i32Const(0);
+        c.localGet(CODE);
+        c.arrayLen();
+        c.call(this.quoteInto());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.i32Const(0);
+        c.call(this.entry());
+        c.end();
+      }
       c.localGet(BASE);
       this.deps.lit(c, "{");
       this.deps.lit(c, "}");

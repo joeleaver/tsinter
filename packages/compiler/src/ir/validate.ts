@@ -19,7 +19,7 @@ import type {
   SrcLoc,
 } from "./nodes.js";
 import { WASMLIB_MEMORY_FNS, wasmLibClassType } from "./nodes.js";
-import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
+import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, BYTES_U8, bytesOf, CAUGHT, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, keyedReadRecv, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, pureArityDrop, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID, FILEHANDLE_T } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -205,6 +205,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "path.hostRelative": { argTypes: [STRING, STRING], result: STRING },
   "path.hostToNamespacedPath": { argTypes: [STRING], result: STRING },
   "os.hostChoice": { argTypes: [STRING, STRING], result: STRING },
+  "fs.oFlag": { argTypes: [F64, F64, F64], result: F64 },
   "stream.hostDefaultHwm": { argTypes: [], result: F64 },
   "os.homedir": { argTypes: [], result: STRING },
   "os.release": { argTypes: [], result: STRING },
@@ -294,6 +295,25 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "fs.statBig": { argTypes: [STRING, STRING], result: STATS_T },
   "fs.fstatBig": { argTypes: [F64], result: STATS_T },
   "fsp.statBig": { argTypes: [STRING, STRING], result: { kind: "promise", inner: STATS_T } },
+  "fsp.open": { argTypes: [STRING, STRING, F64], result: { kind: "promise", inner: FILEHANDLE_T } },
+  "fsp.openNum": { argTypes: [STRING, F64, F64], result: { kind: "promise", inner: FILEHANDLE_T } },
+  "fh.fd": { argTypes: [FILEHANDLE_T], result: F64 },
+  "fh.close": { argTypes: [FILEHANDLE_T], result: { kind: "promise", inner: VOID } },
+  "fh.stat": { argTypes: [FILEHANDLE_T], result: { kind: "promise", inner: STATS_T } },
+  // result: a promise of Node's { bytesRead, buffer } / { bytesWritten,
+  // buffer } record, checked by shape below
+  // (handle, buffer, offset, length, position, hasLength: 0 = Node's
+  // buffer.byteLength - offset)
+  "fh.read": { argTypes: [FILEHANDLE_T, BYTES_U8, F64, F64, F64, F64], result: VOID },
+  "fh.write": { argTypes: [FILEHANDLE_T, BYTES_U8], result: VOID },
+  // (handle, the text, its UTF-8 bytes): the record's buffer is the text
+  "fh.writeStr": { argTypes: [FILEHANDLE_T, STRING, BYTES_U8], result: VOID },
+  "fh.writeFile": { argTypes: [FILEHANDLE_T, BYTES_U8], result: { kind: "promise", inner: VOID } },
+  "fh.readFile": { argTypes: [FILEHANDLE_T], result: { kind: "promise", inner: BYTES_U8 } },
+  "fh.readFileStr": { argTypes: [FILEHANDLE_T], result: { kind: "promise", inner: STRING } },
+  "fh.sync": { argTypes: [FILEHANDLE_T, F64], result: { kind: "promise", inner: VOID } },
+  "fh.chmod": { argTypes: [FILEHANDLE_T, F64], result: { kind: "promise", inner: VOID } },
+  "fh.truncate": { argTypes: [FILEHANDLE_T, F64], result: { kind: "promise", inner: VOID } },
   "stats.big": { argTypes: [STATS_T, STRING], result: BIGINT_T },
   "stats.isKind": { argTypes: [STATS_T, STRING], result: BOOL },
   "big.lit": { argTypes: [STRING], result: BIGINT_T },
@@ -915,6 +935,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // Receiver (any error-hierarchy object) and the program-dependent
   // `string | undefined` result are checked in the libCall case.
   "error.code": { argTypes: [null], result: VOID },
+  "error.syscall": { argTypes: [null], result: VOID },
+  "error.errno": { argTypes: [null], result: VOID },
   // DOMException: construction takes the two dyn args (WebIDL's
   // resolution runs in the runtime); the %DOMException result is a
   // program-dependent object type, checked in the libCall case. The
@@ -4532,7 +4554,14 @@ function validateFunction(
           }
           break;
         }
-        if (e.fn === "error.code") {
+        if (e.fn === "error.errno") {
+          const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
+          if (!def || def.arms.length !== 2 || !def.arms.some((a) => a.kind === "f64") || !def.arms.some((a) => a.kind === "undefinedT")) {
+            err(`libCall error.errno must return the 'number | undefined' union`, e.loc);
+          }
+          break;
+        }
+        if (e.fn === "error.code" || e.fn === "error.syscall") {
           // Receiver: any error-hierarchy object (a user subclass embeds
           // the code slot in its prefix); result: the interned
           // `string | undefined` union (the process.envGet pattern).
@@ -4790,6 +4819,10 @@ function validateFunction(
               e.loc,
             );
           }
+        }
+        if (e.fn === "fh.read" || e.fn === "fh.write" || e.fn === "fh.writeStr") {
+          if (e.type.kind !== "promise" || e.type.inner.kind !== "record") err(`libCall ${e.fn} must be a promise of a record`, e.loc);
+          break;
         }
         if (!typeEquals(e.type, sig.result)) {
           err(`libCall ${e.fn} must be ${sig.result.kind}, got ${e.type.kind}`, e.loc);

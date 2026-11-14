@@ -769,7 +769,7 @@ export interface ClassMeta {
       t.kind === "dgramSocket" || t.kind === "testCtx" ||
       t.kind === "httpReq" || t.kind === "httpRes" ||
       t.kind === "httpClientReq" || t.kind === "secureCtx" ||
-      t.kind === "fsWatcher" || t.kind === "childStream" ||
+      t.kind === "fsWatcher" || t.kind === "fileHandle" || t.kind === "childStream" ||
       // Island handles: the box carries scr_jsval_retain_v/release_v and
       // no trace — the same stance as jsval array elements.
       t.kind === "jsval" ||

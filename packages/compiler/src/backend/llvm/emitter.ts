@@ -1163,6 +1163,7 @@ class LlEmitter {
       case "generator":
       case "dyn":
       case "jsval":
+      case "fileHandle":
       case "fsWatcher":
       case "netServer":
       case "netSocket":
@@ -2598,6 +2599,7 @@ class LlEmitter {
       case "child":
       case "childStream":
       case "generator":
+      case "fileHandle":
       case "fsWatcher": {
         // JS objects are ALWAYS truthy; the honest constant reads as a
         // pointer test, exactly the C emitter's `!= NULL`.
@@ -2691,6 +2693,7 @@ class LlEmitter {
             case "child":
             case "childStream":
             case "generator":
+            case "fileHandle":
             case "fsWatcher":
               B.line(`store i1 true, ptr ${slot} ; ${arm.kind}: objects are truthy`);
               break;

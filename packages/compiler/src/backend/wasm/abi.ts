@@ -372,6 +372,16 @@
  *         then atime/mtime/ctime/birthtime as nanoseconds since the epoch
  *         (the host writes them through a DataView / memcpy, never a
  *         BigInt64Array: slot B is only 2-byte aligned).
+ *       FILEHANDLE (fs/promises open + FileHandle, fs.ts fh* helpers):
+ *         25 openRaw(pathA, flags = x the host's own numeric O_* bits
+ *         from fs.constants, mode = y) -> fd or -errno; 26 readAt(fd = x,
+ *         slot A an 8-byte little-endian f64 position, -1 = the current
+ *         one; capacity bLen) -> byte count, raw bytes in slot B; 27
+ *         writeAt(fd = x, slot A the position as 26, the bytes in slot B,
+ *         y = 1 every byte (writeFile) else one write(2)) -> count; 28
+ *         fsync(fd = x, y = 1 fdatasync); 29 ftruncate(fd = x, slot A the
+ *         length as an f64); 30 fchmod(fd = x, mode = y). 26-30 carry no
+ *         path (aLen is the f64's 4 units).
  *     P4 BUILDS: 1, 2, 3, 9, 10, 11, 12, 13, 14, 19, 20. The rest are P5's.
  *     `x`/`y` carry integer options (mode, flags, fd, offset, length,
  *     recursive, force, maxRetries, retryDelay) per op.

@@ -943,6 +943,19 @@ declare module "node:fs" {
     readonly R_OK: number;
     readonly W_OK: number;
     readonly X_OK: number;
+    readonly O_RDONLY: number;
+    readonly O_WRONLY: number;
+    readonly O_RDWR: number;
+    readonly O_CREAT: number;
+    readonly O_EXCL: number;
+    readonly O_TRUNC: number;
+    readonly O_APPEND: number;
+    readonly O_NOCTTY: number;
+    readonly O_DIRECTORY: number;
+    readonly O_NOFOLLOW: number;
+    readonly O_SYNC: number;
+    readonly O_DSYNC: number;
+    readonly O_NONBLOCK: number;
   };
   /* A stat(2) snapshot (statSync follows symlinks, lstatSync does not —
    * Node's split) — immutable; the supported surface is exactly these
@@ -1076,6 +1089,39 @@ declare module "fs/promises" {
   export function lstat(path: string, options?: { bigint?: false }): Promise<import("node:fs").Stats>;
   export function unlink(path: string): Promise<void>;
   export function chmod(path: string, mode: number): Promise<void>;
+  export interface FileReadResult<T extends Uint8Array> {
+    bytesRead: number;
+    buffer: T;
+  }
+  /** The members with no lowering are declared so they refuse by name. */
+  export interface FileHandle {
+    readonly fd: number;
+    close(): Promise<void>;
+    stat(options: { bigint: true }): Promise<import("node:fs").BigIntStats>;
+    stat(options?: { bigint?: false }): Promise<import("node:fs").Stats>;
+    read<T extends Uint8Array>(buffer: T, offset?: number | null, length?: number | null, position?: number | null): Promise<FileReadResult<T>>;
+    read(): Promise<FileReadResult<Buffer>>;
+    write<T extends Uint8Array>(buffer: T, offset?: number | null, length?: number | null, position?: number | null): Promise<{ bytesWritten: number; buffer: T }>;
+    write(data: string, position?: number | null, encoding?: string | null): Promise<{ bytesWritten: number; buffer: string }>;
+    writeFile(data: string | Uint8Array, options?: "utf8" | "utf-8" | { encoding?: "utf8" | "utf-8" }): Promise<void>;
+    readFile(options: "utf8" | "utf-8" | { encoding: "utf8" | "utf-8" }): Promise<string>;
+    readFile(options?: null | { encoding?: null }): Promise<Buffer>;
+    /** the other encodings refuse by name */
+    readFile(options: "ascii" | "latin1" | "binary" | "hex" | "base64" | "base64url" | "ucs2" | "ucs-2" | "utf16le" | "utf-16le" | { encoding: "ascii" | "latin1" | "binary" | "hex" | "base64" | "base64url" | "ucs2" | "ucs-2" | "utf16le" | "utf-16le" }): Promise<string>;
+    sync(): Promise<void>;
+    datasync(): Promise<void>;
+    chmod(mode: number): Promise<void>;
+    truncate(len?: number): Promise<void>;
+    appendFile(data: string | Uint8Array): Promise<void>;
+    chown(uid: number, gid: number): Promise<void>;
+    utimes(atime: number, mtime: number): Promise<void>;
+    readv(buffers: Uint8Array[], position?: number | null): Promise<{ bytesRead: number; buffers: Uint8Array[] }>;
+    writev(buffers: Uint8Array[], position?: number | null): Promise<{ bytesWritten: number; buffers: Uint8Array[] }>;
+    createReadStream(options?: unknown): unknown;
+    createWriteStream(options?: unknown): unknown;
+    readLines(options?: unknown): unknown;
+  }
+  export function open(path: string, flags?: string | number, mode?: number): Promise<FileHandle>;
 }
 declare module "node:fs/promises" {
   export * from "fs/promises";

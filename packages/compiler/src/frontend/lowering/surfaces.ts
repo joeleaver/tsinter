@@ -7,7 +7,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { UNSUPPORTED } from "../../diagnostics/diagnostic.js";
-import { BOOL, BYTES_U8, CHILD_T, DYN, F64, IrExpr, IrLibFn, IrStrIntrinsicMethod, IrType, RUNTIME_ERROR_CLASSES, SPAWNRES_T, STATS_T, STRING, URL_T, VOID, arrayOf } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CHILD_T, DYN, F64, FILEHANDLE_T, IrExpr, IrLibFn, IrStrIntrinsicMethod, IrType, RUNTIME_ERROR_CLASSES, SPAWNRES_T, STATS_T, STRING, URL_T, VOID, arrayOf } from "../../ir/nodes.js";
 import { isNodeTypesPath, requireSpecOf } from "../program.js";
 import { everyLocalRef } from "./lower-exprs.js";
 
@@ -664,6 +664,8 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     stat: { fn: "fsp.stat", params: [STRING], result: { kind: "promise", inner: STATS_T } },
     // Special-cased like fstatSync (lowerStatCall).
     lstat: { fn: "fsp.statBig", params: [STRING], result: { kind: "promise", inner: STATS_T } },
+    // Special-cased (lower-filehandle.ts lowerFspOpenCall); the entry only routes.
+    open: { fn: "fsp.open", params: [STRING], result: { kind: "promise", inner: FILEHANDLE_T } },
     unlink: { fn: "fsp.unlink", params: [STRING], result: { kind: "promise", inner: VOID } },
     chmod: { fn: "fsp.chmod", params: [STRING, F64], result: { kind: "promise", inner: VOID } },
   },

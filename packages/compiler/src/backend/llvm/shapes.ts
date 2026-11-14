@@ -250,6 +250,7 @@ export function vAdapters(host: ShapeHost, t: IrType): { retain: string; release
       host.declare(`declare ptr @scr_classobj_retain_v(ptr)`);
       host.declare(`declare void @scr_classobj_release_v(ptr)`);
       return { retain: "@scr_classobj_retain_v", release: "@scr_classobj_release_v" };
+    case "fileHandle":
     case "fsWatcher":
       // fs.watch handles (ScrWatcher): the runtime's `_v` pair; no trace
       // (listeners drop at close — never part of a lasting cycle).
@@ -389,6 +390,7 @@ export function releaseSym(host: ShapeHost, t: IrType): string {
     case "classval":
       host.declare(`declare void @scr_classobj_release_v(ptr)`);
       return "@scr_classobj_release_v";
+    case "fileHandle":
     case "fsWatcher":
       host.declare(`declare void @scr_watcher_release_v(ptr)`);
       return "@scr_watcher_release_v";
@@ -554,7 +556,7 @@ export function boxNewCall(host: ShapeHost, t: IrType): string {
     // implicit-any `fn` param): the box carries scr_dyn_retain_v/release_v
     // and NO trace — cycles through dyn never collect (SEMANTICS.md).
     t.kind === "dyn" ||
-    t.kind === "fsWatcher"
+    t.kind === "fsWatcher" || t.kind === "fileHandle"
   ) {
     const v = vAdapters(host, t);
     host.declare(`declare ptr @scr_box_new_obj(ptr, ptr, ptr)`);
@@ -600,6 +602,7 @@ export function llFieldType(t: IrType): "double" | "i8" | "ptr" {
     case "generator":
     case "dyn":
     case "jsval":
+    case "fileHandle":
     case "fsWatcher":
     case "netServer":
     case "netSocket":

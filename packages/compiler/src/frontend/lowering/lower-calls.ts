@@ -3,6 +3,7 @@
  * function/lambda lowering and signature collection, and monomorphizing
  * generic instantiation (bounded by MAX_GENERIC_DEPTH and MAX_GENERIC_FN_INSTANCES). */
 import { returnWidens } from "./big-widen.js";
+import { lowerFileHandleMethodCall } from "./lower-filehandle.js";
 import * as ts from "../ts7/adapter.js";
 import { lowerObjModelStatic } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
@@ -4537,6 +4538,8 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         L.lowerUrlMethodCall(expr, expr.expression) ??
         L.lowerSearchParamsMethodCall(expr, expr.expression) ??
         L.lowerStatsMethodCall(expr, expr.expression) ??
+        // fs/promises FileHandle receivers (lower-filehandle.ts).
+        (ts.isPropertyAccessExpression(expr.expression) ? lowerFileHandleMethodCall(L, expr, expr.expression) : null) ??
         L.lowerChildMethodCall(expr, expr.expression) ??
         // Piped child-output stream receivers — on/once("data" | "end").
         lowerChildStreamMethodCall(L, expr, expr.expression) ??

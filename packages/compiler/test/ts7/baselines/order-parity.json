@@ -6051,6 +6051,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2951-fs-filehandle.ts": {
+   "order": [
+    "<repo>/tests/corpus/2951-fs-filehandle.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

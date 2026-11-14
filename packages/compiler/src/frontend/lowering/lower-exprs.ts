@@ -5,6 +5,7 @@
  * ToBoolean/ToString coercion helpers, and field/element reads and writes
  * (FieldTarget). */
 import { wideIndex } from "./big-widen.js";
+import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
 import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
@@ -5118,6 +5119,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       const probe = L.lowerExpr(expr.expression);
       if (probe.type.kind === "array") kind = "array";
     }
+    if (kind === "fileHandle") return ts.isCallExpression(expr.parent) && expr.parent.expression === expr ? null : lowerFileHandleProperty(L, expr);
     if (kind !== "string" && kind !== "array" && kind !== "map" && kind !== "set" && kind !== "f64" && kind !== "regex" && kind !== "url" && kind !== "searchParams" && kind !== "stats" && kind !== "spawnRes" && kind !== "child" && kind !== "bytes" && kind !== "arraybuffer" && kind !== "symbol") {
       return null;
     }
@@ -10648,7 +10650,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       case "array": case "map": case "set": case "regex": case "bytes":
       case "url": case "searchParams": case "stats": case "spawnRes": case "child":
       case "netServer": case "netSocket": case "httpReq": case "httpRes":
-      case "httpClientReq": case "secureCtx": case "fsWatcher":
+      case "httpClientReq": case "secureCtx": case "fsWatcher": case "fileHandle":
       case "childStream": case "procStream":
       case "object": case "record": case "promise":
         return "object";

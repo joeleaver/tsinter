@@ -908,6 +908,11 @@ static int open_flags(int code) {
     case 7: return O_APPEND | O_CREAT | O_WRONLY | O_EXCL;
     case 8: return O_APPEND | O_CREAT | O_RDWR;
     case 9: return O_APPEND | O_CREAT | O_RDWR | O_EXCL;
+    /* Node's synchronous spellings (rs/sr, rs+/sr+, as/sa, as+/sa+) */
+    case 10: return O_RDONLY | O_SYNC;
+    case 11: return O_RDWR | O_SYNC;
+    case 12: return O_APPEND | O_CREAT | O_WRONLY | O_SYNC;
+    case 13: return O_APPEND | O_CREAT | O_RDWR | O_SYNC;
     default: return -1;
   }
 }
@@ -947,7 +952,7 @@ static char *path_arg(uint32_t ptr, uint32_t len, const char *what) {
 
 int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_t bLen, int32_t x, int32_t y) {
   uint32_t B = (uint32_t)bPtr, BL = (uint32_t)bLen;
-  char *path = (op == 5 || op == 6 || op == 18 || op == 22 || op == 23 || (op == 24 && x == 2)) ? NULL : path_arg((uint32_t)aPtr, (uint32_t)aLen, "an fs path");
+  char *path = (op == 5 || op == 6 || op == 18 || op == 22 || op == 23 || (op == 24 && x == 2) || (op >= 26 && op <= 30)) ? NULL : path_arg((uint32_t)aPtr, (uint32_t)aLen, "an fs path");
   int32_t rc = 0;
   switch (op) {
     case 1: {
@@ -1277,6 +1282,47 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       else rc = (int32_t)st.st_size;
       break;
     }
+    case 25: {
+      /* open with the host's own numeric O_* flags (fs.constants) */
+      int fd = open(path, x | O_CLOEXEC, (mode_t)y);
+      rc = fd < 0 ? wn_fs_err(errno) : fd;
+      break;
+    }
+    case 26:
+    case 27:
+    case 29: {
+      /* slot A: a little-endian f64 — the position (-1: the current one)
+       * for 26 (read) and 27 (write, y = 1: every byte), the length for 29 */
+      double a;
+      memcpy(&a, w_hostmem + (uint32_t)aPtr, 8);
+      if (op == 29) {
+        if (ftruncate(x, (off_t)a) != 0) rc = wn_fs_err(errno);
+        break;
+      }
+      size_t done = 0;
+      for (;;) {
+        ssize_t r;
+        size_t want = (size_t)BL - done;
+        do {
+          if (op == 26) r = a < 0 ? read(x, w_hostmem + B, BL) : pread(x, w_hostmem + B, BL, (off_t)a);
+          else r = a < 0 ? write(x, w_hostmem + B + done, want) : pwrite(x, w_hostmem + B + done, want, (off_t)a + (off_t)done);
+        } while (r < 0 && errno == EINTR);
+        if (r < 0) {
+          rc = wn_fs_err(errno);
+          break;
+        }
+        done += (size_t)r;
+        rc = (int32_t)done;
+        if (op == 26 || y != 1 || done >= (size_t)BL || r == 0) break;
+      }
+      break;
+    }
+    case 28:
+      if ((y == 1 ? fdatasync(x) : fsync(x)) != 0) rc = wn_fs_err(errno);
+      break;
+    case 30:
+      if (fchmod(x, (mode_t)y) != 0) rc = wn_fs_err(errno);
+      break;
     default:
       fprintf(stderr, "native runner: fsCall op %d is not part of the host contract\n", op);
       exit(70);

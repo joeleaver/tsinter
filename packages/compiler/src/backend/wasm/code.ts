@@ -327,6 +327,12 @@ export class Code {
     this.w.u8(0x2b);
     this.memarg(0, 0);
   }
+  /** f64.store — an 8-byte little-endian write, alignment hint 0 (the
+   * FileHandle ops' position/length word in slot A). */
+  f64Store(): void {
+    this.w.u8(0x39);
+    this.memarg(0, 0);
+  }
   /** i64.load — an 8-byte little-endian read, alignment hint 0. */
   i64Load(): void {
     this.w.u8(0x29);

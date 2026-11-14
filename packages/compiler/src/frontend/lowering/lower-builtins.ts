@@ -3,6 +3,7 @@
  * methods), JSON.parse/stringify, process properties/methods and
  * process.env access, and console.log detection. */
 import { isBigIntStatsType, lowerBigIntStatsProperty, lowerStatCall } from "./lower-bigint.js";
+import { lowerFspOpenCall } from "./lower-filehandle.js";
 import { readFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, resolve } from "node:path";
@@ -1415,6 +1416,11 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     {
       const st = lowerStatCall(L, expr, bi.module, bi.member);
       if (st !== null) return st;
+    }
+    // fs/promises open -> FileHandle (lower-filehandle.ts).
+    {
+      const fh = lowerFspOpenCall(L, expr, bi.module, bi.member);
+      if (fh !== null) return fh;
     }
     // accessSync(p, mode?): an omitted mode is Node's F_OK (0). The mode
     // is an ordinary number — fs.constants.* reads bake to literals.
@@ -5316,7 +5322,8 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
         return { kind: "libCall", fn: "error.domCause", args: [receiver], type: DYN, loc: locOf(expr) };
       }
     }
-    if (expr.name.text !== "code") return null;
+    const member = expr.name.text;
+    if (member !== "code" && member !== "syscall" && member !== "errno") return null;
     // Error-rooted classes only — builtin or user subclass (both embed the
     // code slot in their layout prefix).
     let info = L.classes.get(recvT.className) ?? null;
@@ -5324,6 +5331,16 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     if (!info || info.def.name !== "%Error") return null;
     if (!L.isStdlibMember(expr)) return null;
     const receiver = L.lowerExpr(expr.expression);
+    // ErrnoException's syscall/errno (the FileHandle's closed-handle Error
+    // carries Node's syscall; see the libCall's doc).
+    if (member === "syscall" && L.sharedDynamic) {
+      return { kind: "libCall", fn: "error.syscall", args: [receiver], type: L.envValueType(), loc: locOf(expr) };
+    }
+    if (member === "errno" && L.sharedDynamic) {
+      const type = L.withUndefinedArmOf(F64);
+      if (type !== null) return { kind: "libCall", fn: "error.errno", args: [receiver], type, loc: locOf(expr) };
+    }
+    if (member !== "code") return null;
     return {
       kind: "libCall",
       fn: "error.code",
@@ -5352,15 +5369,31 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     const bi = L.builtinImportOf(expr.expression);
     if (!bi || bi.module !== "fs" || bi.member !== "constants") return null;
     const MODES: Record<string, number | undefined> = { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 };
+    const loc = locOf(expr);
+    // The open(2) flags (fs/promises open's numeric form): Node's own
+    // values per OS — [linux, darwin, win32 (-1: undefined there)].
+    const O_FLAGS: Record<string, readonly [number, number, number] | undefined> = {
+      O_RDONLY: [0, 0, 0], O_WRONLY: [1, 1, 1], O_RDWR: [2, 2, 2],
+      O_CREAT: [64, 512, 256], O_EXCL: [128, 2048, 1024], O_TRUNC: [512, 1024, 512], O_APPEND: [1024, 8, 8],
+      O_NOCTTY: [256, 131072, -1], O_DIRECTORY: [65536, 1048576, -1], O_NOFOLLOW: [131072, 256, -1],
+      O_SYNC: [1052672, 128, -1], O_DSYNC: [4096, 4194304, -1], O_NONBLOCK: [2048, 4, -1],
+    };
+    const o = own(O_FLAGS, expr.name.text);
+    if (o !== undefined) {
+      const lit = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+      if (L.targetPlatform === "linux") return lit(o[0]);
+      if (L.targetPlatform === "darwin") return lit(o[1]);
+      if (L.targetPlatform === "host") return { kind: "libCall", fn: "fs.oFlag", args: [lit(o[0]), lit(o[1]), lit(o[2])], type: F64, loc };
+    }
     const value = own(MODES, expr.name.text);
     if (value === undefined) {
       L.noLowering(
         `fs.constants.${expr.name.text}`,
         expr,
-        "F_OK, R_OK, W_OK, and X_OK are the lowered constants",
+        "F_OK, R_OK, W_OK, X_OK and the O_ open flags are the lowered constants",
       );
     }
-    return { kind: "numLit", value, type: F64, loc: locOf(expr) };
+    return { kind: "numLit", value, type: F64, loc };
   }
 
 /** `process.stdin/stdout/stderr.isTTY` → isatty(3) on the stream's fd

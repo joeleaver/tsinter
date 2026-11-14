@@ -1648,6 +1648,7 @@ export class CEmitter {
       case "httpRes":
       case "httpClientReq":
       case "secureCtx":
+      case "fileHandle":
       case "fsWatcher":
       case "childStream":
       case "bytes":

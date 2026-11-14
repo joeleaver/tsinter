@@ -48,7 +48,11 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  fchmodSync,
+  fdatasyncSync,
   fstatSync,
+  fsyncSync,
+  ftruncateSync,
   globSync,
   lstatSync,
   mkdirSync,
@@ -65,6 +69,7 @@ import {
   unlinkSync,
   watch as fsWatch,
   writeFileSync,
+  writeSync,
   constants as fsConstants,
   type FSWatcher,
 } from "node:fs";
@@ -3720,6 +3725,7 @@ const TIER_FLOOR: string[] = [
   "2948-fn-decl-binding-review.cjs",
   "2949-fs-bigint-stats.ts",
   "2950-bigint-any-arith/main.ts",
+  "2951-fs-filehandle.ts",
 ];
 
 interface RunResult {
@@ -4016,7 +4022,7 @@ function mapFsError(e: unknown, modulePathLabel: string): number {
 // table. The module already validated the literal at compile time (an
 // unrecognized flags string is a compile-time ERR_INVALID_ARG_VALUE, the
 // 1640 row) — the host only ever sees one of these ten codes.
-const OPEN_FLAGS_BY_CODE: readonly string[] = ["r", "r+", "w", "wx", "w+", "wx+", "a", "ax", "a+", "ax+"];
+const OPEN_FLAGS_BY_CODE: readonly string[] = ["r", "r+", "w", "wx", "w+", "wx+", "a", "ax", "a+", "ax+", "rs", "rs+", "as", "as+"];
 
 // P5 (design §2.6, fs.readdirTypesSync's own %dtype field): libuv's
 // UV_DIRENT encoding (scr_runtime.h:2640's own C-lane comment — the
@@ -6330,8 +6336,9 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
               if (flags === undefined) {
                 throw new Error(`HARNESS SAFETY GUARD: openSync received an unrecognized flags code ${x} for ${modulePath}`);
               }
-              const resolved = flags === "r" ? pathA : guardDestructive(pathA, cwd, modulePath, "openSync");
-              const isNew = flags !== "r" && flags !== "r+" && !existsSync(resolved);
+              const readOnly = flags === "r" || flags === "rs";
+              const resolved = readOnly ? pathA : guardDestructive(pathA, cwd, modulePath, "openSync");
+              const isNew = !readOnly && flags !== "r+" && flags !== "rs+" && !existsSync(resolved);
               const fd = openSync(resolved, flags, y);
               openFds.add(fd);
               if (isNew) createdPaths.add(resolved);
@@ -6368,6 +6375,55 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
               const vals = [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.rdev, st.size, st.blksize, st.blocks, st.atimeNs, st.mtimeNs, st.ctimeNs, st.birthtimeNs];
               const dv = new DataView(memory!.buffer, bPtr, vals.length * 8);
               vals.forEach((v, i) => dv.setBigInt64(i * 8, BigInt.asIntN(64, v), true));
+              return 0;
+            }
+            case 25: {
+              // open(pathA, raw numeric flags = x, mode = y) -> fd: the
+              // FileHandle's numeric-flags form. A read-only open (no write
+              // access, no create/truncate/append) needs no guard.
+              const C = fsConstants;
+              const writes = (x & (C.O_WRONLY | C.O_RDWR | C.O_CREAT | C.O_TRUNC | C.O_APPEND)) !== 0;
+              const resolved = writes ? guardDestructive(pathA, cwd, modulePath, "open") : pathA;
+              const isNew = (x & C.O_CREAT) !== 0 && !existsSync(resolved);
+              const fd = openSync(resolved, x, y);
+              openFds.add(fd);
+              if (isNew) createdPaths.add(resolved);
+              return fd;
+            }
+            case 26: {
+              // readAt(fd = x, position = slot A's f64 (-1: current), cap =
+              // bLen) -> count, raw bytes into slot B.
+              const pos = new DataView(memory!.buffer, aPtr, 8).getFloat64(0, true);
+              const buf = Buffer.alloc(bLen);
+              const n = readSync(x, buf, 0, bLen, pos < 0 ? null : pos);
+              new Uint8Array(memory!.buffer, bPtr, n).set(buf.subarray(0, n));
+              return n;
+            }
+            case 27: {
+              // writeAt(fd = x, position = slot A's f64 (-1: current), the
+              // bytes in slot B; y = 1: every byte) -> count written. The fd
+              // came from a guarded open.
+              const pos = new DataView(memory!.buffer, aPtr, 8).getFloat64(0, true);
+              const data = Buffer.from(new Uint8Array(memory!.buffer, bPtr, bLen));
+              if (y !== 1) return writeSync(x, data, 0, bLen, pos < 0 ? null : pos);
+              let off = 0;
+              while (off < bLen) off += writeSync(x, data, off, bLen - off, pos < 0 ? null : pos + off);
+              return off;
+            }
+            case 28: {
+              // fsync(fd = x); y = 1: fdatasync
+              if (y === 1) fdatasyncSync(x);
+              else fsyncSync(x);
+              return 0;
+            }
+            case 29: {
+              // ftruncate(fd = x, length = slot A's f64)
+              ftruncateSync(x, new DataView(memory!.buffer, aPtr, 8).getFloat64(0, true));
+              return 0;
+            }
+            case 30: {
+              // fchmod(fd = x, mode = y)
+              fchmodSync(x, y >>> 0);
               return 0;
             }
             default:

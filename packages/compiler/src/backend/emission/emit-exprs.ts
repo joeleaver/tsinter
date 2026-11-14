@@ -6299,6 +6299,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "path.hostRelative":
           case "path.hostToNamespacedPath":
           case "os.hostChoice":
+          case "fs.oFlag":
+          case "error.syscall":
+          case "error.errno":
           case "undef.fieldAbsent":
           case "dyn.argStr":
           case "stream.hostDefaultHwm":
@@ -6350,6 +6353,20 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "fsp.statBig":
           case "stats.big":
           case "stats.isKind":
+          case "fsp.open":
+          case "fsp.openNum":
+          case "fh.fd":
+          case "fh.close":
+          case "fh.stat":
+          case "fh.read":
+          case "fh.write":
+          case "fh.writeStr":
+          case "fh.writeFile":
+          case "fh.readFile":
+          case "fh.readFileStr":
+          case "fh.sync":
+          case "fh.chmod":
+          case "fh.truncate":
           case "big.lit":
           case "big.add":
           case "big.sub":

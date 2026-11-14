@@ -122,6 +122,7 @@ import {
   HOST_STR_KIND_CWD,
   HOST_STR_KIND_EXEC_PATH,
   HOST_NUM_KIND_OS_TOTALMEM,
+  PLATFORM_ID_DARWIN,
   PLATFORM_ID_WIN32,
   HOST_STR_KIND_OS_HOMEDIR,
   HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON,
@@ -1153,6 +1154,7 @@ function hostNumReachable(mod: WModule): boolean {
         // arms, and every stream's default highWaterMark
         node.startsWith("path.host") ||
         node === "os.hostChoice" ||
+        node === "fs.oFlag" ||
         node === "stream.hostDefaultHwm" ||
         node.startsWith("url.fileURLToPath") ||
         node === "url.pathToFileURLHost" ||
@@ -1383,6 +1385,9 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fs.statBig" ||
         node === "fs.fstatBig" ||
         node === "fsp.statBig" ||
+        node === "fsp.open" ||
+        node === "fsp.openNum" ||
+        node.startsWith("fh.") ||
         node === "fs.realpathSync" ||
         // The ten fsp promise twins (design §6.5): SYNCHRONOUS syscall +
         // an already-settled promise, so they mint fsCall exactly like
@@ -2301,6 +2306,15 @@ const ERR_IDH = 5;
 const DOMEX_HAS_CAUSE = 5;
 const DOMEX_CAUSE = 6;
 const FETCH_CAUSE = 5;
+const SYSERR_SYSCALL = 5;
+/** Node's open flag strings (stringToFlags, lib/internal/fs/utils.js) as
+ * the host contract's small enum (abi.ts op 21): never raw O_* bits, which
+ * differ per OS. The hosts map each code back (wn_host.c open_flags, the
+ * harness's OPEN_FLAGS_BY_CODE). */
+const OPEN_FLAG_CODES: Record<string, number> = {
+  r: 0, "r+": 1, w: 2, wx: 3, "w+": 4, "wx+": 5, a: 6, ax: 7, "a+": 8, "ax+": 9,
+  rs: 10, sr: 10, "rs+": 11, "sr+": 11, xw: 3, "xw+": 5, xa: 7, as: 12, sa: 12, "xa+": 9, "as+": 13, "sa+": 13,
+};
 
 /** INC-27 U5: the named run-time refusal a null-prototype object meets at
  * every ToString (String(), a template, `+` with a string, join, a
@@ -3223,6 +3237,11 @@ class Assembler {
    * (signals, fs.watch) — an event module whatever else it reaches. */
   private readonly hevSignals: boolean;
   private readonly hevWatch: boolean;
+  /** fs/promises FileHandle: the module reaches an fh.* libCall, so its
+   * closed-handle errors carry Node's `syscall` (class:sysErr), which
+   * fromError and insp.error print — a FileHandle-free module keeps its
+   * bytes. */
+  private readonly fhLive: boolean;
   private readonly hevModule: boolean;
   /** #227: `tsinter.fetch`'s index, or null outside a fetch module. */
   private readonly fetchCallFunc: number | null;
@@ -3286,7 +3305,7 @@ class Assembler {
   /** node:querystring: the record shapes qs.parse results have in this
    * module (empty when qs.parse is unreachable, so no other module's
    * bytes depend on the null-prototype gates). */
-  private readonly qsParseShapes = new Set<string>();
+  private readonly qsParseShapes = new Map<string, string>();
   /** Set only while qs.stringify fetches its own argument's dynFrom
    * walker (the one conversion where the prototype is unobservable). */
   private qsDynFromDirect = false;
@@ -3479,6 +3498,7 @@ class Assembler {
     const hevMod = hevSignals || hevWatch || hevStdin;
     this.hevSignals = hevSignals;
     this.hevWatch = hevWatch;
+    this.fhLive = libCallWhere(mod, (fn) => fn.startsWith("fh."));
     this.hevStdin = hevStdin;
     this.hevModule = hevMod;
     // #227: a fetch module's `_loop` reads `now` too.
@@ -3708,7 +3728,14 @@ class Assembler {
     this.irNodeReachable(mod, (rec) => {
       if (rec["kind"] === "libCall" && rec["fn"] === "qs.parse") {
         const t = rec["type"] as IrType;
-        if (t.kind === "record") this.qsParseShapes.add(t.shapeId);
+        if (t.kind === "record") this.qsParseShapes.set(t.shapeId, "qs.parse");
+      }
+      // fs/promises FileHandle: read/write resolve to Node's
+      // `{ __proto__: null, bytesRead | bytesWritten, buffer }`, under the
+      // same null-prototype gates (lower-filehandle.ts).
+      if (rec["kind"] === "libCall" && (rec["fn"] === "fh.read" || rec["fn"] === "fh.write" || rec["fn"] === "fh.writeStr")) {
+        const t = rec["type"] as IrType;
+        if (t.kind === "promise" && t.inner.kind === "record") this.qsParseShapes.set(t.inner.shapeId, rec["fn"] === "fh.read" ? "fh.read" : "fh.write");
       }
       return false;
     });
@@ -5365,6 +5392,174 @@ class Assembler {
 
   private domexType: number | null = null;
 
+  private sysErrType: number | null = null;
+
+  /** `class:sysErr` — errT's fields, then the error's own `syscall`
+   * (field 5, 6 with ERR_IDH: SYSERR_SYSCALL): the FileHandle's closed-
+   * handle Error, whose own properties are code and syscall (Node's
+   * fsCall in lib/internal/fs/promises.js; no errno). */
+  private sysErrT(): number {
+    if (this.sysErrType !== null) return this.sysErrType;
+    const exc = this.exc();
+    this.sysErrType = this.mb.subStructType(
+      "class:sysErr",
+      [...exc.errFields, { storage: this.strRef, mutable: false }],
+      exc.errT,
+    );
+    return this.sysErrType;
+  }
+
+  /** A plain Error with `code` and `syscall` into the pending cell (the
+   * caller unwinds or settles), the class:sysErr form. */
+  private emitSetCellSysErr(c: Code, message: string, code: string, syscall: string): void {
+    const exc = this.exc();
+    c.globalGet(this.errVtGlobal("%Error", "Error"));
+    this.pushStrLitInto(c, "Error");
+    this.pushStrLitInto(c, message);
+    this.pushStrLitInto(c, code);
+    c.refNull(EQ_HEAP); // ERR_BOX (GH #146)
+    if (this.idKeys) c.i32Const(0); // ERR_IDH (object keys)
+    this.pushStrLitInto(c, syscall);
+    c.structNew(this.sysErrT());
+    c.globalSet(exc.refG);
+    const meta = this.classes.meta("%Error");
+    if (meta === undefined) throw new Error("wasm emitter bug: %Error meta");
+    c.i32Const(meta.pre);
+    c.globalSet(exc.preG);
+    c.i32Const(EXC_OBJ);
+    c.globalSet(exc.kindG);
+  }
+
+  /** `err.syscall` / `err.errno` (IR error.syscall / error.errno): a
+   * class:sysErr answers its syscall and no errno; an error whose code is
+   * a system errno name (E…, not ERR_…) — one this tier builds without
+   * them (GH #205) — stops by name; any other error answers undefined. */
+  private emitErrorSysMember(code: Code, e: Extract<IrExpr, { kind: "libCall" }>): void {
+    if (e.type.kind !== "union") throw new Error(`emitter bug: ${e.fn} type`);
+    const unionId = e.type.unionId;
+    const def = this.unionDef(unionId);
+    const undefTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+    const valTag = def.arms.findIndex((a) => a.kind === (e.fn === "error.syscall" ? "string" : "f64"));
+    const unionVal = this.mapType(e.type, e.loc);
+    const errInfo = this.classInfo("%Error", e.loc);
+    const valSt = this.unionArmStruct(unionId, valTag, e.loc);
+    if (undefTag < 0 || valTag < 0 || unionVal === null || errInfo === null || valSt === null) {
+      code.unreachable();
+      return;
+    }
+    const recvVal = this.classes.ref(errInfo);
+    const R = this.acquireScratch(recvVal);
+    const C = this.acquireScratch(this.strRef);
+    this.walkExpr(e.args[0]!);
+    code.localSet(R);
+    code.blockResult(unionVal);
+    if (this.fhLive) {
+      const t = this.sysErrT();
+      code.localGet(R);
+      code.refTest(t);
+      code.ifVoid();
+      if (e.fn === "error.syscall") {
+        code.i32Const(valTag);
+        code.localGet(R);
+        code.refCast(t);
+        code.structGet(t, SYSERR_SYSCALL + this.errIdhN);
+        code.structNew(valSt);
+      } else {
+        code.globalGet(this.unions.unitGlobal(undefTag));
+      }
+      code.br(1);
+      code.end();
+    }
+    // code[0] === 'E' && !(code starts with "ERR_")
+    code.localGet(R);
+    code.structGet(errInfo.struct, 3);
+    code.localTee(C);
+    code.refIsNull();
+    code.ifResult(I32);
+    code.i32Const(0);
+    code.else_();
+    code.localGet(C);
+    code.arrayLen();
+    code.i32Const(0);
+    code.i32GtS();
+    code.ifResult(I32);
+    code.localGet(C);
+    code.i32Const(0);
+    code.arrayGetU(this.strType);
+    code.i32Const(0x45); // 'E'
+    code.i32Eq();
+    code.localGet(C);
+    code.arrayLen();
+    code.i32Const(4);
+    code.i32GeS();
+    code.ifResult(I32);
+    code.localGet(C);
+    code.i32Const(1);
+    code.arrayGetU(this.strType);
+    code.i32Const(0x52); // 'R'
+    code.i32Eq();
+    code.localGet(C);
+    code.i32Const(2);
+    code.arrayGetU(this.strType);
+    code.i32Const(0x52);
+    code.i32Eq();
+    code.i32And();
+    code.localGet(C);
+    code.i32Const(3);
+    code.arrayGetU(this.strType);
+    code.i32Const(0x5f); // '_'
+    code.i32Eq();
+    code.i32And();
+    code.else_();
+    code.i32Const(0);
+    code.end();
+    code.i32Eqz();
+    code.i32And();
+    code.else_();
+    code.i32Const(0);
+    code.end();
+    code.end();
+    code.ifVoid();
+    this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `the ${e.fn === "error.syscall" ? "syscall" : "errno"} of a system error (only its code and message are carried, GH #205)`), null);
+    code.end();
+    code.globalGet(this.unions.unitGlobal(undefTag));
+    code.end();
+    this.releaseScratch(this.strRef, C);
+    this.releaseScratch(recvVal, R);
+  }
+
+  /** fromError's `syscall` member of a class:sysErr (after `code`, its
+   * own key order). */
+  private emitSysErrPut(c: Code, errLocal: number, objLocal: number): void {
+    const t = this.sysErrT();
+    c.localGet(errLocal);
+    c.refTest(t);
+    c.ifVoid();
+    c.localGet(objLocal);
+    this.pushStrLitInto(c, "syscall");
+    this.dynField!.boxStr(c, (x) => {
+      x.localGet(errLocal);
+      x.refCast(t);
+      x.structGet(t, SYSERR_SYSCALL + this.errIdhN);
+    });
+    c.call(this.dynField!.objPut());
+    c.end();
+  }
+
+  /** Push the error's own `syscall` (a class:sysErr), or null. */
+  private emitSysErrSyscallInto(c: Code, errLocal: number): void {
+    const t = this.sysErrT();
+    c.localGet(errLocal);
+    c.refTest(t);
+    c.ifResult(this.strRef);
+    c.localGet(errLocal);
+    c.refCast(t);
+    c.structGet(t, SYSERR_SYSCALL + this.errIdhN);
+    c.else_();
+    c.refNull(this.strType);
+    c.end();
+  }
+
   private fetchCauseType: number | null = null;
 
   /** `class:fetchCause` (#227) — errT's five fields, then the host's
@@ -6747,7 +6942,7 @@ class Assembler {
       // qs.parse result would print it without Node's
       // "[Object: null prototype]" header.
       if (this.qsParseShapes.size > 0 && fn.name.startsWith("%util.insp.") && fn.params[0] !== undefined && this.qsNullProtoType(fn.params[0].type)) {
-        this.refuse("libCall:qs.parse:null-proto-inspect", fn.loc);
+        this.refuse(`libCall:${this.nullProtoOrigin(fn.params[0].type)}:null-proto-inspect`, fn.loc);
       }
       // ...and a cast, annotated binding or return as ANOTHER record type
       // copies it into a fresh shape (%rec.capture / %rec.width) that the
@@ -6760,7 +6955,7 @@ class Assembler {
         fn.params[0] !== undefined &&
         this.qsNullProtoType(fn.params[0].type)
       ) {
-        this.refuse("libCall:qs.parse:null-proto-reshape", fn.loc);
+        this.refuse(`libCall:${this.nullProtoOrigin(fn.params[0].type)}:null-proto-reshape`, fn.loc);
       }
       if (fn.name === "%str.chars" && this.emitStrCharsBody(fn)) continue;
       this.walkFunction(fn);
@@ -11523,6 +11718,9 @@ class Assembler {
       sameValueF64: () => this.sameValueF64Helper(),
       deqEnter: () => this.deqEnterHelper(),
       deqLeave: () => this.deqLeaveHelper(),
+      ...(!this.domexLive && this.fhLive
+        ? { fromErrorExtra: (c: Code, errLocal: number, objLocal: number): void => this.emitSysErrPut(c, errLocal, objLocal) }
+        : {}),
       ...(this.domexLive
         ? {
             fromErrorExtra: (c: Code, errLocal: number, objLocal: number): void => {
@@ -11548,6 +11746,7 @@ class Assembler {
               c.end();
               // #227: "fetch failed" and its kin carry the host's cause
               // (class:fetchCause), which crosses as itself.
+              if (this.fhLive) this.emitSysErrPut(c, errLocal, objLocal);
               if (this.fetchModule) {
                 const causeT = this.fetchCauseT();
                 c.localGet(errLocal);
@@ -11716,6 +11915,7 @@ class Assembler {
       errCode: () => ERR_CODE,
       errHead: () => this.errTypedHeadHelper(),
       errCtor: () => this.errTypedCtorHelper(),
+      ...(this.fhLive ? { syscall: (c: Code, errLocal: number) => this.emitSysErrSyscallInto(c, errLocal) } : {}),
       dyn: () => this.dyn,
       inspF64: () => this.inspF64Helper(),
       throwError: (c, className, name, pushMessage) =>
@@ -12470,6 +12670,7 @@ class Assembler {
       concat: () => this.concatHelper(),
       f64ToStr: () => this.f64ToStrHelper(),
       throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+      throwSysErr: (c, message, code, syscall) => this.emitSetCellSysErr(c, message, code, syscall),
       // INC-26 P5 (readFileSyncBytes/writeFileSyncBytes) — the SAME
       // bytes-array surface StreamBuilder's own deps already inject
       // (this.bytesB, typedarrays.ts's BytesBuilder), for the FIRST byte
@@ -17824,7 +18025,7 @@ class Assembler {
     if (!this.qsDynFromDirect && this.qsNullProtoType(t)) {
       // A dynamic copy would gain Object.prototype (hasOwnProperty,
       // toString, instanceof Object), which Node's parse result lacks.
-      this.refuse("libCall:qs.parse:null-proto-dyn", loc);
+      this.refuse(`libCall:${this.nullProtoOrigin(t)}:null-proto-dyn`, loc);
       return null;
     }
     const key = typeKey(t);
@@ -21270,6 +21471,9 @@ class Assembler {
         if (this.hevWatch) return this.hev.watcherRef();
         this.refuse(`type:${t.kind}`, loc);
         return null;
+      // fs/promises FileHandle: the descriptor struct (fs.ts fhType)
+      case "fileHandle":
+        return this.fs.fhRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -21464,6 +21668,8 @@ class Assembler {
       // Unit G3: mapType's fsWatcher arm, in lockstep.
       case "fsWatcher":
         return this.hevWatch ? this.hev.watcherRef() : I32;
+      case "fileHandle":
+        return this.fs.fhRef();
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -24509,7 +24715,7 @@ class Assembler {
           if (this.qsNullProtoType(e.operand.type)) {
             // Node: a null-prototype object has no toString, so its
             // ToString throws "Cannot convert object to primitive value".
-            this.refuse("libCall:qs.parse:null-proto-tostring", e.loc);
+            this.refuse(`libCall:${this.nullProtoOrigin(e.operand.type)}:null-proto-tostring`, e.loc);
             code.unreachable();
             return;
           }
@@ -26220,6 +26426,10 @@ class Assembler {
           this.releaseScratch(recvT, recv);
           return;
         }
+        if (e.fn === "error.syscall" || e.fn === "error.errno") {
+          this.emitErrorSysMember(code, e);
+          return;
+        }
         if (e.fn === "error.code") {
           // PASS 2 (stream increment 22): `err.code` on an Error-rooted
           // receiver (lower-builtins.ts's lowerErrorCodeProperty) — the
@@ -27385,6 +27595,28 @@ class Assembler {
           return;
         }
         // S118: path.sep / path.delimiter / os.EOL — [posix, win32]
+        if (e.fn === "fs.oFlag") {
+          const val = (i: number): number => {
+            const a = e.args[i]!;
+            if (a.kind !== "numLit") throw new Error("emitter bug: fs.oFlag args");
+            return a.value;
+          };
+          this.os.emitPlatformIs(code, PLATFORM_ID_DARWIN);
+          code.ifResult(F64);
+          code.f64Const(val(1));
+          code.else_();
+          this.os.emitPlatformIs(code, PLATFORM_ID_WIN32);
+          code.ifResult(F64);
+          if (val(2) < 0) {
+            this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, "this fs.constants O_ flag is undefined on win32"), null);
+            code.f64Const(0);
+          } else code.f64Const(val(2));
+          code.else_();
+          code.f64Const(val(0));
+          code.end();
+          code.end();
+          return;
+        }
         if (e.fn === "os.hostChoice") {
           this.os.emitPlatformIs(code, PLATFORM_ID_WIN32);
           code.ifResult(this.strRef);
@@ -28991,7 +29223,7 @@ class Assembler {
             code.unreachable();
             return;
           }
-          const FLAGS_ENUM: Record<string, number> = { r: 0, "r+": 1, w: 2, wx: 3, "w+": 4, "wx+": 5, a: 6, ax: 7, "a+": 8, "ax+": 9 };
+          const FLAGS_ENUM: Record<string, number> = OPEN_FLAG_CODES;
           const flagCode = FLAGS_ENUM[flagsArg.value];
           this.walkExpr(e.args[0]!);
           if (flagCode === undefined) {
@@ -29738,6 +29970,10 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             code.call(this.fs.statSyncHelper());
           });
+          return;
+        }
+        if (e.fn === "fsp.open" || e.fn === "fsp.openNum" || e.fn.startsWith("fh.")) {
+          this.emitFileHandleCall(code, e);
           return;
         }
         // The full stat record (fs.ts statFullHelper, op 24).
@@ -35008,7 +35244,7 @@ class Assembler {
         // String()) where Node throws — the same named refusal as its
         // dynamic copy (dynFromHelper's gate), never a silent answer.
         if (this.qsNullProtoType(e.value.type)) {
-          this.refuse("libCall:qs.parse:null-proto-dyn", e.loc);
+          this.refuse(`libCall:${this.nullProtoOrigin(e.value.type)}:null-proto-dyn`, e.loc);
           code.unreachable();
           return;
         }
@@ -42268,6 +42504,12 @@ class Assembler {
    * conversion refuse by name (board #231 is the native lanes' side). */
   private qsNullProtoType(t: IrType): boolean {
     return t.kind === "record" && this.qsParseShapes.has(t.shapeId);
+  }
+
+  /** The libCall a null-prototype record type comes from (the refusal's
+   * name): qs.parse, or the FileHandle's fh.read / fh.write results. */
+  private nullProtoOrigin(t: IrType): string {
+    return (t.kind === "record" ? this.qsParseShapes.get(t.shapeId) : undefined) ?? "qs.parse";
   }
 
   /** node:url and the WHATWG URL / URLSearchParams classes — INC-29 U3
@@ -50476,6 +50718,421 @@ class Assembler {
    * arm reads PROM_REF unconditionally, ignoring PROM_KIND) — EXC_OBJ is
    * pushed there as a harmless, unread placeholder, not a claim about
    * the value's real shape. */
+  /** Push 1 when the f64 in `local` is not an integer (Number.isInteger
+   * false: NaN, ±Infinity, a fraction), Node's validateInteger test. */
+  private emitNotInteger(code: Code, local: number): void {
+    code.localGet(local);
+    code.localGet(local);
+    code.f64Trunc();
+    code.f64Ne();
+    code.localGet(local);
+    code.f64Abs();
+    code.f64Const(Infinity);
+    code.f64Eq();
+    code.i32Or();
+  }
+
+  /** Node's ERR_OUT_OF_RANGE RangeError into the pending cell: `The value
+   * of "<name>" is out of range. It must be <range>. Received <value>`
+   * (addNumericalSeparator past 2^32, numReceived). */
+  private emitRangeErrorInto(code: Code, name: string, range: string, valueLocal: number): void {
+    this.emitSetCellError(
+      code,
+      "%RangeError",
+      "RangeError",
+      (c) => {
+        this.pushStrLitInto(c, `The value of "${name}" is out of range. It must be ${range}. Received `);
+        c.localGet(valueLocal);
+        c.call(this.bytesB.numReceivedHelper());
+        c.call(this.concatHelper());
+      },
+      "ERR_OUT_OF_RANGE",
+    );
+  }
+
+  /** fs/promises open and the FileHandle methods (fs.ts's fh* helpers,
+   * abi.ts ops 21/25-30): each an already-settled promise (S074). The
+   * arguments evaluate first, in order; then a closed handle rejects
+   * Node's 'file closed' Error (fsCall's own check), then the method's
+   * own validation, then the syscall. */
+  private emitFileHandleCall(code: Code, e: Extract<IrExpr, { kind: "libCall" }>): void {
+    const F64T: ValType = { kind: "f64" };
+    const bytesRef = this.bytesB.bytesRef();
+    if (e.fn === "fh.fd") {
+      this.walkExpr(e.args[0]!);
+      code.structGet(this.fs.fhType(), 0);
+      code.f64ConvertI32S();
+      return;
+    }
+    if (e.fn === "fsp.open" || e.fn === "fsp.openNum") {
+      const PATH = this.acquireScratch(this.strRef);
+      const MODE = this.acquireScratch(I32);
+      this.walkExpr(e.args[0]!);
+      code.localSet(PATH);
+      let FLAGS: number | null = null;
+      let flagCode: number | undefined;
+      let flagText = "";
+      if (e.fn === "fsp.openNum") {
+        FLAGS = this.acquireScratch(I32);
+        this.walkExpr(e.args[1]!);
+        code.call(this.toInt32Helper());
+        code.localSet(FLAGS);
+      } else {
+        const f = e.args[1]!;
+        if (f.kind !== "strLit") throw new Error("emitter bug: fsp.open flags must be a string literal");
+        flagText = f.value;
+        const FLAGS_ENUM: Record<string, number> = OPEN_FLAG_CODES;
+        flagCode = FLAGS_ENUM[f.value];
+      }
+      this.walkExpr(e.args[2]!);
+      code.call(this.toInt32Helper());
+      code.localSet(MODE);
+      this.emitFspSettled(code, this.fs.fhRef(), () => {
+        if (e.fn === "fsp.open" && flagCode === undefined) {
+          this.emitSetCellErrorCoded(
+            code,
+            "%TypeError",
+            "TypeError",
+            (cc) => this.pushStrLitInto(cc, `The argument 'flags' is invalid. Received '${flagText}'`),
+            (cc) => this.pushStrLitInto(cc, "ERR_INVALID_ARG_VALUE"),
+          );
+          code.refNull(this.fs.fhType());
+          return;
+        }
+        code.localGet(PATH);
+        if (FLAGS !== null) code.localGet(FLAGS);
+        else code.i32Const(flagCode!);
+        code.localGet(MODE);
+        code.call(this.fs.fhOpenHelper(e.fn === "fsp.openNum"));
+      });
+      if (FLAGS !== null) this.releaseScratch(I32, FLAGS);
+      this.releaseScratch(I32, MODE);
+      this.releaseScratch(this.strRef, PATH);
+      return;
+    }
+    if (e.fn === "fh.close") {
+      this.walkExpr(e.args[0]!);
+      const H = this.acquireScratch(this.fs.fhRef());
+      code.localSet(H);
+      this.emitFspSettled(code, null, () => {
+        code.localGet(H);
+        code.call(this.fs.fhCloseHelper());
+      });
+      this.releaseScratch(this.fs.fhRef(), H);
+      return;
+    }
+    // The handle methods: every argument into a scratch local, in order.
+    const H = this.acquireScratch(this.fs.fhRef());
+    this.walkExpr(e.args[0]!);
+    code.localSet(H);
+    const argLocals: { t: ValType; l: number }[] = [];
+    for (let i = 1; i < e.args.length; i++) {
+      const a = e.args[i]!;
+      const t: ValType = a.type.kind === "f64" ? F64T : a.type.kind === "string" ? this.strRef : bytesRef;
+      const l = this.acquireScratch(t);
+      this.walkExpr(a);
+      code.localSet(l);
+      argLocals.push({ t, l });
+    }
+    const arg = (i: number): number => argLocals[i - 1]!.l;
+    const SYSCALL: Record<string, string> = {
+      "fh.stat": "fstat", "fh.read": "read", "fh.write": "write", "fh.writeStr": "write", "fh.writeFile": "writeFile",
+      "fh.readFile": "readFile", "fh.readFileStr": "readFile", "fh.sync": "fsync", "fh.chmod": "fchmod", "fh.truncate": "ftruncate",
+    };
+    let syscall = SYSCALL[e.fn];
+    if (syscall === undefined) throw new Error(`emitter bug: ${e.fn}`);
+    if (e.fn === "fh.sync" && e.args[1]?.kind === "numLit" && e.args[1].value === 1) syscall = "fdatasync";
+    let resultType: ValType | null = null;
+    let rec: RecordInfo | null = null;
+    if (e.fn === "fh.read" || e.fn === "fh.write" || e.fn === "fh.writeStr") {
+      if (e.type.kind !== "promise" || e.type.inner.kind !== "record") throw new Error(`emitter bug: ${e.fn} result`);
+      rec = this.recordInfo(e.type.inner.shapeId, e.loc, false);
+      if (rec === null) {
+        code.unreachable();
+        return;
+      }
+      resultType = { kind: "ref", nullable: true, typeIndex: rec.struct };
+    } else if (e.fn === "fh.stat") resultType = this.fs.statsRef();
+    else if (e.fn === "fh.readFile") resultType = bytesRef;
+    else if (e.fn === "fh.readFileStr") resultType = this.strRef;
+    const dummy = (): void => {
+      if (resultType === null) return;
+      if (resultType.kind === "ref") code.refNull(resultType.typeIndex);
+    };
+    const FD = this.acquireScratch(I32);
+    // the record { <count>, buffer } of read/write
+    const record = (countName: string, pushCount: () => void, bufLocal: number): void => {
+      const R = this.acquireScratch(resultType!);
+      code.structNewDefault(rec!.struct);
+      code.localSet(R);
+      const ci = rec!.fieldIndex.get(countName);
+      const bi = rec!.fieldIndex.get("buffer");
+      if (ci === undefined || bi === undefined) throw new Error(`emitter bug: ${e.fn} record fields`);
+      code.localGet(R);
+      pushCount();
+      code.structSet(rec!.struct, ci);
+      code.localGet(R);
+      code.localGet(bufLocal);
+      code.structSet(rec!.struct, bi);
+      code.localGet(R);
+      this.releaseScratch(resultType!, R);
+    };
+    this.emitFspSettled(code, resultType, () => {
+      code.localGet(H);
+      code.call(this.fs.fhLiveHelper(syscall!));
+      code.localSet(FD);
+      code.localGet(FD);
+      code.i32Const(-1);
+      code.i32Eq();
+      if (resultType !== null) code.ifResult(resultType);
+      else code.ifVoid();
+      dummy();
+      code.else_();
+      switch (e.fn) {
+        case "fh.stat":
+          code.localGet(FD);
+          code.call(this.fs.statFullHelper("fstat"));
+          break;
+        case "fh.readFile":
+          code.localGet(FD);
+          code.call(this.fs.fdReadAllHelper());
+          break;
+        case "fh.readFileStr": {
+          code.localGet(FD);
+          code.call(this.fs.fdReadAllHelper());
+          const B = this.acquireScratch(bytesRef);
+          code.localSet(B);
+          code.globalGet(this.exc().kindG);
+          code.ifResult(this.strRef);
+          code.refNull(this.strType);
+          code.else_();
+          code.localGet(B);
+          code.call(this.bytesB.toStrHelper("utf8"));
+          code.end();
+          this.releaseScratch(bytesRef, B);
+          break;
+        }
+        case "fh.sync":
+          code.localGet(FD);
+          code.i32Const(syscall === "fdatasync" ? 1 : 0);
+          code.f64Const(0);
+          code.call(this.fs.fdOpHelper(28, syscall!));
+          break;
+        case "fh.chmod": {
+          // parseFileMode -> validateUint32(mode, 'mode')
+          const M = arg(1);
+          this.emitNotInteger(code, M);
+          code.ifVoid();
+          this.emitRangeErrorInto(code, "mode", "an integer", M);
+          code.else_();
+          code.localGet(M);
+          code.f64Const(0);
+          code.f64Lt();
+          code.localGet(M);
+          code.f64Const(4294967295);
+          code.f64Gt();
+          code.i32Or();
+          code.ifVoid();
+          this.emitRangeErrorInto(code, "mode", ">= 0 && <= 4294967295", M);
+          code.else_();
+          code.localGet(FD);
+          code.localGet(M);
+          code.i32TruncF64U();
+          code.f64Const(0);
+          code.call(this.fs.fdOpHelper(30, "fchmod"));
+          code.end();
+          code.end();
+          break;
+        }
+        case "fh.truncate": {
+          // validateInteger(len, 'len'), then max(0, len)
+          const L = arg(1);
+          this.emitNotInteger(code, L);
+          code.ifVoid();
+          this.emitRangeErrorInto(code, "len", "an integer", L);
+          code.else_();
+          code.localGet(L);
+          code.f64Abs();
+          code.f64Const(9007199254740991);
+          code.f64Gt();
+          code.ifVoid();
+          this.emitRangeErrorInto(code, "len", ">= -9007199254740991 && <= 9007199254740991", L);
+          code.else_();
+          code.localGet(FD);
+          code.i32Const(0);
+          code.localGet(L);
+          code.f64Const(0);
+          code.f64Max();
+          code.call(this.fs.fdOpHelper(29, "ftruncate"));
+          code.end();
+          code.end();
+          break;
+        }
+        case "fh.writeFile":
+          code.localGet(FD);
+          code.localGet(arg(1));
+          code.f64Const(-1);
+          code.i32Const(1);
+          code.call(this.fs.fdWriteAtHelper());
+          code.drop();
+          break;
+        case "fh.write":
+        case "fh.writeStr": {
+          const data = e.fn === "fh.write" ? arg(1) : arg(2);
+          record("bytesWritten", () => {
+            code.localGet(FD);
+            code.localGet(data);
+            code.f64Const(-1);
+            code.i32Const(0);
+            code.call(this.fs.fdWriteAtHelper());
+          }, arg(1));
+          break;
+        }
+        case "fh.read": {
+          const BUF = arg(1), OFF = arg(2), LEN = arg(3), POS = arg(4);
+          const hasLen = e.args[5]?.kind === "numLit" && e.args[5].value === 1;
+          const BL = this.acquireScratch(F64T);
+          code.localGet(BUF);
+          code.call(this.bytesB.length());
+          code.localSet(BL);
+          const range = (name: string, pushRange: (c: Code) => void, value: number): void => {
+            this.emitSetCellError(
+              code,
+              "%RangeError",
+              "RangeError",
+              (c) => {
+                this.pushStrLitInto(c, `The value of "${name}" is out of range. It must be `);
+                pushRange(c);
+                c.call(this.concatHelper());
+                this.pushStrLitInto(c, ". Received ");
+                c.call(this.concatHelper());
+                c.localGet(value);
+                c.call(this.bytesB.numReceivedHelper());
+                c.call(this.concatHelper());
+              },
+              "ERR_OUT_OF_RANGE",
+            );
+          };
+          const lit = (t: string) => (c: Code): void => this.pushStrLitInto(c, t);
+          // validateInteger(offset, 'offset', 0)
+          code.blockResult(resultType!);
+          this.emitNotInteger(code, OFF);
+          code.ifVoid();
+          range("offset", lit("an integer"), OFF);
+          dummy();
+          code.br(1);
+          code.end();
+          code.localGet(OFF);
+          code.f64Const(0);
+          code.f64Lt();
+          code.localGet(OFF);
+          code.f64Const(9007199254740991);
+          code.f64Gt();
+          code.i32Or();
+          code.ifVoid();
+          range("offset", lit(">= 0 && <= 9007199254740991"), OFF);
+          dummy();
+          code.br(1);
+          code.end();
+          if (!hasLen) {
+            // length ??= buffer.byteLength - offset
+            code.localGet(BL);
+            code.localGet(OFF);
+            code.f64Sub();
+            code.localSet(LEN);
+          }
+          // validatePosition(position, 'position', length): a null position
+          // arrives as -1 (the current one), which passes
+          this.emitNotInteger(code, POS);
+          code.ifVoid();
+          range("position", lit("an integer"), POS);
+          dummy();
+          code.br(1);
+          code.end();
+          code.localGet(POS);
+          code.f64Const(-1);
+          code.f64Lt();
+          code.localGet(POS);
+          code.f64Const(9007199254740991);
+          code.f64Gt();
+          code.i32Or();
+          code.ifVoid();
+          range("position", lit(">= -1 && <= 9007199254740991"), POS);
+          dummy();
+          code.br(1);
+          code.end();
+          // length 0: { bytesRead: 0, buffer } without a read
+          code.localGet(LEN);
+          code.f64Const(0);
+          code.f64Eq();
+          code.ifVoid();
+          record("bytesRead", () => code.f64Const(0), BUF);
+          code.br(1);
+          code.end();
+          code.localGet(BL);
+          code.f64Const(0);
+          code.f64Eq();
+          code.ifVoid();
+          this.emitSetCellErrorCoded(
+            code,
+            "%TypeError",
+            "TypeError",
+            (c) => this.pushStrLitInto(c, "The argument 'buffer' is empty and cannot be written. Received <Buffer >"),
+            (c) => this.pushStrLitInto(c, "ERR_INVALID_ARG_VALUE"),
+          );
+          dummy();
+          code.br(1);
+          code.end();
+          // validateOffsetLengthRead(offset, length, bufferLength)
+          code.localGet(LEN);
+          code.f64Const(0);
+          code.f64Lt();
+          code.ifVoid();
+          range("length", lit(">= 0"), LEN);
+          dummy();
+          code.br(1);
+          code.end();
+          code.localGet(OFF);
+          code.localGet(LEN);
+          code.f64Add();
+          code.localGet(BL);
+          code.f64Gt();
+          code.ifVoid();
+          range("length", (c) => {
+            this.pushStrLitInto(c, "<= ");
+            c.localGet(BL);
+            c.localGet(OFF);
+            c.f64Sub();
+            c.call(this.f64ToStrHelper());
+            c.call(this.concatHelper());
+          }, LEN);
+          dummy();
+          code.br(1);
+          code.end();
+          record("bytesRead", () => {
+            code.localGet(FD);
+            code.localGet(BUF);
+            code.localGet(OFF);
+            code.call(this.toInt32Helper());
+            code.localGet(LEN);
+            code.call(this.toInt32Helper());
+            code.localGet(POS);
+            code.call(this.fs.fdReadAtHelper());
+          }, BUF);
+          code.end();
+          this.releaseScratch(F64T, BL);
+          break;
+        }
+        default:
+          throw new Error(`emitter bug: ${e.fn}`);
+      }
+      code.end();
+    });
+    this.releaseScratch(I32, FD);
+    for (const a of argLocals.reverse()) this.releaseScratch(a.t, a.l);
+    this.releaseScratch(this.fs.fhRef(), H);
+  }
+
   private emitFspSettled(code: Code, resultType: ValType | null, pushSyncResult: () => void): void {
     const exc = this.exc();
     const P = this.acquireScratch(this.proms.promRef());

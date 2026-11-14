@@ -7141,6 +7141,21 @@ stance — `emitFspSettled` wraps the SAME sync fs.ts helpers the ordinary `fs.*
 module's own already-settled-promise minting (`this.proms.mint()`/`this.proms.settle()`), never new async
 machinery (design §6.5) — so one entry covers both lanes rather than a per-lane split.
 
+**fs/promises `open` and the FileHandle (WasmGC lanes; `fsp.open`/`fsp.openNum` and the `fh.*` libCalls,
+fsCall ops 21 and 25-30: openRaw, readAt, writeAt, fsync/fdatasync, ftruncate, fchmod).** `open()` and every
+handle method — `close`, `stat`, `read`, `write`, `writeFile`, `readFile`, `sync`, `datasync`, `chmod`,
+`truncate` — run their syscalls synchronously and return an already-settled promise, exactly as above. The
+SETTLE ORDER is the observable part: two handle calls made without awaiting between them settle in CALL
+order here, each before the caller's next statement, where Node's thread pool may complete them in either
+order and only after the current turn; a handle call raced against a timer or an immediate always wins here.
+The argument validation (Node's own texts, order and `Received` rendering) and the closed-handle Error
+(`'file closed'`, code EBADF, the method's `syscall`) reject, as Node's do.
+
+**Descriptor numbers.** A FileHandle's `fd` (and `openSync`'s answer) is the host's next free descriptor:
+3 or a little above in a fresh process. Node's first descriptor is around 20, past the ones libuv and V8
+open at startup. Programs that print or compare raw descriptor numbers see different numbers; what a
+descriptor names, and `fd === -1` after `close()`, agree.
+
 RETIRES the two unnumbered citations whose SUBJECT is this mechanism: `packages/runtime/src/scr_async.c:1379`
 (inside the block comment introducing the `scr_promise_settled_*` family, immediately before
 `scr_promise_settled_common` at `:1387`: "the documented non-interleaving divergence, SEMANTICS.md") and

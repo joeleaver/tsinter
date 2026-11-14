@@ -378,6 +378,8 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
       return "SecureContext";
     case "fsWatcher":
       return "FSWatcher";
+    case "fileHandle":
+      return "FileHandle";
     case "childStream":
       return "Readable";
     case "procStream":
@@ -637,6 +639,8 @@ const NODE_OPTION_RECORDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   // events.Abortable: the `signal` member's base (ExecFileOptions,
   // MessagingOptions and ForkOptions extend it).
   ["events", new Set(["Abortable"])],
+  // fs/promises FileHandle.read's settled value (lower-filehandle.ts).
+  ["fs/promises", new Set(["FileReadResult"])],
 ]);
 
 /** True when `d` is an interface declaration (or a member of one) listed
@@ -656,7 +660,7 @@ function isNodeOptionRecordType(t: ts.Type, ctx: TypeMapperCtx): boolean {
   const sym = t.getSymbol();
   if (sym === undefined) return false;
   const decls = ctx.checker.declarationsOf(sym);
-  return decls.length > 0 && decls.every((d) => isNodeOptionRecordDecl(d, ctx) || isChildResultLiteral(d, ctx));
+  return decls.length > 0 && decls.every((d) => isNodeOptionRecordDecl(d, ctx) || isChildResultLiteral(d, ctx) || isFhWriteResultLiteral(d, ctx));
 }
 
 /** The promisified exec family's settled value as @types/node spells it:
@@ -669,6 +673,19 @@ function isChildResultLiteral(d: ts.Node, ctx: TypeMapperCtx): boolean {
     members.length === 2 &&
     members.every((m) => ts.isPropertySignature(m) && ts.isIdentifier(m.name) && (m.name.text === "stdout" || m.name.text === "stderr")) &&
     isDeclaredInAmbientModule(d as ts.Declaration, "child_process")
+  );
+}
+
+/** FileHandle.write's settled value as @types/node spells it: the type
+ * literal `{ bytesWritten: number; buffer: ... }` inside fs/promises — a
+ * data record the lowering builds (lower-filehandle.ts). */
+function isFhWriteResultLiteral(d: ts.Node, ctx: TypeMapperCtx): boolean {
+  if (d.kind !== ts.SyntaxKind.TypeLiteral || !ctx.isStdlibFile(d.getSourceFile())) return false;
+  const members = (d as ts.TypeLiteralNode).members;
+  return (
+    members.length === 2 &&
+    members.every((m) => ts.isPropertySignature(m) && ts.isIdentifier(m.name) && (m.name.text === "bytesWritten" || m.name.text === "buffer")) &&
+    isDeclaredInAmbientModule(d as ts.Declaration, "fs/promises")
   );
 }
 
@@ -1226,7 +1243,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       elem.kind === "httpRes" ||
       elem.kind === "httpClientReq" ||
       elem.kind === "secureCtx" ||
-      elem.kind === "fsWatcher" ||
+      elem.kind === "fsWatcher" || elem.kind === "fileHandle" ||
       elem.kind === "childStream" ||
       elem.kind === "procStream" ||
       elem.kind === "generator"
@@ -1969,6 +1986,18 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     )
   ) {
     return { kind: "fsWatcher" };
+  }
+  // fs/promises FileHandle: @types/node's interface (module "fs/promises")
+  // or the fallback declarations'. Provenance-checked like Stats.
+  if (
+    psym?.name === "FileHandle" &&
+    checker.declarationsOf(psym).some(
+      (d) =>
+        (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) &&
+        ctx.isStdlibFile(d.getSourceFile()),
+    )
+  ) {
+    return { kind: "fileHandle" };
   }
   // The piped child-output stream, under BOTH spellings @types/node uses
   // for it: stream.Readable (ChildProcess.stdout's declared type — the

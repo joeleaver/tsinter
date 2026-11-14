@@ -115,6 +115,9 @@ export interface FsDeps {
    * does, via `emitPendingCheck()` immediately after the wrapper call
    * returns. */
   throwCoded: (c: Code, className: string, name: string, pushMessage: (c: Code) => void, pushCode: (c: Code) => void) => void;
+  /** A plain Error with literal `code` and `syscall` own properties into
+   * the pending cell (the FileHandle's closed-handle Error). */
+  throwSysErr: (c: Code, message: string, code: string, syscall: string) => void;
   /** INC-26 P5 (readFileSyncBytes/writeFileSyncBytes) — the SAME bytes-
    * array surface StreamBuilder's own deps already inject
    * (typedarrays.ts's BytesBuilder via emitter.ts's `this.bytesB`), never
@@ -1972,6 +1975,392 @@ export class FsBuilder {
     ]);
     this.statsTypeCache = idx;
     return idx;
+  }
+
+  /* ── fs/promises FileHandle (abi.ts ops 21/25-30) ─────────────────────
+   * The handle is a struct holding the descriptor, -1 once closed. Every
+   * helper leaves a failure in the pending cell (the caller's
+   * emitFspSettled turns it into the rejection) and answers a dummy. */
+  private fhTypeCache: number | undefined;
+  fhType(): number {
+    if (this.fhTypeCache === undefined) this.fhTypeCache = this.mb.structType([{ storage: I32, mutable: true }]);
+    return this.fhTypeCache;
+  }
+  fhRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.fhType() };
+  }
+
+  /** `%w.fs.fhOpen(path, flags, mode) -> handle`: op 21 (flags = the
+   * string-flag code of emitter.ts's FLAGS_ENUM) or op 25 (raw numeric
+   * flags, the host's own O_* values from fs.constants). */
+  fhOpenHelper(numeric: boolean): number {
+    const op = numeric ? 25 : 21;
+    return this.cached(`fhOpen:${op}`, [this.strRef(), I32, I32], [this.fhRef()], (idx) => {
+      const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.fhType()));
+      const PATH = 0, FLAGS = 1, MODE = 2, A_LEN = 3, A_BASE = 4, STATUS = 5, MATCHED = 6, N = 7;
+      c.localGet(PATH);
+      c.arrayLen();
+      c.localSet(A_LEN);
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(A_LEN);
+        c.i32Const(2);
+        c.i32Mul();
+        this.emitRoundUp2(c);
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(PATH);
+      c.localGet(A_BASE);
+      c.call(this.stageStrUtf16AtHelper());
+      c.drop();
+      c.i32Const(op);
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.localGet(FLAGS);
+      c.localGet(MODE);
+      c.call(this.deps.fsCallFunc(op));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifResult(this.fhRef());
+      this.emitThrowFromStatus(c, STATUS, PATH, MATCHED, N, "open", "one", {});
+      c.refNull(this.fhType());
+      c.else_();
+      c.localGet(STATUS);
+      c.structNew(this.fhType());
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fhLive:<syscall>(handle) -> fd`: the open descriptor, or -1
+   * with Node's closed-handle Error in the pending cell (fsCall's own
+   * check in lib/internal/fs/promises.js: message 'file closed', code
+   * EBADF). */
+  fhLiveHelper(syscall: string): number {
+    return this.cached(`fhLive:${syscall}`, [this.fhRef()], [I32], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.fhType(), 0);
+      c.i32Const(-1);
+      c.i32Eq();
+      c.ifVoid();
+      this.deps.throwSysErr(c, "file closed", "EBADF", syscall);
+      c.i32Const(-1);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(this.fhType(), 0);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fhClose(handle) -> void`: a closed handle resolves (Node's own
+   * close); otherwise the descriptor is marked closed, then closed (op 18). */
+  fhCloseHelper(): number {
+    return this.cached("fhClose", [this.fhRef()], [], (idx) => {
+      const c = new Code();
+      const FD = 1;
+      c.localGet(0);
+      c.structGet(this.fhType(), 0);
+      c.localSet(FD);
+      c.localGet(FD);
+      c.i32Const(-1);
+      c.i32Eq();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.i32Const(-1);
+      c.structSet(this.fhType(), 0);
+      c.localGet(FD);
+      c.call(this.closeSyncHelper());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fdOp:<op>:<syscall>(fd, y, a) -> void`: op 28 fsync (y = 1
+   * fdatasync), 29 ftruncate (a = the length), 30 fchmod (y = the mode);
+   * `a` rides slot A as a little-endian f64. */
+  fdOpHelper(op: 28 | 29 | 30, syscall: string): number {
+    return this.cached(`fdOp:${op}:${syscall}`, [I32, I32, { kind: "f64" }], [], (idx) => {
+      const c = new Code();
+      const FD = 0, Y = 1, A = 2, A_BASE = 3, STATUS = 4, MATCHED = 5, N = 6;
+      this.deps.ensureCapacity(c, () => c.i32Const(8));
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(A_BASE);
+      c.localGet(A);
+      c.f64Store();
+      c.i32Const(op);
+      c.localGet(A_BASE);
+      c.i32Const(4); // 8 bytes, in the slot's UTF-16 units
+      c.i32Const(0);
+      c.i32Const(0);
+      c.localGet(FD);
+      c.localGet(Y);
+      c.call(this.deps.fsCallFunc(op));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, FD, MATCHED, N, syscall, "no", {});
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fdReadAt(fd, buffer, offset, length, position) -> f64`: op 26
+   * reads up to `length` bytes at `position` (-1: the current position)
+   * into slot B, copied into `buffer` at `offset`; answers the count. */
+  fdReadAtHelper(): number {
+    return this.cached("fdReadAt", [I32, this.deps.bytesRef(), I32, I32, { kind: "f64" }], [{ kind: "f64" }], (idx) => {
+      const c = new Code();
+      const FD = 0, BUF = 1, OFF = 2, LEN = 3, POS = 4, A_BASE = 5, STATUS = 6, MATCHED = 7, N = 8, I = 9;
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(LEN);
+        c.i32Const(8);
+        c.i32Add();
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(A_BASE);
+      c.localGet(POS);
+      c.f64Store();
+      c.i32Const(26);
+      c.localGet(A_BASE);
+      c.i32Const(4);
+      c.localGet(A_BASE);
+      c.i32Const(8);
+      c.i32Add();
+      c.localGet(LEN);
+      c.localGet(FD);
+      c.i32Const(0);
+      c.call(this.deps.fsCallFunc(26));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, FD, MATCHED, N, "read", "no", {});
+      c.f64Const(0);
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(STATUS);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(BUF);
+      c.localGet(OFF);
+      c.localGet(I);
+      c.i32Add();
+      c.f64ConvertI32S();
+      c.localGet(A_BASE);
+      c.i32Const(8);
+      c.i32Add();
+      c.localGet(I);
+      c.i32Add();
+      c.i32Load8U();
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesSetElem());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(STATUS);
+      c.f64ConvertI32S();
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fdReadAll(fd) -> bytes`: from the current position to EOF,
+   * reading (op 26) until a read answers 0, as Node's readFileHandle does
+   * — a file whose fstat size is 0 (/proc, a pipe) reads in full. */
+  fdReadAllHelper(): number {
+    return this.cached("fdReadAll", [I32], [this.deps.bytesRef()], (idx) => {
+      const c = new Code();
+      const FD = 0, BUF = 1, TOTAL = 2, CAP = 3, A_BASE = 4, STATUS = 5, MATCHED = 6, N = 7, I = 8, NB = 9;
+      const bytesRef = this.deps.bytesRef();
+      c.i32Const(16384);
+      c.localSet(CAP);
+      c.localGet(CAP);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesNewLen());
+      c.localSet(BUF);
+      const copy = (src: number, srcOff: () => void, dst: number, dstOff: () => void, n: number, fromMem: boolean): void => {
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(n);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(dst);
+        dstOff();
+        c.localGet(I);
+        c.i32Add();
+        c.f64ConvertI32S();
+        if (fromMem) {
+          srcOff();
+          c.localGet(I);
+          c.i32Add();
+          c.i32Load8U();
+          c.f64ConvertI32S();
+        } else {
+          c.localGet(src);
+          srcOff();
+          c.localGet(I);
+          c.i32Add();
+          c.f64ConvertI32S();
+          c.call(this.deps.bytesGetElem());
+        }
+        c.call(this.deps.bytesSetElem());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      };
+      c.block();
+      c.loop();
+      // grow when full: double into a fresh array
+      c.localGet(TOTAL);
+      c.localGet(CAP);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(CAP);
+      c.i32Const(2);
+      c.i32Mul();
+      c.localSet(CAP);
+      c.localGet(CAP);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesNewLen());
+      c.localSet(NB);
+      copy(BUF, () => c.i32Const(0), NB, () => c.i32Const(0), TOTAL, false);
+      c.localGet(NB);
+      c.localSet(BUF);
+      c.end();
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(CAP);
+        c.localGet(TOTAL);
+        c.i32Sub();
+        c.i32Const(8);
+        c.i32Add();
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(A_BASE);
+      c.f64Const(-1);
+      c.f64Store();
+      c.i32Const(26);
+      c.localGet(A_BASE);
+      c.i32Const(4);
+      c.localGet(A_BASE);
+      c.i32Const(8);
+      c.i32Add();
+      c.localGet(CAP);
+      c.localGet(TOTAL);
+      c.i32Sub();
+      c.localGet(FD);
+      c.i32Const(0);
+      c.call(this.deps.fsCallFunc(26));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, FD, MATCHED, N, "read", "no", {});
+      c.refNull(this.deps.bytesType());
+      c.return_();
+      c.end();
+      c.localGet(STATUS);
+      c.i32Eqz();
+      c.brIf(1);
+      copy(-1, () => {
+        c.localGet(A_BASE);
+        c.i32Const(8);
+        c.i32Add();
+      }, BUF, () => c.localGet(TOTAL), STATUS, true);
+      c.localGet(TOTAL);
+      c.localGet(STATUS);
+      c.i32Add();
+      c.localSet(TOTAL);
+      c.br(0);
+      c.end();
+      c.end();
+      // the exact-length result
+      c.localGet(TOTAL);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesNewLen());
+      c.localSet(NB);
+      copy(BUF, () => c.i32Const(0), NB, () => c.i32Const(0), TOTAL, false);
+      c.localGet(NB);
+      this.mb.setBody(idx, [bytesRef, I32, I32, I32, I32, I32, I32, I32, bytesRef], c.bytes());
+    });
+  }
+
+  /** `%w.fs.fdWriteAt(fd, data, position, all) -> f64`: op 27 writes
+   * `data` at `position` (-1: the current position) — one write(2), or
+   * every byte when `all` (writeFile); answers the count written. */
+  fdWriteAtHelper(): number {
+    return this.cached("fdWriteAt", [I32, this.deps.bytesRef(), { kind: "f64" }, I32], [{ kind: "f64" }], (idx) => {
+      const c = new Code();
+      const FD = 0, DATA = 1, POS = 2, ALL = 3, LEN = 4, A_BASE = 5, B_BASE = 6, STATUS = 7, MATCHED = 8, N = 9, I = 10;
+      c.localGet(DATA);
+      c.call(this.deps.bytesLength());
+      c.i32TruncF64U();
+      c.localSet(LEN);
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(LEN);
+        c.i32Const(8);
+        c.i32Add();
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(A_BASE);
+      c.localGet(POS);
+      c.f64Store();
+      c.localGet(A_BASE);
+      c.i32Const(8);
+      c.i32Add();
+      c.localSet(B_BASE);
+      this.emitWriteBytesAt(c, DATA, B_BASE, LEN, I);
+      c.i32Const(27);
+      c.localGet(A_BASE);
+      c.i32Const(4);
+      c.localGet(B_BASE);
+      c.localGet(LEN);
+      c.localGet(FD);
+      c.localGet(ALL);
+      c.call(this.deps.fsCallFunc(27));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifResult({ kind: "f64" });
+      this.emitThrowFromStatus(c, STATUS, FD, MATCHED, N, "write", "no", {});
+      c.f64Const(0);
+      c.else_();
+      c.localGet(STATUS);
+      c.f64ConvertI32S();
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32, I32], c.bytes());
+    });
   }
 
   /** The full stat record's i64 array (op 24): STAT_RAW's fourteen slots. */

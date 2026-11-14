@@ -71,6 +71,7 @@ export function cType(t: IrType): string {
       return "ScrHttpClientReq *";
     case "secureCtx":
       return "ScrSecureCtx *";
+    case "fileHandle":
     case "fsWatcher":
       return "ScrWatcher *";
     case "childStream":
@@ -175,6 +176,7 @@ export function retainCallC(type: IrType, expr: string): string {
       return `scr_http_client_retain(${expr})`;
     case "secureCtx":
       return `scr_secure_ctx_retain(${expr})`;
+    case "fileHandle":
     case "fsWatcher":
       return `scr_watcher_retain(${expr})`;
     case "childStream":
@@ -254,6 +256,7 @@ export function releaseCallC(type: IrType, expr: string): string {
       return `scr_http_client_release(${expr})`;
     case "secureCtx":
       return `scr_secure_ctx_release(${expr})`;
+    case "fileHandle":
     case "fsWatcher":
       return `scr_watcher_release(${expr})`;
     case "childStream":
@@ -322,6 +325,7 @@ export function boxKindC(t: IrType): string {
     case "httpRes":
     case "httpClientReq":
     case "secureCtx":
+    case "fileHandle":
     case "fsWatcher":
     case "childStream":
     case "bytes":
@@ -412,6 +416,7 @@ export function vAdapters(t: IrType): { retain: string; release: string } {
       return { retain: "scr_http_client_retain_v", release: "scr_http_client_release_v" };
     case "secureCtx":
       return { retain: "scr_secure_ctx_retain_v", release: "scr_secure_ctx_release_v" };
+    case "fileHandle":
     case "fsWatcher":
       return { retain: "scr_watcher_retain_v", release: "scr_watcher_release_v" };
     case "childStream":
@@ -530,6 +535,7 @@ export function elemKindC(elem: IrType): string {
     case "httpRes":
     case "httpClientReq":
     case "secureCtx":
+    case "fileHandle":
     case "fsWatcher":
     case "childStream":
     case "procStream":
