@@ -193,6 +193,8 @@ export class ObjModel {
     return this.fn("ownIdx", [this.d.objRef(), this.strRef()], [I32], [I32, this.linkedRef()], (c) => {
       const I = 2;
       const LO = 3;
+      // the store's reserved-key check (dyn.ts storeKeyGuard)
+      this.d.storeKeyGuard(c, (x) => x.localGet(1));
       this.forI(c, I, (x) => { x.localGet(0); x.structGet(objT, OBJ_LEN); }, () => {
         c.localGet(0);
         c.structGet(objT, OBJ_ENTRIES);
@@ -342,6 +344,10 @@ export class ObjModel {
     return this.fn("hiddenPush", [this.linkedRef(), this.d.entryRef()], [], [I32, this.entriesRef()], (c) => {
       const N = 2;
       const NB = 3;
+      this.d.storeKeyGuard(c, (x) => {
+        x.localGet(1);
+        x.structGet(this.d.entryT(), ENTRY_KEY);
+      });
       c.localGet(0);
       c.structGet(L, this.d.olProto() + 2);
       c.localSet(N);
@@ -1731,8 +1737,18 @@ export class ObjModel {
         const FP = 7;
         // A well-known symbol's property is modeled only non-enumerable
         // (Node's inspect, spread and assign would show an enumerable one).
+        // Any other symbol's key (symbols.ts keyStr: U+D800 '@@#') is an
+        // ordinary property the walkers order after the string keys.
         c.localGet(1);
         c.call(this.isSymKey());
+        if (this.d.symLive) {
+          c.localGet(1);
+          emitFlatCast(c, this.k.deps.strType());
+          c.arrayLen();
+          c.i32Const(6);
+          c.i32Ne();
+          c.i32And();
+        }
         c.localGet(5);
         c.i32Const(A_E);
         c.i32And();
@@ -2127,20 +2143,53 @@ export class ObjModel {
   isSymKey(): number {
     const strT = this.k.deps.strType();
     return this.fn("isSymKey", [this.strRef()], [I32], [{ kind: "ref", nullable: true, typeIndex: strT }], (c) => {
+      // the whole reserved prefix (U+D800 '@' '@'): an ordinary key that
+      // merely starts with a lone surrogate is a string key
       c.localGet(0);
-      emitFlatCast(c, strT);
-      c.localTee(1);
-      c.arrayLen();
+      c.call(this.d.reservedKey());
+    });
+  }
+
+  /** %w.om.hiddenHasSymKey(d) → i32 — does d hold a NON-enumerable
+   * symbol-keyed property (a reserved key in its hidden table)? */
+  hiddenHasSymKey(): number {
+    const dynT = this.d.dynT();
+    const L = this.d.objLinkedT();
+    const entries = this.d.entriesArrayType();
+    return this.fn("hiddenHasSymKey", [this.d.dynRef()], [I32], [this.linkedRef(), I32], (c) => {
+      const LO = 1;
+      const I = 2;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.d.objPayload(c, (x) => x.localGet(0));
+      c.refTest(L);
       c.i32Eqz();
       c.ifVoid();
       c.i32Const(0);
       c.return_();
       c.end();
-      c.localGet(1);
+      this.d.objPayload(c, (x) => x.localGet(0));
+      c.refCast(L);
+      c.localSet(LO);
+      this.forI(c, I, (x) => { x.localGet(LO); x.structGet(L, this.d.olProto() + 2); }, () => {
+        c.localGet(LO);
+        c.structGet(L, this.d.olProto() + 1);
+        c.localGet(I);
+        c.arrayGet(entries);
+        c.structGet(this.d.entryT(), ENTRY_KEY);
+        c.call(this.d.reservedKey());
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+      });
       c.i32Const(0);
-      c.arrayGetU(strT);
-      c.i32Const(0xd800);
-      c.i32Eq();
     });
   }
 

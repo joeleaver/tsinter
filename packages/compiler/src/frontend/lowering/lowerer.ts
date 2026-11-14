@@ -1885,6 +1885,22 @@ export class Lowerer {
     collectDynArmSyms(this);
     this.es5 = collectEs5(this, this.moduleOrder.length > 0 ? this.moduleOrder : [entry]);
     if (this.es5 !== null) (this.typeCtx as { es5EmptyDyn?: boolean }).es5EmptyDyn = true;
+    // Symbol keys (lower-objmodel.ts): a program string LITERAL spelled with
+    // the reserved U+D800 '@@' prefix refuses by name, wherever it appears
+    // in the whole program — a key, a value later used as one, a JSON text.
+    // (A string the program BUILDS at run time is the object store's check,
+    // dyn.ts storeKeyGuard.)
+    if (this.sharedDynamic && !this.engine) {
+      for (const sf of this.moduleOrder.length > 0 ? this.moduleOrder : [entry]) {
+        if (sf.isDeclarationFile || !sf.text.includes("\uD800") && !/\\u\{?0*[dD]800/.test(sf.text)) continue;
+        ts.walkPreorder(sf, (n) => {
+          if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && n.text.startsWith("\uD800@@")) {
+            this.pushDiag(unsupportedDiag("SC1090", locOf(n), "a string literal beginning with U+D800 '@@' (the form this build reserves for symbol property keys)"));
+          }
+          return undefined;
+        });
+      }
+    }
   }
 
   /** Units U3 + U4 (lower-objmodel.ts): what the program's JavaScript
@@ -3558,7 +3574,33 @@ export class Lowerer {
     return stdlibMemberFence(this, access);
   }
 
+  private readonly ownSymbolsFiles = new Map<ts.SourceFile, boolean>();
+  private fileMentionsOwnSymbols(sf: ts.SourceFile): boolean {
+    let hit = this.ownSymbolsFiles.get(sf);
+    if (hit === undefined) {
+      hit = sf.text.includes("getOwnPropertySymbols");
+      this.ownSymbolsFiles.set(sf, hit);
+    }
+    return hit;
+  }
+
   typeOf(node: ts.Node): ts.Type {
+    // Symbol keys (lower-objmodel.ts): `Object.getOwnPropertySymbols(o)`
+    // answers a dynamic array of symbols (dyn.ownSymbols) — its reads take
+    // the dynamic paths, whatever `symbol[]` the checker spelled.
+    if (this.sharedDynamic && !this.engine) {
+      const ownSymbolsCall = (n: ts.Node | undefined): boolean =>
+        n !== undefined && ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
+        n.expression.name.text === "getOwnPropertySymbols" && ts.isIdentifier(n.expression.expression) &&
+        this.isStdlibGlobal(n.expression.expression, "Object");
+      if (ownSymbolsCall(node)) return this.checker.getAnyType();
+      // ... and a binding it initializes (`const syms = Object.getOwnPropertySymbols(o)`)
+      if (ts.isIdentifier(node) && node.text !== "Object" && this.fileMentionsOwnSymbols(node.getSourceFile())) {
+        const s = this.checker.getSymbolAtLocation(node);
+        const d = s !== undefined ? this.checker.valueDeclarationOf(s) : undefined;
+        if (d !== undefined && ts.isVariableDeclaration(d) && ownSymbolsCall(d.initializer)) return this.checker.getAnyType();
+      }
+    }
     if (this.es5 !== null) {
       const t = es5TypeOf(this, this.es5, node);
       if (t !== null) return t;
@@ -4390,6 +4432,8 @@ export class Lowerer {
     // (A payload the box cannot convert at all — a class instance — keeps
     // the boundary's named refusal: the validator admits only these.)
     if (t.kind === "promise") return t.inner.kind === "jsval" || t.inner.kind === "dyn" || this.dynConvertible(t);
+    // A symbol boxes by reference (DK.SYMBOL) on the engine-free lanes.
+    if (t.kind === "symbol") return !this.engine;
     if (!this.dynConvertible(t)) return false;
     // Under --dynamic a function the island marshals takes that entrance
     // (main's: its composite results reach dynamic code as views, S115
@@ -4433,7 +4477,7 @@ export class Lowerer {
       return { kind: "jsMarshal", value: { kind: "dynFrom", value: this.upcastTo(expr, "%Error"), type: DYN, loc }, type: JSVAL, loc };
     }
     if (!this.oneWorldDynBox(expr.type)) return null;
-    const fnName = expr.type.kind === "func" && node !== null ? jsFuncNameOf(node) : null;
+    const fnName = expr.type.kind === "func" && node !== null ? esFuncNameOf(this, node) : null;
     return {
       kind: "jsMarshal",
       value: { kind: "dynFrom", value: expr, ...(fnName !== null ? { fnName } : {}), type: DYN, loc },
@@ -4481,6 +4525,11 @@ export class Lowerer {
     // dyn→static edge, trust-but-verify: a lying `any` throws a catchable
     // TypeError instead of corrupting memory (SEMANTICS.md). Unmarshalable
     // and unextractable types fall through to requireExactShape's fences.
+    // A symbol into a checked-dynamic slot (an `any[]` element, an `unknown`
+    // binding) on the engine-free WasmGC lanes: its DK.SYMBOL box.
+    if (expected.kind === "dyn" && expr.type.kind === "symbol" && this.sharedDynamic && !this.engine) {
+      return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc } as IrExpr;
+    }
     if (expected.kind === "jsval" && expr.type.kind !== "jsval") {
       // Bare unit literals: the engine's own undefined/null (units have no
       // other producers, so dropping the operand loses nothing).
@@ -4494,6 +4543,10 @@ export class Lowerer {
       // TypeError at runtime (trust-but-verify, like every boundary).
       if (expr.type.kind === "dyn") {
         return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
+      }
+      // A symbol (the engine-free WasmGC lanes): its DK.SYMBOL box.
+      if (expr.type.kind === "symbol" && this.sharedDynamic && !this.engine) {
+        return { kind: "jsMarshal", value: { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc } as IrExpr, type: JSVAL, loc: expr.loc };
       }
       // A class instance shares as its live view (class-views.ts); a
       // function over instances boxes through its class adapter.
@@ -7443,11 +7496,11 @@ export class Lowerer {
     // The checked-dynamic box of a function: named like every boxed
     // closure; its composite parameters and result are S125 (c)'s to judge.
     if (e !== expr && e.kind === "jsMarshal" && e.value.kind === "dynFrom" && expr.type.kind === "func") {
-      const fnName = jsFuncNameOf(node);
+      const fnName = esFuncNameOf(this, node);
       if (fnName !== null) e = { ...e, value: { ...e.value, fnName } };
     } else if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
       if (this.sharedDynamic) {
-        const fnName = jsFuncNameOf(node);
+        const fnName = esFuncNameOf(this, node);
         if (fnName !== null) e = { ...e, fnName };
       }
       this.lastHostShallow = false;
@@ -7503,7 +7556,7 @@ export class Lowerer {
     // NamedEvaluation through a variable initializer) — inspect prints
     // [Function: name] and call errors spell it, like Node.
     if (e.kind === "dynFrom" && e.value.type.kind === "func" && e.fnName === undefined) {
-      const name = jsFuncNameOf(node);
+      const name = esFuncNameOf(this, node);
       if (name !== null) e = { ...e, fnName: name };
     }
     // GH #138: a value this crossing's own expression PROVES is a Buffer

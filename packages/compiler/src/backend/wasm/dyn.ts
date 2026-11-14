@@ -169,6 +169,10 @@ export const DK = {
   /** A BigInt (bigint.ts's `$big` in `ref`). WasmGC lanes only, past the
    * C runtime's table (which has no bigint): appended, never inserted. */
   BIGINT: 12,
+  /** A symbol (symbols.ts's `$sym` in `ref`). WasmGC lanes only: appended,
+   * never inserted. Its property-key form is a reserved string key
+   * (symbols.ts keyStr). */
+  SYMBOL: 13,
 } as const;
 
 /** GH #134: the named run-time refusal the TOTAL ToString helper (toStr)
@@ -435,6 +439,11 @@ export interface DynDeps {
    * `keys(err) -> dyn`. `pushArgs` leaves the arguments. Absent: the
    * program has no such class. */
   errView?: (c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void) => void;
+  /** Symbols as dynamic values and property keys (symbols.ts): the `$sym`
+   * struct type, its toString (`Symbol(desc)`), its description field,
+   * keyStr / fromKey (the reserved property key and back). Absent: the
+   * module holds no symbol. */
+  sym?: { symType: () => number; toStr: () => number; descField: () => number; keyStr: () => number; fromKey: () => number; isGenuineKey: () => number };
   /** Unit U (SEMANTICS.md S119 (b)): the module's "a hole was made" i32
    * global, when the module was lowered with undefSlots — an array that
    * crossed in from typed storage holds the element's `undefined` where
@@ -2410,6 +2419,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "Object.create over");
+      this.symFence(c, K, "Object.create over");
       this.arm(c, K, [DK.NULL], () => this.boxObj(c, (x) => this.pushNewObj(x, true)));
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
@@ -2757,6 +2767,8 @@ export class DynBuilder {
       const N = 4;
       const E = 5;
       const NB = 6;
+      // the store's reserved-key check (storeKeyGuard)
+      this.storeKeyGuard(c, (x) => x.localGet(1));
       c.localGet(0);
       c.structGet(objT, OBJ_LEN);
       c.localSet(N);
@@ -4613,7 +4625,7 @@ export class DynBuilder {
         c.return_();
         c.end();
         c.localGet(1);
-        c.i32Const(2);
+        c.i32Const(this.symLive ? 10 : 2); // entries, symbol keys too (CopyDataProperties)
         c.call(this.objWalkUser());
         c.localTee(P);
         c.refIsNull();
@@ -5164,6 +5176,7 @@ export class DynBuilder {
       c.return_();
       c.end();
       this.bigArm(c, K, () => { this.bigPayload(c, 0); this.bigPayload(c, 1); c.call(this.deps.big!.eq()); });
+      this.symArm(c, K, () => { this.symPayload(c, 0); this.symPayload(c, 1); c.refEq(); });
       // Unit I: two dynamic typed arrays are the same value when they
       // alias the same bytes (each crossing boxes afresh, S014's bytes rule).
       this.typedArm(c, 0, K, () => {
@@ -5573,6 +5586,12 @@ export class DynBuilder {
         this.bigPayload(c, A);
         this.bigPayload(c, B);
         c.call(this.deps.big!.eq());
+      });
+      // SYMBOL -> by identity
+      this.symArm(c, KA, () => {
+        this.symPayload(c, A);
+        this.symPayload(c, B);
+        c.refEq();
       });
 
       // BOOL -> the shared num slot, exact (0/1)
@@ -6008,6 +6027,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.truthy()); });
+      this.symArm(c, K, () => c.i32Const(1));
       this.typedArm(c, 0, K, () => c.i32Const(1)); // Unit I
       this.arm(c, K, [DK.BOOL], () => {
         c.localGet(0);
@@ -6058,6 +6078,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => this.deps.lit(c, "bigint"));
+      this.symArm(c, K, () => this.deps.lit(c, "symbol"));
       this.typedArm(c, 0, K, () => this.deps.lit(c, "object")); // Unit I
       // C tests the island kind BEFORE the switch and early-returns into
       // the engine's own typeof (scr_json.c:1122) — so JSVAL has no answer
@@ -6108,6 +6129,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); });
+      this.symFence(c, K, "converting to a string");
       this.typedArm(c, 0, K, () => {
         // Unit I: Array.prototype.join over the elements is not built; the
         // conversion sites are not catchable, so this refuses uncaught.
@@ -7692,6 +7714,35 @@ export class DynBuilder {
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
         this.bigFence(c, K, "reading a member of");
+        // A symbol's own surface: `description`; Symbol.prototype's other
+        // members stop by name; any other key reads undefined (Node).
+        this.symArm(c, K, () => {
+          c.localGet(1);
+          this.deps.lit(c, "description");
+          c.call(this.deps.strEq());
+          c.ifVoid();
+          this.symPayload(c, 0);
+          c.structGet(this.deps.sym!.symType(), this.deps.sym!.descField());
+          c.localTee(MSG);
+          c.refIsNull();
+          c.ifResult(this.dynRef());
+          c.globalGet(this.undefinedGlobal());
+          c.else_();
+          this.boxStr(c, (x) => x.localGet(MSG));
+          c.end();
+          c.return_();
+          c.end();
+          for (const m of ["toString", "valueOf", "constructor"]) {
+            c.localGet(1);
+            this.deps.lit(c, m);
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            this.deps.fence(c, (x) => this.deps.lit(x, `reading '${m}' of a Symbol held in a dynamic value as a value is not supported yet`));
+            c.unreachable();
+            c.end();
+          }
+          c.globalGet(this.undefinedGlobal());
+        });
         // Unit I: a dynamic typed array's own surface (dyn.ts typedKey).
         this.typedArm(c, 0, K, () => {
           c.localGet(0);
@@ -8275,6 +8326,64 @@ export class DynBuilder {
     if (this.deps.big !== undefined) this.arm(c, kindLocal, [DK.BIGINT], arm);
   }
 
+  /** The SYMBOL arm, in a module that holds a symbol. */
+  private symArm(c: Code, kindLocal: number, arm: () => void): void {
+    if (this.deps.sym !== undefined) this.arm(c, kindLocal, [DK.SYMBOL], arm);
+  }
+
+  /** Param/local `p`'s SYMBOL payload, as the `$sym` struct. */
+  symPayload(c: Code, p: number): void {
+    c.localGet(p);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.deps.sym!.symType());
+  }
+
+  /** An operation with no Symbol arm: loud, by name. */
+  private symFence(c: Code, kindLocal: number, what: string): void {
+    this.symArm(c, kindLocal, () => {
+      this.deps.fence(c, (x) => this.deps.lit(x, `${what} a Symbol held in a dynamic value is not supported yet`));
+      c.unreachable();
+    });
+  }
+
+  /** Box a symbol the caller pushes (`$sym`). */
+  boxSym(c: Code, pushValue: (c: Code) => void): void {
+    c.i32Const(DK.SYMBOL);
+    c.f64Const(0);
+    pushValue(c);
+    c.structNew(this.dynT());
+  }
+
+  /** The symbol's `Symbol(desc)` text (symbols.ts toStringHelper). */
+  symToStr(): number {
+    return this.deps.sym!.toStr();
+  }
+
+  /** %w.dyn.symKeyText(key) → `Symbol(desc)` (inspect's key text) of the symbol a reserved key
+   * names; a well-known symbol's key (no value to name) stops by name. */
+  symKeyText(): number {
+    return this.cached("symKeyText", [this.deps.strRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const S = 1;
+      c.localGet(0);
+      c.call(this.deps.sym!.fromKey());
+      c.localTee(S);
+      c.refIsNull();
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "rendering a well-known symbol key (Symbol.hasInstance, Symbol.iterator, ...) of a dynamic value is not supported yet"));
+      c.end();
+      // Node 24 prints the key as `Symbol(desc)` (no brackets)
+      c.localGet(S);
+      c.call(this.deps.sym!.toStr());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.sym!.symType() }], c.bytes());
+    });
+  }
+
+  /** Does this module hold symbols as dynamic values / keys? */
+  get symLive(): boolean {
+    return this.deps.sym !== undefined;
+  }
+
   /** Param `p`'s BIGINT payload, as the `$big` struct. */
   private bigPayload(c: Code, p: number): void {
     c.localGet(p);
@@ -8378,6 +8487,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "assigning a member of");
+      this.symFence(c, K, "assigning a member of");
       this.typedArm(c, 0, K, () => this.typedFence(c, "assigning a member of", () => {})); // Unit I
       this.urlWriteFence(c, 0, K, () => {}); // Unit I
       const SETM = 8;
@@ -8816,6 +8926,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "'in' or Object.hasOwn on");
+      this.symFence(c, K, "'in' or Object.hasOwn on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' or Object.hasOwn on", (x) => x.i32Const(0))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
@@ -9050,6 +9161,7 @@ export class DynBuilder {
       c.structGet(this.dynT(), DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "assigning a member of");
+      this.symFence(c, K, "assigning a member of");
       this.arm(c, K, [DK.STR, DK.NUM, DK.BOOL], () => {});
       if (this.objModelLive) {
         // Units U3 + U4: the write's rejections are silent (om.set reads
@@ -9079,6 +9191,7 @@ export class DynBuilder {
       c.structGet(this.dynT(), DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => c.i32Const(0));
+      this.symArm(c, K, () => c.i32Const(0));
       this.typedArm(c, 0, K, () => c.i32Const(1));
       this.arm(c, K, [DK.BYTES], () => c.i32Const(1));
       c.localGet(K);
@@ -9125,6 +9238,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "'in' on");
+      this.symFence(c, K, "'in' on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' on", (x) => x.i32Const(0)));
       this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR], () => {
         this.deps.throwTypeError(c, (x) => {
@@ -9360,6 +9474,7 @@ export class DynBuilder {
     OUT: number,
     PAIR: number,
     resolve?: { recv: number; tmp: number },
+    syms?: number,
   ): void {
     const objT = this.objT();
     const entries = this.entriesArrayType();
@@ -9471,7 +9586,9 @@ export class DynBuilder {
     c.br(0);
     c.end();
     c.end();
-    // Pass 2: everything else, in insertion order.
+    // Pass 2: everything else, in insertion order (a symbol's reserved key
+    // is no string key: pass 3, when asked).
+    const pass = (symbols: boolean): void => {
     c.i32Const(0);
     c.localSet(I);
     c.block();
@@ -9486,9 +9603,20 @@ export class DynBuilder {
     c.arrayGet(entries);
     c.localTee(E);
     c.structGet(entryT, ENTRY_KEY);
-    c.call(this.idxKey());
-    c.f64Const(0);
-    c.f64Lt();
+    if (symbols) {
+      c.call(this.reservedKey());
+    } else {
+      c.call(this.idxKey());
+      c.f64Const(0);
+      c.f64Lt();
+      if (this.symLive) {
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        c.call(this.reservedKey());
+        c.i32Eqz();
+        c.i32And();
+      }
+    }
     c.ifVoid();
     this.walkPush(
       c,
@@ -9509,6 +9637,225 @@ export class DynBuilder {
     c.br(0);
     c.end();
     c.end();
+    };
+    pass(false);
+    if (syms !== undefined && this.symLive) {
+      // Pass 3 (spread, Object.assign, inspect): the symbol-keyed entries,
+      // after every string key (OrdinaryOwnPropertyKeys' order).
+      c.localGet(syms);
+      c.ifVoid();
+      pass(true);
+      c.end();
+    }
+  }
+
+  /** %w.dyn.reservedKey(key) → i32: is `key` a symbol's reserved property
+   * key (SYM_KEY_PREFIX: U+D800 '@' '@')? */
+  reservedKey(): number {
+    return this.cached("reservedKey", [this.deps.strRef()], [I32], (idx) => {
+      const s = this.deps.strType();
+      const c = new Code();
+      const F = 1;
+      c.localGet(0);
+      emitFlatCast(c, s);
+      c.localTee(F);
+      c.arrayLen();
+      c.i32Const(3);
+      c.i32LtU();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(F);
+      c.i32Const(0);
+      c.arrayGetU(s);
+      c.i32Const(0xd800);
+      c.i32Eq();
+      c.localGet(F);
+      c.i32Const(1);
+      c.arrayGetU(s);
+      c.i32Const(0x40);
+      c.i32Eq();
+      c.i32And();
+      c.localGet(F);
+      c.i32Const(2);
+      c.arrayGetU(s);
+      c.i32Const(0x40);
+      c.i32Eq();
+      c.i32And();
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: s }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.ownSymbols(d) → an array of the symbols keying d's own
+   * enumerable properties, in insertion order (Object.getOwnPropertySymbols
+   * over a dynamic value). A well-known symbol's key (no symbol value to
+   * hand back here) stops by name. */
+  ownSymbols(): number {
+    return this.cached("ownSymbols", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      // Node lists non-enumerable symbol keys too, which the enumerable
+      // walk below does not see: an object holding one stops by name.
+      if (this.objModelLive) {
+        c.localGet(0);
+        c.call(this.om.hiddenHasSymKey());
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, "Object.getOwnPropertySymbols over an object with a non-enumerable symbol-keyed property is not supported yet"));
+        c.end();
+      }
+      const KS = 1;
+      const A = 2;
+      const N = 3;
+      const I = 4;
+      const K = 5;
+      const S = 6;
+      const OUT = 7;
+      this.pushNewArr(c);
+      c.localSet(OUT);
+      c.localGet(0);
+      c.i32Const(8); // keys, with the symbol keys
+      c.call(this.objWalk());
+      c.localTee(KS);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      this.arrPayload(c, (x) => x.localGet(KS));
+      c.localSet(A);
+      this.arrLen(c, (x) => x.localGet(A));
+      c.localSet(N);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+      c.structGet(this.dynT(), DYN_REF);
+      emitFlatCast(c, this.deps.strType());
+      c.localTee(K);
+      c.call(this.reservedKey());
+      c.ifVoid();
+      c.localGet(K);
+      c.call(this.deps.sym!.fromKey());
+      c.localTee(S);
+      c.refIsNull();
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "Object.getOwnPropertySymbols over an object keyed by a well-known symbol (Symbol.hasInstance, Symbol.iterator, ...) held in a dynamic value is not supported yet"));
+      c.end();
+      c.localGet(OUT);
+      this.boxSym(c, (x) => x.localGet(S));
+      c.call(this.deps.arrPush());
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      this.boxArr(c, (x) => x.localGet(OUT));
+      this.mb.setBody(idx, [this.dynRef(), this.arrRef(), I32, I32, this.deps.strRef(), { kind: "ref", nullable: true, typeIndex: this.deps.sym!.symType() }, this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.keyGuard(key) → key: a program string key spelled with a
+   * symbol's reserved prefix stops by name — it would alias a symbol key
+   * (SEMANTICS.md S016's symbol-keys amendment). */
+  /** Set by the emitter where reserved keys are live (a module uses
+   * symbols, or the IR holds a reserved-prefix literal): the object store
+   * checks every key it appends or looks up (storeKeyGuard). */
+  storeGuardLive = false;
+
+  /** The object store's own check, at its key append and lookup (objPut,
+   * objAppend, the hidden table, the own-entry lookups): a key spelled
+   * with the reserved U+D800 '@@' prefix must BE a reserved key this build
+   * made — a symbol's key string itself (sym.isGenuineKey: identity, not
+   * spelling) or one of the internal named keys (interned literals) — so
+   * JSON.parse, defineProperty, getOwnPropertyDescriptor and every other
+   * route that hands the store a program string stop by name rather than
+   * alias a symbol's property. */
+  storeKeyGuard(c: Code, pushKey: (c: Code) => void): void {
+    if (!this.storeGuardLive) return;
+    pushKey(c);
+    c.call(this.storeKeyCheck());
+  }
+
+  private storeKeyCheck(): number {
+    return this.cached("storeKeyCheck", [this.deps.strRef()], [], (idx) => {
+      const s = this.deps.strType();
+      const c = new Code();
+      const F = 1;
+      c.localGet(0);
+      c.call(this.reservedKey());
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(0);
+      emitFlatCast(c, s);
+      c.localSet(F);
+      // a symbol's key: U+D800 '@' '@' '#' id-hi id-lo, the very string
+      if (this.deps.sym !== undefined) {
+        c.localGet(F);
+        c.arrayLen();
+        c.i32Const(6);
+        c.i32Eq();
+        c.ifResult(I32);
+        c.localGet(F);
+        c.i32Const(3);
+        c.arrayGetU(s);
+        c.i32Const(0x23);
+        c.i32Eq();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.ifVoid();
+        c.localGet(F);
+        c.call(this.deps.sym.isGenuineKey());
+        c.ifVoid();
+        c.return_();
+        c.end();
+        c.end();
+      }
+      // an internal named key (a well-known symbol's, the error mirror's
+      // own-name marker): the interned literal itself
+      for (const name of DynBuilder.INTERNAL_RESERVED_KEYS) {
+        c.localGet(0);
+        this.deps.lit(c, name);
+        c.refEq();
+        c.ifVoid();
+        c.return_();
+        c.end();
+      }
+      this.deps.fence(c, (x) => this.deps.lit(x, "a property key beginning with U+D800 '@@' (the form this build reserves for symbol keys) is not supported yet"));
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: s }], c.bytes());
+    });
+  }
+
+  /** The reserved keys this build makes by name (objmodel.ts
+   * SYM_KEY_PREFIX + a well-known symbol's name; nodes.ts ERR_OWN_NAME). */
+  private static readonly INTERNAL_RESERVED_KEYS = [
+    "asyncIterator", "hasInstance", "isConcatSpreadable", "iterator", "match", "matchAll", "replace",
+    "search", "species", "split", "toPrimitive", "toStringTag", "unscopables", "ownName",
+  ].map((n) => "\uD800@@" + n);
+
+  keyGuard(): number {
+    return this.cached("keyGuard", [this.deps.strRef()], [this.deps.strRef()], (idx) => {
+      // (the frontend emits the guard only in a program that names Symbol
+      // in some module — lower-objmodel.ts guardDynKey — and well-known
+      // keys such as U3's Symbol.hasInstance need no symbol value here,
+      // so the check is unconditional)
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.reservedKey());
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "a property key beginning with U+D800 '@@' (the form this build reserves for symbol keys) is not supported yet"));
+      c.end();
+      c.localGet(0);
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
 
   /** One `objWalk` step, per mode: KEYS pushes the key, VALUES the value,
@@ -9828,10 +10175,23 @@ export class DynBuilder {
       const AB = 16;
       const FP = 17;
       const CELL = 18; // unit A2, only where accessors are live
+      const SYMS = this.accessorsLive ? 19 : 18;
+      if (this.symLive) {
+        // mode bit 8: the symbol-keyed entries too, after the string keys
+        c.localGet(MODE);
+        c.i32Const(8);
+        c.i32And();
+        c.localSet(SYMS);
+        c.localGet(MODE);
+        c.i32Const(7);
+        c.i32And();
+        c.localSet(MODE);
+      }
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "walking the keys of");
+      this.symFence(c, K, "walking the keys of");
       this.typedArm(c, 0, K, () => this.typedFence(c, "walking the keys of", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
@@ -9853,7 +10213,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
         c.localSet(O);
-        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR, { recv: 0, tmp: CELL });
+        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR, { recv: 0, tmp: CELL }, this.symLive ? SYMS : undefined);
         this.boxArr(c, (x) => x.localGet(OUT));
       });
       // P4, SITE C: enumTable entries ONLY (get-shaped surfaces read both
@@ -9874,7 +10234,7 @@ export class DynBuilder {
           x.structGet(this.fnPropsT(), 1);
         });
         c.localSet(O);
-        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR);
+        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR, undefined, this.symLive ? SYMS : undefined);
         c.end();
         this.boxArr(c, (x) => x.localGet(OUT));
       });
@@ -10028,6 +10388,7 @@ export class DynBuilder {
           this.deps.bytesRefU8(),
           { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=17 */,
           ...(this.accessorsLive ? [this.dynRef() /* CELL=18 */] : []),
+          ...(this.symLive ? [I32 /* SYMS */] : []),
         ],
         c.bytes(),
       );
@@ -10455,6 +10816,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => { this.deps.lit(c, "bigint "); this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); c.call(this.deps.concat()); });
+      this.symFence(c, K, "iterating");
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "object null"));
       this.arm(c, K, [DK.BOOL], () => {
@@ -10522,6 +10884,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); });
+      this.symFence(c, K, "iterating");
       this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "[object Array]"));
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "#<Promise>"));
       this.arm(c, K, [DK.OBJ], () => {
@@ -10686,6 +11049,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "iterating");
+      this.symFence(c, K, "iterating");
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       // Buffers step by BYTE in C; unconstructible here, and the
       // not-iterable throw below would be a wrong claim about one.
@@ -10730,6 +11094,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "iterating");
+      this.symFence(c, K, "iterating");
       this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.BYTES, DK.JSVAL], () => this.unmodeledKindFence(c, [DK.BYTES, DK.JSVAL]));
       c.localGet(K);
@@ -10848,6 +11213,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigFence(c, K, "spreading");
+      this.symFence(c, K, "spreading");
       this.typedArm(c, 1, K, () => this.typedFence(c, "spreading", () => {})); // Unit I
       this.arm(c, K, [DK.ARR], () => {
         this.arrPayload(c, (x) => x.localGet(1));
@@ -11082,6 +11448,7 @@ export class DynBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.bigArm(c, K, () => this.deps.lit(c, "bigint"));
+      this.symArm(c, K, () => this.deps.lit(c, "symbol"));
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
       this.arm(c, K, [DK.BOOL], () => this.deps.lit(c, "boolean"));
       this.arm(c, K, [DK.NUM], () => this.deps.lit(c, "number"));
@@ -11165,6 +11532,14 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.symArm(c, K, () => {
+        this.deps.lit(c, "type symbol (");
+        this.symPayload(c, 0);
+        c.call(this.deps.sym!.toStr());
+        c.call(this.deps.concat());
+        this.deps.lit(c, ")");
+        c.call(this.deps.concat());
+      });
       this.bigArm(c, K, () => { this.deps.lit(c, "type bigint ("); this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); c.call(this.deps.concat()); this.deps.lit(c, "n)"); c.call(this.deps.concat()); });
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
@@ -13270,6 +13645,17 @@ export class DynBuilder {
           });
         } else {
           this.bigFence(c, K, `calling '${method}' on`);
+        }
+        if (method === "toString") {
+          // Symbol.prototype.toString: `Symbol(desc)`
+          this.symArm(c, K, () => {
+            this.boxStr(c, (x) => {
+              this.symPayload(x, 0);
+              x.call(this.deps.sym!.toStr());
+            });
+          });
+        } else {
+          this.symFence(c, K, `calling '${method}' on`);
         }
         this.typedArm(c, 0, K, () => this.typedFence(c, `calling '${method}' on`, (x) => x.refNull(dynT))); // Unit I
         this.arrLen(c, (x) => x.localGet(1));

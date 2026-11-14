@@ -949,6 +949,9 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "error.domClone": { argTypes: [null, DYN], result: VOID },
   "dyn.errInstanceof": { argTypes: [DYN, F64], result: BOOL },
   "dyn.errInstanceofClass": { argTypes: [DYN, STRING], result: BOOL },
+  "sym.keyStr": { argTypes: [SYMBOL_T], result: STRING },
+  "dyn.keyGuard": { argTypes: [STRING], result: STRING },
+  "dyn.ownSymbols": { argTypes: [DYN], result: DYN },
   "error.stackReset": { argTypes: [null], result: VOID },
   "dyn.objKeys": { argTypes: [DYN], result: DYN },
   "dyn.hasOwn": { argTypes: [DYN, STRING], result: BOOL },
@@ -3334,7 +3337,10 @@ function validateFunction(
         // The WasmGC lanes box every promise by reference: a jsval payload
         // rides the dyn payload's slot (the emitter's promise arm).
         const wasmPromise = undefSlots && vt.kind === "promise" && (vt.inner.kind === "jsval" || vt.inner.kind === "dyn");
-        if (!wasmPromise && !canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
+        // ... and box a symbol as DK.SYMBOL (symbol-keyed properties on
+        // dynamic values).
+        const wasmSymbol = undefSlots && vt.kind === "symbol";
+        if (!wasmPromise && !wasmSymbol && !canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
           err(`dynFrom of non-dyn-convertible type ${vt.kind}`, e.loc);
         }
         break;

@@ -8,7 +8,7 @@ import { wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
-import { lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
+import { guardDynKeyLoc, symbolKeyOf, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
@@ -839,7 +839,15 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // element- / field-checked by the exit.
         // Units U3 + U4: a JavaScript literal the object model reaches
         // (lower-objmodel.ts collectEs5) is a dynamic object.
-        if (L.es5 !== null && L.es5.lits.has(expr)) return true;
+        // (One with a runtime computed key — a symbol key — builds through
+        // the runtime-keyed dynamic literal below instead: the island
+        // literal has no computed-key form.)
+        if (L.es5 !== null && L.es5.lits.has(expr)) {
+          return !(ts.isObjectLiteralExpression(expr) && L.sharedDynamic && !L.engine && expr.properties.some((p) => {
+            const n = ts.isSpreadAssignment(p) ? undefined : p.name;
+            return n !== undefined && ts.isComputedPropertyName(n) && literalComputedKey(L, n) === null;
+          }));
+        }
         const islandSrc = (e: ts.Expression): boolean =>
           (L.typeOf(e).flags & ts.TypeFlags.Any) !== 0 || L.mapTypeOf(L.typeOf(e))?.kind === "jsval";
         if (L.dynamic && (ts.isObjectLiteralExpression(expr)
@@ -4749,6 +4757,11 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           const skey: IrExpr = { kind: "toString", operand: key, type: STRING, loc: key.loc };
           return L.maybeNarrow({ kind: "dynKeyGet", key: skey, optional: true, value: receiver, type: DYN, loc }, expr);
         }
+        // a symbol key (`o?.[sym]`): the symbol's reserved string key
+        if (key.type.kind === "symbol" && L.sharedDynamic && !L.engine) {
+          const skey: IrExpr = { kind: "libCall", fn: "sym.keyStr", args: [key], type: STRING, loc: key.loc } as IrExpr;
+          return L.maybeNarrow({ kind: "dynKeyGet", key: skey, optional: true, value: receiver, type: DYN, loc }, expr);
+        }
       }
       // The METHOD-call step (`rawName?.match(re)` on a dyn value): a
       // nullish receiver short-circuits to the undefined dyn singleton
@@ -5938,7 +5951,11 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
     // WIDENS to string un-late-binds the property, its type is no literal,
     // and the fence stays.
     if (!pureKeyExpr(L, expr)) return null;
-    return literalKeySpellingOf(L.typeOf(expr));
+    // (A checker literal type's value crosses the tsgo bridge as UTF-8, so
+    // a lone surrogate arrives as U+FFFD: such a spelling is not the
+    // program's string — the runtime key path answers instead.)
+    const spelled = literalKeySpellingOf(L.typeOf(expr));
+    return spelled !== null && spelled.includes("�") ? null : spelled;
   }
 
   /** The property-name spelling of a single-literal checker type: string
@@ -6040,8 +6057,13 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       let key: IrExpr;
       if (ts.isComputedPropertyName(name)) {
         const folded = literalComputedKey(L, name);
+        const symKey = folded === null ? symbolKeyOf(L, name.expression) : null;
         if (folded !== null) {
           key = { kind: "strLit", value: folded, type: STRING, loc: locOf(name) };
+        } else if (symKey !== null) {
+          // a symbol key: its reserved string (stream-chain's
+          // `{[manySymbol]: 1, values}`)
+          key = symKey;
         } else {
           let k = L.lowerExpr(name.expression);
           if (L.sharedDynamic) k = asDynOperand(k);
@@ -7966,6 +7988,22 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     if (L.mapTypeOf(L.typeOf(expr.argumentExpression))?.kind === "symbol") {
       const target = symbolFieldTarget(L, expr);
       if (target) return L.maybeNarrow(L.fieldGetExpr(target, locOf(expr), expr), expr);
+      // A dynamic receiver: the symbol's reserved key, through the keyed
+      // read (lower-objmodel.ts symbolKeyOf; stream-chain's `o?.[sym]`).
+      if (L.sharedDynamic && !L.engine) {
+        const rIr = L.mapTypeOf(L.typeOf(expr.expression));
+        if (rIr === null || rIr.kind === "dyn" || rIr.kind === "jsval") {
+          const recv = asDynOperand(L.lowerExpr(expr.expression));
+          const key = recv.type.kind === "dyn" ? symbolKeyOf(L, expr.argumentExpression) : null;
+          if (key !== null) {
+            const opt = chainGuardedByQuestionDot(expr.expression);
+            return L.maybeNarrow(
+              checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recv, type: DYN, loc: locOf(expr) }),
+              expr,
+            );
+          }
+        }
+      }
       L.unsupported(
         "SC1090",
         expr,
@@ -8540,6 +8578,21 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
       if (fieldT) {
         const value = L.lowerExprExpecting(expr.right, fieldT.fieldType);
         return L.fieldSetStmt(fieldT, value, locOf(expr), target);
+      }
+      // A dynamic receiver: the symbol's reserved key, through the keyed
+      // write (stream-chain's `fn[flushSymbol] = 1`).
+      if (L.sharedDynamic && !L.engine) {
+        const rIr = L.mapTypeOf(L.typeOf(target.expression));
+        if (rIr === null || rIr.kind === "dyn" || rIr.kind === "jsval") {
+          const obj = asDynOperand(L.lowerExpr(target.expression));
+          const key = obj.type.kind === "dyn" ? symbolKeyOf(L, target.argumentExpression) : null;
+          if (key !== null) {
+            const value = L.coerceToExpected(L.lowerExpr(expr.right), DYN);
+            if (value.type.kind === "dyn") {
+              return { kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.keySet", args: [obj, key, value], type: VOID, loc: locOf(expr) }, loc: locOf(expr) };
+            }
+          }
+        }
       }
       L.unsupported(
         "SC1090",
@@ -9342,7 +9395,14 @@ const INHERITED_BY_KIND: [("array" | "string" | "function" | "number" | "boolean
  * `undefined`. A literal key that names no inherited member, an optional
  * (chain-guarded) read, and every read outside those programs stay as
  * they are. */
-function checkedDynKeyGet(L: Lowerer, e: IrExpr): IrExpr {
+function checkedDynKeyGet(L: Lowerer, e0: IrExpr): IrExpr {
+  // A program's runtime string key: the reserved symbol-key prefix stops
+  // by name (lower-objmodel.ts guardDynKey; a symbol's own key passes).
+  let e = e0;
+  if (e.kind === "dynKeyGet" && L.sharedDynamic && !(e.key.kind === "libCall" && e.key.fn === "sym.keyStr")) {
+    const guarded = guardDynKeyLoc(L, e.key);
+    if (guarded !== e.key) e = { ...e, key: guarded };
+  }
   if (e.kind !== "dynKeyGet" || !L.sharedDynamic || e.optional) return e;
   // A JavaScript source keeps the JS lane's own-members answer (S015's
   // body; U1b parity): the fence is U1a's TypeScript amendment.
@@ -10085,6 +10145,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     if (L.sharedDynamic && (left.type.kind === "dyn" || right.type.kind === "dyn")) {
       left = asDynOperand(left);
       right = asDynOperand(right);
+      // a symbol beside a dynamic value: its box (DK.SYMBOL), so strict
+      // equality compares identity like any reference kind
+      if (left.type.kind === "symbol") left = { kind: "dynFrom", value: left, type: DYN, loc: left.loc } as IrExpr;
+      if (right.type.kind === "symbol") right = { kind: "dynFrom", value: right, type: DYN, loc: right.loc } as IrExpr;
     }
     if (left.type.kind === "dyn" || right.type.kind === "dyn") {
       // The narrowing unit comparisons ARE answerable on unknown: `v ===
@@ -11766,6 +11830,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       {
         const probed = probeLowerDyn(L, expr.right);
         if (probed?.type.kind === "dyn") {
+          // a symbol key: its reserved string (`fListSymbol in o`)
+          const symKey = symbolKeyOf(L, expr.left);
+          if (symKey !== null) {
+            const recvS0 = L.lowerExpr(expr.right);
+            const recvS = L.sharedDynamic ? asDynOperand(recvS0) : recvS0;
+            if (recvS.type.kind === "dyn") {
+              return { kind: "libCall", fn: "dyn.hasKey", args: [recvS, symKey], type: BOOL, loc };
+            }
+          }
           let k = L.lowerExpr(expr.left); // JS order: the key evaluates first
           if (k.type.kind === "f64" || k.type.kind === "string" || k.type.kind === "dyn") {
             k = undefinedAsText(L, L.ensureString(k, expr.left), loc);

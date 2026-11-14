@@ -112,13 +112,30 @@ export function lowerObjModelStatic(L: Lowerer, call: ts.CallExpression, member:
         const key: IrExpr = { kind: "jsMarshal", value: { kind: "strLit", value: "\uD800@@" + k.name.text, type: STRING, loc }, type: JSVAL, loc } as IrExpr;
         return lib("om.defineProperty", [js(L, args[0]!), key, js(L, args[2]!)], loc);
       }
+      // any other symbol key: its reserved string (symbols.ts keyStr)
+      const symKey = symbolKeyOf(L, args[1]!);
+      if (symKey !== null) {
+        const target = js(L, args[0]!);
+        const key: IrExpr = { kind: "jsMarshal", value: symKey, type: JSVAL, loc } as IrExpr;
+        return lib("om.defineProperty", [target, key, js(L, args[2]!)], loc);
+      }
       return lib("om.defineProperty", [js(L, args[0]!), js(L, args[1]!), js(L, args[2]!)], loc);
     }
+    case "getOwnPropertySymbols":
+      if (!dyn0) return null;
+      return lib("dyn.ownSymbols", [{ kind: "dynFromJsval", value: js(L, args[0]!), type: DYN, loc } as IrExpr], loc, DYN);
     case "defineProperties":
       if (!dyn0 || args.length < 2) return null;
       return lib("om.defineProperties", [js(L, args[0]!), js(L, args[1]!)], loc);
     case "getOwnPropertyDescriptor":
       if (!dyn0 || args.length < 1) return null;
+      {
+        const symKey = args.length > 1 ? symbolKeyOf(L, args[1]!) : null;
+        if (symKey !== null) {
+          const target = js(L, args[0]!);
+          return lib("om.getOwnPropertyDescriptor", [target, { kind: "jsMarshal", value: symKey, type: JSVAL, loc } as IrExpr], loc);
+        }
+      }
       return lib("om.getOwnPropertyDescriptor", [js(L, args[0]!), args.length > 1 ? js(L, args[1]!) : undefJs(loc)], loc);
     case "getOwnPropertyDescriptors":
       if (!dyn0) return null;
@@ -159,6 +176,59 @@ export function lowerObjModelStatic(L: Lowerer, call: ts.CallExpression, member:
   }
 }
 
+/** A symbol-typed key expression's reserved property key (symbols.ts
+ * keyStr), or null when `e` is no symbol: the dynamic objects keep a
+ * symbol-keyed property under that string (SEMANTICS.md S016's symbol-keys
+ * amendment). WasmGC lanes only. */
+export function symbolKeyOf(L: Lowerer, e: ts.Expression): IrExpr | null {
+  if (!L.sharedDynamic || L.engine) return null;
+  if (L.mapTypeOf(L.typeOf(e))?.kind !== "symbol") return null;
+  const v = L.lowerExpr(e);
+  if (v.type.kind !== "symbol") return null;
+  return { kind: "libCall", fn: "sym.keyStr", args: [v], type: STRING, loc: locOf(e) } as IrExpr;
+}
+
+/** Does the program name `Symbol` anywhere (a symbol key can exist)? Only
+ * then does a runtime string key on a dynamic receiver pass the reserved-
+ * prefix check (dyn.ts keyGuard). */
+const symbolPrograms = new WeakMap<Lowerer, boolean>();
+export function programUsesSymbols(L: Lowerer): boolean {
+  let v = symbolPrograms.get(L);
+  if (v === undefined) {
+    // the WHOLE program: every module lowered (dependencies, compiled npm
+    // JavaScript) and every source the checker holds, declarations aside
+    v = L.moduleOrder.some((sf) => sf.text.includes("Symbol")) ||
+      L.program.getSourceFiles().some((sf) => !sf.isDeclarationFile && sf.text.includes("Symbol"));
+    symbolPrograms.set(L, v);
+  }
+  return v;
+}
+
+/** A program's runtime string key on a dynamic receiver, checked against
+ * the reserved symbol-key prefix where symbols exist (dyn.ts keyGuard). A
+ * literal key spelled with the prefix refuses at compile time. */
+export function guardDynKey(L: Lowerer, key: IrExpr, at: ts.Node): IrExpr {
+  if (!L.sharedDynamic || key.type.kind !== "string") return key;
+  if (key.kind === "strLit") {
+    if ((key as { value: string }).value.startsWith("\uD800@@")) {
+      L.unsupported("SC1090", at, "a property key beginning with U+D800 '@@' (the form this build reserves for symbol keys)");
+    }
+    return key;
+  }
+  // a runtime key: the emitter checks it (emitter.ts keyGuard over every
+  // dynamic keyed read, write, `in` and delete)
+  return key;
+}
+
+/** guardDynKey for a key with no syntax node at hand: a literal spelled
+ * with the reserved prefix stops at run time instead (the key's own
+ * position). */
+export function guardDynKeyLoc(L: Lowerer, key: IrExpr): IrExpr {
+  if (!L.sharedDynamic || key.type.kind !== "string") return key;
+  if (key.kind !== "strLit" || !(key as { value: string }).value.startsWith("\uD800@@")) return key;
+  return { kind: "libCall", fn: "dyn.keyGuard", args: [key], type: STRING, loc: key.loc } as IrExpr;
+}
+
 /** `delete o.k` / `delete o[k]` on a dynamic receiver, or null. */
 export function lowerObjModelDelete(L: Lowerer, expr: ts.DeleteExpression): IrExpr | null {
   if (!omActive(L)) return null;
@@ -172,9 +242,12 @@ export function lowerObjModelDelete(L: Lowerer, expr: ts.DeleteExpression): IrEx
     if (!isDynNode(L, target.expression)) return null;
     const recv = js(L, target.expression);
     const keyNode = target.argumentExpression;
+    // a symbol key: its reserved string (stream-chain's `delete o[fListSymbol]`)
+    const sym = symbolKeyOf(L, keyNode);
+    if (sym !== null) return lib("om.delete", [recv, sym], loc, BOOL);
     const key = L.lowerExpr(keyNode);
     const keyStr: IrExpr = key.type.kind === "string" ? key : { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) } as IrExpr;
-    return lib("om.delete", [recv, keyStr], loc, BOOL);
+    return lib("om.delete", [recv, guardDynKey(L, keyStr, keyNode)], loc, BOOL);
   }
   return null;
 }

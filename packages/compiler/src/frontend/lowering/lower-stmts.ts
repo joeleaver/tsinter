@@ -4170,7 +4170,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     const t: IrType = strs ? STRING : F64;
     return {
       kind: "seqExpr",
-      stmts: [{ kind: "varDecl", localId: tmp.id, init: { kind: "dynFromJsval", value: disc, type: DYN, loc }, loc }],
+      stmts: [{ kind: "varDecl", localId: tmp.id, init: disc.type.kind === "dyn" ? disc : { kind: "dynFromJsval", value: disc, type: DYN, loc }, loc }],
       result: {
         kind: "ternary",
         cond: { kind: "dynTest", test: strs ? "string" : "number", value: ref(), type: BOOL, loc },
@@ -4195,6 +4195,10 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // value; a value of another kind takes a sentinel no case equals (Node's
     // `===` matches none of them), so the default runs.
     if (L.dynArmActive && disc.type.kind === "jsval") disc = armSwitchDisc(L, stmt, disc) ?? disc;
+    // A checked-dynamic discriminant (a JavaScript source's `any`) under the
+    // same rule: all-string or all-number literal cases switch on the typed
+    // value, any other kind matching none of them (strict equality).
+    if (L.sharedDynamic && disc.type.kind === "dyn") disc = armSwitchDisc(L, stmt, disc) ?? disc;
     const dk = disc.type.kind;
     if (dk === "dyn") {
       L.unsupported("SC1100", stmt.expression, "switch statements on 'unknown' values");

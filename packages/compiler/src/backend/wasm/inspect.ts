@@ -4062,6 +4062,14 @@ export class InspectBuilder {
           c.return_();
         });
       }
+      if (dyn.symLive) {
+        // a symbol: `Symbol(desc)`, as inspect prints it
+        this.kindArm(c, K, [DK.SYMBOL], () => {
+          dyn.symPayload(c, D);
+          c.call(dyn.symToStr());
+          c.return_();
+        });
+      }
       const big = this.deps.big;
       if (big !== undefined) {
         this.kindArm(c, K, [DK.BIGINT], () => {
@@ -4813,7 +4821,8 @@ export class InspectBuilder {
         // hands an accessor member back as its cell (rendered `[Getter]`
         // below, Node's text) instead of calling the getter.
         c.localGet(D);
-        c.i32Const(dyn.accessorsLive ? 3 : 2); // Object.entries mode
+        // Object.entries mode; symbol-keyed entries after the string keys
+        c.i32Const((dyn.accessorsLive ? 3 : 2) | (dyn.symLive ? 8 : 0));
         c.call(dyn.objWalk());
         c.localSet(ENTS);
         dyn.arrPayload(c, (x) => x.localGet(ENTS));
@@ -4839,7 +4848,20 @@ export class InspectBuilder {
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
         emitFlatCast(c, strT);
-        c.call(this.key());
+        if (dyn.symLive) {
+          // a symbol's reserved key prints as `[Symbol(desc)]`
+          c.localTee(KS);
+          c.call(dyn.reservedKey());
+          c.ifResult(this.deps.strRef());
+          c.localGet(KS);
+          c.call(dyn.symKeyText());
+          c.else_();
+          c.localGet(KS);
+          c.call(this.key());
+          c.end();
+        } else {
+          c.call(this.key());
+        }
         c.localSet(KS);
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
         deeper();
