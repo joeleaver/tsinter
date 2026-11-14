@@ -2340,6 +2340,15 @@ const PROTO_LINK_REFUSAL =
 /** Units U3 + U4: an IR node that needs the object model — an `om.*`
  * libCall, or `new` on a dynamic callee other than the pattern-served
  * globals. */
+/** Object's own statics (Node 22+), each a hidden stopping getter on the
+ * Object constructor held as a dynamic value. */
+const OBJECT_STATICS = [
+  "assign", "create", "defineProperties", "defineProperty", "entries", "freeze", "fromEntries",
+  "getOwnPropertyDescriptor", "getOwnPropertyDescriptors", "getOwnPropertyNames", "getOwnPropertySymbols",
+  "getPrototypeOf", "groupBy", "hasOwn", "is", "isExtensible", "isFrozen", "isSealed", "keys",
+  "preventExtensions", "seal", "setPrototypeOf", "values",
+];
+
 function isObjModelNode(rec: Record<string, unknown>): boolean {
   if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("om.")) return true;
   if (rec["kind"] === "jsOp" && rec["op"] === "instanceOf") return true;
@@ -3331,6 +3340,7 @@ class Assembler {
   private readonly objCreateLive: boolean;
   /** Units U3 + U4 (objmodel.ts): the module reaches an object-model op. */
   private readonly objModelLive: boolean;
+  private readonly globalBoxLive: boolean;
   /** Unit A2: the module builds an island tag call's strings array. */
   private readonly tplLive: boolean;
   /** Unit F1: the module builds an island RegExp (the island's
@@ -3674,6 +3684,13 @@ class Assembler {
     // globalGet("Object")) can build a null-prototype object or a linked
     // one; both readers' refusals are installed only where it appears.
     this.objModelLive = this.irNodeReachable(mod, (rec) => isObjModelNode(rec));
+    // Units U3 + U4 (review): globalThis taken as a dynamic value — every
+    // reflection helper stops on its box (dyn.globalReflectGuard).
+    this.globalBoxLive = this.objModelLive && this.irNodeReachable(mod, (rec) => {
+      if (rec["kind"] !== "libCall" || rec["fn"] !== "om.builtinValue") return false;
+      const a = (rec["args"] as { kind?: string; value?: unknown }[] | undefined)?.[0];
+      return a?.kind === "strLit" && a.value === "globalThis";
+    });
     this.objCreateLive = this.objModelLive || this.irNodeReachable(mod, (rec) => isIslandObjectCreate(rec));
     this.nullProtoLive =
       this.objCreateLive ||
@@ -4173,7 +4190,24 @@ class Assembler {
         x.end();
         x.localTee(T);
         x.structGet(dynT, DYN_KIND);
-        x.localTee(K);
+        x.localSet(K);
+        // a primitive: V8's TypeError
+        x.i32Const(0);
+        for (const k of [DK.NULL, DK.BOOL, DK.NUM, DK.STR, DK.UNDEF, DK.BIGINT]) {
+          x.localGet(K);
+          x.i32Const(k);
+          x.i32Eq();
+          x.i32Or();
+        }
+        x.ifVoid();
+        this.emitSetCellError(x, "%TypeError", "TypeError", (y) => this.pushStrLitInto(y, "invalid_argument"), null);
+        x.refNull(dynT);
+        x.return_();
+        x.end();
+        // any other object but a plain object or a function (an array, a
+        // typed array, a promise): Node gives it a stack too — stopped by
+        // name here (no own-property table to hold it)
+        x.localGet(K);
         x.i32Const(DK.OBJ);
         x.i32Ne();
         x.localGet(K);
@@ -4181,9 +4215,7 @@ class Assembler {
         x.i32Ne();
         x.i32And();
         x.ifVoid();
-        this.emitSetCellError(x, "%TypeError", "TypeError", (y) => this.pushStrLitInto(y, "invalid_argument"), null);
-        x.refNull(dynT);
-        x.return_();
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "Error.captureStackTrace on an array, typed array or other non-plain object held in a dynamic value is not supported yet"), null);
         x.end();
         // A program's own Error.prepareStackTrace would format this
         // stack: that stops by name (SEMANTICS.md S114).
@@ -4212,6 +4244,14 @@ class Assembler {
         // The header V8 writes (ErrorUtils::ToString): `name` (undefined
         // is "Error") and `message` (undefined is ""), joined by ": "
         // when both are non-empty. An error answers its own toString.
+        // An error target: Node rewrites its `stack`, which an error held
+        // in a dynamic value does not carry here (redefining it is the
+        // mirror's own stop) — stopped by name.
+        x.localGet(T);
+        x.call(dyn.isError());
+        x.ifVoid();
+        this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "Error.captureStackTrace on an error held in a dynamic value (Node rewrites its stack) is not supported yet"), null);
+        x.end();
         x.localGet(T);
         x.call(dyn.isError());
         x.ifVoid();
@@ -4310,7 +4350,7 @@ class Assembler {
       }, DATA | A_W | A_C);
       define(c, "isError", (x) => dyn.boxFn(x, marker, (y) => y.refFunc(isErrThunk), -9, (y) => this.pushStrLitInto(y, "isError"), 1, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
       define(c, "stackTraceLimit", (x) => dyn.boxNum(x, (y) => y.f64Const(10)), DATA | A_W | A_E | A_C);
-      define(c, "prototype", (x) => dyn.boxObj(x, (y) => dyn.pushNewObj(y, false)), DATA);
+      // (no own `prototype` entry: its read stops by name, om.fnPrototype)
     } else if (name === "Object") {
       const objThunk = this.omThunk("ObjectCtor", [dyn.dynRef(), I32], (x) => {
         const A = 2;
@@ -4354,6 +4394,17 @@ class Assembler {
       dyn.boxFn(c, marker, (x) => x.refFunc(objThunk), -7, (x) => this.pushStrLitInto(x, "Object"), 1, undefined, (x) => x.i32Const(2));
       c.globalSet(g);
       define(c, "prototype", (x) => x.call(om.objectProto()), HAS_VALUE | HAS_WRITABLE | HAS_ENUM | HAS_CONF);
+      // Object's statics read through the value (`const O = Object;
+      // O.keys(o)`): the static spelling lowers them; through the value
+      // each is a non-enumerable function (typeof "function", its own
+      // name) whose CALL stops by name.
+      for (const st of OBJECT_STATICS) {
+        const th = this.omThunk(`ObjectStatic:${st}`, [], (x) => {
+          this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, `Object.${st} called through the Object constructor held as a dynamic value is not supported yet (call Object.${st} directly)`), null);
+          x.refNull(dynT);
+        });
+        define(c, st, (x) => dyn.boxFn(x, marker, (y) => y.refFunc(th), -9, (y) => this.pushStrLitInto(y, st), 1, undefined, (y) => y.i32Const(2)), DATA | A_W | A_C);
+      }
     } else {
       const fenceThunk = this.omThunk("globalFence", [], (x) => {
         this.emitFenceFatal(x, (y) => this.pushStrLitInto(y, "reading a standard global through globalThis as a dynamic value is not supported yet"), null);
@@ -4361,6 +4412,8 @@ class Assembler {
       });
       dyn.boxObj(c, (x) => dyn.pushNewObj(x, false));
       c.globalSet(g);
+      c.globalGet(g);
+      c.globalSet(dyn.globalBoxG());
       const getterBox = (x: Code): void => dyn.boxFn(x, marker, (y) => y.refFunc(fenceThunk), -9, (y) => y.refNull(this.strType), 0, undefined, (y) => y.i32Const(2));
       for (const gname of globals) {
         c.globalGet(g);
@@ -12187,6 +12240,7 @@ class Assembler {
           }
         : {}),
     });
+    if (this.globalBoxLive) this.dynField.globalBoxLive = true;
     return this.dynField;
   }
 
