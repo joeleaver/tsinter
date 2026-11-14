@@ -6,7 +6,7 @@
  * match byte for byte. Rows default to a project with @types/node (the
  * vendored copy in tests/fixtures/node-types), as paperclip has. */
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -38,6 +38,22 @@ export interface Row {
   /** The entry's path when it is not the `main.*` file written (e.g. the
    * same file reached through a symlinked directory). */
   entry?: string;
+  /** --npm-static for the build: these packages' JavaScript compiles
+   * statically (a package with shipped declarations types the program by
+   * them, SEMANTICS.md S133). */
+  npmStatic?: readonly string[] | "auto";
+  /** Environment changes for the run (Node's and the compiled program's
+   * alike): a string sets the variable, undefined removes it. */
+  env?: Record<string, string | undefined>;
+}
+
+function envOf(row: Row): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [k, v] of Object.entries(row.env ?? {})) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return env;
 }
 
 export function scratchDir(tag: string): string {
@@ -49,7 +65,17 @@ export function scratchDir(tag: string): string {
 function write(scratch: string, row: Row, backend: string): string {
   const dir = join(scratch, `${row.id.split(" ")[0]}-${backend}`);
   mkdirSync(dir, { recursive: true });
-  if (row.nodeTypes !== false) symlinkSync(nodeTypes, join(dir, "node_modules"));
+  if (row.nodeTypes !== false) {
+    if (Object.keys(row.files).some((f) => f.startsWith("node_modules/"))) {
+      // The row ships packages of its own: a real node_modules holding
+      // them, with the vendored @types/node entries linked in one by one
+      // (never writing through a link into the shared fixture).
+      mkdirSync(join(dir, "node_modules"), { recursive: true });
+      for (const e of readdirSync(nodeTypes)) symlinkSync(join(nodeTypes, e), join(dir, "node_modules", e));
+    } else {
+      symlinkSync(nodeTypes, join(dir, "node_modules"));
+    }
+  }
   if (row.noTsconfig !== true) writeFileSync(join(dir, "tsconfig.json"), TSCONFIG);
   let entry = "";
   for (const [name, src] of Object.entries(row.files)) {
@@ -64,14 +90,14 @@ function write(scratch: string, row: Row, backend: string): string {
   return row.entry !== undefined ? join(dir, row.entry) : entry;
 }
 
-function nodeRun(file: string, args: string[]): Out {
-  const r = spawnSync(process.execPath, [file, ...args], { encoding: "utf8", input: "" });
+function nodeRun(file: string, args: string[], env?: NodeJS.ProcessEnv): Out {
+  const r = spawnSync(process.execPath, [file, ...args], { encoding: "utf8", input: "", ...(env ? { env } : {}) });
   return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
 }
 
-async function nativeRun(path: string, args: string[]): Promise<Out> {
+async function nativeRun(path: string, args: string[], env?: NodeJS.ProcessEnv): Promise<Out> {
   try {
-    const p = run(path, args, { encoding: "utf8" });
+    const p = run(path, args, { encoding: "utf8", ...(env ? { env } : {}) });
     p.child.stdin?.end();
     const r = await p;
     return { stdout: r.stdout, stderr: r.stderr, exitCode: 0 };
@@ -86,7 +112,7 @@ async function nativeRun(path: string, args: string[]): Promise<Out> {
 export async function checkRefuses(scratch: string, row: Row, expected: string, absent?: string, backend: "wasm" | "wasm-native" = "wasm"): Promise<void> {
   const entry = write(scratch, row, `refuse-${backend}`);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.npmStatic !== undefined ? { npmStatic: row.npmStatic } : {}) });
   expect(res.ok, row.id).toBe(false);
   const text = res.diagnostics.map((d) => `${d.code} ${d.message}`).join("\n");
   expect(text).toContain(expected);
@@ -98,7 +124,7 @@ export async function checkRefuses(scratch: string, row: Row, expected: string, 
 export async function checkBuilds(scratch: string, row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
   const entry = write(scratch, row, `${backend}-build`);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.npmStatic !== undefined ? { npmStatic: row.npmStatic } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
 }
 
@@ -109,7 +135,7 @@ export async function checkBuilds(scratch: string, row: Row, backend: "wasm" | "
 export async function checkFenced(scratch: string, row: Row, backend: "wasm-native", nodeStdoutPrefix: string, fence: string): Promise<void> {
   const entry = write(scratch, row, `${backend}-fence`);
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend });
+  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend, ...(row.npmStatic !== undefined ? { npmStatic: row.npmStatic } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
   const node = nodeRun(entry, []);
   expect(node.stdout.startsWith(nodeStdoutPrefix), `${row.id}: Node's stdout ${JSON.stringify(node.stdout)}`).toBe(true);
@@ -124,7 +150,7 @@ export async function checkFenced(scratch: string, row: Row, backend: "wasm-nati
 export async function checkFencedLine(scratch: string, row: Row, suffix: string): Promise<void> {
   const entry = write(scratch, row, "wasm-native-line");
   const dir = join(entry, "..");
-  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native" });
+  const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", ...(row.npmStatic !== undefined ? { npmStatic: row.npmStatic } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
   const got = await nativeRun(res.binaryPath!, []);
   const line = got.stderr.split("\n").find((l) => l.startsWith("tsinter: unsupported: ")) ?? "";
@@ -135,11 +161,11 @@ export async function checkRow(scratch: string, row: Row, backend: "wasm" | "was
   const entry = write(scratch, row, backend);
   const dir = join(entry, "..");
   const args: string[] = [];
-  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+  const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.npmStatic !== undefined ? { npmStatic: row.npmStatic } : {}) });
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
-  const node = nodeRun(entry, args);
+  const node = nodeRun(entry, args, envOf(row));
   const got: Out = backend === "wasm"
-    ? await runWasm(res.binaryPath!).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: r.exitCode }))
-    : await nativeRun(res.binaryPath!, args);
+    ? await runWasm(res.binaryPath!, row.env ? { env: Object.entries(row.env).filter((e): e is [string, string] => e[1] !== undefined) } : undefined).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: r.exitCode }))
+    : await nativeRun(res.binaryPath!, args, envOf(row));
   expect(got, row.id).toEqual(node);
 }

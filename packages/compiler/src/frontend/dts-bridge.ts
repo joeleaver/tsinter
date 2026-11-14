@@ -65,9 +65,25 @@ export function installDtsBridge(program: ts.Program): void {
     exportsOfViews = [];
     for (const view of views.values()) {
       const declared = new Map<Sym, string>();
-      for (const e of exportsOf(moduleSymbolOf(program.getSourceFile(view.mirrorEntry)))) {
-        declared.set(resolveAlias(e), e.name);
-        declared.set(e, e.name);
+      const mirrorMod = moduleSymbolOf(program.getSourceFile(view.mirrorEntry));
+      // `export = picocolors` (a declared const the whole module IS): the
+      // const maps to the JS module's own `module.exports = …` value, and
+      // its MEMBERS (which the module's exports list repeats) stay the
+      // declared type's members — a member read reads the implementation
+      // value's own member and crosses it (SEMANTICS.md S133).
+      const declaredEq = mirrorMod?.getExports().get("export=" as ts.__String);
+      const eqIsConst =
+        declaredEq !== undefined &&
+        checker.rawDeclarationsOf(resolveAlias(declaredEq)).some((d) => ts.isVariableDeclaration(d));
+      if (!eqIsConst) {
+        for (const e of exportsOf(mirrorMod)) {
+          declared.set(resolveAlias(e), e.name);
+          declared.set(e, e.name);
+        }
+      }
+      if (declaredEq !== undefined) {
+        declared.set(resolveAlias(declaredEq), "export=");
+        declared.set(declaredEq, "export=");
       }
       const js = new Map<string, Sym>();
       for (const entry of view.jsEntries) {
@@ -75,6 +91,8 @@ export function installDtsBridge(program: ts.Program): void {
         // type of module.exports); ES modules answer either way.
         const mod = moduleSymbolOf(program.getSourceFile(entry));
         if (mod === undefined) continue;
+        const jsEq = mod.getExports().get("export=" as ts.__String);
+        if (jsEq !== undefined && !js.has("export=")) js.set("export=", jsEq);
         const named = exportsOf(mod);
         const props = named.length > 0 ? named : checker.getPropertiesOfType(checker.getTypeOfSymbol(mod));
         for (const e of props) {

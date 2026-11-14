@@ -68,6 +68,7 @@ import {
   fetchInitDtsPath,
   isCjsExportTableLiteral,
   isJsSourceFile,
+  isModuleExportsAccess,
   isNodeEsmFile,
   isNodeTypesPath,
   locOf,
@@ -2347,6 +2348,87 @@ export class Lowerer {
       }
     }
     return true;
+  }
+
+  /** The COMPUTED whole export (`module.exports = createColors()`, one
+   * typed global — collectGlobals) a binding names, with the members its
+   * module adds later (`module.exports.createColors = createColors`, each
+   * with its own export storage): null for any other binding. A program
+   * typed by the package's declarations reaches it through the
+   * declared-surface redirect (`export = picocolors`). */
+  computedExportOf(ident: ts.Identifier): { decl: ts.BinaryExpression; expandos: Set<string> } | null {
+    // Side-effect free (no resolveValueSymbol: its fences and deferred
+    // flushes belong to the read's own lowering): the alias chain only.
+    let sym = this.checker.getSymbolAtLocation(ident);
+    if (sym && sym.flags & ts.SymbolFlags.Alias) sym = this.checker.getAliasedSymbol(sym);
+    if (!sym) return null;
+    for (const d of this.checker.declarationsOf(sym)) {
+      // `module.exports = <call>` only (a member export `exports.k =
+      // <call>` is a member, not the whole value).
+      if (!ts.isBinaryExpression(d) || !isModuleExportsAccess(d.left) || !this.globalsByDeclNode.has(d)) continue;
+      let r: ts.Expression = d.right;
+      while (ts.isParenthesizedExpression(r)) r = r.expression;
+      if (!ts.isCallExpression(r)) continue;
+      const stmt = d.parent;
+      const expandos = new Set<string>();
+      for (const s of d.getSourceFile().statements) {
+        if (s.pos < stmt.pos) continue;
+        const other = cjsExportAssignmentOf(s);
+        if (other?.kind === "member" && ts.isIdentifier(other.name)) expandos.add(other.name.text);
+      }
+      return { decl: d, expandos };
+    }
+    return null;
+  }
+
+  /** `m.k` where `m` names a computed whole export and `k` is a member its
+   * module adds after the replacement: that member's own export storage
+   * (Node reads the property the statement added), else null. */
+  computedExportExpando(expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (expr.questionDotToken || !ts.isIdentifier(expr.expression) || !ts.isIdentifier(expr.name)) return null;
+    const ce = this.computedExportOf(expr.expression);
+    if (ce === null || !ce.expandos.has(expr.name.text)) return null;
+    const exp = this.cjsModuleExportSymbol(ce.decl.getSourceFile(), expr.name.text);
+    let g = exp ? this.globalsBySymbol.get(exp) : undefined;
+    if (!g && exp) {
+      for (const d of this.checker.declarationsOf(exp)) {
+        g = this.globalsByDeclNode.get(d);
+        if (g) break;
+      }
+    }
+    if (!g) return null;
+    // The receiver still evaluates (a binding read: no effects, but its
+    // own TDZ/fence rules apply), then the member's storage answers.
+    const recv = this.lowerExpr(expr.expression);
+    const loc = locOf(expr);
+    return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: recv, loc }], result: { kind: "varRef", localId: g.id, type: g.type, loc }, type: g.type, loc };
+  }
+
+  /** A binding of a computed whole export whose module adds members later
+   * reads as that value only where the added members cannot be missed: as
+   * a member read's receiver (`m.k`, the member's own storage for an added
+   * one) and as an identity test's operand (`m === other`). Anything that
+   * would see the value WHOLE — enumerate it, spread it, pass or store it
+   * — would see it without the added members, so it refuses by name. */
+  private fenceComputedExportWholeUse(ident: ts.Identifier): void {
+    let outer: ts.Node = ident;
+    while (outer.parent !== undefined && ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+    const p = outer.parent;
+    if (p === undefined) return;
+    if ((ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === outer) return;
+    if (ts.isCallExpression(p) && p.expression === outer) return;
+    if (ts.isBinaryExpression(p)) {
+      const k = p.operatorToken.kind;
+      if (k === ts.SyntaxKind.EqualsEqualsEqualsToken || k === ts.SyntaxKind.ExclamationEqualsEqualsToken) return;
+    }
+    if (ts.isImportClause(p) || ts.isVariableDeclaration(p) && p.name === outer) return;
+    const ce = this.computedExportOf(ident);
+    if (ce === null || ce.expandos.size === 0) return;
+    this.unsupported(
+      "SC1090",
+      ident,
+      `the module value '${ident.text}' used whole while its module adds members to it after 'module.exports = …' (only its member reads and identity tests see them — SEMANTICS.md S133)`,
+    );
   }
 
   /** Assignment-target resolution: a function local (possibly captured) or
@@ -5951,6 +6033,10 @@ export class Lowerer {
             canMarshalTypedFuncIntoIsland(src, (id) => this.shapes.get(id), (id) => this.unions.get(id))))
       );
     }
+    // An island value into a checked-dynamic slot: the wrap coerceToExpected
+    // makes (dynFromJsval — the one world's same value under the dyn type;
+    // picocolors' `replace = open` formatter through an `any`-param slot).
+    if (src.kind === "jsval" && dst.kind === "dyn") return true;
     if (src.kind === "jsval") return this.boundaryExitSafe(dst);
     if (dst.kind === "dyn") return src.kind !== "dyn" && this.dynConvertible(src);
     if (src.kind === "dyn") {
@@ -9103,7 +9189,10 @@ export class Lowerer {
   /* ── expressions ──────────────────────────────────────────────────── */
 
   lowerExpr(expr: ts.Expression): IrExpr {
-    const e = ts.isPropertyAccessExpression(expr) ? dtsPropertyRead(this, expr, lowerExpr(this, expr)) : lowerExpr(this, expr);
+    if (ts.isIdentifier(expr)) this.fenceComputedExportWholeUse(expr);
+    const e = ts.isPropertyAccessExpression(expr)
+      ? dtsPropertyRead(this, expr, this.computedExportExpando(expr) ?? lowerExpr(this, expr))
+      : lowerExpr(this, expr);
     // Unit U2a (dyn-arm.ts): an operator over a dynamic-arm operand lowers
     // to the dynamic operation (a jsval) where TypeScript types its result
     // primitive (`"n=" + v.a` is a string, `v.a < 1` a boolean, `-v.a` a

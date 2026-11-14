@@ -3717,9 +3717,15 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // Computed shapes carry provenance per MEMBER: a utility type over a
       // lib interface (`Readonly<Date>`) is still the lib's type world, not
       // a data shape. Synthesized members (a literal-key Record's) have no
-      // declarations and pass.
+      // declarations and pass, and so do members a compiled package's
+      // declared surface declares (its mirror, SEMANTICS.md S133 — the
+      // program's vocabulary, like recordProvenanceOk's rule: picocolors'
+      // `Colors & { createColors }`).
       const optionMember = isNodeOptionMember(p, ctx);
-      if (computed && !optionMember && checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile)) {
+      if (
+        computed && !optionMember &&
+        checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile && !isDtsMirrorPath(d.getSourceFile().fileName))
+      ) {
         return null;
       }
       const fieldTs = checker.getTypeOfSymbol(p);

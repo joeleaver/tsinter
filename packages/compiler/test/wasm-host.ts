@@ -117,6 +117,8 @@ export interface HostOverrides {
   /** Called once, right after instantiation (a scripted import that
    * reads or writes the module's memory takes it from here). */
   onInstance?: (instance: WebAssembly.Instance) => void;
+  /** The program's environment (default: empty), in this order. */
+  env?: [string, string][];
 }
 
 export interface HostRun {
@@ -239,8 +241,11 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
           case 0: // argv
             return index >= 0 && index < argv.length ? write(argv[index]!) : -1;
           case 1: // env key
-          case 2: // env value
-            return -1; // the default env is empty
+          case 2: { // env value
+            // the default env is empty; a run may give its own
+            const e = overrides?.env?.[index];
+            return e === undefined ? -1 : write(kind === 1 ? e[0] : e[1]);
+          }
           case 3: // cwd
             return write(process.cwd());
           case 4: // platform
@@ -296,7 +301,7 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
           case 0: // argc
             return 2;
           case 1: // env pair count
-            return 0;
+            return overrides?.env?.length ?? 0;
           case 2: // pid
             return 1;
           case 3: // uid
