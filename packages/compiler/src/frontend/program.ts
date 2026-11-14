@@ -41,6 +41,7 @@
  *    JSON.parse's wording rather than tsc's, the one message-text delta on
  *    that path (no snapshot pins it). */
 
+import { directiveCovers, hasSuppression, suppressedWriteSites } from "./ts-directives.js";
 import { libHost } from "./lib-host.js";
 import { wasmLibCapabilityDiag } from "../diagnostics/diagnostic.js";
 import { builtinModules } from "node:module";
@@ -2013,6 +2014,14 @@ function preflight7(load: LoadResult): {
    * exactly when its partner (same file, same name) was comment-side, so
    * a REAL duplicate declaration (both halves in code — Node's own
    * SyntaxError) keeps tsc's voice. */
+  /* A `@ts-expect-error` / `@ts-ignore` reaches its whole next statement
+   * (ts-directives.ts): an error a newer TypeScript reports further into
+   * the statement than the project's pinned one did stays suppressed. */
+  const directiveStatementSuppressed = (p: ts.Program, d: ts.Diagnostic): boolean => {
+    if (d.fileName === undefined || d.pos === undefined) return false;
+    const sf = p.getSourceFile(d.fileName);
+    return sf !== undefined && directiveCovers(sf, d.pos);
+  };
   const insideBlockComment = (text: string, pos: number): boolean => {
     const open = text.lastIndexOf("/*", pos);
     if (open < 0) return false;
@@ -2061,6 +2070,11 @@ function preflight7(load: LoadResult): {
     return all.filter(
       (d) =>
         d.category === ts.DiagnosticCategory.Error &&
+        // An UNUSED directive (TS2578) never blocks a build: it is a
+        // complaint about a comment, and the line it names compiles the
+        // same either way (docs/design/ts-directives.md).
+        d.code !== 2578 &&
+        !directiveStatementSuppressed(p, d) &&
         !suppressedJsStrictness7(d) &&
         !npmStaticFileSuppressed(d) &&
         !nodeModulesJsSuppressed(d) &&
@@ -2129,6 +2143,20 @@ function preflight7(load: LoadResult): {
         // stay program source — only the island-bound JS steps out.
         !islandJsFile(sf.fileName),
     );
+
+  // docs/design/ts-directives.md: in a file whose TypeScript errors a
+  // directive can suppress, the writes Node rejects that a suppressed
+  // error would otherwise let through (a const binding, a read-only value)
+  // refuse by name at the site.
+  {
+    const holeChecker = program.getTypeChecker();
+    for (const sf of userFiles) {
+      if (!hasSuppression(sf)) continue;
+      for (const site of suppressedWriteSites(sf, holeChecker)) {
+        diags.push(unsupportedDiag("SC1090", locOf7(site.node), site.feature));
+      }
+    }
+  }
 
   const ambientModules = new Set<string>(SUPPORTED_NODE_MODULES);
 

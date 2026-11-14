@@ -12988,7 +12988,42 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
       const ovfShape = literalField !== null && shape.indexValue ? { ...shape, fields: [] } : shape;
       if (!recordKeyResultOk(L, ovfShape, type)) return null;
     }
-    return { kind: "unionKeyGet", unionId, key, value, type, loc: locOf(expr) };
+    // A unit arm answers undefined only where it cannot be reached (an
+    // optional-chain tail, a receiver the checker narrowed). Where the
+    // checker still types the receiver as possibly null/undefined, the
+    // read is one a suppressed (or JavaScript-relaxed) error let through,
+    // and Node throws there: the receiver passes the unit-arm guard
+    // (Node's "Cannot read properties of undefined (reading 'k')").
+    let recv = value;
+    if (def.arms.some(isUnitType) && (ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) &&
+        expr.questionDotToken === undefined && !L.chainNarrowedType.has(expr.expression)) {
+      const rt = L.typeOf(expr.expression);
+      const parts = rt.isUnionType() ? rt.getTypes() : [rt];
+      if (parts.some((p) => (p.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) !== 0)) {
+        const loc = locOf(expr);
+        if (literalField !== null) {
+          recv = assertedRecvGuardFor(L, value, literalField, loc);
+        } else {
+          // Node's message names the runtime key; the guard spells a
+          // static one, so a computed key on a unit arm stops by name.
+          const t = L.declareHiddenLocal("%ukr", value.type);
+          const ref: IrExpr = { kind: "varRef", localId: t.id, type: value.type, loc };
+          const stmts: IrStmt[] = [{ kind: "varDecl", localId: t.id, init: value, loc }];
+          def.arms.forEach((a, i) => {
+            if (!isUnitType(a)) return;
+            stmts.push({
+              kind: "if",
+              cond: { kind: "unionIsTag", unionId, tag: i, negated: false, value: ref, type: BOOL, loc },
+              then: [{ kind: "runtimeFence", code: "SC1090", message: `a computed-key read through ${a.kind === "nullT" ? "null" : "undefined"} (Node throws TypeError: Cannot read properties of ${a.kind === "nullT" ? "null" : "undefined"} (reading <the key>))`, loc }],
+              else_: null,
+              loc,
+            });
+          });
+          recv = { kind: "seqExpr", stmts, result: ref, type: value.type, loc };
+        }
+      }
+    }
+    return { kind: "unionKeyGet", unionId, key, value: recv, type, loc: locOf(expr) };
   }
 
 /** Recognizes `obj.field` as an assignable field target: receiver is a
