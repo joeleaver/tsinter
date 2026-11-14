@@ -783,9 +783,18 @@ in JavaScript sources too. Two crossings keep the copy this entry
 describes, judged by S125 (c): a tagged template's strings array in a
 JavaScript source (frozen in Node; a view would let writes through), and
 an object literal passed straight into an implicit-any JavaScript
-parameter (built as the checked-dynamic literal, as before). **Tested by:**
+parameter (built as the checked-dynamic literal, as before). A JavaScript
+array binding that the program writes elements of another kind into
+(`a[2] = flag` on an array its literals typed `(string | number)[]`, or a
+push, unshift, splice or fill of one) is the dynamic array when every value
+assigned to it is fresh (an array literal, an `&&`/`||`/`??`/`?:`
+chain over literals, or the call of a function returning such a binding,
+which returns the dynamic array), so the write stores the value as in Node; a binding
+assigned any other array keeps its typed array, and such a write stops by
+name (SC1100) (GH #204). **Tested by:**
 the JS corpus on the wasm lanes, and the hand-written rows of
-`wasm-dynsmalls-u5`, `wasm-review-repros` and `wasm-smalls-u2` (row75).
+`wasm-dynsmalls-u5`, `wasm-review-repros` and `wasm-smalls-u2` (row75),
+and `wasm-gh204-js-array-widen` (GH204-01..).
 
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
@@ -1145,7 +1154,11 @@ write sets the module's "a hole was made" flag (S119), and `in`/`hasOwn`
 over an index holding `undefined` once that flag is set ends the program at
 a named fence (S122), as S119 (b)'s observers do; an unpadded index answers
 exactly. `Object.keys`, values and entries stay as this paragraph says. The
-c and llvm lanes keep the silent answer.*
+c and llvm lanes keep the silent answer.* *GH #204 amendment (wasm and
+wasm-native): printing such an array (`console.log`, `util.inspect`) is no
+longer silent either — an element holding `undefined` once that flag is set
+ends the program at the same named fence as a typed array's printing (S119
+(b)), where it used to print `undefined` and Node prints `<1 empty item>`.*
 
 The index write is not the only route to a padded slot. `map` binds its
 output to the length it captured before the first step (the spec's own

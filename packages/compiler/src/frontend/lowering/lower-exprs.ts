@@ -9466,6 +9466,17 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
           return { kind: "libCall", fn: "num.fromString", args: [operand], type: F64, loc };
         }
         if (operand.type.kind === "bigint") return lowerBigUnaryPlus(operand, loc);
+        // A checked-dynamic operand (a JavaScript source's `any`, moment's
+        // `+posNegDuration > 0`): ToNumber, as `Number(x)` lowers it — the
+        // dyn tree's own conversion (undefined NaN, null 0, booleans 1/0,
+        // strings by the StringNumericLiteral grammar). Where the program
+        // can hold a bigint, the island's `+` (Node's TypeError on one).
+        if (operand.type.kind === "dyn") {
+          if (L.sharedDynamic && L.bigWiden) {
+            return { kind: "jsOp", op: "plus", args: [L.jsvalIn(operand, expr.operand)], type: JSVAL, loc };
+          }
+          return { kind: "libCall", fn: "dyn.toNumber", args: [operand], type: F64, loc };
+        }
         if (operand.type.kind !== "f64") L.unsupported("SC1043", expr);
         return toNumberCanon(L, operand);
       }

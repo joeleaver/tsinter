@@ -241,6 +241,12 @@ export interface InspectDeps {
    * the text already carries its code) and traps — nothing catches it.
    * Code emitted after it is dead. */
   fence: (c: Code, pushMessage: (c: Code) => void, code?: string) => void;
+  /** S119 (b): the module's "a hole was made" flag (i32 global), when the
+   * module stores holes as undefined. Printing a dynamic array element
+   * holding undefined once it is set ends the program by name, as the
+   * typed arrays' printing does: the element may be a hole Node prints
+   * as `<1 empty item>`. */
+  holesMade?: () => number;
   /** The exception cell's kind global — 0 when nothing is pending. Every
    * recursive step of the walker tests it, so a fence deep in a tree
    * unwinds instead of rendering the rest into a string nobody reads. */
@@ -4382,6 +4388,18 @@ export class InspectBuilder {
         c.brIf(1);
         dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
         c.localSet(E);
+        if (this.deps.holesMade !== undefined) {
+          c.localGet(E);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.UNDEF);
+          c.i32Eq();
+          c.globalGet(this.deps.holesMade());
+          c.i32And();
+          c.ifVoid();
+          this.deps.fence(c, (x) =>
+            this.deps.lit(x, "printing (util.inspect) over an array that may hold holes (a write past an array's end leaves undefined where Node keeps a hole, and printing (util.inspect) tells them apart — SEMANTICS.md S119)"));
+          c.end();
+        }
         c.localGet(E);
         deeper();
         c.localGet(DEPTH);
