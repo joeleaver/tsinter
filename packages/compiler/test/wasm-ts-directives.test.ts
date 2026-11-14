@@ -41,6 +41,9 @@ interface Row {
   refused?: string;
   /** ...and that diagnostic's message contains this. */
   refusedMsg?: string;
+  /** Builds, then stops by name at run time: stdout up to the stop is a
+   * prefix of Node's, and stderr carries this. */
+  fence?: string;
 }
 
 const ROWS: Row[] = [
@@ -176,6 +179,43 @@ console.log(a);`,
     refused: "SC1090",
     refusedMsg: "'push' on a read-only array",
   },
+  {
+    id: "TSD-14 a computed-key read through a possibly-undefined value, inside a function: a defined value reads as Node, an undefined one stops by name (Node's message names the runtime key)",
+    src: `function read(e: Record<string, number> | undefined, k: string): number {
+  // @ts-ignore
+  return e[k];
+}
+console.log(read({ a: 1 }, "a"));
+try { console.log(read(undefined, "a")); } catch (err) { console.log(String(err)); }`,
+    fence: "a computed-key read through undefined",
+  },
+  {
+    id: "TSD-15 a read-only array passed into a mutable array parameter, its error suppressed, refuses by name (a later push would throw in Node)",
+    src: `function add(xs: number[]): void { xs.push(3); }
+const ro = Object.freeze([1, 2]);
+// @ts-ignore
+add(ro);
+console.log(ro.length);`,
+    refused: "SC1090",
+    refusedMsg: "a read-only array entering a mutable array slot",
+  },
+  {
+    id: "TSD-16 probe: a let binding reassigned in a file with directives does not refuse",
+    src: `let n = 1;
+// @ts-ignore
+n = 2;
+n += 3;
+for (let i = 0; i < 2; i++) n++;
+console.log(n);`,
+  },
+  {
+    id: "TSD-17 probe: a defined T | undefined read under a directive reads the value (no throw)",
+    src: `interface E { k: number }
+function get(b: boolean): E | undefined { return b ? { k: 7 } : undefined; }
+const f = get(process.argv.length < 99);
+// @ts-ignore
+console.log(f.k + 1);`,
+  },
 ];
 
 function write(row: Row, backend: string): string {
@@ -213,6 +253,21 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
     if (row.refusedMsg !== undefined) {
       expect(res.diagnostics.some((d) => d.code === row.refused && d.message.includes(row.refusedMsg!)), JSON.stringify(res.diagnostics)).toBe(true);
     }
+    return;
+  }
+  if (row.fence !== undefined) {
+    if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
+    const nodeOut = nodeRun(entry);
+    const fenced: Out = backend === "wasm"
+      ? await runWasm(res.binaryPath!).then(
+          (r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: r.exitCode }),
+          () => runWasmToTrap(res.binaryPath!).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: 1 })),
+        )
+      : await nativeRun(res.binaryPath!);
+    expect(nodeOut.exitCode).toBe(0);
+    expect(fenced.exitCode, row.id).not.toBe(0);
+    expect(nodeOut.stdout.startsWith(fenced.stdout), row.id).toBe(true);
+    expect(fenced.stderr, row.id).toContain(row.fence);
     return;
   }
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);

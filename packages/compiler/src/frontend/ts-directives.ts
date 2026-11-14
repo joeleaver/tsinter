@@ -195,7 +195,50 @@ export function suppressedWriteSites(sf: ts.SourceFile, checker: ts.TypeChecker)
       return s.startsWith("Readonly<") || s.startsWith("readonly ") || s.startsWith("ReadonlyArray<");
     });
   };
+  const readonlyArray = (t: ts.Type): boolean => {
+    const parts = t.isUnionType() ? t.getTypes() : [t];
+    return parts.some((p) => {
+      const str = checker.typeToString(p);
+      return str.startsWith("readonly ") || str.startsWith("ReadonlyArray<");
+    });
+  };
+  const mutableArray = (t: ts.Type): boolean => {
+    const parts = t.isUnionType() ? t.getTypes() : [t];
+    return parts.some((p) => {
+      const str = checker.typeToString(p);
+      return !str.startsWith("readonly ") && (str.endsWith("[]") || str.startsWith("Array<") || /^\[.*\]$/.test(str));
+    });
+  };
+  /** A value position whose slot type is its contextual type: an argument,
+   * an initializer, an assignment's right side, a returned value, a
+   * property value. */
+  const slotValue = (n: ts.Node): boolean => {
+    const p = n.parent;
+    if (p === undefined || !ts.isExpression(n)) return false;
+    const args: readonly ts.Node[] | undefined = ts.isCallExpression(p) || ts.isNewExpression(p) ? p.arguments : undefined;
+    return (args !== undefined && args.some((a) => a === n)) ||
+      (ts.isVariableDeclaration(p) && p.initializer === n && p.type !== undefined) ||
+      (ts.isBinaryExpression(p) && p.right === n && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) ||
+      (ts.isReturnStatement(p) && p.expression === n) ||
+      (ts.isPropertyAssignment(p) && p.initializer === n);
+  };
   const visit = (n: ts.Node): void => {
+    if (isTs && slotValue(n)) {
+      let vt: ts.Type | undefined;
+      let ct: ts.Type | undefined;
+      try {
+        vt = checker.getTypeAtLocation(n);
+        ct = checker.getContextualType(n as ts.Expression);
+      } catch {
+        vt = undefined;
+      }
+      if (vt !== undefined && ct !== undefined && readonlyArray(vt) && !readonlyArray(ct) && mutableArray(ct)) {
+        out.push({
+          node: n,
+          feature: "a read-only array entering a mutable array slot (TypeScript's error there is suppressed; a later write through the slot would throw in Node on a frozen array, and this build keeps no frozen bit)",
+        });
+      }
+    }
     if (ts.isIdentifier(n)) {
       const w = writeTop(n);
       if (w !== null && !ts.isDeleteExpression(w)) {

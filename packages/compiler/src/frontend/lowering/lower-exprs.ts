@@ -3836,6 +3836,45 @@ export function assertedRecvGuardFor(L: Lowerer, inner: IrExpr, member: string, 
   return { kind: "call", callee: name, args: [inner], type: t, loc };
 }
 
+/** `inner` (a union with unit arms), or a named stop when it holds one:
+ * a computed-key read through a possibly undefined or null value, whose
+ * Node TypeError names the runtime key (docs/design/ts-directives.md). */
+function unitArmFence(L: Lowerer, inner: IrExpr, loc: SrcLoc): IrExpr {
+  if (inner.type.kind !== "union") return inner;
+  const unionId = inner.type.unionId;
+  const arms = L.unions.get(unionId)?.arms ?? [];
+  const units = arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+  if (units.length === 0) return inner;
+  const t = inner.type;
+  const key = `unitfence:${unionId}`;
+  let name = L.retagHelpers.get(key);
+  if (!name) {
+    name = `%union.recv.${L.retagHelpers.size}`;
+    L.retagHelpers.set(key, name);
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: t, loc };
+    const body: IrStmt[] = units.map((i) => {
+      const what = arms[i]!.kind === "nullT" ? "null" : "undefined";
+      return {
+        kind: "if",
+        cond: { kind: "unionIsTag", unionId, tag: i, negated: false, value: x, type: BOOL, loc },
+        then: [{ kind: "runtimeFence", code: "SC1090", message: `a computed-key read through ${what} (Node throws TypeError: Cannot read properties of ${what} (reading <the key>))`, loc }],
+        else_: null,
+        loc,
+      } as IrStmt;
+    });
+    body.push({ kind: "return", value: x, loc });
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "x.0", name: "x", type: t }],
+      returnType: t,
+      locals: [{ id: "x.0", name: "x", type: t, mutable: false }],
+      body,
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [inner], type: t, loc };
+}
+
 export function undefRecvGuard(L: Lowerer, operand: IrExpr, member: string, loc: SrcLoc): IrExpr {
   return undefThrowGuard(L, operand, `Cannot read properties of undefined (reading '${member}')`, loc);
 }
@@ -13005,21 +13044,9 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
           recv = assertedRecvGuardFor(L, value, literalField, loc);
         } else {
           // Node's message names the runtime key; the guard spells a
-          // static one, so a computed key on a unit arm stops by name.
-          const t = L.declareHiddenLocal("%ukr", value.type);
-          const ref: IrExpr = { kind: "varRef", localId: t.id, type: value.type, loc };
-          const stmts: IrStmt[] = [{ kind: "varDecl", localId: t.id, init: value, loc }];
-          def.arms.forEach((a, i) => {
-            if (!isUnitType(a)) return;
-            stmts.push({
-              kind: "if",
-              cond: { kind: "unionIsTag", unionId, tag: i, negated: false, value: ref, type: BOOL, loc },
-              then: [{ kind: "runtimeFence", code: "SC1090", message: `a computed-key read through ${a.kind === "nullT" ? "null" : "undefined"} (Node throws TypeError: Cannot read properties of ${a.kind === "nullT" ? "null" : "undefined"} (reading <the key>))`, loc }],
-              else_: null,
-              loc,
-            });
-          });
-          recv = { kind: "seqExpr", stmts, result: ref, type: value.type, loc };
+          // static one, so a computed key on a unit arm stops by name
+          // (an interned helper: the check stays straight-line here).
+          recv = unitArmFence(L, value, loc);
         }
       }
     }

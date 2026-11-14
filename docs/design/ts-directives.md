@@ -51,12 +51,15 @@ closed now:
 2. **A member read through a value the checker types as possibly `undefined`/`null`** throws Node's
    `TypeError: Cannot read properties of undefined (reading 'k')`. Before, it answered `undefined`. Covered:
    `e.k` with `e: T | undefined`, the error suppressed or relaxed in JavaScript. A computed key there (`e[k]`)
-   stops by name instead, because Node's message names the runtime key. A receiver the checker has narrowed,
+   stops by name instead (an interned helper, so the check is straight-line), because Node's message names the runtime key. A receiver the checker has narrowed,
    or an optional chain, is unchanged.
 3. **A write to a read-only value refuses by name** (SC1090). The values in scope are a `Readonly<…>` (what
    `Object.freeze` answers) and a readonly array or tuple, in a TypeScript file. The writes covered are a
    member or element write, `delete`, `++`/`--`, and a mutating array method (`push`, `pop`, `shift`,
    `unshift`, `splice`, `sort`, `reverse`, `fill`, `copyWithin`).
+   - A read-only array flowing into a mutable array slot (an argument, a typed initializer, an assignment, a
+     return or a property value) also refuses by name, because a later write through the slot would throw in
+     Node on a frozen array.
    - This build keeps no runtime frozen bit. In strict code Node throws a TypeError there, so a refusal is the
      cheapest sound answer.
    - Not covered: a frozen value reached through a binding typed mutable (assignability ignores `readonly`).
@@ -70,4 +73,4 @@ closed now:
 - This is build acceptance only. Nothing in Node's observable behaviour differs, so there is no SEMANTICS.md
   entry.
 
-Rows: `packages/compiler/test/wasm-ts-directives.test.ts` (TSD-01..13).
+Rows: `packages/compiler/test/wasm-ts-directives.test.ts` (TSD-01..17).
