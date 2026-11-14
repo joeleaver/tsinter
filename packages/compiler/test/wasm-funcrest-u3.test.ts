@@ -515,7 +515,8 @@ test("LOUD-4-symiter direct: arguments[Symbol.iterator] traps with a named diagn
     "'use strict';\nfunction f() {\n  console.log(typeof arguments[Symbol.iterator]);\n}\nf(1, 'two');",
   );
   expect(stdout).toBe("");
-  expect(stderr).toContain("symbol-keyed property access outside class fields");
+  // Symbol step A: the well-known symbol value itself is what stops first.
+  expect(stderr).toContain("'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet");
 });
 test("LOUD-4-symiter value: same, through setTimeout", async () => {
   const { stdout, stderr } = await runRowTrap(
@@ -523,7 +524,8 @@ test("LOUD-4-symiter value: same, through setTimeout", async () => {
     "'use strict';\nsetTimeout(function () {\n  console.log(typeof arguments[Symbol.iterator]);\n}, 0, 1, 'two');",
   );
   expect(stdout).toBe("");
-  expect(stderr).toContain("symbol-keyed property access outside class fields");
+  // Symbol step A: the well-known symbol value itself is what stops first.
+  expect(stderr).toContain("'Symbol.iterator' is part of the standard library types but has no scriptc lowering yet");
 });
 
 // ============================================================
