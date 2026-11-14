@@ -8945,40 +8945,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // accessor-carrying shapes keep the SC2020 fence; non-record receivers
     // do too.
     if (member === "hasOwn" && call.arguments.length === 2 && !call.arguments.some((a) => ts.isSpreadElement(a))) {
-      const recvNode = call.arguments[0]!;
-      const keyNode = call.arguments[1]!;
-      const probed = probeLower(L, recvNode);
-      // A CHECKED-DYNAMIC receiver (the JS file-scope object-literal
-      // identity story): the runtime dyn probe — OBJ member presence, ARR
-      // index bounds, Node's ToObject TypeError on nullish.
-      if (probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval")) {
-        const loc = locOf(call);
-        const receiver = asDynOperand(L.lowerExpr(recvNode));
-        let key = L.lowerExpr(keyNode);
-        if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
-          key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
-        }
-        if (key.type.kind !== "string") return null;
-        return { kind: "libCall", fn: "dyn.hasOwn", args: [receiver, key], type: BOOL, loc };
-      }
-      if (probed?.type.kind !== "record") return null;
-      const shape = L.shapes.get(probed.type.shapeId);
-      if (!shape || shape.tuple || (!shape.indexValue && shapeHasAccessorSlots(shape))) return null;
-      const loc = locOf(call);
-      const receiver = undefToObjectGuard(L, L.lowerExpr(recvNode), locOf(call));
-      if (receiver.type.kind !== "record") return null; // probe/lower drift: keep the fence
-      let key = L.lowerExpr(keyNode);
-      // Number/boolean/dyn keys stringify — ToPropertyKey, the keyed-write
-      // path's rule; symbol and composite keys keep the fence.
-      if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
-        key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
-      }
-      if (key.type.kind !== "string") return null;
-      key = undefinedAsText(L, key, locOf(keyNode)); // GH #104: ToPropertyKey of undefined is "undefined"
-      // Index-signature shapes (Step 2B): own membership is the declared
-      // names plus the overflow keys (lower-stdlib-members.ts).
-      const helper = shape.indexValue ? recordHasOwnIndexHelper(L, receiver.type.shapeId, loc) : recordHasOwnHelper(L, receiver.type.shapeId, loc);
-      return { kind: "call", callee: helper, args: [receiver, key], type: BOOL, loc };
+      return lowerHasOwnCall(L, call, call.arguments[0]!, call.arguments[1]!);
     }
     if (member !== "keys" && member !== "values" && member !== "entries") return null;
     if (call.arguments.length !== 1 || ts.isSpreadElement(call.arguments[0]!)) return null;
@@ -10698,4 +10665,43 @@ function assignSourceDyn(L: Lowerer, src: IrExpr, node: ts.Node): IrExpr {
     return { kind: "dynFromJsval", value: L.jsvalIn(src, node), type: DYN, loc: src.loc };
   }
   return L.coerceToExpected(src, DYN);
+}
+
+/** `Object.hasOwn(recv, key)` (and `Object.prototype.hasOwnProperty.call(
+ * recv, key)`, the same own-key test): a checked-dynamic receiver's runtime
+ * probe, or a record's own-key answer; null keeps the caller's fence. */
+export function lowerHasOwnCall(L: Lowerer, call: ts.CallExpression, recvNode: ts.Expression, keyNode: ts.Expression): IrExpr | null {
+    const probed = probeLower(L, recvNode);
+    // A CHECKED-DYNAMIC receiver (the JS file-scope object-literal
+    // identity story): the runtime dyn probe — OBJ member presence, ARR
+    // index bounds, Node's ToObject TypeError on nullish.
+    if (probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval")) {
+      const loc = locOf(call);
+      const receiver = asDynOperand(L.lowerExpr(recvNode));
+      let key = L.lowerExpr(keyNode);
+      if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
+        key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
+      }
+      if (key.type.kind !== "string") return null;
+      return { kind: "libCall", fn: "dyn.hasOwn", args: [receiver, key], type: BOOL, loc };
+    }
+    if (probed?.type.kind !== "record") return null;
+    const shape = L.shapes.get(probed.type.shapeId);
+    if (!shape || shape.tuple || (!shape.indexValue && shapeHasAccessorSlots(shape))) return null;
+    const loc = locOf(call);
+    const receiver = undefToObjectGuard(L, L.lowerExpr(recvNode), locOf(call));
+    if (receiver.type.kind !== "record") return null; // probe/lower drift: keep the fence
+    let key = L.lowerExpr(keyNode);
+    // Number/boolean/dyn keys stringify — ToPropertyKey, the keyed-write
+    // path's rule; symbol and composite keys keep the fence.
+    if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
+      key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
+    }
+    if (key.type.kind !== "string") return null;
+    key = undefinedAsText(L, key, locOf(keyNode)); // GH #104: ToPropertyKey of undefined is "undefined"
+    // Index-signature shapes (Step 2B): own membership is the declared
+    // names plus the overflow keys (lower-stdlib-members.ts).
+    const helper = shape.indexValue ? recordHasOwnIndexHelper(L, receiver.type.shapeId, loc) : recordHasOwnHelper(L, receiver.type.shapeId, loc);
+    return { kind: "call", callee: helper, args: [receiver, key], type: BOOL, loc };
+  
 }

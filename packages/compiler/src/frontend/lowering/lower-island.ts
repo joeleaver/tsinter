@@ -671,7 +671,34 @@ import { regexCrossingChecked } from "./lower-regex.js";
   export function lowerIslandObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
     const loc = locOf(expr);
     const args: IrExpr[] = [];
+    // Leading spreads (`{ ...init, headers }`, the request-init idiom): each
+    // source copies onto a fresh object in source order (CopyDataProperties,
+    // the objSpread op) and the explicit properties merge last (JS's
+    // later-wins). A spread after an explicit property keeps the fence (its
+    // later-wins over that property is not this composition).
+    const spreadSrcs: IrExpr[] = [];
+    let sawProp = false;
     for (const prop of expr.properties) {
+      if (ts.isSpreadAssignment(prop)) {
+        if (sawProp) {
+          L.unsupported("SC1090", prop, "an object spread after explicit properties in an island-built object literal (spreads must come first)");
+        }
+        spreadSrcs.push(L.jsvalIn(L.lowerExpr(prop.expression), prop.expression));
+        continue;
+      }
+      sawProp = true;
+      // A shorthand property (`{ body, headers }`): the binding's value under
+      // its own name.
+      if (ts.isShorthandPropertyAssignment(prop) && prop.objectAssignmentInitializer === undefined) {
+        const nameLoc = locOf(prop.name);
+        args.push({
+          kind: "jsMarshal",
+          value: { kind: "strLit", value: (prop.name as ts.Identifier).text, type: STRING, loc: nameLoc },
+          type: JSVAL, loc: nameLoc,
+        });
+        args.push(L.jsvalIn(L.lowerShorthandValue(prop), prop.name));
+        continue;
+      }
       if (
         !ts.isPropertyAssignment(prop) ||
         !(ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))
@@ -679,7 +706,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
         L.unsupported(
           "SC1090",
           prop,
-          "this property form in an island-built object literal (only `name: value` is supported)",
+          "this property form in an island-built object literal (only `name: value`, shorthand names and leading spreads are supported)",
         );
       }
       const nameLoc = locOf(prop.name);
@@ -698,7 +725,11 @@ import { regexCrossingChecked } from "./lower-regex.js";
         args.push(L.jsvalIn(L.lowerExpr(init), init));
       }
     }
-    return { kind: "jsOp", op: "objLit", args, type: JSVAL, loc };
+    const lit: IrExpr = { kind: "jsOp", op: "objLit", args, type: JSVAL, loc };
+    if (spreadSrcs.length === 0) return lit;
+    let acc: IrExpr = { kind: "jsOp", op: "objLit", args: [], type: JSVAL, loc };
+    for (const src of spreadSrcs) acc = { kind: "jsOp", op: "objSpread", args: [acc, src], type: JSVAL, loc };
+    return args.length > 0 ? { kind: "jsOp", op: "objSpread", args: [acc, lit], type: JSVAL, loc } : acc;
   }
 
 /** Method calls on the island-backed ambient surface: `Math.<fn>(...)`
