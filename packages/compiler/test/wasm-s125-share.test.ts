@@ -66,4 +66,68 @@ const b = recA(src);
 b.k = "x";
 console.log(src, a === b);`,
   },
+  {
+    id: "S125-RET-01 a plain function returning a dynamic array as a typed result: the caller's push reaches the original (was H-EXIT-02)",
+    entry: "main.ts",
+    src: `const o: any = { list: ["a"] };
+function get(): string[] { return o.list; }
+const r = get(); r.push("b");
+console.log(o.list.length, r.length, r === o.list);`,
+  },
+  {
+    id: "S125-RET-02 an unknown argument cast and returned as a typed array: one array (was H-UNK-01b)",
+    entry: "main.ts",
+    src: `const src: any = { xs: [1] };
+function f(u: unknown): number[] { return (u as { xs: number[] }).xs; }
+const t = f(src);
+t.push(2);
+console.log(src.xs.length, src.xs);`,
+  },
+  {
+    id: "S125-RET-03 a spread of an arm value returned as a narrower type, whose caller reads undeclared keys, re-spreads and serializes it: the result's exact-fit copy stops by name at the return, never a record missing 'b' and 'z' (#148's case)",
+    entry: "main.ts",
+    fence: { text: /copied into typed storage it does not fit exactly/, stdout: "" },
+    src: `type Wide = { a: number; b: number };
+type Narrow = { a: number };
+const shared: any = JSON.parse('{"a":1,"b":2,"z":9}');
+function get(): unknown { return shared; }
+function f(): Narrow {
+  const w = get() as Wide;
+  return { ...w };
+}
+const r = f();
+console.log(r, Object.keys(r), (r as any).b, (r as any).z, { ...r }, JSON.stringify(r));
+const r3 = f();
+const r2 = { ...r3, extra: 1 };
+console.log(r2, Object.keys(r2));`,
+  },
+  {
+    id: "S125-W222-01 a cast of an unknown parameter returned as a narrower record, then printed, key-listed and serialized: every key, as Node (#222)",
+    entry: "main.ts",
+    src: `function f(v: unknown): { a: number } { return v as { a: number }; }
+const r = f(JSON.parse('{"a":1,"b":2}'));
+console.log(r, Object.keys(r), JSON.stringify(r));
+const s = f(JSON.parse('{"a":3}'));
+console.log(s.a + 1, s);`,
+  },
+  {
+    id: "S125-W222-02 the same result stored into a class field (fields never take the arm): the copy stops by name where it would drop 'b', never a silent { a: 1 } (#222)",
+    entry: "main.ts",
+    fence: { text: /copied into typed storage it does not fit exactly/, stdout: "" },
+    src: `function f(v: unknown): { a: number } { return v as { a: number }; }
+class C { p: { a: number } = { a: 0 }; }
+const c = new C();
+c.p = f(JSON.parse('{"a":1,"b":2}'));
+console.log(c.p);`,
+  },
+  {
+    id: "S125-W222-03 a cast of an unknown value into a narrower record printed where it is made (#222)",
+    entry: "main.ts",
+    src: `function show(v: unknown): void { console.log(v as { a: number }); }
+show(JSON.parse('{"a":1,"b":2}'));
+const keep: unknown[] = [];
+function hold(v: unknown): void { const x = v as { a: number }; keep.push(x.a); console.log(x.a); }
+hold(JSON.parse('{"a":5,"z":1}'));
+console.log(keep);`,
+  },
 ]);

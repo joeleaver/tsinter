@@ -297,7 +297,8 @@ test("H-VIEW-INSPECT console.log of nested views prints the static values as Nod
 
 const EXIT_ROWS: [string, string][] = [
   ["H-EXIT-01 a01-field-exit", "// @dynamic\nclass Box { items: string[] = []; }\nconst o: any = { list: [\"a\"] };\nconst b = new Box();\nb.items = o.list;\nb.items.push(\"b\");\nconsole.log(o.list.length, b.items.length);"],
-  ["H-EXIT-02 a02-return-exit", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction get(): string[] { return o.list; }\nconst r = get(); r.push(\"b\");\nconsole.log(o.list.length, r.length);"],
+  // H-EXIT-02 (a02-return-exit) is S125-RET-01 in wasm-s125-share.test.ts: a
+  // plain function's result now shares the dynamic value (S125's amendment).
   ["H-EXIT-03 a05-map-value", "// @dynamic\nconst o: any = { list: [\"a\"] };\nconst m = new Map<string, string[]>();\nm.set(\"k\", o.list);\nm.get(\"k\")!.push(\"z\");\nconsole.log(o.list.length);"],
   ["H-EXIT-04 a09-generator", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction* g(): Generator<string[]> { yield o.list; }\nfor (const x of g()) x.push(\"z\");\nconsole.log(o.list.length);"],
   ["H-EXIT-06 a15-ctor-param", "// @dynamic\nconst o: any = { list: [\"a\"] };\nclass R { constructor(xs: string[]) { xs.push(\"z\"); } }\nnew R(o.list);\nconsole.log(o.list.length);"],
@@ -442,10 +443,8 @@ test("H-UNK-01a an 'unknown' value leaving into typed storage follows S115 (d): 
   expect(await armRow("H-UNK-01a", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nconst t = u as number[];\nt.push(2);\nconsole.log(src.length);")).toBe("2\n");
 });
 
-test("H-UNK-01b an 'unknown' value leaving into typed storage follows S115 (d): u04-unknown-param.ts refuses by name", async () => {
-  const d = await refuseRow("H-UNK-01b", "// @dynamic\nconst src: any = { xs: [1] };\nfunction f(u: unknown): number[] { return (u as { xs: number[] }).xs; }\nconst t = f(src);\nt.push(2);\nconsole.log(src.xs.length);");
-  expect(d).toMatch(EXIT_REFUSED);
-});
+// H-UNK-01b (u04-unknown-param.ts) is S125-RET-02 in wasm-s125-share.test.ts:
+// a plain function's result now shares the dynamic value (S125's amendment).
 
 test("H-UNK-01c an 'unknown' value leaving into typed storage follows S115 (d): u05-unknown-guard.ts — unit U2a: not fresh, so the binding takes the dynamic arm (the value itself), matching Node", async () => {
   expect(await armRow("H-UNK-01c", "// @dynamic\nconst src: any = [1];\nconst u: unknown = src;\nif (Array.isArray(u)) {\n  const t: number[] = u as number[];\n  t.push(2);\n}\nconsole.log(src.length);")).toBe("2\n");

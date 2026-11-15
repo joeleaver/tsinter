@@ -10609,6 +10609,20 @@ not build:
   instance those parameters, and the result, hold the dynamic values
   themselves, so dynamic code and the body share the array. Direct calls
   from typed code keep the typed function.
+- **A width copy that is printed (GH #222).** A dynamic value checked into
+  a closed record type (or an array of one) keeps only the type's declared
+  fields, where the JavaScript object keeps every key. (c) now counts a
+  print, a serialization or a key listing as an observer of that copy:
+  where the check is made, through the binding it lands in, or anywhere a
+  value of the type (or of a closed record type inside it) is printed when
+  no binding accounts for every use. At a contained slot (a cast, a
+  binding, a plain function's result) such a copy takes the dynamic arm,
+  so it prints every key as Node; where the arm does not build, the slot's
+  copy takes only exactly-fitting values and stops by name otherwise
+  (S128 (a3)). Anywhere else it refuses like any other observed copy, and
+  a copy taken from an arm value into a field or element stops by name
+  (S128 (a2)). S009's width tolerance stays only for
+  a value nothing else holds (a fresh `JSON.parse(text) as T`).
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes).
 

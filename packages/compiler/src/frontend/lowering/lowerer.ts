@@ -1516,19 +1516,18 @@ export class Lowerer {
       if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined || (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
       return fn;
     })();
-    if (retFn !== null) {
-      this.dynArmExitNodes.set(exit, `ret:${dynArmKey(retFn)}`);
-      return exit;
-    }
-    const key = dynArmKey(n);
-    if (contained) this.dynArmExitNodes.set(exit, key);
+    // (Review: the result's exit keeps the exact-fit guard below — a copy
+    // taken from an arm value, or at a `ret:` slot whose arm did not build.)
+    const key = retFn !== null ? `ret:${dynArmKey(retFn)}` : dynArmKey(n);
+    const armable = contained || retFn !== null;
+    if (armable) this.dynArmExitNodes.set(exit, key);
     // Never a silent width copy where U2 is in play: a copy taken FROM a
     // dynamic-arm value, or one at a slot whose arm did not build (the
     // fallback pass's exactSites), copies only a value of exactly its
     // type's shape, and stops by name otherwise (SEMANTICS.md S128 (a2)).
     if (exit.kind === "dynCheck") {
       const fromArm = this.exitFromArm(node);
-      if ((fromArm || (contained && this.exactSites.has(key))) && this.copiesOnCrossing(exit.type) && this.boundaryExitSafe(exit.type)) {
+      if ((fromArm || (armable && this.exactSites.has(key))) && this.copiesOnCrossing(exit.type) && this.boundaryExitSafe(exit.type)) {
         return this.exactGuard(exit, fromArm
           ? "a dynamic value held in a typed slot (SEMANTICS.md S128) copied into typed storage it does not fit exactly (a key the type does not declare, keys out of the type's order, an absent required key that is not a plain number, string or boolean, an optional key holding undefined, or a mistyped value): the copy would differ from the object"
           : "a dynamic value that does not have exactly its typed slot's shape, in a slot whose uses this build cannot compile on the dynamic arm yet (SEMANTICS.md S128 (a3))");
