@@ -9,6 +9,7 @@ import { programHoldsBigint, wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
+import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { builtinBoxOperand, isDynClassDecl, isGlobalBox, lowerBuiltinBox, lowerBuiltinBoxCall, lowerDynClass, lowerCodegenSite, lowerHasOwnPropertyCall, lowerEs5Ref, lowerObjModelDelete, lowerObjModelInstanceof, lowerObjModelNew, lowerObjectPrototypeRead, guardDynKeyLoc, symbolKeyOf } from "./lower-objmodel.js";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11419,6 +11420,87 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
   /** probeLower, with an island result retyped as the checked-dynamic
    * value it is on the one-world lanes without the engine (U1a): the
    * dyn-keyed special cases claim island operands too. */
+  /** A dynamic-receiver method call's PROBE of its receiver, held for the
+   * one real lowering that follows (lowerDynReceiverMethodCall): when the
+   * probe's answer is not the dynamic value, the call returns null and the
+   * typed path lowers the same receiver node again. In a chain
+   * (`new Command().a().b()...`) that second lowering re-probes every
+   * inner receiver, so the cost doubled per link. Held, the next
+   * `L.lowerExpr` of the node in the same function context takes the
+   * probe's own IR, or its poisoning with exactly the diagnostics the
+   * probe captured, once; the owning call drops an untaken entry when it
+   * finishes. A chain lowers each link once. */
+  export const heldProbes = new Map<ts.Node, { ir: IrExpr | null; diags: ScrDiagnostic[]; fences: ScrDiagnostic[]; ctx: object; owner: ts.Node }>();
+
+  /** The runtime fences (coverage's ledger) the last probeLowerHeld
+   * recorded: a held probe whose IR no lowering takes drops them, so a
+   * re-lowered receiver is not counted twice. */
+  let lastProbeFences: ScrDiagnostic[] = [];
+
+  /** The held probe: a REAL lowering of the receiver (the sink is left as
+   * it is, so the deferrals a JavaScript member or function value takes in
+   * a real lowering -- which a capturing probe disables -- happen exactly
+   * as they will), done ahead of time. A poisoned probe's diagnostics move
+   * out of the sink into the held entry (owned by `owner`): taken, they
+   * come back where the lowering happens; untaken, they are dropped, as a
+   * capturing probe drops them. A successful probe's diagnostics are the
+   * lowering's own; the caller holds the IR with holdProbe when it
+   * declines it. */
+  export function probeLowerHeld(L: Lowerer, node: ts.Expression, owner: ts.Node): IrExpr | null {
+    const sink = L.diagSink ?? L.diags;
+    const before = sink.length;
+    const fencesBefore = L.runtimeFences.length;
+    try {
+      const ir = L.lowerExpr(node);
+      lastProbeFences = L.runtimeFences.slice(fencesBefore);
+      return ir;
+    } catch (e) {
+      if (e instanceof PoisonError) {
+        const diags = sink.splice(before);
+        heldProbes.set(node, { ir: null, diags, fences: L.runtimeFences.slice(fencesBefore), ctx: L.ctx, owner });
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  export function holdProbe(L: Lowerer, node: ts.Node, ir: IrExpr, owner: ts.Node): void {
+    heldProbes.set(node, { ir, diags: [], fences: lastProbeFences, ctx: L.ctx, owner });
+  }
+
+  /** Drop `node`'s held probe if `owner` holds it (the owning call ended
+   * without any lowering taking it): its runtime fences leave the ledger,
+   * since whatever lowered that receiver instead recorded its own. */
+  export function releaseHeldProbe(L: Lowerer, owner: ts.Node, node: ts.Node): void {
+    const h = heldProbes.get(node);
+    if (h === undefined || h.owner !== owner) return;
+    heldProbes.delete(node);
+    if (h.fences.length > 0) {
+      const drop = new Set(h.fences);
+      const kept = L.runtimeFences.filter((f) => !drop.has(f));
+      L.runtimeFences.length = 0;
+      L.runtimeFences.push(...kept);
+    }
+  }
+
+  /** Lowerer.lowerExpr's first step: a held probe of this node, lowered in
+   * this same function context, is this lowering -- its IR, or its
+   * poisoning (the probe's diagnostics pushed now, where the lowering
+   * happens). Undefined when nothing is held. */
+  export function takeHeldProbe(L: Lowerer, node: ts.Node): IrExpr | undefined {
+    if (heldProbes.size === 0) return undefined;
+    const h = heldProbes.get(node);
+    if (h === undefined || h.ctx !== L.ctx) return undefined;
+    heldProbes.delete(node);
+    if (h.ir === null) {
+      // Already in their final form (pushDiag transformed them once, as
+      // the probe lowered): delivered as they are.
+      for (const d of h.diags) L.pushDiagRaw(d);
+      throw new PoisonError();
+    }
+    return h.ir;
+  }
+
   export function probeLowerDyn(L: Lowerer, node: ts.Expression): IrExpr | null {
     const e = probeLower(L, node);
     return e !== null && L.sharedDynamic ? asDynOperand(e) : e;

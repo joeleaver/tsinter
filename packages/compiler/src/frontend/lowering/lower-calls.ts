@@ -26,7 +26,7 @@ import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCa
 import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
 import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
-import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
+import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
@@ -3089,7 +3089,12 @@ const armCallScoped = new WeakSet<ts.CallExpression>();
  * check, a dynamic result stays dynamic and checks at the typed leaf it
  * reaches, anything else converts where the types differ. */
 export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
-  return dtsCallResult(L, expr, lowerCallInner(L, expr));
+  try {
+    return dtsCallResult(L, expr, lowerCallInner(L, expr));
+  } finally {
+    // A receiver probe this call held and no lowering took ends with it.
+    if (ts.isPropertyAccessExpression(expr.expression)) releaseHeldProbe(L, expr, expr.expression.expression);
+  }
 }
 
 function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
@@ -5052,8 +5057,14 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // evolving `let h = {}` object flowing back out of a JS helper —
       // tsc types the return by the evolved shape, the binding lowered
       // dyn): probe the lowering and claim exactly the dyn results.
-      const probed = probeLowerDyn(L, access.expression);
-      if (probed?.type.kind !== "dyn") return null;
+      // The probe is held for the typed path's own lowering of the same
+      // receiver (lower-exprs.ts heldProbes): a chain lowers each link once.
+      const raw = probeLowerHeld(L, access.expression, call);
+      const probed = raw !== null && L.sharedDynamic ? asDynOperand(raw) : raw;
+      if (probed?.type.kind !== "dyn") {
+        if (raw !== null) holdProbe(L, access.expression, raw, call);
+        return null;
+      }
       recv = probed;
     }
     // A checker-`any` receiver that already lowered to a real STRING (the

@@ -123,7 +123,7 @@ import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { orderNoteCopy } from "./record-order.js";
-import { asDynOperand, bindOnce, captureAssignValue, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -3261,6 +3261,13 @@ export class Lowerer {
     const d = this.instantiationContext
       ? { ...diag, message: `${diag.message} (${this.instantiationContext})` }
       : diag;
+    this.pushDiagRaw(d);
+  }
+
+  /** pushDiag's delivery half: a diagnostic already in its final form (a
+   * held probe's, transformed when it was first pushed) goes to the sink,
+   * or to the build's list unless an exact duplicate is there. */
+  pushDiagRaw(d: ScrDiagnostic): void {
     // Deferred collection: the wrapper decides whether these ever report
     // (a reference flushes them; unreferenced declarations stay silent in
     // builds and report under coverage's unreached group).
@@ -9343,6 +9350,10 @@ export class Lowerer {
   /* ── expressions ──────────────────────────────────────────────────── */
 
   lowerExpr(expr: ts.Expression): IrExpr {
+    // A dynamic-receiver call's held probe of this very node (lower-exprs.ts
+    // heldProbes): that lowering, taken once.
+    const held = takeHeldProbe(this, expr);
+    if (held !== undefined) return held;
     try {
       return this.lowerExprUntagged(expr);
     } catch (err) {
