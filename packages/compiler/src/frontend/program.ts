@@ -802,6 +802,17 @@ function declaredOnlyExportUses(load: LoadResult): ScrDiagnostic[] {
         if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = checker.rawGetAliasedSymbol(sym);
         const d = unimplemented(sym);
         if (d !== null) report(n, (n.propertyName ?? n.name).text, d);
+      } else if (
+        ts.isExportSpecifier(n) && !n.isTypeOnly &&
+        ts.isExportDeclaration(n.parent.parent) && !n.parent.parent.isTypeOnly && n.parent.parent.moduleSpecifier !== undefined
+      ) {
+        // A re-export from the package (`export { flavor as f2 } from
+        // "pkg"`): Node links it at load, so a missing export fails the
+        // whole program there too.
+        let sym = checker.getSymbolAtLocation((n.propertyName ?? n.name) as ts.Node);
+        if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = checker.rawGetAliasedSymbol(sym);
+        const d = unimplemented(sym);
+        if (d !== null) report(n, ((n.propertyName ?? n.name) as ts.Identifier).text, d);
       } else if (ts.isPropertyAccessExpression(n)) {
         const d = unimplemented(checker.getSymbolAtLocation(n.name));
         if (d !== null) report(n.name, n.name.text, d);

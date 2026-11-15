@@ -32,8 +32,9 @@ interface SpecUse {
   kind: "import" | "require";
   start: number;
   end: number;
-  /** A type-only use (`import type`, `export type`, an all-`type`
-   * specifier list, an `import("x")` type): no JS is loaded for it. */
+  /** A type-only use (`import type`, `export type`, an `import("x")`
+   * type): no JS is loaded for it. An all-inline-`type` specifier list
+   * (`import { type X } from "m"`) still LOADS the module under Node. */
   typeOnly: boolean;
 }
 
@@ -70,19 +71,10 @@ function specifierUsesOf(file: string): SpecUse[] {
   const push = (lit: ts5.Node & { text: string }, kind: "import" | "require", typeOnly = false): void => {
     uses.push({ spec: lit.text, kind, start: lit.getStart(sf), end: lit.getEnd(), typeOnly });
   };
-  const importTypeOnly = (n: ts5.ImportDeclaration | ts5.ExportDeclaration): boolean => {
-    if (ts5.isExportDeclaration(n)) {
-      if (n.isTypeOnly) return true;
-      const ec = n.exportClause;
-      return ec !== undefined && ts5.isNamedExports(ec) && ec.elements.length > 0 && ec.elements.every((e) => e.isTypeOnly);
-    }
-    const clause = n.importClause;
-    if (clause === undefined) return false; // a side-effect import loads the module
-    if (clause.isTypeOnly) return true;
-    if (clause.name !== undefined) return false;
-    const nb = clause.namedBindings;
-    return nb !== undefined && ts5.isNamedImports(nb) && nb.elements.length > 0 && nb.elements.every((e) => e.isTypeOnly);
-  };
+  // Only `import type` / `export type` erase the statement; inline `type`
+  // specifiers leave an import Node still evaluates.
+  const importTypeOnly = (n: ts5.ImportDeclaration | ts5.ExportDeclaration): boolean =>
+    ts5.isExportDeclaration(n) ? n.isTypeOnly : n.importClause?.isTypeOnly === true;
   const visit = (n: ts5.Node): void => {
     if ((ts5.isImportDeclaration(n) || ts5.isExportDeclaration(n)) && n.moduleSpecifier !== undefined && ts5.isStringLiteral(n.moduleSpecifier)) {
       push(n.moduleSpecifier, "import", importTypeOnly(n));

@@ -175,6 +175,9 @@ describe("S133 (b) through the view: a declared export the loaded JS lacks refus
     ["DV-07 a CommonJS package's require destructure", ["ndiff"], { ...LACKS("ndiff", false, false, false), "main.js": `const { greet, flavor } = require("ndiff");\nconsole.log(greet("x"), flavor);` }],
     ["DV-08 a dual package's ESM side lacks a named import (Node's link-time SyntaxError)", ["cdiff2"], { ...LACKS("cdiff2", true, true, false), "main.ts": `import { greet, flavor } from "cdiff2";\nconsole.log(greet("x"), flavor);` }],
     ["DV-09 a member read of the module object", ["cdiff"], { ...LACKS("cdiff", true, false, true), "main.js": `const m = require("cdiff");\nconsole.log(m.greet("x"), m.flavor);` }],
+    ["DV-14 a re-export of the missing name (Node's link-time SyntaxError)", ["cdiff2"], { ...LACKS("cdiff2", true, true, false), "main.ts": `export { flavor } from "cdiff2";\nconsole.log("hi");` }],
+    ["DV-15 a re-export in an intermediate module the entry imports only partly", ["cdiff2"], { ...LACKS("cdiff2", true, true, false), "re.ts": `export { greet, flavor } from "cdiff2";`, "main.ts": `import { greet } from "./re.ts";\nconsole.log(greet("x"));` }],
+    ["DV-16 a renamed re-export from a non-dual CommonJS package", ["ndiff"], { ...LACKS("ndiff", false, false, false), "main.ts": `export { flavor as f2 } from "ndiff";\nconsole.log("hi");` }],
   ];
   test.for(cases)("%s", async ([id, pkgs, files]) => {
     const entry = project(id.split(" ")[0]!, files);
