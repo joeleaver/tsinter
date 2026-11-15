@@ -32,6 +32,10 @@ interface SpecUse {
   kind: "import" | "require";
   start: number;
   end: number;
+  /** A type-only use (`import type`, `export type`, an `import("x")`
+   * type): no JS is loaded for it. An all-inline-`type` specifier list
+   * (`import { type X } from "m"`) still LOADS the module under Node. */
+  typeOnly: boolean;
 }
 
 const usesCache = new Map<string, { key: string; uses: SpecUse[] }>();
@@ -64,12 +68,16 @@ function specifierUsesOf(file: string): SpecUse[] {
   }
   const sf = ts5.createSourceFile(file, text, ts5.ScriptTarget.Latest, true, scriptKindOf(file));
   const uses: SpecUse[] = [];
-  const push = (lit: ts5.Node & { text: string }, kind: "import" | "require"): void => {
-    uses.push({ spec: lit.text, kind, start: lit.getStart(sf), end: lit.getEnd() });
+  const push = (lit: ts5.Node & { text: string }, kind: "import" | "require", typeOnly = false): void => {
+    uses.push({ spec: lit.text, kind, start: lit.getStart(sf), end: lit.getEnd(), typeOnly });
   };
+  // Only `import type` / `export type` erase the statement; inline `type`
+  // specifiers leave an import Node still evaluates.
+  const importTypeOnly = (n: ts5.ImportDeclaration | ts5.ExportDeclaration): boolean =>
+    ts5.isExportDeclaration(n) ? n.isTypeOnly : n.importClause?.isTypeOnly === true;
   const visit = (n: ts5.Node): void => {
     if ((ts5.isImportDeclaration(n) || ts5.isExportDeclaration(n)) && n.moduleSpecifier !== undefined && ts5.isStringLiteral(n.moduleSpecifier)) {
-      push(n.moduleSpecifier, "import");
+      push(n.moduleSpecifier, "import", importTypeOnly(n));
     } else if (ts5.isImportEqualsDeclaration(n) && ts5.isExternalModuleReference(n.moduleReference) && ts5.isStringLiteral(n.moduleReference.expression)) {
       push(n.moduleReference.expression, "require");
     } else if (ts5.isCallExpression(n)) {
@@ -79,7 +87,7 @@ function specifierUsesOf(file: string): SpecUse[] {
         else if (ts5.isIdentifier(n.expression) && n.expression.text === "require" && n.arguments.length === 1) push(arg, "require");
       }
     } else if (ts5.isImportTypeNode(n) && ts5.isLiteralTypeNode(n.argument) && ts5.isStringLiteral(n.argument.literal)) {
-      push(n.argument.literal, "import");
+      push(n.argument.literal, "import", true);
     }
   };
   // An explicit stack, never recursion: a long binary chain (a corpus
@@ -116,6 +124,10 @@ export interface DevGraph {
    * included), with the first file naming it — the npm subpaths a program
    * imports (SEMANTICS.md S133 (f)). */
   bareSpecs: Map<string, string>;
+  /** Every site naming each non-relative specifier, with its syntax
+   * (`import` — static or dynamic — or `require`): the declared-surface
+   * view of a dual package resolves from these (SEMANTICS.md S133 (j)). */
+  bareSites: Map<string, { file: string; kind: "import" | "require"; typeOnly: boolean }[]>;
 }
 
 /** Walks the source graph from `roots` (see the header) and answers the
@@ -131,6 +143,7 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
   };
   for (const r of roots) enqueue(r);
   const bySpec = new Map<string, DevGraphConflict["sites"]>();
+  const bareSites = new Map<string, { file: string; kind: "import" | "require"; typeOnly: boolean }[]>();
   const devSpecs = new Set<string>();
   while (queue.length > 0) {
     const file = queue.shift()!;
@@ -141,6 +154,9 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
         enqueue(resolveRelativeModule(file, spec));
         continue;
       }
+      let bs = bareSites.get(spec);
+      if (bs === undefined) bareSites.set(spec, (bs = []));
+      bs.push({ file, kind: u.kind, typeOnly: u.typeOnly });
       const dev = devResolve(file, spec, u.kind);
       let sites = bySpec.get(spec);
       if (sites === undefined) bySpec.set(spec, (sites = []));
@@ -166,5 +182,5 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
   }
   const bareSpecs = new Map<string, string>();
   for (const [spec, sites] of bySpec) bareSpecs.set(spec, sites[0]!.file);
-  return { paths, conflicts, files: [...seen], bareSpecs };
+  return { paths, conflicts, files: [...seen], bareSpecs, bareSites };
 }

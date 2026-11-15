@@ -95,7 +95,7 @@ function nodeRun(file: string, args: string[], env?: NodeJS.ProcessEnv): Out {
   return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
 }
 
-async function nativeRun(path: string, args: string[], env?: NodeJS.ProcessEnv): Promise<Out> {
+export async function nativeRun(path: string, args: string[], env?: NodeJS.ProcessEnv): Promise<Out> {
   try {
     const p = run(path, args, { encoding: "utf8", ...(env ? { env } : {}) });
     p.child.stdin?.end();

@@ -5,7 +5,7 @@
 import { returnWidens } from "./big-widen.js";
 import { lowerFileHandleMethodCall } from "./lower-filehandle.js";
 import * as ts from "../ts7/adapter.js";
-import { lowerObjModelStatic } from "./lower-objmodel.js";
+import { lowerObjModelStatic, usesThis } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
@@ -4402,6 +4402,22 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         if (facadeServed) return facadeServed;
         const memberSym = L.checker.getSymbolAtLocation(nsMember);
         if (memberSym) fenceEarlyNsMemberRef(L, expr.expression, memberSym);
+        // Node calls `ns.f()` with the namespace object as `this`; the
+        // direct call below passes none, so a callee whose own body reads
+        // `this` refuses by name (an arrow's `this` is lexical, unaffected).
+        {
+          const impl = L.resolveValueSymbol(nsMember);
+          const d = impl ? L.checker.declarationsOf(impl)[0] : undefined;
+          const init = d && ts.isVariableDeclaration(d) && d.initializer ? d.initializer : undefined;
+          const fn = d && ts.isFunctionDeclaration(d) ? d : init && ts.isFunctionExpression(init) ? init : undefined;
+          if (fn && fn.body && usesThis(fn)) {
+            L.unsupported(
+              "SC1090",
+              expr,
+              `calling '${nsMember.text}' through its namespace when its body reads 'this' (Node passes the namespace object as 'this')`,
+            );
+          }
+        }
         const generic = L.genericFnOf(nsMember);
         if (generic) return L.lowerGenericCall(expr, generic);
         const sig = L.fnSigOf(nsMember);

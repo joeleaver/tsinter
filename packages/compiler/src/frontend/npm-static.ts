@@ -81,6 +81,7 @@ export function setNpmStaticPackages(packages: Iterable<string>): void {
   untypedPkgCache.clear();
   realpathProbed.clear();
   dtsViews.clear();
+  dtsViewRefusals.clear();
 }
 
 /* ── the declared-surface view (SEMANTICS.md S133) ──────────────────────
@@ -134,6 +135,19 @@ const dtsViews = new Map<string, NpmStaticDtsView>();
 
 export function registerNpmStaticDtsView(view: NpmStaticDtsView): void {
   if (activePackages.has(view.pkg)) dtsViews.set(view.specifier, view);
+}
+
+/** Why an opted-in package that ships declarations got NO declared-surface
+ * view this load (a dual package imported with both syntaxes, importers
+ * resolving to different copies): the fallback note names it. */
+const dtsViewRefusals = new Map<string, string>();
+
+export function setNpmStaticDtsViewRefusal(pkg: string, reason: string): void {
+  if (activePackages.has(pkg)) dtsViewRefusals.set(pkg, reason);
+}
+
+export function npmStaticDtsViewRefusalOf(pkg: string): string | undefined {
+  return dtsViewRefusals.get(pkg);
 }
 
 export function npmStaticDtsViews(): ReadonlyMap<string, NpmStaticDtsView> {
@@ -444,7 +458,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
       // The declared-surface mirror serves the real declaration's bytes.
       const mirror = dtsMirrorTargetOf(path);
       if (mirror !== null) {
-        if (!isDeclarationFileName(mirror.real)) return undefined;
+        if (!mirrorServes(mirror.real)) return undefined;
         try {
           return readFileSync(mirror.real, "utf8");
         } catch {
@@ -511,7 +525,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     },
     hideFile: (path) => {
       const mirror = dtsMirrorTargetOf(path);
-      if (mirror !== null) return !isDeclarationFileName(mirror.real) || !isFileSync(mirror.real);
+      if (mirror !== null) return !mirrorServes(mirror.real) || !isFileSync(mirror.real);
       const target = shadowTargetOf(path);
       if (!target) return false;
       if (target.viaTypes) return true; // the @types twin hides whole
@@ -520,7 +534,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     fileExists: (path) => {
       const mirror = dtsMirrorTargetOf(path);
       if (mirror === null) return undefined;
-      return isDeclarationFileName(mirror.real) && isFileSync(mirror.real);
+      return mirrorServes(mirror.real) && isFileSync(mirror.real);
     },
     directoryExists: (path) => {
       const mirror = dtsMirrorTargetOf(path);
@@ -535,7 +549,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
         for (const e of readdirSync(mirror.real, { withFileTypes: true })) {
           if (e.isDirectory()) {
             if (e.name !== "node_modules") directories.push(e.name);
-          } else if (isDeclarationFileName(e.name)) files.push(e.name);
+          } else if (mirrorServes(e.name)) files.push(e.name);
         }
         return { files, directories };
       } catch {
@@ -544,6 +558,15 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     },
     realpath: (path) => (dtsMirrorTargetOf(path) !== null ? path : undefined),
   };
+}
+
+/** What the declared-surface mirror serves from the real tree: declaration
+ * files, and the package.json files that set their MODULE FORMAT (a
+ * `types/package.json` with no "type" makes `types/index.d.ts` CommonJS in
+ * a "type": "module" package — postgres — so `export =` keeps its default
+ * import under NodeNext, exactly as the project's own tsc sees it). */
+function mirrorServes(real: string): boolean {
+  return isDeclarationFileName(real) || real === "package.json" || real.endsWith("/package.json") || real.endsWith("\\package.json");
 }
 
 /* ── auto-detection (--npm-static=auto) ─────────────────────────────────
