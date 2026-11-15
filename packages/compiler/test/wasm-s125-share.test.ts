@@ -84,9 +84,8 @@ t.push(2);
 console.log(src.xs.length, src.xs);`,
   },
   {
-    id: "S125-RET-03 a spread of an arm value returned as a narrower type, whose caller reads undeclared keys, re-spreads and serializes it: the result's exact-fit copy stops by name at the return, never a record missing 'b' and 'z' (#148's case)",
+    id: "S125-RET-03 a spread of an arm value returned as a narrower type, whose caller reads undeclared keys, re-spreads and serializes it: every key, as Node (#148's case)",
     entry: "main.ts",
-    fence: { text: /copied into typed storage it does not fit exactly/, stdout: "" },
     src: `type Wide = { a: number; b: number };
 type Narrow = { a: number };
 const shared: any = JSON.parse('{"a":1,"b":2,"z":9}');
@@ -129,5 +128,23 @@ const keep: unknown[] = [];
 function hold(v: unknown): void { const x = v as { a: number }; keep.push(x.a); console.log(x.a); }
 hold(JSON.parse('{"a":5,"z":1}'));
 console.log(keep);`,
+  },
+  {
+    id: "S125-RV-01 (delta review) a fresh spread of an arm value returned as a narrower type is a new object: reading its declared key runs as Node",
+    entry: "main.ts",
+    src: `type Wide = { a: number; b: number };
+const shared: any = JSON.parse('{"a":1,"b":2,"z":9}');
+function f(): { a: number } { const w = shared as Wide; return { ...w }; }
+console.log(f().a);`,
+  },
+  {
+    id: "S125-RV-02 (delta review) a cast pushed into a typed array, the array printed: the element copy stops by name where it would drop 'b', never a silent { a: 1 } (#222)",
+    entry: "main.ts",
+    fence: { text: /does not have exactly its typed slot's shape/, stdout: "" },
+    src: `type N = { a: number };
+const src: unknown = JSON.parse('{"a":1,"b":2}');
+const arr: N[] = [];
+arr.push(src as N);
+console.log(arr);`,
   },
 ]);

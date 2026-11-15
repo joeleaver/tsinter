@@ -1526,7 +1526,10 @@ export class Lowerer {
     // fallback pass's exactSites), copies only a value of exactly its
     // type's shape, and stops by name otherwise (SEMANTICS.md S128 (a2)).
     if (exit.kind === "dynCheck") {
-      const fromArm = this.exitFromArm(node);
+      // (Review: a fresh literal or spread returned from a plain function is
+      // a NEW object; its width is GH #148's judgement, not an exact fit.)
+      const freshRet = retFn !== null && (ts.isObjectLiteralExpression(n) || ts.isArrayLiteralExpression(n));
+      const fromArm = !freshRet && this.exitFromArm(node);
       if ((fromArm || (armable && this.exactSites.has(key))) && this.copiesOnCrossing(exit.type) && this.boundaryExitSafe(exit.type)) {
         return this.exactGuard(exit, fromArm
           ? "a dynamic value held in a typed slot (SEMANTICS.md S128) copied into typed storage it does not fit exactly (a key the type does not declare, keys out of the type's order, an absent required key that is not a plain number, string or boolean, an optional key holding undefined, or a mistyped value): the copy would differ from the object"

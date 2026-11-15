@@ -2583,8 +2583,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       if (all.some((t) => foldedKeys.has(tkey(t)))) return true;
       if (nested.some((t) => reachNoSpec.has(tkey(t)))) return true;
       if (s.observedAt === true) return true;
-      if (s.consumed) return false;
-      const db = destBinding(s);
+      // (A consumed copy — pushed, read once — still meets every printer
+      // of its type: review of #222's `arr.push(src as N)`.)
+      const db = s.consumed ? null : destBinding(s);
       if (db !== null && s.dest !== null && !s.dest.param) {
         if (db.uses.some((u) => u === "print" || u === "keys")) return true;
         if (db.uses.every((u) => u === "read")) return false;
@@ -3268,9 +3269,19 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // fields where the dynamic object may carry more, so printing it,
         // serializing it or listing its keys tells the two apart (S009's
         // width tolerance applies only to a value nothing else holds).
-        if (!why && !freshSpine && !freshAssign && !uniqueDyn(s.arg, s.where) && widthObserved(s)) {
-          const k = L.dynArmExitNodes.get(s.node as object);
-          if (k !== undefined && !isJsSourceFileName(k.replace(/^ret:/, "").replace(/:\d+:\d+$/, ""))) widthOnly = true;
+        // (A plain function's result tries the arm even for a fresh value —
+        // `return JSON.parse(s)` keeps every key, as its const form does.)
+        const wk = L.dynArmExitNodes.get(s.node as object);
+        const retArm = wk !== undefined && wk.startsWith("ret:");
+        // (and a slot already tried on the arm that still copies, fresh or
+        // not: `arr.push(src as N)` — delta review)
+        const armedStill = wk !== undefined && (L.dynArmSites.has(wk) || L.exactSites.has(wk));
+        if (!why && !freshSpine && !freshAssign && (retArm || armedStill || !uniqueDyn(s.arg, s.where)) && widthObserved(s)) {
+          // (Delta review: a slot already on the arm that still copies — the
+          // value must enter typed storage, `arr.push(src as N)` — refuses,
+          // so the fallback pass's exact-fit copy stops by name; one the
+          // fallback still copies without that test refuses outright.)
+          if (wk !== undefined && !L.dynArmSites.has(wk) && !L.exactSites.has(wk) && !isJsSourceFileName(wk.replace(/^ret:/, "").replace(/:\d+:\d+$/, ""))) widthOnly = true;
           else why = DYN_WIDTH;
         }
       }

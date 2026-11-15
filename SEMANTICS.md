@@ -10619,7 +10619,11 @@ not build:
   binding, a plain function's result) such a copy takes the dynamic arm,
   so it prints every key as Node; where the arm does not build, the slot's
   copy takes only exactly-fitting values and stops by name otherwise
-  (S128 (a3)). Anywhere else it refuses like any other observed copy, and
+  (S128 (a3)); a slot that still copies on the arm (`arr.push(src as N)`,
+  the element must enter typed storage) takes that exact-fit copy too,
+  fresh source or not. A fresh object literal or spread a plain function
+  returns is a new object: its width is GH #148's judgement, not an exact
+  fit. Anywhere else it refuses like any other observed copy, and
   a copy taken from an arm value into a field or element stops by name
   (S128 (a2)). S009's width tolerance stays only for
   a value nothing else holds (a fresh `JSON.parse(text) as T`).
