@@ -55,7 +55,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, JSON_SAFE_DEPTH_BUDGET, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -6978,7 +6978,10 @@ export class Lowerer {
    * which have no JSON serialization (a handle isn't JSON) but an honest
    * per-field construction. Recursion terminates: recursive shapes are
    * rejected at mapping time. */
-  jsvalLiftable(t: IrType, visiting: Set<string> = new Set()): boolean {
+  jsvalLiftable(t: IrType, visiting: Set<string> = new Set(), depth = 0): boolean {
+    // A type graph deeper than the JSON walk's budget answers false (the
+    // value refuses by name at its use), never a stack overflow.
+    if (depth > JSON_SAFE_DEPTH_BUDGET) return false;
     if (t.kind === "jsval") return true;
     if (this.boundarySafe(t)) return true;
     // Typed arrays and URLs marshal IN without joining the round-trip
@@ -7011,10 +7014,10 @@ export class Lowerer {
       visiting.add(t.shapeId);
       // An INDEX-SIGNATURE record lifts when its value slot does (dyn
       // included): declared fields write first, then the overflow keys.
-      if (shape.indexValue && !this.jsvalLiftable(shape.indexValue, visiting)) return false;
-      return shape.fields.every((f) => !isReservedField(shape, f.name) && this.jsvalLiftable(f.type, visiting));
+      if (shape.indexValue && !this.jsvalLiftable(shape.indexValue, visiting, depth + 1)) return false;
+      return shape.fields.every((f) => !isReservedField(shape, f.name) && this.jsvalLiftable(f.type, visiting, depth + 1));
     }
-    if (t.kind === "array") return this.jsvalLiftable(t.elem, visiting);
+    if (t.kind === "array") return this.jsvalLiftable(t.elem, visiting, depth + 1);
     // A union crossing IN lifts arm by arm (a runtime tag switch — see
     // unionToJsvalHelper) when every arm does: unit arms become the
     // engine's own undefined/null (which is why bare undefined-armed
@@ -7023,7 +7026,7 @@ export class Lowerer {
     // knots pass through records, guarded above).
     if (t.kind === "union") {
       const def = this.unions.get(t.unionId);
-      return !!def && def.arms.every((a) => isUnitType(a) || this.jsvalLiftable(a, visiting));
+      return !!def && def.arms.every((a) => isUnitType(a) || this.jsvalLiftable(a, visiting, depth + 1));
     }
     return false;
   }

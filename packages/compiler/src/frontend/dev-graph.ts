@@ -116,6 +116,10 @@ export interface DevGraph {
    * included), with the first file naming it — the npm subpaths a program
    * imports (SEMANTICS.md S133 (f)). */
   bareSpecs: Map<string, string>;
+  /** Every site naming each non-relative specifier, with its syntax
+   * (`import` — static or dynamic — or `require`): the declared-surface
+   * view of a dual package resolves from these (SEMANTICS.md S133 (j)). */
+  bareSites: Map<string, { file: string; kind: "import" | "require" }[]>;
 }
 
 /** Walks the source graph from `roots` (see the header) and answers the
@@ -131,6 +135,7 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
   };
   for (const r of roots) enqueue(r);
   const bySpec = new Map<string, DevGraphConflict["sites"]>();
+  const bareSites = new Map<string, { file: string; kind: "import" | "require" }[]>();
   const devSpecs = new Set<string>();
   while (queue.length > 0) {
     const file = queue.shift()!;
@@ -141,6 +146,9 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
         enqueue(resolveRelativeModule(file, spec));
         continue;
       }
+      let bs = bareSites.get(spec);
+      if (bs === undefined) bareSites.set(spec, (bs = []));
+      bs.push({ file, kind: u.kind });
       const dev = devResolve(file, spec, u.kind);
       let sites = bySpec.get(spec);
       if (sites === undefined) bySpec.set(spec, (sites = []));
@@ -166,5 +174,5 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
   }
   const bareSpecs = new Map<string, string>();
   for (const [spec, sites] of bySpec) bareSpecs.set(spec, sites[0]!.file);
-  return { paths, conflicts, files: [...seen], bareSpecs };
+  return { paths, conflicts, files: [...seen], bareSpecs, bareSites };
 }

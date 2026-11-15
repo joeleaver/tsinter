@@ -73,7 +73,7 @@ import {
 } from "./package-options.js";
 import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
 import { installDtsBridge } from "./dts-bridge.js";
-import { dtsMirrorPathOf, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsRoots, npmStaticFsShadow, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
+import { dtsMirrorPathOf, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsRoots, npmStaticFsShadow, npmStaticHasDtsView, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticDtsViewRefusal, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
 import { STUB_BUILTIN_EXPORTS } from "./stub-builtin-exports.js";
@@ -417,6 +417,7 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // viewed package's bare specifier — and each SUBPATH of it the source
   // graph names (S133 (f)) — types against its mirrored declarations, and
   // its JS joins as a root.
+  registerDtsViewsFromGraph(dev.bareSites);
   registerDtsSubpathViews(dev.bareSpecs);
   const dtsPaths = npmStaticDtsPaths();
   if (dtsPaths !== null) options = { ...options, paths: { ...(options.paths ?? {}), ...dtsPaths } };
@@ -653,8 +654,64 @@ function registerDtsView(entryPath: string, pkg: string, specifier: string = pkg
   // A DUAL package whose import and require syntaxes load different
   // implementations: one declared surface cannot name both, so it keeps
   // the inferred surface (each syntax types against its own file).
+  // (registerDtsViewsFromGraph serves a dual package whose program uses
+  // one syntax, from the program's own import sites.)
   if (jsEntries.length !== 1) return;
   registerNpmStaticDtsView({ pkg, specifier, typesRoot, typesEntry, mirrorEntry: dtsMirrorPathOf(typesRoot, typesEntry), jsEntries });
+}
+
+/** The declared surface an opted-in package's bare specifier gets when
+ * resolved from `fromFile` with `kind`'s JS entry only (null when it
+ * resolves to no declaration file of the package's own, or to no JS). */
+function dtsViewFrom(fromFile: string, pkg: string, kind: "import" | "require"): { typesRoot: string; typesEntry: string; js: string } | null {
+  const declared = resolveBareModule(fromFile, pkg, "declared");
+  if (declared === null || !/\.d\.(ts|mts|cts)$/.test(declared.typesFile)) return null;
+  const typesEntry = declared.typesFile.split("\\").join("/");
+  let typesRoot: string | null = null;
+  const nm = typesEntry.lastIndexOf("/node_modules/");
+  if (nm >= 0) {
+    const rest = typesEntry.slice(nm + "/node_modules/".length).split("/");
+    const depth = rest[0]!.startsWith("@") ? 2 : 1;
+    typesRoot = typesEntry.slice(0, nm + "/node_modules/".length) + rest.slice(0, depth).join("/");
+  } else if (declared.workspaceDir !== undefined) {
+    typesRoot = declared.workspaceDir.split("\\").join("/");
+  }
+  if (typesRoot === null || !typesEntry.startsWith(`${typesRoot}/`)) return null;
+  const js = resolveBareModule(fromFile, pkg, undefined, kind);
+  if (js === null || !isJsSourceFileName(js.typesFile)) return null;
+  return { typesRoot, typesEntry, js: js.typesFile };
+}
+
+/** SEMANTICS.md S133 (j): the declared-surface view of an opted-in package
+ * the ENTRY could not give one — a DUAL package (its import and require
+ * syntaxes load different files), or one only a non-entry file of the graph
+ * resolves (a workspace package's own dependency) — from the program's own
+ * import sites (the pre-load source-graph scan):
+ *   - every site uses ONE syntax: the view types against the declarations
+ *     and compiles the JS Node loads for that syntax;
+ *   - both syntaxes appear: no view (one declared surface cannot type two
+ *     implementations), and the fallback note says so;
+ *   - the sites resolve to DIFFERENT copies of the package (different types
+ *     roots or JS files): no view, and the note names the copies. */
+function registerDtsViewsFromGraph(bareSites: ReadonlyMap<string, readonly { file: string; kind: "import" | "require" }[]>): void {
+  for (const [spec, sites] of bareSites) {
+    if (packagePrefixOf(spec) !== spec || !isNpmStaticPackage(spec) || npmStaticHasDtsView(spec)) continue;
+    const kinds = new Set(sites.map((s) => s.kind));
+    const views = sites.map((s) => dtsViewFrom(s.file, spec, s.kind));
+    if (views.some((v) => v === null)) continue; // no declarations: the inferred surface, as before
+    if (kinds.size > 1) {
+      setNpmStaticDtsViewRefusal(spec, "the program loads it with both import and require, which this dual package answers with two different implementations (one declared surface cannot type both)");
+      continue;
+    }
+    const distinct = new Map<string, { typesRoot: string; typesEntry: string; js: string }>();
+    for (const v of views) distinct.set(`${v!.typesRoot}\u0000${v!.js}`, v!);
+    if (distinct.size > 1) {
+      setNpmStaticDtsViewRefusal(spec, `its importers resolve to different copies of it (${[...distinct.values()].map((v) => v.typesRoot).join(", ")})`);
+      continue;
+    }
+    const v = [...distinct.values()][0]!;
+    registerNpmStaticDtsView({ pkg: spec, specifier: spec, typesRoot: v.typesRoot, typesEntry: v.typesEntry, mirrorEntry: dtsMirrorPathOf(v.typesRoot, v.typesEntry), jsEntries: [v.js] });
+  }
 }
 
 /** Registers a declared-surface view for each SUBPATH of an opted-in

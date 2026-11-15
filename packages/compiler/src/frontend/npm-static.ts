@@ -81,6 +81,7 @@ export function setNpmStaticPackages(packages: Iterable<string>): void {
   untypedPkgCache.clear();
   realpathProbed.clear();
   dtsViews.clear();
+  dtsViewRefusals.clear();
 }
 
 /* ── the declared-surface view (SEMANTICS.md S133) ──────────────────────
@@ -134,6 +135,19 @@ const dtsViews = new Map<string, NpmStaticDtsView>();
 
 export function registerNpmStaticDtsView(view: NpmStaticDtsView): void {
   if (activePackages.has(view.pkg)) dtsViews.set(view.specifier, view);
+}
+
+/** Why an opted-in package that ships declarations got NO declared-surface
+ * view this load (a dual package imported with both syntaxes, importers
+ * resolving to different copies): the fallback note names it. */
+const dtsViewRefusals = new Map<string, string>();
+
+export function setNpmStaticDtsViewRefusal(pkg: string, reason: string): void {
+  if (activePackages.has(pkg)) dtsViewRefusals.set(pkg, reason);
+}
+
+export function npmStaticDtsViewRefusalOf(pkg: string): string | undefined {
+  return dtsViewRefusals.get(pkg);
 }
 
 export function npmStaticDtsViews(): ReadonlyMap<string, NpmStaticDtsView> {

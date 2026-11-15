@@ -11354,6 +11354,29 @@ piped stdout; the whole-use refusal);
 `packages/compiler/test/wasm-top10-paperclip-computed-export.test.ts`
 (PC19-03..06, untyped JavaScript requirers).
 
+**Amendment (dual packages and non-entry importers, every lane —
+paperclip's zod and drizzle-orm).** (j) A package used to get its
+declared-surface view only when the ENTRY resolved it and its `import`
+and `require` syntaxes loaded the same file. Now a package the entry
+cannot view — a DUAL package (an `exports` map with separate `import` and
+`require` targets), or one only a non-entry file of the graph resolves (a
+workspace package's own dependency) — is viewed from the program's own
+import sites, found by the pre-load source-graph scan:
+- every site uses ONE syntax (static or dynamic `import`, or `require`):
+  the program types against the shipped declarations and compiles the JS
+  file Node loads for that syntax;
+- both syntaxes appear: no view (one declared surface cannot type two
+  implementations); if the program then fails to typecheck against the
+  inferred surface, the package's fallback note says "no declared-surface
+  view: the program loads it with both import and require …";
+- the sites resolve to DIFFERENT copies (different package roots or JS
+  files): no view, and the note names the copies.
+A type graph that decides whether a value crosses into dynamic code is
+walked to a depth budget (400 levels); a deeper one answers "does not
+cross", so the use refuses by name instead of the walk overflowing the
+compiler's stack (drizzle-orm's generated table types reached that).
+**Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..06).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would

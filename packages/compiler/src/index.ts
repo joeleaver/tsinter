@@ -28,7 +28,7 @@ import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.
 import { firstBigintSite, moduleUsesBigint, moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
-import { npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath, runtimeOfTypesTwin } from "./frontend/npm-static.js";
+import { npmStaticDtsViewRefusalOf, npmStaticHasDtsView, npmStaticIneligibleReason, npmStaticOffenders, npmStaticPackageOfPath, runtimeOfTypesTwin } from "./frontend/npm-static.js";
 import { EntryLoadError, canonicalBuiltinModule, checkPreflight, clearImportEdgeMemo, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
@@ -558,9 +558,10 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
         }
       }
       for (const [pkg, count] of named) {
+        const viewRefusal = npmStaticDtsViewRefusalOf(pkg);
         reasons.set(
           pkg,
-          `its inferred export surface breaks ${count} import site${count === 1 ? "" : "s"} in program files${npmStatic === "lib" ? "" : " — the package serves from the island instead"} (bundler-emitted surfaces type only as far as inference reaches)`,
+          `${viewRefusal !== undefined ? `no declared-surface view: ${viewRefusal}; ` : ""}its inferred export surface breaks ${count} import site${count === 1 ? "" : "s"} in program files${npmStatic === "lib" ? "" : " — the package serves from the island instead"} (bundler-emitted surfaces type only as far as inference reaches)`,
         );
       }
     }
@@ -613,11 +614,15 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
   if (inferredOnly.length > 0 && beyondBase(preflight, base).length > 0) {
     const dropWithNote = (p: string): void => {
       effective.delete(p);
+      // A package that ships declarations but got no declared-surface view
+      // says why (SEMANTICS.md S133 (j)).
+      const viewRefusal = npmStaticDtsViewRefusalOf(p);
       statuses.push({
         package: p,
         status: "fallback",
-        detail:
-          npmStatic === "auto"
+        detail: viewRefusal !== undefined
+          ? `no declared-surface view: ${viewRefusal}${npmStatic === "auto" || npmStatic === "lib" ? "" : " — the package serves from the island instead"}`
+          : npmStatic === "auto"
             ? "auto: the program does not typecheck against its inferred surface"
             : npmStatic === "lib"
               ? "the program does not typecheck against its inferred surface (type-only declarations and .d.ts type guards have no JS value inference can chase)"

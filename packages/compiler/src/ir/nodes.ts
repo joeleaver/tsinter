@@ -6015,7 +6015,7 @@ export function isJsonSafeType(
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
 ): boolean {
-  return isJsonSafeAt(t, getRecord, getUnion, false, new Set());
+  return isJsonSafeAt(t, getRecord, getUnion, false, new Set(), 0);
 }
 
 /** The recursion behind isJsonSafeType. `inRecordField` is the ONE position
@@ -6026,13 +6026,22 @@ export function isJsonSafeType(
  * stringified whole or cast to) exactness is unreachable: Node's stringify
  * of bare undefined is not a string at all, and JSON text can never contain
  * a value that matches the arm. */
+/** How deep isJsonSafeAt walks a type graph before answering false. */
+export const JSON_SAFE_DEPTH_BUDGET = 400;
+
 function isJsonSafeAt(
   t: IrType,
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
   inRecordField: boolean,
   visiting: Set<string>,
+  depth: number,
 ): boolean {
+  // A type graph nested deeper than the budget (a package's generated
+  // types — drizzle's table builders — can chain thousands of distinct
+  // records): answered NOT JSON-safe, so the value refuses by name at its
+  // use instead of the walk overflowing the stack.
+  if (depth > JSON_SAFE_DEPTH_BUDGET) return false;
   switch (t.kind) {
     case "f64":
     case "string":
@@ -6045,7 +6054,7 @@ function isJsonSafeAt(
     case "bigint":
       return true;
     case "array":
-      return isJsonSafeAt(t.elem, getRecord, getUnion, false, visiting);
+      return isJsonSafeAt(t.elem, getRecord, getUnion, false, visiting, depth + 1);
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
@@ -6058,7 +6067,7 @@ function isJsonSafeAt(
       // TUPLE positions are array slots, not droppable object keys: an
       // undefined-armed position would stringify as `null` in JS (not
       // drop), so tuples keep the array rule for their fields.
-      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, !shape.tuple, visiting))) {
+      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, !shape.tuple, visiting, depth + 1))) {
         return false;
       }
       // Overflow values sit in record-key position too: dyn is JSON-safe
@@ -6066,7 +6075,7 @@ function isJsonSafeAt(
       // like any undefined-valued key), everything else follows the
       // record-field rule.
       if (shape.indexValue && shape.indexValue.kind !== "dyn") {
-        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, true, visiting);
+        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, true, visiting, depth + 1);
       }
       return true;
     }
@@ -6076,7 +6085,7 @@ function isJsonSafeAt(
       const key = `${t.unionId}:${inRecordField}`;
       if (visiting.has(key)) return true; // the recursive knot, union-flavored
       visiting.add(key);
-      return def.arms.every((a) => isJsonSafeAt(a, getRecord, getUnion, inRecordField, visiting));
+      return def.arms.every((a) => isJsonSafeAt(a, getRecord, getUnion, inRecordField, visiting, depth + 1));
     }
     case "func":
     case "object":
