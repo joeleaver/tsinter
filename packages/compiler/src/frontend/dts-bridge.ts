@@ -103,8 +103,33 @@ export function installDtsBridge(program: ts.Program): void {
         }
       }
       exportsOfViews.push({ declared, js });
+      nestedNamespaces(declared, js, new Set());
     }
     return exportsOfViews;
+  };
+  const isFileModule = (s: Sym): boolean => checker.rawDeclarationsOf(s).some((d) => ts.isSourceFile(d));
+  /** A namespace export (`export * as iso from "./iso.js"`, zod's
+   * `z.iso.date()`) that the declarations AND the JS both make a module
+   * namespace: that module's exports map name for name, as the entry's do,
+   * and so on down. */
+  const nestedNamespaces = (declared: Map<Sym, string>, js: Map<string, Sym>, seen: Set<Sym>): void => {
+    for (const [dsym, name] of declared) {
+      if (!(dsym.flags & ts.SymbolFlags.ValueModule) || seen.has(dsym) || !isFileModule(dsym)) continue;
+      const j = js.get(name);
+      if (j === undefined) continue;
+      const jmod = resolveAlias(j);
+      if (!(jmod.flags & ts.SymbolFlags.ValueModule) || !isFileModule(jmod)) continue;
+      seen.add(dsym);
+      const d2 = new Map<Sym, string>();
+      for (const e of exportsOf(dsym)) {
+        d2.set(resolveAlias(e), e.name);
+        d2.set(e, e.name);
+      }
+      const j2 = new Map<string, Sym>();
+      for (const e of exportsOf(jmod)) j2.set(e.name, e);
+      exportsOfViews!.push({ declared: d2, js: j2 });
+      nestedNamespaces(d2, j2, seen);
+    }
   };
 
   /** The JS class a value symbol names (the symbol itself when it is one;
@@ -154,6 +179,19 @@ export function installDtsBridge(program: ts.Program): void {
 
   checker.setSymbolRedirect((sym) => redirect(sym));
 
+  // A declared export of a view's entry (or of a namespace export nested in
+  // it) whose JS module exports no value of that name. Only those: a
+  // declaration the bridge never maps (a declared class member, a module
+  // the JS does not make a namespace) is not a missing export, whatever
+  // its redirect answers.
+  unmappedExportLookups.set(program, (sym) => {
+    for (const v of viewExports()) {
+      const name = v.declared.get(sym);
+      if (name !== undefined) return !v.js.has(name);
+    }
+    return false;
+  });
+
   // The reverse question (the implementation's side): the DECLARED type of
   // a JS class's member, where the declarations describe that class.
   let declaredClassOfJs: Map<Sym, Sym> | null = null;
@@ -177,6 +215,16 @@ export function installDtsBridge(program: ts.Program): void {
 }
 
 let declaredMemberLookup: ((jsClass: Sym, name: string, isStatic: boolean) => ts.Type | undefined) | null = null;
+/** Per program: preflight judges several loads (scout, base, probe), and a
+ * symbol is only meaningful against the program whose bridge mapped it. */
+const unmappedExportLookups = new WeakMap<ts.Program, (sym: Sym) => boolean>();
+
+/** True when `sym` is an export a viewed package's entry declarations
+ * declare and its JS entry does not export (SEMANTICS.md S133 (j)'s
+ * build-time refusal). False for anything the bridge does not judge. */
+export function isUnmappedDeclaredExport(program: ts.Program, sym: Sym): boolean {
+  return unmappedExportLookups.get(program)?.(sym) ?? false;
+}
 
 /** The type the shipped declarations give member `name` of the JS class
  * `jsClass` (a compiled npm package's class the declarations describe), or

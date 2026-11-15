@@ -237,6 +237,15 @@ export class CheckerFacade {
     return aliased;
   }
 
+  /** The symbol that implements `symbol`: the declared-surface redirect's
+   * answer for a symbol declared in a mirrored .d.ts that the use reached
+   * WITHOUT an alias hop (a member read through a namespace value,
+   * `iso.date` — getSymbolAtLocation answers the declaration itself), else
+   * `symbol` unchanged. */
+  implementationOf(symbol: Ts7Symbol): Ts7Symbol {
+    return this.redirected(symbol, "alias") ?? symbol;
+  }
+
   private redirected(symbol: Ts7Symbol, use: "decl" | "alias"): Ts7Symbol | null {
     const r = this.symbolRedirect?.(symbol, use) ?? null;
     return r !== null && r !== symbol ? r : null;

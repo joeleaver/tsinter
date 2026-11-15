@@ -11383,12 +11383,16 @@ member read of the module object naming a value the declarations export
 but the loaded JavaScript does not refuses at build time (SC2013, "'x' is declared by
 the 'pkg' package's type declarations, but its compiled JavaScript
 defines no 'x' …"). Node fails an ESM import of it at link time and
-answers `undefined` on the CommonJS side.
+answers `undefined` on the CommonJS side. A namespace export that the
+declarations and the JavaScript both make a module namespace (`export * as
+iso from "./iso.js"`, zod's `z.iso.date()`) maps its own exports the same
+way, at any depth: its members compile against the implementation's, and
+one the JavaScript lacks refuses at build time as above.
 A type graph that decides whether a value crosses into dynamic code is
 walked to a depth budget (400 levels); a deeper one answers "does not
 cross", so the use refuses by name instead of the walk overflowing the
 compiler's stack (drizzle-orm's generated table types reached that).
-**Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..16).
+**Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..18).
 
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 

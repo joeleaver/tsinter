@@ -2040,6 +2040,11 @@ export class Lowerer {
         return member;
       }
       symbol = this.checker.getAliasedSymbol(symbol);
+    } else {
+      // A viewed package's export reached without an alias hop (a member
+      // read through a namespace, `z.iso.date`): the implementation the
+      // declared-surface bridge maps it to (SEMANTICS.md S133).
+      symbol = this.checker.implementationOf(symbol);
     }
     // CommonJS export plumbing: a binding that resolved to a PROPERTY of a
     // top-level `module.exports = { ... }` literal (shorthand, or a plain

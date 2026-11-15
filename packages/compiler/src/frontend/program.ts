@@ -73,7 +73,7 @@ import {
   type AdoptedOptions,
 } from "./package-options.js";
 import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
-import { installDtsBridge } from "./dts-bridge.js";
+import { installDtsBridge, isUnmappedDeclaredExport } from "./dts-bridge.js";
 import { dtsMirrorPathOf, isDtsMirrorPath, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsViews, npmStaticDtsRoots, npmStaticFsShadow, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticDtsViewRefusal, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
@@ -782,10 +782,11 @@ function declaredOnlyExportUses(load: LoadResult): ScrDiagnostic[] {
     if (sym === undefined) return null;
     const raw = checker.rawDeclarationsOf(sym);
     if (raw.length === 0 || !raw.every(inMirror) || !raw.some(isValueDecl)) return null;
-    // The redirect (dts-bridge.ts) maps every declared export the JS has;
-    // one still answering only its declaration has no JS counterpart.
-    const now = checker.declarationsOf(sym);
-    return now.length > 0 && now.every(inMirror) ? raw[0]! : null;
+    // Only an export the bridge (dts-bridge.ts) judged and found no JS
+    // export for — the view's entry exports and those of namespace exports
+    // nested in it (`z.iso.date`, under `export * as iso`). A declaration
+    // the bridge never maps is not missing because of that.
+    return isUnmappedDeclaredExport(load.program, sym) ? raw[0]! : null;
   };
   const report = (site: ts.Node, name: string, decl: ts.Node): void => {
     out.push(npmDeclaredOnlyDiag(npmPackageNameOf(decl.getSourceFile().fileName) ?? "the", name, locOf7(site)));

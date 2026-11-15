@@ -190,6 +190,17 @@ describe("S133 (b) through the view: a declared export the loaded JS lacks refus
   }, 600_000);
 });
 
+const NEST = (missing: boolean): Record<string, string> =>
+  under("node_modules/nest", {
+    "package.json": pj({ name: "nest", version: "1.0.0", type: "module", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } }),
+    "index.d.ts": `export * from "./external.js";\nimport * as n from "./external.js";\nexport { n };`,
+    "external.d.ts": `export * as iso from "./iso.js";\nexport declare function top(): string;`,
+    "iso.d.ts": `export declare function date(): string;${missing ? "\nexport declare function time(): string;" : ""}`,
+    "index.js": `export * from "./external.js";\nimport * as n from "./external.js";\nexport { n };`,
+    "external.js": `export * as iso from "./iso.js";\nexport function top() { return "top"; }`,
+    "iso.js": `export function date() { return "date"; }`,
+  });
+
 const PERCOND = (name: string): Record<string, string> =>
   under(`node_modules/${name}`, {
     "package.json": pj({ name, version: "1.0.0", exports: { ".": { import: { types: "./index.d.mts", default: "./index.mjs" }, require: { types: "./index.d.cts", default: "./index.cjs" } } } }),
@@ -230,6 +241,15 @@ const ROWS2: Row[] = [
       "tsconfig.json": pj({ compilerOptions: { strict: true, skipLibCheck: true, module: "nodenext", allowJs: true, allowImportingTsExtensions: true, noEmit: true } }),
     },
   },
+  {
+    id: "DV-17 a member of a nested namespace export (zod's z.iso.date()) is no missing export",
+    npmStatic: ["nest"],
+    files: {
+      ...NEST(false),
+      "main.ts": `import { iso, top, n } from "nest";\nconsole.log(top(), iso.date(), n.iso.date());`,
+      "tsconfig.json": pj({ compilerOptions: { strict: true, skipLibCheck: true, module: "nodenext", noEmit: true } }),
+    },
+  },
 ];
 
 describe("S133 (j) review fixes (wasm lane vs Node)", () => {
@@ -241,6 +261,21 @@ describe("S133 (j) review fixes (wasm lane vs Node)", () => {
 describe("S133 (j) review fixes (wasm-native lane vs Node)", () => {
   test.for(ROWS2.map((r) => [r.id, r] as const))("%s", async ([, row]) => {
     await checkRow(scratch, row, "wasm-native");
+  }, 600_000);
+});
+
+describe("S133 (j): a nested namespace member the JS lacks refuses at build time", () => {
+  test("DV-18 iso.time() declared in the nested declarations, absent from iso.js", async () => {
+    const entry = project("DV-18", {
+      ...NEST(true),
+      "main.ts": `import { iso } from "nest";\nconsole.log(iso.date());\nconsole.log(iso.time());`,
+    });
+    const res = await compile(entry, { outPath: join(entry, "..", "p.wasm"), outDir: join(entry, ".."), backend: "wasm", npmStatic: ["nest"] });
+    expect(res.ok).toBe(false);
+    const text = (res.diagnostics ?? []).map((d) => d.message).join("\n");
+    expect(text).toContain(DECLARED_ONLY);
+    expect(text).toContain("'time'");
+    expect(text).not.toContain("'date'");
   }, 600_000);
 });
 
