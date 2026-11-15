@@ -16,6 +16,7 @@
  * insp.dyn/insp.str/undefined-arm machinery (no new code this file
  * exercises beyond the sym.* dispatch, mapType/mapTypeSoft's new arm,
  * and the registry's own linear scan). */
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,6 +59,21 @@ async function compileDiag(name: string, src: string, dynamic: boolean): Promise
   const res = await compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm", dynamic });
   if (res.ok) throw new Error(`${name} [${dynamic ? "dyn" : "plain"}] compiled but was expected to refuse`);
   return [...new Set(res.diagnostics.map((d) => `${d.code}:${d.message}`))].sort();
+}
+
+/** Symbol step A (symkeys): a symbol crosses into a dynamic value in a
+ * plain build (DK.SYMBOL), so a plain-mode gate row now runs and is
+ * compared with Node's own stdout of the same program, byte for byte. */
+async function plainMatchesNode(name: string, src: string): Promise<void> {
+  const entry = join(scratch, `${name}.ts`);
+  await writeFile(entry, `${src}\n`);
+  const res = await compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm", dynamic: false });
+  if (!res.ok) throw new Error(`${name} [plain] refused: ${res.diagnostics[0]?.message}`);
+  const node = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", entry], { encoding: "utf8", input: "" });
+  expect(node.status).toBe(0);
+  const { stdout, exitCode } = await runWasm(res.binaryPath);
+  expect(stdout).toBe(node.stdout);
+  expect(exitCode).toBe(0);
 }
 
 /** Compile ONE row expecting SUCCESS in the given mode (a number-typed
@@ -583,10 +599,9 @@ test("ASSERT H deepStrictEqual — the 'strictly deep-equal' header variant, oth
 test("B-i gate 1 (const s: any = Symbol('d')) — plain and dynamic, with a number twin", async () => {
   const sym = "const s: any = Symbol('d');\nconsole.log('done');";
   const num = "const s: any = 1;\nconsole.log('done');";
-  const plain = await compileDiag("bi-g1-plain", sym, false);
-  // Unit U1a: the plain build takes the one dynamic world too, so it
-  // refuses with the --dynamic build's text.
-  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  // Symbol step A: the plain build boxes the symbol (DK.SYMBOL) and runs
+  // as Node; the --dynamic build keeps the crossing refusal.
+  await plainMatchesNode("bi-g1-plain", sym);
   const dyn = await compileDiag("bi-g1-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -598,10 +613,9 @@ test("B-i gate 1 (const s: any = Symbol('d')) — plain and dynamic, with a numb
 test("B-i gate 2 (const t: symbol = ...; const s: any = t) — plain and dynamic, with a number twin", async () => {
   const sym = "const t: symbol = Symbol('d');\nconst s: any = t;\nconsole.log('done');";
   const num = "const t: number = 1;\nconst s: any = t;\nconsole.log('done');";
-  const plain = await compileDiag("bi-g2-plain", sym, false);
-  // Unit U1a: the plain build takes the one dynamic world too, so it
-  // refuses with the --dynamic build's text.
-  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  // Symbol step A: the plain build boxes the symbol (DK.SYMBOL) and runs
+  // as Node; the --dynamic build keeps the crossing refusal.
+  await plainMatchesNode("bi-g2-plain", sym);
   const dyn = await compileDiag("bi-g2-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -613,10 +627,9 @@ test("B-i gate 2 (const t: symbol = ...; const s: any = t) — plain and dynamic
 test("B-i gate 3 (f(Symbol('d')) where f(v: any)) — plain and dynamic, with a number twin", async () => {
   const sym = "function f(v: any) { }\nf(Symbol('d'));\nconsole.log('done');";
   const num = "function f(v: any) { }\nf(1);\nconsole.log('done');";
-  const plain = await compileDiag("bi-g3-plain", sym, false);
-  // Unit U1a: the plain build takes the one dynamic world too, so it
-  // refuses with the --dynamic build's text.
-  expect(plain).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  // Symbol step A: the plain build boxes the symbol (DK.SYMBOL) and runs
+  // as Node; the --dynamic build keeps the crossing refusal.
+  await plainMatchesNode("bi-g3-plain", sym);
   const dyn = await compileDiag("bi-g3-dyn", sym, true);
   expect(dyn).toEqual([
     "SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet",
@@ -649,12 +662,12 @@ test("B-i gate 4 (const a: any[] = [Symbol('d')]) — DYNAMIC ONLY; plain fences
 test("B-i gate 5 (const u: unknown = Symbol('d')) — mode-invariant, with a number twin", async () => {
   const sym = "const u: unknown = Symbol('d');\nconsole.log(u);";
   const num = "const u: unknown = 1;\nconsole.log(u);";
-  for (const dynamic of [false, true]) {
-    const codes = await compileDiag(`bi-g5-${dynamic ? "dyn" : "plain"}`, sym, dynamic);
-    // Unit U1a: `unknown` is the island value in both builds.
-    expect(codes).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
-    await compileOk(`bi-g5-num-${dynamic ? "dyn" : "plain"}`, num, dynamic);
-  }
+  // Symbol step A: the plain build prints the boxed symbol as Node does;
+  // the --dynamic build keeps the crossing refusal.
+  await plainMatchesNode("bi-g5-plain", sym);
+  const codes = await compileDiag("bi-g5-dyn", sym, true);
+  expect(codes).toEqual(["SC1090:passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet"]);
+  for (const dynamic of [false, true]) await compileOk(`bi-g5-num-${dynamic ? "dyn" : "plain"}`, num, dynamic);
 });
 
 test("B-i gate 6 (a symbol under Record<string, unknown>) — mode-invariant, with a number twin", async () => {
@@ -765,6 +778,13 @@ const B_II_DYN_OVERRIDE: Record<string, string> = {
   row5: "tsinter: unsupported: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at ",
 };
 
+// Symbol step A: the plain build boxes the symbol, so row 5's template
+// conversion stops at the dynamic symbol-to-string fence (Node throws a
+// catchable TypeError there; this tier ends the program by name).
+const B_II_PLAIN_OVERRIDE: Record<string, string> = {
+  row5: "tsinter: unsupported: converting to a string a Symbol held in a dynamic value is not supported yet [SC1090",
+};
+
 for (const row of B_II_ROWS) {
   for (const dynamic of [false, true]) {
     const tag = dynamic ? "dyn" : "plain";
@@ -778,16 +798,26 @@ for (const row of B_II_ROWS) {
         dynamic,
       });
       if (!res.ok) throw new Error(`${row.id} [${tag}] refused at compile time: ${res.diagnostics[0]?.message}`);
+      if (!dynamic && row.id === "row1") {
+        // Symbol step A: the plain build boxes the symbol, so `typeof v`
+        // answers as Node does (compared with Node's own run).
+        const node = spawnSync(process.execPath, [entry], { encoding: "utf8", input: "" });
+        const { stdout, exitCode } = await runWasm(res.binaryPath);
+        expect(stdout).toBe(node.stdout);
+        expect(exitCode).toBe(node.status);
+        return;
+      }
       const { stdout, stderr } = await runWasmToTrap(res.binaryPath);
       expect(stdout).toBe("");
       // U1b: JS sources take the one world in both modes, so rows 1 and 5 name
       // the crossing-into-`any` text with or without --dynamic.
-      const expected = B_II_DYN_OVERRIDE[row.id] ?? row.expected;
+      const expected = dynamic ? (B_II_DYN_OVERRIDE[row.id] ?? row.expected) : (B_II_PLAIN_OVERRIDE[row.id] ?? row.expected);
       expect(stderr.startsWith(expected)).toBe(true);
       // The suffix shape (":<line>]\n" at the very end) and exactly ONE
       // fence line in the whole message — tighter than the prefix
       // match alone.
-      expect(stderr).toMatch(/:\d+\]\n$/);
+      // (the runtime symbol-to-string fence names no source line)
+      expect(stderr).toMatch(!dynamic && B_II_PLAIN_OVERRIDE[row.id] !== undefined ? /\[SC1090\]\n$/ : /:\d+\]\n$/);
       expect(stderr.match(/tsinter: unsupported: /g)?.length).toBe(1);
     });
   }

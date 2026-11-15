@@ -146,7 +146,7 @@ let z = 0;
 console.log(q[0](), q["0"](), q[z]());`,
   },
   {
-    id: "GH133-JS-05 a symbol-keyed call on a dynamic object stops at the symbol-key fence",
+    id: "GH133-JS-05 a symbol-keyed call on a dynamic object: an absent symbol key is not a function, V8's TypeError (symbol step A)",
     entry: "main.js",
     src: `'use strict';
 ${T}
@@ -154,7 +154,6 @@ const o = JSON.parse('{"v":9}');
 const s = Symbol("m");
 console.log("before");
 t(() => o[s]());`,
-    fence: { text: /symbol-keyed property access outside class fields .* is not supported yet \[SC1090/, stdout: "before\n" },
   },
   {
     id: "GH133-JS-06 a non-callable element throws V8's TypeError, spelled as V8 spells the callee",

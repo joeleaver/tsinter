@@ -6810,6 +6810,21 @@ class Assembler {
     c.refNull(dynT);
     ret();
     c.end();
+    if (dyn.symLive) {
+      // A symbol does not clone: Node's DataCloneError names it
+      // (`Symbol(s) could not be cloned.`), alone or nested.
+      kindIn([DK.SYMBOL]);
+      c.ifVoid();
+      this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => {
+        dyn.symPayload(x, 0);
+        x.call(dyn.symToStr());
+        this.pushStrLitInto(x, " could not be cloned.");
+        x.call(this.concatHelper());
+      }, null);
+      c.refNull(dynT);
+      ret();
+      c.end();
+    }
     kindIn([DK.FUNC]);
     c.ifVoid();
     // GH #86 review: Node's DataCloneError quotes the function's source

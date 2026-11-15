@@ -45,6 +45,7 @@
  * stderr is the tier's report line (S007 for an uncaught exception, S010
  * for an unhandled rejection, which is how a failing top-level-await
  * module reports); a trap is this tier's exit 1. */
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -863,12 +864,15 @@ test("R45 UNCLONE: a typed promise, alone and nested, throws DataCloneError", as
   expect(exitCode).toBe(0);
 });
 
-test("R46 UNCLONE: a symbol stops at its crossing into a dynamic value", async () => {
-  const src = "'use strict';\nconst c = (x) => structuredClone(x);\ntry { c(Symbol(\"s\")); } catch (e) { console.log(e.name, e.message); }\n";
-  // This tier's answer (the existing SC1101 crossing fence, which ends the program — GH #86, SEMANTICS.md S122); Node prints "DataCloneError Symbol(s) could not be cloned.\n".
-  const { stdout, stderr } = await runRowTrap("R46", src, "cjs");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: passing a value of type 'symbol' into dynamically-executed ('any'-typed) code (only numbers, strings, booleans, typed arrays, URLs, undefined/null-armed unions, and JSON-safe records/arrays/unions can cross the boundary) is not supported yet [SC1090 at <ROW>:3]\n");
+test("R46 UNCLONE: a symbol, alone and nested, throws DataCloneError as Node (symbol step A)", async () => {
+  const src = "'use strict';\nconst c = (x) => structuredClone(x);\ntry { c(Symbol(\"s\")); } catch (e) { console.log(e.name, e.message); }\ntry { c({ a: Symbol(\"t\") }); } catch (e) { console.log(e.name, e.message); }\n";
+  const got = await runRow("R46", src, "cjs");
+  const entry = join(dirFor("cjs"), "R46-node.cjs");
+  await writeFile(entry, src);
+  const node = spawnSync(process.execPath, [entry], { encoding: "utf8", input: "" });
+  expect(got.stdout).toBe(node.stdout);
+  expect(got.stderr).toBe(node.stderr);
+  expect(got.exitCode).toBe(node.status);
 });
 
 test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", async () => {
