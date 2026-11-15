@@ -1408,7 +1408,7 @@
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
  *                                                      INSTEAD of _tick]
- *   (export "_status" (func (result i32)))  [top-level-await modules only]
+ *   (export "_status" (func (result i32)))  [top-level-await / process.exitCode modules only]
  *   (export "memory" (memory))          — where write's bytes live.
  *
  * THE EVENT LOOP. `_start` runs the program to its first checkpoint: the
@@ -1503,10 +1503,12 @@
  *     catch (trap) { code = 1; }
  *
  * `_status()` exists ONLY in a module whose entry is an async module —
- * i.e. one using top-level await — and answers Node's status for the
- * module evaluation promise at QUIESCENCE: 13 when it is still pending
- * (Node's "unsettled top-level await" exit — SEMANTICS.md S012), 0 when
- * it settled. It is a pure read of that promise's state, so it is
+ * i.e. one using top-level await — or one that writes process.exitCode,
+ * and answers Node's status at QUIESCENCE: the code process.exitCode
+ * holds when the program set one (Node's `process.exitCode ??= 13`),
+ * else 13 when the module evaluation promise is still pending (Node's
+ * "unsettled top-level await" exit — SEMANTICS.md S012), 0 when it
+ * settled. It is a pure read of that promise's state, so it is
  * only meaningful once the pump has returned a negative deadline; calling
  * it earlier answers about a program that is still running. A trap
  * overrides it: the program is already dead with exit 1, and a rejected

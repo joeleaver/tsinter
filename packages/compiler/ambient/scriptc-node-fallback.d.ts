@@ -184,9 +184,12 @@ declare var process: {
   /* `never`, like @types/node: code behind an early-exit guard narrows
    * (`if (!x) process.exit(1)` proves x afterwards) — typed `void` the
    * guard narrows nothing and correct programs fail preflight. The
-   * lowering already handles the optional code (bare exit() is exit(0),
-   * Node's behavior when exitCode was never set). */
+   * lowering already handles the optional code (a bare exit() exits with
+   * the held process.exitCode, else 0 -- Node's behavior). */
   exit(code?: number | null): never;
+  /* @types/node's spelling. Writes lower (number codes, undefined, null);
+   * a read stops by name. */
+  exitCode?: number | string | null | undefined;
   cwd(): string;
   /* The user tick queue: callbacks run before promise jobs at every loop
    * checkpoint (Node's tick-then-microtask order); trailing arguments

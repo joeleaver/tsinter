@@ -5,7 +5,7 @@
  * ToBoolean/ToString coercion helpers, and field/element reads and writes
  * (FieldTarget). */
 import { stubByDefinition } from "./lower-island.js";
-import { wideIndex } from "./big-widen.js";
+import { programHoldsBigint, wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
 import * as ts from "../ts7/adapter.js";
@@ -514,11 +514,120 @@ function requireBuiltinTokenUse(L: Lowerer, expr: ts.Expression, name: string): 
   );
 }
 
+/** A member/element assignment in VALUE position (lowerMemberAssignValue):
+ * the right-hand side node whose lowered value the write stores is kept
+ * in a hidden temp as it lowers, so the expression can yield exactly the
+ * value written. Every lowering of the node records its temp; the caller
+ * accepts the result only when exactly one of them reached the output. */
+export const capturedAssignValues = new Map<ts.Node, { id: string; type: IrType }[]>();
+
+/** The capture hook (lowerExpr / lowerExprExpecting): lower the node
+ * through `lower` with the capture lifted (no nested capture), and hand
+ * back `t = v; t` with the temp recorded. Undefined when the node is not
+ * captured. */
+export function captureAssignValue(L: Lowerer, node: ts.Expression, lower: () => IrExpr): IrExpr | undefined {
+  const cap = capturedAssignValues.get(node);
+  if (cap === undefined) return undefined;
+  capturedAssignValues.delete(node);
+  let v: IrExpr;
+  try {
+    v = lower();
+  } finally {
+    capturedAssignValues.set(node, cap);
+  }
+  // A bare unit value has no standalone slot (GH #107): no temp, and the
+  // caller sees no capture for this lowering.
+  if (isUnitType(v.type) || v.type.kind === "void") return v;
+  const t = L.declareHiddenLocal("%asg.val", v.type);
+  cap.push({ id: t.id, type: v.type });
+  return {
+    kind: "seqExpr",
+    stmts: [{ kind: "varDecl", localId: t.id, init: v, loc: v.loc }],
+    result: { kind: "varRef", localId: t.id, type: v.type, loc: v.loc },
+    type: v.type,
+    loc: v.loc,
+  };
+}
+
+function countVarDecls(node: unknown, ids: ReadonlySet<string>): { n: number; last: string | undefined } {
+  let n = 0;
+  let last: string | undefined;
+  const walk = (x: unknown): void => {
+    if (x === null || typeof x !== "object") return;
+    if (Array.isArray(x)) {
+      for (const y of x) walk(y);
+      return;
+    }
+    const o = x as Record<string, unknown>;
+    if (o.kind === "varDecl" && typeof o.localId === "string" && ids.has(o.localId)) {
+      n++;
+      last = o.localId;
+    }
+    for (const k in o) if (k !== "loc" && k !== "type") walk(o[k]);
+  };
+  walk(node);
+  return { n, last };
+}
+
+/** `o.k = v` / `a[i] = v` in VALUE position (`tree = cached[i] = f()`,
+ * `hit || (cache[s] = fn(s))`, `ok && (res[k] = v)`): the statement
+ * lowering of the same assignment -- its receiver/key-before-value order
+ * (GH #194) and every write path and fence -- with the stored value kept
+ * in a temp the expression yields (JS's assignment value is the right-
+ * hand side's value; the temp is that value in the slot's representation,
+ * the stance of the variable form's assignExpr). Null when the write
+ * needs control flow, or its value is not exactly one straight-line
+ * capture (a unit right-hand side, a write that lowers the value twice):
+ * the caller's fence names it then. */
+function lowerMemberAssignValue(L: Lowerer, expr: ts.BinaryExpression): IrExpr | null {
+  const loc = locOf(expr);
+  const caps: { id: string; type: IrType }[] = [];
+  capturedAssignValues.set(expr.right, caps);
+  let stmt: IrStmt;
+  try {
+    stmt = L.lowerExprStatement(expr);
+  } finally {
+    capturedAssignValues.delete(expr.right);
+  }
+  // The write's own guards (`if`) may ride inside the expression on the
+  // WasmGC lanes (the backend emits a seqExpr's statements as a body; the
+  // validator's seqIfOk), outside async and generator bodies, whose
+  // suspension rewrite splices a seqExpr as straight-line statements.
+  const suspends = L.ctx.isAsync === true || (L.ctx.generator ?? null) !== null;
+  const ifOk = L.undefSlots && !suspends;
+  const kinds: string[] = [];
+  const collect = (st: IrStmt): void => {
+    if (st.kind === "block") st.body.forEach(collect);
+    else if (st.kind === "if" && ifOk) {
+      st.then.forEach(collect);
+      st.else_?.forEach(collect);
+    } else if (!seqExprSafeStmt(st)) kinds.push(st.kind);
+  };
+  collect(stmt);
+  if (kinds.length > 0) {
+    L.unsupported("SC1090", expr, `assignment to a member or element as an expression where the write needs control flow (${[...new Set(kinds)].join(", ")}${suspends ? ", in an async or generator body" : ""}) — write it as a statement`);
+  }
+  const { n, last } = countVarDecls(stmt, new Set(caps.map((c) => c.id)));
+  const local = caps.find((c) => c.id === last);
+  if (n !== 1 || last === undefined || !local) {
+    L.unsupported("SC1090", expr, `assignment to a member or element as an expression whose stored value is not one straight-line value here (${n} value captures${caps.length === 0 ? ", the value has no slot" : ""}) — write it as a statement`);
+  }
+  return {
+    kind: "seqExpr",
+    stmts: [stmt],
+    result: { kind: "varRef", localId: last, type: local.type, loc },
+    type: local.type,
+    loc,
+  };
+}
+
 export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     // GH #194: an assignment target's receiver/key evaluated once, ahead of
     // the right-hand side (lower-stmts.ts bindAssignTargetParts).
     const bound = boundTargetParts.get(expr);
     if (bound !== undefined) return { ...bound };
+    const captured = captureAssignValue(L, expr, () => lowerExpr(L, expr));
+    if (captured !== undefined) return captured;
     if (lowerExprDepth >= LOWER_EXPR_MAX_DEPTH) {
       L.unsupported("SC1090", expr, `expressions nested deeper than ${LOWER_EXPR_MAX_DEPTH} levels`);
     }
@@ -9735,9 +9844,82 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
       L.rejectUnresolved(expr.operand, `increment/decrement of '${expr.operand.text}' (not a writable local or module global)`);
     }
     if (target.type.kind === "bigint") return lowerBigIncDec(L, target, op, prefix, loc);
+    if ((target.type.kind === "dyn" || target.type.kind === "jsval") && !isJsSourceFile(expr.getSourceFile())) {
+      return lowerAnyIncDec(L, expr, target, prefix);
+    }
     if (target.type.kind !== "f64") L.unsupported("SC1043", expr);
     return { kind: "incDec", op, prefix, localId: target.id, type: F64, loc };
   }
+
+/** `x++` / `--x` over an 'any'-typed VARIABLE in a TypeScript source (a
+ * `noImplicitAny: false` loop counter, `let i, l` -- Vue's render helpers):
+ * Node's update expression exactly. OldValue = ToNumeric(x) -- ONE
+ * conversion, so an object's own valueOf/toString runs once and its throw
+ * propagates; a string converts by the StringNumericLiteral grammar
+ * ("1" -> 2, never "11"); undefined NaN, null 0, booleans 1/0 -- then x
+ * takes OldValue +/- 1 and the expression yields OldValue (postfix) or the
+ * new value (prefix). Where the program can hold a bigint, a bigint stays
+ * one (1n steps it) through the island operators; a program that holds
+ * bigints without them stops by name rather than convert one to a number.
+ * (JavaScript sources keep their S009 number-validating stance.) */
+export function lowerAnyIncDec(
+  L: Lowerer,
+  expr: ts.PrefixUnaryExpression | ts.PostfixUnaryExpression,
+  target: { id: string; type: IrType },
+  prefix: boolean,
+): IrExpr {
+  const loc = locOf(expr);
+  const plus = expr.operator === ts.SyntaxKind.PlusPlusToken;
+  const read: IrExpr = { kind: "varRef", localId: target.id, type: target.type, loc };
+  if (L.bigWiden) {
+    // ToNumeric through the island: neg(neg(x)) converts once (the inner
+    // neg runs the object protocol; the outer one sees a primitive) and
+    // keeps a bigint a bigint (and -0 as -0).
+    const oldT = L.declareHiddenLocal("%anyOld", JSVAL);
+    const newT = L.declareHiddenLocal("%anyNew", JSVAL);
+    const old = (): IrExpr => ({ kind: "varRef", localId: oldT.id, type: JSVAL, loc });
+    const neg1: IrExpr = { kind: "jsOp", op: "neg", args: [L.jsvalIn(read, expr.operand)], type: JSVAL, loc };
+    const numeric: IrExpr = { kind: "jsOp", op: "neg", args: [neg1], type: JSVAL, loc };
+    const step = (one: IrExpr): IrExpr => ({ kind: "jsOp", op: plus ? "add" : "sub", args: [old(), L.jsvalIn(one, expr)], type: JSVAL, loc });
+    const next: IrExpr = {
+      kind: "ternary",
+      cond: { kind: "dynTest", test: "number", value: { kind: "dynFromJsval", value: old(), type: DYN, loc }, type: BOOL, loc },
+      then: step({ kind: "numLit", value: 1, type: F64, loc }),
+      else_: step(bigLitOf(1n, loc)),
+      type: JSVAL,
+      loc,
+    };
+    const nv = (): IrExpr => ({ kind: "varRef", localId: newT.id, type: JSVAL, loc });
+    return {
+      kind: "seqExpr",
+      stmts: [
+        { kind: "varDecl", localId: oldT.id, init: numeric, loc },
+        { kind: "varDecl", localId: newT.id, init: next, loc },
+        { kind: "assign", localId: target.id, value: L.coerceInto(expr, nv(), target.type), loc },
+      ],
+      result: prefix ? nv() : old(),
+      type: JSVAL,
+      loc,
+    };
+  }
+  if (programHoldsBigint(L.program, L.moduleOrder)) {
+    L.unsupported("SC1090", expr.operand, "increment/decrement of an 'any' value in a program that holds bigints on this lane");
+  }
+  const oldT = L.declareHiddenLocal("%anyOld", F64);
+  const old = (): IrExpr => ({ kind: "varRef", localId: oldT.id, type: F64, loc });
+  const next: IrExpr = { kind: "bin", op: plus ? "+" : "-", left: old(), right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc };
+  const numeric: IrExpr = { kind: "libCall", fn: "dyn.toNumber", args: [asDynOperand(read)], type: F64, loc };
+  const stmts: IrStmt[] = [{ kind: "varDecl", localId: oldT.id, init: numeric, loc }];
+  if (prefix) {
+    const newT = L.declareHiddenLocal("%anyNew", F64);
+    const nv = (): IrExpr => ({ kind: "varRef", localId: newT.id, type: F64, loc });
+    stmts.push({ kind: "varDecl", localId: newT.id, init: next, loc });
+    stmts.push({ kind: "assign", localId: target.id, value: L.coerceInto(expr, nv(), target.type), loc });
+    return { kind: "seqExpr", stmts, result: nv(), type: F64, loc };
+  }
+  stmts.push({ kind: "assign", localId: target.id, value: L.coerceInto(expr, next, target.type), loc });
+  return { kind: "seqExpr", stmts, result: old(), type: F64, loc };
+}
 
 /** Whether a lowered statement can live inside a seqExpr — the
  * validator's straight-line set (writes and effect expressions only; the
@@ -9918,6 +10100,14 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
             };
           }
         }
+      }
+      if (
+        op === ts.SyntaxKind.EqualsToken &&
+        (ts.isPropertyAccessExpression(expr.left) || ts.isElementAccessExpression(expr.left)) &&
+        !expr.left.questionDotToken
+      ) {
+        const v = lowerMemberAssignValue(L, expr);
+        if (v) return v;
       }
       // Destructuring assignment in VALUE position (`(() => [i] = [i+1])()`,
       // `({} = {x} = a)`, `var d = ([] = src)`): the statement machinery's

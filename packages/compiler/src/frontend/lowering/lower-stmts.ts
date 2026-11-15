@@ -28,7 +28,9 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, createRequireSpecOf } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { boundTargetParts } from "./lower-exprs.js";
+import { boundTargetParts, lowerAnyIncDec } from "./lower-exprs.js";
+import { lowerArrayLengthWrite } from "./lower-stdlib-members.js";
+import { lowerProcessExitCodeWrite } from "./lower-builtins.js";
 import { orderedRecordWrite, abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
@@ -5480,6 +5482,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             const viaStream = lowerStreamUnderscoreAssign(L, expr);
             if (viaStream) return viaStream;
           }
+          // `process.exitCode = v` (Node's validating setter).
+          {
+            const viaExit = lowerProcessExitCodeWrite(L, expr.left, expr.right, locOf(expr));
+            if (viaExit) return viaExit;
+          }
+          // `a.length = n` on an array (Node's ArraySetLength).
+          {
+            const viaLen = lowerArrayLengthWrite(L, expr.left, expr.right, locOf(expr));
+            if (viaLen) return viaLen;
+          }
           const target = L.fieldTarget(expr.left);
           if (target) {
             const value = L.lowerExprExpecting(expr.right, target.fieldType);
@@ -5736,6 +5748,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     const dynTarget = target.type.kind === "dyn" && isJsSourceFile(expr.getSourceFile());
     if (target.type.kind === "bigint") {
       return { kind: "assign", localId: target.id, value: bigArith(op, readTarget, bigLitOf(1n, loc), loc)!, loc };
+    }
+    if ((target.type.kind === "dyn" || target.type.kind === "jsval") && !isJsSourceFile(expr.getSourceFile())) {
+      // An 'any' variable in a TypeScript source: Node's ToNumeric update
+      // (lower-exprs.ts lowerAnyIncDec), the value discarded.
+      return { kind: "exprStmt", expr: lowerAnyIncDec(L, expr, target, true), loc };
     }
     if (target.type.kind !== "f64" && !dynTarget) {
       L.unsupported("SC1090", expr.operand, "increment/decrement of non-number targets");

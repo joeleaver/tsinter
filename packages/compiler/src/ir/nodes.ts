@@ -3541,6 +3541,9 @@ export type IrLibFn =
    * running) — the runtime flag scr_run_exit_listeners/process.exit set.
    * Never throws. */
   | "process.exiting"
+  | "process.setExitCode"
+  | "process.clearExitCode"
+  | "process.exitCodeOr0"
   /** os.type(): uname(2)'s sysname ("Darwin", "Linux"; "Windows_NT" on
    * win32) — Node's uv_os_uname answer. Interned per call; never throws. */
   | "os.type"

@@ -7770,6 +7770,62 @@ export function fspCheckedFileMode(L: Lowerer, mode: IrExpr, loc: SrcLoc, name: 
  * addNumericalSeparator over String(n) ("9_007_199_254_740_992"; the
  * underscore walk runs over the STRING, quirks included), everything else
  * is inspect's formatNumber (NaN, Infinity, -0). Interned once per module. */
+/** `process.exitCode = n`'s check -- Node's validateInteger(n, "code")
+ * at its default bounds: a non-integer (NaN, Infinity, a fraction) is
+ * ERR_OUT_OF_RANGE "It must be an integer", one past the safe-integer
+ * range "It must be >= -9007199254740991 && <= 9007199254740991", both
+ * with errors.js's "Received" rendering. An interned
+ * `%proc.exitCodeMsg(m) -> string`, "" for a valid code. */
+export function exitCodeMessage(L: Lowerer, loc: SrcLoc): string {
+  const key = "proc:exitCodeMsg";
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const fn = `%proc.exitCodeMsg.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, fn);
+  const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const m: IrExpr = { kind: "varRef", localId: "m.0", type: F64, loc };
+  const fail = (rule: string): IrStmt => ({
+    kind: "return",
+    value: {
+      kind: "strConcat",
+      left: { kind: "strLit", value: `The value of "code" is out of range. ${rule}. Received `, type: STRING, loc },
+      right: { kind: "call", callee: bufferReceivedHelper(L, loc), args: [m], type: STRING, loc },
+      type: STRING,
+      loc,
+    },
+    loc,
+  });
+  const notInteger: IrExpr = {
+    kind: "logical",
+    op: "||",
+    left: { kind: "bin", op: "!==", left: { kind: "libCall", fn: "math.trunc", args: [m], type: F64, loc }, right: m, type: BOOL, loc },
+    right: { kind: "bin", op: "!==", left: { kind: "bin", op: "-", left: m, right: m, type: F64, loc }, right: num(0), type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  const outOfRange: IrExpr = {
+    kind: "logical",
+    op: "||",
+    left: { kind: "bin", op: "<", left: m, right: num(Number.MIN_SAFE_INTEGER), type: BOOL, loc },
+    right: { kind: "bin", op: ">", left: m, right: num(Number.MAX_SAFE_INTEGER), type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  L.liftedFns.push({
+    name: fn,
+    params: [{ localId: "m.0", name: "m", type: F64 }],
+    returnType: STRING,
+    locals: [{ id: "m.0", name: "m", type: F64, mutable: false }],
+    body: [
+      { kind: "if", cond: notInteger, then: [fail("It must be an integer")], else_: null, loc },
+      { kind: "if", cond: outOfRange, then: [fail(`It must be >= ${Number.MIN_SAFE_INTEGER} && <= ${Number.MAX_SAFE_INTEGER}`)], else_: null, loc },
+      { kind: "return", value: { kind: "strLit", value: "", type: STRING, loc }, loc },
+    ],
+    loc,
+  });
+  return fn;
+}
+
 function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
   const key = "errors:received";
   const existing = L.inspectHelpers.get(key);

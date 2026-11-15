@@ -3312,6 +3312,13 @@ class Assembler {
    * gate site reads this, never the mutable `procField`/
    * `hasExitListenerSurface()` state. */
   private readonly needsExitDrain: boolean;
+  /** Does the program write process.exitCode (process.setExitCode /
+   * clearExitCode reached)? Static, like needsExitDrain: the quiescence
+   * drain and `_status` consult the held code only then, so a program
+   * that never writes it emits exactly what it did before. */
+  private readonly usesExitCode: boolean;
+  /** process.exitCode's held state: [is a code set, the code (ToInt32)]. */
+  private exitCodeGlobalsField: { set: number; val: number; captured: number } | null = null;
   /** Same reasoning, for `process.onUnhandledRejection` — see
    * unhandledRejectionReachable's own comment. */
   private readonly needsUnhandledRejectionDispatch: boolean;
@@ -3590,7 +3597,9 @@ class Assembler {
         : null;
     // `exit`'s decision (INC-26 P1, D3): present only in modules that call
     // `process.exit`, minted right after `hostNumFunc`.
-    this.exitFunc = exitReachable(mod)
+    // A module that writes process.exitCode needs it too: an uncaught
+    // error then exits with the held code (reportUncaughtHelper).
+    this.exitFunc = exitReachable(mod) || libCallWhere(mod, (fn) => fn === "process.setExitCode" || fn === "process.clearExitCode")
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EXIT, this.mb.funcType([I32], []))
       : null;
     // `kill`/`chdir`/`umask`'s decisions (INC-26 P3, design §2.7/§0.5):
@@ -3709,6 +3718,7 @@ class Assembler {
     // own comment on why this must not be a runtime flag): true iff
     // process.exit/onExit/offExit is reached anywhere in the module.
     this.needsExitDrain = this.exitFunc !== null || exitListenerSurfaceReachable(mod);
+    this.usesExitCode = libCallWhere(mod, (fn) => fn === "process.setExitCode" || fn === "process.clearExitCode");
     this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
     this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
     this.needsListenerLoopTerm = this.needsUnhandledRejectionDispatch || this.needsRejectionHandledDispatch;
@@ -5210,6 +5220,23 @@ class Assembler {
     // the cell, so exitDrainHelper's P1-R2 branch restores it unchanged
     // over any throwing listener's own error rather than leaving that
     // behind (see process.ts's exitDrainHelper doc comment: WAS_FATAL).
+    // A module that writes process.exitCode: Node's fatal-exception
+    // handler sets exitCode = 1 unless the process is already exiting (an
+    // error thrown by an 'exit' listener keeps the held code), the
+    // listeners run, and the exit status is the code they leave -- a trap
+    // can only say 1, so such a module exits through the exit import.
+    const viaExit = this.usesExitCode && this.lib === null;
+    if (viaExit) {
+      const g = this.exitCodeGlobals();
+      c.globalGet(this.proc.exitingFlagGlobal());
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(g.val);
+      c.i32Const(1);
+      c.globalSet(g.set);
+      c.end();
+    }
     if (this.needsExitDrain) {
       c.i32Const(1);
       c.call(this.proc.exitDrainHelper());
@@ -5220,6 +5247,16 @@ class Assembler {
       this.libResetScratch(c);
     }
     c.call(this.renderUncaughtHelper());
+    if (viaExit) {
+      const g = this.exitCodeGlobals();
+      c.globalGet(g.set);
+      c.ifResult(I32);
+      c.globalGet(g.val);
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.call(this.exitFuncOrThrow());
+    }
     c.unreachable();
     this.mb.setBody(idx, [], c.bytes());
     return idx;
@@ -7543,24 +7580,12 @@ class Assembler {
    * top-level-await program, so nothing else grows an export. */
   private emitStatus(): void {
     const root = this.rootGlobal();
-    if (root === null) return;
+    if (root === null && !this.usesExitCode) return;
     const status = this.mb.declareFunc(this.mb.funcType([], [I32]), "%w.status");
     const c = new Code();
-    c.globalGet(root);
-    c.refIsNull();
-    c.ifResult(I32);
-    // `_start` never ran: nothing to report on.
-    c.i32Const(0);
-    c.else_();
-    c.globalGet(root);
-    c.structGet(this.proms.promT, PROM_STATE);
-    c.i32Eqz();
-    c.ifResult(I32);
-    c.i32Const(13);
-    c.else_();
-    c.i32Const(0);
-    c.end();
-    c.end();
+    // A set process.exitCode, else the root's verdict (0 when `_start`
+    // never ran: nothing to report on).
+    this.emitCurrentStatusCode(c);
     this.mb.setBody(status, [], c.bytes());
     this.mb.exportFunc(EXPORT_STATUS, status);
   }
@@ -7573,6 +7598,43 @@ class Assembler {
    * (rev-26's own P4 pre-read finding: an unsettled top-level-await root
    * drains with code 13). Read verbatim from `emitStatus` above. */
   private emitCurrentStatusCode(c: Code): void {
+    if (this.usesExitCode) {
+      // process.exitCode, when the program set one, is the status (Node's
+      // run_main: `process.exitCode ??= kUnsettledTopLevelAwait`).
+      const g = this.exitCodeGlobals();
+      c.globalGet(g.set);
+      c.ifResult(I32);
+      c.globalGet(g.val);
+      c.else_();
+      this.emitRootStatusCode(c);
+      c.end();
+      return;
+    }
+    this.emitRootStatusCode(c);
+  }
+
+  /** process.exitCode's two globals, minted on first use. */
+  private exitCodeGlobals(): { set: number; val: number; captured: number } {
+    if (this.exitCodeGlobalsField !== null) return this.exitCodeGlobalsField;
+    const set = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    const val = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    const captured = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    this.exitCodeGlobalsField = { set, val, captured };
+    return this.exitCodeGlobalsField;
+  }
+
+  /** The module root's own verdict: 13 while a top-level await is
+   * unsettled, else 0. */
+  private emitRootStatusCode(c: Code): void {
     const root = this.rootGlobal();
     if (root === null) {
       c.i32Const(0);
@@ -7611,14 +7673,40 @@ class Assembler {
   private emitImplicitDrainAndCheck(c: Code): void {
     if (!this.needsExitDrain) return;
     this.emitCurrentStatusCode(c);
-    c.call(this.proc.exitDrainHelper());
+    if (this.usesExitCode) {
+      // Node captures the status BEFORE the 'exit' listeners run; the exit
+      // status is then the exitCode a listener leaves set, else the
+      // captured code (a listener clearing it does not make it 0). Nothing
+      // runs after this drain, so the held code takes the captured one
+      // when the listeners leave none.
+      const g = this.exitCodeGlobals();
+      c.globalSet(g.captured);
+      c.globalGet(g.captured);
+      c.call(this.proc.exitDrainHelper());
+    } else {
+      c.call(this.proc.exitDrainHelper());
+    }
     const exc = this.exc();
     c.globalGet(exc.kindG);
     c.i32Const(0);
     c.i32Ne();
     c.ifVoid();
+    // A listener threw: the uncaught report exits (with the held code in
+    // an exitCode module, else 1) and never returns.
     c.call(this.reportUncaughtHelper());
     c.end();
+    if (this.usesExitCode) {
+      // No error: the listeners' exitCode, else the captured status.
+      const g = this.exitCodeGlobals();
+      c.globalGet(g.set);
+      c.i32Eqz();
+      c.ifVoid();
+      c.globalGet(g.captured);
+      c.globalSet(g.val);
+      c.i32Const(1);
+      c.globalSet(g.set);
+      c.end();
+    }
   }
 
   finish(): Uint8Array {
@@ -27926,8 +28014,29 @@ class Assembler {
           // corpus exercises; see cp1-plan-p1.txt §9's own note.
           const codeLocal = this.acquireScratch(I32);
           code.localSet(codeLocal);
+          if (this.usesExitCode) {
+            // Node's process.exit(code): exitCode = code first (a bare
+            // exit() passes the held code, the same value), the 'exit'
+            // listeners run, then the exit status is the exitCode they
+            // leave (0 when one cleared it).
+            const g = this.exitCodeGlobals();
+            code.localGet(codeLocal);
+            code.globalSet(g.val);
+            code.i32Const(1);
+            code.globalSet(g.set);
+          }
           code.localGet(codeLocal);
           code.call(this.proc.exitDrainHelper());
+          if (this.usesExitCode) {
+            const g = this.exitCodeGlobals();
+            code.globalGet(g.set);
+            code.ifResult(I32);
+            code.globalGet(g.val);
+            code.else_();
+            code.i32Const(0);
+            code.end();
+            code.localSet(codeLocal);
+          }
           // P1-R2: this is the one drain site whose CODE is EXPLICIT —
           // Node's measured rule keeps it unchanged even when a listener
           // threw (process.exit(3) + throwing listener -> exit 3, the
@@ -28701,6 +28810,37 @@ class Assembler {
           code.call(this.umaskFuncOrThrow());
           code.f64ConvertI32S();
           this.releaseScratch(F64, MASK);
+          return;
+        }
+        if (e.fn === "process.setExitCode") {
+          // The lowering validated the code (validateInteger); the held
+          // value is its ToInt32, the exit status the host truncates.
+          const g = this.exitCodeGlobals();
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.globalSet(g.val);
+          code.i32Const(1);
+          code.globalSet(g.set);
+          return;
+        }
+        if (e.fn === "process.clearExitCode") {
+          code.i32Const(0);
+          code.globalSet(this.exitCodeGlobals().set);
+          return;
+        }
+        if (e.fn === "process.exitCodeOr0") {
+          if (!this.usesExitCode) {
+            code.f64Const(0);
+            return;
+          }
+          const g = this.exitCodeGlobals();
+          code.globalGet(g.set);
+          this.openIfResult(F64);
+          code.globalGet(g.val);
+          code.f64ConvertI32S();
+          code.else_();
+          code.f64Const(0);
+          this.close();
           return;
         }
         if (e.fn === "process.exiting") {

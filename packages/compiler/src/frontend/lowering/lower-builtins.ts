@@ -34,7 +34,7 @@ import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { execFileAsyncValueCall, execNormLiteral, execSyncValueCall, lowerOptionsValue, spawnValueCall } from "./lower-child-options.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
-import { checkedFileMode, fspCheckedFileMode } from "./lower-containers.js";
+import { checkedFileMode, exitCodeMessage, fspCheckedFileMode } from "./lower-containers.js";
 import { registerHttpClientFnBinding } from "./lower-server.js";
 import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTREAM_T, IrExpr, IrFunction, IrLibFn, IrLocal, IrStmt, IrType, JSVAL, NULL_T, SEARCH_PARAMS_T, SPAWNRES_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, funcOf, isUnitType, typeEquals, typeKey } from "../../ir/nodes.js";
 
@@ -6124,6 +6124,49 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     return { kind: "libCall", fn: "process.envGet", args: [key], type: L.envValueType(), loc };
   }
 
+/** `process.exitCode = v` in statement position (the WasmGC lanes):
+ * Node's setter -- undefined/null clears the code; a number must pass
+ * validateInteger(v, "code") (ERR_OUT_OF_RANGE otherwise, the code left as
+ * it was); a valid code is what a natural exit, a bare process.exit() and
+ * the 'exit' listeners' code argument then use. A string code (Node takes
+ * an integer string) and other value kinds stop by name. Null when the
+ * target is not process.exitCode. */
+export function lowerProcessExitCodeWrite(L: Lowerer, left: ts.PropertyAccessExpression, right: ts.Expression, loc: SrcLoc): IrStmt | null {
+  if (left.questionDotToken || L.stdlibGlobalMember(left, "process") !== "exitCode") return null;
+  if (!L.undefSlots) return null;
+  const v = L.lowerExpr(right);
+  if (isUnitType(v.type)) {
+    return { kind: "exprStmt", expr: { kind: "libCall", fn: "process.clearExitCode", args: [], type: VOID, loc }, loc };
+  }
+  if (v.type.kind !== "f64") {
+    L.unsupported("SC1090", right, `process.exitCode = <a '${L.fmt(v.type)}' value> (number codes, undefined and null are supported)`);
+  }
+  const t = L.declareHiddenLocal("%exitCode", F64);
+  const m = L.declareHiddenLocal("%exitCodeMsg", STRING);
+  const tRef: IrExpr = { kind: "varRef", localId: t.id, type: F64, loc };
+  const mRef: IrExpr = { kind: "varRef", localId: m.id, type: STRING, loc };
+  return {
+    kind: "block",
+    body: [
+      { kind: "varDecl", localId: t.id, init: v, loc },
+      { kind: "varDecl", localId: m.id, init: { kind: "call", callee: exitCodeMessage(L, loc), args: [tRef], type: STRING, loc }, loc },
+      {
+        kind: "if",
+        cond: { kind: "strEq", negated: true, left: mRef, right: { kind: "strLit", value: "", type: STRING, loc }, type: BOOL, loc },
+        then: [{
+          kind: "exprStmt",
+          expr: { kind: "libCall", fn: "error.nodeThrow", args: [{ kind: "numLit", value: 2, type: F64, loc }, { kind: "strLit", value: "ERR_OUT_OF_RANGE", type: STRING, loc }, mRef], type: VOID, loc },
+          loc,
+        }],
+        else_: null,
+        loc,
+      },
+      { kind: "exprStmt", expr: { kind: "libCall", fn: "process.setExitCode", args: [tRef], type: VOID, loc }, loc },
+    ],
+    loc,
+  };
+}
+
 /** `process.exit(code)` / `process.cwd()` → libCall. The fallback
    * declaration makes exit's code required; @types/node declares it
    * optional, and a bare `process.exit()` lowers as exit(0) — exactly
@@ -6746,10 +6789,14 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     }
     if (member === "exit") {
       const arg = call.arguments[0];
+      // A bare `process.exit()` exits with process.exitCode when the
+      // program set one (the WasmGC lanes hold it), else 0.
       const code: IrExpr =
         arg !== undefined
           ? L.lowerExprExpecting(arg, F64)
-          : { kind: "numLit", value: 0, type: F64, loc };
+          : L.undefSlots
+            ? { kind: "libCall", fn: "process.exitCodeOr0", args: [], type: F64, loc }
+            : { kind: "numLit", value: 0, type: F64, loc };
       return { kind: "libCall", fn: "process.exit", args: [code], type: VOID, loc };
     }
     return null; // process.argv(...) etc. are tsc errors before lowering

@@ -892,6 +892,72 @@ export function lowerNewArrayLength(L: Lowerer, lenNode: ts.Expression, arrT: Ir
   return { kind: "call", callee: helper, args: [n], type: arrT, loc };
 }
 
+/** `a.length = n` on a typed array value (Vue's `pendingCleanupDeps.length
+ * = 0`): Node's ArraySetLength -- the receiver, then n; n must be a valid
+ * array length (`n === n >>> 0`, else V8's `RangeError: Invalid array
+ * length`); a shorter length drops the elements past it, a longer one
+ * appends HOLES, held as the element's undefined exactly as `new
+ * Array(n)` holds them (SEMANTICS.md S119; the holes flag rises, so every
+ * observer that tells a hole from undefined stops by name). Lanes without
+ * undefined slots stop by name on a growing write. Null unless the
+ * receiver maps to an array and n is a number. */
+export function lowerArrayLengthWrite(L: Lowerer, left: ts.PropertyAccessExpression, right: ts.Expression, loc: SrcLoc): IrStmt | null {
+  if (left.questionDotToken || left.name.text !== "length") return null;
+  const arrT = L.mapTypeOf(L.typeOf(left.expression));
+  if (arrT?.kind !== "array") return null;
+  const recv = L.lowerExpr(left.expression);
+  if (recv.type.kind !== "array") return null;
+  const n = L.lowerExpr(right);
+  if (n.type.kind !== "f64") return null;
+  const t = recv.type;
+  const holes = L.undefSlots;
+  const helper = internHelper(
+    L,
+    `arr.setLength:${typeKey(t)}:${holes ? 1 : 0}`,
+    "arr.setLength",
+    [{ id: "a.0", type: t }, { id: "n.0", type: F64 }],
+    [],
+    VOID,
+    loc,
+    () => {
+      const a = ref("a.0", t, loc);
+      const nn = ref("n.0", F64, loc);
+      return [
+        ifThen(bin("!==", nn, bin(">>>", nn, num(0, loc), loc), loc), [
+          exprStmt(nodeThrowExpr(2, "", "Invalid array length", VOID, loc), loc),
+        ], loc),
+        ifThen(bin("<", nn, arrLen(a, loc), loc), [
+          exprStmt({ kind: "arrIntrinsic", method: "splice", receiver: a, args: [nn], type: t, loc }, loc),
+        ], loc),
+        ifThen(bin(">", nn, arrLen(a, loc), loc), holes
+          ? [
+            ifThen(bin(">", bin("-", nn, arrLen(a, loc), loc), num(NEW_ARRAY_HOLES_MAX, loc), loc), [
+              {
+                kind: "runtimeFence",
+                code: "SC1090",
+                message: `growing an array's length by more than ${NEW_ARRAY_HOLES_MAX} (this tier allocates every hole, where Node keeps the array sparse -- SEMANTICS.md S119) [SC1090 at an array length write]`,
+                loc,
+              } as IrStmt,
+            ], loc),
+            exprStmt({ kind: "arrayLit", elems: [], holes: true, type: t, loc }, loc),
+            whileLoop(bin("<", arrLen(a, loc), nn, loc), [
+              exprStmt({ kind: "arrIntrinsic", method: "push", receiver: a, args: [{ kind: "slotUndef", type: t.elem, loc } as IrExpr], type: F64, loc }, loc),
+            ], loc),
+          ]
+          : [
+            {
+              kind: "runtimeFence",
+              code: "SC1090",
+              message: "growing an array's length (its new slots are holes, which this lane cannot hold) [SC1090 at an array length write]",
+              loc,
+            } as IrStmt,
+          ], loc),
+      ];
+    },
+  );
+  return { kind: "exprStmt", expr: { kind: "call", callee: helper, args: [recv, n], type: VOID, loc }, loc };
+}
+
 /** Array.prototype.fill(value, start, end): relative start and end (the
  * same resolution as slice: ToIntegerOrInfinity, negatives from the end,
  * clamped; end defaults to the length), every index between written;

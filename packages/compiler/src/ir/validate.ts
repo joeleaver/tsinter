@@ -215,6 +215,9 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "process.umaskRead": { argTypes: [], result: F64 },
   "process.chdir": { argTypes: [STRING], result: VOID },
   "process.exiting": { argTypes: [], result: BOOL },
+  "process.setExitCode": { argTypes: [F64], result: VOID },
+  "process.clearExitCode": { argTypes: [], result: VOID },
+  "process.exitCodeOr0": { argTypes: [], result: F64 },
   "net.getAutoSelTimeout": { argTypes: [], result: F64 },
   "net.setAutoSelTimeout": { argTypes: [F64], result: VOID },
   "fs.realpathSync": { argTypes: [STRING], result: STRING },
@@ -1319,9 +1322,14 @@ function ffiClassType(cls: string): IrType {
 /** Library mode's host imports, by "module.name" (validateModule sets it
  * for the duration of one validation). */
 let hostImports = new Map<string, NonNullable<IrModule["wasmLib"]>["imports"][number]>();
+/** The WasmGC lanes emit a seqExpr's statements as an ordinary body inside
+ * the expression, so an `if` may sit there (a member assignment used as a
+ * value whose write guards its receiver); the C emission point cannot. */
+let seqIfOk = false;
 
 export function validateModule(mod: IrModule): IrValidationError[] {
   hostImports = new Map((mod.wasmLib?.imports ?? []).map((i) => [`${i.module}.${i.name}`, i]));
+  seqIfOk = mod.undefSlots === true;
   const errors: IrValidationError[] = [];
   const functionsByName = new Map<string, IrFunction>();
   for (const fn of mod.functions) {
@@ -2015,6 +2023,12 @@ function validateFunction(
         const allowed = new Set(["varDecl", "assign", "exprStmt", "fieldSet", "recordSet", "recordKeySet", "arraySet", "bytesSet", "block"]);
         const flat = (ss: IrStmt[]): void => {
           for (const s of ss) {
+            if (s.kind === "if" && seqIfOk) {
+              checkExpr(s.cond);
+              flat(s.then);
+              if (s.else_ !== null) flat(s.else_);
+              continue;
+            }
             if (!allowed.has(s.kind)) {
               err(`seqExpr statement kind "${s.kind}" is not straight-line`, s.loc);
               continue;
