@@ -1063,7 +1063,16 @@ export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null
   if (p === undefined) return null;
   if (ts.isPropertyAccessExpression(p) && p.expression === child) {
     const m = p.name.text;
-    if (name === "Error") return ERROR_STATICS.has(m) ? name : null;
+    if (name === "Error") {
+      // `Error.captureStackTrace(this, …)` over a statically typed class
+      // instance keeps its own lowering (commander's error constructors:
+      // lowerErrorCaptureStackTrace, or its refusal) — the dynamic value's
+      // capture applies to dynamic objects only (S132 U3+U4 amendment (g4)).
+      const call = p.parent;
+      if (m === "captureStackTrace" && call !== undefined && ts.isCallExpression(call) && call.expression === p && call.arguments.length >= 1 &&
+        !ts.isSpreadElement(call.arguments[0]!) && L.mapTypeOf(L.typeOf(call.arguments[0]!))?.kind === "object") return null;
+      return ERROR_STATICS.has(m) ? name : null;
+    }
     if (name === "globalThis") {
       // a member the standard library declares keeps its own lowering
       // (the object's own aliases aside: `globalThis.global` must be the

@@ -3093,6 +3093,13 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
 }
 
 function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
+    // `Error.captureStackTrace(this, …)` over a statically typed error
+    // instance (commander's error constructors) before any receiver path
+    // takes `Error` as a value (units U3 + U4's box).
+    if (ts.isPropertyAccessExpression(expr.expression) && expr.expression.name.text === "captureStackTrace") {
+      const cst = lowerErrorCaptureStackTrace(L, expr, expr.expression);
+      if (cst !== null) return cst;
+    }
     // Unit U2a (dyn-arm.ts): a method called on a dynamic-arm receiver hands
     // its callbacks whatever the receiver holds, whatever the receiver's
     // declared type said — an unannotated callback parameter binds that
