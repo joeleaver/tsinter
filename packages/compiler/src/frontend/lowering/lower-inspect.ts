@@ -37,7 +37,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
 import { BOOL, BYTES_U8, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
-import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
+import { noLoweringDiag, unsupportedDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
@@ -168,11 +168,19 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
         // ladder. Hybrids keep the fence — JS orders integer keys first
         // ACROSS the declared and overflow stores, an interleave the
         // declared-then-overflow walk cannot honor.
-        if (shape.fields.length > 0) {
-          return "index-signature records with declared fields have no inspect lowering yet (JS interleaves integer keys across the declared and dynamic key sets)";
+        // A hybrid (declared fields AND an index signature) prints its
+        // declared fields, then its overflow keys — SEMANTICS.md S031's
+        // declared-then-overflow order, as Object.keys answers it. A
+        // declared integer-like field name keeps Object.keys' fence.
+        if (shape.fields.some((f) => /^(0|[1-9][0-9]{0,9})$/.test(f.name) && Number(f.name) <= 4294967294)) {
+          return "index-signature records with an integer-like declared field name have no inspect lowering yet (JS orders integer keys first, across declared and overflow keys)";
         }
         const why = inspectSupport(L, shape.indexValue, visiting, out);
         if (why !== null) return why;
+        for (const f of shape.fields) {
+          const fwhy = inspectSupport(L, f.type, visiting, out);
+          if (fwhy !== null) return fwhy;
+        }
         visiting.delete(t.shapeId);
         return null;
       }
@@ -344,6 +352,31 @@ function inspectExprRaw(
  * helpers over such types run Node's circular machinery (seen stack +
  * <ref *N>/[Circular *N]); everything acyclic keeps the zero-cost path
  * (a value of an acyclic type can never repeat on its own path). */
+/** Can a value of type `t` hold a dynamic value (an `unknown`/`any` field,
+ * element or index value) — one that may be a view of this very value?
+ * Its printer then joins the seen protocol, whose identity for a view is
+ * the static value it views (S125 unit 2 review: `r.self = r`). */
+function holdsDynamicSlot(L: Lowerer, t: IrType, seen: Set<string> = new Set()): boolean {
+  if (t.kind === "dyn" || t.kind === "jsval") return true;
+  const k = typeKey(t);
+  if (seen.has(k)) return false;
+  seen.add(k);
+  switch (t.kind) {
+    case "record": {
+      const sh = L.shapes.get(t.shapeId);
+      if (sh === undefined) return false;
+      if (sh.indexValue !== undefined && holdsDynamicSlot(L, sh.indexValue, seen)) return true;
+      return sh.fields.some((f) => holdsDynamicSlot(L, f.type, seen));
+    }
+    case "array":
+      return holdsDynamicSlot(L, t.elem, seen);
+    case "union":
+      return (L.unions.get(t.unionId)?.arms ?? []).some((a) => holdsDynamicSlot(L, a, seen));
+    default:
+      return false;
+  }
+}
+
 export function typeReachesItself(L: Lowerer, t: IrType): boolean {
   const root = typeKey(t);
   const seen = new Set<string>();
@@ -420,7 +453,7 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
   // keep the zero-cost path.
   const onCycle =
     (t.kind === "record" || t.kind === "array" || t.kind === "map" || t.kind === "object") &&
-    typeReachesItself(L, t);
+    (typeReachesItself(L, t) || holdsDynamicSlot(L, t));
   const begin = (): IrStmt[] => [
     exprStmt({ kind: "libCall", fn: "insp.begin", args: [rPlus1()], type: { kind: "void" }, loc }),
     ...(onCycle
@@ -731,7 +764,53 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
           loc,
         });
       }
-      body.push(depthGate("[Object]"), ...begin(), ...ordered);
+      if (shape.indexValue) {
+        // A hybrid: the declared fields above, then the overflow keys in
+        // their own order, each through insp.key and the keyed get — Node's
+        // order exactly when every declared field precedes every added key,
+        // which hybridOrderPass proves for the whole program or refuses.
+        if (!L.hybridInspects.has(t.shapeId)) L.hybridInspects.set(t.shapeId, loc);
+        const iv = shape.indexValue;
+        const ksT: IrType = { kind: "array", elem: STRING };
+        for (const l of [
+          { id: "ks.0", name: "ks", type: ksT, mutable: false },
+          { id: "n.0", name: "n", type: F64, mutable: false },
+          { id: "i.0", name: "i", type: F64, mutable: true },
+          { id: "k.0", name: "k", type: STRING, mutable: false },
+        ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
+        const ks = (): IrExpr => ref("ks.0", ksT);
+        const n = (): IrExpr => ref("n.0", F64);
+        const i = (): IrExpr => ref("i.0", F64);
+        const k = (): IrExpr => ref("k.0", STRING);
+        // `{}` only when no declared field is present AND no overflow key
+        const first = body[0];
+        if (first !== undefined && first.kind === "if") {
+          body[0] = { ...first, cond: { kind: "logical", op: "&&", left: first.cond, right: { kind: "bin", op: "===", left: n(), right: num(0, loc), type: BOOL, loc }, type: BOOL, loc } };
+        }
+        body.unshift(
+          { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: v(), shapeId: t.shapeId, type: ksT, loc }, loc },
+          { kind: "varDecl", localId: "n.0", init: { kind: "arrIntrinsic", method: "length", receiver: ks(), args: [], type: F64, loc }, loc },
+        );
+        const keyedRead = (): IrExpr =>
+          ({ kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key: k(), overflowOnly: true, type: iv, loc });
+        const overflowLoop: IrStmt = {
+          kind: "for",
+          init: { kind: "varDecl", localId: "i.0", init: num(0, loc), loc },
+          cond: { kind: "bin", op: "<", left: i(), right: n(), type: BOOL, loc },
+          update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i(), right: num(1, loc), type: F64, loc }, loc },
+          body: [
+            { kind: "varDecl", localId: "k.0", init: { kind: "arrayGet", arr: ks(), index: i(), type: STRING, loc }, loc },
+            entry(
+              concatAll([{ kind: "libCall", fn: "insp.key", args: [k()], type: STRING, loc }, str(": ", loc), child(iv, keyedRead())], loc),
+              boolLit(false, loc),
+            ),
+          ],
+          loc,
+        };
+        body.push(depthGate("[Object]"), ...begin(), ...ordered, overflowLoop);
+      } else {
+        body.push(depthGate("[Object]"), ...begin(), ...ordered);
+      }
       body.push(ret(end(str("", loc), str("{", loc), str("}", loc), false, boolLit(false, loc))));
       break;
     }
@@ -2297,4 +2376,109 @@ function lowerGetCallSitesCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc)
     };
   };
   return { kind: "dynArrLit", elems: [frame(), frame(), frame()], type: DYN, loc };
+}
+
+/* ── S125 unit 2 (review): a printed hybrid's key order ─────────────────
+ *
+ * A hybrid record (declared fields AND an index signature) prints its
+ * declared fields, then its added keys. Node prints every own key in
+ * insertion order, so the two agree exactly when, in every value of the
+ * shape, every declared field was set before any added key. This pass
+ * proves that over the finished program, or refuses the print by name:
+ *  - every record literal of the shape lists its declared fields before
+ *    any added (overflow) key — an omitted optional field the frontend
+ *    completes with undefined is no key, an explicit `undefined` is one;
+ *  - on a shape with an optional declared field, no write through a key
+ *    that is not a literal naming an added key (it may name that field);
+ *  - no optional declared field is ever assigned (it would join after the
+ *    keys already added);
+ *  - no value of the shape (or of a union, array or field holding it) is
+ *    built by a dynamic check, an island exit, or a runtime helper (a
+ *    width copy, a capture), whose key order is the source's.
+ * Object.keys, for-in and JSON keep S031's registered declared-first
+ * order. */
+export function hybridOrderPass(L: Lowerer, functions: { body: unknown }[]): void {
+  if (L.hybridInspects.size === 0) return;
+  const shapes = new Set(L.hybridInspects.keys());
+  const holds = new Map<string, Set<string>>();
+  /** The hybrid shapes a value of type `t` may hold (itself, union arms,
+   * array elements, record fields), memoized by type key. */
+  const held = (t: IrType, depth = 0): Set<string> => {
+    const k = typeKey(t);
+    const hit = holds.get(k);
+    if (hit !== undefined) return hit;
+    const out = new Set<string>();
+    holds.set(k, out);
+    if (depth > 8) return out;
+    const add = (x: IrType): void => { for (const s of held(x, depth + 1)) out.add(s); };
+    switch (t.kind) {
+      case "record": {
+        if (shapes.has(t.shapeId)) out.add(t.shapeId);
+        const sh = L.shapes.get(t.shapeId);
+        for (const f of sh?.fields ?? []) add(f.type);
+        if (sh?.indexValue !== undefined) add(sh.indexValue);
+        break;
+      }
+      case "union":
+        for (const a of L.unions.get(t.unionId)?.arms ?? []) add(a);
+        break;
+      case "array":
+        add(t.elem);
+        break;
+      default:
+        break;
+    }
+    return out;
+  };
+  const bad = new Map<string, string>();
+  const mark = (ids: Iterable<string>, why: string): void => {
+    for (const id of ids) if (!bad.has(id)) bad.set(id, why);
+  };
+  const isAbsent = (e: unknown): boolean => e !== null && typeof e === "object" && L.omittedLitValues.has(e);
+  const PRODUCER = new Set(["dynCheck", "jsExit", "dynDestrCheck", "jsMarshal", "dynMatch"]);
+  const visit = (n: unknown): void => {
+    if (n === null || typeof n !== "object") return;
+    if (Array.isArray(n)) {
+      for (const x of n) visit(x);
+      return;
+    }
+    const r = n as Record<string, unknown>;
+    const kind = r["kind"];
+    const t = r["type"] as IrType | undefined;
+    if (typeof kind === "string" && t !== undefined && typeof t === "object" && typeof (t as { kind?: unknown }).kind === "string") {
+      if (kind === "recordLit" && t.kind === "record" && shapes.has(t.shapeId)) {
+        let sawOverflow = false;
+        for (const f of r["fields"] as { overflow?: true; drop?: true; value: unknown }[]) {
+          if (f.drop) continue;
+          if (f.overflow) sawOverflow = true;
+          else if (sawOverflow && !isAbsent(f.value)) {
+            mark([t.shapeId], "a literal sets a declared field after an added key");
+            break;
+          }
+        }
+      } else if (PRODUCER.has(kind) || (kind === "call" && typeof r["callee"] === "string" && /^%(?!fn\d|init\.|arr\.)/.test(r["callee"])) || kind === "libCall") {
+        const hs = held(t);
+        if (hs.size > 0) mark(hs, "a value of it is built from another value's keys");
+      }
+    }
+    if (kind === "recordKeySet" && r["overflowOnly"] !== true && typeof r["shapeId"] === "string" && shapes.has(r["shapeId"]) &&
+      (L.shapes.get(r["shapeId"])?.fields ?? []).some((f) => f.optional === true)) {
+      mark([r["shapeId"]], "a computed key may set an optional declared field after an added key");
+    }
+    if (kind === "recordSet" && typeof r["shapeId"] === "string" && shapes.has(r["shapeId"])) {
+      const sh = L.shapes.get(r["shapeId"]);
+      if (sh?.fields.some((f) => f.name === r["field"] && f.optional === true)) mark([r["shapeId"]], "an optional declared field is assigned after the record is built");
+    }
+    for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") visit(r[key]);
+  };
+  for (const f of functions) visit(f.body);
+  for (const [id, why] of bad) {
+    const loc = L.hybridInspects.get(id)!;
+    L.pushDiag(unsupportedDiag(
+      "SC1090",
+      loc,
+      `printing an index-signature record with declared fields whose added keys may come before a declared field (${why}): JavaScript prints its keys in insertion order, which this record's declared-then-added layout does not keep`,
+      "print Object.fromEntries(Object.entries(r)) or the fields you need, or declare the record without an index signature",
+    ));
+  }
 }
