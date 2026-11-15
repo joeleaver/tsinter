@@ -3075,6 +3075,7 @@ export class InspectBuilder {
     return this.cached("fnKind", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
       const c = new Code();
       const V = 1;
+      dyn.stubFence(c, "inspect form");
       dyn.fnPayload(c, (x) => x.localGet(0));
       c.structGet(dyn.fnT(), FN_PROTO);
       c.i32Const(2);

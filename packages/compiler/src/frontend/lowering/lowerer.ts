@@ -13,7 +13,7 @@
  *   ("x.0", "x.1" for shadowing); the IR is scope-flat.
  */
 import { lowerHostCall } from "./lower-host.js";
-import { isRelativeSpecifier } from "../shared.js";
+import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
@@ -55,7 +55,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -4085,6 +4085,8 @@ export class Lowerer {
     // and FN_PROTO_GENERATOR, what inspect's `[AsyncFunction: f]` /
     // `[GeneratorFunction: f]` / `[AsyncGeneratorFunction: f]` header reads
     const kinds = new Map<string, Map<number, number>>();
+    const lengths = new Map<string, number>();
+    const spans = new Map<string, [number, number]>();
     const kindsOf = (file: string): Map<number, number> => {
       const hit = kinds.get(file);
       if (hit !== undefined) return hit;
@@ -4099,7 +4101,27 @@ export class Lowerer {
           // Node: ordinary functions and every generator own `prototype`;
           // arrows, methods and async functions do not.
           const proto = gen || (!async && !ts.isArrowFunction(n) && !ts.isMethodDeclaration(n)) ? 1 : 2;
-          m.set(n.getStart(sf), proto | (async ? FN_PROTO_ASYNC : 0) | (gen ? FN_PROTO_GENERATOR : 0));
+          // Keyed by the function's start and also by its name's and its
+          // body's starts: an IR function (a generator's body, for one) may
+          // span from either, and each position belongs to this function
+          // alone. The definition's own span is kept for its source text.
+          const keys = [n.getStart(sf)];
+          { const nm = (n as { name?: ts.Node }).name; if (nm !== undefined) keys.push(nm.getStart(sf)); }
+          if (n.body !== undefined) keys.push(n.body.getStart(sf));
+          for (const key of keys) {
+            m.set(key, proto | (async ? FN_PROTO_ASYNC : 0) | (gen ? FN_PROTO_GENERATOR : 0));
+            spans.set(`${file}:${key}`, [n.getStart(sf), n.end]);
+          }
+          // Node's `f.length`: the parameters before the first one with a
+          // default or a rest (`this` is no parameter; TypeScript's `?`
+          // erases and counts).
+          let len = 0;
+          for (const p of n.parameters) {
+            if (ts.isIdentifier(p.name) && p.name.text === "this") continue;
+            if (p.initializer !== undefined || p.dotDotDotToken !== undefined) break;
+            len++;
+          }
+          for (const key of keys) lengths.set(`${file}:${key}`, len);
         }
         return undefined;
       });
@@ -4135,15 +4157,32 @@ export class Lowerer {
         for (const item of n) visit(item);
         return;
       }
-      const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: number };
+      const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: number; fnLength?: number };
       if ((rec.kind === "dynFrom" || rec.kind === "jsMarshal") && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
         const fnName = rec.value.kind === "closure" ? rec.value.fnName : boundFn.get(rec.value.localId as string);
-        const loc = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;
-        if (loc !== undefined) {
-          const k = kindsOf(loc.file).get(loc.start);
-          if (k !== undefined) rec.fnProto = k;
-          const text = clones ? this.program.getSourceFile(loc.file)?.text.slice(loc.start, loc.end) : undefined;
-          if (text !== undefined && text !== "") rec.srcText = text.replace(/^export\s+(default\s+)?/, "");
+        const loc0 = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;
+        // Only an IR function whose span starts at a function-like node is
+        // that function's definition (a call-time fence stub, `%fn_islfence`,
+        // spans the reference it stands for and carries its definition's
+        // facts itself, boxFactsOf).
+        const k = loc0 === undefined ? undefined : kindsOf(loc0.file).get(loc0.start);
+        const loc = k === undefined ? undefined : loc0;
+        if (loc !== undefined && k !== undefined) {
+          rec.fnProto = k;
+          const len = lengths.get(`${loc.file}:${loc.start}`);
+          if (len !== undefined) rec.fnLength = len;
+          // The source text: Node's own `String(f)` (a JavaScript source,
+          // whose text Node echoes verbatim) and its DataCloneError quote.
+          // A TypeScript function's text is not what Node echoes (Node
+          // prints its type-stripped form), so only a cloning module
+          // carries one (SEMANTICS.md S019).
+          const js = isJsSourceFileName(loc.file);
+          const span = spans.get(`${loc.file}:${loc.start}`);
+          const text = (clones || js) && span !== undefined ? this.program.getSourceFile(loc.file)?.text.slice(span[0], span[1]) : undefined;
+          if (text !== undefined && text !== "") {
+            rec.srcText = text.replace(/^export\s+(default\s+)?/, "");
+            if (!js) rec.fnProto = (rec.fnProto ?? 0) | FN_PROTO_SRC_TS;
+          }
         }
       }
       for (const v of Object.values(n as Record<string, unknown>)) visit(v);
@@ -10435,4 +10474,194 @@ function tagLowererBug(err: unknown, node: ts.Node): unknown {
     // a synthesized node: no position to add
   }
   return err;
+}
+
+/** What a box of the function `node` (or the function an identifier or a
+ * variable names) reports, Node's way: its name (a declaration's own, an
+ * anonymous function's binding or key), `length` (parameters before the
+ * first default or rest), the FN_PROTO kind bits, and, for a JavaScript
+ * source, its own source text (SEMANTICS.md S019, S020). Null when `node`
+ * names no function-like definition. */
+/** The bindings the program writes after their declaration anywhere (an
+ * assignment, compound assignment, `++`/`--`, a destructuring target, a
+ * for-in/of head), across every source file: a let/var's initializer is
+ * its value for good only when it is not in here. */
+const writtenBindings = new WeakMap<Lowerer, { all: Set<ts.Symbol>; rebound: Set<ts.Symbol> }>();
+/** Every binding written after its declaration or whose own members are
+ * redefined through Object.* (facts are not settled for any of them). */
+function writtenSymbols(L: Lowerer): Set<ts.Symbol> {
+  return bindingWrites(L).all;
+}
+/** The bindings the program REBINDS after their declaration (identity is
+ * not settled for these; a member redefinition keeps the same object). */
+function reboundSymbols(L: Lowerer): Set<ts.Symbol> {
+  return bindingWrites(L).rebound;
+}
+function bindingWrites(L: Lowerer): { all: Set<ts.Symbol>; rebound: Set<ts.Symbol> } {
+  const hit = writtenBindings.get(L);
+  if (hit !== undefined) return hit;
+  const out = new Set<ts.Symbol>();
+  const rebound = new Set<ts.Symbol>();
+  writtenBindings.set(L, { all: out, rebound });
+  const K = ts.SyntaxKind;
+  const isAssign = (k: ts.SyntaxKind): boolean => k >= K.FirstAssignment && k <= K.LastAssignment;
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n)) {
+      let top: ts.Node = n;
+      for (;;) {
+        const q = top.parent;
+        if (q !== undefined && (ts.isParenthesizedExpression(q) || ts.isArrayLiteralExpression(q) || ts.isObjectLiteralExpression(q) ||
+          ts.isShorthandPropertyAssignment(q) || ts.isSpreadElement(q) || ts.isSpreadAssignment(q) ||
+          (ts.isPropertyAssignment(q) && q.initializer === top))) {
+          top = q;
+          continue;
+        }
+        break;
+      }
+      const q = top.parent;
+      const written = q !== undefined && (
+        (ts.isBinaryExpression(q) && q.left === top && isAssign(q.operatorToken.kind)) ||
+        ((ts.isPrefixUnaryExpression(q) || ts.isPostfixUnaryExpression(q)) && (q.operator === K.PlusPlusToken || q.operator === K.MinusMinusToken)) ||
+        ((ts.isForOfStatement(q) || ts.isForInStatement(q)) && q.initializer === top));
+      // The target of Object.defineProperty / defineProperties / assign /
+      // setPrototypeOf: its own members (a function's name, length) are
+      // rewritten, so it is no settled definition either.
+      const call = n.parent;
+      const objWrite = call !== undefined && ts.isCallExpression(call) && call.arguments[0] === n &&
+        ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) &&
+        call.expression.expression.text === "Object" &&
+        ["defineProperty", "defineProperties", "assign", "setPrototypeOf"].includes(call.expression.name.text);
+      if (written || objWrite) {
+        const p = n.parent;
+        const sym = p !== undefined && ts.isShorthandPropertyAssignment(p) ? L.checker.getShorthandAssignmentValueSymbol(p) : L.checker.getSymbolAtLocation(n);
+        if (sym !== undefined) {
+          out.add(sym);
+          if (written) rebound.add(sym);
+        }
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  for (const sf of L.program.getSourceFiles()) if (!sf.isDeclarationFile) ts.forEachChild(sf, visit);
+  return { all: out, rebound };
+}
+
+/** The function-like DEFINITION whose function object the value `node`
+ * is, wherever the program can name it for certain: a function or
+ * class-member definition in place, an identifier bound to one (a
+ * function declaration, or a const / let / var the program never rebinds,
+ * through import aliases), a namespace import's member. A property read
+ * off an ordinary object is not (it can be overwritten). Identity comes
+ * from this: one box per definition (lower-island.ts). */
+/** Whether a function definition is EVALUATED ONCE per run, so one
+ * stub can stand for the one function object Node creates from it: its
+ * nearest enclosing function is the module itself (no function, method,
+ * accessor, constructor or per-instance field initializer around it) and
+ * no loop body encloses it. A definition evaluated per call or per
+ * iteration is a new object each time in Node, so a shared stub would
+ * compare equal and share properties where Node does not. */
+export function evaluatedOnce(def: ts.Node): boolean {
+  for (let n: ts.Node | undefined = def.parent; n !== undefined; n = n.parent) {
+    if (ts.isSourceFile(n)) return true;
+    if (
+      ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) || ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n) ||
+      ts.isClassStaticBlockDeclaration(n)
+    ) {
+      return false;
+    }
+    if (ts.isPropertyDeclaration(n) && !(n.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ?? false)) return false;
+    if (
+      ts.isForStatement(n) || ts.isForInStatement(n) || ts.isForOfStatement(n) ||
+      ts.isWhileStatement(n) || ts.isDoStatement(n)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function fnDefinitionOf(L: Lowerer, node: ts.Node, trail?: ts.Symbol[]): ts.Node | undefined {
+  const isFn = (n: ts.Node): boolean =>
+    ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) || ts.isMethodDeclaration(n);
+  const seen = new Set<ts.Symbol>();
+  const fromSymbol = (sym0: ts.Symbol | undefined): ts.Node | undefined => {
+    let sym = sym0;
+    if (sym !== undefined && (sym.flags & ts.SymbolFlags.Alias) !== 0) sym = L.checker.getAliasedSymbol(sym);
+    if (sym === undefined || seen.has(sym)) return undefined;
+    seen.add(sym);
+    trail?.push(sym);
+    const decls = L.checker.declarationsOf(sym);
+    if (decls.length !== 1) return undefined;
+    const d = decls[0]!;
+    if (reboundSymbols(L).has(sym)) return undefined;
+    if (ts.isFunctionDeclaration(d)) return d;
+    if (ts.isVariableDeclaration(d) && d.initializer !== undefined) return fromExpr(d.initializer);
+    if (ts.isExportAssignment(d)) return fromExpr(d.expression);
+    return undefined;
+  };
+  const fromExpr = (e0: ts.Node): ts.Node | undefined => {
+    let e = e0;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (isFn(e)) return e;
+    if (ts.isIdentifier(e)) return fromSymbol(L.checker.getSymbolAtLocation(e));
+    if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
+      // `ns.gen` over a namespace import: the module's own export binding.
+      const recv = L.checker.getSymbolAtLocation(e.expression);
+      const isNs = recv !== undefined && L.checker.declarationsOf(recv).some((d) => ts.isNamespaceImport(d));
+      if (isNs) return fromSymbol(L.checker.getSymbolAtLocation(e.name));
+    }
+    return undefined;
+  };
+  return fromExpr(node);
+}
+
+export function boxFactsOf(L: Lowerer, node: ts.Node, opts?: { objectWritesOk?: boolean }): { fnName?: string; fnLength: number; fnProto: number; srcText?: string } | null {
+  // The facts of the function-like definition `node` denotes, where that
+  // definition is certain (fnDefinitionOf: the definition in place, a
+  // function declaration or a binding the program never rebinds, an import
+  // alias or a namespace member to one) and no binding on the way has its
+  // own members redefined through Object.* (its name or length may no
+  // longer be the definition's). A property read off an ordinary object
+  // is not followed. What is not followed stops by name (FN_PROTO_STUB).
+  const trail: ts.Symbol[] = [];
+  const def = fnDefinitionOf(L, node, trail);
+  // A box that IS the function (an ES5 constructor's FUNC box) keeps its
+  // definition's slots under Object.* redefinitions: those land in its
+  // property table, which reads consult first (objectWritesOk); a rebind
+  // still means the definition is not certain.
+  const written = opts?.objectWritesOk === true ? reboundSymbols(L) : writtenSymbols(L);
+  if (def === undefined || trail.some((sym) => written.has(sym))) return null;
+  const f = def as ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction | ts.MethodDeclaration;
+  const async = (ts.getModifiers(f) ?? []).some((x) => x.kind === ts.SyntaxKind.AsyncKeyword);
+  const gen = !ts.isArrowFunction(f) && f.asteriskToken !== undefined;
+  const proto = gen || (!async && !ts.isArrowFunction(f) && !ts.isMethodDeclaration(f)) ? 1 : 2;
+  let len = 0;
+  for (const p of f.parameters) {
+    if (ts.isIdentifier(p.name) && p.name.text === "this") continue;
+    if (p.initializer !== undefined || p.dotDotDotToken !== undefined) break;
+    len++;
+  }
+  // Node's name: the definition's own, else the one SetFunctionName gives
+  // an anonymous function at its binding, property key or default export.
+  let name: string | undefined;
+  const own = (f as { name?: ts.Node }).name;
+  if (own !== undefined && (ts.isIdentifier(own) || ts.isStringLiteral(own))) name = own.text;
+  else {
+    let p = f.parent;
+    while (p !== undefined && ts.isParenthesizedExpression(p)) p = p.parent;
+    if (p !== undefined && ts.isVariableDeclaration(p) && ts.isIdentifier(p.name)) name = p.name.text;
+    else if (p !== undefined && ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) name = p.name.text;
+    else if (p !== undefined && ts.isExportAssignment(p)) name = "default";
+    else if (ts.isFunctionDeclaration(f) && (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) name = "default";
+  }
+  const sf = f.getSourceFile();
+  const srcText = isJsSourceFileName(sf.fileName) ? sf.text.slice(f.getStart(sf), f.end).replace(/^export\s+(default\s+)?/, "") : undefined;
+  return {
+    ...(name !== undefined ? { fnName: name } : {}),
+    fnLength: len,
+    fnProto: proto | (async ? FN_PROTO_ASYNC : 0) | (gen ? FN_PROTO_GENERATOR : 0),
+    ...(srcText !== undefined ? { srcText } : {}),
+  };
 }

@@ -5,14 +5,14 @@
 import { boolToNumber, toNumberCanon, undefCallSpreadGuard } from "./lower-exprs.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, FN_PROTO_STUB, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
 import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
 import { npmDeclaredOnlyDiag, requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isDtsMirrorPath } from "../npm-static.js";
-import { classLiftIn } from "./class-views.js";
+import { classLiftIn, fencedValue } from "./class-views.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
-import { PoisonError, esFuncNameOf, newFnCtx, own } from "./lowerer.js";
+import { PoisonError, boxFactsOf, esFuncNameOf, evaluatedOnce, fnDefinitionOf, newFnCtx, own } from "./lowerer.js";
 import { regexCrossingChecked } from "./lower-regex.js";
 
 /** True iff the checker's type for this node maps to jsval ('any') —
@@ -83,6 +83,21 @@ import { regexCrossingChecked } from "./lower-regex.js";
    * invoked — building the value compiles; only a call through the
    * island stops the run. Null (caller rethrows) outside the JS deferral
    * gate: TypeScript sources, probe mode, ICEs. */
+  /** One call-time fence stub per function DEFINITION (lazily, a module-
+   * level closure): every crossing of that definition's function object,
+   * whatever path reached it (a let, a namespace import, the definition in
+   * place), shares it, so `===` and properties set through one reference
+   * hold as in Node. */
+  const stubs = new WeakMap<Lowerer, Map<ts.Node, string>>();
+  export function stubByDefinition(L: Lowerer): Map<ts.Node, string> {
+    let m = stubs.get(L);
+    if (m === undefined) {
+      m = new Map();
+      stubs.set(L, m);
+    }
+    return m;
+  }
+
   export function islandFuncValueFence(L: Lowerer, err: unknown, diagsBefore: number, node: ts.Node): IrExpr | null {
     if (
       !(err instanceof PoisonError) ||
@@ -101,8 +116,26 @@ import { regexCrossingChecked } from "./lower-regex.js";
       first.loc.start,
     );
     const loc = locOf(node);
-    const fnName = `%fn${L.lambdaCounter++}_islfence`;
-    L.liftedFns.push({
+    // Identity comes from the definition: a value whose definition the
+    // lowering cannot name (a property read, a rebound let, a choice made
+    // at run time) would cross as a fresh box and compare unequal where
+    // Node compares equal, so it stops by name at the crossing instead.
+    // A definition evaluated more than once (inside a function body or a
+    // loop) is a new object each time in Node: one stub would compare
+    // equal and share properties, so it stops by name too.
+    const def = fnDefinitionOf(L, node);
+    if (def === undefined) {
+      return fencedValue(L, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc } as IrExpr, "SC1090",
+        `a function value whose definition this build cannot see crossing into dynamic code (its identity, name and length could not match Node) is not supported yet [SC1090 at ${loc.file}:${ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1}]`, loc);
+    }
+    if (!evaluatedOnce(def)) {
+      return fencedValue(L, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc } as IrExpr, "SC1090",
+        `a function value defined inside a function body or a loop crossing into dynamic code (each evaluation is a new function object in Node; this build's stand-in would be one shared object) is not supported yet [SC1090 at ${loc.file}:${ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.getStart()).line + 1}]`, loc);
+    }
+    const reused = stubByDefinition(L).get(def);
+    const fnName = reused ?? `%fn${L.lambdaCounter++}_islfence`;
+    if (reused === undefined) stubByDefinition(L).set(def, fnName);
+    if (reused === undefined) L.liftedFns.push({
       name: fnName,
       params: [],
       returnType: VOID,
@@ -118,9 +151,14 @@ import { regexCrossingChecked } from "./lower-regex.js";
       ],
       loc,
     });
+    // The stub stands for the function `node` names: its box reports that
+    // definition's name, length, kind and source (Node's answers); only a
+    // call through it stops by name.
+    const facts = boxFactsOf(L, node);
     return {
       kind: "jsMarshal",
       value: { kind: "closure", fnName, captures: [], type: { kind: "func", params: [], ret: VOID }, loc },
+      ...(facts ?? { fnProto: FN_PROTO_STUB }),
       type: JSVAL,
       loc,
     };

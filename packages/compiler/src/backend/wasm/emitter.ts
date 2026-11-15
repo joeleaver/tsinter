@@ -18694,6 +18694,7 @@ class Assembler {
             this.pushStrLitInto(c, f.name);
             c.refNull(this.strType);
             c.i32Const(0);
+            c.i32Const(this.declaredArity(f.type));
             c.call(box);
           } else c.call(inner);
           c.call(dyn.objPut());
@@ -18939,6 +18940,7 @@ class Assembler {
         c.refNull(this.strType);
         c.refNull(this.strType);
         c.i32Const(0);
+        c.i32Const(this.declaredArity(t));
         c.call(box);
         return true;
       }
@@ -20993,6 +20995,13 @@ class Assembler {
   /** The per-signature box builder (C's sc_dfb_N): `(closure, name) →
    * the FUNC box`. The NAME parameter is null for an anonymous value —
    * never the empty string, which keyGet substitutes at read time. */
+  /** S020's approximation of `f.length` for a box with no known
+   * definition: the declared parameter count (the island-rest form's last
+   * declared parameter IS its rest array, so it is excluded). */
+  private declaredArity(t: IrType & { kind: "func" }): number {
+    return t.rest === true && t.restAbi === "jsval" ? t.params.length - 1 : t.params.length;
+  }
+
   private dynFnBox(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
     const key = typeKey(t);
     const hit = this.dynFnBoxes.get(key);
@@ -21001,7 +21010,7 @@ class Assembler {
     if (pair === null) return null;
     const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
     const idx = this.mb.declareFunc(
-      this.mb.funcType([closRef, this.strRef, this.strRef, I32], [this.dyn.dynRef()]),
+      this.mb.funcType([closRef, this.strRef, this.strRef, I32, I32], [this.dyn.dynRef()]),
       `%w.dyn.fnBox:${key}`,
     );
     this.dynFnBoxes.set(key, idx);
@@ -21015,17 +21024,11 @@ class Assembler {
       (x) => x.refFunc(thunk),
       this.dynFnSigId(key),
       (x) => x.localGet(1),
-      // ARITY is the DECLARED parameter count. SEMANTICS.md S020: that
-      // is an APPROXIMATION of `f.length`, which JS stops counting at the
-      // first parameter with a DEFAULT — `(a, b = 1)` answers 1 in Node
-      // and 2 here. A rest parameter is excluded from both, and
-      // TypeScript's `?` erases, so those two agree. Only the reported
-      // number is affected: the thunk's checks still admit a missing
-      // defaulted argument (its type carries an undefined arm), so the
-      // body applies its own default exactly like Node. The island-rest
-      // form's last declared parameter IS its rest array (unit A1), so it
-      // is excluded the same way.
-      t.rest === true && t.restAbi === "jsval" ? t.params.length - 1 : t.params.length,
+      // ARITY, Node's `f.length`, is the caller's: a box built from a
+      // known definition passes the parameters before its first default
+      // or rest (SEMANTICS.md S020's amendment); one that crossed without
+      // it passes declaredArity (S020's approximation).
+      (x) => x.localGet(4),
       (x) => x.localGet(2),
       (x) => x.localGet(3),
     );
@@ -31343,6 +31346,7 @@ class Assembler {
             if (e.srcText !== undefined) this.pushStrLitInto(code, e.srcText);
             else code.refNull(this.strType);
             code.i32Const(e.fnProto ?? 0);
+            code.i32Const(e.fnLength ?? this.declaredArity(vt));
             code.call(box);
             return;
           }
@@ -34099,10 +34103,12 @@ class Assembler {
             // (S020), as dynFrom's box does.
             if (e.fnName !== undefined && e.fnName !== "") this.pushStrLitInto(code, e.fnName);
             else code.refNull(this.strType);
-            code.refNull(this.strType);
+            if (e.srcText !== undefined) this.pushStrLitInto(code, e.srcText);
+            else code.refNull(this.strType);
             // Unit U4: whether it owns `prototype` (arrows and methods do
             // not: `new` on one throws), stamped by the lowering.
-            code.i32Const((e as { fnProto?: number }).fnProto ?? 0);
+            code.i32Const(e.fnProto ?? 0);
+            code.i32Const(e.fnLength ?? this.declaredArity(vt));
             code.call(box);
             return;
           }

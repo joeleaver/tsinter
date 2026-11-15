@@ -22,8 +22,9 @@
  *    `$dynAcc` subtype (the getter in the ref slot, either half may be the
  *    `undefined` box). */
 import type { DynBuilder } from "./dyn.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, ENTRY_KEY, ENTRY_VALUE, FN_ARITY, FN_CLOS, FN_NAME, FN_PROTO, FN_SIG, FN_SRC, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, ENTRY_KEY, ENTRY_VALUE, FN_CLOS, FN_NAME, FN_PROTO, FN_SIG, FN_SRC, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
 import { Code } from "./code.js";
+import { FN_PROTO_GENERATOR, FN_PROTO_STUB } from "../../ir/nodes.js";
 import { emitFlatCast } from "./strings.js";
 import { F64, I32, type ValType } from "./module.js";
 
@@ -1777,6 +1778,30 @@ export class ObjModel {
           c.call(this.define());
         });
         this.k.arm(c, K, [DK.FUNC], () => {
+          // An ordinary function's `name` / `length` redefinition lands in
+          // its table, which reads consult before the box's own slots
+          // (keyGet, inspect), as Node redefines them. A STAND-IN box (a
+          // function with no compiled form, FN_PROTO_STUB) reports facts
+          // the lowering stamped from its definition, which typed reads
+          // also carry, so redefining either there stops by name
+          // (docs/design/function-type.md).
+          for (const fixed of ["name", "length"]) {
+            c.localGet(1);
+            this.lit(c, fixed);
+            c.call(this.k.deps.strEq());
+            this.d.fnPayload(c, (x) => x.localGet(0));
+            c.structGet(this.d.fnT(), FN_PROTO);
+            c.i32Const(FN_PROTO_STUB);
+            c.i32And();
+            c.i32Const(0);
+            c.i32Ne();
+            c.i32And();
+            c.ifVoid();
+            this.k.deps.fence(c, (x) => this.lit(x, `redefining a function's '${fixed}' (Object.defineProperty, defineProperties or assign) is not supported yet`));
+            c.i32Const(0);
+            c.return_();
+            c.end();
+          }
           // A function's own table: enumerable keys in enumT, the rest in
           // its hidden table (keyGet/hasOwn read both).
           this.d.fnPayload(c, (x) => x.localGet(0));
@@ -3196,6 +3221,16 @@ export class ObjModel {
       c.ifVoid();
       this.k.deps.fence(c, (x) => this.lit(x, "Error.prototype read through the Error constructor held as a dynamic value is not supported yet"));
       c.end();
+      // A generator function's `prototype` is the prototype its generator
+      // objects inherit (not a constructor prototype); generator objects
+      // here do not look up through it, so using it stops by name.
+      this.d.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.d.fnT(), FN_PROTO);
+      c.i32Const(FN_PROTO_GENERATOR);
+      c.i32And();
+      c.ifVoid();
+      this.k.deps.fence(c, (x) => this.lit(x, "a generator function's 'prototype' (the prototype its generator objects inherit) is not supported yet"));
+      c.end();
       c.end();
       c.localGet(0);
       c.call(this.fnPrototypeRaw());
@@ -3327,6 +3362,21 @@ export class ObjModel {
         c.call(this.concatArgs());
         c.localGet(2);
         c.call(this.construct());
+        c.return_();
+        c.end();
+        // A generator is never a constructor (Node: "G is not a
+        // constructor"), though it owns a `prototype`.
+        this.d.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.d.fnT(), FN_PROTO);
+        c.i32Const(FN_PROTO_GENERATOR);
+        c.i32And();
+        c.ifVoid();
+        this.throwType(c, (x) => {
+          x.localGet(2);
+          this.lit(x, " is not a constructor");
+          this.concat(x);
+        });
+        c.refNull(dynT);
         c.return_();
         c.end();
         // A builtin's stand-in (SIG -2/-3: a constructor read from a
@@ -3642,29 +3692,91 @@ export class ObjModel {
       c.localGet(R);
     });
     this.k.mb.declareFuncRef(thunk);
-    return this.fn("bindFn", [this.d.dynRef(), this.d.dynRef(), this.d.arrRef()], [this.d.dynRef()], [I32, this.strRef()], (c) => {
+    return this.fn("bindFn", [this.d.dynRef(), this.d.dynRef(), this.d.arrRef()], [this.d.dynRef()], [I32, this.strRef(), this.d.dynRef(), F64], (c) => {
       const AR = 3;
       const NM = 4;
-      this.d.fnPayload(c, (x) => x.localGet(0));
-      c.structGet(fnT, FN_ARITY);
+      const P = 5;
+      const D = 6;
+      // Node's Function.prototype.bind reads the target's properties, so a
+      // redefined `length` / `name` (its table, ahead of the box's own
+      // slots) is what the bound function reports. L: a number length
+      // gives max(0, ToIntegerOrInfinity(len) - argCount), anything else 0.
+      c.localGet(0);
+      this.lit(c, "length");
+      c.i32Const(0);
+      c.call(this.d.keyGet());
+      c.localTee(P);
+      c.refIsNull();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(P);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifResult(F64);
+      c.localGet(P);
+      c.structGet(dynT, DYN_NUM);
+      c.else_();
+      c.f64Const(0);
+      c.end();
+      c.end();
+      c.localSet(D);
+      // +Infinity is Node's bound length too; the box's length slot is an
+      // i32, so that (and a length past it) stops by name.
+      c.localGet(D);
+      c.f64Const(2147483647);
+      c.f64Gt();
+      c.ifVoid();
+      this.k.deps.fence(c, (x) => this.lit(x, "binding a function whose 'length' is above 2147483647 (Infinity included) is not supported yet"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // ToIntegerOrInfinity (NaN -> 0, -Infinity -> 0 after the max below)
+      c.localGet(D);
+      c.localGet(D);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(D);
+      c.f64Trunc();
+      c.end();
       this.d.arrLen(c, (x) => x.localGet(2));
-      c.i32Sub();
-      c.localTee(AR);
+      c.f64ConvertI32S();
+      c.f64Sub();
+      c.localTee(D);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifResult(I32);
       c.i32Const(0);
-      c.localGet(AR);
-      c.i32Const(0);
-      c.i32GtS();
-      c.select();
+      c.else_();
+      c.localGet(D);
+      c.i32TruncSatF64S();
+      c.end();
       c.localSet(AR);
+      // name: Get(target, "name"); a non-string answers "".
       this.lit(c, "bound ");
-      this.d.fnPayload(c, (x) => x.localGet(0));
-      c.structGet(fnT, FN_NAME);
-      c.localTee(NM);
+      c.localGet(0);
+      this.lit(c, "name");
+      c.i32Const(0);
+      c.call(this.d.keyGet());
+      c.localTee(P);
       c.refIsNull();
       c.ifResult(this.strRef());
       this.lit(c, "");
       c.else_();
-      c.localGet(NM);
+      c.localGet(P);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifResult(this.strRef());
+      c.localGet(P);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.k.deps.strType());
+      c.else_();
+      this.lit(c, "");
+      c.end();
       c.end();
       this.concat(c);
       c.localSet(NM);

@@ -424,6 +424,15 @@ export const NULL_T: IrType = { kind: "nullT" };
  * answer (the low two bits): an async function, a generator. */
 export const FN_PROTO_ASYNC = 4;
 export const FN_PROTO_GENERATOR = 8;
+/** FN_PROTO bit: the box's FN_SRC is TypeScript text (a cloning module's
+ * DataCloneError quote), not what Node's `String(f)` echoes, so a string
+ * conversion stops by name (SEMANTICS.md S019). */
+export const FN_PROTO_SRC_TS = 16;
+/** FN_PROTO bit: the box is a call-time fence stub (a JavaScript function
+ * value with no compiled form) whose definition the lowering could not
+ * see: its `name`, `length` and inspect form stop by name, as a call does,
+ * never a stand-in 0, "" or anonymous (docs/design/function-type.md). */
+export const FN_PROTO_STUB = 32;
 
 export function isUnitType(t: IrType): boolean {
   return t.kind === "undefinedT" || t.kind === "nullT";
@@ -5367,7 +5376,7 @@ export type IrExpr =
    * async functions) — or'd with GH #156's kind bits FN_PROTO_ASYNC /
    * FN_PROTO_GENERATOR (inspect's `[AsyncFunction: f]` header). `isBuffer` (GH #138): a bytes<u8> value the checker
    * types as a Buffer — the BYTES payload's Buffer flag (SEMANTICS.md S037). */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: number; isBuffer?: true; type: IrType; loc: SrcLoc }
+  | { kind: "dynFrom"; value: IrExpr; fnName?: string; srcText?: string; fnProto?: number; /** A function value: Node's `length` (parameters before the first default or rest), stamped from its definition; absent, the declared count. */ fnLength?: number; isBuffer?: true; type: IrType; loc: SrcLoc }
   /** Island value → dyn conversion (`type` is always dyn; the operand
    * is always jsval): the jsval→dyn crossing — an 'any'-typed engine
    * value flowing into an 'unknown'/'object'/JS-residue slot wraps BY
@@ -5770,7 +5779,7 @@ export type IrExpr =
    * type-directed JSON serializer and the engine's JSON parser; the
    * aliasing divergence is documented in SEMANTICS.md). Result is an
    * owned (+1) jsval; the operand is borrowed. Never throws. */
-  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; /** GH #138: a bytes<u8> value the checker types as a Buffer (dynFrom's `isBuffer`). */ isBuffer?: true; type: IrType; loc: SrcLoc }
+  | { kind: "jsMarshal"; value: IrExpr; /** A function value only (U1a): the spelling of the binding it is marshaled from — the box's `name` (S020), as dynFrom carries it. */ fnName?: string; /** As dynFrom's. */ srcText?: string; fnProto?: number; fnLength?: number; /** GH #138: a bytes<u8> value the checker types as a Buffer (dynFrom's `isBuffer`). */ isBuffer?: true; type: IrType; loc: SrcLoc }
   /** An operation on island values (--dynamic builds only), executed by
    * the embedded engine with JS-exact semantics (coercions come from
    * pinned prelude closures, not C reimplementations). `args` are

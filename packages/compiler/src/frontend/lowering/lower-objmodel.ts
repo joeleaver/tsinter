@@ -6,7 +6,7 @@
  * existing path. Also SEMANTICS.md S132: the `Function` constructor and
  * `eval` throw Node's --disallow-code-generation-from-strings EvalError. */
 import * as ts from "../ts7/adapter.js";
-import { PoisonError, fnProtoOfValueNode, nodeThrowExpr, type Lowerer } from "./lowerer.js";
+import { PoisonError, boxFactsOf, fnProtoOfValueNode, nodeThrowExpr, type Lowerer } from "./lowerer.js";
 import { BOOL, DYN, F64, JSVAL, STRING, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -274,8 +274,21 @@ export function lowerEs5Ref(L: Lowerer, expr: ts.Identifier): IrExpr | null {
   es5RefGuard = expr;
   try {
     const raw = L.lowerExpr(expr);
-    if (raw.type.kind === "jsval" || raw.type.kind === "dyn") return raw;
-    return L.jsvalIn(raw, expr);
+    const out = raw.type.kind === "jsval" || raw.type.kind === "dyn" ? raw : L.jsvalIn(raw, expr);
+    // The box reports its definition's kind (a generator's
+    // GeneratorFunction, an async function's) and Node's length; a
+    // redefined name or length lands in its property table, read first.
+    if (out.kind === "jsMarshal" || out.kind === "dynFrom") {
+      const facts = boxFactsOf(L, expr, { objectWritesOk: true });
+      if (facts !== null) {
+        const o = out as { fnProto?: number; fnLength?: number; fnName?: string; srcText?: string };
+        o.fnProto = (o.fnProto ?? 0) | facts.fnProto;
+        o.fnLength = facts.fnLength;
+        if (facts.fnName !== undefined) o.fnName ??= facts.fnName;
+        if (facts.srcText !== undefined) o.srcText ??= facts.srcText;
+      }
+    }
+    return out;
   } finally {
     es5RefGuard = saved;
   }
