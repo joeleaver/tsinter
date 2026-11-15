@@ -8,7 +8,7 @@ import type { Lowerer } from "./lowerer.js";
 import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js";
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
-import { PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
+import { PoisonError, boundIdentifiersOf, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, importCallHandleType, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
@@ -568,6 +568,7 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
    * binding. */
   function varBindingType(L: Lowerer, nameNode: ts.Identifier): IrType | null {
     let type = L.mapTypeOf(L.typeOf(nameNode));
+    if (jsMixedObjectUnion(L, nameNode, type)) type = DYN; // S014's U1b amendment
     if (type?.kind === "record" && isJsSourceFile(nameNode.getSourceFile())) {
       const shape = L.shapes.get(type.shapeId);
       if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;

@@ -12,7 +12,7 @@ import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam,
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { declaredInterfaceOverDynamic, isGenericCallableMemberType, typeKey } from "../types.js";
-import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr, jsMixedObjectUnion } from "./lowerer.js";
 import { armRooted, dynArmKey, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
@@ -700,7 +700,10 @@ export interface GenericInstance {
     // the value here.
     const ownType = (e: ts.Expression): IrType | null => {
       const t = L.typeOf(e);
-      return L.mapTypeOf(t) ?? (isJsSourceFile(e.getSourceFile()) ? dynFallbackType(L, e, t) : null);
+      const m = L.mapTypeOf(t);
+      if (m !== null && jsMixedObjectUnion(L, e, m)) return DYN;
+      if (m !== null) return m;
+      return isJsSourceFile(e.getSourceFile()) ? dynFallbackType(L, e, t) : null;
     };
     const mapped = target
       ? L.mapTypeOf(target)
@@ -898,6 +901,7 @@ export interface GenericInstance {
       return DYN;
     }
     const returnType = L.mapTypeOf(retTsType);
+    if (jsMixedObjectUnion(L, decl, returnType)) return DYN; // S014's U1b amendment (never the array-keeping fallback)
     if (!returnType) {
       // JS inference residue (an `any` return, an unmappable union): the
       // checked-dynamic fallback, exactly the declaration story in
@@ -5195,6 +5199,19 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (extracted) return extracted;
     }
     if (access.name.text === "flatMap") return lowerDynArrayFlatMapCall(L, call, access, recv);
+    // `x.localeCompare(y)` over a dynamic receiver (commander's help sort,
+    // `a.name().localeCompare(b.name())`): a STRING receiver collates as
+    // the typed form does (ICU root, SEMANTICS.md S120) — a non-string
+    // argument stops by name (Node ToStrings it) — and any other receiver
+    // keeps the runtime dispatch (its own member, or Node's TypeError).
+    if (
+      access.name.text === "localeCompare" && L.sharedDynamic && call.arguments.length >= 1 &&
+      !call.arguments.some(ts.isSpreadElement) && !call.questionDotToken && !access.questionDotToken
+    ) {
+      const loc = locOf(call);
+      const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+      return { kind: "call", callee: dynLocaleCompareHelper(L, access.getText(), args.length, loc), args: [recv, ...args], type: DYN, loc };
+    }
     // String methods claim only names NO other dyn-representable kind's
     // prototype declares (Array carries includes/indexOf/slice too): for
     // these, "the receiver is a string, or the call throws V8's TypeError"
@@ -5317,6 +5334,46 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
  * these could be a REAL method on a real value, which a stored-member
  * read would silently mis-answer — they keep the fence. Everything else
  * is own-property-or-throw for every dyn value (the honest dynCall). */
+/** `%dyn.lcmp(r, a)`: localeCompare over a dynamic receiver (see the
+ * call site in the dynamic method lowering). */
+function dynLocaleCompareHelper(L: Lowerer, calleeName: string, argc: number, loc: SrcLoc): string {
+  const key = `dyn.lcmp:${calleeName}:${argc}`;
+  let name = L.arrHofHelpers.get(key);
+  if (name) return name;
+  name = `%dyn.lcmp.${L.arrHofHelpers.size}`;
+  L.arrHofHelpers.set(key, name);
+  const r: IrExpr = { kind: "varRef", localId: "r.0", type: DYN, loc };
+  const argRefs: IrExpr[] = Array.from({ length: argc }, (_, i) => ({ kind: "varRef", localId: `a${i}.0`, type: DYN, loc }));
+  const isStr = (v: IrExpr): IrExpr => ({ kind: "dynTest", test: "string", value: v, type: BOOL, loc });
+  const asStr = (v: IrExpr): IrExpr => ({ kind: "dynCheck", value: v, type: STRING, loc });
+  const onString: IrStmt[] = argc === 1
+    ? [{
+        kind: "if",
+        cond: isStr(argRefs[0]!),
+        then: [{
+          kind: "return",
+          value: { kind: "dynFrom", value: { kind: "strIntrinsic", method: "localeCompare", receiver: asStr(r), args: [asStr(argRefs[0]!)], type: F64, loc }, type: DYN, loc },
+          loc,
+        }],
+        else_: null,
+        loc,
+      },
+      { kind: "runtimeFence", code: "SC1090", message: "localeCompare on a dynamic string with an argument that is not a string (Node converts it to a string first) is not supported yet [SC1090 at a dynamic string]", loc }]
+    : [{ kind: "runtimeFence", code: "SC1090", message: "localeCompare with a locales or options argument on a dynamic string is not supported yet [SC1090 at a dynamic string]", loc }];
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "r.0", name: "r", type: DYN }, ...argRefs.map((_, i) => ({ localId: `a${i}.0`, name: `a${i}`, type: DYN }))],
+    returnType: DYN,
+    locals: [{ id: "r.0", name: "r", type: DYN, mutable: false }, ...argRefs.map((_, i) => ({ id: `a${i}.0`, name: `a${i}`, type: DYN, mutable: false }))],
+    body: [
+      { kind: "if", cond: isStr(r), then: onString, else_: null, loc },
+      { kind: "return", value: { kind: "dynInvoke", recv: r, method: "localeCompare", calleeName, args: argRefs, type: DYN, loc }, loc },
+    ],
+    loc,
+  });
+  return name;
+}
+
 const DYN_PROTO_METHOD_NAMES = new Set([
   // Object.prototype
   "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf",

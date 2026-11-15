@@ -23,7 +23,7 @@ import { fencedValue, lowerConstructorName, viewableClass } from "./class-views.
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped } from "./lower-builtins.js";
@@ -5771,6 +5771,10 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
     const ctxType = L.checker.getContextualType(expr);
     const tsType = ctxType ?? L.typeOf(expr);
     let mapped = expected ?? L.mapTypeOf(tsType);
+    // S014's U1b amendment (the JSDoc-union rule): a contextual array of
+    // such a union is no storage — the literal builds as the dynamic array
+    // its slot holds (`/** @type {Array<Foo|string>} */ this.list = []`).
+    if (expected === undefined && jsMixedObjectUnion(L, expr, mapped)) mapped = DYN;
     // The one-world lanes: see lowerObjectLiteral's rule.
     if (L.sharedDynamic && !expected && mapped?.kind === "jsval") {
       const own = L.mapTypeOf(L.typeOf(expr));
