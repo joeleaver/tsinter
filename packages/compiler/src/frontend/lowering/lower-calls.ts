@@ -13,7 +13,7 @@ import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { declaredInterfaceOverDynamic, isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
-import { armRooted, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
+import { armRooted, dynArmKey, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
@@ -1023,12 +1023,18 @@ export function collectSignatureInner(L: Lowerer, decl: ts.FunctionDeclaration):
       params.push({ type: DYN, mode: "dynRest" });
     }
     const nameBlame: ts.Node = decl.name ?? decl;
-    const returnType = L.declaredReturnType(decl, nameBlame);
+    let returnType = L.declaredReturnType(decl, nameBlame);
     if (isAsync && returnType.kind !== "promise") {
       L.badType(nameBlame, L.typeOf(nameBlame));
     }
     if (isGenerator && returnType.kind !== "generator") {
       L.badType(nameBlame, L.typeOf(nameBlame));
+    }
+    // S125 A1: a plain function whose result copy was refused at a `return`
+    // returns on the dynamic arm in this pass (dyn-arm.ts `ret:` sites).
+    if (!isAsync && !isGenerator && returnType.kind !== "void") {
+      const armRet = dynArmResultType(L, decl);
+      if (armRet !== null) returnType = armRet;
     }
 
     const symbol = declSymbolOf(L, decl);
@@ -2220,14 +2226,61 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
   return { kind: "call", callee: inst.name, args, type: inst.returnType, loc };
 }
 
+/** S125 share-vs-copy, A4 (the commander collector shape, design "C"): a
+ * DECLARED function's closure crossing into a dynamic value, whose refused
+ * composite parameters are recorded `dparam:` sites, boxes its BOXED
+ * instance instead — the same per-call-site machinery as S125 (a), with
+ * those parameters bound to `any` (dynamic-arm slots), so dynamic code and
+ * the body share the argument. Direct calls keep the typed function. The
+ * closure as is when nothing applies (or the instance does not lower). */
+export function dynboxClosure(L: Lowerer, e: IrExpr): IrExpr {
+  if (e.kind !== "closure" || L.dynArmSites.size === 0 || e.captures.length > 0) return e;
+  const hit = L.declByFnName(e.fnName);
+  if (hit === undefined) return e;
+  const { decl, sig } = hit;
+  if (decl.typeParameters !== undefined || sig.isAsync || sig.generator !== undefined || decl.asteriskToken !== undefined) return e;
+  if (bodyReadsArguments(decl) || decl.parameters.length !== sig.params.length) return e;
+  const js = isJsSourceFile(decl.getSourceFile());
+  const bindings = new Map<ts.Symbol, ts.Type>();
+  const shapes: ParamShape[] = sig.params.slice();
+  decl.parameters.forEach((param, i) => {
+    if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.initializer || isThisParameter(param)) return;
+    if (!L.dynArmSites.has(`dparam:${dynArmKey(param)}`)) return;
+    const psym = L.checker.getSymbolAtLocation(param.name);
+    if (psym === undefined) return;
+    bindings.set(psym, L.checker.getAnyType());
+    shapes[i] = { type: js ? DYN : JSVAL, mode: shapes[i]!.mode };
+  });
+  // a refused composite result: the boxed instance returns the dynamic value
+  const retArm = sig.returnType.kind !== "void" && L.dynArmSites.has(`dret:${dynArmKey(decl)}`) ? (js ? DYN : JSVAL) : undefined;
+  if (bindings.size === 0 && retArm === undefined) return e;
+  let info = L.widthSpecInfos.get(decl);
+  if (!info) {
+    info = {
+      decl,
+      baseName: decl.name?.text ?? sig.name,
+      qualifiedName: `${sig.name}%w`,
+      typeParams: [],
+      instances: new Map(),
+      implicitParams: decl.parameters.map(() => null),
+    };
+    L.widthSpecInfos.set(decl, info);
+  }
+  for (const b of bindings.keys()) L.widthBoundParams.add(b);
+  const inst = widthInstance(L, info, shapes, bindings, retArm);
+  if (inst === null) return e;
+  L.dynboxDecls.set(inst.name, hit);
+  return { kind: "closure", fnName: inst.name, captures: [], type: { kind: "func", params: inst.params.map((p) => p.type), ret: inst.returnType }, loc: e.loc };
+}
+
 /** The instance of `info` over `shapes`, lowered eagerly at first demand
  * (internImplicitInstance's discipline), or null when the body does not
  * lower over the bound types (a construct the class instance does not
  * support — `JSON.stringify` of an instance, say): the call then keeps its
  * ordinary path, whose copy widthCopyPass judges. Nothing the failed
  * attempt reported survives it. */
-function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], argTypes: Map<ts.Symbol, ts.Type>): GenericInstance | null {
-  const key = shapes.map((s) => typeKey(s.type)).join(",");
+function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], argTypes: Map<ts.Symbol, ts.Type>, retOverride?: IrType): GenericInstance | null {
+  const key = shapes.map((s) => typeKey(s.type)).join(",") + (retOverride !== undefined ? `|ret=${typeKey(retOverride)}` : "");
   const existing = info.instances.get(key);
   if (existing) {
     if (existing.implicitState === "failed") return null;
@@ -2236,7 +2289,7 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
   }
   if (instanceBoundExceeded(info, "width") !== null) return null;
   const rendered = shapes.map((s) => L.fmt(s.type)).join(", ");
-  const declared = implicitDeclaredReturn(L, info);
+  const declared = retOverride ?? implicitDeclaredReturn(L, info);
   if (declared === null) return null;
   const inst: GenericInstance = {
     name: `${info.qualifiedName}%${info.instances.size}`,

@@ -317,7 +317,11 @@ longer validates eagerly: the slot is the dynamic value, checked only
 where a value must enter typed storage, and a fresh value is a typed copy
 only when it has exactly the type's shape (SEMANTICS.md S128). The width
 tolerance below (a record copy keeps only its type's declared fields)
-applies only where a copy is still made.*
+applies only where a copy is still made — including a fresh
+`JSON.parse(text) as T` pushed or stored straight into a typed array or
+field, even one the program later prints (S125's GH #222 amendment: a
+value nothing else holds keeps this tolerance; the printed copy shows only
+the type's declared fields where Node shows every key).*
 
 `e as C` on a catch binding is a RUNTIME check: a payload that is an
 instance of `C` passes through, and anything else throws a catchable
@@ -10719,6 +10723,52 @@ slot by copy. **Tested by:** `packages/compiler/test/wasm-dyn-copies.test.ts`
 and `wasm-u1-shared-dynamic.test.ts` (the rows that refused before U2 now
 equal Node), `wasm-u2-maybe-dynamic.test.ts`.
 
+**Amendment (S125 share-vs-copy, paperclip slice A — wasm and
+wasm-native): two more slots share instead of copying.** Each is a
+contained slot of S128's dynamic arm, taken only where this entry's (c)
+refused the copy, and falling back to the copy refusal when the arm does
+not build:
+- **A plain function's result.** The result of a plain function (a
+  declaration, or a function literal; not generic, async or a generator)
+  whose `return` would copy a dynamic value into its typed result (the
+  `asRecord` helper, `return value as Record<string, unknown>`) is the
+  dynamic value itself. Every direct caller receives the shared object and
+  checks it only where it must enter typed storage. A cast whose value is
+  returned there is no conversion. A caller that stores the result into a
+  field or element keeps the refusal, because fields never take the arm.
+- **A declared function handed to dynamic code.** A declared, non-generic,
+  non-async function boxed into a dynamic value (commander's
+  `.option(flag, desc, collect, [])` collector) whose composite parameters
+  or result would be copies boxes a second instance of itself. In that
+  instance those parameters, and the result, hold the dynamic values
+  themselves, so dynamic code and the body share the array. Direct calls
+  from typed code keep the typed function.
+- **A width copy that is printed (GH #222).** A dynamic value checked into
+  a closed record type (or an array of one) keeps only the type's declared
+  fields, where the JavaScript object keeps every key. (c) now counts a
+  print, a serialization or a key listing as an observer of that copy:
+  where the check is made, through the binding it lands in, or anywhere a
+  value of the type (or of a closed record type inside it) is printed when
+  no binding accounts for every use. At a contained slot (a cast, a
+  binding, a plain function's result) such a copy takes the dynamic arm,
+  so it prints every key as Node; where the arm does not build, the slot's
+  copy takes only exactly-fitting values and stops by name otherwise
+  (S128 (a3)); a slot that still copies on the arm (`arr.push(src as N)`,
+  the element must enter typed storage) takes that exact-fit copy too,
+  fresh source or not. A fresh object literal or spread a plain function
+  returns is a new object: its width is GH #148's judgement, not an exact
+  fit. Anywhere else it refuses like any other observed copy, and
+  a copy taken from an arm value into a field or element stops by name
+  (S128 (a2)). S009's width tolerance stays only for
+  a value nothing else holds (a fresh `JSON.parse(text) as T`). That
+  includes a fresh parse pushed or stored straight into a typed array or
+  field that is later printed (`xs.push(JSON.parse(t) as N);
+  console.log(xs)` prints `[ { a: 1 } ]` where Node prints every key):
+  the parse is a value nothing else holds, so the copy keeps S009's
+  tolerance rather than this observer rule.
+**Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
+both lanes).
+
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
 
 Docs: `docs/design/dynamic-values.md` §4.3 (unit U2; Joe's rulings J1,
@@ -10884,6 +10934,14 @@ default runs — exactly Node's strict equality. Other case shapes keep the
 named stop ("switch statements on 'unknown' values"). **Tested by:**
 `packages/compiler/test/wasm-symbol-keys.test.ts` (SYMK-01: stream-chain's
 normalizeMany) and SYMK-SW.
+
+**Amendment (S125 share-vs-copy — the boxed declared function).** A
+declared function whose boxed instance carries dynamic-arm parameters or
+result (S125's amendment) is, for dynamic code, that instance: the same
+body lowered again with those slots `any`, through S125 (a)'s per-call-site
+instance machinery. Its direct calls name the typed original. Both
+instances run the same source, so the program cannot tell them apart;
+only the representation of the parameter differs.
 
 ## S129 — An import of a Node builtin this build does not serve binds stubs: the program runs until it first touches one, and stops there by name *(every lane; tested on wasm and wasm-native)*
 

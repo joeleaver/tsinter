@@ -185,6 +185,9 @@ interface DynSite extends Site {
   holder?: { key: string; list: unknown[]; index: number } | undefined;
   /** The crossing's own IR node (the dynamic copy, for an in-crossing). */
   node: IrExpr;
+  /** GH #222: an out-crossing printed, serialized or key-listed right where
+   * it is made. */
+  observedAt?: boolean;
 }
 
 /** GH #148 (review): the island spread literals (`{ ...x }` over a dynamic
@@ -207,6 +210,10 @@ function spreadsIn(v: unknown, out: Record<string, unknown>[] = []): Record<stri
     case "dynFromJsval":
     case "jsMarshal":
       return spreadsIn(r["value"], out);
+    case "call":
+      // (U2's exact-fit test passes its argument through)
+      if (typeof r["callee"] === "string" && /^%u2\.exact\./.test(r["callee"])) return spreadsIn((r["args"] as unknown[])[0], out);
+      return out;
     case "seqExpr":
       return spreadsIn(r["result"], out);
     default:
@@ -1151,6 +1158,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         dynSites.push({
           dir: "out", callee: "%dyn.check", arg: r["value"] as IrExpr, t, loc, where: curFn, top: curTop, node: r as unknown as IrExpr,
           dest: destOf(parent, pkey, r), consumed: consumedAt(stack.length - 1, t), atReturn: atReturn(stack.length - 1),
+          observedAt: stack.length > 0 && ((): boolean => {
+            const [anc, key] = stack[forwardFrom(stack.length - 1)]!;
+            const u = useOf(anc, key);
+            return u === "print" || u === "keys";
+          })(),
           scope: parent?.["kind"] === "varDecl" && pkey === "init" && stack.length >= 2 && stack[stack.length - 2]![0]["kind"] === "seqExpr" &&
             stack[stack.length - 2]![1] === "stmts" ? stack[stack.length - 2]![0] : undefined,
           holder: holderAt(stack.length - 1),
@@ -2535,6 +2547,55 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     const ORIG_WRITTEN = "the program writes to values of the original's type, and the copy would not see the write";
     const COPY_WRITTEN = "the program writes to values of the copy's type, and a write through the copy would not reach the dynamic value";
     const COPY_IDENTITY = "the program compares values of the copy's type by identity, and the copy is a different object";
+    const DYN_WIDTH = "the program prints, serializes or lists the keys of the copy, which keeps only the type's declared fields where JavaScript's object keeps every key it has";
+    /** GH #222: the closed record types a check into `t` copies by width:
+     * the type's own record arms, or its array's elements' (`top`), and
+     * those reached inside them (`nested`: a deep copy narrows every
+     * level). */
+    const widthArms = (t: IrType): { top: IrType[]; nested: IrType[] } => {
+      const top = closedRecordArms(L, t).map((a) => a.t);
+      if (t.kind === "array") top.push(...closedRecordArms(L, t.elem).map((a) => a.t));
+      const nested: IrType[] = [];
+      const seen = new Set(top.map(tkey));
+      const walk = (x: IrType, depth: number): void => {
+        if (depth > 6) return;
+        const sh = x.kind === "record" ? L.shapes.get(x.shapeId) : undefined;
+        for (const f of sh?.fields ?? []) {
+          const inner = [...closedRecordArms(L, f.type).map((a) => a.t), ...(f.type.kind === "array" ? closedRecordArms(L, f.type.elem).map((a) => a.t) : [])];
+          for (const i of inner) {
+            if (seen.has(tkey(i))) continue;
+            seen.add(tkey(i));
+            nested.push(i);
+            walk(i, depth + 1);
+          }
+        }
+      };
+      for (const a of top) walk(a, 0);
+      return { top, nested };
+    };
+    /** Does a print, serialization or key listing meet the out-crossing's
+     * width copy: where it is made, through its own binding, or (with no
+     * binding accounting for every use) anywhere a value of its type is
+     * observed? */
+    const widthObserved = (s: DynSite): boolean => {
+      // (A copy behind U2's exact-fit test is no width copy: a value with a
+      // key the type lacks stops by name — S128 (a2)/(a3).)
+      if (s.arg?.kind === "call" && /^%u2\.exact\./.test(s.arg.callee)) return false;
+      const { top, nested } = widthArms(s.t);
+      if (top.length === 0) return false;
+      const all = [...top, ...nested];
+      if (all.some((t) => foldedKeys.has(tkey(t)))) return true;
+      if (nested.some((t) => reachNoSpec.has(tkey(t)))) return true;
+      if (s.observedAt === true) return true;
+      // (A consumed copy — pushed, read once — still meets every printer
+      // of its type: review of #222's `arr.push(src as N)`.)
+      const db = s.consumed ? null : destBinding(s);
+      if (db !== null && s.dest !== null && !s.dest.param) {
+        if (db.uses.some((u) => u === "print" || u === "keys")) return true;
+        if (db.uses.every((u) => u === "read")) return false;
+      }
+      return top.some((t) => reachNoSpec.has(tkey(t)));
+    };
     const unwrap = (e: IrExpr | undefined): IrExpr | undefined => {
       // (jsMarshal of a dynamic value is the same value retyped — one world.)
       while (e && ((e.kind === "call" && PASS_THROUGH.test(e.callee)) || e.kind === "upcast" || e.kind === "downcast" || e.kind === "dynDestrCheck" || e.kind === "dynFromJsval" ||
@@ -3081,6 +3142,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       // The function literal's source parameters (U2a: a refused one takes
       // the dynamic arm in the next pass).
       const srcParams = L.dynArmFnParams.get(name);
+      // (S125 A4: a DECLARED function boxed into dynamic code — its refused
+      // parameter is a `dparam:` site, taken only by the function's boxed
+      // instance, so its direct calls keep the typed parameter.)
+      const declHit = srcParams === undefined ? L.declByFnName(name) : undefined;
       for (const p of f.params) {
         const refs = refsOf(p.type).refs;
         if (refs.length === 0) continue;
@@ -3090,7 +3155,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const transient = !reachFns.suspends && db !== null && !db.uses.includes("other");
         const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
         const sp = srcParams?.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
-        const param = sp !== undefined ? `param:${dynArmKey(sp)}` : undefined;
+        const dp = declHit?.decl.parameters.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken && !q.initializer);
+        const param = sp !== undefined ? `param:${dynArmKey(sp)}` : dp !== undefined ? `dparam:${dynArmKey(dp)}` : undefined;
         const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         if (typedSideWritten(ps, p.type, null)) return out(COPY_WRITTEN);
         if (anyIdentity(refs)) return out(COPY_IDENTITY);
@@ -3111,7 +3177,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // Unit U2 (dyn-arm.ts): a refused result of a function literal
         // takes the dynamic arm in the next pass, as its parameters do.
         const fnNode = L.dynArmFnNodes.get(name);
-        const param = fnNode !== undefined ? `ret:${dynArmKey(fnNode)}` : undefined;
+        // (S125 A4: a declared function's result — a `dret:` site, taken by
+        // its boxed instance only)
+        const param = fnNode !== undefined ? `ret:${dynArmKey(fnNode)}` : declHit !== undefined ? `dret:${dynArmKey(declHit.decl)}` : undefined;
         const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         for (const v0 of rets) {
           const v = unwrap(v0);
@@ -3145,6 +3213,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     for (const s of dynSites) {
       let why: string | null = null;
       let feature = "";
+      // GH #222: a width copy only its printing could tell apart — at an
+      // armable slot it tries the arm (falling back to U2's exact-fit copy,
+      // which stops by name on an extra key); elsewhere it refuses.
+      let widthOnly = false;
       let hint = "";
       const refs = refsOf(s.t).refs;
       if (s.dir === "in") {
@@ -3197,6 +3269,25 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           }
           else if (anyIdentity(refs)) why = COPY_IDENTITY;
         }
+        // GH #222: the copy keeps only its closed record type's declared
+        // fields where the dynamic object may carry more, so printing it,
+        // serializing it or listing its keys tells the two apart (S009's
+        // width tolerance applies only to a value nothing else holds).
+        // (A plain function's result tries the arm even for a fresh value —
+        // `return JSON.parse(s)` keeps every key, as its const form does.)
+        const wk = L.dynArmExitNodes.get(s.node as object);
+        const retArm = wk !== undefined && wk.startsWith("ret:");
+        // (and a slot already tried on the arm that still copies, fresh or
+        // not: `arr.push(src as N)` — delta review)
+        const armedStill = wk !== undefined && (L.dynArmSites.has(wk) || L.exactSites.has(wk));
+        if (!why && !freshSpine && !freshAssign && (retArm || armedStill || !uniqueDyn(s.arg, s.where)) && widthObserved(s)) {
+          // (Delta review: a slot already on the arm that still copies — the
+          // value must enter typed storage, `arr.push(src as N)` — refuses,
+          // so the fallback pass's exact-fit copy stops by name; one the
+          // fallback still copies without that test refuses outright.)
+          if (wk !== undefined && !L.dynArmSites.has(wk) && !L.exactSites.has(wk) && !isJsSourceFileName(wk.replace(/^ret:/, "").replace(/:\d+:\d+$/, ""))) widthOnly = true;
+          else why = DYN_WIDTH;
+        }
       }
       // Functions boxed with the value (or unboxed from it).
       if (!why) {
@@ -3243,7 +3334,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // (TypeScript sources only: a JavaScript source keeps U1b's
         // checked-dynamic storage wherever its program builds.)
         const k = s.dir === "out" ? L.dynArmExitNodes.get(s.node as object) : undefined;
-        if (k !== undefined && !isJsSourceFileName(k.replace(/:\d+:\d+$/, ""))) L.dynArmSoft.add(k);
+        if (k !== undefined && (widthOnly || !k.startsWith("ret:")) && !isJsSourceFileName(k.replace(/:\d+:\d+$/, ""))) L.dynArmSoft.add(k);
         continue;
       }
       // Unit U2a (dyn-arm.ts): a refused crossing at a contained slot

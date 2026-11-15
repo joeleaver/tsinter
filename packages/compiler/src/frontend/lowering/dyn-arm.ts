@@ -136,7 +136,7 @@ export function dynArmResultType(L: Lowerer, fn: ts.Node): IrType | null {
  * binding's statement may reference it). */
 export function collectDynArmSyms(L: Lowerer): void {
   if (L.dynArmSites.size === 0) return;
-  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^(param|ret):/, "").replace(/:\d+:\d+$/, "")));
+  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^(param|dparam|ret|dret):/, "").replace(/:\d+:\d+$/, "")));
   for (const sf of L.program.getSourceFiles()) {
     if (sf.isDeclarationFile || !files.has(sf.fileName)) continue;
     const visit = (n: ts.Node): void => {
@@ -164,6 +164,28 @@ export function armCast(L: Lowerer, node: ts.AsExpression | ts.TypeAssertion): b
     if (e instanceof PoisonError) return false;
     throw e;
   }
+}
+
+/** S125 A1: a cast whose value is what a function returns (directly, or
+ * through parentheses and a conditional's branches), where that function's
+ * RESULT is on the dynamic arm (a `ret:` site): the cast is no conversion,
+ * the result is the dynamic value itself. */
+export function armRetCast(L: Lowerer, node: ts.Expression): boolean {
+  if (L.dynArmSites.size === 0) return false;
+  let n: ts.Node = node;
+  let up: ts.Node | undefined = n.parent;
+  while (up !== undefined && (ts.isParenthesizedExpression(up) || (ts.isConditionalExpression(up) && up.condition !== n))) {
+    n = up;
+    up = up.parent;
+  }
+  let fn: ts.Node | undefined;
+  if (up !== undefined && ts.isReturnStatement(up)) {
+    fn = up.parent;
+    while (fn !== undefined && !ts.isFunctionLike(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+  } else if (up !== undefined && ts.isArrowFunction(up) && up.body === n) {
+    fn = up;
+  }
+  return fn !== undefined && (ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn)) && dynArmResult(L, fn);
 }
 
 /** A block-scoped local whose initializer is already on the dynamic arm
@@ -221,6 +243,33 @@ export function dynArmTypeOf(L: Lowerer, node: ts.Node): ts.Type | null {
  * `||`, `??`, `?:`, assignment), over one? Comparisons, arithmetic and the
  * like keep the checker's answer (boolean, number): TypeScript's own
  * answer over `any`. */
+const hasRetSites = new WeakMap<ReadonlySet<string>, boolean>();
+
+/** S125 A1: a direct call of a function whose RESULT is on the dynamic arm
+ * (a declaration, or a binding of a function literal, with a `ret:` site):
+ * the call answers the dynamic value itself. */
+function armResultCall(L: Lowerer, call: ts.CallExpression): boolean {
+  if (L.dynArmSites.size === 0) return false;
+  let has = hasRetSites.get(L.dynArmSites);
+  if (has === undefined) {
+    has = [...L.dynArmSites].some((k) => k.startsWith("ret:"));
+    hasRetSites.set(L.dynArmSites, has);
+  }
+  if (!has) return false;
+  const callee = stripParens(call.expression);
+  if (!ts.isIdentifier(callee)) return false;
+  const sym = L.checker.getSymbolAtLocation(callee);
+  if (sym === undefined) return false;
+  for (const d of L.checker.declarationsOf(sym)) {
+    if (ts.isFunctionDeclaration(d) && dynArmResult(L, d)) return true;
+    if (ts.isVariableDeclaration(d) && d.initializer !== undefined) {
+      const init = stripParens(d.initializer);
+      if ((ts.isArrowFunction(init) || ts.isFunctionExpression(init)) && dynArmResult(L, init)) return true;
+    }
+  }
+  return false;
+}
+
 export function armRooted(L: Lowerer, node: ts.Node): boolean {
   if (ts.isIdentifier(node)) {
     const p = node.parent;
@@ -248,7 +297,7 @@ export function armRooted(L: Lowerer, node: ts.Node): boolean {
   if (ts.isAsExpression(node) || ts.isTypeAssertion(node)) return isDynArmSite(L, node) || armCast(L, node);
   if (ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)) return armRooted(L, node.expression);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return armRooted(L, node.expression);
-  if (ts.isCallExpression(node)) return armRooted(L, stripParens(node.expression));
+  if (ts.isCallExpression(node)) return armRooted(L, stripParens(node.expression)) || armResultCall(L, node);
   if (ts.isConditionalExpression(node)) return armRooted(L, node.whenTrue) || armRooted(L, node.whenFalse);
   // GH #132 / U2: an object literal spreading a dynamic-arm value is `any`
   // to TypeScript, so it builds the dynamic object (its keys in the

@@ -5864,8 +5864,13 @@ export type IrExpr =
    * cannot be told from it? `type` is bool. Never throws, never copies.
    * `lenient`: declared keys may be missing (S119 holds them as undefined,
    * printed as Node prints the missing key); no undeclared key, order kept.
+   * `width` (with lenient, a record target only): a top-level key the type
+   * does not declare is skipped rather than failing — the copy is a NEW
+   * object built from a fresh literal (S125: a spread a plain function
+   * returns), so dropping it is #148's judgement, not this test's; nested
+   * values stay exact.
    * WasmGC lanes only. */
-  | { kind: "jsFits"; value: IrExpr; target: IrType; type: IrType; lenient?: true; loc: SrcLoc }
+  | { kind: "jsFits"; value: IrExpr; target: IrType; type: IrType; lenient?: true; width?: true; loc: SrcLoc }
   /** Island → static PROMISE bridge (--dynamic builds only): `value` is a
    * jsval whose declared type is Promise<T> (a package call's promise —
    * it lives in the engine); the result is a fresh pending static promise
