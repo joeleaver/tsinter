@@ -10609,6 +10609,13 @@ not build:
   instance those parameters, and the result, hold the dynamic values
   themselves, so dynamic code and the body share the array. Direct calls
   from typed code keep the typed function.
+- **A class instance into an interface with methods.** (a)'s per-call-site
+  instance of a plain function now also takes a class instance whose
+  type's members include methods (paperclip's API client handed to a
+  helper typed `{ base: string; get(path: string): string }`): each method
+  member is carried by the class's own or inherited method of exactly that
+  signature (not abstract, async or a generator), so the body reads, writes
+  and calls through the caller's object, as in Node.
 - **A width copy that is printed (GH #222).** A dynamic value checked into
   a closed record type (or an array of one) keeps only the type's declared
   fields, where the JavaScript object keeps every key. (c) now counts a

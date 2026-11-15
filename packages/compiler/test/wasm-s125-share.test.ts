@@ -147,4 +147,34 @@ const arr: N[] = [];
 arr.push(src as N);
 console.log(arr);`,
   },
+  {
+    id: "S125-A2-01 a class instance into an interface parameter with a method (paperclip's API client into fetchLog): the body writes and calls through the caller's object",
+    entry: "main.ts",
+    src: `interface Api { base: string; get(path: string): string }
+class Client implements Api {
+  base = "http://x";
+  calls = 0;
+  get(path: string): string { this.calls++; return this.base + path; }
+}
+function fetchLog(api: Api, p: string): string {
+  api.base = api.base + "/v1";
+  return api.get(p);
+}
+const ctx = { api: new Client() };
+console.log(fetchLog(ctx.api, "/log"), ctx.api.calls, ctx.api.base, ctx.api instanceof Client);`,
+  },
+  {
+    id: "S125-B-01 printing an index-signature record with declared fields: declared fields, then the added keys (SEMANTICS.md S031's order)",
+    entry: "main.ts",
+    src: `type Rec = { id: string | undefined; [key: string]: unknown };
+function assertSafe(r: Rec): void {
+  if (r.id === undefined) throw new Error("no id");
+  r.checked = true;
+}
+const existing: Rec = { id: "a1", name: "n" };
+assertSafe(existing);
+console.log(existing);
+const e: Rec = { id: undefined };
+console.log(e, { id: "x", tags: ["a"], n: { deep: 1 } } as Rec);`,
+  },
 ]);

@@ -168,11 +168,19 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
         // ladder. Hybrids keep the fence — JS orders integer keys first
         // ACROSS the declared and overflow stores, an interleave the
         // declared-then-overflow walk cannot honor.
-        if (shape.fields.length > 0) {
-          return "index-signature records with declared fields have no inspect lowering yet (JS interleaves integer keys across the declared and dynamic key sets)";
+        // A hybrid (declared fields AND an index signature) prints its
+        // declared fields, then its overflow keys — SEMANTICS.md S031's
+        // declared-then-overflow order, as Object.keys answers it. A
+        // declared integer-like field name keeps Object.keys' fence.
+        if (shape.fields.some((f) => /^(0|[1-9][0-9]{0,9})$/.test(f.name) && Number(f.name) <= 4294967294)) {
+          return "index-signature records with an integer-like declared field name have no inspect lowering yet (JS orders integer keys first, across declared and overflow keys)";
         }
         const why = inspectSupport(L, shape.indexValue, visiting, out);
         if (why !== null) return why;
+        for (const f of shape.fields) {
+          const fwhy = inspectSupport(L, f.type, visiting, out);
+          if (fwhy !== null) return fwhy;
+        }
         visiting.delete(t.shapeId);
         return null;
       }
@@ -731,7 +739,50 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
           loc,
         });
       }
-      body.push(depthGate("[Object]"), ...begin(), ...ordered);
+      if (shape.indexValue) {
+        // A hybrid (S031): the declared fields above, then the overflow
+        // keys in their own order, each through insp.key and the keyed get.
+        const iv = shape.indexValue;
+        const ksT: IrType = { kind: "array", elem: STRING };
+        for (const l of [
+          { id: "ks.0", name: "ks", type: ksT, mutable: false },
+          { id: "n.0", name: "n", type: F64, mutable: false },
+          { id: "i.0", name: "i", type: F64, mutable: true },
+          { id: "k.0", name: "k", type: STRING, mutable: false },
+        ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
+        const ks = (): IrExpr => ref("ks.0", ksT);
+        const n = (): IrExpr => ref("n.0", F64);
+        const i = (): IrExpr => ref("i.0", F64);
+        const k = (): IrExpr => ref("k.0", STRING);
+        // `{}` only when no declared field is present AND no overflow key
+        const first = body[0];
+        if (first !== undefined && first.kind === "if") {
+          body[0] = { ...first, cond: { kind: "logical", op: "&&", left: first.cond, right: { kind: "bin", op: "===", left: n(), right: num(0, loc), type: BOOL, loc }, type: BOOL, loc } };
+        }
+        body.unshift(
+          { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: v(), shapeId: t.shapeId, type: ksT, loc }, loc },
+          { kind: "varDecl", localId: "n.0", init: { kind: "arrIntrinsic", method: "length", receiver: ks(), args: [], type: F64, loc }, loc },
+        );
+        const keyedRead = (): IrExpr =>
+          ({ kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key: k(), overflowOnly: true, type: iv, loc });
+        const overflowLoop: IrStmt = {
+          kind: "for",
+          init: { kind: "varDecl", localId: "i.0", init: num(0, loc), loc },
+          cond: { kind: "bin", op: "<", left: i(), right: n(), type: BOOL, loc },
+          update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i(), right: num(1, loc), type: F64, loc }, loc },
+          body: [
+            { kind: "varDecl", localId: "k.0", init: { kind: "arrayGet", arr: ks(), index: i(), type: STRING, loc }, loc },
+            entry(
+              concatAll([{ kind: "libCall", fn: "insp.key", args: [k()], type: STRING, loc }, str(": ", loc), child(iv, keyedRead())], loc),
+              boolLit(false, loc),
+            ),
+          ],
+          loc,
+        };
+        body.push(depthGate("[Object]"), ...begin(), ...ordered, overflowLoop);
+      } else {
+        body.push(depthGate("[Object]"), ...begin(), ...ordered);
+      }
       body.push(ret(end(str("", loc), str("{", loc), str("}", loc), false, boolLit(false, loc))));
       break;
     }
