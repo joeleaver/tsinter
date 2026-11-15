@@ -1088,6 +1088,7 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
   const done = new Set<IrFunction>();
   const reported = new Set<string>();
   const seenNodes = new WeakSet<object>();
+  let curFn = "";
   const rewrite = (node: Record<string, unknown>): Record<string, unknown> => {
     walk(node);
     const k = node["kind"];
@@ -1128,7 +1129,11 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
       const key = `${loc.file}:${loc.start}`;
       // A compiled npm package's own JavaScript (SEMANTICS.md S133): the
       // refusal stops the program where the exit RUNS, never the build.
-      if (npmStaticPackageOfPath(loc.file) !== null) {
+      // So does a class view's set() (class-views.ts): it exists for every
+      // viewed class, and only a dynamic STORE into a composite-typed field
+      // (`view.items = [...]`) is the copy S115 refuses — the view of a
+      // class with a `number[]` field must not stop the build.
+      if (npmStaticPackageOfPath(loc.file) !== null || /^%cview\.\d+\.set$/.test(curFn)) {
         const diag = s115Diag(loc, exitRefusal(L, node["type"] as IrType));
         if (!reported.has(key)) L.runtimeFences.push(diag);
         reported.add(key);
@@ -1166,6 +1171,7 @@ export function islandViewPass(L: Lowerer, functions: IrFunction[]): void {
     for (const fn of [...functions, ...L.liftedFns]) {
       if (done.has(fn)) continue;
       done.add(fn);
+      curFn = fn.name;
       fn.body = fn.body.map((s) => rewrite(s as unknown as Record<string, unknown>) as unknown as IrStmt);
     }
     if (L.liftedFns.length === before) break;

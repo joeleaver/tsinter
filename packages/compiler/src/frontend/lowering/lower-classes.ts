@@ -10,7 +10,7 @@ import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrPar
 import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
-import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
+import { PoisonError, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable, undefinedAsAbsent } from "./lower-exprs.js";
 import { lowerNewArrayLength, lowerSetFromIterable } from "./lower-stdlib-members.js";
@@ -2278,13 +2278,14 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
               // TS-annotated `unknown` fields keep their fence (KEEP NARROW
               // applies where an annotation could say better).
               let type = t ? (L.mapTypeOf(t) ?? dynFallbackType(L, assign, t)) : null;
+              if (t && jsMixedObjectUnion(L, assign, type)) type = DYN; // S014's U1b amendment
               // SEMANTICS.md S133: a field inference leaves `any` in a class
               // the package's shipped declarations describe takes the declared
               // type (`this.parent = null` declared `parent: Command | null`).
               if (t !== undefined && (t.flags & ts.TypeFlags.Any) !== 0 && classSym !== undefined) {
                 const declared = declaredMemberTypeOf(classSym, name);
                 const dt = declared !== undefined && (declared.flags & ts.TypeFlags.Any) === 0 ? L.mapTypeOf(declared) : null;
-                if (dt !== null && dt.kind !== "void") type = dt;
+                if (dt !== null && dt.kind !== "void") type = jsMixedObjectUnion(L, assign, dt) ? DYN : dt;
               }
               if (!type || type.kind === "void") L.badType(assign, t ?? L.typeOf(assign));
               // A field initialized with an EMPTY object literal (`this._optionValues
@@ -2364,7 +2365,8 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
                 : rhs
                   ? L.checker.getBaseTypeOfLiteralType(L.checker.getTypeAtLocation(rhs))
                   : undefined;
-              const type = t ? (L.mapTypeOf(t) ?? dynFallbackType(L, lhs, t)) : null;
+              let type = t ? (L.mapTypeOf(t) ?? dynFallbackType(L, lhs, t)) : null;
+              if (t && jsMixedObjectUnion(L, lhs, type)) type = DYN; // S014's U1b amendment
               if (!type || type.kind === "void") L.badType(lhs, t ?? L.typeOf(lhs));
               fields.set(key.fieldName, type);
               symbolFields.set(key.sym, key.fieldName);

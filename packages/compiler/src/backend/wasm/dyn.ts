@@ -962,6 +962,9 @@ export class DynBuilder {
   }
 
   private readonly builtinMethodFns = new Map<string, number>();
+  /** promiseMethodFn's interned boxes, by method name (keyGetRaw compares
+   * a FUNC receiver against them). */
+  private readonly promiseMethodGlobals = new Map<string, number>();
 
   private static readonly BUILTIN_ARITY: Readonly<Record<string, number>> = {
     get: 1, set: 2, has: 1, delete: 1, add: 1, clear: 0, forEach: 1, keys: 0, values: 0, entries: 0,
@@ -1015,6 +1018,56 @@ export class DynBuilder {
       -1,
       (x) => this.deps.lit(x, method),
       DynBuilder.BUILTIN_ARITY[method] ?? 0,
+      (x) => this.deps.lit(x, `function ${method}() { [native code] }`),
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** %w.dyn.pmethod:<name>() → the interned FUNC box a dynamic PROMISE's
+   * `then` / `catch` / `finally` reads as (SEMANTICS.md S015's promise
+   * amendment): one box per name, as Promise.prototype's are (`p.then ===
+   * q.then`), truthy, `typeof` "function", with Node's name, length and
+   * native-code text. Calling it as a value stops by name (method calls
+   * dispatch directly and never come here). commander's thenable test reads it:
+   * `promise?.then && typeof promise.then === 'function'`. */
+  promiseMethodFn(method: "then" | "catch" | "finally"): number {
+    const key = `Promise.${method}`;
+    const hit = this.builtinMethodFns.get(key);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal(this.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.dynT());
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [this.dynRef()]), `%w.dyn.pmethod:${method}`);
+    this.builtinMethodFns.set(key, idx);
+    this.promiseMethodGlobals.set(method, g);
+    const thunk = this.mb.declareFunc(this.thunkSig(), `%w.dyn.pthunk:${method}`);
+    this.mb.declareFuncRef(thunk);
+    {
+      // A call through the value (`p.then.call(p, f)`, a detached `t(f)`)
+      // stops by name: the promise reaction is the emitter's, gated per
+      // module before this body could be requested. Method calls
+      // (`p.then(f)`) never reach here — they dispatch directly.
+      const c = new Code();
+      this.deps.fence(c, (x) => this.deps.lit(x, `calling Promise.prototype.${method} read as a value from a dynamic promise (call it as a method: p.${method}(...))`));
+      c.refNull(this.dynT());
+      this.mb.setBody(thunk, [], c.bytes());
+    }
+    const c = new Code();
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.boxFn(
+      c,
+      (x) => this.deps.lit(x, `Promise.prototype.${method}`),
+      (x) => x.refFunc(thunk),
+      -1,
+      (x) => this.deps.lit(x, method),
+      method === "then" ? 2 : 1,
       (x) => this.deps.lit(x, `function ${method}() { [native code] }`),
     );
     c.globalSet(g);
@@ -7893,6 +7946,48 @@ export class DynBuilder {
         this.deps.throwTypeError(c, (x) => x.localGet(MSG));
         c.refNull(dynT);
         c.return_();
+        c.end();
+        // A promise's then/catch/finally read as a value (S015's promise
+        // amendment): Promise.prototype's interned method boxes.
+        c.localGet(K);
+        c.i32Const(DK.PROMISE);
+        c.i32Eq();
+        c.ifVoid();
+        for (const m of ["then", "catch", "finally"] as const) {
+          c.localGet(1);
+          this.deps.lit(c, m);
+          c.call(this.deps.strEq());
+          c.ifVoid();
+          c.call(this.promiseMethodFn(m));
+          c.return_();
+          c.end();
+        }
+        c.end();
+        // Function.prototype's call/apply/bind read off one of those boxes:
+        // not modeled on them (S015's promise amendment) — stops by name.
+        c.localGet(K);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifVoid();
+        for (const m of ["then", "catch", "finally"] as const) {
+          const g = this.promiseMethodGlobals.get(m);
+          if (g === undefined) continue;
+          c.localGet(0);
+          c.globalGet(g);
+          c.refEq();
+          c.ifVoid();
+          for (const fk of ["call", "apply", "bind"] as const) {
+            c.localGet(1);
+            this.deps.lit(c, fk);
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            this.deps.fence(c, (x) => this.deps.lit(x, `reading '${fk}' of Promise.prototype.${m} read as a value from a dynamic promise`));
+            c.refNull(dynT);
+            c.return_();
+            c.end();
+          }
+          c.end();
+        }
         c.end();
         // Objects answer their own members — and, unit A2, their
         // prototypes' where a link exists, with an accessor member read

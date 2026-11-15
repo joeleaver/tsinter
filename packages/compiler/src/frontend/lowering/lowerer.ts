@@ -55,7 +55,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID, JSON_SAFE_DEPTH_BUDGET } from "../../ir/nodes.js";
+import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID, JSON_SAFE_DEPTH_BUDGET, RUNTIME_EMITTER_CLASS, RUNTIME_STREAM_CLASSES } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -917,6 +917,47 @@ function dynArmPattern(p: ts.ArrayBindingPattern): boolean {
   });
 }
 
+
+/** SEMANTICS.md S014's U1b amendment (the JSDoc-union rule): in a
+ * JavaScript source on the one-world lanes, a type that maps to a UNION
+ * mixing a program-class or Promise arm with any other arm is no storage
+ * — the checked-dynamic value holds it (dynFallbackType answers). Such
+ * unions come from JSDoc and declared surfaces (commander's
+ * `@return {(Promise|undefined)}`, `string|Command` getter-setters,
+ * `Command | null` fields); the value is the same object either way, and
+ * every use then consults it at run time. */
+export function jsMixedObjectUnion(L: Lowerer, node: ts.Node, t: IrType | null): boolean {
+  if (t === null || !L.sharedDynamic || L.engine || !isJsSourceFile(node.getSourceFile())) return false;
+  return containsJsMixedUnion(L, t, 0);
+}
+
+/** The rule's union test, through the containers a JavaScript value
+ * carries such a union in: an array's elements (`[cmd.name()]`), a
+ * function's parameters and result (`function () { return p ?? undefined }`). */
+function containsJsMixedUnion(L: Lowerer, t: IrType, depth: number): boolean {
+  if (depth > 4) return false;
+  if (t.kind === "array") return containsJsMixedUnion(L, t.elem, depth + 1);
+  if (t.kind === "func") return t.params.some((p) => containsJsMixedUnion(L, p, depth + 1)) || containsJsMixedUnion(L, t.ret, depth + 1);
+  if (t.kind !== "union") return false;
+  const arms = L.unions.get(t.unionId)?.arms ?? [];
+  // A program class arm: a viewable class, or (while classes are still
+  // being collected — method signatures map mid-collection) any class the
+  // runtime does not provide. Runtime classes (errors, emitters, streams)
+  // keep their own dynamic crossings.
+  const programClass = (a: IrType): boolean => {
+    if (a.kind !== "object") return false;
+    const info = L.classes.get(a.className);
+    if (info !== undefined) return viewableClass(L, a) !== null;
+    return a.className !== RUNTIME_EMITTER_CLASS && !RUNTIME_ERROR_CLASSES.has(a.className) && !RUNTIME_STREAM_CLASSES.has(a.className);
+  };
+  if (arms.length < 2) return false;
+  // A Promise arm beside anything (`Promise | undefined`), or a class arm
+  // beside a NON-unit arm (`string | Command`). A class beside only
+  // undefined/null (an array `find` result, an optional field) keeps its
+  // typed union: its arms are told apart by the unit tag.
+  if (arms.some((a) => a.kind === "promise")) return true;
+  return arms.some(programClass) && arms.some((a) => !programClass(a) && !isUnitType(a));
+}
 
 export function dynFallbackType(L: Lowerer, node: ts.Node, t: ts.Type): IrType | null {
   if (t.flags & ts.TypeFlags.Void) return null;
@@ -3713,8 +3754,76 @@ export class Lowerer {
       const wide = bigWidenTypeOf(this, node, t);
       if (wide !== null) return wide;
     }
+    // S014's U1b amendment (the JSDoc-union rule): in a JavaScript source,
+    // a value whose type maps to a union mixing a program-class or Promise
+    // arm with other arms is the checked-dynamic value — `any` to every
+    // lowering keyed on the checker type, as a dynamic-arm value is.
+    if (this.sharedDynamic && !this.engine && isJsSourceFile(node.getSourceFile())) {
+      if (this.isJsMixedUnionType(t, node)) return this.checker.getAnyType();
+      // A reference to a binding — or a property read of a field — whose
+      // DECLARED type is such a union holds the checked-dynamic value, so a
+      // flow narrowing (`promise?.then && promise.then(...)`, `h.p =
+      // Promise.resolve(9); h.p.then(...)` narrow to Promise) does not
+      // re-type it.
+      if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) {
+        const sym = this.checker.getSymbolAtLocation(ts.isPropertyAccessExpression(node) ? node.name : node);
+        if (sym !== undefined) {
+          let declared: ts.Type | undefined;
+          try {
+            declared = this.checker.getTypeOfSymbol(sym);
+          } catch {
+            declared = undefined;
+          }
+          if (declared !== undefined && declared !== t && this.isJsMixedUnionType(declared, node)) return this.checker.getAnyType();
+        }
+      }
+      // A member read or call off a receiver the rule made dynamic (where
+      // the checker typed it otherwise) reads the dynamic value too:
+      // `h.p.then(f).finally(g)` — the checker types `h.p.then(f)` as a
+      // Promise, but its receiver is the dynamic `h.p`.
+      const recv = ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)
+        ? node.expression
+        : ts.isCallExpression(node) && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+          ? node.expression.expression
+          : null;
+      if (recv !== null && (t.flags & ts.TypeFlags.Any) === 0) {
+        let dynRecv = this.ruleDynRecv.get(recv);
+        if (dynRecv === undefined) {
+          const recvChecker = this.checker.getTypeAtLocation(recv);
+          dynRecv = (recvChecker.flags & ts.TypeFlags.Any) === 0 && (this.typeOf(recv).flags & ts.TypeFlags.Any) !== 0;
+          this.ruleDynRecv.set(recv, dynRecv);
+        }
+        if (dynRecv) return this.checker.getAnyType();
+      }
+    }
     return t;
   }
+
+  /** Does the checker type map to a JSDoc-rule union (S014's U1b amendment)? */
+  private isJsMixedUnionType(t: ts.Type, node: ts.Node): boolean {
+    // Unions and arrays only: a FUNCTION type answering `any` would turn a
+    // method reference (`p.name(...)`'s callee) into a bound-method value;
+    // function-typed bindings take the rule at their storage instead.
+    if ((t.flags & ts.TypeFlags.Union) === 0 && !this.checker.isArrayType(t)) return false;
+    let mixed = this.jsMixedUnionTypes.get(t);
+    if (mixed === undefined) {
+      let m: IrType | null = null;
+      try {
+        m = this.mapTypeOf(t);
+      } catch {
+        m = null;
+      }
+      mixed = jsMixedObjectUnion(this, node, m);
+      this.jsMixedUnionTypes.set(t, mixed);
+    }
+    return mixed;
+  }
+
+  /** Per checker type: does it map to a JSDoc-rule union (typeOf above)? */
+  private readonly jsMixedUnionTypes = new Map<ts.Type, boolean>();
+  /** Per receiver node: does the JSDoc-union rule make it dynamic where the
+   * checker typed it otherwise (typeOf's chained-member arm)? */
+  private readonly ruleDynRecv = new WeakMap<ts.Node, boolean>();
 
   /** mapType with this Lowerer's registries and (while a generic instance
    * body lowers) type-parameter bindings threaded through. */
@@ -4346,6 +4455,8 @@ export class Lowerer {
     if (mapped && mapped.kind !== "jsval" && this.sharedDynamic && !this.engine && isJsSourceFile(node.getSourceFile()) && this.nestsJsval(mapped)) {
       mapped = null;
     }
+    // (DYN itself: the JS fallback below would keep an array's array-ness.)
+    if (jsMixedObjectUnion(this, node, mapped)) return DYN;
     if (!mapped) {
       // The checked-dynamic declaration fallback (dynFallbackType): a
       // JAVASCRIPT binding of any inference residue, or a TypeScript

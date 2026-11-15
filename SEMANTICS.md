@@ -795,6 +795,15 @@ name (SC1100) (GH #204). **Tested by:**
 the JS corpus on the wasm lanes, and the hand-written rows of
 `wasm-dynsmalls-u5`, `wasm-review-repros` and `wasm-smalls-u2` (row75),
 and `wasm-gh204-js-array-widen` (GH204-01..).
+**The JSDoc-union rule (commander batch 1):** a JavaScript declaration
+whose type maps to a union of a Promise arm with any other arm
+(`@return {(Promise|undefined)}`), or of a program-class arm with a
+non-unit arm (a `string|Command` getter-setter), is no storage either (a
+class beside only `undefined`/`null`, such as an array `find` result,
+keeps its typed union): the checked-dynamic value holds it, and every use consults the
+value at run time — the same object, so nothing observable changes
+(`lowerer.ts` `jsMixedObjectUnion`). **Tested by:**
+`packages/compiler/test/wasm-commander-stops2.test.ts` (CMDR2-1x).
 
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
@@ -1104,6 +1113,20 @@ constructor read from a dynamic value. A binding the checker types as the constr
 keeps the typed coercion closure's one signature `(value: string) =>
 primitive` (types.ts), so a call with no argument refuses by name there.
 **Tested by:** `packages/compiler/test/wasm-builtin-conv-fn.test.ts`.
+
+**Amendment (commander batch 1, wasm and wasm-native): a promise's
+`then`, `catch` and `finally`.** Read as a value from a dynamic promise
+(`promise?.then && typeof promise.then === 'function'`, commander's
+thenable test), each answers Promise.prototype's method as Node does: one
+function value per name (`p.then === q.then`), truthy, `typeof`
+"function", with Node's `name`, `length` and native-code text. A call
+through the value (`p.then.call(p, f)`, or the value detached) stops by
+name, where Node runs the method or throws its incompatible-receiver
+TypeError; a method call (`p.then(f)`) is unaffected; reading `call`,
+`apply` or `bind` off the value stops by name too. Every other key of a
+promise still reads as above, and so does presence: `'then' in p` answers
+from the promise's own properties only (false). **Tested by:**
+`packages/compiler/test/wasm-commander-stops2.test.ts` (CMDR2-10, CMDR2-14, CMDR2-15).
 
 ## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
 
@@ -9526,8 +9549,21 @@ leaving into typed storage follows (d)). So:
   initialized with an instance and later assigned a value that may be
   `null`/`undefined` holds that union (a member read through it throws
   Node's `Cannot read properties of null` TypeError), or the dynamic value
-  when it is assigned an `any`. Tested by
-  `packages/compiler/test/wasm-class-views.test.ts`.
+  when it is assigned an `any`; (vii) a dynamic STORE into a
+  composite-typed field through the view (`view.items = [9, 9]` for an
+  `items: number[]` field) ends the program by name at run time — the
+  same S115 copy refusal this entry's exits name, deferred from the build
+  to the store, so a class with a composite field still crosses as its
+  view — while reads of that field and mutations through it from dynamic
+  code (`view.items.push(4)`, `view.items[0] = 1`) stay shared. Tested by
+  `packages/compiler/test/wasm-class-views.test.ts` and, for (vii),
+  `wasm-commander-stops2.test.ts` CMDR2-22/23. **Amendment (commander
+  batch 1):** (vii) is new: such a class used to refuse at compile time
+  wherever its instance crossed into dynamic code. With the JSDoc-union
+  rule (S014's U1b amendment), a store that used to be typed can now be
+  dynamic and stop by name where Node runs it: `h.v = foo; h.v.items =
+  [9, 9]` through a JSDoc `(Foo|string)` field, which matched Node before
+  (CMDR2-23).
 
 **Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts` —
 H-VIEW-01..09 ((a), wasm and c against Node), H-VERR-01..08 ((b), wasm and
