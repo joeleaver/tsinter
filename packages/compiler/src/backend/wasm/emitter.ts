@@ -19840,21 +19840,21 @@ class Assembler {
    * leaf of the declared kind, every union the arm the checked copy would
    * pick, no view anywhere — so the checked copy (dynCheckHelper) builds a
    * typed value nothing can tell from it. Never throws. */
-  private dynFitsHelper(t: IrType, loc: SrcLoc | undefined, lenient = false): number | null {
-    const key = `${lenient ? "L" : "E"}${typeKey(t)}`;
+  private dynFitsHelper(t: IrType, loc: SrcLoc | undefined, lenient = false, width = false): number | null {
+    const key = `${width ? "W" : lenient ? "L" : "E"}${typeKey(t)}`;
     const hit = this.dynFitsFns.get(key);
     if (hit !== undefined) return hit;
     const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [I32]), `%w.dyn.fits:${key}`);
     this.dynFitsFns.set(key, idx);
     const w = this.newWalker(1);
-    if (!this.emitDynFitsBody(w, t, loc, lenient)) return this.walkerDead(idx);
+    if (!this.emitDynFitsBody(w, t, loc, lenient, width)) return this.walkerDead(idx);
     this.mb.setBody(idx, w.locals, w.c.bytes());
     return idx;
   }
 
   private readonly dynFitsFns = new Map<string, number>();
 
-  private emitDynFitsBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined, lenient: boolean): boolean {
+  private emitDynFitsBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined, lenient: boolean, width = false): boolean {
     const c = w.c;
     const dyn = this.dyn;
     const fail0 = (): void => {
@@ -20027,7 +20027,40 @@ class Assembler {
           c.localSet(n);
           c.i32Const(0);
           c.localSet(k);
+          // `width`: skip the entries whose key the type does not declare
+          // (the declared ones keep their order and their checks).
+          const skipUndeclared = (): void => {
+            if (!width) return;
+            c.block();
+            c.loop();
+            c.localGet(k);
+            c.localGet(n);
+            c.i32GeU();
+            c.brIf(1);
+            c.localGet(o);
+            c.structGet(dyn.objT(), OBJ_ENTRIES);
+            c.localGet(k);
+            c.arrayGet(dyn.entriesArrayType());
+            c.localSet(e);
+            if (fields.length === 0) c.i32Const(0);
+            fields.forEach((f, i) => {
+              c.localGet(e);
+              c.structGet(dyn.entryT(), ENTRY_KEY);
+              this.pushStrLitInto(c, f.name);
+              c.call(this.strEqHelper());
+              if (i > 0) c.i32Or();
+            });
+            c.brIf(1);
+            c.localGet(k);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(k);
+            c.br(0);
+            c.end();
+            c.end();
+          };
           for (const f of fields) {
+            skipUndeclared();
             const inner = this.dynFitsHelper(f.type, loc, true);
             if (inner === null) return false;
             // Only a plain number, string or boolean slot carries S119's missing
@@ -20076,6 +20109,7 @@ class Assembler {
             }
             c.end();
           }
+          skipUndeclared();
           c.localGet(k);
           c.localGet(n);
           c.i32Eq();
@@ -35775,7 +35809,7 @@ class Assembler {
       }
       case "jsFits": {
         // Unit U2b: the exact-shape test in front of a speculative copy.
-        const h = this.dynFitsHelper(e.target, e.loc, e.lenient === true);
+        const h = this.dynFitsHelper(e.target, e.loc, e.lenient === true, e.width === true && e.lenient === true && e.target.kind === "record");
         if (h === null) {
           this.refuse(`expr:${e.kind}`, e.loc);
           code.unreachable();

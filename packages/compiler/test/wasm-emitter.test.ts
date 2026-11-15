@@ -5,6 +5,7 @@
  * this exists for sub-second feedback while working on the emitter, and
  * to pin the artifact contract (the import/export names, the refusal
  * shape) at the API level. */
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -100,6 +101,19 @@ async function runWasmToTrap(modulePath: string): Promise<{ stdout: Buffer; stde
     );
   expect(trap).toBeInstanceOf(WebAssembly.RuntimeError);
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]) };
+}
+
+/** S125 (a plain function's result shares the dynamic value): a program
+ * that used to stop at a crossing now runs, and is compared with Node's own
+ * run of the same source, byte for byte. */
+async function expectNodeRow(name: string, source: string): Promise<void> {
+  const res = await buildWasm(name, source);
+  if (!res.ok) throw new Error(`${name} refused: ${res.diagnostics[0]?.message}`);
+  const node = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", join(scratch, name)], { encoding: "utf8", input: "" });
+  expect(node.status).toBe(0);
+  const r = await runWasm(res.binaryPath);
+  expect(r.stdout.toString("utf8")).toBe(node.stdout);
+  expect(r.stderr.toString("utf8")).toBe(node.stderr);
 }
 
 /** GH #86 (SEMANTICS.md S122): a runtime fence ENDS the program — the
@@ -568,7 +582,16 @@ test("S009: a composite `as` names the PATH it failed at — each failure ends t
       "expected number at $.a, got string"],
   ];
   for (const [i, [lines, text]] of cases.entries()) {
-    await expectFenceRow(`dyn-check-path-${i}.ts`, [...pre, ...lines, ""].join("\n"), false, "1\n", `${text} [SC1100]`);
+    // S125 (A1(a)): `asOrder`/`asOrd` return the dynamic value itself (a
+    // plain function's result shares it), so the record cases no longer
+    // check at the cast — as Node, which erases it: compared with Node's
+    // own run. The tuple cases (`asPair`) and the two-bad-fields case
+    // (`asOrd`) still check, by path.
+    if (lines.some((l) => l.includes("asPair(") || l.includes("asOrd("))) {
+      await expectFenceRow(`dyn-check-path-${i}.ts`, [...pre, ...lines, ""].join("\n"), false, "1\n", `${text} [SC1100]`);
+    } else {
+      await expectNodeRow(`dyn-check-path-${i}.ts`, [...pre, ...lines, ""].join("\n"));
+    }
   }
 });
 
@@ -1871,7 +1894,7 @@ test("S015: keyed reads on unknown see OWN properties only", async () => {
   );
 });
 
-test("S014: crossing the dyn boundary COPIES — a program that would observe the copy refuses by name (S125 (c))", async () => {
+test("S014: crossing the dyn boundary — the round trip through an unknown parameter and a plain function's result shares the object, as Node (S125)", async () => {
   // Node erases the casts and hands the same object back, so it prints
   // "3 3" and "2 2" where the copies would print "2 2" and "1 2". Since
   // GH #120 (unit U0) such a program no longer runs silently wrong: the
@@ -1894,9 +1917,14 @@ test("S014: crossing the dyn boundary COPIES — a program that would observe th
       "",
     ].join("\n"),
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.diagnostics.some((d) => d.code === "SC1090" && /it would be a COPY where JavaScript shares the object.*SEMANTICS\.md S125/.test(d.message))).toBe(true);
+  // S125: toU's result takes the view (S115) and fromU's result shares the
+  // dynamic value (A1(a)), so the program no longer copies: it prints
+  // Node's "3 3" / "2 2" (compared with Node's own run).
+  if (!res.ok) throw new Error(`dyn-copy refused: ${res.diagnostics[0]?.message}`);
+  const node = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", join(scratch, "dyn-copy.ts")], { encoding: "utf8", input: "" });
+  const r = await runWasm(res.binaryPath);
+  expect(r.stdout.toString("utf8")).toBe(node.stdout);
+  expect(node.stdout).toBe("3 3\n2 2\n");
 });
 
 test("dyn keyed write: V8's refusal texts on every receiver that has no slot", async () => {
