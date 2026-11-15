@@ -55,6 +55,7 @@ import {
   packageTypingDiag,
   tscPassthroughDiag,
   unsupportedDiag,
+  npmDeclaredOnlyDiag,
 } from "../diagnostics/diagnostic.js";
 import { isNodeModulesPath, nearestPkgJsonPath, packagePrefixOf, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
@@ -73,7 +74,7 @@ import {
 } from "./package-options.js";
 import { scanDevGraph, type DevGraphConflict } from "./dev-graph.js";
 import { installDtsBridge } from "./dts-bridge.js";
-import { dtsMirrorPathOf, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsRoots, npmStaticFsShadow, npmStaticHasDtsView, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticDtsViewRefusal, setNpmStaticPackages } from "./npm-static.js";
+import { dtsMirrorPathOf, isDtsMirrorPath, isNpmStaticPackage, npmStaticActive, npmStaticDtsPaths, npmStaticDtsViews, npmStaticDtsRoots, npmStaticFsShadow, npmStaticPackageOfPath, registerNpmStaticDtsView, reportNpmStaticOffender, setNpmStaticDtsViewRefusal, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
 import { STUB_BUILTIN_EXPORTS } from "./stub-builtin-exports.js";
@@ -81,6 +82,7 @@ import { nodePackageTypeOf } from "./node-conditions.js";
 import {
   ADOPTED_OPTIONS,
   ambientDtsPath,
+  npmPackageNameOf,
   builtinDefaultImportModule,
   canonicalBuiltinModule,
   clearWorkspacePackages,
@@ -664,7 +666,9 @@ function registerDtsView(entryPath: string, pkg: string, specifier: string = pkg
  * resolved from `fromFile` with `kind`'s JS entry only (null when it
  * resolves to no declaration file of the package's own, or to no JS). */
 function dtsViewFrom(fromFile: string, pkg: string, kind: "import" | "require"): { typesRoot: string; typesEntry: string; js: string } | null {
-  const declared = resolveBareModule(fromFile, pkg, "declared");
+  // The declarations of the syntax being viewed: a per-syntax types entry
+  // (`require: { types: ".d.cts" }`) types a require view.
+  const declared = resolveBareModule(fromFile, pkg, "declared", kind);
   if (declared === null || !/\.d\.(ts|mts|cts)$/.test(declared.typesFile)) return null;
   const typesEntry = declared.typesFile.split("\\").join("/");
   let typesRoot: string | null = null;
@@ -693,24 +697,34 @@ function dtsViewFrom(fromFile: string, pkg: string, kind: "import" | "require"):
  *     implementations), and the fallback note says so;
  *   - the sites resolve to DIFFERENT copies of the package (different types
  *     roots or JS files): no view, and the note names the copies. */
-function registerDtsViewsFromGraph(bareSites: ReadonlyMap<string, readonly { file: string; kind: "import" | "require" }[]>): void {
-  for (const [spec, sites] of bareSites) {
-    if (packagePrefixOf(spec) !== spec || !isNpmStaticPackage(spec) || npmStaticHasDtsView(spec)) continue;
-    const kinds = new Set(sites.map((s) => s.kind));
+function registerDtsViewsFromGraph(bareSites: ReadonlyMap<string, readonly { file: string; kind: "import" | "require"; typeOnly: boolean }[]>): void {
+  for (const [spec, allSites] of bareSites) {
+    // Bare specifiers and SUBPATHS (S133 (f): `drizzle-orm/pg-core`) alike.
+    const pkg = packagePrefixOf(spec);
+    if (!isNpmStaticPackage(pkg) || npmStaticDtsViews().has(spec)) continue;
+    // Type-only uses load no JS: the sites that do decide; a package only
+    // named in types takes its import side's declarations.
+    const runtime = allSites.filter((s) => !s.typeOnly);
+    const sites = runtime.length > 0 ? runtime : allSites.slice(0, 1).map((s) => ({ ...s, kind: "import" as const }));
     const views = sites.map((s) => dtsViewFrom(s.file, spec, s.kind));
     if (views.some((v) => v === null)) continue; // no declarations: the inferred surface, as before
-    if (kinds.size > 1) {
-      setNpmStaticDtsViewRefusal(spec, "the program loads it with both import and require, which this dual package answers with two different implementations (one declared surface cannot type both)");
+    // Different package copies, or one copy loading different files per
+    // syntax (a dual package reached by both import and require): one
+    // declared surface cannot type them. One copy whose sites all load the
+    // SAME file (a non-dual package reached by both syntaxes) keeps its view.
+    const roots = new Set(views.map((v) => v!.typesRoot));
+    if (roots.size > 1) {
+      setNpmStaticDtsViewRefusal(pkg, `its importers resolve to different copies of it (${[...roots].join(", ")})`);
       continue;
     }
     const distinct = new Map<string, { typesRoot: string; typesEntry: string; js: string }>();
-    for (const v of views) distinct.set(`${v!.typesRoot}\u0000${v!.js}`, v!);
+    for (const v of views) distinct.set(`${v!.typesEntry}\u0000${v!.js}`, v!);
     if (distinct.size > 1) {
-      setNpmStaticDtsViewRefusal(spec, `its importers resolve to different copies of it (${[...distinct.values()].map((v) => v.typesRoot).join(", ")})`);
+      setNpmStaticDtsViewRefusal(pkg, "the program loads it with both import and require, which this dual package answers with two different implementations (one declared surface cannot type both)");
       continue;
     }
     const v = [...distinct.values()][0]!;
-    registerNpmStaticDtsView({ pkg: spec, specifier: spec, typesRoot: v.typesRoot, typesEntry: v.typesEntry, mirrorEntry: dtsMirrorPathOf(v.typesRoot, v.typesEntry), jsEntries: [v.js] });
+    registerNpmStaticDtsView({ pkg, specifier: spec, typesRoot: v.typesRoot, typesEntry: v.typesEntry, mirrorEntry: dtsMirrorPathOf(v.typesRoot, v.typesEntry), jsEntries: [v.js] });
   }
 }
 
@@ -742,7 +756,70 @@ export function checkPreflight(load: LoadResult): ScrDiagnostic[] {
   const { diags, moduleOrder, startupCrash } = preflight7(load);
   load.moduleOrder = moduleOrder;
   load.startupCrash = startupCrash;
-  return diags;
+  return [...diags, ...declaredOnlyExportUses(load)];
+}
+
+/** SEMANTICS.md S133 (b): a program use of a value a viewed package's
+ * declarations EXPORT but its loaded JavaScript does not (the redirect found
+ * no export of that name) refuses at build time. It covers the use forms
+ * that bind an export without a member read: an import specifier (Node's
+ * ESM link fails the whole program there: "does not provide an export
+ * named"), an object-pattern binding of `require(...)`, and a member read
+ * of the module object. Node's CommonJS side answers `undefined` instead;
+ * the static build cannot type that `undefined` against the declaration. */
+function declaredOnlyExportUses(load: LoadResult): ScrDiagnostic[] {
+  if (npmStaticDtsViews().size === 0) return [];
+  const checker = load.program.getTypeChecker();
+  const out: ScrDiagnostic[] = [];
+  const inMirror = (d: ts.Node): boolean => isDtsMirrorPath(d.getSourceFile().fileName);
+  // A TOP-LEVEL value declaration of the declarations file: a member of a
+  // declared namespace (`sql.raw` under `declare namespace sql`) is a
+  // member, which the member fences judge where it is read.
+  const isValueDecl = (d: ts.Node): boolean =>
+    ((ts.isFunctionDeclaration(d) || ts.isClassDeclaration(d) || ts.isEnumDeclaration(d)) && ts.isSourceFile(d.parent)) ||
+    (ts.isVariableDeclaration(d) && ts.isSourceFile(d.parent.parent.parent));
+  const unimplemented = (sym: ts.Symbol | undefined): ts.Node | null => {
+    if (sym === undefined) return null;
+    const raw = checker.rawDeclarationsOf(sym);
+    if (raw.length === 0 || !raw.every(inMirror) || !raw.some(isValueDecl)) return null;
+    // The redirect (dts-bridge.ts) maps every declared export the JS has;
+    // one still answering only its declaration has no JS counterpart.
+    const now = checker.declarationsOf(sym);
+    return now.length > 0 && now.every(inMirror) ? raw[0]! : null;
+  };
+  const report = (site: ts.Node, name: string, decl: ts.Node): void => {
+    out.push(npmDeclaredOnlyDiag(npmPackageNameOf(decl.getSourceFile().fileName) ?? "the", name, locOf7(site)));
+  };
+  const isRequireCall = (e: ts.Expression | undefined): boolean =>
+    e !== undefined && ts.isCallExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === "require";
+  for (const sf of load.program.getSourceFiles()) {
+    if (sf.isDeclarationFile || isNodeModulesPath(sf.fileName)) continue;
+    const stack: ts.Node[] = [sf];
+    while (stack.length > 0) {
+      const n = stack.pop()!;
+      if (ts.isImportSpecifier(n) && !n.isTypeOnly && (n.parent.parent as ts.ImportClause).phaseModifier !== ts.SyntaxKind.TypeKeyword) {
+        let sym = checker.getSymbolAtLocation(n.name);
+        if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = checker.rawGetAliasedSymbol(sym);
+        const d = unimplemented(sym);
+        if (d !== null) report(n, (n.propertyName ?? n.name).text, d);
+      } else if (ts.isPropertyAccessExpression(n)) {
+        const d = unimplemented(checker.getSymbolAtLocation(n.name));
+        if (d !== null) report(n.name, n.name.text, d);
+      } else if (ts.isBindingElement(n) && !n.dotDotDotToken && ts.isObjectBindingPattern(n.parent) && ts.isVariableDeclaration(n.parent.parent) && isRequireCall(n.parent.parent.initializer)) {
+        const key = (n.propertyName ?? n.name) as ts.Node;
+        if (ts.isIdentifier(key)) {
+          const prop = checker.getPropertyOfType(checker.getTypeAtLocation(n.parent.parent.initializer!), key.text);
+          const d = unimplemented(prop);
+          if (d !== null) report(key, key.text, d);
+        }
+      }
+      ts.forEachChild(n, (c) => {
+        stack.push(c);
+        return undefined;
+      });
+    }
+  }
+  return out;
 }
 
 /* Finding 5: tsgo's strict CommonJS modeling fires checker codes on JS

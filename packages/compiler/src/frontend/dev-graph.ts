@@ -32,6 +32,9 @@ interface SpecUse {
   kind: "import" | "require";
   start: number;
   end: number;
+  /** A type-only use (`import type`, `export type`, an all-`type`
+   * specifier list, an `import("x")` type): no JS is loaded for it. */
+  typeOnly: boolean;
 }
 
 const usesCache = new Map<string, { key: string; uses: SpecUse[] }>();
@@ -64,12 +67,25 @@ function specifierUsesOf(file: string): SpecUse[] {
   }
   const sf = ts5.createSourceFile(file, text, ts5.ScriptTarget.Latest, true, scriptKindOf(file));
   const uses: SpecUse[] = [];
-  const push = (lit: ts5.Node & { text: string }, kind: "import" | "require"): void => {
-    uses.push({ spec: lit.text, kind, start: lit.getStart(sf), end: lit.getEnd() });
+  const push = (lit: ts5.Node & { text: string }, kind: "import" | "require", typeOnly = false): void => {
+    uses.push({ spec: lit.text, kind, start: lit.getStart(sf), end: lit.getEnd(), typeOnly });
+  };
+  const importTypeOnly = (n: ts5.ImportDeclaration | ts5.ExportDeclaration): boolean => {
+    if (ts5.isExportDeclaration(n)) {
+      if (n.isTypeOnly) return true;
+      const ec = n.exportClause;
+      return ec !== undefined && ts5.isNamedExports(ec) && ec.elements.length > 0 && ec.elements.every((e) => e.isTypeOnly);
+    }
+    const clause = n.importClause;
+    if (clause === undefined) return false; // a side-effect import loads the module
+    if (clause.isTypeOnly) return true;
+    if (clause.name !== undefined) return false;
+    const nb = clause.namedBindings;
+    return nb !== undefined && ts5.isNamedImports(nb) && nb.elements.length > 0 && nb.elements.every((e) => e.isTypeOnly);
   };
   const visit = (n: ts5.Node): void => {
     if ((ts5.isImportDeclaration(n) || ts5.isExportDeclaration(n)) && n.moduleSpecifier !== undefined && ts5.isStringLiteral(n.moduleSpecifier)) {
-      push(n.moduleSpecifier, "import");
+      push(n.moduleSpecifier, "import", importTypeOnly(n));
     } else if (ts5.isImportEqualsDeclaration(n) && ts5.isExternalModuleReference(n.moduleReference) && ts5.isStringLiteral(n.moduleReference.expression)) {
       push(n.moduleReference.expression, "require");
     } else if (ts5.isCallExpression(n)) {
@@ -79,7 +95,7 @@ function specifierUsesOf(file: string): SpecUse[] {
         else if (ts5.isIdentifier(n.expression) && n.expression.text === "require" && n.arguments.length === 1) push(arg, "require");
       }
     } else if (ts5.isImportTypeNode(n) && ts5.isLiteralTypeNode(n.argument) && ts5.isStringLiteral(n.argument.literal)) {
-      push(n.argument.literal, "import");
+      push(n.argument.literal, "import", true);
     }
   };
   // An explicit stack, never recursion: a long binary chain (a corpus
@@ -119,7 +135,7 @@ export interface DevGraph {
   /** Every site naming each non-relative specifier, with its syntax
    * (`import` — static or dynamic — or `require`): the declared-surface
    * view of a dual package resolves from these (SEMANTICS.md S133 (j)). */
-  bareSites: Map<string, { file: string; kind: "import" | "require" }[]>;
+  bareSites: Map<string, { file: string; kind: "import" | "require"; typeOnly: boolean }[]>;
 }
 
 /** Walks the source graph from `roots` (see the header) and answers the
@@ -135,7 +151,7 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
   };
   for (const r of roots) enqueue(r);
   const bySpec = new Map<string, DevGraphConflict["sites"]>();
-  const bareSites = new Map<string, { file: string; kind: "import" | "require" }[]>();
+  const bareSites = new Map<string, { file: string; kind: "import" | "require"; typeOnly: boolean }[]>();
   const devSpecs = new Set<string>();
   while (queue.length > 0) {
     const file = queue.shift()!;
@@ -148,7 +164,7 @@ export function scanDevGraph(roots: readonly string[]): DevGraph {
       }
       let bs = bareSites.get(spec);
       if (bs === undefined) bareSites.set(spec, (bs = []));
-      bs.push({ file, kind: u.kind });
+      bs.push({ file, kind: u.kind, typeOnly: u.typeOnly });
       const dev = devResolve(file, spec, u.kind);
       let sites = bySpec.get(spec);
       if (sites === undefined) bySpec.set(spec, (sites = []));

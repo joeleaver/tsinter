@@ -367,6 +367,12 @@ const JS_ONLY_CONDITIONS = new Set(["import", "default"]);
  * edge reads the "require" key exactly where Node's require would. */
 const JS_ONLY_REQUIRE_CONDITIONS = new Set(["require", "default"]);
 
+/** The declared (types-first) lookup for a require() site: Node's require
+ * condition set plus "types", so a package with per-syntax declarations
+ * (`require: { types: "./index.d.cts", default: "./index.cjs" }`) types a
+ * require view against the require side's declarations. */
+const DECLARED_REQUIRE_CONDITIONS = new Set(["types", "require", "default"]);
+
 /** package.json "exports" lookup: exact subpath keys, then '*' patterns
  * (longest literal prefix wins), condition objects in object-key order,
  * arrays first-resolvable. Returns the target path relative to the package
@@ -778,7 +784,9 @@ export function resolveBareModule(
     ? kind === "require"
       ? JS_ONLY_REQUIRE_CONDITIONS
       : JS_ONLY_CONDITIONS
-    : EXPORT_CONDITIONS;
+    : mode === "declared" && kind === "require"
+      ? DECLARED_REQUIRE_CONDITIONS
+      : EXPORT_CONDITIONS;
 
   const inPackage = (nmPkgDir: string, name: string, pass: NmPass): BareResolution | null => {
     // A workspace link: the answer's realpath escaped node_modules, so the

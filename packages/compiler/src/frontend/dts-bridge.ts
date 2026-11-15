@@ -91,7 +91,10 @@ export function installDtsBridge(program: ts.Program): void {
         // type of module.exports); ES modules answer either way.
         const mod = moduleSymbolOf(program.getSourceFile(entry));
         if (mod === undefined) continue;
-        const jsEq = mod.getExports().get("export=" as ts.__String);
+        // An ESM implementation of `export =` declarations (postgres: CommonJS
+        // .d.ts over an ESM `export default`): the default-import binding the
+        // declarations type as `module.exports` is the ESM default export.
+        const jsEq = mod.getExports().get("export=" as ts.__String) ?? mod.getExports().get("default" as ts.__String);
         if (jsEq !== undefined && !js.has("export=")) js.set("export=", jsEq);
         const named = exportsOf(mod);
         const props = named.length > 0 ? named : checker.getPropertiesOfType(checker.getTypeOfSymbol(mod));

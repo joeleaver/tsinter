@@ -11362,20 +11362,31 @@ cannot view — a DUAL package (an `exports` map with separate `import` and
 `require` targets), or one only a non-entry file of the graph resolves (a
 workspace package's own dependency) — is viewed from the program's own
 import sites, found by the pre-load source-graph scan:
-- every site uses ONE syntax (static or dynamic `import`, or `require`):
-  the program types against the shipped declarations and compiles the JS
-  file Node loads for that syntax;
-- both syntaxes appear: no view (one declared surface cannot type two
+- the sites (type-only ones — `import type`, all-`type` specifier lists —
+  decide nothing) all load ONE file of ONE copy: the program types against
+  that syntax's declarations (a per-syntax `types` condition included: a
+  require view types against `require.types`, `.d.cts`) and compiles the
+  JS file Node loads; a non-dual package reached by both syntaxes loads
+  one file and keeps its view;
+- one copy loading DIFFERENT files per syntax (a dual package reached by
+  both import and require): no view (one declared surface cannot type two
   implementations); if the program then fails to typecheck against the
   inferred surface, the package's fallback note says "no declared-surface
   view: the program loads it with both import and require …";
-- the sites resolve to DIFFERENT copies (different package roots or JS
-  files): no view, and the note names the copies.
+- the sites resolve to DIFFERENT copies (different package roots): no
+  view, and the note names the copies.
+Under any view, (b) holds for exports as for members: an import
+specifier, an object-pattern binding of `require(…)` or a member read of
+the module object naming a value the declarations export but the loaded
+JavaScript does not refuses at build time (SC2013, "'x' is declared by
+the 'pkg' package's type declarations, but its compiled JavaScript
+defines no 'x' …"). Node fails an ESM import of it at link time and
+answers `undefined` on the CommonJS side.
 A type graph that decides whether a value crosses into dynamic code is
 walked to a depth budget (400 levels); a deeper one answers "does not
 cross", so the use refuses by name instead of the walk overflowing the
 compiler's stack (drizzle-orm's generated table types reached that).
-**Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..06).
+**Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..12).
 
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 

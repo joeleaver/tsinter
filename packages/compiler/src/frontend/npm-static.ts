@@ -458,7 +458,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
       // The declared-surface mirror serves the real declaration's bytes.
       const mirror = dtsMirrorTargetOf(path);
       if (mirror !== null) {
-        if (!isDeclarationFileName(mirror.real)) return undefined;
+        if (!mirrorServes(mirror.real)) return undefined;
         try {
           return readFileSync(mirror.real, "utf8");
         } catch {
@@ -525,7 +525,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     },
     hideFile: (path) => {
       const mirror = dtsMirrorTargetOf(path);
-      if (mirror !== null) return !isDeclarationFileName(mirror.real) || !isFileSync(mirror.real);
+      if (mirror !== null) return !mirrorServes(mirror.real) || !isFileSync(mirror.real);
       const target = shadowTargetOf(path);
       if (!target) return false;
       if (target.viaTypes) return true; // the @types twin hides whole
@@ -534,7 +534,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     fileExists: (path) => {
       const mirror = dtsMirrorTargetOf(path);
       if (mirror === null) return undefined;
-      return isDeclarationFileName(mirror.real) && isFileSync(mirror.real);
+      return mirrorServes(mirror.real) && isFileSync(mirror.real);
     },
     directoryExists: (path) => {
       const mirror = dtsMirrorTargetOf(path);
@@ -549,7 +549,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
         for (const e of readdirSync(mirror.real, { withFileTypes: true })) {
           if (e.isDirectory()) {
             if (e.name !== "node_modules") directories.push(e.name);
-          } else if (isDeclarationFileName(e.name)) files.push(e.name);
+          } else if (mirrorServes(e.name)) files.push(e.name);
         }
         return { files, directories };
       } catch {
@@ -558,6 +558,15 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
     },
     realpath: (path) => (dtsMirrorTargetOf(path) !== null ? path : undefined),
   };
+}
+
+/** What the declared-surface mirror serves from the real tree: declaration
+ * files, and the package.json files that set their MODULE FORMAT (a
+ * `types/package.json` with no "type" makes `types/index.d.ts` CommonJS in
+ * a "type": "module" package — postgres — so `export =` keeps its default
+ * import under NodeNext, exactly as the project's own tsc sees it). */
+function mirrorServes(real: string): boolean {
+  return isDeclarationFileName(real) || real === "package.json" || real.endsWith("/package.json") || real.endsWith("\\package.json");
 }
 
 /* ── auto-detection (--npm-static=auto) ─────────────────────────────────
