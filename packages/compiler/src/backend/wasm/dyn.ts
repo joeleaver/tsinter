@@ -133,7 +133,7 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
-import { ERR_OWN_NAME, ERRV_PROBE } from "../../ir/nodes.js";
+import { ERR_OWN_NAME, ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "../../ir/nodes.js";
 import { ObjModel } from "./objmodel.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
@@ -2933,13 +2933,27 @@ export class DynBuilder {
    * the discipline is the caller's. `pushName` pushes NULL for an
    * anonymous value — never the empty string, which keyGet's `name` arm
    * substitutes at READ time (C's `d->v.fn.name ? : ""`). */
+  /** In a keyGet over the FUNC box in local 0: a call-time fence stub
+   * with no visible definition (FN_PROTO_STUB) stops by name rather than
+   * answer its stand-in `what`. */
+  stubFence(c: Code, what: string, pushFn: (c: Code) => void = (x) => x.localGet(0)): void {
+    this.fnPayload(c, pushFn);
+    c.structGet(this.fnT(), FN_PROTO);
+    c.i32Const(FN_PROTO_STUB);
+    c.i32And();
+    c.ifVoid();
+    this.deps.fence(c, (x) => this.deps.lit(x, `a function that cannot run in this build (a call through it stops by name) whose definition this build cannot see: its ${what} is not supported yet`));
+    c.unreachable();
+    c.end();
+  }
+
   boxFn(
     c: Code,
     pushClos: (c: Code) => void,
     pushThunk: (c: Code) => void,
     sig: number,
     pushName: (c: Code) => void,
-    arity: number,
+    arity: number | ((c: Code) => void),
     pushSrc?: (c: Code) => void,
     pushProto?: (c: Code) => void,
   ): void {
@@ -2948,7 +2962,8 @@ export class DynBuilder {
       pushThunk(x);
       x.i32Const(sig);
       pushName(x);
-      x.i32Const(arity);
+      if (typeof arity === "number") x.i32Const(arity);
+      else arity(x);
       if (pushSrc !== undefined) pushSrc(x);
       else x.refNull(this.deps.strType());
       if (pushProto !== undefined) pushProto(x);
@@ -3470,6 +3485,56 @@ export class DynBuilder {
   /** Was helper `name` built (requested at least once)? */
   built(name: string): boolean {
     return this.fns.has(name);
+  }
+
+  /** A function's `name` as a property read sees it (Get(F, "name"): a
+   * redefined own `name` first, then the box's), "" for a non-string —
+   * where Node's own code reads `fn.name` (an error's "Received function
+   * <name>"). */
+  fnNameProp(): number {
+    return this.cached("fnNameProp", [this.dynRef()], [this.deps.strRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const P = 1;
+      // A builder without the module's fence (a unit-test harness that
+      // builds this helper alone) has no property reads to consult: the
+      // box's own name.
+      if (this.deps.fence === undefined) {
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_NAME);
+        c.refIsNull();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "");
+        c.else_();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_NAME);
+        c.end();
+        this.mb.setBody(idx, [], c.bytes());
+        return;
+      }
+      c.localGet(0);
+      this.deps.lit(c, "name");
+      c.i32Const(0);
+      c.call(this.keyGet());
+      c.localTee(P);
+      c.refIsNull();
+      c.ifVoid();
+      this.deps.lit(c, "");
+      c.return_();
+      c.end();
+      c.localGet(P);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Ne();
+      c.ifVoid();
+      this.deps.lit(c, "");
+      c.return_();
+      c.end();
+      c.localGet(P);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.deps.strType());
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
   }
 
   private cached(name: string, params: ValType[], results: ValType[], build: (idx: number) => void): number {
@@ -6358,7 +6423,22 @@ export class DynBuilder {
         this.deps.fence(c, (x) =>
           this.deps.lit(x, "converting a class read as a dynamic value's constructor to a string (Node prints its source) is not supported yet"));
         c.end();
+        // A builtin's box (a negative signature: a constructor or method
+        // the runtime provides, the Function and Error values, a bound
+        // function): Node's native-code form, a bound function's nameless.
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_SIG);
+        c.i32Const(0);
+        c.i32LtS();
+        c.ifVoid();
         this.deps.lit(c, "function ");
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_SIG);
+        c.i32Const(-5);
+        c.i32Eq();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "");
+        c.else_();
         this.fnPayload(c, (x) => x.localGet(0));
         c.structGet(this.fnT(), FN_NAME);
         c.localTee(OUT);
@@ -6368,9 +6448,33 @@ export class DynBuilder {
         c.else_();
         c.localGet(OUT);
         c.end();
+        c.end();
         c.call(concat);
         this.deps.lit(c, "() { [native code] }");
         c.call(concat);
+        c.return_();
+        c.end();
+        // SEMANTICS.md S019 (amended): Node echoes the function's source
+        // text. A box built from a known JavaScript definition carries it
+        // (FN_SRC) and answers it; any other compiled function, a cloning
+        // module's TypeScript text included (FN_PROTO_SRC_TS), stops by
+        // name, never an invented or TypeScript text.
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_SRC);
+        c.refIsNull();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_PROTO);
+        c.i32Const(FN_PROTO_SRC_TS);
+        c.i32And();
+        c.i32Or();
+        c.ifVoid();
+        this.deps.fence(c, (x) =>
+          this.deps.lit(x, "converting a compiled function to a string (Node prints its source text, which this build does not keep for this function — SEMANTICS.md S019) is not supported yet"));
+        c.unreachable();
+        c.end();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_SRC);
+        emitFlatCast(c, this.deps.strType());
       });
       // BYTES' text depends on the Buffer flag: a plain Uint8Array joins
       // ELEMENT VALUES with commas (Array.prototype.toString's own rule,
@@ -8121,6 +8225,27 @@ export class DynBuilder {
         // Everything else falls through to undefined, C's NULL answer
         // reaching the same place.
         this.arm(c, K, [DK.FUNC], () => {
+          // A generator function's `prototype` is what its generator
+          // objects inherit; they do not look up through it here, so a
+          // read stops by name in every module (with or without the
+          // object model).
+          c.localGet(1);
+          this.deps.lit(c, "prototype");
+          c.call(this.deps.strEq());
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(this.fnT(), FN_PROTO);
+          c.i32Const(FN_PROTO_GENERATOR);
+          c.i32And();
+          c.i32Const(0);
+          c.i32Ne();
+          c.i32And();
+          c.ifVoid();
+          if (this.deps.fence !== undefined) {
+            this.deps.fence(c, (x) => this.deps.lit(x, "a generator function's 'prototype' (the prototype its generator objects inherit) is not supported yet"));
+          }
+          c.refNull(dynT);
+          c.return_();
+          c.end();
           if (this.objModelLive) {
             // Unit U4: an ordinary function's `prototype`, made on first use.
             c.localGet(1);
@@ -8176,6 +8301,7 @@ export class DynBuilder {
           this.deps.lit(c, "name");
           c.call(this.deps.strEq());
           c.ifVoid();
+          this.stubFence(c, "name");
           this.boxStr(c, (x) => {
             this.fnPayload(x, (y) => y.localGet(0));
             x.structGet(this.fnT(), FN_NAME);
@@ -8191,6 +8317,7 @@ export class DynBuilder {
           c.end();
           this.pushIsLength(c, (x) => x.localGet(1));
           c.ifVoid();
+          this.stubFence(c, "length");
           this.boxNum(c, (x) => {
             this.fnPayload(x, (y) => y.localGet(0));
             x.structGet(this.fnT(), FN_ARITY);
@@ -11711,8 +11838,9 @@ export class DynBuilder {
       });
       this.arm(c, K, [DK.FUNC], () => {
         this.deps.lit(c, "function ");
-        this.fnPayload(c, (x) => x.localGet(0));
-        c.structGet(this.fnT(), FN_NAME);
+        // errors.js's `value.name`: a read, so a redefined name shows
+        c.localGet(0);
+        c.call(this.fnNameProp());
         c.localTee(S);
         c.refIsNull();
         c.ifResult(this.deps.strRef());
@@ -14077,6 +14205,19 @@ export class DynBuilder {
           }
           throwNotFn();
         });
+
+        // `f.toString()` on a function: Function.prototype.toString, the
+        // same answer as String(f) (the toStr FUNC arm: a JavaScript
+        // definition's own source, else a stop by name; SEMANTICS.md S019).
+        if (method === "toString") {
+          this.arm(c, K, [DK.FUNC], () => {
+            this.boxStr(c, (x) => {
+              x.localGet(0);
+              x.call(this.toStr());
+            });
+            c.return_();
+          });
+        }
 
         if (DynBuilder.FN_METHODS.has(method)) {
           this.arm(c, K, [DK.FUNC], () => {

@@ -1404,6 +1404,24 @@ boundary twice stays one JS value. The NAME this text embeds is the
 approximation S020 registers, so a value whose `f.name` is wrong there
 renders the same wrong name here.
 
+**Amendment (the Function-type unit, wasm and wasm-native): no invented
+text.** `String(f)`, `f.toString()`, a template, or concatenation of a boxed function now
+answers Node's text or stops by name:
+- A box built from a known JavaScript definition carries that definition's
+  own source text, which is what Node echoes, and answers it.
+- Any other compiled function stops by name ("converting a compiled
+  function to a string … is not supported yet"). That covers a TypeScript
+  function, whose source Node echoes type-stripped and this build does not
+  have, and a function that crossed without its definition.
+- A module that clones dynamic values carries a TypeScript function's text
+  for the DataCloneError quote. It is marked as TypeScript text, so
+  `String(f)` stops there too.
+- Node's builtins keep their native-code form, which is Node's own answer
+  for them.
+- No corpus program moved: the census held at 1135/1138 claimed. **Tested
+  by:** `packages/compiler/test/wasm-function-type.test.ts` (FN-07 to
+  FN-13).
+
 **`util.format`'s `%s` reaches for this same text in Node and gets a
 different answer here.** Node's `%s` arm is `String(arg)` for anything that
 is not an object, so `format('%s', f)` prints the SOURCE, while this tier
@@ -1488,6 +1506,42 @@ the S014 argument, since no corpus program can pin any of it: one whose
 output observed the divergence would fail the differential on every lane
 by construction.
 
+
+**Amendment (the Function-type unit, wasm and wasm-native): `f.length`
+from a known definition is Node's.** A box built from a function whose
+definition the lowering knows carries Node's count: the parameters before
+the first default or rest, with `this` not a parameter and TypeScript's `?`
+counted. S020's four shapes answer "1 0 2 2" as in Node.
+- **Known only by its type.** A compiled function box known only by its TYPE
+  keeps the type's parameter count above. That covers a callback parameter or
+  a field read, and a function that reaches dynamic code through a converting
+  composite. So `lenOf((a) => a)` with `cb: (a: number, b?: number) =>
+  number` answers 2, where Node answers the arrow's own 1. `f.name` is
+  unchanged for these.
+- **Call-time fence stubs.** A JavaScript function value with no compiled
+  form (a generator, for one) crosses as a stub that stops by name when
+  called. Its box reports its definition's own name, `length` and kind, as
+  Node does, wherever that definition is certain. The lowering follows only
+  these to it:
+  - a function declaration;
+  - a `const` binding;
+  - an import alias of one of those;
+  - a `let`/`var` the program never writes after its declaration, in any
+    module;
+  - a default export of one of those.
+
+  An anonymous function gets the name Node gives it at its binding, key or
+  default export.
+- **A stub whose definition is not certain.** Its `name`, `length` and
+  inspect form stop by name, as `String(f)` does. They never read a
+  stand-in 0, "" or "anonymous", and never a replaced definition's facts.
+  The cases are:
+  - a property read (`o.g`), which can be written through aliases, element
+    writes or Object.assign;
+  - a symbol merged from several declarations;
+  - a written `let`;
+  - a value chosen at run time. **Tested by:** the S020 emitter test and
+`wasm-function-type.test.ts` (FN-03, FN-04, FN-10, FN-11, FN-14 to FN-23).
 
 **Amendment (GH #140, wasm and wasm-native): an object literal's function
 members are named by their key.** ES SetFunctionName names a method

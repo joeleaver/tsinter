@@ -4,6 +4,7 @@
  * comparisons, nullish coalescing and optional chains, conditions and
  * ToBoolean/ToString coercion helpers, and field/element reads and writes
  * (FieldTarget). */
+import { stubByDefinition } from "./lower-island.js";
 import { wideIndex } from "./big-widen.js";
 import { lowerFileHandleProperty } from "./lower-filehandle.js";
 import { checkedExecEncodingLiteral, lowerExecErrorMember } from "./lower-child-options.js";
@@ -16,12 +17,12 @@ import { realpathSync } from "node:fs";
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
-import { ARRAYBUFFER_T, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
-import { lowerConstructorName, viewableClass } from "./class-views.js";
+import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { fencedValue, lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, THIS_BINDING, dynUndefinedExpr, esFuncNameOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { armCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped } from "./lower-builtins.js";
@@ -1022,8 +1023,23 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             L.program.getSourceFile(first.loc.file) ?? expr.getSourceFile(),
             first.loc.start,
           );
-          const fnName = `%fn${L.lambdaCounter++}_islfence`;
-          L.liftedFns.push({
+          // One stub per definition (lower-island.ts stubByDefinition): the
+          // member's own function object, shared with every other crossing
+          // of it.
+          const defKey = fnDefinitionOf(L, valueNode);
+          // A function-shaped member whose definition is not one object per
+          // run (unnamed, or evaluated per call / per iteration) stops by
+          // name: a shared stand-in would compare equal and share
+          // properties where Node's objects do not.
+          if (getterName === null && (defKey === undefined || !evaluatedOnce(defKey))) {
+            const vloc = locOf(valueNode);
+            return fencedValue(L, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc: vloc } as IrExpr, "SC1090",
+              `a function value defined inside a function body or a loop crossing into dynamic code (each evaluation is a new function object in Node; this build's stand-in would be one shared object) is not supported yet [SC1090 at ${vloc.file}:${ts.getLineAndCharacterOfPosition(valueNode.getSourceFile(), valueNode.getStart()).line + 1}]`, vloc);
+          }
+          const reused = defKey === undefined ? undefined : stubByDefinition(L).get(defKey);
+          const fnName = reused ?? `%fn${L.lambdaCounter++}_islfence`;
+          if (defKey !== undefined && reused === undefined) stubByDefinition(L).set(defKey, fnName);
+          if (reused === undefined) L.liftedFns.push({
             name: fnName,
             params: [],
             returnType: VOID,
@@ -1044,7 +1060,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             getters.push({ name: getterName, fn: L.jsvalIn(fence, valueNode), loc: locOf(valueNode) });
             return null;
           }
-          return L.jsvalIn(fence, valueNode);
+          // A function-shaped member: the stub's box reports the member's
+          // own definition (name, length, kind, source), as Node does; only
+          // a call through it stops by name.
+          const lifted = L.jsvalIn(fence, valueNode);
+          const facts = boxFactsOf(L, valueNode);
+          return lifted.kind === "jsMarshal" ? { ...lifted, ...(facts ?? { fnProto: FN_PROTO_STUB }) } : lifted;
         };
         // The member's SHAPE decides the fence's granularity: syntactic
         // functions and checker-callable values keep the call-time

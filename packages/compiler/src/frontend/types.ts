@@ -1574,6 +1574,14 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // Object` still maps as a record. Its Object.prototype member surface
   // (`x.toString()`) fences at each use site, never silently.
   if (isStdlibInterface("Object")) return DYN;
+  // The lib's `Function` interface: tsc admits every callable, of any
+  // signature, into a `Function` slot and gives back only `any` from a
+  // call, so no static signature exists to keep. It is the dynamic value,
+  // as `Object` is (provenance-checked; a user's own `interface Function`
+  // maps as itself): typed functions entering box (one box per closure),
+  // and calls, `.call`/`.apply`/`.bind`/`.name`/`.length` are the dynamic
+  // function's own (docs/design/function-type.md).
+  if (isStdlibInterface("Function")) return ctx.sharedDynamic === true ? JSVAL : DYN;
   // events.EventEmitter: the runtime-provided emitter base class (the
   // Error-hierarchy precedent — user subclasses resolved through the
   // class-instance branch above). Both type layers declare it in the

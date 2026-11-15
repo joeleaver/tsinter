@@ -2403,8 +2403,6 @@ test("S019/S016: a boxed function's members, its String() and the write it (no l
       "function b(x: boolean): string { return x ? 'T' : 'F'; }",
       "console.log(b('name' in b1) + b('length' in b1) + b('nope' in b1));",
       "console.log(b(Object.hasOwn(b1, 'name')) + b(Object.hasOwn(b1, 'length')) + b(Object.hasOwn(b1, 'zz')));",
-      "const s: string = `${b1}`;",
-      "console.log(s);",
       "try { b1.x = 1; console.log('wrote'); } catch (e) { console.log((e as Error).message); }",
       "",
     ].join("\n"),
@@ -2419,17 +2417,15 @@ test("S019/S016: a boxed function's members, its String() and the write it (no l
       "[anon] 1",
       "TTF", // Node: TTF — the C lane answers FFF
       "TTF", // Node: TTF — the C lane answers FFF
-      // S019 — Node prints the SOURCE, and under --experimental-strip-types
-      // the type annotations are blanked to SPACES rather than removed:
-      //   "function named(a        , b        )         { return a + b; }"
-      "function named() { [native code] }",
+      // (String(b1) is S019's: a TypeScript function's text is not what
+      // Node echoes, so it stops by name — wasm-function-type.test.ts.)
       "wrote", // S016's FUNC-write arm is RETIRED (P4, board #98) — matches Node
       "",
     ].join("\n"),
   );
 });
 
-test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", async () => {
+test("S020: f.name is the BOX SITE's binding; f.length is Node's from a known definition", async () => {
   // Both members are compile-time approximations captured where the box
   // is built, and both are close enough to be mistaken for exact. Every
   // Node answer below was verified against real Node, and the C lane
@@ -2500,11 +2496,11 @@ test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", a
       // (anonymous); `passed` is re-boxed at `f as unknown` inside takesFn
       // (unit U1a: a cast to unknown boxes there), whose binding is `f`.
       "[] [f]",
-      // S020's four length shapes, in order: def / def2 / opt / mix.
-      // Node: "1 0 2 2" — only `opt` (the `?` marker, which erases and so
-      // gets counted on both lanes) agrees, and `mix` shows the split
-      // inside one signature: its `?` is counted, its `= 3` is not.
-      "2 2 2 3",
+      // S020's four length shapes, in order: def / def2 / opt / mix: Node's
+      // "1 0 2 2" since the function-type unit (a box from a known
+      // definition counts the parameters before the first default or
+      // rest; TypeScript's `?` erases and counts).
+      "1 0 2 2",
       // Agrees exactly — the defaults still APPLY through the box, which
       // is S020's narrowness paragraph. Only the reported count is wrong.
       "6 7 5 8",
