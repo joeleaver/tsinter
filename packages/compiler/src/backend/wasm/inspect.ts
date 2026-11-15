@@ -133,6 +133,7 @@ import {
   OBJ_PROTO_MAP,
   OBJ_PROTO_NULL,
   OBJ_PROTO_WEAKMAP,
+  VIEW_TOKEN,
   type DynBuilder,
 } from "./dyn.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
@@ -4001,6 +4002,27 @@ export class InspectBuilder {
       const PREFIX = 23; // P4 SITE D: the "[Function: name]" piece, built before the block
       const CN = 24; // units U3 + U4: the prototype chain's constructor name (null: none / Object)
       const MK2 = 25; // units U3 + U4: the region mark the class prefix renders in
+      const OID = 26; // the circular identity: the payload, or a VIEW's token
+      /** OID := the composite's circular identity. A VIEW's payload is a
+       * fresh snapshot per read, so its identity is the static value it
+       * views (the token two views of one value share, and what the typed
+       * printers push): a cycle through a typed record a dynamic slot
+       * holds is found (S125 unit 2 review). */
+      const identity = (payload: number): void => {
+        if (dyn.viewsLive) {
+          c.localGet(D);
+          c.structGet(dyn.dynT(), DYN_REF);
+          c.refTest(dyn.viewT());
+          c.ifResult(EQ_REF);
+          dyn.viewField(c, (x) => x.localGet(D), VIEW_TOKEN);
+          c.else_();
+          c.localGet(payload);
+          c.end();
+        } else {
+          c.localGet(payload);
+        }
+        c.localSet(OID);
+      };
       /** recurse + 1 — the depth children format at. */
       const deeper = (): void => {
         c.localGet(RECURSE);
@@ -4363,6 +4385,7 @@ export class InspectBuilder {
       this.kindArm(c, K, [DK.ARR], () => {
         dyn.arrPayload(c, (x) => x.localGet(D));
         c.localSet(V);
+        identity(V);
         dyn.arrLen(c, (x) => x.localGet(V));
         c.localSet(N);
         // The empty answer comes BEFORE the frame (an empty frame renders
@@ -4384,7 +4407,7 @@ export class InspectBuilder {
         this.deps.lit(c, "[]");
         c.return_();
         c.end();
-        c.localGet(V);
+        c.localGet(OID);
         c.call(this.circCheck());
         c.localSet(ID);
         circularAnswer();
@@ -4405,7 +4428,7 @@ export class InspectBuilder {
         c.end();
         deeper();
         c.call(this.begin());
-        c.localGet(V);
+        c.localGet(OID);
         c.call(this.seenPush());
         // shown = min(n, 100)
         c.localGet(N);
@@ -4525,7 +4548,7 @@ export class InspectBuilder {
         c.localGet(MORE);
         c.call(this.end());
         c.localSet(R);
-        c.localGet(V);
+        c.localGet(OID);
         c.localGet(R);
         c.call(this.refWrap());
         c.return_();
@@ -4540,6 +4563,7 @@ export class InspectBuilder {
         });
         dyn.objPayload(c, (x) => x.localGet(D));
         c.localSet(O);
+        identity(O);
         if (dyn.urlLive) {
           // Unit I: Node prints a URL as its full URL { href: ..., ... }
           // record, which is not built — refused by name.
@@ -4685,7 +4709,7 @@ export class InspectBuilder {
         byProto((name) => `${name}(0) {}`, npOr(`${NULL_PROTO} {}`, "{}"));
         c.return_();
         c.end();
-        c.localGet(O);
+        c.localGet(OID);
         c.call(this.circCheck());
         c.localSet(ID);
         circularAnswer();
@@ -4709,7 +4733,7 @@ export class InspectBuilder {
         c.end();
         deeper();
         c.call(this.begin());
-        c.localGet(O);
+        c.localGet(OID);
         c.call(this.seenPush());
         if (builtins) {
           // A weak collection's first entry: Node's formatWeakCollection
@@ -4931,7 +4955,7 @@ export class InspectBuilder {
         c.i32Const(0);
         c.call(this.end());
         c.localSet(R);
-        c.localGet(O);
+        c.localGet(OID);
         c.localGet(R);
         c.call(this.refWrap());
         c.return_();
@@ -5094,7 +5118,7 @@ export class InspectBuilder {
         [
           I32, I32, dyn.arrRef(), dyn.objRef(), I32, I32, I32, I32, I32, F64,
           dyn.dynRef(), dyn.arrRef(), strRef, strRef, strRef, dyn.dynRef(), strRef,
-          this.deps.bytesRefU8(), strRef, EQ_REF, strRef, strRef, I32,
+          this.deps.bytesRefU8(), strRef, EQ_REF, strRef, strRef, I32, EQ_REF,
         ],
         c.bytes(),
       );

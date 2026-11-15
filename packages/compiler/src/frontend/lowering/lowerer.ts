@@ -99,6 +99,7 @@ import {
 } from "../types.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
+import { hybridOrderPass } from "./lower-inspect.js";
 import { bigWidenTypeOf, programHoldsBigint } from "./big-widen.js";
 import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
@@ -1467,6 +1468,13 @@ export class Lowerer {
   /** The judged copies at contained slots S125 (c) accepted (a further
    * pass tries them on the dynamic arm, falling back if it fails). */
   readonly dynArmSoft = new Set<string>();
+  /** S125 unit 2 (review): the hybrid record shapes console.log/inspect
+   * prints, with the first print site (hybridOrderPass judges them). */
+  readonly hybridInspects = new Map<string, SrcLoc>();
+  /** The values the frontend completes an omitted optional field of a
+   * record literal with (no key in JavaScript's object, unlike an explicit
+   * `undefined` written in the source). */
+  readonly omittedLitValues = new WeakSet<object>();
   /** A judged exit's IR node → the key of its contained slot. */
   readonly dynArmExitNodes = new WeakMap<object, string>();
   /** Bindings and parameters holding the dynamic arm. */
@@ -2870,6 +2878,9 @@ export class Lowerer {
       // (Its deferred fences in compiled npm JavaScript intern helpers.)
       functions.push(...this.liftedFns.slice(liftedBefore));
     }
+    // A printed hybrid record whose keys may not all follow its declared
+    // fields refuses by name (console.log's order is Node's, never S031's).
+    hybridOrderPass(this, functions);
 
     if (this.remainder) {
       // Deferred collection diagnostics nothing flushed — declarations no

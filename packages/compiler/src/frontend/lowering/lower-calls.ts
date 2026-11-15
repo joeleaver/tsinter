@@ -2341,11 +2341,16 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
 function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
   const target = L.shapes.get(shapeId);
   if (!target || target.tuple || target.indexValue) return false;
-  if (target.fields.some((f) => f.type.kind === "func" || f.name.startsWith("%"))) return false;
+  if (target.fields.some((f) => f.name.startsWith("%"))) return false;
   if (t.kind === "object") {
     const cls = L.classes.get(t.className);
     if (!cls || cls.def.runtime) return false;
     return target.fields.every((f) => {
+      // S125 share-vs-copy (paperclip's API client into an interface with
+      // methods): a function member is carried by a METHOD of the class
+      // (own or inherited) of exactly that signature — the instance's body
+      // calls the class method directly.
+      if (f.type.kind === "func") return classCarriesMethod(L, t.className, f.name, f.type);
       const ft = cls.fields.get(f.name);
       return ft !== undefined && typeEquals(ft, f.type);
     });
@@ -2357,6 +2362,23 @@ function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
       const sf = src.fields.find((x) => x.name === f.name);
       return sf !== undefined && typeEquals(sf.type, f.type);
     });
+  }
+  return false;
+}
+
+/** Does class `className` (or a base) declare a method `name` whose
+ * required parameters and result are exactly `fn`'s? */
+function classCarriesMethod(L: Lowerer, className: string, name: string, fn: IrType & { kind: "func" }): boolean {
+  let c = L.classes.get(className);
+  while (c !== undefined) {
+    const m = c.methods.get(name);
+    if (m !== undefined) {
+      if (m.abstract === true || m.async === true || m.gen !== undefined) return false;
+      if (m.params.length !== fn.params.length || !m.params.every((p, i) => p.mode === "required" && typeEquals(p.type, fn.params[i]!))) return false;
+      return typeEquals(m.ret, fn.ret);
+    }
+    if (c.fields.has(name)) return false;
+    c = c.base ?? undefined;
   }
   return false;
 }

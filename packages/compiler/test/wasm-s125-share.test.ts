@@ -148,4 +148,115 @@ const arr: N[] = [];
 arr.push(src as N);
 console.log(arr);`,
   },
+  {
+    id: "S125-A2-01 a class instance into an interface parameter with a method (paperclip's API client into fetchLog): the body writes and calls through the caller's object, which is identical (===) to the caller's instance",
+    entry: "main.ts",
+    src: `interface Api { base: string; get(path: string): string }
+class Client implements Api {
+  base = "http://x";
+  calls = 0;
+  get(path: string): string { this.calls++; return this.base + path; }
+}
+function fetchLog(api: Api, p: string): string {
+  api.base = api.base + "/v1";
+  return api.get(p) + " " + String(api === ctx.api);
+}
+const ctx = { api: new Client() };
+console.log(fetchLog(ctx.api, "/log"), ctx.api.calls, ctx.api.base, ctx.api instanceof Client);`,
+  },
+  {
+    id: "S125-B-01 printing an index-signature record with declared fields: declared fields, then the added keys (SEMANTICS.md S031's order)",
+    entry: "main.ts",
+    src: `type Rec = { id: string | undefined; [key: string]: unknown };
+function assertSafe(r: Rec): void {
+  if (r.id === undefined) throw new Error("no id");
+  r.checked = true;
+}
+const existing: Rec = { id: "a1", name: "n" };
+assertSafe(existing);
+console.log(existing);
+const e: Rec = { id: undefined };
+console.log(e, { id: "x", tags: ["a"], n: { deep: 1 } } as Rec);`,
+  },
+  {
+    id: "S125-B-02 (review) a hybrid record holding itself under an added key prints Node's <ref *1> / [Circular *1]",
+    entry: "main.ts",
+    src: `type R = { id: string; [k: string]: unknown };
+const r: R = { id: "a" };
+r.self = r;
+console.log(r);
+const q: R = { id: "q" };
+q.l = [q, 2];
+q.i = { b: q };
+console.log(q);`,
+  },
+  {
+    id: "S125-B-03 (review) a plain Record<string, unknown> holding itself prints Node's circular markers",
+    entry: "main.ts",
+    src: `const r: Record<string, unknown> = { a: 1 };
+r.self = r;
+r.list = [r, 2];
+console.log(r);
+const e: Record<string, unknown> = {};
+e.self = e;
+console.log(e);`,
+  },
+  {
+    id: "S125-B-04 (review) a hybrid literal that sets an added key before a declared field refuses its print by name (Node prints insertion order)",
+    entry: "main.ts",
+    src: `type R = { id: string; [k: string]: unknown };
+const r: R = { name: "n", id: "a1" };
+console.log(r);`,
+    refused: /printing an index-signature record with declared fields whose added keys may come before a declared field/,
+  },
+  {
+    id: "S125-B-05 (review) a hybrid whose optional declared field is assigned after an added key refuses its print by name",
+    entry: "main.ts",
+    src: `type R = { id: string; tag?: string; [k: string]: unknown };
+const r: R = { id: "a" };
+r.extra = 1;
+r.tag = "t";
+console.log(r);`,
+    refused: /printing an index-signature record with declared fields whose added keys may come before a declared field/,
+  },
+  {
+    id: "S125-B-06 (review) a hybrid checked out of JSON (keys in the source's order) refuses its print by name",
+    entry: "main.ts",
+    src: `type R = { id: string; [k: string]: unknown };
+function load(s: string): R { return JSON.parse(s) as R; }
+const r = load('{"name":"n","id":"a1"}');
+console.log(r);`,
+    refused: /printing an index-signature record with declared fields/,
+  },
+  {
+    id: "S125-B-07 (re-check) a computed-key write on a hybrid with an optional declared field may set it after an added key: the print refuses by name",
+    entry: "main.ts",
+    src: `type R = { id?: string; [k: string]: unknown };
+const r: R = {};
+r.x = 1;
+const k = ["i", "d"].join("");
+r[k] = "a";
+console.log(r);`,
+    refused: /a computed key may set an optional declared field after an added key/,
+  },
+  {
+    id: "S125-B-08 (re-check) keys from data written into a hybrid with an optional declared field: the print refuses by name",
+    entry: "main.ts",
+    src: `type R = { id?: string; [k: string]: unknown };
+const r: R = {};
+for (const k of JSON.parse('["x","id"]') as string[]) r[k] = k;
+console.log(r);`,
+    refused: /a computed key may set an optional declared field after an added key/,
+  },
+  {
+    id: "S125-B-09 (re-check) an explicit undefined written after an added key in a literal is a key: the print refuses by name (required and optional declared fields)",
+    entry: "main.ts",
+    src: `type R = { id: string | undefined; [k: string]: unknown };
+const r: R = { name: "n", id: undefined };
+console.log(r);
+type Q = { id?: string; [k: string]: unknown };
+const q: Q = { name: "n", id: undefined };
+console.log(q);`,
+    refused: /a literal sets a declared field after an added key/,
+  },
 ]);

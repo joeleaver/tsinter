@@ -2460,6 +2460,24 @@ half); no corpus program can pin the Node-DIVERGENT order — a corpus
 program's output must match Node byte-for-byte by definition, so a program
 exercising this exact split would fail the differential on every lane.
 
+**Amendment (S125 unit 2, wasm and wasm-native): the split is not only
+integer keys, and console.log does not take it.** The declared-first rule
+above reorders ANY added key that was set before a declared field: a
+literal `{ name: "n", id: "a1" }` typed `{ id: string; [k: string]:
+unknown }` answers `Object.keys` as `['id', 'name']` and serializes
+`{"id":"a1","name":"n"}` where Node answers `['name', 'id']` and
+`{"name":"n","id":"a1"}`; a JSON source checked into the shape reorders the
+same way. `Object.keys`/`values`/`entries`, `for...in` and `JSON.stringify`
+keep this registered order. `console.log`/`util.inspect` do NOT: a hybrid
+prints its declared fields, then its added keys, only where the whole
+program proves that order is Node's (every literal of the shape sets its
+declared fields before any added key, no optional declared field is
+assigned after the record is built, and no value of the shape is built by
+a dynamic check, an island exit or a runtime copy); anywhere else the
+print refuses by name (`printing an index-signature record with declared
+fields whose added keys may come before a declared field`). **Tested by:**
+`packages/compiler/test/wasm-s125-share.test.ts` S125-B-01..06.
+
 **Amendment (increment 17, index-signature records): `__proto__` is an
 ordinary own key here, not the prototype accessor.** A dynamic-keyed write
 naming `"__proto__"` — `r["__proto__"] = v` — stores an ordinary overflow
@@ -10743,6 +10761,19 @@ not build:
   instance those parameters, and the result, hold the dynamic values
   themselves, so dynamic code and the body share the array. Direct calls
   from typed code keep the typed function.
+- **A typed record a dynamic slot holds is the same value to the
+  printer.** A record or array whose field, element or index value is
+  dynamic prints Node's `<ref *N>`/`[Circular *N]` when it holds itself
+  (`r.self = r` on a `Record<string, unknown>` or a hybrid): the dynamic
+  slot holds a view of the record, and the printer's identity for a view is
+  the record it views.
+- **A class instance into an interface with methods.** (a)'s per-call-site
+  instance of a plain function now also takes a class instance whose
+  type's members include methods (paperclip's API client handed to a
+  helper typed `{ base: string; get(path: string): string }`): each method
+  member is carried by the class's own or inherited method of exactly that
+  signature (not abstract, async or a generator), so the body reads, writes
+  and calls through the caller's object, as in Node.
 - **A width copy that is printed (GH #222).** A dynamic value checked into
   a closed record type (or an array of one) keeps only the type's declared
   fields, where the JavaScript object keeps every key. (c) now counts a
