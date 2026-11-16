@@ -759,6 +759,91 @@ static int rm_cb(const char *p, const struct stat *sb, int fl, struct FTW *f) {
   return fl == FTW_DP ? rmdir(p) : unlink(p);
 }
 
+/* fs.promises.rm's rimraf (Node v24.18.1 lib/internal/fs/rimraf.js,
+ * rimrafPromises with no retries): lstat, then unlink or rmdir; a
+ * directory rmdir refuses as not empty walks its children (libuv's
+ * scandir order: strcmp-sorted), EVERY child attempted, the first failure
+ * in that order reported, the directory's own rmdir skipped after one.
+ * ENOENT anywhere is success. A failure records its syscall (0 lstat,
+ * 1 unlink, 2 rmdir, 3 scandir) and path. */
+typedef struct { int err, tag, count; char *path; } RimrafErr;
+static int rimraf_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void rimraf_fail(RimrafErr *e, int err, int tag, const char *p) {
+  e->count++;
+  if (e->err) return;
+  e->err = err;
+  e->tag = tag;
+  e->path = strdup(p);
+  if (!e->path) abort();
+}
+static void rimraf_path(const char *p, RimrafErr *e);
+static void rimraf_dir(const char *p, int origErr, int origTag, RimrafErr *e) {
+  if (rmdir(p) == 0 || errno == ENOENT) return;
+  int er = errno;
+  if (er == ENOTDIR) {
+    /* _rmdir's callback(originalErr): with none (a symlink to a directory
+     * spelled with a trailing slash), the removal succeeds, deleting
+     * nothing */
+    if (origErr) rimraf_fail(e, origErr, origTag, p);
+    return;
+  }
+  if (er != ENOTEMPTY && er != EEXIST && er != EPERM) {
+    rimraf_fail(e, er, 2, p);
+    return;
+  }
+  DIR *d = opendir(p);
+  if (!d) {
+    if (errno != ENOENT) rimraf_fail(e, errno, 3, p);
+    return;
+  }
+  char **names = NULL;
+  size_t n = 0, cap = 0;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+    if (n == cap) {
+      cap = cap ? cap * 2 : 16;
+      names = realloc(names, cap * sizeof *names);
+      if (!names) abort();
+    }
+    names[n] = strdup(de->d_name);
+    if (!names[n]) abort();
+    n++;
+  }
+  closedir(d);
+  qsort(names, n, sizeof *names, rimraf_cmp);
+  int before = e->count;
+  for (size_t i = 0; i < n; i++) {
+    size_t lp = strlen(p), ln = strlen(names[i]);
+    char *c = malloc(lp + ln + 2);
+    if (!c) abort();
+    memcpy(c, p, lp);
+    c[lp] = '/';
+    memcpy(c + lp + 1, names[i], ln + 1);
+    rimraf_path(c, e);
+    free(c);
+    free(names[i]);
+  }
+  free(names);
+  if (e->count != before) return;
+  if (rmdir(p) != 0 && errno != ENOENT) rimraf_fail(e, errno, 2, p);
+}
+static void rimraf_path(const char *p, RimrafErr *e) {
+  struct stat st;
+  if (lstat(p, &st) != 0) {
+    if (errno != ENOENT) rimraf_fail(e, errno, 0, p);
+    return;
+  }
+  if (S_ISDIR(st.st_mode)) {
+    rimraf_dir(p, 0, 0, e);
+    return;
+  }
+  if (unlink(p) == 0 || errno == ENOENT) return;
+  int er = errno;
+  if (er == EPERM || er == EISDIR) rimraf_dir(p, er, 1, e);
+  else rimraf_fail(e, er, 1, p);
+}
+
 static int mkdir_p(char *path, mode_t mode) {
   struct stat st;
   if (stat(path, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : (errno = EEXIST, -1);
@@ -1031,11 +1116,12 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       break;
     }
     case 3: {
+      /* The module stages the TEMPLATE (prefix + "XXXXXX", fs.ts's
+       * buildReadLengthOp), so the path is used as is. */
       size_t n = strlen(path);
-      char *t = malloc(n + 7);
+      char *t = malloc(n + 1);
       if (!t) abort();
-      memcpy(t, path, n);
-      memcpy(t + n, "XXXXXX", 7);
+      memcpy(t, path, n + 1);
       if (!mkdtemp(t)) rc = wn_fs_err(errno);
       else rc = put_str(t, B, BL);
       free(t);
@@ -1178,6 +1264,41 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       break;
     case 14: {
       struct stat st;
+      if (x & 2) {
+        /* fs.promises.rm (x = recursive | 2): validateRmOptions' lstat,
+         * then rimraf; a failure writes slot B as u16 syscall tag, u16
+         * code-unit count, the path's code units (BL code units of room;
+         * a path that does not fit reports count 0: the argument itself) */
+        RimrafErr e = {0, 0, 0, NULL};
+        if (lstat(path, &st) != 0) {
+          if (errno == ENOENT && y == 1) break;
+          rimraf_fail(&e, errno, 0, path);
+        } else if (S_ISDIR(st.st_mode) && !(x & 1)) {
+          rc = wn_fs_err(EISDIR);
+          break;
+        } else {
+          rimraf_path(path, &e);
+        }
+        if (e.err) {
+          size_t ln = strlen(e.path);
+          size_t len = wn_utf8_to_16((const uint8_t *)e.path, ln, NULL);
+          uint16_t *u = malloc(len * 2 + 4);
+          if (!u) abort();
+          u[0] = (uint16_t)e.tag;
+          if (len + 2 > BL) {
+            u[1] = 0;
+            len = 0;
+          } else {
+            u[1] = (uint16_t)len;
+            wn_utf8_to_16((const uint8_t *)e.path, ln, u + 2);
+          }
+          memcpy(w_hostmem + B, u, (len + 2) * 2);
+          free(u);
+          free(e.path);
+          rc = wn_fs_err(e.err);
+        }
+        break;
+      }
       if (lstat(path, &st) != 0) {
         rc = (errno == ENOENT && y == 1) ? 0 : wn_fs_err(errno);
         break;

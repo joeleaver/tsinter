@@ -863,6 +863,8 @@ interface ImportMeta {
   url: string;
   filename: string;
   dirname: string;
+  /** compiles to a named runtime stop (SEMANTICS.md S139) */
+  resolve(specifier: string): string;
 }
 
 /* The synchronous node:fs surface — utf8-only, no options objects, no
@@ -1083,9 +1085,18 @@ declare module "fs/promises" {
   export function readFile(path: string, encoding: "utf8" | "utf-8"): Promise<string>;
   export function readFile(path: string): Promise<Buffer>;
   export function writeFile(path: string, data: string): Promise<void>;
+  export function writeFile(path: string, data: string | Uint8Array, options?: "utf8" | "utf-8" | { encoding?: "utf8" | "utf-8"; mode?: number; flag?: string }): Promise<void>;
   export function mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<void>;
   export function readdir(path: string): Promise<string[]>;
-  export function rm(path: string): Promise<void>;
+  export function readdir(path: string, options: { withFileTypes: true }): Promise<import("node:fs").Dirent[]>;
+  export function rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  export function realpath(path: string): Promise<string>;
+  export function mkdtemp(prefix: string): Promise<string>;
+  export function copyFile(src: string, dest: string): Promise<void>;
+  export function access(path: string, mode?: number): Promise<void>;
+  /** declared so they refuse by name */
+  export function symlink(target: string, path: string): Promise<void>;
+  export function readlink(path: string): Promise<string>;
   export function stat(path: string, options: { bigint: true }): Promise<import("node:fs").BigIntStats>;
   export function stat(path: string, options?: { bigint?: false }): Promise<import("node:fs").Stats>;
   export function lstat(path: string, options: { bigint: true }): Promise<import("node:fs").BigIntStats>;
@@ -1266,7 +1277,10 @@ interface URL {
   readonly href: string;
   readonly host: string;
   readonly hostname: string;
+  readonly username: string;
+  readonly password: string;
   readonly search: string;
+  readonly hash: string;
   readonly searchParams: URLSearchParams;
   toString(): string;
 }

@@ -5669,6 +5669,10 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       // host field verbatim (Node would keep IPv6 brackets here, but the
       // parser rejects IPv6 hosts — documented divergence — so the getter
       // never sees one).
+      if (name === "username" || name === "password") {
+        const receiver = L.lowerExpr(expr.expression);
+        return { kind: "libCall", fn: name === "username" ? "url.username" : "url.password", args: [receiver], type: STRING, loc: locOf(expr) };
+      }
       if (name === "protocol" || name === "pathname" || name === "href" || name === "host" || name === "hostname" || name === "search" || name === "hash") {
         const receiver = L.lowerExpr(expr.expression);
         const fn =
@@ -5700,7 +5704,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       L.noLowering(
         `URL.${name}`,
         expr,
-        "protocol, pathname, href, host, hostname, search, hash, searchParams, and toString() are the supported URL members",
+        "protocol, pathname, href, host, hostname, username, password, search, hash, searchParams, and toString() are the supported URL members",
         L.checker.getSymbolAtLocation(expr.name),
       );
     }

@@ -1459,12 +1459,18 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fsp.rm" ||
         node === "fsp.stat" ||
         node === "fsp.mkdir" ||
+        node === "fsp.mkdirRecursive" ||
         node === "fsp.mkdirRecursiveMode" ||
         node === "fsp.writeFileMode" ||
         node === "fsp.writeFileExclMode" ||
         node === "fsp.readdir" ||
         node === "fsp.unlink" ||
         node === "fsp.chmod" ||
+        node === "fsp.realpath" ||
+        node === "fsp.mkdtemp" ||
+        node === "fsp.copyFile" ||
+        node === "fsp.access" ||
+        node === "fsp.rmOpts" ||
         // INC-26 P6 delta-02 (eba33a02484f182e): fs.existsChk's real-
         // answer arm reuses P4's existsSyncHelper (fs.ts:1754), which
         // calls fsCall internally — the SAME failure class as the other
@@ -29843,8 +29849,7 @@ class Assembler {
           code.localSet(PATH);
           code.localGet(PATH);
           this.walkExpr(e.args[1]!);
-          code.call(this.toInt32Helper());
-          code.call(this.fs.accessSyncHelper());
+          code.call(this.fs.accessCheckedHelper());
           this.emitPendingCheck();
           this.releaseScratch(this.strRef, PATH);
           return;
@@ -31235,7 +31240,9 @@ class Assembler {
         if (e.fn === "fsp.rm") {
           this.emitFspSettled(code, null, () => {
             this.walkExpr(e.args[0]!);
-            code.call(this.fs.rmSyncHelper());
+            code.i32Const(0);
+            code.i32Const(0);
+            code.call(this.fs.rmPromiseHelper());
           });
           return;
         }
@@ -31311,12 +31318,53 @@ class Assembler {
           });
           return;
         }
+        if (e.fn === "fsp.mkdirRecursive") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.mkdirRecursiveSyncHelper());
+          });
+          return;
+        }
         if (e.fn === "fsp.mkdirRecursiveMode") {
           this.emitFspSettled(code, null, () => {
             this.walkExpr(e.args[0]!);
             this.walkExpr(e.args[1]!);
             code.call(this.toInt32Helper());
             code.call(this.fs.mkdirRecursiveModeSyncHelper());
+          });
+          return;
+        }
+        // paperclip's stdlib batch: each over its sync sibling's helper,
+        // a failure rejecting at the await (emitFspSettled).
+        if (e.fn === "fsp.realpath" || e.fn === "fsp.mkdtemp") {
+          this.emitFspSettled(code, this.strRef, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(e.fn === "fsp.realpath" ? this.fs.realpathNativeHelper() : this.fs.mkdtempSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.copyFile") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.fs.copyFileSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.access") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.fs.accessCheckedHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.rmOpts") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            this.walkExpr(e.args[2]!);
+            code.call(this.fs.rmPromiseHelper());
           });
           return;
         }
@@ -43907,6 +43955,10 @@ class Assembler {
         return simple(() => W().hostFn(), false);
       case "url.hostname":
         return simple(() => W().hostnameFn(), false);
+      case "url.username":
+        return simple(() => W().usernameFn(), false);
+      case "url.password":
+        return simple(() => W().passwordFn(), false);
       case "url.pathname":
         return simple(() => W().pathnameFn(), false);
       case "url.search":

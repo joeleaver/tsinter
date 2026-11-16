@@ -940,9 +940,21 @@
       "note": "recognized module (bare and node:-prefixed specifiers)"
     },
     {
+      "id": "node-builtin.fs.promises.access",
+      "kind": "node-builtin",
+      "name": "fs/promises.access",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.promises.chmod",
       "kind": "node-builtin",
       "name": "fs/promises.chmod",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.promises.copyFile",
+      "kind": "node-builtin",
+      "name": "fs/promises.copyFile",
       "status": "static"
     },
     {
@@ -955,6 +967,12 @@
       "id": "node-builtin.fs.promises.mkdir",
       "kind": "node-builtin",
       "name": "fs/promises.mkdir",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.promises.mkdtemp",
+      "kind": "node-builtin",
+      "name": "fs/promises.mkdtemp",
       "status": "static"
     },
     {
@@ -973,6 +991,12 @@
       "id": "node-builtin.fs.promises.readdir",
       "kind": "node-builtin",
       "name": "fs/promises.readdir",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.promises.realpath",
+      "kind": "node-builtin",
+      "name": "fs/promises.realpath",
       "status": "static"
     },
     {

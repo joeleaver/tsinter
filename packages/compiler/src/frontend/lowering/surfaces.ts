@@ -668,6 +668,11 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     open: { fn: "fsp.open", params: [STRING], result: { kind: "promise", inner: FILEHANDLE_T } },
     unlink: { fn: "fsp.unlink", params: [STRING], result: { kind: "promise", inner: VOID } },
     chmod: { fn: "fsp.chmod", params: [STRING, F64], result: { kind: "promise", inner: VOID } },
+    // paperclip's stdlib batch: the sync operations behind settled promises
+    realpath: { fn: "fsp.realpath", params: [STRING], result: { kind: "promise", inner: STRING } },
+    mkdtemp: { fn: "fsp.mkdtemp", params: [STRING], result: { kind: "promise", inner: STRING } },
+    copyFile: { fn: "fsp.copyFile", params: [STRING, STRING], result: { kind: "promise", inner: VOID } },
+    access: { fn: "fsp.access", params: [STRING, F64], result: { kind: "promise", inner: VOID } },
   },
   // The bare module's POSIX-target binding; a win32 target rebinds it to
   // the win32 table (builtinModuleFnsOf — Node on Windows IS path.win32).

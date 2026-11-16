@@ -7338,6 +7338,29 @@ paths across the full fsp surface; #143's own native corpus rows (1461/1531/2314
 negative control, confirming this entry's own native code paths (`scr_promise_settled_*`) sit beside, and
 are unaffected by, that rider's three separate C-lane fixes.
 
+
+*Amendment (paperclip's stdlib batch, wasm and wasm-native).* fs/promises `realpath`,
+`mkdtemp`, `copyFile`, `access`, `mkdir(path, { recursive })` and `rm(path, { recursive,
+force })` run their operations behind settled promises, like the members above, with the
+promise forms' own error shapes: `realpath` is Node's native realpath (a failure names
+syscall `realpath` and the path as given; `""` rejects with ENOENT instead of resolving to the
+working directory); `rm` is Node's rimraf (a failure names the syscall and path that failed --
+`unlink '<D>/ro/in'`, `rmdir '<D>/ro/sd'`, `scandir …`, `lstat …` -- children walked in
+libuv's sorted scandir order, every child attempted, the first failure in sorted depth-first
+order reported -- where a tree holds several failures Node reports whichever of its parallel
+operations settles first, at any depth and among siblings alike (measured: the same tree has
+answered `unlink '<D>/ro/in'` on one run and `rmdir '<D>/ro/sd'` on another), a choice that
+depends on its scheduling; the tree left behind is Node's either way, and a tree with one
+failure reports it exactly); `access` (and `accessSync`) range-check the mode as Node's binding does (a
+non-finite mode: RangeError ERR_OUT_OF_RANGE "mode is out of range"; otherwise truncated, and
+outside 0..7 "mode is out of range: >= 0 && <= 7"). `symlink`, `readlink` and
+`readdir(path, { withFileTypes: true })` -- which paperclip's sources use only on code its
+workload does not reach (the `agent` command, embedded-Postgres startup) -- compile, with
+their arguments evaluated, to a named runtime stop: the build continues, and a run that
+reaches one stops by name where Node performs it. Unpicked, not scoped out: their Node-exact
+forms (host symlink/readlink operations; the typed Dirent rows inside the settled promise)
+are the path when a workload reaches them.
+
 ## S075 — `process.getActiveResourcesInfo()` reports only the resource KINDS this tier's own event loop models *(wasm tier; native lanes ship the same divergence)*
 
 Node's real answer enumerates every live libuv handle by KIND — timers, sockets, file-descriptor
@@ -12152,6 +12175,17 @@ rule (the real path, as Node's CJS loader names the module).
 (wasm and wasm-native against Node: two modules, an entry reached
 through a symlinked directory with `import.meta` and `__dirname`; the
 resolve and CommonJS refusals).
+
+
+*Amendment (paperclip's stdlib batch, wasm and wasm-native).* `import.meta.resolve(specifier)`
+resolves a module at run time; a compiled program carries no module resolution. The call
+compiles (its arguments evaluate as in Node) to a named runtime stop, so a build whose
+workload never reaches the call (paperclip's `runtime setup` / `runtime import-remote`,
+which then start `node` on a provisioner script or import a computed path) builds and
+runs as Node does, and a run that reaches it stops by name where Node answers the
+resolved URL. Unpicked, not scoped out: a Node-exact resolve (package lookup and the
+`exports` conditions, at run time or baked from the source tree) is the path if a
+workload ever reaches those commands.
 
 ## S147 — Library mode: tsinter:memory is C-like memory with a fixed layout and a 1 GiB limit *(wasm, library mode)*
 

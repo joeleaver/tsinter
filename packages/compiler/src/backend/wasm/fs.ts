@@ -1363,6 +1363,107 @@ export class FsBuilder {
     );
   }
 
+  /** `%w.fs.rmPromise(path, recursive, force)` — fs.promises.rm (op 14 with
+   * x = recursive | 2): Node's promise form runs validateRmOptions' lstat,
+   * then rimraf (lib/internal/fs/rimraf.js), so a failure names the
+   * syscall that failed and the path it failed on (`unlink '<D>/ro/in'`,
+   * `rmdir '<D>/ro/sd'`, `scandir …`, `lstat …`), which the host writes
+   * into slot B: a u16 syscall tag (0 lstat, 1 unlink, 2 rmdir, 3
+   * scandir), a u16 code-unit count (0: the argument itself), then the
+   * code units. A non-recursive directory is ERR_FS_EISDIR, as rmSync's. */
+  rmPromiseHelper(): number {
+    return this.cached("rmPromise", [this.strRef(), I32, I32], [], (idx) => {
+      const c = new Code();
+      this.emitNulGuard(c, 0, "path", () => {});
+      const PATH = 0, REC = 1, FORCE = 2;
+      const A_LEN = 3, A_BASE = 4, B_BASE = 5, STATUS = 6, MATCHED = 7, N = 8, TAG = 9, ELEN = 10, PBASE = 11, I = 12, EPATH = 13;
+      const B_UNITS = 4098;
+      c.localGet(PATH);
+      c.arrayLen();
+      c.localSet(A_LEN);
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(A_LEN);
+        c.i32Const(2);
+        c.i32Mul();
+        this.emitRoundUp2(c);
+        c.i32Const(B_UNITS * 2);
+        c.i32Add();
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(PATH);
+      c.localGet(A_BASE);
+      c.call(this.stageStrUtf16AtHelper());
+      c.drop();
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.i32Const(2);
+      c.i32Mul();
+      this.emitRoundUp2(c);
+      c.i32Add();
+      c.localSet(B_BASE);
+      c.i32Const(14);
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.localGet(B_BASE);
+      c.i32Const(B_UNITS);
+      c.localGet(REC);
+      c.i32Const(2);
+      c.i32Or();
+      c.localGet(FORCE);
+      c.call(this.deps.fsCallFunc(14));
+      c.localSet(STATUS);
+      // ERR_FS_EISDIR first (S073's second sentence, rmSync's shape)
+      c.localGet(STATUS);
+      c.i32Const(-EISDIR_CODE);
+      c.i32Eq();
+      c.ifVoid();
+      this.deps.throwCoded(
+        c,
+        "%Error",
+        "Error",
+        (cc) => {
+          this.deps.pushStrLit(cc, "Path is a directory: rm returned EISDIR (is a directory) ");
+          cc.localGet(PATH);
+          cc.call(this.deps.concat());
+        },
+        (cc) => this.deps.pushStrLit(cc, "ERR_FS_EISDIR"),
+      );
+      c.return_();
+      c.end();
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(B_BASE);
+      c.i32Load16U();
+      c.localSet(TAG);
+      c.localGet(B_BASE);
+      c.i32Const(2);
+      c.i32Add();
+      c.localSet(PBASE);
+      this.emitReadLengthPrefixedStrAt(c, PBASE, EPATH, ELEN, PBASE, I);
+      c.localGet(ELEN);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(PATH);
+      c.localSet(EPATH);
+      c.end();
+      const syscalls = ["lstat", "unlink", "rmdir", "scandir"];
+      syscalls.forEach((sc, tag) => {
+        c.localGet(TAG);
+        c.i32Const(tag);
+        c.i32Eq();
+        c.ifVoid();
+        this.emitThrowFromStatus(c, STATUS, EPATH, MATCHED, N, sc, "one", {});
+        c.return_();
+        c.end();
+      });
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, this.strRef()], c.bytes());
+    });
+  }
+
   /** rmRetrySync (op 14, a THIRD key — CP1 delta cp1b/C-2, D-3): [STRING,
    * BOOL, BOOL, F64, F64] = recursive, force, maxRetries, retryDelay.
    * recursive/force keep x/y exactly as rmOptsSync; maxRetries/retryDelay
@@ -1400,6 +1501,52 @@ export class FsBuilder {
       "access",
       false,
     );
+  }
+
+  /** `%w.fs.accessChecked(path, mode: f64)` — accessSync/fs.promises.access
+   * with Node v24.18.1's mode check first (its binding's GetValidMode, as
+   * measured): a non-finite mode throws RangeError ERR_OUT_OF_RANGE "mode
+   * is out of range"; otherwise the mode truncates toward zero and outside
+   * 0..7 throws "mode is out of range: >= 0 && <= 7" (1.5 and -0.9 pass as
+   * 1 and 0). The syscall runs only on a valid mode. */
+  accessCheckedHelper(): number {
+    return this.cached("accessChecked", [this.strRef(), { kind: "f64" }], [], (idx) => {
+      const c = new Code();
+      const PATH = 0;
+      const M = 1;
+      const T = 2;
+      const rangeErr = (msg: string): void => {
+        this.deps.throwCoded(c, "%RangeError", "RangeError", (cc) => this.deps.pushStrLit(cc, msg), (cc) => this.deps.pushStrLit(cc, "ERR_OUT_OF_RANGE"));
+        c.return_();
+      };
+      // non-finite: m - m is NaN exactly for NaN and the infinities
+      c.localGet(M);
+      c.localGet(M);
+      c.f64Sub();
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifVoid();
+      rangeErr("mode is out of range");
+      c.end();
+      c.localGet(M);
+      c.f64Trunc();
+      c.localSet(T);
+      c.localGet(T);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(T);
+      c.f64Const(7);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      rangeErr("mode is out of range: >= 0 && <= 7");
+      c.end();
+      c.localGet(PATH);
+      c.localGet(T);
+      c.i32TruncSatF64S();
+      c.call(this.accessSyncHelper());
+      this.mb.setBody(idx, [{ kind: "f64" }], c.bytes());
+    });
   }
 
   /** chmodSync (op 16, [STRING, F64] mode — converted to i32 at the CALL
@@ -2642,7 +2789,21 @@ export class FsBuilder {
    * below (no scan loop, no content assumption), never `pathALocal` the
    * way every other op's message does. */
   realpathSyncHelper(): number {
-    return this.cached("realpathSync", [this.strRef()], [this.strRef()], (idx) => {
+    return this.buildRealpath(false);
+  }
+
+  /** `%w.fs.realpathNative(path) -> str` — fs.promises.realpath, which Node
+   * serves with the native realpath(3) rather than realpathSync's JS lstat
+   * walk: the same resolution (host op 4), but a failure names syscall
+   * `realpath` and the path AS GIVEN (`ENOENT: no such file or directory,
+   * realpath '<path>'`), and the empty path fails with ENOENT instead of
+   * resolving to the working directory. */
+  realpathNativeHelper(): number {
+    return this.buildRealpath(true);
+  }
+
+  private buildRealpath(native: boolean): number {
+    return this.cached(native ? "realpathNative" : "realpathSync", [this.strRef()], [this.strRef()], (idx) => {
       const c = new Code();
       this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.strType()));
       const PATH = 0;
@@ -2663,6 +2824,18 @@ export class FsBuilder {
       c.localSet(A_LEN);
       c.i32Const(64);
       c.localSet(CAP);
+      if (native) {
+        // realpath(3) of "" is ENOENT (code 1).
+        c.localGet(A_LEN);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(-1);
+        c.localSet(STATUS);
+        this.emitThrowFromStatus(c, STATUS, PATH, MATCHED, N, "realpath", "one", {});
+        c.refNull(this.strType());
+        c.return_();
+        c.end();
+      }
 
       // B_OUTER { B_MIDDLE { L_RETRY { ...; brIf(2) on a COMMITTED failure
       // (status<0 — the host only returns this once CAP already covered
@@ -2733,9 +2906,13 @@ export class FsBuilder {
       // FAILURE: slot B holds a u16 code-unit COUNT at its base, then the
       // error path's own UTF-16 payload at base+2 (3C-2's ruling) — read
       // it back instead of PATH.
-      this.emitReadLengthPrefixedStrAt(c, B_BASE, RESULT, ELEN, PBASE, I);
-      const op4Entry = OP_TABLE.find((e) => e.op === 4)!; // never a duplicated literal — OP_TABLE is the ONE source fs-errno-rows.test.ts's own cross-check reads
-      this.emitThrowFromStatus(c, STATUS, RESULT, MATCHED, N, op4Entry.syscall, "one", op4Entry.codeOverrides);
+      if (native) {
+        this.emitThrowFromStatus(c, STATUS, PATH, MATCHED, N, "realpath", "one", {});
+      } else {
+        this.emitReadLengthPrefixedStrAt(c, B_BASE, RESULT, ELEN, PBASE, I);
+        const op4Entry = OP_TABLE.find((e) => e.op === 4)!; // never a duplicated literal — OP_TABLE is the ONE source fs-errno-rows.test.ts's own cross-check reads
+        this.emitThrowFromStatus(c, STATUS, RESULT, MATCHED, N, op4Entry.syscall, "one", op4Entry.codeOverrides);
+      }
       c.refNull(this.strType());
       c.end();
 

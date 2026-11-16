@@ -79,15 +79,6 @@ fenced.ts:30:13 - error SC2020: 'CpuInfo[].length' is part of the standard libra
 
   hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
 
-fenced.ts:31:13 - error SC2020: 'PlatformPath.sep' is typed by @types/node but has no scriptc lowering yet
-
-  30 | console.log(cpus().length);
-  31 | console.log(win32.sep);
-     |             ^~~~~~~~~
-  32 | /* URL members beyond the supported getters (protocol/pathname/href/
-
-  hint: the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)
-
 fenced.ts:44:13 - error SC2020: 'deflateSync of 'string' data' is part of the standard library types but has no scriptc lowering yet
 
   43 | import { deflateSync, gzipSync } from "zlib";

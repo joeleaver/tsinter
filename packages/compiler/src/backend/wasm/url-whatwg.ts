@@ -1831,6 +1831,22 @@ export class UrlEngine {
     });
   }
 
+  /** WHATWG's username / password getters: the stored (already
+   * percent-encoded) userinfo field, "" when absent. */
+  usernameFn(): number {
+    return this.fn("username", [this.urlRef()], [this.sRef], (_f, $) => {
+      const u = $.get(this.urlType(), U_USER, $.l(0));
+      $.do($.sel(this.sRef, $.isNull(u), $.anew(this.S, $.i(0)), u));
+    });
+  }
+
+  passwordFn(): number {
+    return this.fn("password", [this.urlRef()], [this.sRef], (_f, $) => {
+      const p = $.get(this.urlType(), U_PASS, $.l(0));
+      $.do($.sel(this.sRef, $.isNull(p), $.anew(this.S, $.i(0)), p));
+    });
+  }
+
   pathnameFn(): number {
     return this.fn("pathname", [this.urlRef()], [this.sRef], (_f, $) => {
       $.do($.get(this.urlType(), U_PATH, $.l(0)));

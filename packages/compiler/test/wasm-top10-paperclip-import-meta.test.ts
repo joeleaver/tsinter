@@ -5,12 +5,12 @@
  * constants, the module's REAL source location at build time (SEMANTICS.md
  * S139, symlinks resolved as Node's loader resolves them; __filename and
  * __dirname likewise): Node's exact values when the binary runs beside the
- * tree it was built from, as these rows do. import.meta.resolve, the
- * import.meta object itself, and import.meta in a CommonJS module (Node's
- * SyntaxError) refuse by name. Rows run under Node and on both WasmGC
+ * tree it was built from, as these rows do. The import.meta object itself
+ * and import.meta in a CommonJS module (Node's SyntaxError) refuse by
+ * name; import.meta.resolve stops by name where a run reaches it. Rows run under Node and on both WasmGC
  * lanes; a helper module checks the value is per module. */
 import { describe, test } from "vitest";
-import { checkRefuses, checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";
+import { checkFenced, checkRefuses, checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";
 
 const scratch = scratchDir("pc-import-meta");
 
@@ -69,7 +69,9 @@ describe("paperclip: the rest of import.meta keeps the fence", () => {
   test("PC11-R2 import.meta in a CommonJS module", async () => {
     await checkRefuses(scratch, { id: "PC11-R2", files: { "main.cts": `console.log(import.meta.url);` } }, "'import.meta' in a CommonJS module");
   });
-  test("PC11-R1 import.meta.resolve", async () => {
-    await checkRefuses(scratch, { id: "PC11-R1", files: { "main.ts": `console.log(import.meta.resolve("./x.js"));` } }, "ImportMeta.resolve");
-  });
+  // import.meta.resolve builds (paperclip's runtime setup never reaches
+  // it) and stops by name where a run does (SEMANTICS.md S139 amended).
+  test("PC11-R1 import.meta.resolve reached stops by name", async () => {
+    await checkFenced(scratch, { id: "PC11-R1", files: { "main.ts": `console.log("before");\nconsole.log(import.meta.resolve("./x.js"));` } }, "wasm-native", "before\n", "import.meta.resolve(specifier)");
+  }, 600_000);
 });

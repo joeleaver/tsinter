@@ -892,6 +892,40 @@ export function dynUndefinedExpr(loc: SrcLoc): IrExpr {
  * symbol-to-string TypeError). kind 0 Error / 1 TypeError / 2 RangeError;
  * an empty code means no code slot. `type` is the replaced expression's
  * own (never materialized — the global.undefRead pattern). */
+/** S074's reach-only stops (see lowerNamespaceBuiltinCall). */
+function fspReachOnlyStop(L: Lowerer, call: ts.CallExpression, bi: { module: string; member: string }): IrExpr | null {
+  if (bi.module !== "fs/promises") return null;
+  const n = call.arguments.length;
+  let inner: IrType | null = null;
+  let shape = "";
+  if ((bi.member === "symlink") && (n === 2 || n === 3)) {
+    inner = VOID;
+    shape = "symlink";
+  } else if (bi.member === "readlink" && n === 1) {
+    inner = STRING;
+    shape = "readlink";
+  } else if (bi.member === "readdir" && n === 2 && ts.isObjectLiteralExpression(call.arguments[1]!) &&
+             call.arguments[1]!.properties.some((p) => ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === "withFileTypes" && p.initializer.kind === ts.SyntaxKind.TrueKeyword)) {
+    const t = L.mapTypeOf(L.typeOf(call));
+    if (t === null || t.kind !== "promise") return null;
+    inner = t.inner;
+    shape = "readdir with { withFileTypes: true }";
+  }
+  if (inner === null) return null;
+  const loc = locOf(call);
+  const line = ts.getLineAndCharacterOfPosition(call.getSourceFile(), call.getStart()).line + 1;
+  const stmts: IrStmt[] = call.arguments.map((a) => ({ kind: "exprStmt", expr: L.lowerExpr(a), loc: locOf(a) }) as IrStmt);
+  const promT: IrType = { kind: "promise", inner };
+  const placeholder: IrExpr = inner.kind === "void"
+    ? { kind: "intrinsic", name: "promise.resolve", args: [], type: promT, loc }
+    : inner.kind === "string"
+      ? { kind: "intrinsic", name: "promise.resolve", args: [{ kind: "strLit", value: "", type: STRING, loc }], type: promT, loc }
+      : { kind: "intrinsic", name: "promise.resolve", args: [{ kind: "arrayLit", elems: [], type: inner, loc } as IrExpr], type: promT, loc };
+  const fenced = fencedValue(L, placeholder, "SC1090",
+    `fs/promises ${shape} (no lowering yet; SEMANTICS.md S074) is not supported yet [SC1090 at ${loc.file}:${line}]`, loc);
+  return stmts.length === 0 ? fenced : { kind: "seqExpr", stmts, result: fenced, type: promT, loc };
+}
+
 export function nodeThrowExpr(kind: 0 | 1 | 2, code: string, message: string, type: IrType, loc: SrcLoc): IrExpr {
   return {
     kind: "libCall",
@@ -10430,6 +10464,18 @@ export class Lowerer {
           return canonicalBuiltinModule(importDecl.moduleSpecifier.text);
         }
       }
+      // A NAMED sub-namespace import -- `import { promises as fs } from
+      // "node:fs"` (paperclip's spelling): the member is itself a supported
+      // module ("fs/promises"); canonicalBuiltinModule gates the composition,
+      // so an ordinary named function import answers null (builtinImportOf
+      // owns those).
+      if (ts.isImportSpecifier(decl)) {
+        const importDecl = decl.parent.parent.parent;
+        if (!ts.isImportDeclaration(importDecl) || !ts.isStringLiteral(importDecl.moduleSpecifier)) return null;
+        const outer = canonicalBuiltinModule(importDecl.moduleSpecifier.text);
+        const member = (decl.propertyName ?? decl.name).text;
+        return outer !== null ? canonicalBuiltinModule(`${outer}/${member}`) : null;
+      }
       if (!ts.isNamespaceImport(decl)) return null;
       const importDecl = decl.parent.parent;
       if (!ts.isImportDeclaration(importDecl) || !ts.isStringLiteral(importDecl.moduleSpecifier)) return null;
@@ -10513,6 +10559,15 @@ export class Lowerer {
     // at the call site — no runtime entry exists to table.
     const cryptoServed = this.lowerCryptoModuleCall(call, bi, locOf(access));
     if (cryptoServed) return cryptoServed;
+    // paperclip's fs/promises members with no lowering yet, on code its
+    // workload does not reach (symlink/readlink in the agent command,
+    // readdir withFileTypes at embedded-Postgres startup): the arguments
+    // evaluate as Node evaluates them, then a named runtime stop -- the
+    // build continues; a run that reaches the call stops (S074 amended).
+    {
+      const reachOnly = fspReachOnlyStop(this, call, bi);
+      if (reachOnly) return reachOnly;
+    }
     const builtinFn = builtinModuleFnOf(this, bi.module, bi.member);
     if (!builtinFn) {
       this.noLowering(

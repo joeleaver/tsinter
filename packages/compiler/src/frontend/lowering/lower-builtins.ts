@@ -1382,6 +1382,21 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     // runtime implements Node's linear-backoff retry on
     // EBUSY/EMFILE/ENFILE/ENOTEMPTY/EPERM. The retry-free shape keeps the
     // historical rmOptsSync byte for byte.
+    // fs/promises rm(path, { recursive, force }) (paperclip's cleanup
+    // shape): the rmSync options over a settled promise.
+    if (bi.module === "fs/promises" && bi.member === "rm" && expr.arguments.length === 2) {
+      const opts = literalBoolOptions(L, expr.arguments[1]!, ["recursive", "force"], []);
+      if (opts === null) {
+        L.noLowering(
+          "fs/promises rm with an options argument beyond { recursive, force }",
+          expr.arguments[1]!,
+          "the recursive/force flags must be boolean literals; other options have no lowering",
+        );
+      }
+      const path = checkedStrParam(L, expr.arguments[0]!, "path", FS_PATH_TEXT, true);
+      const flag = (v: boolean): IrExpr => ({ kind: "boolLit", value: v, type: BOOL, loc });
+      return { kind: "libCall", fn: "fsp.rmOpts", args: [path, flag(opts.bools["recursive"] === true), flag(opts.bools["force"] === true)], type: { kind: "promise", inner: VOID }, loc };
+    }
     if (bi.module === "fs" && bi.member === "rmSync" && expr.arguments.length === 2) {
       const opts = literalBoolOptions(L, expr.arguments[1]!, ["recursive", "force"], ["maxRetries", "retryDelay"]);
       if (opts === null) {
@@ -4456,6 +4471,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       } else {
         const raw = L.lowerExpr(node);
         if (raw.type.kind === "dyn") v = raw;
+        // An 'any' value (the one dynamic world's jsval, paperclip's CLI
+        // flags): the same box, coerced by the same runtime protocol.
+        else if (raw.type.kind === "jsval" && L.sharedDynamic) v = asDynOperand(raw);
         else if (raw.kind === "unitLit" || L.dynConvertible(raw.type)) {
           v = { kind: "dynFrom", value: raw, type: DYN, loc: raw.loc };
         } else if (raw.type.kind === "record") {

@@ -294,7 +294,7 @@
  *           uninitialized — the text key's own row asserts it): UTF-16
  *           CODE UNITS, bLen in code units, exactly P4's own contract,
  *           unchanged.)
- *         3 mkdtemp(prefixA)->path length     4 realpath(pathA)->path length
+ *         3 mkdtemp(templA)->path length      4 realpath(pathA)->path length
  *                                              (on success; on failure, see
  *                                              OP 4's own paragraph below)
  *                                                                   [P5]
