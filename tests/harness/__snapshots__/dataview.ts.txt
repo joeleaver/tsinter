@@ -14,22 +14,6 @@ dataview.ts:9:17 - error SC1090: '.buffer' outside new DataView(x.buffer, ...) /
      |                 ^~~~~~~~~~
   10 | 
 
-dataview.ts:12:7 - error SC2001: values of type 'bigint' cannot be compiled yet (supported: number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
-  11 | // bigint values have no representation — only Number(view.getBigUint64(...)).
-  12 | const big = view.getBigUint64(0);
-     |       ^~~
-  13 | 
-
-dataview.ts:12:13 - error SC2020: '.getBigUint64 outside Number(...)' is part of the standard library types but has no scriptc lowering yet
-
-  11 | // bigint values have no representation — only Number(view.getBigUint64(...)).
-  12 | const big = view.getBigUint64(0);
-     |             ^~~~~~~~~~~~~~~~~~~~
-  13 | 
-
-  hint: bigint values have no representation — Number(view.getBigUint64(offset, littleEndian?)) is the lowered form
-
 dataview.ts:15:7 - error SC2020: 'ArrayBuffer' is part of the standard library types but has no scriptc lowering yet
 
   14 | // The constructor wants a typed array's own '.buffer'.

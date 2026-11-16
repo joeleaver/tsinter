@@ -159,6 +159,11 @@ const NEEDS: Record<string, readonly [boolean, string]> = {
 };
 const TIMED: Record<string, string> = {
   "U3-TWO-02": "S086 (l): close-together children's exit and end follow the reads",
+  // Node's own run: a self-sent SIGTERM reaches its listeners through
+  // libuv's signal pipe, which a loaded machine can starve past the row's
+  // 50 ms timer (the full gate at fe241dc1 saw Node print the timer line);
+  // the lane's answer is the row's pinned one
+  "G1-SIG-06": "Node's self-sent signal can lose the race with a 50 ms timer under load",
 };
 /* Rows whose Node output is one of a few, by timing (GH #124): Node and the
  * lane must each print one of the listed outputs (stderr and exit status

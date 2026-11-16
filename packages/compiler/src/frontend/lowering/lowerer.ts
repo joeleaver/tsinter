@@ -10597,6 +10597,8 @@ function bindingWrites(L: Lowerer): { all: Set<ts.Symbol>; rebound: Set<ts.Symbo
   writtenBindings.set(L, { all: out, rebound });
   const K = ts.SyntaxKind;
   const isAssign = (k: ts.SyntaxKind): boolean => k >= K.FirstAssignment && k <= K.LastAssignment;
+  // Iterative (walkPreorder): a thousands-deep expression must not
+  // overflow the compiler's stack.
   const visit = (n: ts.Node): void => {
     if (ts.isIdentifier(n)) {
       let top: ts.Node = n;
@@ -10632,9 +10634,8 @@ function bindingWrites(L: Lowerer): { all: Set<ts.Symbol>; rebound: Set<ts.Symbo
         }
       }
     }
-    ts.forEachChild(n, visit);
   };
-  for (const sf of L.program.getSourceFiles()) if (!sf.isDeclarationFile) ts.forEachChild(sf, visit);
+  for (const sf of L.program.getSourceFiles()) if (!sf.isDeclarationFile) ts.walkPreorder(sf, (n) => { if (n !== sf) visit(n); });
   return { all: out, rebound };
 }
 

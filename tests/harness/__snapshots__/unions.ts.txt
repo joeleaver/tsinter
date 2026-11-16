@@ -42,13 +42,6 @@ unions.ts:69:19 - error SC1090: '== null' / '!= null' on a 'null | string | unde
      |                   ^~~~~~~~~~~~~~~~~~~
   70 | 
 
-unions.ts:96:1 - error SC1090: '??=' on non-variable targets (write it out: if (o.f === undefined) o.f = v) are not supported yet
-
-  95 | const holder: { slot?: string } = {};
-  96 | holder.slot ??= "v";
-     | ^~~~~~~~~~~
-  97 | 
-
 unions.ts:100:10 - error SC1090: '?.' on 'number | string | undefined' (the guarded receiver is a sub-union; check a discriminant field first) is not supported yet
 
    99 | function chainSubUnion(x: number | string | undefined): number {
