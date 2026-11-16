@@ -1083,17 +1083,26 @@ function anyPiecedFuncType(L: Lowerer, node: ts.Node, t: ts.Type): IrType | null
  * their own name, anonymous function/arrow expressions their
  * NamedEvaluation home (a variable initializer or property assignment).
  * Null when nothing names the value (the box stays anonymous). */
-export function jsFuncNameOf(node: ts.Node): string | null {
+/** Parentheses and the TypeScript-only wrappers Node never sees (`as`,
+ * `<T>x`, `satisfies`, `!`): the expression Node evaluates. */
+function stripTsWrappers(node: ts.Node): ts.Node {
   let n: ts.Node = node;
-  while (ts.isParenthesizedExpression(n)) n = n.expression;
+  while (ts.isParenthesizedExpression(n) || ts.isAsExpression(n) || ts.isTypeAssertion(n) || ts.isSatisfiesExpression(n) || ts.isNonNullExpression(n)) n = n.expression;
+  return n;
+}
+
+export function jsFuncNameOf(node: ts.Node): string | null {
+  const n: ts.Node = stripTsWrappers(node);
   if (ts.isIdentifier(n)) return n.text;
   if (ts.isPropertyAccessExpression(n)) return n.name.text;
   if ((ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)) && n.name) return n.name.text;
   if (ts.isFunctionExpression(n) || ts.isArrowFunction(n)) {
-    // NamedEvaluation looks through parentheses: `f: (function () {})`.
+    // NamedEvaluation looks through parentheses: `f: (function () {})`,
+    // and through the TypeScript-only wrappers Node never sees
+    // (`let counter = function () {} as Counter`).
     let p: ts.Node | undefined = n.parent;
     let child: ts.Node = n;
-    while (p && ts.isParenthesizedExpression(p)) {
+    while (p && (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertion(p) || ts.isSatisfiesExpression(p) || ts.isNonNullExpression(p))) {
       child = p;
       p = p.parent;
     }
@@ -1130,8 +1139,7 @@ function objLitKeyName(name: ts.PropertyName): string | null {
  * checked-dynamic Buffer ladders, whose dyn boxes carry the name only
  * for their error texts. */
 export function esFuncNameOf(L: Lowerer, node: ts.Node): string | null {
-  let n: ts.Node = node;
-  while (ts.isParenthesizedExpression(n)) n = n.expression;
+  const n: ts.Node = stripTsWrappers(node);
   if (ts.isIdentifier(n)) {
     const sym = L.resolveValueSymbol(n);
     const d = sym !== null ? L.checker.valueDeclarationOf(sym) : undefined;
@@ -3039,6 +3047,7 @@ export class Lowerer {
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
             ...(this.undefSlots ? { undefSlots: true as const } : {}),
             ...(this.sharedDynamic ? { sharedDynamic: true as const } : {}),
+            ...(this.es5 !== null && this.es5.tsCtors.size > 0 ? { objModel: true as const } : {}),
             ...(errViews !== null ? { errViews } : {}),
           };
     return {
@@ -6487,11 +6496,15 @@ export class Lowerer {
         if (!typeEquals(converted.type, pt)) throw new Error("lowerer bug: probed fn-adapter param stopped coercing");
         return converted;
       });
+      // A transparent adapter: the wrapped function runs with the
+      // adapter's own receiver (a dynamic method call through the box binds
+      // it), never the plain-call bracket's undefined.
       const call: IrExpr = {
         kind: "callValue",
         callee: { kind: "varRef", localId: "f.0", type: fromT, loc },
         args,
         type: fromT.ret,
+        keepThis: true,
         loc,
       };
       if (toT.ret.kind === "void") {

@@ -226,7 +226,9 @@ export function classFuncBox(L: Lowerer, e: IrExpr, loc: SrcLoc, force = false):
       L.jsinHelpers.delete(key);
       return null;
     }
-    const call: IrExpr = { kind: "callValue", callee: f(), args, type: ft.ret, loc };
+    // the box is transparent: the function runs with the box call's own
+    // receiver (a dynamic method call binds it), not the plain-call bracket
+    const call: IrExpr = { kind: "callValue", callee: f(), args, type: ft.ret, keepThis: true, loc };
     if (ft.ret.kind === "void") body.push({ kind: "exprStmt", expr: call, loc }, { kind: "return", value: undef(loc), loc });
     else body.push({ kind: "return", value: liftOut(L, call, loc), loc });
     const inner = `${name}.fn`;

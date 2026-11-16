@@ -613,6 +613,9 @@ export interface TypeMapperCtx {
    * dynamic object, not the empty record. */
   es5EmptyDyn?: boolean;
   es5DynSymbol?: (s: ts.Symbol) => boolean;
+  /** docs/design/vue-object-model.md D1: program interfaces some `as` cast
+   * targets (collected before lowering, lower-objmodel.ts). */
+  castCallableIfaces?: Set<ts.Symbol>;
   /** LowerOptions.hostFetch: the backend's host supplies fetch, so the
    * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
    * without --dynamic (the module serves them — SEMANTICS.md S098). */
@@ -918,6 +921,47 @@ function describeRecordStack(ctx: TypeMapperCtx): string {
   void ctx;
   const shown = names.length > 12 ? [...names.slice(0, 6), "…", ...names.slice(-5)] : names;
   return shown.length === 0 ? "no record type" : shown.join(" > ");
+}
+
+/** A declaration in the program's own sources: not the TypeScript lib or
+ * a builtin's declarations, not an npm package's (`node_modules`, which
+ * S133 governs). */
+function programSourceDecl(d: ts.Node, ctx: TypeMapperCtx): boolean {
+  const sf = d.getSourceFile();
+  return !ctx.isStdlibFile(sf) && !sf.fileName.includes("/node_modules/");
+}
+
+function ambientClassDecl(d: ts.Node): boolean {
+  if (!ts.isClassDeclaration(d)) return false;
+  if (d.getSourceFile().isDeclarationFile) return true;
+  for (let n: ts.Node | undefined = d; n !== undefined; n = n.parent) {
+    const mods = (n as { modifiers?: readonly ts.Node[] }).modifiers;
+    if (mods?.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) return true;
+  }
+  return false;
+}
+
+/** docs/design/vue-object-model.md (A): a class symbol every declaration of
+ * which is ambient (a `declare class`, or an interface merged with one) in
+ * the program's own sources, with no class body anywhere -- or (D1) a
+ * program-declared interface with a call signature and members of its own,
+ * merged with no class. Its values are the dynamic value. */
+export function declaredDynamicSymbol(sym: ts.Symbol, type: ts.Type, checker: ts.TypeChecker, ctx: TypeMapperCtx): boolean {
+  const decls = checker.declarationsOf(sym);
+  if (decls.length === 0 || !decls.every((d) => programSourceDecl(d, ctx))) return false;
+  if ((sym.flags & ts.SymbolFlags.Class) !== 0) {
+    return decls.some(ambientClassDecl) &&
+      decls.every((d) => ambientClassDecl(d) || ts.isInterfaceDeclaration(d));
+  }
+  if ((sym.flags & ts.SymbolFlags.Interface) !== 0 && decls.every((d) => ts.isInterfaceDeclaration(d))) {
+    // D1, narrow: only an interface the program CASTS a value to (Vue's
+    // `Vue as unknown as GlobalAPI`); a const annotated with it over a
+    // function literal keeps the static expando path (corpus 2072).
+    if (ctx.castCallableIfaces?.has(sym) !== true) return false;
+    if (checker.getCallSignatures(type).length === 0) return false;
+    return decls.some((d) => (d as ts.InterfaceDeclaration).members.some((m) => !ts.isCallSignatureDeclaration(m)));
+  }
+  return false;
 }
 
 export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
@@ -1443,6 +1487,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   // symbol, but with construct signatures — that is the STATIC side, and
   // it maps to classval below.
+  // Declared-dynamic types (docs/design/vue-object-model.md (A), Joe's
+  // 2026-11-15 ruling): a body-less `declare class` written in the
+  // program's own sources, and a program-declared callable interface with
+  // members (a plain function given properties: Vue's GlobalAPI), describe
+  // a value only the dynamic world holds -- the instance type, the class's
+  // `typeof`, and the interface map to the dynamic value.
+  {
+    const ds = widened.getSymbol();
+    if (ds !== undefined && declaredDynamicSymbol(ds, widened, checker, ctx)) return ctx.sharedDynamic === true ? JSVAL : DYN;
+  }
   const widenedSym = widened.getSymbol();
   const classDecl = widenedSym ? checker.valueDeclarationOf(widenedSym) : undefined;
   if (

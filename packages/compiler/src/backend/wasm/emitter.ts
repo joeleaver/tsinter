@@ -3738,7 +3738,7 @@ class Assembler {
     // Unit A2: the island's `Object.create(...)` (jsOp callMethod over
     // globalGet("Object")) can build a null-prototype object or a linked
     // one; both readers' refusals are installed only where it appears.
-    this.objModelLive = this.irNodeReachable(mod, (rec) => isObjModelNode(rec));
+    this.objModelLive = (mod as { objModel?: true }).objModel === true || this.irNodeReachable(mod, (rec) => isObjModelNode(rec));
     // Units U3 + U4 (review): globalThis taken as a dynamic value — every
     // reflection helper stops on its box (dyn.globalReflectGuard).
     this.globalBoxLive = this.objModelLive && this.irNodeReachable(mod, (rec) => {
@@ -40807,7 +40807,15 @@ class Assembler {
     }
     c.localGet(0);
     c.structGet(pair.clos, 0);
+    // Node calls a comparator with `this` undefined, whatever call encloses
+    // the sort (thisReaders' doc: the plain-call bracket).
+    const bracket = this.thisReaders.size > 0;
+    if (bracket) {
+      c.globalGet(this.dyn.undefinedGlobal());
+      c.call(this.dyn.thisPush());
+    }
     c.callRef(pair.fn);
+    if (bracket) c.call(this.dyn.thisPop());
     // ToNumber of the answer. An undefined f64 is a NaN, and NaN is 0 to the sort.
     switch (ct.ret.kind) {
       case "f64":

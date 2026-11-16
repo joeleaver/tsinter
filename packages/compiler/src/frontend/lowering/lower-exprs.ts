@@ -622,6 +622,97 @@ function lowerMemberAssignValue(L: Lowerer, expr: ts.BinaryExpression): IrExpr |
   };
 }
 
+/** A TypeScript file Node runs as a sloppy CommonJS script: no module
+ * syntax and no 'use strict' prologue (SEMANTICS.md S042's 1a amendment). */
+function sloppyTsScript(sf: ts.SourceFile): boolean {
+  for (const st of sf.statements) {
+    if (ts.isImportDeclaration(st) || ts.isExportDeclaration(st) || ts.isExportAssignment(st) || ts.isImportEqualsDeclaration(st)) return false;
+    const mods = (st as { modifiers?: readonly ts.Node[] }).modifiers;
+    if (mods?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) return false;
+  }
+  const first = sf.statements[0];
+  if (first !== undefined && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression) && first.expression.text === "use strict") return false;
+  return true;
+}
+
+/** A `this` the checker types `undefined` only because a standard-library
+ * callback parameter's `this: This` defaults to undefined (no thisArg:
+ * `xs.flatMap(function () { this })`): the callback's own function is a
+ * plain function expression with no `this` parameter of its own, passed
+ * straight to a call the standard library declares. Node calls it with no
+ * receiver, which the ambient receiver reads (rule (C)); a program's own
+ * `this: undefined` keeps its lowering. */
+function libCallbackUndefinedThis(L: Lowerer, thisNode: ts.Node): boolean {
+  if ((L.checker.getTypeAtLocation(thisNode).flags & ts.TypeFlags.Undefined) === 0) return false;
+  let fn: ts.Node | undefined = thisNode.parent;
+  while (fn !== undefined && !ts.isFunctionExpression(fn) && !ts.isFunctionDeclaration(fn) && !ts.isMethodDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+  if (fn === undefined || !ts.isFunctionExpression(fn) || explicitThisParam(thisNode)) return false;
+  let child: ts.Node = fn;
+  let p: ts.Node | undefined = fn.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) {
+    child = p;
+    p = p.parent;
+  }
+  if (p === undefined || !ts.isCallExpression(p) || !p.arguments.some((a) => a === child)) return false;
+  const calleeName = ts.isPropertyAccessExpression(p.expression) ? p.expression.name : p.expression;
+  const sym = L.checker.getSymbolAtLocation(calleeName);
+  const decls = sym !== undefined ? L.checker.declarationsOf(sym) : [];
+  return decls.length > 0 && decls.every((d) => L.isStdlibFile(d.getSourceFile()));
+}
+
+const LISTENER_REGISTRATIONS: ReadonlySet<string> = new Set(["on", "once", "addListener", "prependListener", "prependOnceListener"]);
+
+/** The `this` keyword's own (non-arrow) function is a listener handed to a
+ * builtin emitter's registration method (`e.on("x", function () { this })`):
+ * Node calls it with `this` bound to the emitter, which a TypeScript
+ * listener here does not receive (SEMANTICS.md S042's 1a amendment). */
+function builtinListenerThis(L: Lowerer, thisNode: ts.Node): boolean {
+  let fn: ts.Node | undefined = thisNode.parent;
+  while (fn !== undefined && !ts.isFunctionExpression(fn) && !ts.isFunctionDeclaration(fn) && !ts.isMethodDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+  if (fn === undefined || !ts.isFunctionExpression(fn)) return false;
+  let child: ts.Node = fn;
+  let p: ts.Node | undefined = fn.parent;
+  while (p !== undefined && ts.isParenthesizedExpression(p)) {
+    child = p;
+    p = p.parent;
+  }
+  if (p === undefined || !ts.isCallExpression(p) || !p.arguments.some((a) => a === child)) return false;
+  const callee = p.expression;
+  if (!ts.isPropertyAccessExpression(callee) || !LISTENER_REGISTRATIONS.has(callee.name.text)) return false;
+  const sym = L.checker.getSymbolAtLocation(callee.name);
+  return sym !== undefined && L.checker.declarationsOf(sym).some((d) => L.isStdlibFile(d.getSourceFile()));
+}
+
+function refuseListenerThis(L: Lowerer, expr: ts.Node): never {
+  L.unsupported(
+    "SC1080",
+    expr,
+    "'this' in a TypeScript function listener of a builtin emitter (Node binds the emitter; SEMANTICS.md S042)",
+  );
+}
+
+function refuseSloppyThis(L: Lowerer, expr: ts.Node): never {
+  L.unsupported(
+    "SC1080",
+    expr,
+    "'this' in a plain function of a TypeScript script with no module syntax or 'use strict' (Node runs it as sloppy CommonJS, where a plain call's 'this' is globalThis; SEMANTICS.md S042)",
+  );
+}
+
+/** The `this` keyword's own function (arrows are transparent) declares an
+ * explicit `this` parameter: (C)'s implicit-any rule leaves it alone. */
+function explicitThisParam(thisNode: ts.Node): boolean {
+  for (let n: ts.Node | undefined = thisNode.parent; n !== undefined; n = n.parent) {
+    if (ts.isArrowFunction(n)) continue;
+    if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isMethodDeclaration(n)) {
+      const p0 = n.parameters[0];
+      return p0 !== undefined && ts.isIdentifier(p0.name) && p0.name.text === "this";
+    }
+    if (ts.isSourceFile(n)) return false;
+  }
+  return false;
+}
+
 export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     // GH #194: an assignment target's receiver/key evaluated once, ahead of
     // the right-hand side (lower-stmts.ts bindAssignTargetParts).
@@ -2127,7 +2218,17 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // `this` in plain nested functions is already a tsc error under
       // noImplicitThis, so the generic scope walk here is preflight-safe.
       const local = L.resolveThis();
-      if (local) return { kind: "varRef", localId: local.id, type: local.type, loc };
+      if (local) {
+        const ref: IrExpr = { kind: "varRef", localId: local.id, type: local.type, loc };
+        // a TypeScript plain function's captured receiver (FnCtx.lexThis,
+        // a dyn local) is the program's one dynamic value
+        if (local.type.kind === "dyn" && L.sharedDynamic && !isJsSourceFile(expr.getSourceFile())) {
+          if (sloppyTsScript(expr.getSourceFile())) refuseSloppyThis(L, expr);
+          if (builtinListenerThis(L, expr)) refuseListenerThis(L, expr);
+          return { kind: "jsMarshal", value: ref, type: JSVAL, loc };
+        }
+        return ref;
+      }
       // `this` in a plain JS FUNCTION (not a method): the AMBIENT
       // RECEIVER (libCall dyn.this — scr_dyn_this_get). Firing sites bind
       // the emitting handle around each listener call (Node calls
@@ -2141,6 +2242,17 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // compile-time story there).
       if (isJsSourceFile(expr.getSourceFile())) {
         return { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc };
+      }
+      // docs/design/vue-object-model.md (C), D2: a TypeScript plain
+      // function whose `this` the checker types `any` (noImplicitThis off --
+      // Vue's prototype mixins, `const vm: Component = this`) reads the same
+      // ambient receiver Node binds: a dynamic method call's object, `new`'s
+      // instance, call/apply/bind's thisArg, undefined for a plain call.
+      if (((L.checker.getTypeAtLocation(expr).flags & ts.TypeFlags.Any) !== 0 && !explicitThisParam(expr)) || libCallbackUndefinedThis(L, expr)) {
+        if (sloppyTsScript(expr.getSourceFile())) refuseSloppyThis(L, expr);
+        if (builtinListenerThis(L, expr)) refuseListenerThis(L, expr);
+        const dynThis: IrExpr = { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc };
+        return L.sharedDynamic ? { kind: "jsMarshal", value: dynThis, type: JSVAL, loc } : dynThis;
       }
       L.unsupported("SC1080", expr);
     }

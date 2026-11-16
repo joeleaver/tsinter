@@ -900,6 +900,11 @@ export interface IrModule {
    * tools observe which world a build took); the wasm backend reads it for
    * one choice, the miss of a dynamic `x.constructor` read (GH #135). */
   sharedDynamic?: true;
+  /** docs/design/vue-object-model.md (B): the program has TypeScript
+   * dynamic constructors, so the backend builds the object model (a
+   * prototype read, an expando, an inspect header) even where no
+   * object-model op is reachable. */
+  objModel?: true;
 }
 
 /** Library mode on the WasmGC lane: the module's boundary, resolved from

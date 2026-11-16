@@ -13,6 +13,7 @@ import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { lowerHasOwnCall } from "./lower-calls.js";
 import { isJsSourceFileName } from "../shared.js";
 import { stdlibGlobalNameOf } from "./surfaces.js";
+import { declaredDynamicSymbol } from "../types.js";
 
 /** The object model serves the one-world WasmGC lowering (not the
  * embedded engine's --dynamic island, which has its own). */
@@ -436,6 +437,10 @@ export function lowerCodegenSite(L: Lowerer, expr: ts.Expression): IrExpr | null
  *  - `lits`: object literals built as dynamic objects in place. */
 export interface Es5Info {
   ctors: Set<ts.Symbol>;
+  /** docs/design/vue-object-model.md (B): the TypeScript functions among
+   * `ctors` -- their module turns the object model on (IrModule.objModel)
+   * even with no object-model op of its own reachable. */
+  tsCtors: Set<ts.Symbol>;
   syms: Set<ts.Symbol>;
   lits: Set<ts.Node>;
   /** GH #204: functions returning a widened array binding: their result
@@ -501,11 +506,106 @@ export function usesThis(fn: ts.Node): boolean {
   return found;
 }
 
+/** docs/design/vue-object-model.md (B): TypeScript functions that are
+ * dynamic constructors -- newed, their `.prototype` touched, or the value
+ * reaching a declared-dynamic slot (types.ts declaredDynamicSymbol): an
+ * argument to such a parameter (a `@ts-expect-error`'d call included: it
+ * runs regardless, D3), an `as` cast to such a type, or a binding typed by
+ * one. `call`/`apply`/`bind` reads are not a TypeScript trigger (common in
+ * typed code, which keeps its static calls). */
+function collectTsDynCtors(L: Lowerer, files: readonly ts.SourceFile[]): Set<ts.Symbol> {
+  const out = new Set<ts.Symbol>();
+  const checker = L.checker;
+  const tsFiles = files.filter((sf) => !sf.isDeclarationFile && !isJsSourceFileName(sf.fileName) && !sf.fileName.includes("/node_modules/"));
+  if (tsFiles.length === 0) return out;
+  // D1's cast targets first: the interfaces some `as` cast names.
+  const casts = new Set<ts.Symbol>();
+  for (const sf of tsFiles) {
+    walk(sf, (n) => {
+      if (ts.isAsExpression(n)) {
+        const cs = checker.getTypeAtLocation(n.type).getSymbol();
+        if (cs !== undefined && (cs.flags & ts.SymbolFlags.Interface) !== 0) casts.add(cs);
+      }
+      return true;
+    });
+  }
+  if (casts.size > 0) (L.typeCtx as { castCallableIfaces?: Set<ts.Symbol> }).castCallableIfaces = casts;
+  const tsFn = (e: ts.Expression): ts.Symbol | undefined => {
+    const x = strip(e);
+    if (!ts.isIdentifier(x)) return undefined;
+    const sym = checker.getSymbolAtLocation(x);
+    if (sym === undefined) return undefined;
+    for (const d of checker.declarationsOf(sym)) {
+      const sf = d.getSourceFile();
+      if (sf.isDeclarationFile || isJsSourceFileName(sf.fileName)) continue;
+      if (ts.isFunctionDeclaration(d) && d.body !== undefined) return sym;
+      if (ts.isVariableDeclaration(d) && d.initializer !== undefined && ts.isFunctionExpression(strip(d.initializer))) return sym;
+    }
+    return undefined;
+  };
+  const declDyn = (t: ts.Type | undefined): boolean => {
+    if (t === undefined) return false;
+    const ds = t.getSymbol();
+    return ds !== undefined && declaredDynamicSymbol(ds, t, checker, L.typeCtx);
+  };
+  for (const sf of tsFiles) {
+    walk(sf, (n) => {
+      if (ts.isNewExpression(n)) {
+        const f = tsFn(n.expression);
+        if (f !== undefined) out.add(f);
+      } else if (ts.isPropertyAccessExpression(n) && n.name.text === "prototype") {
+        const f = tsFn(n.expression);
+        if (f !== undefined) out.add(f);
+      } else if (ts.isPropertyAccessExpression(n) && (n.name.text === "call" || n.name.text === "apply" || n.name.text === "bind")) {
+        // D2: a function reading its (implicit-any) `this`, re-routed
+        // through call/apply/bind: its receiver is the thisArg, so it is
+        // the dynamic function (a function not reading `this` keeps its
+        // direct-call lowering).
+        const f = tsFn(n.expression);
+        if (f !== undefined && checker.declarationsOf(f).some((d) => {
+          const fnNode = ts.isVariableDeclaration(d) && d.initializer !== undefined ? strip(d.initializer) : d;
+          return (ts.isFunctionDeclaration(fnNode) || ts.isFunctionExpression(fnNode)) && usesThis(fnNode);
+        })) out.add(f);
+      } else if (ts.isCallExpression(n)) {
+        // the callee's own declaration (through an import alias): its
+        // parameter's annotated type decides (an erroneous, suppressed
+        // call still names the parameter it passes to)
+        const calleeNode = ts.isPropertyAccessExpression(n.expression) ? n.expression.name : n.expression;
+        let cs = checker.getSymbolAtLocation(calleeNode);
+        if (cs !== undefined && (cs.flags & ts.SymbolFlags.Alias) !== 0) cs = checker.getAliasedSymbol(cs);
+        const decl = cs !== undefined ? checker.valueDeclarationOf(cs) : undefined;
+        let fn: ts.Node | undefined = decl;
+        if (fn !== undefined && ts.isVariableDeclaration(fn) && fn.initializer !== undefined) fn = strip(fn.initializer);
+        const params = fn !== undefined && (ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn) || ts.isMethodDeclaration(fn))
+          ? fn.parameters
+          : undefined;
+        n.arguments.forEach((a, i) => {
+          const f = tsFn(a);
+          const param = params?.[i];
+          if (f === undefined || param === undefined || param.type === undefined) return;
+          if (declDyn(checker.getTypeAtLocation(param.type))) out.add(f);
+        });
+      } else if (ts.isAsExpression(n)) {
+        let inner: ts.Expression = n.expression;
+        while (ts.isAsExpression(inner) || ts.isParenthesizedExpression(inner)) inner = inner.expression;
+        const f = tsFn(inner);
+        if (f !== undefined && declDyn(checker.getTypeAtLocation(n.type))) out.add(f);
+      } else if (ts.isVariableDeclaration(n) && n.type !== undefined && n.initializer !== undefined) {
+        const f = tsFn(n.initializer);
+        if (f !== undefined && declDyn(checker.getTypeAtLocation(n.type))) out.add(f);
+      }
+      return true;
+    });
+  }
+  return out;
+}
+
 export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info | null {
   if (!omActive(L)) return null;
   const jsFiles = files.filter((sf) => !sf.isDeclarationFile && isJsSourceFileName(sf.fileName));
-  if (jsFiles.length === 0) return null;
-  const info: Es5Info = { ctors: new Set(), syms: new Set(), lits: new Set(), rets: new Set() };
+  const tsCtors = collectTsDynCtors(L, files);
+  if (jsFiles.length === 0 && tsCtors.size === 0) return null;
+  const info: Es5Info = { ctors: new Set(tsCtors), tsCtors, syms: new Set(), lits: new Set(), rets: new Set() };
   const checker = L.checker;
   const symOf = (e: ts.Expression): ts.Symbol | undefined => {
     const x = strip(e);

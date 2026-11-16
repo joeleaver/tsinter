@@ -6958,6 +6958,18 @@ const inliningPredicates = new Set<ts.Symbol>();
     return found;
   }
 
+/** docs/design/vue-object-model.md (C): a TypeScript arrow whose `this`
+   * the checker types `any` (an implicit-any receiver of the plain function
+   * creating it) captures that receiver at creation, as a JavaScript arrow
+   * does (S042's GH #133 amendment). */
+  function tsArrowCapturesThis(L: Lowerer, node: ts.ArrowFunction): boolean {
+    let found: ts.Node | undefined;
+    ts.walkPreorder(node.body, (n) => {
+      if (found === undefined && n.kind === ts.SyntaxKind.ThisKeyword) found = n;
+    });
+    return found !== undefined && (L.checker.getTypeAtLocation(found).flags & ts.TypeFlags.Any) !== 0;
+  }
+
 /** Lifts an arrow function / function expression / nested declaration /
    * object-literal shorthand method to a module-level function and yields
    * the `closure` expression creating it. */
@@ -6974,7 +6986,7 @@ const inliningPredicates = new Set<ts.Symbol>();
     // declarations, module inits) reads its receiver ONCE, at entry, into
     // `%lexthis` — its own `this` reads resolve there too; any other
     // creator reads it as each arrow is created.
-    if (ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile()) && arrowReadsThis(node) && L.resolveThis() === null) {
+    if (ts.isArrowFunction(node) && (isJsSourceFile(node.getSourceFile()) || tsArrowCapturesThis(L, node)) && arrowReadsThis(node) && L.resolveThis() === null) {
       if (L.ctx.lexThisOk) {
         L.ctx.lexThis ??= L.declareHiddenLocal("%lexthis", DYN);
         L.ctx.scopes[0]!.set(THIS_BINDING, L.ctx.lexThis);
@@ -7068,7 +7080,10 @@ function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpres
       : L.bodyReturnType(isAsync, funcType.ret);
 
     const fnCtx = newFnCtx(true, selfSymbol, funcType, bodyReturn);
-    if (!ts.isArrowFunction(node) && isJsSourceFile(node.getSourceFile())) fnCtx.lexThisOk = true;
+    // A plain function owns its `this` (JavaScript, and TypeScript under
+    // docs/design/vue-object-model.md (C)): the search for an enclosing
+    // binding stops here, and its arrows capture its receiver.
+    if (!ts.isArrowFunction(node) && (isJsSourceFile(node.getSourceFile()) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node))) fnCtx.lexThisOk = true;
     fnCtx.isAsync = isAsync;
     if (isGenerator && funcType.ret.kind === "generator") {
       fnCtx.generator = { yieldT: funcType.ret.yieldT, nextT: funcType.ret.nextT };
@@ -9418,7 +9433,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
       ? L.genBodyReturnType(sig.returnType)
       : L.bodyReturnType(sig.isAsync === true, sig.returnType);
     const ctx = newFnCtx(false, null, null, bodyReturn);
-    if (isJsSourceFile(decl.getSourceFile())) ctx.lexThisOk = true; // GH #133 review: FnCtx.lexThis
+    if (isJsSourceFile(decl.getSourceFile()) || ts.isFunctionDeclaration(decl) || ts.isFunctionExpression(decl)) ctx.lexThisOk = true; // GH #133 review: FnCtx.lexThis
     ctx.isAsync = sig.isAsync === true;
     if (sig.generator !== undefined) ctx.generator = sig.generator;
     const diagsBefore = L.diags.length;

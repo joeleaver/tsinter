@@ -3866,6 +3866,28 @@ pass a real object as `thisArg`, where the two agree);
 `packages/compiler/test/wasm-js-map-untyped.test.ts` (JSMAP-18, forEach's
 primitive and null `thisArg` in sloppy code).
 
+*Unit 1a amendment (Vue's object model, wasm and wasm-native; docs/design/vue-object-model.md (C)).*
+In a TypeScript source, a plain function whose `this` the checker types
+`any` (`noImplicitThis: false`, no explicit `this` parameter) owns its
+receiver as a JavaScript plain function does: a dynamic method call binds the
+object, `new` the instance, `call`/`apply`/`bind` their thisArg, and a plain
+call binds `undefined` (Node's strict module code). Its arrows capture that
+receiver when they are created (the GH #133 capture), and the search for an
+enclosing binding stops at it, so a plain function nested in a class method
+no longer reads the method's receiver. An explicitly typed `this` parameter
+keeps its lowering (SC1080, U1-THIS-01). A TypeScript file with no module syntax
+and no `'use strict'` prologue is a sloppy CommonJS script to Node, where a
+plain call's `this` is `globalThis`: there such a `this` refuses by name
+(SC1080), never reading `undefined` where Node reads `globalThis`. A function
+listener handed to a builtin emitter's `on`/`once`/`addListener`/
+`prependListener`/`prependOnceListener` is called by Node with `this` bound to
+the emitter; such a TypeScript listener's `this` refuses by name (SC1080).
+Other builtin callbacks keep the residue this entry records: Node calls a
+setTimeout/setInterval callback with the Timeout object as `this` (and array
+callbacks with `undefined` or their thisArg), where a TypeScript plain function
+here reads the ambient receiver, `undefined` -- array callbacks match, a timer
+callback reading `this` does not.
+
 ## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
 
 The wasm tier's island has no engine (jsval ≡ dyn, increment 21), so

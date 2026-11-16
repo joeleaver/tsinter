@@ -80,6 +80,9 @@ function expandoFnSymbolOf(L: Lowerer, recv: ts.Expression): ts.Symbol | null {
   // member stories (engine property writes, dyn keyed writes) stay put.
   const sym = L.resolveValueSymbol(recv);
   if (!sym) return null;
+  // A dynamic constructor (U4 / docs/design/vue-object-model.md (B)) is a
+  // FUNC box: its members are its property table's, read and written alike.
+  if (L.es5 !== null && L.es5.ctors.has(sym)) return null;
   const decl = L.checker.valueDeclarationOf(sym);
   if (!decl || decl.getSourceFile().isDeclarationFile) return null;
   if (isJsSourceFile(decl.getSourceFile())) return null;

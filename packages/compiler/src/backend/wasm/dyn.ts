@@ -14301,6 +14301,44 @@ export class DynBuilder {
           throwNotFn();
         });
 
+        // A function's OWN member called as a method (`Vue.use(plugin)`,
+        // `Sub.extend(o)` -- statics a program assigned to a function):
+        // the member, with `this` bound to the function; it shadows the
+        // Function.prototype members below, as in Node.
+        {
+          c.localGet(K);
+          c.i32Const(DK.FUNC);
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(0);
+          this.deps.lit(c, method);
+          c.call(this.fnOwnGet());
+          c.localTee(M);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(M);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.FUNC);
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(0);
+          c.call(this.thisPush());
+          c.localGet(M);
+          c.localGet(1);
+          c.localGet(2);
+          c.call(this.callFn());
+          c.localSet(R);
+          c.call(this.thisPop());
+          c.localGet(R);
+          c.return_();
+          c.end();
+          throwNotFn();
+          c.return_();
+          c.end();
+          c.end();
+        }
+
         // `f.toString()` on a function: Function.prototype.toString, the
         // same answer as String(f) (the toStr FUNC arm: a JavaScript
         // definition's own source, else a stop by name; SEMANTICS.md S019).
