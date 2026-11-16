@@ -3806,6 +3806,17 @@ export class Lowerer {
     return stdlibMemberFence(this, access);
   }
 
+  private readonly errProtoFiles = new Map<ts.SourceFile, boolean>();
+  private fileMentionsErrProto(sf: ts.SourceFile): boolean {
+    let hit = this.errProtoFiles.get(sf);
+    if (hit === undefined) {
+      // (review: the bracket and template spellings too)
+      hit = sf.text.includes("Error.prototype") || /Error\s*\[\s*["'`]prototype["'`]\s*\]/.test(sf.text);
+      this.errProtoFiles.set(sf, hit);
+    }
+    return hit;
+  }
+
   private readonly ownSymbolsFiles = new Map<ts.SourceFile, boolean>();
   private fileMentionsOwnSymbols(sf: ts.SourceFile): boolean {
     let hit = this.ownSymbolsFiles.get(sf);
@@ -3836,6 +3847,21 @@ export class Lowerer {
         const s = this.checker.getSymbolAtLocation(node);
         const d = s !== undefined ? this.checker.valueDeclarationOf(s) : undefined;
         if (d !== undefined && ts.isVariableDeclaration(d) && ownSymbolsCall(d.initializer)) return this.checker.getAnyType();
+      }
+      // GH #238: `Error.prototype` is the Error kind's prototype object, a
+      // dynamic value (not an Error, whatever the lib's `prototype: Error`
+      // says) — and so is a binding it initializes.
+      // (review: the literal-key bracket spelling `Error["prototype"]` too)
+      const errProtoRead = (n: ts.Node | undefined): boolean =>
+        n !== undefined &&
+        ((ts.isPropertyAccessExpression(n) && n.name.text === "prototype") ||
+          (ts.isElementAccessExpression(n) && ts.isStringLiteralLike(n.argumentExpression) && n.argumentExpression.text === "prototype")) &&
+        ts.isIdentifier(n.expression) && n.expression.text === "Error" && this.isStdlibGlobal(n.expression, "Error");
+      if (errProtoRead(node)) return this.checker.getAnyType();
+      if (ts.isIdentifier(node) && this.fileMentionsErrProto(node.getSourceFile())) {
+        const s = this.checker.getSymbolAtLocation(node);
+        const d = s !== undefined ? this.checker.valueDeclarationOf(s) : undefined;
+        if (d !== undefined && ts.isVariableDeclaration(d) && errProtoRead(d.initializer)) return this.checker.getAnyType();
       }
     }
     if (this.es5 !== null) {

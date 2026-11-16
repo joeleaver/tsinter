@@ -429,6 +429,10 @@ export interface DynDeps {
    * prototype method or accessor named `key`? A dynamic read, call or `in`
    * of such a name stops. Absent: no class declares one. */
   errProtoDeclares?: () => number;
+  /** GH #238: `(err) -> i32`, the error's exact builtin kind (0 Error,
+   * 1 TypeError, 2 RangeError, 3 SyntaxError), or -1 for any other class
+   * (a user subclass, DOMException). Absent: no error class. */
+  errExactKind?: () => number;
   /** S138: pushes i32, is the error an instance of a user Error subclass
    * that sets an own `name`? JSON, key listings and Object.assign of its
    * encoding stop (Node lists the own name; the encoding hides it). */
@@ -6270,6 +6274,7 @@ export class DynBuilder {
       c.localSet(K);
       this.bigArm(c, K, () => { this.bigPayload(c, 0); c.call(this.deps.big!.toStr10()); });
       this.symFence(c, K, "converting to a string");
+      this.errProtoGuard(c, (x) => x.localGet(0), "converting to a string"); // GH #238 (review)
       this.typedArm(c, 0, K, () => {
         // Unit I: Array.prototype.join over the elements is not built; the
         // conversion sites are not catchable, so this refuses uncaught.
@@ -7650,6 +7655,7 @@ export class DynBuilder {
    * anything otherwise: its typed fields (and the struct's name and
    * message slots) keep no absent, non-writable or non-enumerable state. */
   errMirrorGuard(c: Code, pushDyn: (c: Code) => void, pushKey: ((c: Code) => void) | null, what: string): void {
+    this.errProtoGuard(c, pushDyn, `${what} of`);
     if (this.deps.errView === undefined) return;
     pushDyn(c);
     c.structGet(this.dynT(), DYN_KIND);
@@ -8014,6 +8020,8 @@ export class DynBuilder {
         // through its getter (`this` = the receiver, wherever on the
         // chain the getter lives).
         this.arm(c, K, [DK.OBJ], () => {
+          // GH #238: so do the error prototype objects.
+          this.errProtoGuard(c, (x) => x.localGet(0), "reading a member of");
           if (this.objModelLive) {
             // Units U3 + U4: the Object.prototype stand-in models only its
             // identity; a member read through it stops by name.
@@ -8754,6 +8762,7 @@ export class DynBuilder {
       this.typedArm(c, 0, K, () => this.typedFence(c, "assigning a member of", () => {})); // Unit I
       this.urlWriteFence(c, 0, K, () => {}); // Unit I
       const SETM = 8;
+      this.errProtoGuard(c, (x) => x.localGet(0), "assigning a member of");
       this.arm(c, K, [DK.OBJ], () => {
         if (this.regexLive) {
           // Unit F1: an island RegExp holds no own members (its readers —
@@ -9191,6 +9200,7 @@ export class DynBuilder {
       this.bigFence(c, K, "'in' or Object.hasOwn on");
       this.symFence(c, K, "'in' or Object.hasOwn on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' or Object.hasOwn on", (x) => x.i32Const(0))); // Unit I
+      this.errProtoGuard(c, (x) => x.localGet(0), "'in', Object.hasOwn or hasOwnProperty on"); // GH #238 (review)
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
         c.i32Const(0);
@@ -9502,6 +9512,7 @@ export class DynBuilder {
       c.localSet(K);
       this.bigFence(c, K, "'in' on");
       this.symFence(c, K, "'in' on");
+      this.errProtoGuard(c, (x) => x.localGet(0), "'in' on");
       this.typedArm(c, 0, K, () => this.typedFence(c, "'in' on", (x) => x.i32Const(0)));
       this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR], () => {
         this.deps.throwTypeError(c, (x) => {
@@ -10416,6 +10427,89 @@ export class DynBuilder {
     });
   }
 
+  /** GH #238: set by the emitter where the object model is live, before
+   * any helper is built — the Error-family prototype objects exist (Error.
+   * prototype read through the Error value, Object.getPrototypeOf of an
+   * error), and every helper that could expose their members stops on
+   * them (errProtoGuard). */
+  errProtoLive = false;
+  private errProtoGl: (number | null)[] = [null, null, null, null];
+
+  private errProtoG(k: number): number {
+    this.errProtoGl[k] ??= this.mb.addGlobal(this.dynRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.dynT());
+    });
+    return this.errProtoGl[k]!;
+  }
+
+  /** %w.dyn.errorProto<k>() → the prototype object of builtin error kind
+   * `k` (0 Error, 1 TypeError, 2 RangeError, 3 SyntaxError), created once:
+   * a linked object whose prototype is Error.prototype (kinds 1-3) or the
+   * Object.prototype stand-in (Error). Only its identity is modeled. */
+  errorProto(k: number): number {
+    return this.cached(`errorProto${k}`, [], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const g = this.errProtoG(k);
+      c.globalGet(g);
+      c.refIsNull();
+      c.ifVoid();
+      this.boxObj(c, (x) => this.pushNewLinkedObj(x, (y) => y.call(k === 0 ? this.om.objectProto() : this.errorProto(0))));
+      c.globalSet(g);
+      c.end();
+      c.globalGet(g);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.isErrProto(d) → i32: is `d` one of the error prototype objects? */
+  isErrProto(): number {
+    return this.cached("isErrProto", [this.dynRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      for (let k = 0; k < 4; k++) {
+        const g = this.errProtoG(k);
+        c.globalGet(g);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.globalGet(g);
+        c.structGet(dynT, DYN_REF);
+        c.refEq();
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        c.end();
+      }
+      c.i32Const(0);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** GH #238: stop by name when the value `getD` pushes is an error
+   * prototype object — only its identity is modeled (===, Set/WeakSet/Map
+   * keys); `what` names the use. */
+  errProtoGuard(c: Code, getD: (c: Code) => void, what: string): void {
+    if (!this.errProtoLive) return;
+    getD(c);
+    c.call(this.isErrProto());
+    c.ifVoid();
+    this.deps.fence(c, (x) => this.deps.lit(x, `${what} an error prototype (Error.prototype, or the prototype of an Error, TypeError, RangeError or SyntaxError) held as a dynamic value is not supported yet: only its identity is modeled`));
+    c.unreachable();
+    c.end();
+  }
+
   /** Units U3 + U4 (review): set by the emitter when the program takes
    * `globalThis` as a dynamic value (om.builtinValue), before any helper
    * is built. */
@@ -10434,7 +10528,8 @@ export class DynBuilder {
   /** Stop by name when the value `getD` pushes is the globalThis box:
    * its own keys are a stand-in (hidden accessors for the standard
    * globals), so no reflection may report them. */
-  globalReflectGuard(c: Code, getD: (c: Code) => void): void {
+  globalReflectGuard(c: Code, getD: (c: Code) => void, errProtoToo = true): void {
+    if (errProtoToo) this.errProtoGuard(c, getD, "reflecting over (listing, copying, printing, serializing or describing the properties of)");
     if (!this.globalBoxLive) return;
     const dynT = this.dynT();
     c.globalGet(this.globalBoxG());
@@ -14122,6 +14217,10 @@ export class DynBuilder {
          * isPrototypeOf is always false; valueOf is ToObject(this), the
          * receiver itself. */
         const objProtoCall = (): void => {
+          // GH #238 (review): an error prototype's Object.prototype methods
+          // (toString, toLocaleString, isPrototypeOf, ...) are its own
+          // chain's in Node — Error.prototype.toString among them.
+          this.errProtoGuard(c, (x) => x.localGet(0), "calling an Object.prototype method on");
           if (method === "valueOf") {
             c.localGet(0);
             return;

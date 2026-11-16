@@ -875,6 +875,11 @@ export class ObjModel {
       c.refNull(dynT);
       c.return_();
       c.end();
+      // GH #238 (review): a chain walk (a member lookup, instanceof, for-in)
+      // that reaches an error prototype stops — its members and its
+      // place in the Error family are not modeled (a constructor whose
+      // prototype was set to one, a linked object).
+      this.d.errProtoGuard(c, (x) => x.localGet(P), "walking a prototype chain that reaches");
       c.localGet(P);
       c.structGet(dynT, DYN_KIND);
       c.i32Const(DK.OBJ);
@@ -2601,18 +2606,52 @@ export class ObjModel {
   /* ── prototypes ─────────────────────────────────────────────────────── */
 
   /** %w.om.getProto(v) → the prototype: an OBJ's link, the
-   * Object.prototype stand-in, or null. */
+   * Object.prototype stand-in, or null. An error's encoding answers its
+   * builtin kind's prototype object (GH #238). */
   getProto(): number {
     const dynT = this.d.dynT();
     const L = this.d.objLinkedT();
-    return this.fn("getProto", [this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef()], (c) => {
-      this.d.globalReflectGuard(c, (x) => x.localGet(0));
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.k.deps.errT() };
+    return this.fn("getProto", [this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), errRef, I32], (c) => {
+      // (an error prototype object answers its own link: its identity)
+      this.d.globalReflectGuard(c, (x) => x.localGet(0), false);
       const K = 1;
       const P = 2;
+      const ER = 3;
+      const EK = 4;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
       this.k.arm(c, K, [DK.OBJ], () => {
+        // GH #238: an error's encoding (the GH #137 marker) answers the
+        // prototype of its exact builtin kind — Error, TypeError,
+        // RangeError, SyntaxError; any other class (a program's own
+        // subclass, DOMException) stops by name.
+        const exact = this.k.deps.errExactKind;
+        if (this.d.errProtoLive && exact !== undefined) {
+          this.d.objPayload(c, (x) => x.localGet(0));
+          c.call(this.d.errLinkOf());
+          c.localTee(ER);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(ER);
+          c.call(exact());
+          c.localSet(EK);
+          for (let k = 0; k < 4; k++) {
+            c.localGet(EK);
+            c.i32Const(k);
+            c.i32Eq();
+            c.ifVoid();
+            c.call(this.d.errorProto(k));
+            c.return_();
+            c.end();
+          }
+          this.k.deps.fence(c, (x) => this.lit(x, "Object.getPrototypeOf of an error held as a dynamic value whose class is not Error, TypeError, RangeError or SyntaxError (a program's own Error subclass, a DOMException, or an error the runtime builds as a URIError, ReferenceError, EvalError, AggregateError or AssertionError) is not supported yet"));
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+        }
         // the stand-in itself: null
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
@@ -2662,6 +2701,10 @@ export class ObjModel {
     const L = this.d.objLinkedT();
     return this.fn("setProto", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), I32], (c) => {
       this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.setPrototypeOf");
+      // GH #238 (review): an object linked to an error prototype is an
+      // error-like object in Node (instanceof, name, toString through the
+      // chain), which this tier does not model.
+      this.d.errProtoGuard(c, (x) => x.localGet(1), "linking an object (Object.create, Object.setPrototypeOf, __proto__) to");
       const PK = 2;
       const W = 3;
       const G = 4;
@@ -3219,7 +3262,14 @@ export class ObjModel {
       c.i32Const(-6);
       c.i32Eq();
       c.ifVoid();
-      this.k.deps.fence(c, (x) => this.lit(x, "Error.prototype read through the Error constructor held as a dynamic value is not supported yet"));
+      // GH #238: Error.prototype is the Error kind's prototype object
+      // (identity only; dyn.errProtoGuard stops every other use)
+      if (this.d.errProtoLive) {
+        c.call(this.d.errorProto(0));
+        c.return_();
+      } else {
+        this.k.deps.fence(c, (x) => this.lit(x, "Error.prototype read through the Error constructor held as a dynamic value is not supported yet"));
+      }
       c.end();
       // A generator function's `prototype` is the prototype its generator
       // objects inherit (not a constructor prototype); generator objects
@@ -3487,6 +3537,8 @@ export class ObjModel {
       const G = 4;
       const H = 5;
       const A = 6;
+      // GH #238 (review): an error prototype object on the left
+      this.d.errProtoGuard(c, (x) => x.localGet(0), "'instanceof' with, on its left,");
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.i32Const(DK.FUNC);

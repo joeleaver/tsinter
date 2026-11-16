@@ -430,13 +430,12 @@ console.log(mixed());`,
     },
   },
   {
-    id: "SB-19 Error.prototype read in JavaScript stops by name (GH #238: it read undefined)",
+    id: "SB-19 Error.prototype read in JavaScript is an object (GH #238: it read undefined, then stopped by name)",
     nodeTypes: true,
     src: `import { protos } from "./p.js";
 console.log("before");
 console.log(protos());`,
     extra: { "p.js": `export function protos() { return typeof Error.prototype; }` },
-    fence: "Error.prototype read through the Error constructor",
   },
 ];
 

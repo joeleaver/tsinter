@@ -12339,8 +12339,8 @@ No such object is ever built:
   symbol (`Symbol.for`) element throws Node's `TypeError: Invalid value
   used in weak set` there; an element of a kind the table's element type
   does not hold, and any other symbol element, refuses at compile time by
-  name. (zod's own line still stops by name: `Error.prototype` is not
-  modelled, GH #238.) Like every WeakSet
+  name. (zod's own line runs as Node since the GH #238
+  amendment below.) Like every WeakSet
   here (S131) it holds its elements strongly: memory only, since nothing
   observes collection without `WeakRef`/`FinalizationRegistry`. A seed
   that is not an array at run time stops by name (Node takes any iterable).
@@ -12354,3 +12354,55 @@ project's sites use, Node-exact; a site its workload does not reach compiles
 to a named stop instead of failing the whole build. **Tested by:**
 `packages/compiler/test/wasm-stdlib-batch.test.ts` (SB-08..SB-18, wasm and
 wasm-native, against Node).
+
+**Amendment (GH #238, 2026-11-16): the Error-family prototypes as identities.**
+In a program with the object model live, `Error.prototype` (and a binding
+it initializes) is the Error kind's prototype object, a dynamic value, so
+zod's module-load line runs as Node. `Object.getPrototypeOf` of an error
+held as a dynamic value (a caught error, an error passed into dynamic
+code) answers its exact builtin kind's prototype object: Error, TypeError,
+RangeError or SyntaxError, each created once per program, with Node's chain
+(TypeError.prototype, RangeError.prototype and SyntaxError.prototype link to
+Error.prototype, and Error.prototype to Object.prototype). That fixes a
+silent divergence: such a lookup answered Object.prototype before. "Exact"
+means the error's own class and, for a plain Error, the runtime's class tag
+(GH #141): an error of any other class stops by name there — a program's own
+`extends Error` class, a DOMException, and the errors the runtime builds as a
+plain Error under another class's tag (URIError from `decodeURIComponent`,
+the TDZ ReferenceError, EvalError, AggregateError, assert's AssertionError,
+an error rebuilt from a host's or the engine's name and message). Only
+identity is modelled: `===`, and Set, WeakSet and Map membership. The other
+uses this tier names stop by name: a member read (`Error.prototype.name`), a
+write, `in` (a literal key included), `Object.hasOwn` and `hasOwnProperty`,
+the Object.prototype methods called on one (`toString`, `toLocaleString`,
+`isPrototypeOf`, …), conversion to a string (`String(p)`, a template, `p +
+""`), defineProperty, delete, setPrototypeOf, freeze, key listing,
+descriptors, printing and serialization, `instanceof` with one on its left
+(`Object.getPrototypeOf(err) instanceof Error`, true in Node through its own
+chain) — and LINKING: `Object.create(p)` and `Object.setPrototypeOf(o, p)`
+stop, and so does any prototype-chain walk (a member lookup, `instanceof`, for-in) that reaches one
+(a constructor whose `prototype` was set to one), since an object inheriting
+from an error prototype is error-like in Node (`instanceof Error`, its
+`name`, `String(o)`), which this tier does not model. An object literal's
+`__proto__: value` entry (a plain or quoted key; not computed, not
+shorthand, not a method) is refused by name — at compile time in
+TypeScript, where it runs in JavaScript on every lowering path of the
+literal (the JavaScript deferral stance; an unreached literal still
+builds) — (GH #244: JavaScript sets the new object's
+prototype there, where a record would have made an own key `__proto__`; the
+full modelling is unpicked); the shorthand `{ __proto__ }`, the computed
+`{ ["__proto__"]: v }` and the method `{ __proto__() {} }` are own keys in
+Node too and are unaffected. `Error["prototype"]` (bracket or template
+key, and a binding it initializes) is `Error.prototype`; a run-time key read
+of an Error-family constructor (`Error[k]`) and `Object.getOwnPropertyDescriptor`
+/ `getOwnPropertyDescriptors` / `getOwnPropertyNames` / `hasOwn` / `keys` /
+`values` / `entries` over one stop by name (they answered undefined);
+`globalThis.Error.prototype` (and the other Error kinds read through the
+global object) is refused by name the same way rather than answering
+undefined. `instanceof Error`/`TypeError`/… with a dynamic ERROR on the left answered
+correctly before and is unchanged (an error prototype on the left stops, as
+above). `TypeError.prototype` written as an
+expression still refuses at compile time (SC2020), and a dynamic class
+extending the Error value keeps its own unlinked prototype. **Tested by:**
+`packages/compiler/test/wasm-gh238-error-proto.test.ts` (GH238-01..32, 25 and 27
+compile-time refusals; wasm and wasm-native, against Node).

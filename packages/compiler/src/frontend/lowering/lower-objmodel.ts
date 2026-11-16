@@ -1197,7 +1197,11 @@ export function builtinBoxPosition(L: Lowerer, id: ts.Identifier): string | null
     }
     return null;
   }
-  if (ts.isElementAccessExpression(p) && p.expression === child) return name === "globalThis" ? name : null;
+  if (ts.isElementAccessExpression(p) && p.expression === child) {
+    // GH #238 (review): `Error["prototype"]` is `Error.prototype`.
+    if (name === "Error") return ts.isStringLiteralLike(p.argumentExpression) && p.argumentExpression.text === "prototype" ? name : null;
+    return name === "globalThis" ? name : null;
+  }
   if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === child) return null;
   if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === child) return null;
   if (ts.isTypeOfExpression(p) || ts.isExpressionWithTypeArguments(p) || ts.isHeritageClause(p) || ts.isDecorator(p)) return null;

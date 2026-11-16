@@ -8811,7 +8811,9 @@ test("increment 21 stage A gate round 3 fix R3: a LITERAL \"__proto__\" key in a
     ].join("\n"),
   );
   if (res.ok) throw new Error("expected a refusal, got a compiled module");
-  expect(res.diagnostics[0]?.message).toContain("jsOp:objLit-proto-key");
+  // (GH #238 review / GH #244: the frontend now refuses every literal
+  // `__proto__: v` entry by name, before the backend's own refusal.)
+  expect(res.diagnostics[0]?.message).toMatch(/jsOp:objLit-proto-key|a `__proto__: value` entry in an object literal/);
 });
 
 test("increment 21 stage A gate round 3 fix R3 negative control: keys that merely CONTAIN \"proto\" (\"proto\", \"__proto\", \"a__proto__b\" — none is the EXACT string \"__proto__\") are ordinary own entries, unaffected by the compile-time refusal, byte-exact against Node", async () => {

@@ -4936,6 +4936,53 @@ class Assembler {
   }
 
   private errProtoDeclaresFn: number | null = null;
+  private errExactKindFn: number | null = null;
+
+  /** `%w.err.exactKind(err) -> i32` (GH #238): 0 Error, 1 TypeError,
+   * 2 RangeError, 3 SyntaxError when that is the error's EXACT class (the
+   * class info's preorder number), else -1. */
+  private errExactKind(): number {
+    if (this.errExactKindFn !== null) return this.errExactKindFn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [I32]), "%w.err.exactKind");
+    this.errExactKindFn = idx;
+    const c = new Code();
+    const PRE = 1;
+    c.localGet(0);
+    c.structGet(exc.errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.localSet(PRE);
+    for (const [name, k] of [["%Error", 0], ["%TypeError", 1], ["%RangeError", 2], ["%SyntaxError", 3]] as const) {
+      const meta = this.classes.meta(name);
+      if (meta === undefined) continue;
+      c.localGet(PRE);
+      c.i32Const(meta.pre);
+      c.i32Eq();
+      c.ifVoid();
+      if (name === "%Error") {
+        // (review) a plain %Error the runtime built under another class's
+        // tag (GH #141: URIError, ReferenceError, EvalError, AggregateError,
+        // AssertionError, a rebuilt foreign error) is not an Error: only
+        // the untagged vt is.
+        c.localGet(0);
+        c.structGet(exc.errT, 0);
+        c.globalGet(this.classes.vtGlobal("%Error"));
+        c.refEq();
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(-1);
+        c.return_();
+        c.end();
+      }
+      c.i32Const(k);
+      c.return_();
+      c.end();
+    }
+    c.i32Const(-1);
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
 
   /** `%w.err.protoDeclares(err, key) -> i32` (S138): does the error's exact
    * user class chain declare a prototype method or accessor named `key`? */
@@ -12502,6 +12549,7 @@ class Assembler {
       ...(this.mod.errViews !== undefined ? { errView: (c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void) => this.errViewCall(c, op, pushArgs) } : {}),
       ...(this.errNamePres().length > 0 ? { errNameTest: (c: Code, pushErr: (c: Code) => void) => this.emitErrStopTest(c, pushErr, true) } : {}),
       ...(this.errProtoNames().size > 0 ? { errProtoDeclares: () => this.errProtoDeclares() } : {}),
+      ...(this.classes.meta("%Error") !== undefined ? { errExactKind: () => this.errExactKind() } : {}),
       ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
       excKind: () => this.exc().kindG,
       strCmpU16: () => this.strCmpHelper(true),
@@ -12664,6 +12712,8 @@ class Assembler {
         : {}),
     });
     if (this.globalBoxLive) this.dynField.globalBoxLive = true;
+    // GH #238: the Error-family prototype objects (identity only)
+    if (this.objModelLive) this.dynField.errProtoLive = true;
     // the object store's reserved-key check (dyn.storeKeyGuard)
     if (this.reservedKeysLive) this.dynField.storeGuardLive = true;
     return this.dynField;
@@ -27356,6 +27406,12 @@ class Assembler {
           const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
           const er = this.acquireScratch(errRef);
           this.walkExpr(e.args[0]!);
+          // GH #238 (review): an error prototype object on the left stops.
+          if (this.dyn.errProtoLive) {
+            const d = this.acquireScratch(this.dyn.dynRef());
+            code.localTee(d);
+            this.dyn.errProtoGuard(code, (c) => c.localGet(d), "'instanceof' with, on its left,");
+          }
           code.call(this.dyn.toError());
           code.localTee(er);
           code.refIsNull();
@@ -32324,6 +32380,8 @@ class Assembler {
         const d = this.acquireScratch(this.dyn.dynRef());
         this.walkExpr(e.value);
         code.localSet(d);
+        // GH #238 (review): a literal-key `in` on an error prototype object
+        this.dyn.errProtoGuard(code, (c) => c.localGet(d), "'in' on");
         // Unit I: a dynamic typed array answers `in` with the key known at
         // compile time: a canonical index by a length compare, a
         // TypedArray.prototype name true (Node's HasProperty), any other
@@ -32982,6 +33040,14 @@ class Assembler {
           // the test (nodes.ts), because only caughtToDyn and the
           // error-rooted dynFrom mint one.
           this.walkExpr(e.value);
+          // GH #238 (review): an error prototype object on the left
+          // (`Object.getPrototypeOf(err) instanceof Error`, true in Node
+          // through its own chain) stops by name.
+          if (this.dyn.errProtoLive) {
+            const d = this.acquireScratch(this.dyn.dynRef());
+            code.localTee(d);
+            this.dyn.errProtoGuard(code, (c) => c.localGet(d), "'instanceof' with, on its left,");
+          }
           code.call(this.dyn.isError());
           if (e.negated === true) code.i32Eqz();
           return;

@@ -804,6 +804,44 @@ const GLOBAL_REFLECT_STATICS = new Set([
 
 function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     const loc = locOf(expr);
+    // GH #238 (review): an Error-family prototype read through the global
+    // object (`globalThis.Error.prototype`) answered undefined; only the
+    // `Error.prototype` spelling is modeled.
+    if (L.sharedDynamic && !L.engine && (ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr))) {
+      const key = ts.isPropertyAccessExpression(expr) ? expr.name.text : ts.isStringLiteralLike(expr.argumentExpression) ? expr.argumentExpression.text : null;
+      let recv = expr.expression;
+      while (ts.isParenthesizedExpression(recv)) recv = recv.expression;
+      const recvName = ts.isPropertyAccessExpression(recv) ? recv.name.text
+        : ts.isElementAccessExpression(recv) && ts.isStringLiteralLike(recv.argumentExpression) ? recv.argumentExpression.text : null;
+      const base = ts.isPropertyAccessExpression(recv) || ts.isElementAccessExpression(recv) ? recv.expression : null;
+      if (key === "prototype" && recvName !== null && /^(Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError)$/.test(recvName) &&
+          base !== null && ts.isIdentifier(base) && stdlibGlobalNameOf(L, base) === "globalThis") {
+        L.unsupported("SC1090", expr, `${recvName}.prototype read through the global object (globalThis.${recvName}.prototype; only the plain Error.prototype spelling is modeled)`);
+      }
+    }
+    // GH #238 (review, round 3): a run-time key read of an Error-family
+    // constructor (`Error[k]`) and a reflective read of its own properties
+    // (`Object.getOwnPropertyDescriptor(Error, "prototype")`) answered
+    // undefined; only `Error.prototype` / `Error["prototype"]` are modeled.
+    if (L.sharedDynamic && !L.engine) {
+      const errCtor = (e: ts.Expression): string | null => {
+        let x = e;
+        while (ts.isParenthesizedExpression(x)) x = x.expression;
+        if (!ts.isIdentifier(x) || !/^(Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError)$/.test(x.text)) return null;
+        return L.isStdlibGlobal(x, x.text) ? x.text : null;
+      };
+      if (ts.isElementAccessExpression(expr) && !ts.isStringLiteralLike(expr.argumentExpression) && !ts.isNumericLiteral(expr.argumentExpression)) {
+        const n = errCtor(expr.expression);
+        if (n !== null) L.unsupported("SC1090", expr, `a run-time key read of the ${n} constructor's members (${n}[key]; only ${n === "Error" ? "Error.prototype" : n + "'s named members"} is modeled)`);
+      }
+      if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression) && ts.isIdentifier(expr.expression.expression) &&
+          (expr.expression.expression.text === "Object" || expr.expression.expression.text === "Reflect") &&
+          /^(getOwnPropertyDescriptor|getOwnPropertyDescriptors|getOwnPropertyNames|hasOwn|keys|values|entries)$/.test(expr.expression.name.text) &&
+          expr.arguments.length >= 1 && !ts.isSpreadElement(expr.arguments[0]!)) {
+        const n = errCtor(expr.arguments[0]!);
+        if (n !== null) L.unsupported("SC1090", expr, `${expr.expression.expression.text}.${expr.expression.name.text} over the ${n} constructor (its own properties are not modeled)`);
+      }
+    }
 
     // An optional chain's guarded receiver: already evaluated by the
     // enclosing optChain — read the bind temp instead of re-lowering.
@@ -1053,6 +1091,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       for (const p of expr.properties) {
         if (ts.isSpreadAssignment(p) && isGlobalBox(L, p.expression)) {
           L.unsupported("SC1090", p, "spreading globalThis into an object literal (copying the global object's own properties)");
+        }
+        // GH #238 review, GH #244: `{ __proto__: v }` (a non-computed,
+        // non-shorthand key) sets the new object's prototype in JavaScript;
+        // it is not an own key, which is what a record would make of it.
+        if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "__proto__") {
+          L.unsupported("SC1090", p, "a `__proto__: value` entry in an object literal (it sets the object's prototype, GH #244)");
         }
       }
     }
@@ -6497,6 +6541,13 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
 
   export function lowerDynObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
     const loc = locOf(expr);
+    // GH #238 review, GH #244: the dynamic (JavaScript, object-model) path
+    // of a literal too — `{ __proto__: v }` sets the prototype in Node.
+    for (const p of expr.properties) {
+      if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "__proto__") {
+        L.unsupported("SC1090", p, "a `__proto__: value` entry in an object literal (it sets the object's prototype, GH #244)");
+      }
+    }
     const fields: { key: IrExpr; value: IrExpr }[] = [];
     // A SPREAD of a dynamic value (commander's configureOutput: `{
     // ...this._outputConfiguration, ...configuration }`): the properties
@@ -6913,6 +6964,12 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
 
 function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
     const loc = locOf(expr);
+    // GH #238 review, GH #244 (every lowering path of a literal).
+    for (const p of expr.properties) {
+      if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "__proto__") {
+        L.unsupported("SC1090", p, "a `__proto__: value` entry in an object literal (it sets the object's prototype, GH #244)");
+      }
+    }
     // The RUNTIME-KEYED literal (JS): a computed key that doesn't fold to a
     // compile-time string means the literal's shape is not a compile-time
     // fact — no record shape can hold it. The whole literal builds as a dyn
