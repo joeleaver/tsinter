@@ -5,6 +5,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { ARRAYBUFFER_T, BIGINT_T, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedIndexValue, isUnitType, shapeHasReservedFields, typeEquals } from "../../ir/nodes.js";
+import { orderFromKeys, orderedFieldStmts, orderedShape, ownKeysHelper } from "./record-order.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { lowerArrayFromIterable, optionalNumber } from "./lower-stdlib-members.js";
 import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
@@ -8002,6 +8003,12 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       const body: IrStmt[] = [
         { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: resultT, loc }, loc },
       ];
+      // GH #227: the declared walk (the fast path's), each field's unguarded
+      // push (an ordered record's own order decides presence), merged with
+      // the added keys below.
+      const outerBody = body;
+      const declared: IrStmt[] = [];
+      const eachOf = new Map<string, IrStmt[]>();
 
       // Declared fields, in declaration order. Undefined-valued fields
       // skip at runtime (the unset-optional convention); values surface
@@ -8101,7 +8108,12 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
           }
         }
         if (guard === null) guard = plainFieldPresent(L, raw, loc);
-        body.push(guard !== null ? { kind: "if", cond: guard, then: [push(pushed)], else_: elseUndef, loc } : push(pushed));
+        declared.push(guard !== null ? { kind: "if", cond: guard, then: [push(pushed)], else_: elseUndef, loc } : push(pushed));
+        // Off the fast path the field is an own key whatever it holds: a
+        // narrowed push still needs its undefined answer.
+        eachOf.set(f.name, narrows && guard !== null
+          ? [{ kind: "if", cond: guard, then: [push(pushed)], else_: elseUndef ?? [], loc }]
+          : [push(pushed)]);
       }
 
       // The overflow walk: a fresh key snapshot in JS own-key order, each
@@ -8127,7 +8139,19 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
                 type: tupleT!,
                 loc,
               };
-      body.push(
+      const pushedFor = (k: IrExpr): IrExpr => {
+        const rv: IrExpr | null = valueT ? { kind: "recordKeyGet", obj: rRef, shapeId: argIr.shapeId, key: k, overflowOnly: true, type: valueT, loc } : null;
+        return member === "keys" ? k : member === "values" ? rv! : { kind: "recordLit", fields: [{ name: "0", value: k }, { name: "1", value: rv! }], type: tupleT!, loc };
+      };
+      const ordLocals: IrLocal[] = [];
+      if (orderedShape(L, argIr.shapeId) !== null) {
+        outerBody.push(...orderedFieldStmts(L, rRef, argIr.shapeId, declared, (f) => eachOf.get(f.name) ?? [], (name, type) => {
+          const id = `${name.slice(1)}.0`;
+          ordLocals.push({ id, name: name.slice(1), type, mutable: true });
+          return id;
+        }, loc, (k) => [push(pushedFor(k))]), { kind: "return", value: outRef, loc });
+      } else outerBody.push(...declared);
+      if (orderedShape(L, argIr.shapeId) === null) body.push(
         { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: rRef, shapeId: argIr.shapeId, type: ksT, loc }, loc },
         {
           kind: "for",
@@ -8165,6 +8189,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
           { id: "ks.0", name: "ks", type: ksT, mutable: false },
           { id: "i.0", name: "i", type: F64, mutable: true },
           { id: "k.0", name: "k", type: STRING, mutable: false },
+          ...ordLocals,
         ],
         body,
         loc,
@@ -8633,6 +8658,9 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
         },
       );
     }
+    // GH #227: the copy answers the source's own keys in the source's order
+    // (Node's cast shares the object).
+    body.push(...orderFromKeys(L, outRef, toId, { kind: "call", callee: ownKeysHelper(L, fromId, loc), args: [sRef], type: arrayOf(STRING), loc }, loc));
     body.push({ kind: "return", value: outRef, loc });
     L.liftedFns.push({
       name,
@@ -8739,6 +8767,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       const intoSlot = (v: IrExpr, lift: WidthLift | "dyn"): IrExpr =>
         lift === "dyn" ? { kind: "dynFrom", value: v, type: DYN, loc } : L.applyWidthLift(lift, v, tIv, loc);
       const body: IrStmt[] = [];
+      const eachWrite = new Map<string, IrStmt>();
       for (const ff of plan.fields) {
         const raw: IrExpr = { kind: "recordGet", obj: sRef, shapeId: plan.fromId, field: ff.name, type: ff.type, loc };
         const utag = ff.type.kind === "union" ? L.armTag(ff.type.unionId, UNDEFINED_T) : -1;
@@ -8750,6 +8779,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
           value: intoSlot(raw, ff.lift),
           loc,
         };
+        eachWrite.set(ff.name, write);
         body.push(
           utag >= 0 && ff.type.kind === "union"
             ? {
@@ -8764,7 +8794,28 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
       }
       const ksT = arrayOf(STRING);
       const fromShape = L.shapes.get(plan.fromId)!;
-      if (plan.ovfLift !== null && fromShape.indexValue) {
+      const ordLocals: IrLocal[] = [];
+      if (plan.ovfLift !== null && fromShape.indexValue && orderedShape(L, plan.fromId) !== null) {
+        // GH #227: a hybrid source copies its own keys in its own order.
+        const fIv = fromShape.indexValue;
+        const ovfLift = plan.ovfLift;
+        const declared = body.splice(0, body.length);
+        body.push(...orderedFieldStmts(L, sRef, plan.fromId, declared, (f) => {
+          const w0 = eachWrite.get(f.name);
+          return w0 === undefined ? [] : [w0];
+        }, (lname, type) => {
+          const id = `${lname.slice(1)}.0`;
+          ordLocals.push({ id, name: lname.slice(1), type, mutable: true });
+          return id;
+        }, loc, (key) => [{
+          kind: "recordKeySet",
+          obj: tRef,
+          shapeId: targetIr.shapeId,
+          key,
+          value: intoSlot({ kind: "recordKeyGet", obj: sRef, shapeId: plan.fromId, key, overflowOnly: true, type: fIv, loc }, ovfLift),
+          loc,
+        }]));
+      } else if (plan.ovfLift !== null && fromShape.indexValue) {
         const fIv = fromShape.indexValue;
         body.push(
           { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: sRef, shapeId: plan.fromId, type: ksT, loc }, loc },
@@ -8811,6 +8862,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
         locals: [
           { id: "t.0", name: "t", type: toT, mutable: true },
           { id: "s.0", name: "s", type: fromT, mutable: true },
+          ...ordLocals,
           ...(plan.ovfLift !== null && fromShape.indexValue
             ? [
                 { id: "ks.0", name: "ks", type: ksT, mutable: false },
@@ -9045,6 +9097,8 @@ export type IndexMergeContributor =
             ? v
             : { kind: "unionWrap", unionId: (tIv as IrType & { kind: "union" }).unionId, tag: plan.wrapTag, value: v, type: tIv, loc };
       // Declared source fields first (literal keys; absent optionals skip).
+      const srcDeclared: IrStmt[] = [];
+      const srcEach = new Map<string, IrStmt>();
       for (const ff of from.fields) {
         const raw: IrExpr = { kind: "recordGet", obj: sRef, shapeId: plan.shapeId, field: ff.name, type: ff.type, loc };
         const utag = ff.type.kind === "union" ? L.armTag(ff.type.unionId, UNDEFINED_T) : -1;
@@ -9057,12 +9111,33 @@ export type IndexMergeContributor =
           overflowOnly: true,
           loc,
         };
-        body.push(
+        srcEach.set(ff.name, write);
+        srcDeclared.push(
           utag >= 0 && ff.type.kind === "union"
             ? { kind: "if", cond: { kind: "unionIsTag", unionId: ff.type.unionId, tag: utag, negated: true, value: raw, type: BOOL, loc }, then: [write], else_: null, loc }
             : write,
         );
       }
+      if (orderedShape(L, plan.shapeId) !== null) {
+        // GH #227: a hybrid source contributes its own keys in its own order.
+        body.push(...orderedFieldStmts(L, sRef, plan.shapeId, srcDeclared, (f) => {
+          const w0 = srcEach.get(f.name);
+          return w0 === undefined ? [] : [w0];
+        }, (lname, type) => {
+          const id = `${lname.slice(1)}.${ci}`;
+          locals.push({ id, name: `${lname.slice(1)}${ci}`, type, mutable: true });
+          return id;
+        }, loc, (key) => [{
+          kind: "recordKeySet",
+          obj: outRef,
+          shapeId: toId,
+          key,
+          value: intoSlot({ kind: "recordKeyGet", obj: sRef, shapeId: plan.shapeId, key, overflowOnly: true, type: fIv, loc }),
+          loc,
+        }]));
+        return;
+      }
+      body.push(...srcDeclared);
       // Then the source overflow, in JS own-key order.
       const ks = `ks.${ci}`;
       const iv = `i.${ci}`;
@@ -9260,11 +9335,21 @@ export type IndexMergeContributor =
     const body: IrStmt[] = [
       { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: arrT, loc }, loc },
     ];
-    for (const f of shape.fields) {
-      const raw: IrExpr = { kind: "recordGet", obj: sRef, shapeId, field: f.name, type: f.type, loc };
-      const k: IrExpr = { kind: "strLit", value: f.name, type: STRING, loc };
-      body.push(writeFor(k, raw, f.type));
+    const fieldWrite = (f: { name: string; type: IrType }): IrStmt =>
+      writeFor({ kind: "strLit", value: f.name, type: STRING, loc }, { kind: "recordGet", obj: sRef, shapeId, field: f.name, type: f.type, loc }, f.type);
+    if (shape.indexValue && orderedShape(L, shapeId) !== null) {
+      // GH #227: a hybrid's own keys in its own order.
+      const iv = shape.indexValue;
+      body.push(...orderedFieldStmts(L, sRef, shapeId, shape.fields.map(fieldWrite), (f) => [fieldWrite(f)], (lname, type) => {
+        const id = `${lname.slice(1)}.0`;
+        locals.push({ id, name: lname.slice(1), type, mutable: true });
+        return id;
+      }, loc, (key) => [writeFor(key, { kind: "recordKeyGet", obj: sRef, shapeId, key, overflowOnly: true, type: iv, loc }, iv)]));
+      body.push({ kind: "return", value: outRef, loc });
+      L.liftedFns.push({ name, params: [{ localId: "s.0", name: "s", type: recT }], returnType: arrT, locals, body, loc });
+      return name;
     }
+    for (const f of shape.fields) body.push(fieldWrite(f));
     if (shape.indexValue) {
       const iv = shape.indexValue;
       const ksT = arrayOf(STRING);

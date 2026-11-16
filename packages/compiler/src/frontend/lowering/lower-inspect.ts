@@ -37,7 +37,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
 import { BOOL, BYTES_U8, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
-import { noLoweringDiag, unsupportedDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
+import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
@@ -765,12 +765,10 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
         });
       }
       if (shape.indexValue) {
-        // A hybrid: the added array-index keys, the declared fields above,
-        // then the other added keys in their own order, each through
-        // insp.key and the keyed get — Node's order exactly when every
-        // declared field precedes every added non-index key, which
-        // hybridOrderPass proves for the whole program or refuses.
-        if (!L.hybridInspects.has(t.shapeId)) L.hybridInspects.set(t.shapeId, loc);
+        // A hybrid (GH #227): every own key in Node's order — the index added
+        // keys, then the declared fields and the named added keys as created
+        // (record-order.ts's merged walk), each added key through insp.key
+        // and the keyed get.
         const iv = shape.indexValue;
         const ksT: IrType = { kind: "array", elem: STRING };
         for (const l of [
@@ -779,67 +777,34 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
         ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
         const ks = (): IrExpr => ref("ks.0", ksT);
         const n = (): IrExpr => ref("n.0", F64);
-        // `{}` only when no declared field is present AND no overflow key
-        const first = body[0];
-        if (first !== undefined && first.kind === "if") {
-          body[0] = { ...first, cond: { kind: "logical", op: "&&", left: first.cond, right: { kind: "bin", op: "===", left: n(), right: num(0, loc), type: BOOL, loc }, type: BOOL, loc } };
+        const i = (): IrExpr => ref("i.0", F64);
+        const k = (): IrExpr => ref("k.0", STRING);
+        // `{}` only when no declared field is present AND no added key: every
+        // empty-record answer (the fast path's, an ordered record's) gains
+        // the test
+        for (let bi = 0; bi < body.length; bi++) {
+          const st = body[bi]!;
+          if (st.kind !== "if" || st.then.length !== 1) continue;
+          const t0 = st.then[0]!;
+          if (t0.kind !== "return" || t0.value === null || t0.value.kind !== "strLit" || t0.value.value !== "{}") continue;
+          body[bi] = { ...st, cond: { kind: "logical", op: "&&", left: st.cond, right: { kind: "bin", op: "===", left: n(), right: num(0, loc), type: BOOL, loc }, type: BOOL, loc } };
         }
         body.unshift(
           { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: v(), shapeId: t.shapeId, type: ksT, loc }, loc },
           { kind: "varDecl", localId: "n.0", init: { kind: "arrIntrinsic", method: "length", receiver: ks(), args: [], type: F64, loc }, loc },
         );
-        // Node prints an object's array-index keys first (ascending), then
-        // its other keys in insertion order. Declared field names are never
-        // array indices (the fence above), so the added keys that ARE print
-        // before the declared fields and the rest after them (the overflow
-        // keys arrive in JS order, indices first). A key is an array index
-        // when ToString(ToNumber(k)) is k and the number is an integer in
-        // [0, 2**32 - 2].
-        const overflowLoop = (sfx: string, wantIndex: boolean): IrStmt => {
-          const ii = `i${sfx}.0`, kk = `k${sfx}.0`, nn = `kn${sfx}.0`;
-          for (const l of [
-            { id: ii, name: `i${sfx}`, type: F64, mutable: true },
-            { id: kk, name: `k${sfx}`, type: STRING, mutable: false },
-            { id: nn, name: `kn${sfx}`, type: F64, mutable: false },
-          ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
-          const iR = (): IrExpr => ref(ii, F64);
-          const kR = (): IrExpr => ref(kk, STRING);
-          const nR = (): IrExpr => ref(nn, F64);
-          const and = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: a, right: b, type: BOOL, loc });
-          const isIndex: IrExpr = and(
-            and(
-              { kind: "strEq", negated: false, left: { kind: "toString", operand: nR(), type: STRING, loc }, right: kR(), type: BOOL, loc },
-              { kind: "bin", op: "===", left: { kind: "libCall", fn: "math.floor", args: [nR()], type: F64, loc }, right: nR(), type: BOOL, loc },
-            ),
-            and(
-              { kind: "bin", op: ">=", left: nR(), right: num(0, loc), type: BOOL, loc },
-              { kind: "bin", op: "<=", left: nR(), right: num(4294967294, loc), type: BOOL, loc },
-            ),
-          );
-          const keyedRead: IrExpr = { kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key: kR(), overflowOnly: true, type: iv, loc };
-          return {
-            kind: "for",
-            init: { kind: "varDecl", localId: ii, init: num(0, loc), loc },
-            cond: { kind: "bin", op: "<", left: iR(), right: n(), type: BOOL, loc },
-            update: { kind: "assign", localId: ii, value: { kind: "bin", op: "+", left: iR(), right: num(1, loc), type: F64, loc }, loc },
-            body: [
-              { kind: "varDecl", localId: kk, init: { kind: "arrayGet", arr: ks(), index: iR(), type: STRING, loc }, loc },
-              { kind: "varDecl", localId: nn, init: { kind: "libCall", fn: "num.fromString", args: [kR()], type: F64, loc }, loc },
-              {
-                kind: "if",
-                cond: wantIndex ? isIndex : { kind: "unary", op: "!", operand: isIndex, type: BOOL, loc },
-                then: [entry(
-                  concatAll([{ kind: "libCall", fn: "insp.key", args: [kR()], type: STRING, loc }, str(": ", loc), child(iv, keyedRead)], loc),
-                  boolLit(false, loc),
-                )],
-                else_: null,
-                loc,
-              },
-            ],
-            loc,
-          };
-        };
-        body.push(depthGate("[Object]"), ...begin(), overflowLoop("x", true), ...ordered, overflowLoop("y", false));
+        void i;
+        void k;
+        const merged = orderedFieldStmts(L, v(), t.shapeId, fastPuts, (f) => [putOf(f.name, f.type)], (name, type) => {
+          const id = `${name.slice(1)}.0`;
+          if (!locals.some((l) => l.id === id)) locals.push({ id, name: name.slice(1), type, mutable: true });
+          return id;
+        }, loc, (key) => [entry(
+          concatAll([{ kind: "libCall", fn: "insp.key", args: [key], type: STRING, loc }, str(": ", loc),
+            child(iv, { kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key, overflowOnly: true, type: iv, loc })], loc),
+          boolLit(false, loc),
+        )]);
+        body.push(depthGate("[Object]"), ...begin(), ...merged);
       } else {
         body.push(depthGate("[Object]"), ...begin(), ...ordered);
       }
@@ -2410,107 +2375,3 @@ function lowerGetCallSitesCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc)
   return { kind: "dynArrLit", elems: [frame(), frame(), frame()], type: DYN, loc };
 }
 
-/* ── S125 unit 2 (review): a printed hybrid's key order ─────────────────
- *
- * A hybrid record (declared fields AND an index signature) prints its
- * declared fields, then its added keys. Node prints every own key in
- * insertion order, so the two agree exactly when, in every value of the
- * shape, every declared field was set before any added key. This pass
- * proves that over the finished program, or refuses the print by name:
- *  - every record literal of the shape lists its declared fields before
- *    any added (overflow) key — an omitted optional field the frontend
- *    completes with undefined is no key, an explicit `undefined` is one;
- *  - on a shape with an optional declared field, no write through a key
- *    that is not a literal naming an added key (it may name that field);
- *  - no optional declared field is ever assigned (it would join after the
- *    keys already added);
- *  - no value of the shape (or of a union, array or field holding it) is
- *    built by a dynamic check, an island exit, or a runtime helper (a
- *    width copy, a capture), whose key order is the source's.
- * Object.keys, for-in and JSON keep S031's registered declared-first
- * order. */
-export function hybridOrderPass(L: Lowerer, functions: { body: unknown }[]): void {
-  if (L.hybridInspects.size === 0) return;
-  const shapes = new Set(L.hybridInspects.keys());
-  const holds = new Map<string, Set<string>>();
-  /** The hybrid shapes a value of type `t` may hold (itself, union arms,
-   * array elements, record fields), memoized by type key. */
-  const held = (t: IrType, depth = 0): Set<string> => {
-    const k = typeKey(t);
-    const hit = holds.get(k);
-    if (hit !== undefined) return hit;
-    const out = new Set<string>();
-    holds.set(k, out);
-    if (depth > 8) return out;
-    const add = (x: IrType): void => { for (const s of held(x, depth + 1)) out.add(s); };
-    switch (t.kind) {
-      case "record": {
-        if (shapes.has(t.shapeId)) out.add(t.shapeId);
-        const sh = L.shapes.get(t.shapeId);
-        for (const f of sh?.fields ?? []) add(f.type);
-        if (sh?.indexValue !== undefined) add(sh.indexValue);
-        break;
-      }
-      case "union":
-        for (const a of L.unions.get(t.unionId)?.arms ?? []) add(a);
-        break;
-      case "array":
-        add(t.elem);
-        break;
-      default:
-        break;
-    }
-    return out;
-  };
-  const bad = new Map<string, string>();
-  const mark = (ids: Iterable<string>, why: string): void => {
-    for (const id of ids) if (!bad.has(id)) bad.set(id, why);
-  };
-  const isAbsent = (e: unknown): boolean => e !== null && typeof e === "object" && L.omittedLitValues.has(e);
-  const PRODUCER = new Set(["dynCheck", "jsExit", "dynDestrCheck", "jsMarshal", "dynMatch"]);
-  const visit = (n: unknown): void => {
-    if (n === null || typeof n !== "object") return;
-    if (Array.isArray(n)) {
-      for (const x of n) visit(x);
-      return;
-    }
-    const r = n as Record<string, unknown>;
-    const kind = r["kind"];
-    const t = r["type"] as IrType | undefined;
-    if (typeof kind === "string" && t !== undefined && typeof t === "object" && typeof (t as { kind?: unknown }).kind === "string") {
-      if (kind === "recordLit" && t.kind === "record" && shapes.has(t.shapeId)) {
-        let sawOverflow = false;
-        for (const f of r["fields"] as { overflow?: true; drop?: true; value: unknown }[]) {
-          if (f.drop) continue;
-          if (f.overflow) sawOverflow = true;
-          else if (sawOverflow && !isAbsent(f.value)) {
-            mark([t.shapeId], "a literal sets a declared field after an added key");
-            break;
-          }
-        }
-      } else if (PRODUCER.has(kind) || (kind === "call" && typeof r["callee"] === "string" && /^%(?!fn\d|init\.|arr\.)/.test(r["callee"])) || kind === "libCall") {
-        const hs = held(t);
-        if (hs.size > 0) mark(hs, "a value of it is built from another value's keys");
-      }
-    }
-    if (kind === "recordKeySet" && r["overflowOnly"] !== true && typeof r["shapeId"] === "string" && shapes.has(r["shapeId"]) &&
-      (L.shapes.get(r["shapeId"])?.fields ?? []).some((f) => f.optional === true)) {
-      mark([r["shapeId"]], "a computed key may set an optional declared field after an added key");
-    }
-    if (kind === "recordSet" && typeof r["shapeId"] === "string" && shapes.has(r["shapeId"])) {
-      const sh = L.shapes.get(r["shapeId"]);
-      if (sh?.fields.some((f) => f.name === r["field"] && f.optional === true)) mark([r["shapeId"]], "an optional declared field is assigned after the record is built");
-    }
-    for (const key of Object.keys(r)) if (key !== "type" && key !== "loc") visit(r[key]);
-  };
-  for (const f of functions) visit(f.body);
-  for (const [id, why] of bad) {
-    const loc = L.hybridInspects.get(id)!;
-    L.pushDiag(unsupportedDiag(
-      "SC1090",
-      loc,
-      `printing an index-signature record with declared fields whose added keys may come before a declared field (${why}): JavaScript prints its keys in insertion order, which this record's declared-then-added layout does not keep`,
-      "print Object.fromEntries(Object.entries(r)) or the fields you need, or declare the record without an index signature",
-    ));
-  }
-}

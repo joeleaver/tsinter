@@ -99,7 +99,6 @@ import {
 } from "../types.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
-import { hybridOrderPass } from "./lower-inspect.js";
 import { bigWidenTypeOf, programHoldsBigint } from "./big-widen.js";
 import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
@@ -123,7 +122,7 @@ import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueT
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
-import { orderNoteCopy } from "./record-order.js";
+import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
 import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
@@ -1509,13 +1508,6 @@ export class Lowerer {
   /** The judged copies at contained slots S125 (c) accepted (a further
    * pass tries them on the dynamic arm, falling back if it fails). */
   readonly dynArmSoft = new Set<string>();
-  /** S125 unit 2 (review): the hybrid record shapes console.log/inspect
-   * prints, with the first print site (hybridOrderPass judges them). */
-  readonly hybridInspects = new Map<string, SrcLoc>();
-  /** The values the frontend completes an omitted optional field of a
-   * record literal with (no key in JavaScript's object, unlike an explicit
-   * `undefined` written in the source). */
-  readonly omittedLitValues = new WeakSet<object>();
   /** A judged exit's IR node → the key of its contained slot. */
   readonly dynArmExitNodes = new WeakMap<object, string>();
   /** Bindings and parameters holding the dynamic arm. */
@@ -2908,6 +2900,12 @@ export class Lowerer {
     islandViewPass(this, [...functions, ...this.implicitFns]);
     functions.push(...this.liftedFns);
     functions.push(...this.implicitFns);
+    // GH #227: keyed writes and deletes keep a hybrid's own-key order.
+    {
+      const liftedBefore = this.liftedFns.length;
+      hybridWritePass(this, functions);
+      functions.push(...this.liftedFns.slice(liftedBefore));
+    }
     // Module-scope TDZ guards (board #265): every access the analysis
     // could not prove late enough tests its binding's init flag.
     insertModuleTdzChecks(this.moduleTdz, functions, this.globalsList);
@@ -2919,9 +2917,6 @@ export class Lowerer {
       // (Its deferred fences in compiled npm JavaScript intern helpers.)
       functions.push(...this.liftedFns.slice(liftedBefore));
     }
-    // A printed hybrid record whose keys may not all follow its declared
-    // fields refuses by name (console.log's order is Node's, never S031's).
-    hybridOrderPass(this, functions);
 
     if (this.remainder) {
       // Deferred collection diagnostics nothing flushed — declarations no
@@ -7412,6 +7407,36 @@ export class Lowerer {
     const ref = (localId: string, type: IrType): IrExpr => ({ kind: "varRef", localId, type, loc });
     const num = (value: number): IrExpr => ({ kind: "numLit", value, type: f64, loc });
     const kRef = ref("k.0", STRING);
+    if (orderedShape(this, shapeId) !== null) {
+      // GH #227: a hybrid's own keys in Node's order — every declared field
+      // (the fast path), each one the order lists, and the added keys merged.
+      const setIdx = (key: IrExpr, value: IrExpr): IrStmt => ({
+        kind: "exprStmt",
+        expr: { kind: "jsOp", op: "setIdx", args: [ref("out.0", JSVAL), { kind: "jsMarshal", value: key, type: JSVAL, loc }, value], type: VOID, loc },
+        loc,
+      });
+      const fieldSet = (f: { name: string; type: IrType }): IrStmt =>
+        setIdx({ kind: "strLit", value: f.name, type: STRING, loc }, this.jsvalLiftExpr({ kind: "recordGet", obj: r, shapeId, field: f.name, type: f.type, loc }, loc));
+      const ordLocals: IrLocal[] = [];
+      const walk = orderedFieldStmts(this, r, shapeId, shape.fields.map(fieldSet), (f) => [fieldSet(f)], (lname, type) => {
+        const id = `${lname.slice(1)}.0`;
+        ordLocals.push({ id, name: lname.slice(1), type, mutable: true });
+        return id;
+      }, loc, (key) => [setIdx(key, this.jsvalLiftExpr({ kind: "recordKeyGet", obj: r, shapeId, key, overflowOnly: true, type: iv, loc }, loc))]);
+      this.liftedFns.push({
+        name,
+        params: [{ localId: "r.0", name: "r", type: recT }],
+        returnType: JSVAL,
+        locals: [{ id: "r.0", name: "r", type: recT, mutable: true }, { id: "out.0", name: "out", type: JSVAL, mutable: false }, ...ordLocals],
+        body: [
+          { kind: "varDecl", localId: "out.0", init: { kind: "jsOp", op: "objLit", args: [], type: JSVAL, loc }, loc },
+          ...walk,
+          { kind: "return", value: ref("out.0", JSVAL), loc },
+        ],
+        loc,
+      });
+      return name;
+    }
     this.liftedFns.push({
       name,
       params: [{ localId: "r.0", name: "r", type: recT }],

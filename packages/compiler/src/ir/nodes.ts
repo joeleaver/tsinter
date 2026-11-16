@@ -5578,12 +5578,18 @@ export type IrExpr =
    * shapes. `obj` must be a record whose shape carries an indexValue; the
    * receiver is borrowed, the array is owned (+1). Declared fields are NOT
    * listed (they never live in the overflow map — the lowering prepends
-   * them from the shape). Never throws. */
-  | { kind: "recordOvfKeys"; obj: IrExpr; shapeId: string; type: IrType; loc: SrcLoc }
+   * them from the shape). Never throws. With `part` (GH #227, WasmGC
+   * lanes only): "index" lists only the canonical array-index keys (the
+   * ascending prefix), "named" only the rest, in insertion order — the
+   * keys an order vector's markers stand for. */
+  | { kind: "recordOvfKeys"; obj: IrExpr; shapeId: string; part?: "index" | "named"; type: IrType; loc: SrcLoc }
   /** GH #132: a record's own-key ORDER, as V8 keeps it — a number[] laid
    * out as one presence flag per field of recordOrderFields(shape) (1 =
    * own key) followed by the field numbers of its own keys in creation
-   * order — or the array slot's undefined while the record is on the
+   * order (GH #227: on a hybrid shape, a -1 MARKER stands for the next
+   * non-index overflow key, in the overflow map's insertion order; index
+   * keys take no marker, JS lists them first) — or the array slot's
+   * undefined while the record is on the
    * FAST PATH, whose own keys are the declared order filtered by the
    * SEMANTICS.md S091 key rule (lowering/record-order.ts). With `hi`, the
    * fast path's high-water mark instead (f64: 0 unknown, else 2 + the

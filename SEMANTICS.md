@@ -2483,23 +2483,26 @@ half); no corpus program can pin the Node-DIVERGENT order — a corpus
 program's output must match Node byte-for-byte by definition, so a program
 exercising this exact split would fail the differential on every lane.
 
-**Amendment (S125 unit 2, wasm and wasm-native): the split is not only
-integer keys, and console.log does not take it.** The declared-first rule
-above reorders ANY added key that was set before a declared field: a
-literal `{ name: "n", id: "a1" }` typed `{ id: string; [k: string]:
-unknown }` answers `Object.keys` as `['id', 'name']` and serializes
-`{"id":"a1","name":"n"}` where Node answers `['name', 'id']` and
-`{"name":"n","id":"a1"}`; a JSON source checked into the shape reorders the
-same way. `Object.keys`/`values`/`entries`, `for...in` and `JSON.stringify`
-keep this registered order. `console.log`/`util.inspect` do NOT: a hybrid
-prints its declared fields, then its added keys, only where the whole
-program proves that order is Node's (every literal of the shape sets its
-declared fields before any added key, no optional declared field is
-assigned after the record is built, and no value of the shape is built by
-a dynamic check, an island exit or a runtime copy); anywhere else the
-print refuses by name (`printing an index-signature record with declared
-fields whose added keys may come before a declared field`). **Tested by:**
-`packages/compiler/test/wasm-s125-share.test.ts` S125-B-01..06.
+**Amendment (GH #227, 2026-11-16): RETIRED on the wasm and wasm-native
+lanes — the order is Node's exactly.** A hybrid record (declared fields and
+an index signature) keeps GH #132's own-key order slot, extended with a
+MARKER for "the next non-index added key": a record whose keys were created
+declared-first carries no order (the fast path: its declared fields, then
+its added keys), and one that leaves that order — a literal spelling an
+added key before a declared field or an explicit `undefined`, a dynamic
+source checked into the shape in its own key order, an optional declared
+field gaining its key (by name or through a computed key) after an added
+key exists — records its keys as created. Every own-key surface reads one
+merged walk: the index added keys first (JavaScript lists every integer key
+ahead), then the declared fields and the added keys in creation order —
+`Object.keys`/`values`/`entries`, `for...in`, `JSON.stringify`,
+`console.log`/`util.inspect`, the record seen as `any`/`unknown` (the view,
+the dynamic copy), `Object.assign` from it and the copies a cast takes. The
+paragraphs above describe the c and llvm lanes, which keep the
+declared-then-overflow order. **Tested by:**
+`packages/compiler/test/wasm-hybrid-order.test.ts` (HO-01..05) and
+`packages/compiler/test/wasm-s125-share.test.ts` S125-B-01..09, against
+Node on both WasmGC lanes.
 
 **Amendment (increment 17, index-signature records): `__proto__` is an
 ordinary own key here, not the prototype accessor.** A dynamic-keyed write
@@ -3682,9 +3685,11 @@ is then Node's.
   from a dynamic value (`JSON.parse(s) as T`, a JavaScript value entering a typed slot, the `structuredClone`
   round trip) takes the declared order whatever the source's key order (`JSON.parse('{"b":1,"a":2}') as {
   a?: number; b: number }` answers `[ 'a', 'b' ]`, Node `[ 'b', 'a' ]`);
-- index-signature records keep S031's declared-then-overflow order, including a late declared optional key
-  (`{ xx?: number; b: number; [k: string]: number | undefined }` with `o.xx = 4` after `{ b: 2 }` answers
-  `xx` first);
+- index-signature records: GH #227 (S031's amendment) retires S031's declared-then-overflow order on these
+  lanes — a hybrid's keys answer in Node's order, a late declared optional key included (`{ xx?: number;
+  b: number; [k: string]: number | undefined }` with `o.xx = 4` after `{ b: 2 }` answers `b, xx`), and a
+  dynamic source checked into a hybrid keeps its own key order (the checked-conversion item above stays
+  for plain declared records);
 - spreads: when the result's shape keeps an order, it takes the source's own keys in the source's own
   order, as they stand at the spread's position (a later property that deletes, adds or clears a source
   key does not change the result) — for every record-typed source the spread accepts: a binding, a

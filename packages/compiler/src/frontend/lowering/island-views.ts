@@ -22,7 +22,7 @@
  * nested typed slot must BE a view of that slot's type (jsUnview — it
  * unwraps, no copy) or the write throws a named TypeError. */
 import { isUndefExpr, orderedRecordWrite, plainFieldPresent } from "./lower-exprs.js";
-import { orderedFieldStmts } from "./record-order.js";
+import { orderedFieldStmts, orderedShape } from "./record-order.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFileName } from "../shared.js";
@@ -338,13 +338,20 @@ export function viewFactory(L: Lowerer, t: IrType, loc: SrcLoc, frozen = false):
     }
     // GH #132: off the fast path the record's own order decides.
     const ordLocals: { id: string; type: IrType }[] = [];
+    const ksT = arrayOf(STRING);
+    // GH #227: a hybrid's added keys join the walk in Node's order.
+    const pushJsKey = (key: IrExpr): IrStmt => ({
+      kind: "exprStmt",
+      expr: { kind: "jsOp", op: "callMethod", name: "push", args: [ref("o.0", outT, loc), { kind: "jsMarshal", value: key, type: JSVAL, loc }], type: JSVAL, loc },
+      loc,
+    });
+    const mergedOvf = shape.indexValue !== undefined && orderedShape(L, shape.id) !== null;
     keysBody.push(...orderedFieldStmts(L, x(), shape.id, fastKeys, (f) => [pushKey(f.name)], (name, type) => {
       const id = `${name.slice(1)}.0`;
       ordLocals.push({ id, type });
       return id;
-    }, loc));
-    const ksT = arrayOf(STRING);
-    if (shape.indexValue) {
+    }, loc, mergedOvf ? (key) => [pushJsKey(key)] : undefined));
+    if (shape.indexValue && !mergedOvf) {
       keysBody.push(
         { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: x(), shapeId: shape.id, type: ksT, loc }, loc },
         {
