@@ -17,7 +17,7 @@ import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrS
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
-import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
+import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingRestFnInfoOf, bindingRestFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { bindingNeverWritten, stdlibGlobalAliasDecl } from "./surfaces.js";
@@ -1349,6 +1349,16 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             } catch (e) {
               if (!(e instanceof PoisonError)) throw e;
             }
+            continue;
+          }
+        }
+        // `const one = (...scopes: string[]) => …` at file scope, only ever
+        // called: lowered like a function declaration (bindingRestFnNodeOf).
+        // No global exists; the statement lowering skips by the same test.
+        {
+          const restNode = bindingRestFnNodeOf(L, decl);
+          if (restNode) {
+            bindingRestFnInfoOf(L, decl, restNode);
             continue;
           }
         }
