@@ -4,10 +4,3 @@ expressions.ts:3:13 - error SC1090: object spread of computed sources (the field
   3 | const o = { ...{ a: 1 } };
     |             ^~~~~~~~~~~
   4 | const b = "a" in { a: 1 };
-
-expressions.ts:5:11 - error SC1090: typeof expressions on statically-typed values are not supported yet
-
-  4 | const b = "a" in { a: 1 };
-  5 | const m = typeof "ab".indexOf("b"); // a CALL operand — pure computations fold now
-    |           ^~~~~~~~~~~~~~~~~~~~~~~~
-  6 | const u = n === 3 ? 1 : 2;

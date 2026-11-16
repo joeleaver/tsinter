@@ -5344,10 +5344,12 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     const receiver = L.lowerExpr(expr.expression);
     // ErrnoException's syscall/errno (the FileHandle's closed-handle Error
     // carries Node's syscall; see the libCall's doc).
-    if (member === "syscall" && L.sharedDynamic) {
+    // The legacy lanes lower it too, so their backend's SC3003 names it
+    // (LEGACY_REFUSED_FNS) and coverage agrees with the WasmGC lanes.
+    if (member === "syscall" && (L.sharedDynamic || !L.undefSlots)) {
       return { kind: "libCall", fn: "error.syscall", args: [receiver], type: L.envValueType(), loc: locOf(expr) };
     }
-    if (member === "errno" && L.sharedDynamic) {
+    if (member === "errno" && (L.sharedDynamic || !L.undefSlots)) {
       const type = L.withUndefinedArmOf(F64);
       if (type !== null) return { kind: "libCall", fn: "error.errno", args: [receiver], type, loc: locOf(expr) };
     }

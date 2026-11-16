@@ -1637,6 +1637,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       if (folded && droppableStatic(operand)) {
         return { kind: "strLit", value: folded, type: STRING, loc };
       }
+      // An operand with effects (a host read such as a stat field or a
+      // FileHandle's fd): it evaluates once, as JS evaluates typeof's
+      // operand, and the answer is its type's.
+      if (folded) {
+        const lit: IrExpr = { kind: "strLit", value: folded, type: STRING, loc };
+        return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: operand, loc }], result: lit, type: STRING, loc };
+      }
       // A union operand: every arm's typeof answer is static, so the value
       // form is a ternary chain over runtime TAG tests (arms grouped by
       // answer; the last group needs no test). The operand rides several

@@ -895,8 +895,14 @@ export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly I
     chmodSync: ["fs.lchmodSyncChk"],
     // The two-argument listener form.
     watch: ["fs.watchCb"],
+    // The { bigint: true } forms (lowerStatCall): one spelling for both,
+    // its kind an argument.
+    statSync: ["fs.statBig"],
+    lstatSync: ["fs.statBig"],
   },
   "fs/promises": {
+    // stat's { bigint: true } form shares lstat's spelling (lowerStatCall).
+    stat: ["fsp.statBig"],
     // The Buffer form (no encoding).
     readFile: ["fsp.readFileBytes"],
     // The options form ({ mode?, flag?: "w" | "wx", encoding?: "utf8" }).
@@ -936,8 +942,8 @@ export const AMBIENT_SURFACE_FNS: readonly AmbientSurfaceRow[] = [
   {
     id: "node-builtin.os.hostChoice",
     kind: "node-builtin",
-    name: "host OS constants (os.EOL, path.sep, path.delimiter)",
-    fns: ["os.hostChoice"],
+    name: "host OS constants (os.EOL, path.sep, path.delimiter, fs.constants.O_*)",
+    fns: ["os.hostChoice", "fs.oFlag"],
     note: "the run-time choice of a constant's value by the host OS on the wasm and wasm-native lanes (SEMANTICS.md S118)",
   },
   // ── the Date slice (lowerDateCall): Date.now/Date.UTC and the composed

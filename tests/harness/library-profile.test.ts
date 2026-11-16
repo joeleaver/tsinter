@@ -431,7 +431,7 @@ describe("library profile fences", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const dateIds = r.profile.fences[0]!.surfaces.map((s) => s.id);
-    expect(dateIds).toEqual(["stdlib.date.UTC", "stdlib.date.getTime", "stdlib.date.now", "stdlib.date.toISOString"]);
+    expect(dateIds).toEqual(["stdlib.date.UTC", "stdlib.date.getTime", "stdlib.date.getTimezoneOffset", "stdlib.date.now", "stdlib.date.toISOString"]);
     expect(r.profile.fences[0]!.surfaces.every((s) => s.detector !== undefined)).toBe(true);
     const processIds = r.profile.fences[1]!.surfaces.map((s) => s.id);
     expect(processIds).toContain("node-builtin.process.env");

@@ -2471,7 +2471,16 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // INSTANTIATION prints its family's name — JS has one `Box`.
           jsName: jsNameOverride ?? decl.name?.text ?? (isAnonymousDefaultClass(decl) ? "default" : ""),
           ...(declaresStaticNameOrLength(decl) ? { staticNameOrLength: true as const } : {}),
-          ...((): { dynLossyMembers?: { data?: true; name?: true; proto?: string[] } } => { const k = errorDynLossy(decl); return k !== null ? { dynLossyMembers: k } : {}; })(),
+          // S138's lossy-member facts, for Error-rooted classes only (the
+          // only ones the WasmGC emitter reads them for): a plain class's
+          // IR carries no names of its members (deadstrip.test.ts).
+          ...((): { dynLossyMembers?: { data?: true; name?: true; proto?: string[] } } => {
+            let b: ClassInfo | null = base;
+            while (b !== null && !RUNTIME_ERROR_CLASSES.has(b.def.name)) b = b.base;
+            if (b === null) return {};
+            const k = errorDynLossy(decl);
+            return k !== null ? { dynLossyMembers: k } : {};
+          })(),
           ...(ctor === null ? { implicitCtor: true as const } : {}),
           ...(base ? { base: base.def.name } : {}),
           // Layout order: the base chain's fields as an IDENTICAL prefix,

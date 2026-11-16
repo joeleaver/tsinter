@@ -903,6 +903,12 @@
       "status": "static"
     },
     {
+      "id": "node-builtin.fs.fstatSync",
+      "kind": "node-builtin",
+      "name": "fs.fstatSync",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.lstatSync",
       "kind": "node-builtin",
       "name": "fs.lstatSync",
@@ -940,9 +946,21 @@
       "status": "static"
     },
     {
+      "id": "node-builtin.fs.promises.lstat",
+      "kind": "node-builtin",
+      "name": "fs/promises.lstat",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.promises.mkdir",
       "kind": "node-builtin",
       "name": "fs/promises.mkdir",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.promises.open",
+      "kind": "node-builtin",
+      "name": "fs/promises.open",
       "status": "static"
     },
     {
@@ -1151,7 +1169,7 @@
     {
       "id": "node-builtin.os.hostChoice",
       "kind": "node-builtin",
-      "name": "host OS constants (os.EOL, path.sep, path.delimiter)",
+      "name": "host OS constants (os.EOL, path.sep, path.delimiter, fs.constants.O_*)",
       "status": "static",
       "note": "the run-time choice of a constant's value by the host OS on the wasm and wasm-native lanes (SEMANTICS.md S118)"
     },
@@ -1498,7 +1516,7 @@
       "kind": "node-builtin",
       "name": "process.exit",
       "status": "static",
-      "note": "process.exit and the process._exiting flag read are one surface"
+      "note": "process.exit, the process._exiting flag read and the process.exitCode writes are one surface"
     },
     {
       "id": "node-builtin.process.getgid",
