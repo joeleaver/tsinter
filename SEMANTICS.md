@@ -12268,3 +12268,89 @@ A stream exported from one module and used in another is not covered. **Rational
 a member the build does not model would otherwise answer wrong.
 **Tested by:** `packages/compiler/test/wasm-proc-streams.test.ts` (PS-01,
 PS-02, PS-04 on both lanes vs Node; PS-R1..R7 the stops and refusals).
+
+## S149 — Date, FormData and Blob values are the dynamic value, and building one stops by name; a dynamic `Object.fromEntries` and `util.styleText` stop on shapes no paperclip run reaches *(wasm and wasm-native)*
+
+Paperclip's stdlib batch 2. On the WasmGC lanes a value the program types as
+the standard library's (or @types/node's) `Date`, `FormData` or `Blob` — a
+`date: Date` parameter, a `Date | null | undefined` return, a
+`createdAt: Date` record member, a multipart upload form — is the dynamic
+value: the slot holds whatever reaches it, exactly as Node's would (a JSON
+string where a declaration claims a Date included: `typeof row.createdAt`
+answers `"string"` in both), and member calls on it dispatch dynamically.
+No such object is ever built:
+
+- (a) `new Date(...)` as a value (the composed `new Date(x).getTime()`,
+  `.toISOString()` and `.getTimezoneOffset()` forms keep their static
+  lowering), `new FormData()` and `new Blob(...)` evaluate their
+  arguments as Node does, then stop the program by name (S122's fence:
+  `tsinter: unsupported: a Date object (new Date(...) as a value; SEMANTICS.md
+  S149) is not supported yet [SC1090 at <file>:<line>]`, exit 1) where
+  Node builds the object. Paperclip uses them only on code its workload
+  does not reach (backup pruning keys, worktree seed timestamps, token
+  expiry, the bootstrap invite, attachment and asset uploads). Unpicked,
+  not scoped out: the Node-exact form (a Date object with its local- and
+  UTC-field accessors over the host zone, S113; FormData and Blob with
+  their multipart serialization into `fetch`) is the path when a workload
+  reaches one.
+- (b) `Date.parse(string)` is the composed `new Date(string).getTime()`
+  read: the same two modelled grammars and S069's fence outside them.
+- (c) `Object.fromEntries(pairs)` over pairs that lowered to the dynamic
+  value, or over a pairs array the static shapes decline (a literal-union
+  key, a value kind outside the index-signature values, a generic record's
+  entries, a result cast `as` a record of declared keys), builds a dynamic
+  plain object: Node's walk over the array (its live length), keys in
+  Node's own-key order (integer-like keys ascending first, then the others
+  in insertion order), a later duplicate overwriting the value in place. A
+  typed use of the result crosses it as any dynamic value (S128). Shapes no
+  paperclip site produces stop by name (`Object.fromEntries with <shape>
+  (SEMANTICS.md S149) is not supported yet`): pairs that are not an array
+  at run time (a Map, a generator — Node walks any iterable), an entry
+  that is not an object (Node throws a catchable
+  `TypeError: Iterator value … is not an entry object`), a key that is
+  neither a string nor a number (a symbol key, or an object whose
+  `toString` Node would run), and the `"__proto__"` key (Node creates an
+  own data property of that name). The result crossing into a typed slot
+  follows S125; where S125 would refuse the copy (paperclip's
+  `removeUndefined<T>(input)`, whose result shares the input's member
+  objects, in a client command its workload does not reach) the crossing
+  instead stops the program by name where it runs, as S133 (e) does for a
+  package's own JavaScript. Unpicked: an index-signature-to-declared-record
+  capture that keeps the members' identity.
+- (d) `util.styleText(format, text)` (the two-argument form @clack/prompts
+  calls; the options form keeps its compile-time refusal) is Node's
+  default-stream path: with `FORCE_COLOR` unset and stdout not a terminal
+  — every piped run — it answers `text` unchanged after checking each
+  format name against Node v24.18.1's style table (`util.inspect.colors`
+  plus `"none"`), exactly as Node does. A run that would colorize (stdout
+  a terminal, or `FORCE_COLOR` set to `""`, `"1"`, `"true"`, `"2"` or
+  `"3"`) stops by name (`util.styleText colorizing (…; SEMANTICS.md S149)
+  is not supported yet`), as does a run-time format outside the table, a
+  hex color, or a format or text that is not a string, where Node throws
+  its catchable `ERR_INVALID_ARG_VALUE` / `ERR_INVALID_ARG_TYPE` (a hex
+  color it accepts). A literal format outside the table refuses at
+  compile time. Unpicked: the coloring path (Node's ANSI open/close codes
+  with its close-code replacement, and `getColorDepth`'s terminal
+  heuristics) is the path when a workload runs on a terminal.
+- (e) A JavaScript `new WeakSet(array)` (zod's module-load
+  `new WeakSet([Object.prototype, Error.prototype])`) evaluates the array,
+  then adds each element in order to the weak table (the checker's
+  WeakSet type, or the untyped stand-in): a primitive or a registered
+  symbol (`Symbol.for`) element throws Node's `TypeError: Invalid value
+  used in weak set` there; an element of a kind the table's element type
+  does not hold, and any other symbol element, refuses at compile time by
+  name. (zod's own line still stops by name: `Error.prototype` is not
+  modelled, GH #238.) Like every WeakSet
+  here (S131) it holds its elements strongly: memory only, since nothing
+  observes collection without `WeakRef`/`FinalizationRegistry`. A seed
+  that is not an array at run time stops by name (Node takes any iterable).
+- (f) Inside a generic function, `T[keyof T]` over a binding whose fields
+  have different types (paperclip's `removeUndefined<T>` over
+  `Object.entries(input)`) maps to the union of those field types, the
+  type the checker computes for the concrete `T`.
+
+**Rationale:** Joe's scoping rule (2026-11-16): build the shapes the target
+project's sites use, Node-exact; a site its workload does not reach compiles
+to a named stop instead of failing the whole build. **Tested by:**
+`packages/compiler/test/wasm-stdlib-batch.test.ts` (SB-08..SB-18, wasm and
+wasm-native, against Node).

@@ -1057,6 +1057,28 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (type.flags & ts.TypeFlags.Object && stubDeclaredModuleOfType(checker, type) !== null) {
     return ctx.sharedDynamic === true ? JSVAL : DYN;
   }
+  // A Date, FormData or Blob VALUE (paperclip's `date: Date` parameters,
+  // `Date | null` returns, `createdAt: Date` record members, its multipart
+  // upload forms): the dynamic value, so the slot holds whatever reaches it
+  // as Node's would (a JSON string where the declaration claims a Date
+  // included). No such object is ever built here: `new Date(...)`,
+  // `new FormData()` and `new Blob(...)` as values are reach-only named
+  // stops (SEMANTICS.md S149), and member calls on the value dispatch
+  // dynamically. Provenance-checked (class or interface, standard library
+  // or @types/node): a user's own `Date`/`FormData`/`Blob` maps as itself.
+  const osym = type.flags & ts.TypeFlags.Object ? type.getSymbol() : undefined;
+  if (
+    ctx.sharedDynamic === true &&
+    (osym?.name === "Date" || osym?.name === "FormData" || osym?.name === "Blob") &&
+    // the instance type, never the class's own constructor (`typeof Blob`)
+    checker.getConstructSignatures(type).length === 0 &&
+    checker.declarationsOf(osym).some(
+      (d) => (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) &&
+        (ctx.isStdlibFile(d.getSourceFile()) || isNodeTypesPath(d.getSourceFile().fileName)),
+    )
+  ) {
+    return JSVAL;
+  }
   if (resolveTypeParam && type.flags & ts.TypeFlags.TypeParameter) {
     const bound = resolveTypeParam(type);
     if (bound) {
@@ -1090,7 +1112,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // keeps symbolic inside the body. Two resolvers, tried in order: the
     // structural read against the record binding, then the bound-checker
     // route for a K naming one concrete key (mapBoundIndexedAccess).
-    const viaIndexed = mapGenericIndexedAccess(type, ctx) ?? mapBoundIndexedAccess(type, ctx);
+    const viaIndexed = mapGenericIndexedAccess(type, ctx) ?? mapBoundIndexedAccess(type, ctx) ?? mapGenericIndexedAccess(type, ctx, true);
     if (viaIndexed !== null) {
       contextResolutions++;
       return viaIndexed;
@@ -3258,7 +3280,7 @@ function mapGenericAwaitedAlias(type: ts.Type, ctx: TypeMapperCtx): IrType | nul
  * the same access against the concrete T, so the shapes intern equal);
  * disagreeing fields would need a union whose arms this relation cannot
  * vouch for — those stay unmapped, keeping their fences. */
-function mapGenericIndexedAccess(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
+function mapGenericIndexedAccess(type: ts.Type, ctx: TypeMapperCtx, asUnion = false): IrType | null {
   const { resolveTypeParam, shapes } = ctx;
   if (!resolveTypeParam || !type.isIndexedAccessType()) return null;
   const obj = type.getObjectType();
@@ -3283,7 +3305,19 @@ function mapGenericIndexedAccess(type: ts.Type, ctx: TypeMapperCtx): IrType | nu
   }
   if (!covered || covered.length === 0) return null;
   const first = covered[0]!;
-  return covered.every((t) => typeEquals(t, first)) ? first : null;
+  if (covered.every((t) => typeEquals(t, first))) return first;
+  // The one-world lanes, only when asked (after mapBoundIndexedAccess has
+  // had its say on a K bound to one literal): an all-keys access over
+  // fields of different kinds (paperclip's `removeUndefined<T>` over
+  // `Object.entries(input)`, `[string, T[keyof T]][]`) is the union of the
+  // field types, exactly what the checker computes for the concrete T.
+  if (!asUnion || ctx.sharedDynamic !== true) return null;
+  const byKey = new Map<string, IrType>();
+  for (const t of covered) {
+    for (const arm of t.kind === "union" ? (ctx.unions.get(t.unionId)?.arms ?? [t]) : [t]) byKey.set(typeKey(arm), arm);
+  }
+  const arms = [...byKey.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map((e) => e[1]);
+  return arms.length === 1 ? arms[0]! : { kind: "union", unionId: ctx.unions.intern(arms) };
 }
 
 function mapGenericUtilityAlias(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {

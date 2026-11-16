@@ -439,6 +439,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
     // values they build (a keys list, a snapshot); their stores into the
     // typed value are typed writes, noted as such.
     if (/^%view\./.test(curFn)) return;
+    // The dynamic Object.fromEntries writes only the fresh object it builds.
+    if (/^%obj\.fromEntries\.dyn\./.test(curFn)) return;
     dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]), ...(method !== undefined ? { method } : {}) });
   };
   /** The program compares dynamic values by identity somewhere. */
@@ -2676,6 +2678,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // (process.argv and the like answer one shared value.)
           return !/^(dyn|process|global|emitter|stdin)\./.test(e.fn);
         case "call":
+          // A map whose callback returns values it built (paperclip's
+          // `names.map((n) => [n, one(n)])`): a fresh spine of owned values.
+          if (/^%arr\.map\.\d+$/.test(e.callee) && e.args.length === 2) {
+            const cb = unwrap(e.args[1]);
+            if (cb?.kind === "closure" && byName.has(cb.fnName)) return returnsOwned(cb.fnName, depth + 1);
+          }
           // A program function every return of which builds a value from
           // its own locals.
           if ((!e.callee.startsWith("%") || /^%fn\d+$/.test(e.callee)) && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
@@ -2756,6 +2764,14 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // An island view of a typed value (U1b: a JS evolving binding
           // reassigned from a typed result) shares that value's storage:
           // nothing else holds it when nothing else holds the typed value.
+          // The dynamic Object.fromEntries (lower-containers.ts) builds a
+          // fresh object holding the pairs' values: nothing else holds it
+          // when nothing else holds the pairs.
+          if (/^%obj\.fromEntries\.dyn\.\d+$/.test(e.callee)) {
+            const a = unwrap(e.args[0]);
+            if (a !== undefined && a.kind === "jsMarshal") return deepFresh(a.value, fn, depth + 1);
+            return uniqueDyn(e.args[0], fn, depth + 1);
+          }
           return /^%view\.\d+$/.test(e.callee) && deepFresh(e.args[0], fn, depth + 1);
         case "varRef": {
           const b = bindings.get(bkey(fn, e.localId));
@@ -3350,7 +3366,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       // A compiled npm package's own JavaScript (SEMANTICS.md S133) takes the
       // JS deferral stance: the observable copy refuses where it RUNS — the
       // crossing ends the program by name — never the program's build.
-      if (npmStaticPackageOfPath(s.loc.file) !== null && s.node !== null && typeof s.node === "object" && typeof (s.node as { kind?: unknown }).kind === "string") {
+      // So does the crossing of a dynamic Object.fromEntries result
+      // (paperclip's removeUndefined<T> in an unreached client command):
+      // a reach-only named stop (SEMANTICS.md S149 (c)).
+      const fromEntriesArg = unwrap(s.arg);
+      const fromEntriesDyn = fromEntriesArg?.kind === "call" && /^%obj\.fromEntries\.dyn\.\d+$/.test(fromEntriesArg.callee);
+      if ((npmStaticPackageOfPath(s.loc.file) !== null || fromEntriesDyn) && s.node !== null && typeof s.node === "object" && typeof (s.node as { kind?: unknown }).kind === "string") {
         const node = s.node as unknown as Record<string, unknown>;
         const orig = { ...node };
         for (const k of Object.keys(node)) delete node[k];

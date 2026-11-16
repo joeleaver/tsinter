@@ -880,7 +880,8 @@ test("R47 UNCLONE: Date, RegExp, Map and Set stop at their existing fences", asy
   // This tier's answer (the existing SC2020 fence); Node prints "true 0\na+ g\n2\ntrue\n" and exits 0.
   const { stdout, stderr } = await runRowTrap("R47", src, "cjs");
   expect(stdout).toBe("");
-  expect(stderr).toBe("tsinter: unsupported: 'new Date' is part of the standard library types but has no scriptc lowering yet [SC2020 at <ROW>:3]\n");
+  // (a Date object is a reach-only named stop since SEMANTICS.md S149)
+  expect(stderr).toBe("tsinter: unsupported: a Date object (new Date(...) as a value; SEMANTICS.md S149) is not supported yet [SC1090 at <ROW>:3]\n");
 });
 
 test("R48 CLONE: a class instance shared with dynamic code clones as a plain object (SEMANTICS.md S115 class instances)", async () => {

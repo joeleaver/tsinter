@@ -10,11 +10,12 @@ import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrPar
 import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
-import { PoisonError, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
+import { nodeThrowExpr, PoisonError, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable, undefinedAsAbsent } from "./lower-exprs.js";
 import { lowerNewArrayLength, lowerSetFromIterable } from "./lower-stdlib-members.js";
 import { lowerSearchParamsNew, lowerUrlBaseArgs } from "./lower-builtins.js";
+import { fencedValue } from "./class-views.js";
 import { requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { STREAM_API_MEMBERS, STREAM_PROP_MEMBERS, UNDERSCORE_METHODS, lowerStreamNew, lowerStreamSuperCall, streamCtorShape } from "./lower-stream.js";
 import { emitOverrideShapeReason, emitSpecSuperForward, emitterRooted, lowerEmitterSuperCall, type EmitOverrideRec } from "./lower-emitter.js";
@@ -5415,6 +5416,20 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       // `new Date(...)` NOT consumed by the composed toISOString lowering
       // (lowerDateCall claims that form before the receiver lowers): Date
       // values have no representation — point at what does compile.
+      // On the WasmGC lanes a Date, FormData or Blob value is the dynamic
+      // value (types.ts) and no such object is ever built: the arguments
+      // evaluate as Node evaluates them, then a named stop -- paperclip's
+      // live in code its workload does not reach (SEMANTICS.md S149).
+      if (symbol && (symbol.name === "Date" || symbol.name === "FormData" || symbol.name === "Blob") &&
+          L.sharedDynamic && (L.isStdlibSymbol(symbol) || L.nodeTypesOnlySymbol(symbol)) && !(expr.arguments ?? []).some((a) => ts.isSpreadElement(a))) {
+        const what = symbol.name === "Date" ? "a Date object (new Date(...) as a value"
+          : symbol.name === "FormData" ? "a FormData object (new FormData()" : "a Blob object (new Blob(...)";
+        const line = ts.getLineAndCharacterOfPosition(expr.getSourceFile(), expr.getStart()).line + 1;
+        const stmts: IrStmt[] = (expr.arguments ?? []).map((a) => ({ kind: "exprStmt", expr: L.lowerExpr(a), loc: locOf(a) }) as IrStmt);
+        const fenced = fencedValue(L, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, "SC1090",
+          `${what}; SEMANTICS.md S149) is not supported yet [SC1090 at ${loc.file}:${line}]`, loc);
+        return stmts.length === 0 ? fenced : { kind: "seqExpr", stmts, result: fenced, type: JSVAL, loc };
+      }
       if (symbol && symbol.name === "Date" && L.isStdlibSymbol(symbol)) {
         L.noLowering(
           "new Date",
@@ -5684,6 +5699,67 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
         (expr.arguments?.length ?? 0) === 0
       ) {
         return { kind: "dynObjLit", builtin: symbol.name as "WeakMap" | "WeakSet", type: DYN, loc };
+      }
+      // zod's module-load `new WeakSet([Object.prototype, Error.prototype])`
+      // (v4/core/errors.js): the untyped stand-in, then add() of each
+      // element in order, as Node's constructor does. A seed that is not an
+      // array at run time stops by name (SEMANTICS.md S149).
+      if (
+        symbol?.name === "WeakSet" &&
+        L.isStdlibSymbol(symbol) &&
+        isJsSourceFile(expr.getSourceFile()) &&
+        expr.arguments?.length === 1 &&
+        !ts.isSpreadElement(expr.arguments[0]!)
+      ) {
+        const seedNode = expr.arguments[0]!;
+        // A binding the checker types as a WeakSet the static build maps
+        // (zod's: WeakSet<Object | Error>, elements the dynamic value):
+        // the typed weak table, seeded element by element from the literal.
+        const wt = L.mapTypeOf(L.typeOf(expr));
+        if (wt?.kind === "set" && wt.weak === true && ts.isArrayLiteralExpression(seedNode) &&
+            !seedNode.elements.some((e) => ts.isSpreadElement(e) || e.kind === ts.SyntaxKind.OmittedExpression)) {
+          const t = L.declareHiddenLocal("%wseed", wt);
+          const tRef: IrExpr = { kind: "varRef", localId: t.id, type: wt, loc };
+          const stmts: IrStmt[] = [{ kind: "varDecl", localId: t.id, init: { kind: "setNew", type: wt, loc }, loc }];
+          // Node evaluates the whole array literal, then adds each element
+          // in order: a primitive or a registered symbol (Symbol.for) throws
+          // its TypeError "Invalid value used in weak set" there. Elements
+          // of a kind the weak table's element type does not hold refuse by
+          // name.
+          const adds: IrStmt[] = [];
+          let thrown = false;
+          for (const e of seedNode.elements) {
+            const v = L.lowerExpr(e);
+            const tmp = L.declareHiddenLocal("%wseedv", v.type);
+            stmts.push({ kind: "varDecl", localId: tmp.id, init: v, loc });
+            if (thrown) continue;
+            const ref: IrExpr = { kind: "varRef", localId: tmp.id, type: v.type, loc };
+            const registered = ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression) &&
+              L.stdlibGlobalMember(e.expression, "Symbol") === "for";
+            const primitive = v.type.kind === "f64" || v.type.kind === "string" || v.type.kind === "bool" || v.type.kind === "bigint" || isUnitType(v.type);
+            if (registered || primitive) {
+              adds.push({ kind: "exprStmt", expr: nodeThrowExpr(1, "", "Invalid value used in weak set", VOID, loc), loc });
+              thrown = true;
+              continue;
+            }
+            // An element of the table's type, or one arm of its union
+            // (`[obj, arr, fn]`), coerces in; a symbol or another kind
+            // refuses by name.
+            const cv = v.type.kind === "symbol" ? null : L.coerceToExpected(ref, wt.elem);
+            if (cv === null || !typeEquals(cv.type, wt.elem)) {
+              L.noLowering(
+                `new WeakSet(array) with a '${L.fmt(v.type)}' element where the set holds '${L.fmt(wt.elem)}'`,
+                e,
+                "construct the WeakSet empty and add() each element",
+              );
+            }
+            adds.push({ kind: "exprStmt", expr: { kind: "setIntrinsic", method: "add", receiver: tRef, args: [cv], type: VOID, loc }, loc });
+          }
+          stmts.push(...adds);
+          return { kind: "seqExpr", stmts, result: tRef, type: wt, loc };
+        }
+        const seed = L.jsvalIn(L.lowerExpr(seedNode), seedNode);
+        return { kind: "call", callee: weakSetSeedHelper(L, loc), args: [seed], type: DYN, loc };
       }
       if (symbol?.name === "Set" && L.isStdlibSymbol(symbol)) {
         const tsType = L.typeOf(expr);
@@ -6191,4 +6267,61 @@ function commaOperandsOf(e: ts.Expression): ts.Expression[] {
     return [...commaOperandsOf(e.left), ...commaOperandsOf(e.right)];
   }
   return [e];
+}
+
+/** `%weakset.seed(a)`: a fresh untyped WeakSet holding each element of the
+ * array `a`, added in order through the WeakSet's own add (a non-object
+ * element throws Node's TypeError there). */
+function weakSetSeedHelper(L: Lowerer, loc: SrcLoc): string {
+  const hit = L.jsinHelpers.get("weakset.seed");
+  if (hit) return hit;
+  const name = `%weakset.seed.${L.jsinHelpers.size}`;
+  L.jsinHelpers.set("weakset.seed", name);
+  const a: IrExpr = { kind: "varRef", localId: "a.0", type: JSVAL, loc };
+  const w: IrExpr = { kind: "varRef", localId: "w.0", type: DYN, loc };
+  const i: IrExpr = { kind: "varRef", localId: "i.0", type: F64, loc };
+  const body: IrStmt[] = [
+    { kind: "varDecl", localId: "w.0", init: { kind: "dynObjLit", builtin: "WeakSet", type: DYN, loc }, loc },
+    {
+      kind: "if",
+      cond: { kind: "unary", op: "!", operand: { kind: "dynTest", test: "array", value: { kind: "dynFromJsval", value: a, type: DYN, loc }, type: BOOL, loc }, type: BOOL, loc } as IrExpr,
+      then: [{ kind: "runtimeFence", code: "SC1090", message: "new WeakSet(iterable) over a value that is not an array (SEMANTICS.md S149) is not supported yet [SC1090 at new WeakSet]", loc } as IrStmt],
+      else_: null,
+      loc,
+    },
+    {
+      kind: "for",
+      init: { kind: "varDecl", localId: "i.0", init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+      cond: {
+        kind: "bin", op: "<", left: i,
+        right: { kind: "jsExit", value: { kind: "jsOp", op: "getProp", name: "length", args: [a], type: JSVAL, loc }, type: F64, loc } as IrExpr,
+        type: BOOL, loc,
+      },
+      update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i, right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc }, loc },
+      body: [{
+        kind: "exprStmt",
+        expr: {
+          kind: "dynInvoke", recv: w, method: "add", calleeName: "WeakSet.prototype.add",
+          args: [{ kind: "dynFromJsval", value: { kind: "jsOp", op: "getIdx", args: [a, { kind: "jsMarshal", value: i, type: JSVAL, loc }], type: JSVAL, loc }, type: DYN, loc }],
+          type: DYN, loc,
+        },
+        loc,
+      }],
+      loc,
+    },
+    { kind: "return", value: w, loc },
+  ];
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "a.0", name: "a", type: JSVAL }],
+    returnType: DYN,
+    locals: [
+      { id: "a.0", name: "a", type: JSVAL, mutable: false },
+      { id: "w.0", name: "w", type: DYN, mutable: false },
+      { id: "i.0", name: "i", type: F64, mutable: true },
+    ],
+    body,
+    loc,
+  });
+  return name;
 }

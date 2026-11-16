@@ -3953,6 +3953,14 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // of lowerCall routed unhandled ones to the chain lowering), so
     // `x?.y(...)` re-dispatches into this same method-call form with the
     // receiver reading back as the chain's bound handle.
+    // The composed Date forms (`new Date(x).toISOString()/getTime()/
+    // getTimezoneOffset()`) before the island dispatch: a Date value is the
+    // dynamic value on the one-world lanes (SEMANTICS.md S149), so the
+    // receiver would otherwise read as an island value and build a Date.
+    if (ts.isPropertyAccessExpression(expr.expression) && ts.isNewExpression(expr.expression.expression)) {
+      const composed = L.lowerDateCall(expr, expr.expression);
+      if (composed) return composed;
+    }
     if (
       ts.isPropertyAccessExpression(expr.expression) &&
       L.isIslandExpr(expr.expression.expression)

@@ -1122,7 +1122,7 @@ export function retsCall(L: Lowerer, info: Es5Info, call: ts.CallExpression): bo
 /* ── builtins as dynamic values: Error, Object, globalThis ─────────── */
 
 /** Error's own statics, readable through the dynamic Error value. */
-const ERROR_STATICS = new Set(["captureStackTrace", "stackTraceLimit", "prepareStackTrace", "isError"]);
+const ERROR_STATICS = new Set(["captureStackTrace", "stackTraceLimit", "prepareStackTrace", "isError", "prototype"]);
 const BOX_BUILTINS = new Set(["Error", "Object", "globalThis"]);
 /** Node v24.18.1's global object's own property names, measured on the
  * reference host (`Object.getOwnPropertyNames(globalThis)`): what `in`

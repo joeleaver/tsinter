@@ -8228,6 +8228,98 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
     return { kind: "call", callee: helper, args: [receiver], type: resultT, loc };
   }
 
+/** `Object.fromEntries(pairs)` built in the dynamic world (paperclip's zod
+   * shapes, its JSON projection and its removeUndefined over a generic
+   * record): the pairs cross into the dynamic value and an interned helper
+   * walks them with the iterator protocol, as Node's fromEntries does —
+   * each entry's [0] is the key and its [1] the value, written in order
+   * onto a fresh plain object (a later duplicate overwrites the value in
+   * place, the first insertion keeping the key's position). The result is
+   * the dynamic object; a typed use crosses it like any dynamic value
+   * (S128). Entry shapes paperclip never produces stop by name
+   * (SEMANTICS.md S149): an entry that is not an object (Node's catchable
+   * "Iterator value … is not an entry object" TypeError), a key that is
+   * neither a string nor a number (a symbol key; an object whose toString
+   * runs), and the "__proto__" key (an own data property in Node, which
+   * the dynamic keyed write would not create). */
+  function lowerFromEntriesDynamic(L: Lowerer, call: ts.CallExpression, argNode: ts.Expression): IrExpr {
+    const loc = locOf(call);
+    const arg = L.jsvalIn(L.lowerExpr(argNode), argNode);
+    const line = ts.getLineAndCharacterOfPosition(call.getSourceFile(), call.getStart()).line + 1;
+    const key = `obj.fromEntriesDyn:${loc.file}:${line}`;
+    let helper = L.arrHofHelpers.get(key);
+    if (!helper) {
+      helper = `%obj.fromEntries.dyn.${L.arrHofHelpers.size}`;
+      L.arrHofHelpers.set(key, helper);
+      const ref = (id: string): IrExpr => ({ kind: "varRef", localId: id, type: JSVAL, loc });
+      const str = (value: string): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
+      const tyOf = (id: string): IrExpr => ({ kind: "jsOp", op: "typeof", args: [ref(id)], type: STRING, loc });
+      const tyIs = (id: string, t: string): IrExpr => ({ kind: "strEq", negated: false, left: tyOf(id), right: str(t), type: BOOL, loc });
+      const or = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "logical", op: "||", left: a, right: b, type: BOOL, loc });
+      const and = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: a, right: b, type: BOOL, loc });
+      const truthy = (e: IrExpr): IrExpr => ({ kind: "jsOp", op: "truthy", args: [e], type: BOOL, loc });
+      const idx = (n: number): IrExpr => ({ kind: "jsMarshal", value: { kind: "numLit", value: n, type: F64, loc }, type: JSVAL, loc });
+      const stop = (what: string): IrStmt => ({
+        kind: "runtimeFence",
+        code: "SC1090",
+        message: `Object.fromEntries with ${what} (SEMANTICS.md S149) is not supported yet [SC1090 at ${loc.file}:${line}]`,
+        loc,
+      } as IrStmt);
+      // An entry is an object: typeof "object" and not null, or a function.
+      const isObj = or(and(tyIs("e.0", "object"), truthy(ref("e.0"))), tyIs("e.0", "function"));
+      const keyOk = or(tyIs("k.0", "string"), tyIs("k.0", "number"));
+      const isProto: IrExpr = { kind: "jsOp", op: "eq", args: [ref("k.0"), { kind: "jsMarshal", value: str("__proto__"), type: JSVAL, loc }], type: BOOL, loc };
+      const i = (): IrExpr => ({ kind: "varRef", localId: "i.0", type: F64, loc });
+      const body: IrStmt[] = [
+        { kind: "varDecl", localId: "out.0", init: { kind: "jsOp", op: "objLit", args: [], type: JSVAL, loc }, loc },
+        {
+          kind: "if",
+          cond: { kind: "unary", op: "!", operand: { kind: "dynTest", test: "array", value: { kind: "dynFromJsval", value: ref("a.0"), type: DYN, loc }, type: BOOL, loc } as IrExpr, type: BOOL, loc } as IrExpr,
+          then: [stop("pairs that are not an array")],
+          else_: null,
+          loc,
+        },
+        {
+          kind: "for",
+          init: { kind: "varDecl", localId: "i.0", init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+          // The LIVE length per step, as Array's iterator reads it.
+          cond: {
+            kind: "bin",
+            op: "<",
+            left: i(),
+            right: { kind: "jsExit", value: { kind: "jsOp", op: "getProp", name: "length", args: [ref("a.0")], type: JSVAL, loc }, type: F64, loc } as IrExpr,
+            type: BOOL,
+            loc,
+          },
+          update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i(), right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc }, loc },
+          body: [
+            { kind: "varDecl", localId: "e.0", init: { kind: "jsOp", op: "getIdx", args: [ref("a.0"), { kind: "jsMarshal", value: i(), type: JSVAL, loc }], type: JSVAL, loc }, loc },
+            { kind: "if", cond: { kind: "unary", op: "!", operand: isObj, type: BOOL, loc } as IrExpr, then: [stop("an entry that is not an object")], else_: null, loc },
+            { kind: "varDecl", localId: "k.0", init: { kind: "jsOp", op: "getIdx", args: [ref("e.0"), idx(0)], type: JSVAL, loc }, loc },
+            { kind: "varDecl", localId: "v.0", init: { kind: "jsOp", op: "getIdx", args: [ref("e.0"), idx(1)], type: JSVAL, loc }, loc },
+            { kind: "if", cond: { kind: "unary", op: "!", operand: keyOk, type: BOOL, loc } as IrExpr, then: [stop("a key that is neither a string nor a number")], else_: null, loc },
+            { kind: "if", cond: isProto, then: [stop("the \"__proto__\" key")], else_: null, loc },
+            { kind: "exprStmt", expr: { kind: "jsOp", op: "setIdx", args: [ref("out.0"), ref("k.0"), ref("v.0")], type: VOID, loc }, loc },
+          ],
+          loc,
+        },
+        { kind: "return", value: ref("out.0"), loc },
+      ];
+      L.liftedFns.push({
+        name: helper,
+        params: [{ localId: "a.0", name: "a", type: JSVAL }],
+        returnType: JSVAL,
+        locals: [
+          ...["a.0", "out.0", "e.0", "k.0", "v.0"].map((id) => ({ id, name: id.split(".")[0]!, type: JSVAL, mutable: false })),
+          { id: "i.0", name: "i", type: F64, mutable: true },
+        ],
+        body,
+        loc,
+      });
+    }
+    return { kind: "call", callee: helper, args: [arg], type: JSVAL, loc };
+  }
+
 /** The pairs argument, lowered, in the array type the checker gave it. The
    * lowering can disagree with the checker (`Object.entries(x).map(...)`
    * where x itself only lowered checked-dynamic — the lowered chain is a
@@ -8261,6 +8353,44 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
     if (callee.name.text !== "fromEntries") return null;
     if (call.arguments.length !== 1 || ts.isSpreadElement(call.arguments[0]!)) return null;
     const argNode = call.arguments[0]!;
+    // The one-world lanes: pairs that lowered to the dynamic value
+    // (`Object.entries(x).map(...)` over a dynamic x) build the dynamic
+    // object (lowerFromEntriesDynamic).
+    if (L.sharedDynamic) {
+      const probed = probeLower(L, argNode);
+      if (probed !== null && (probed.type.kind === "dyn" || probed.type.kind === "jsval")) {
+        return lowerFromEntriesDynamic(L, call, argNode);
+      }
+    }
+    // `Object.fromEntries(KEYS.map(...)) as Record<Key, V>` (paperclip's
+    // permission records): the static result is an index-signature record
+    // that cannot width-coerce into the declared keys, so the one-world
+    // lanes build the dynamic object and the cast checks it (S128).
+    if (L.sharedDynamic) {
+      let up: ts.Node = call.parent;
+      while (ts.isParenthesizedExpression(up)) up = up.parent;
+      if (ts.isAsExpression(up)) {
+        const target = L.mapTypeOf(L.typeOf(up));
+        const shape = target?.kind === "record" ? L.shapes.get(target.shapeId) : undefined;
+        const declaredKeys = target?.kind === "jsval" || (shape !== undefined && !shape.tuple && !shape.indexValue && shape.fields.length > 0);
+        const probed = declaredKeys ? probeLower(L, argNode) : null;
+        if (probed !== null && probed.type.kind === "array") return lowerFromEntriesDynamic(L, call, argNode);
+      }
+    }
+    const fixed = lowerObjectFromEntriesStatic(L, call, argNode);
+    if (fixed !== null || !L.sharedDynamic) return fixed;
+    // The one-world lanes, where the static shapes decline (a literal-union
+    // key, a value outside the index-value kinds, a generic record's
+    // entries, an array literal with spreads): a pairs ARRAY builds the
+    // dynamic object. Other iterables (a Map, a generator) keep the fence.
+    const probed = probeLower(L, argNode);
+    if (probed !== null && probed.type.kind === "array") return lowerFromEntriesDynamic(L, call, argNode);
+    // An argument that does not lower reports its own blocker.
+    if (probed === null) L.lowerExpr(argNode);
+    return null;
+  }
+
+  function lowerObjectFromEntriesStatic(L: Lowerer, call: ts.CallExpression, argNode: ts.Expression): IrExpr | null {
     const argIr = L.mapTypeOf(L.typeOf(argNode));
     if (argIr?.kind !== "array") return null;
     // `Object.fromEntries(rows)` over a `string[][]` VALUE — the env-line
@@ -8301,6 +8431,7 @@ function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
     const convert = (v: IrExpr): IrExpr =>
       typeEquals(valT, iv) ? v : { kind: "dynFrom", value: v, type: DYN, loc };
     if (!convertible) {
+      if (L.sharedDynamic) return null;
       L.unsupported(
         "SC1090",
         call,

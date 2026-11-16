@@ -2337,9 +2337,155 @@ export function lowerUtilModuleCall(
       return lowerFormatCall(L, expr, loc, true);
     case "getCallSites":
       return lowerGetCallSitesCall(L, expr, loc);
+    case "styleText":
+      return lowerStyleTextCall(L, expr, loc);
     default:
       return null;
   }
+}
+
+/** Node v24.18.1's style names: `Object.getOwnPropertyNames(util.inspect.colors)`,
+ * measured on the reference host — what util.styleText accepts (with
+ * "none" and a hex color). */
+const STYLE_NAMES: ReadonlySet<string> = new Set([
+  "reset", "bold", "dim", "italic", "underline", "blink", "inverse", "hidden", "strikethrough",
+  "doubleunderline", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bgBlack",
+  "bgRed", "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "framed", "overlined",
+  "gray", "redBright", "greenBright", "yellowBright", "blueBright", "magentaBright", "cyanBright",
+  "whiteBright", "bgGray", "bgRedBright", "bgGreenBright", "bgYellowBright", "bgBlueBright",
+  "bgMagentaBright", "bgCyanBright", "bgWhiteBright", "grey", "blackBright", "bgGrey", "bgBlackBright",
+  "faint", "crossedout", "strikeThrough", "crossedOut", "conceal", "swapColors", "swapcolors",
+  "doubleUnderline",
+]);
+
+const VOID_T: IrType = { kind: "void" };
+
+/** The shared util.styleText checks (lowerStyleTextCall), interned once
+ * per module: "text" (a dynamic text must be a string; answers it),
+ * "stream" (shouldColorize(process.stdout) must be false), "key" and
+ * "keyDyn" (a run-time format name must be in Node's table). */
+function styleHelper(L: Lowerer, which: "text" | "stream" | "key" | "keyDyn", loc: SrcLoc): string {
+  const memo = `util.styleText:${which}`;
+  const hit = L.jsinHelpers.get(memo);
+  if (hit) return hit;
+  const name = `%util.styleText.${which}.${L.jsinHelpers.size}`;
+  L.jsinHelpers.set(memo, name);
+  const str = (value: string): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
+  const stop = (what: string): IrStmt => ({
+    kind: "runtimeFence",
+    code: "SC1090",
+    message: `util.styleText ${what} (SEMANTICS.md S149) is not supported yet [SC1090 at util.styleText]`,
+    loc,
+  } as IrStmt);
+  const ref = (id: string, type: IrType): IrExpr => ({ kind: "varRef", localId: id, type, loc });
+  const tyOf = (v: IrExpr): IrExpr => ({ kind: "jsOp", op: "typeof", args: [v], type: STRING, loc });
+  const strEq = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "strEq", negated: false, left: a, right: b, type: BOOL, loc });
+  const not = (e: IrExpr): IrExpr => ({ kind: "unary", op: "!", operand: e, type: BOOL, loc } as IrExpr);
+  const anyOf = (v: IrExpr, values: readonly string[]): IrExpr =>
+    values.map((x) => strEq(v, str(x))).reduce((a, b) => ({ kind: "logical", op: "||", left: a, right: b, type: BOOL, loc }));
+  const jsExit = (v: IrExpr): IrExpr => ({ kind: "jsExit", value: v, type: STRING, loc } as IrExpr);
+  let params: { localId: string; name: string; type: IrType }[] = [];
+  let returnType: IrType = VOID_T;
+  let body: IrStmt[] = [];
+  if (which === "text") {
+    params = [{ localId: "t.0", name: "t", type: JSVAL }];
+    returnType = STRING;
+    body = [
+      { kind: "if", cond: not(strEq(tyOf(ref("t.0", JSVAL)), str("string"))), then: [stop("with a text that is not a string")], else_: null, loc },
+      { kind: "return", value: jsExit(ref("t.0", JSVAL)), loc },
+    ];
+  } else if (which === "stream") {
+    const fc = L.coerceToExpected({ kind: "libCall", fn: "process.envGet", args: [str("FORCE_COLOR")], type: L.envValueType(), loc }, JSVAL);
+    const isTty: IrExpr = { kind: "libCall", fn: "process.isTTY", args: [{ kind: "numLit", value: 1, type: F64, loc }], type: BOOL, loc };
+    body = [
+      { kind: "varDecl", localId: "fc.0", init: fc, loc },
+      {
+        kind: "if",
+        cond: strEq(tyOf(ref("fc.0", JSVAL)), str("string")),
+        then: [{ kind: "if", cond: anyOf(jsExit(ref("fc.0", JSVAL)), ["", "1", "true", "2", "3"]), then: [stop("colorizing (FORCE_COLOR asks for colors)")], else_: null, loc }],
+        else_: [{ kind: "if", cond: isTty, then: [stop("colorizing (stdout is a terminal)")], else_: null, loc }],
+        loc,
+      },
+    ];
+  } else if (which === "key") {
+    params = [{ localId: "k.0", name: "k", type: STRING }];
+    body = [{ kind: "if", cond: not(anyOf(ref("k.0", STRING), ["none", ...STYLE_NAMES])), then: [stop("with a format outside Node's style names (or a hex color)")], else_: null, loc }];
+  } else {
+    params = [{ localId: "k.0", name: "k", type: JSVAL }];
+    body = [
+      { kind: "if", cond: not(strEq(tyOf(ref("k.0", JSVAL)), str("string"))), then: [stop("with a format that is not a style name string")], else_: null, loc },
+      { kind: "exprStmt", expr: { kind: "call", callee: styleHelper(L, "key", loc), args: [jsExit(ref("k.0", JSVAL))], type: VOID_T, loc }, loc },
+    ];
+  }
+  const locals = [
+    ...params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: false })),
+    ...(which === "stream" ? [{ id: "fc.0", name: "fc", type: JSVAL, mutable: false }] : []),
+  ];
+  L.liftedFns.push({ name, params, returnType, locals, body, loc });
+  return name;
+}
+
+/** `util.styleText(format, text)` — the two-argument form @clack/prompts
+ * calls (SEMANTICS.md S149 (d)). Node's default `validateStream` checks
+ * process.stdout: with FORCE_COLOR unset and stdout not a terminal (every
+ * piped run) it answers `text` unchanged, after validating each format
+ * name; that is exact here. A run that would colorize — stdout a terminal,
+ * or FORCE_COLOR set to a coloring level ("", "1", "true", "2", "3") —
+ * stops by name, as does a run-time format name outside Node's table, a
+ * hex color, or a format/text that is not a string (Node throws its
+ * catchable ERR_INVALID_ARG_VALUE / ERR_INVALID_ARG_TYPE there). A literal
+ * format name outside the table refuses at compile time. Null (the module
+ * fence) for the options form. */
+function lowerStyleTextCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrExpr | null {
+  const args = expr.arguments;
+  if (args.length !== 2 || args.some((a) => ts.isSpreadElement(a))) return null;
+  const fmtNode = args[0]!;
+  const textNode = args[1]!;
+  const literalKey = (n: ts.Expression): boolean => {
+    if (!ts.isStringLiteralLike(n)) return false;
+    if (n.text !== "none" && !STYLE_NAMES.has(n.text)) {
+      L.noLowering(`util.styleText with the format '${n.text}'`, n, "Node's style names (util.inspect.colors), 'none'; hex colors are not lowered");
+    }
+    return true;
+  };
+  const stmts: IrStmt[] = [];
+  const temp = (e: IrExpr): IrExpr => {
+    const t = L.declareHiddenLocal("%style", e.type);
+    stmts.push({ kind: "varDecl", localId: t.id, init: e, loc });
+    return { kind: "varRef", localId: t.id, type: e.type, loc };
+  };
+  // Node evaluates the format (an array literal's elements in order), then
+  // the text, before styleText validates anything.
+  const keys: IrExpr[] = [];
+  const keyOf = (n: ts.Expression): void => {
+    if (literalKey(n)) return;
+    const v = L.lowerExpr(n);
+    if (v.type.kind !== "string" && v.type.kind !== "jsval") {
+      L.noLowering(`util.styleText with a '${L.fmt(v.type)}' format`, n, "a style name string or an array literal of them");
+    }
+    keys.push(temp(v));
+  };
+  if (ts.isArrayLiteralExpression(fmtNode)) {
+    if (fmtNode.elements.some((e) => ts.isSpreadElement(e) || e.kind === ts.SyntaxKind.OmittedExpression)) {
+      L.noLowering("util.styleText with a spread format array", fmtNode);
+    }
+    for (const e of fmtNode.elements) keyOf(e);
+  } else {
+    keyOf(fmtNode);
+  }
+  const textV = L.lowerExpr(textNode);
+  if (textV.type.kind !== "string" && textV.type.kind !== "jsval") {
+    L.noLowering(`util.styleText with a '${L.fmt(textV.type)}' text`, textNode, "the text is a string");
+  }
+  const text = temp(textV);
+  // The checks live in shared helpers (a sequence expression holds only
+  // straight-line statements): the text's kind, the stream, each run-time
+  // format name.
+  const call = (name: "text" | "stream" | "key" | "keyDyn", a: IrExpr[], type: IrType): IrExpr => ({ kind: "call", callee: styleHelper(L, name, loc), args: a, type, loc });
+  const textStr = text.type.kind === "jsval" ? temp(call("text", [text], STRING)) : text;
+  stmts.push({ kind: "exprStmt", expr: call("stream", [], VOID_T), loc });
+  for (const k of keys) stmts.push({ kind: "exprStmt", expr: call(k.type.kind === "jsval" ? "keyDyn" : "key", [k], VOID_T), loc });
+  return { kind: "seqExpr", stmts, result: textStr, type: STRING, loc };
 }
 
 /** util.getCallSites() in a JS source: compiled binaries keep no runtime

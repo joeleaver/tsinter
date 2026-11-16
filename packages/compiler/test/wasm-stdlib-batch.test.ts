@@ -6,7 +6,7 @@
  * the second describe, on the wasm-native lane, or stops by name where
  * noted. */
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -39,6 +39,12 @@ interface Row {
   refusedMsg?: string;
   /** Other files written beside the entry (name -> source). */
   extra?: Record<string, string>;
+  /** A project with @types/node (the vendored tests/fixtures/node-types
+   * copy) and a strict tsconfig, as paperclip has. */
+  nodeTypes?: boolean;
+  /** Environment changes for the run, Node's and the tier's alike (a
+   * string sets the variable, undefined removes it). */
+  env?: Record<string, string | undefined>;
 }
 
 const ROWS: Row[] = [
@@ -215,25 +221,255 @@ console.log("after");
 await fs.unlink(link);`,
     fence: "fs/promises symlink",
   },
+  {
+    id: "SB-08 Date values in code the run never reaches build (paperclip's backup keys, seed timestamps, token expiry); Date.parse of strings and a Date-typed member holding JSON's string run as Node does",
+    nodeTypes: true,
+    src: `function timestamp(date: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return \`\${date.getFullYear()}\${pad(date.getMonth() + 1)}\${pad(date.getDate())}-\${pad(date.getHours())}\`;
+}
+function isoWeekKey(date: Date): string {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return \`\${d.getUTCFullYear()}-W\${Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7)}\`;
+}
+function startAttempt(path: string, now = new Date()): { path: string; at: string } {
+  return { path, at: now.toISOString() };
+}
+function resolveExpiresAt(opts: { neverExpires?: boolean; expiresAt?: string; ttlDays?: string }): Date | null | undefined {
+  if (opts.neverExpires) return null;
+  if (opts.expiresAt?.trim()) {
+    const date = new Date(opts.expiresAt.trim());
+    if (!Number.isFinite(date.getTime())) throw new Error(\`Invalid --expires-at value: \${opts.expiresAt}\`);
+    return date;
+  }
+  if (opts.ttlDays?.trim()) return new Date(Date.now() + Number(opts.ttlDays) * 86400000);
+  return undefined;
+}
+const str = (value: unknown, max = 160): string | null =>
+  typeof value === "string" && value.length > 0 ? value.slice(0, max) : null;
+const iso = (value: unknown): string | null => {
+  const text = str(value, 64);
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
+};
+if (process.argv.length > 99) console.log(timestamp(), isoWeekKey(new Date(0)), startAttempt("x").at);
+console.log(iso("2026-01-02T03:04:05Z"), iso("2026-01-02"), iso("never"), iso(5), iso(""));
+console.log(Date.parse("2026-11-16T00:00:00.000Z"), Date.parse("Jul  1 00:00:00 2026 GMT"));
+console.log(resolveExpiresAt({ neverExpires: true }), resolveExpiresAt({}));
+type Row = { name: string; createdAt: Date; pausedAt: Date | null };
+const row = JSON.parse('{"name":"acme","createdAt":"2026-01-01T00:00:00.000Z","pausedAt":null}') as Row;
+console.log(row.name, typeof row.createdAt, row.createdAt, row.pausedAt === null);`,
+  },
+  {
+    id: "SB-09 a Date object reached stops by name after its arguments evaluate",
+    nodeTypes: true,
+    src: `function ms(): number { console.log("arg evaluated"); return 0; }
+console.log("before");
+const d = new Date(ms());
+console.log(d.getTime());`,
+    fence: "new Date(...) as a value",
+  },
+  {
+    id: "SB-10 FormData and Blob in code the run never reaches build (paperclip's attachment and asset uploads)",
+    nodeTypes: true,
+    src: `async function uploadAsset(apiBase: string, bytes: Uint8Array, file: string, opts: { namespace?: string; title?: string }): Promise<number> {
+  const form = new FormData();
+  form.set("file", new Blob([bytes], { type: "image/png" }), file.split(/[\\\\/]/).pop() ?? "asset");
+  if (opts.namespace?.trim()) form.set("namespace", opts.namespace.trim());
+  if (opts.title?.trim()) form.set("title", opts.title.trim());
+  const response = await fetch(apiBase + "/api/assets", { method: "POST", body: form });
+  return response.status;
+}
+if (process.argv.length > 99) void uploadAsset("http://x", new Uint8Array(1), "a.png", {});
+console.log("built");`,
+  },
+  {
+    id: "SB-11 new FormData() reached stops by name",
+    nodeTypes: true,
+    src: `console.log("before");
+const form = new FormData();
+form.set("a", "b");
+console.log("after");`,
+    fence: "new FormData()",
+  },
+  {
+    id: "SB-12 Object.fromEntries over pairs the static shapes decline (paperclip's connector scopes and permission records): Node's object, key order and duplicate rule",
+    nodeTypes: true,
+    src: `const auth = (s: string) => \`https://www.googleapis.com/auth/\${s}\`;
+const one = (a: string, b?: string) => [(b === undefined ? [a] : [a, b]).map(auth)];
+// (an object type, not Record<Service, …>: GH #235 orders a Record's keys)
+const toolScopes: { gmail: Record<string, string[][]>; drive: Record<string, string[][]> } = {
+  gmail: Object.fromEntries([
+    ...["get_message", "get_thread", "list_labels"].map((name) => [name, one("gmail.readonly")]),
+    ["create_draft", one("gmail.compose")],
+    ["get_thread", one("gmail.modify")],
+  ]),
+  drive: Object.fromEntries([
+    ...["read_file_content"].map((name) => [name, one("drive.readonly")]),
+    ...["copy_file", "create_file"].map((name) => [name, one("drive.file", "drive")]),
+  ]),
+};
+console.log(JSON.stringify(toolScopes), Object.keys(toolScopes.gmail).join(","));
+const KEYS = ["canAssign", "canMention", "canEdit"] as const;
+type Key = (typeof KEYS)[number];
+function resolvePerms(value: unknown): Record<Key, boolean> {
+  const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return Object.fromEntries(KEYS.map(key => [key, record[key] !== false])) as Record<Key, boolean>;
+}
+const perms = resolvePerms({ canMention: false });
+console.log(JSON.stringify(perms), perms.canEdit, perms.canMention);`,
+  },
+  {
+    id: "SB-13 a dynamic Object.fromEntries entry that is not an object stops by name",
+    nodeTypes: true,
+    src: `const rows = JSON.parse('[["a",1],5]') as any;
+console.log("before");
+try {
+  console.log(Object.fromEntries(rows));
+} catch (e) {
+  console.log("caught", e instanceof TypeError);
+}`,
+    fence: "an entry that is not an object",
+  },
+  {
+    id: "SB-14 util.styleText on a piped stdout with FORCE_COLOR unset (@clack/prompts' calls): the text unchanged, as Node answers it",
+    nodeTypes: true,
+    env: { FORCE_COLOR: undefined, NO_COLOR: undefined, NODE_DISABLE_COLORS: undefined },
+    src: `import { styleText } from "node:util";
+import { bar } from "./bar.js";
+const S_BAR = "│";
+const pick = (ok: boolean) => (ok ? "cyan" : "dim");
+console.log(styleText("gray", S_BAR), styleText(["strikethrough", "dim"], "gone"), styleText(pick(false), "[ submit ]"));
+console.log(styleText(["gray", "bgWhite", "inverse"], " space "), styleText("none", "plain"), JSON.stringify(styleText("red", "")));
+const name = process.argv.length > 99 ? "blue" : "magenta";
+console.log(styleText(name, "m"), bar("error"), bar("active"));`,
+    extra: {
+      "bar.js": `import { styleText } from "node:util";
+export function bar(state) {
+  const color = state === "error" ? "yellow" : "cyan";
+  return styleText(color, "|") + styleText("dim", \`(\${state})\`);
+}`,
+    },
+  },
+  {
+    id: "SB-15 util.styleText that would colorize (FORCE_COLOR=1) stops by name",
+    nodeTypes: true,
+    env: { FORCE_COLOR: "1", NO_COLOR: undefined, NODE_DISABLE_COLORS: undefined },
+    src: `import { styleText } from "node:util";
+console.log("before");
+console.log(styleText("green", "ok"));`,
+    fence: "util.styleText colorizing",
+  },
+  {
+    id: "SB-16 removeUndefined<T> (paperclip's teams policy records) in code the run never reaches builds",
+    nodeTypes: true,
+    src: `function removeUndefined<T extends Record<string, unknown>>(input: T): T {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;
+}
+function policy(name: string | undefined, mode: string | undefined, overrides: Record<string, { adapterConfig: Record<string, unknown> }> | undefined) {
+  return removeUndefined({ name, mode, adapterOverrides: overrides });
+}
+if (process.argv.length > 99) console.log(JSON.stringify(policy("n", undefined, undefined)));
+console.log("built");`,
+  },
+  {
+    id: "SB-17 removeUndefined<T> reached stops by name at the result's crossing",
+    nodeTypes: true,
+    src: `function removeUndefined<T extends Record<string, unknown>>(input: T): T {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;
+}
+const shared = { a: { x: 1 } };
+console.log("before");
+const out = removeUndefined({ name: "n", mode: undefined as string | undefined, adapterOverrides: shared });
+console.log(out.adapterOverrides === shared, JSON.stringify(out));`,
+    fence: "it would be a COPY",
+  },
+  {
+    id: "SB-18 a JavaScript module-load new WeakSet([...]) (the shape of zod's v4/core/errors.js): the seeded set, Node's has/add",
+    nodeTypes: true,
+    src: `import { check } from "./zerr.js";
+console.log(check());`,
+    extra: {
+      "zerr.js": `const seeded = {};
+const installed = /* @__PURE__ */ new WeakSet([Object.prototype, seeded]);
+const own = {};
+export function check() {
+  const before = [installed.has(Object.prototype), installed.has(seeded), installed.has(own)];
+  installed.add(own);
+  return before.join(",") + " " + installed.has(own);
+}`,
+    },
+  },
+  {
+    id: "SB-18b a JavaScript new WeakSet([...]) with a registered symbol or a primitive throws Node's TypeError",
+    nodeTypes: true,
+    src: `import { tries } from "./ws.js";
+console.log(tries());`,
+    extra: {
+      "ws.js": `function a() { return new WeakSet([Symbol.for("x")]); }
+function b() { return new WeakSet([{}, 3]); }
+export function tries() {
+  const out = [];
+  try { a(); out.push("ok"); } catch (e) { out.push(String(e instanceof TypeError) + " " + e.message); }
+  try { b(); out.push("ok"); } catch (e) { out.push(String(e instanceof TypeError) + " " + e.message); }
+  return out.join(" | ");
+}`,
+    },
+  },
+  {
+    id: "SB-18c a JavaScript new WeakSet([...]) of an object, an array and a function (no internal error)",
+    nodeTypes: true,
+    src: `import { mixed } from "./wm.js";
+console.log(mixed());`,
+    extra: {
+      "wm.js": `export function mixed() {
+  const w = new WeakSet([{ a: 1 }, [1, 2], function f() {}]);
+  return typeof w;
+}`,
+    },
+  },
+  {
+    id: "SB-19 Error.prototype read in JavaScript stops by name (GH #238: it read undefined)",
+    nodeTypes: true,
+    src: `import { protos } from "./p.js";
+console.log("before");
+console.log(protos());`,
+    extra: { "p.js": `export function protos() { return typeof Error.prototype; }` },
+    fence: "Error.prototype read through the Error constructor",
+  },
 ];
 
 function write(row: Row, backend: string): string {
   const dir = join(scratch, `${row.id.split(" ")[0]}-${backend}`);
   mkdirSync(dir, { recursive: true });
   const entry = join(dir, row.entry ?? "main.ts");
+  if (row.nodeTypes === true) {
+    symlinkSync(join(import.meta.dirname, "../../../tests/fixtures/node-types/node_modules"), join(dir, "node_modules"));
+    writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, skipLibCheck: true, allowJs: true } }));
+  }
   writeFileSync(entry, row.src + "\n");
   for (const [name, text] of Object.entries(row.extra ?? {})) writeFileSync(join(dir, name), text + "\n");
   return entry;
 }
 
-function nodeRun(file: string): Out {
-  const r = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
+function envOf(row: Row): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [k, v] of Object.entries(row.env ?? {})) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return env;
+}
+
+function nodeRun(file: string, env: NodeJS.ProcessEnv): Out {
+  const r = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "", env });
   return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
 }
 
-async function nativeRun(path: string): Promise<Out> {
+async function nativeRun(path: string, env: NodeJS.ProcessEnv): Promise<Out> {
   try {
-    const p = run(path, [], { encoding: "utf8" });
+    const p = run(path, [], { encoding: "utf8", env });
     p.child.stdin?.end();
     const r = await p;
     return { stdout: r.stdout, stderr: r.stderr, exitCode: 0 };
@@ -253,14 +489,16 @@ async function check(row: Row, backend: "wasm" | "wasm-native"): Promise<void> {
     return;
   }
   if (!res.ok) throw new Error(`${row.id} refused on ${backend}: ${JSON.stringify(res.diagnostics)}`);
-  const node = nodeRun(entry);
+  const env = envOf(row);
+  const host = row.env ? { env: Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined) } : undefined;
+  const node = nodeRun(entry, env);
   const got: Out = backend === "wasm"
-    ? await runWasm(res.binaryPath!).then(
+    ? await runWasm(res.binaryPath!, host).then(
         (r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: r.exitCode }),
         // A trap is the tier's exit-1 channel: compare what it printed.
-        () => runWasmToTrap(res.binaryPath!).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: 1 })),
+        () => runWasmToTrap(res.binaryPath!, host).then((r) => ({ stdout: String(r.stdout), stderr: String(r.stderr), exitCode: 1 })),
       )
-    : await nativeRun(res.binaryPath!);
+    : await nativeRun(res.binaryPath!, env);
   if (row.fence !== undefined) {
     expect(node.exitCode).toBe(0);
     expect(got.exitCode, row.id).not.toBe(0);

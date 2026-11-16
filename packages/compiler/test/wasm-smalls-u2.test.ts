@@ -586,12 +586,10 @@ test("row58 [plain]: join with ZERO arguments joins with \",\" (Step 2B; the ari
   expect(out).toBe("1,0,NaN\n");
 });
 
-test("row59 B-i [plain]: an array of Date (element does not compile) — the EXACT two-diagnostic set, an explicit separator so the arity fence never fires here (row58 alone owns it)", async () => {
-  const diags = await runRowRefuse("row59", 'const a: Date[] = [new Date(0)]; console.log(a.join(","));', false);
-  expect(diags).toEqual([
-    "SC2009:values of type 'Date[]' cannot be compiled: the array shape is supported, but its element type 'Date' does not compile",
-    "SC2020:'Date[].join' is part of the standard library types but has no scriptc lowering yet",
-  ]);
+test("row59 [plain]: an array of Date builds (a Date value is the dynamic value) and its Date object stops by name (SEMANTICS.md S149)", async () => {
+  const { stdout, stderr } = await runRowTrap("row59", 'const a: Date[] = [new Date(0)]; console.log(a.join(","));');
+  expect(stdout).toBe("");
+  expect(stderr).toContain("tsinter: unsupported: a Date object (new Date(...) as a value; SEMANTICS.md S149) is not supported yet [SC1090 at ");
 });
 
 test("row60 [plain]: a (bigint|null)[] union joins (BigInt unit: the decimal text, null empty)", async () => {

@@ -7045,6 +7045,17 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       }
       return { kind: "libCall", fn: "date.utc", args, type: F64, loc };
     }
+    // Date.parse(string) (paperclip's expiry checks): exactly the composed
+    // `new Date(string).getTime()` read -- the same bounded grammar, the
+    // same S069 fence outside it. Other argument kinds keep the refusal.
+    if (L.stdlibGlobalMember(access, "Date") === "parse") {
+      if (call.arguments.length !== 1 || ts.isSpreadElement(call.arguments[0]!)) return null;
+      const arg = L.lowerExpr(call.arguments[0]!);
+      if (arg.type.kind !== "string") {
+        L.noLowering(`Date.parse of '${L.fmt(arg.type)}' values`, call.arguments[0]!, "Date.parse lowers for string arguments");
+      }
+      return { kind: "libCall", fn: "date.parseGetTime", args: [arg], type: F64, loc };
+    }
     if (access.name.text !== "toISOString" && access.name.text !== "getTime" && access.name.text !== "getTimezoneOffset") return null;
     const recv = access.expression;
     if (!ts.isNewExpression(recv) || !ts.isIdentifier(recv.expression)) return null;
