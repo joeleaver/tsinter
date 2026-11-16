@@ -37,7 +37,7 @@ import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
 import { isDtsMirrorPath, npmStaticPackageOfPath } from "../npm-static.js";
 import { dtsCallResult } from "./lower-dts.js";
-import { classViewOf, viewableClass } from "./class-views.js";
+import { classViewOf, fencedValue, viewableClass } from "./class-views.js";
 import { lowerVoidTernaryStatement } from "./lower-stmts.js";
 import { onlyStubTouches } from "./stub-builtins.js";
 
@@ -3185,6 +3185,23 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
 }
 
 function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
+    // `import.meta.resolve(specifier)`: a module's resolution at run time,
+    // which a compiled program does not carry (paperclip's `runtime setup`
+    // / `import-remote` commands). The arguments evaluate as Node evaluates
+    // them, then a named runtime stop -- the build continues and only a
+    // run that reaches the call stops (SEMANTICS.md S139's amendment).
+    {
+      const callee = expr.expression;
+      if (ts.isPropertyAccessExpression(callee) && callee.name.text === "resolve" && ts.isMetaProperty(callee.expression) &&
+          callee.expression.keywordToken === ts.SyntaxKind.ImportKeyword && callee.expression.name.text === "meta") {
+        const loc = locOf(expr);
+        const line = ts.getLineAndCharacterOfPosition(expr.getSourceFile(), expr.getStart()).line + 1;
+        const stmts: IrStmt[] = expr.arguments.map((a) => ({ kind: "exprStmt", expr: L.lowerExpr(a), loc: locOf(a) }) as IrStmt);
+        const fenced = fencedValue(L, { kind: "strLit", value: "", type: STRING, loc }, "SC1090",
+          `import.meta.resolve(specifier) (a module resolution at run time, which a compiled program does not carry; SEMANTICS.md S139) is not supported yet [SC1090 at ${loc.file}:${line}]`, loc);
+        return stmts.length === 0 ? fenced : { kind: "seqExpr", stmts, result: fenced, type: STRING, loc };
+      }
+    }
     // `Error.captureStackTrace(this, …)` over a statically typed error
     // instance (commander's error constructors) before any receiver path
     // takes `Error` as a value (units U3 + U4's box).

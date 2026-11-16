@@ -2985,6 +2985,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_url_protocol(${arg(0)})`);
           case "url.host":
             return finish(`scr_url_host(${arg(0)})`);
+          case "url.username":
+          case "url.password":
+            throw new Error(`${fn} is lowered for the WasmGC lanes only (use --backend wasm)`);
           case "url.hostname":
             return finish(`scr_url_hostname(${arg(0)})`);
           case "url.pathname":
@@ -5099,6 +5102,12 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_fsp_mkdir_recursive(${arg(0)})`);
           case "fsp.mkdirRecursiveMode":
             return finish(`scr_fsp_mkdir_recursive_mode(${arg(0)}, ${arg(1)})`);
+          case "fsp.realpath":
+          case "fsp.mkdtemp":
+          case "fsp.copyFile":
+          case "fsp.access":
+          case "fsp.rmOpts":
+            throw new Error(`${fn} is lowered for the WasmGC lanes only (use --backend wasm)`);
           case "fsp.unlink":
             return finish(`scr_fsp_unlink(${arg(0)})`);
           case "fsp.chmod":
