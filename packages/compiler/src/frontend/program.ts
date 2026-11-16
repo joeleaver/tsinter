@@ -45,7 +45,7 @@ import { directiveCovers, hasSuppression, suppressedWriteSites } from "./ts-dire
 import { libHost } from "./lib-host.js";
 import { wasmLibCapabilityDiag } from "../diagnostics/diagnostic.js";
 import { builtinModules } from "node:module";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import * as ts from "./ts7/adapter.js";
@@ -421,6 +421,7 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // its JS joins as a root.
   registerDtsViewsFromGraph(dev.bareSites);
   registerDtsSubpathViews(dev.bareSpecs);
+  registerDtsViewsFromDeclarations(dev.bareSites);
   const dtsPaths = npmStaticDtsPaths();
   if (dtsPaths !== null) options = { ...options, paths: { ...(options.paths ?? {}), ...dtsPaths } };
   // Per-package options (SEMANTICS.md S136): each file is checked under its
@@ -745,6 +746,63 @@ function registerDtsSubpathViews(bareSpecs: ReadonlyMap<string, string>): void {
     const pkg = packagePrefixOf(spec);
     if (pkg === spec || !isNpmStaticPackage(pkg)) continue;
     registerDtsView(fromFile, pkg, spec);
+  }
+}
+
+/** SEMANTICS.md S133 (m): a viewed package's declarations that import
+ * another opted-in package (@clack/prompts' `index.d.mts` naming
+ * @clack/core's types) type against that package's DECLARATIONS too: under
+ * its inferred surface the type-only names the declarations import do not
+ * exist, and the program fails to typecheck. The dependency gets a view of
+ * its own, resolved from the declaring package's location (its copy), when
+ * the declaring package's JavaScript imports it as well, so Node loads it;
+ * a reference only the types make brings no JS in. To a fixpoint (a chain
+ * of packages). When the declaring packages (or the program's own import
+ * sites) resolve the dependency to DIFFERENT copies, no view is registered
+ * and the note names the copies, as registerDtsViewsFromGraph does. */
+function registerDtsViewsFromDeclarations(bareSites: ReadonlyMap<string, readonly { file: string; kind: "import" | "require"; typeOnly: boolean }[]>): void {
+  const BARE = /\b(?:from\s*|import\s*\(\s*|import\s+|require\s*\(\s*)["']([^"'./][^"']*)["']/g;
+  const specsOf = (file: string): Set<string> => {
+    const out = new Set<string>();
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      return out;
+    }
+    for (const m of text.matchAll(BARE)) if (!m[1]!.startsWith("node:")) out.add(m[1]!);
+    return out;
+  };
+  const seen = new Set<string>();
+  const refused = new Set<string>();
+  for (let changed = true; changed;) {
+    changed = false;
+    // The candidates this round: dependency specifier → the declaring
+    // packages' entries that import it (types and JS both).
+    const from = new Map<string, string[]>();
+    for (const view of [...npmStaticDtsViews().values()]) {
+      if (seen.has(view.specifier)) continue;
+      seen.add(view.specifier);
+      const runtime = new Set<string>();
+      for (const js of view.jsEntries) for (const s of specsOf(js)) runtime.add(s);
+      for (const spec of specsOf(view.typesEntry)) {
+        const pkg = packagePrefixOf(spec);
+        if (pkg === view.pkg || !isNpmStaticPackage(pkg) || npmStaticDtsViews().has(spec) || !runtime.has(spec) || refused.has(spec)) continue;
+        from.set(spec, [...(from.get(spec) ?? []), view.typesEntry]);
+      }
+    }
+    for (const [spec, files] of from) {
+      const pkg = packagePrefixOf(spec);
+      const sites = [...files, ...(bareSites.get(spec) ?? []).filter((s) => !s.typeOnly).map((s) => s.file)];
+      const roots = new Set(sites.map((f) => dtsViewFrom(f, pkg, "import")?.typesRoot).filter((r): r is string => r !== undefined));
+      if (roots.size > 1) {
+        refused.add(spec);
+        setNpmStaticDtsViewRefusal(pkg, `its importers resolve to different copies of it (${[...roots].join(", ")})`);
+        continue;
+      }
+      registerDtsView(files[0]!, pkg, spec);
+      if (npmStaticDtsViews().has(spec)) changed = true;
+    }
   }
 }
 
