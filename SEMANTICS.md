@@ -10846,6 +10846,27 @@ not build:
   member is carried by the class's own or inherited method of exactly that
   signature (not abstract, async or a generator), so the body reads, writes
   and calls through the caller's object, as in Node.
+- **Hybrids and arrays of records into a plain function (paperclip's
+  config and plan helpers, 2026-11-16).** (a)'s per-call-site instance
+  also takes: a hybrid record (declared fields plus an `unknown` index
+  signature, paperclip's config) into a record type whose fields it
+  carries (`Pick<PaperclipConfig, "secrets">`); a hybrid into
+  `Record<string, unknown>` (the managed-agent checks); and an ARRAY of
+  wider records into an array-of-record parameter
+  (`summarizePlanCounts(plans: Array<{ action: … }>)`, `toKeySet`), when
+  the body uses the array only as `xs.length`, `xs.forEach(cb)`,
+  `xs.map(cb)` with a primitive result, or `xs.filter(cb).length` with an
+  inline callback, whose unannotated element parameter is bound to the
+  caller's element the same way (an element read, iteration, `slice`,
+  `sort` or a kept filter result keeps the judged copy). The body reads
+  and writes the caller's object or elements, as in Node; a write through
+  the `Record<string, unknown>` view that would change a declared field's
+  type is the hybrid's runtime fence (SC1090/SC1100), as for any write to
+  the hybrid. A parameter (or callback element) the body casts (`p as T`)
+  is not bound, and a body the instance cannot lower keeps the judged
+  copy (and its refusal). A function RESULT of the wider type (`return
+  existing` into `Promise<Record<string, unknown>>`) is still a copy
+  judged by (c).
 - **A width copy that is printed (GH #222).** A dynamic value checked into
   a closed record type (or an array of one) keeps only the type's declared
   fields, where the JavaScript object keeps every key. (c) now counts a

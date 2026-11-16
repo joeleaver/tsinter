@@ -343,4 +343,63 @@ console.log(isKept(collect), same(collect, collect));
 const r = option(collect, ["x"]);
 console.log(r.r2, collect("direct"));`,
   },
+  { id: "S125-A5-01 (paperclip managed-agent) a hybrid into Record<string, unknown> passed onward, with Record writes elsewhere", entry: "main.ts", src: `type RemoteResource = { id?: string; [key: string]: unknown };
+function record(v: unknown): Record<string, unknown> { return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {}; }
+function modelOf(agent: Record<string, unknown>): unknown { return typeof agent.model === "string" ? agent.model : record(agent.model).id; }
+function assertSafeManagedAgent(agent: Record<string, unknown>): void {
+  if (agent.archived_at !== null || modelOf(agent) !== "m1") throw new Error("unsafe");
+}
+function findAgent(): RemoteResource { return { id: "a1", archived_at: null, model: "m1" }; }
+const existing = findAgent();
+assertSafeManagedAgent(existing);
+const bag: Record<string, unknown> = {};
+bag.k = 1;
+console.log(existing.id, bag, existing);` },
+  {
+    id: "S125-A5-02 (paperclip ensureLocalSecretsKeyFile) the hybrid config into a Pick, passed onward, with writes to the Pick type", entry: "main.ts", src: `type Config = { secrets: { provider: string; keyFilePath: string }; server: { port: number }; [key: string]: unknown };
+function keyPath(c: Pick<Config, "secrets">): string { return c.secrets.keyFilePath; }
+function ensureKey(config: Pick<Config, "secrets">, configPath?: string): string {
+  if (config.secrets.provider !== "local") return "skipped";
+  return keyPath(config) + (configPath ?? "");
+}
+function readConfig(): Config { return { secrets: { provider: "local", keyFilePath: "/k" }, server: { port: 1 } }; }
+const cfg = readConfig();
+console.log(ensureKey(cfg, "/c"));
+const p: Pick<Config, "secrets"> = { secrets: { provider: "x", keyFilePath: "" } };
+p.secrets = { provider: "y", keyFilePath: "z" };
+console.log(p);` },
+  {
+    id: "S125-A5-03 (paperclip summarizePlanCounts) an array of wider records into a literal-union element type, filtered", entry: "main.ts", src: `interface Plan { action: "create" | "update" | "skip"; slug: string; reason: string | null }
+function summarize(plans: Array<{ action: "create" | "update" | "skip" }>, noun: string): string {
+  return plans.filter((p) => p.action === "create").length + " " + noun + " of " + plans.length;
+}
+const plans: Plan[] = [{ action: "create", slug: "a", reason: null }, { action: "skip", slug: "b", reason: "x" }];
+const ps: { action: "create" | "update" | "skip" }[] = [{ action: "update" }];
+ps[0]!.action = "skip";
+console.log(summarize(plans, "agent"), ps);
+plans[0]!.action = "update";
+console.log(summarize(plans, "agent"), plans);` },
+  {
+    id: "S125-A5-04 (paperclip toKeySet) an array of wider records into Array<{ key: string }>, mapped to its keys, with writes of the element type elsewhere", entry: "main.ts", src: `type Option = { key: string; label: string; hint?: string; files: string[] };
+function toKeySet(items: Array<{ key: string }>): Set<string> {
+  return new Set(items.map((item) => item.key));
+}
+const projects: Option[] = [{ key: "p1", label: "P1", files: ["a"] }, { key: "p2", label: "P2", hint: "h", files: [] }];
+const keys = toKeySet(projects);
+const ks: { key: string }[] = [{ key: "z" }];
+ks[0]!.key = "y";
+projects[0]!.key = "p9";
+console.log(keys, ks, projects, toKeySet(projects));` },
+  {
+    id: "S125-A5-05 (review V04) a hybrid into Record<string, unknown> whose body casts the parameter keeps the copy, refused by name", entry: "main.ts", src: `type R = { id?: string; count: number; name: string; [k: string]: unknown };
+function f(r: Record<string, unknown>) { (r as Record<string, unknown>).t = 2; }
+const x: R = { count: 1, name: "n" };
+f(x);
+console.log(x);`, refused: /SC1090 .*COPY where JavaScript shares the object.*S125/ },
+  {
+    id: "S125-A5-06 (review V14) an array of hybrids whose forEach callback casts its element keeps the copy, refused by name", entry: "main.ts", src: `type P = { action: string; slug: string; [k: string]: unknown };
+function f(xs: Array<{ action: string }>) { xs.forEach((x) => { const r = x as { action: string }; r.action = "u"; }); }
+const ps: P[] = [{ action: "create", slug: "a" }];
+f(ps);
+console.log(ps);`, refused: /SC1090 .*COPY where JavaScript shares the object.*S125/ },
 ]);

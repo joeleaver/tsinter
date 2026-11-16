@@ -1955,7 +1955,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
    * parameter symbol — assignment, compound assignment, ++/--, a
    * destructuring-assignment target, or a for-in/of cursor. A written
    * param's binding could lie after the write, so it stays dyn. */
-  function paramWrittenInBody(L: Lowerer, body: ts.Node, sym: ts.Symbol, name: string): boolean {
+  export function paramWrittenInBody(L: Lowerer, body: ts.Node, sym: ts.Symbol, name: string): boolean {
     let written = false;
     const targetsSym = (e: ts.Expression): boolean => {
       let n: ts.Expression = e;
@@ -2177,6 +2177,96 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     return inst;
   }
 
+/** S125 (a): does the body cast the parameter itself (`p as T`, `<T>p`)?
+ * A cast keeps the DECLARED type where a per-call-site instance binds the
+ * caller's own type, so such a parameter is not bound (the call keeps the
+ * judged copy and its named refusal). */
+export function castsParam(L: Lowerer, body: ts.Node, sym: ts.Symbol, name: string): boolean {
+  let hit = false;
+  const walk = (n: ts.Node): void => {
+    if (hit) return;
+    if (ts.isAssertionExpression(n)) {
+      let e: ts.Expression = n.expression;
+      while (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+      if (ts.isIdentifier(e) && e.text === name && L.checker.getSymbolAtLocation(e) === sym) {
+        hit = true;
+        return;
+      }
+    }
+    n.forEachChild(walk);
+  };
+  walk(body);
+  return hit;
+}
+
+/** S125 (a), an array-of-record parameter bound to the caller's wider
+   * elements: only where every use of the parameter keeps the checker's
+   * declared element type out of the body's IR — `xs.length`, an inline
+   * callback handed to `xs.map`/`xs.forEach`, or `xs.filter(cb).length`
+   * (paperclip's toKeySet and summarizePlanCounts). Any other use (an
+   * element read, iteration, `slice`, `sort`, a filter result kept) would
+   * type a derived value by the declared element, so the parameter keeps
+   * the judged copy. */
+  function arrayParamUsesBindable(L: Lowerer, body: ts.Node, sym: ts.Symbol, name: string): boolean {
+    let ok = true;
+    const assignTarget = (n: ts.Node): boolean => {
+      const q = n.parent;
+      if (ts.isBinaryExpression(q)) {
+        const k = q.operatorToken.kind;
+        return q.left === n && k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment;
+      }
+      return ((ts.isPrefixUnaryExpression(q) && (q.operator === ts.SyntaxKind.PlusPlusToken || q.operator === ts.SyntaxKind.MinusMinusToken)) ||
+        ts.isPostfixUnaryExpression(q) || ts.isDeleteExpression(q));
+    };
+    const inlineFn = (c: ts.CallExpression): boolean =>
+      c.arguments.length === 1 && (ts.isArrowFunction(c.arguments[0]!) || ts.isFunctionExpression(c.arguments[0]!));
+    const useOk = (ref: ts.Identifier): boolean => {
+      const p = ref.parent;
+      if (!ts.isPropertyAccessExpression(p) || p.expression !== ref || p.questionDotToken) return false;
+      const m = p.name.text;
+      if (m === "length") {
+        return !assignTarget(p);
+      }
+      const c = p.parent;
+      if (!ts.isCallExpression(c) || c.expression !== p || !inlineFn(c)) return false;
+      // (the callback's element parameter must bind too — hofCallbackArg:
+      // unannotated, never written or cast)
+      const fn = c.arguments[0] as ts.ArrowFunction | ts.FunctionExpression;
+      const ep = fn.parameters[0];
+      if (ep !== undefined) {
+        const esym = ts.isIdentifier(ep.name) ? L.checker.getSymbolAtLocation(ep.name) : undefined;
+        if (!ts.isIdentifier(ep.name) || ep.type || ep.initializer || ep.dotDotDotToken || esym === undefined ||
+            paramWrittenInBody(L, fn.body, esym, ep.name.text) || castsParam(L, fn.body, esym, ep.name.text)) return false;
+      }
+      if (m === "forEach") return true;
+      if (m === "map") {
+        // (a primitive result only: a mapped element would be typed by the
+        // declared element type)
+        const sig = L.checker.getCallSignatures(L.checker.getTypeAtLocation(c.arguments[0]!))[0];
+        let r: IrType | null = null;
+        try {
+          r = sig ? L.mapTypeOf(L.checker.getReturnTypeOfSignature(sig)) : null;
+        } catch (e) {
+          if (!(e instanceof PoisonError)) throw e;
+        }
+        return r !== null && (r.kind === "string" || r.kind === "f64" || r.kind === "bool");
+      }
+      if (m !== "filter") return false;
+      const q = c.parent;
+      return ts.isPropertyAccessExpression(q) && q.expression === c && q.name.text === "length" && !q.questionDotToken && !assignTarget(q);
+    };
+    const walk = (n: ts.Node): void => {
+      if (!ok) return;
+      if (ts.isIdentifier(n) && n.text === name && L.checker.getSymbolAtLocation(n) === sym && !useOk(n)) {
+        ok = false;
+        return;
+      }
+      n.forEachChild(walk);
+    };
+    walk(body);
+    return ok;
+  }
+
 /** GH #109 (SEMANTICS.md S125): a direct call of a plain TypeScript
  * function passing a CLASS INSTANCE or a WIDER RECORD where a parameter
  * is typed by a record (`bump(p)` against `function bump(o: { n: number
@@ -2225,11 +2315,17 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
       return;
     }
     if (js) return;
-    if (!arg || shape.type.kind !== "record" || shape.mode !== "required") return;
+    // (paperclip's summarizePlanCounts: an ARRAY of wider records into an
+    // array-of-record parameter binds like a record parameter — the body
+    // reads the caller's elements; its filter callbacks bind the element
+    // parameter the same way, lower-containers.ts hofCallbackArg. A body
+    // the instance cannot lower falls back to the judged copy.)
+    const arrayOfRecord = shape.type.kind === "array" && shape.type.elem.kind === "record";
+    if (!arg || (shape.type.kind !== "record" && !arrayOfRecord) || shape.mode !== "required") return;
     if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.questionToken || param.initializer) return;
     if (isThisParameter(param)) return;
     const psym = L.checker.getSymbolAtLocation(param.name);
-    if (!psym || paramWrittenInBody(L, decl.body!, psym, param.name.text)) return;
+    if (!psym || paramWrittenInBody(L, decl.body!, psym, param.name.text) || castsParam(L, decl.body!, psym, param.name.text)) return;
     let a: ts.Expression = arg;
     while (ts.isParenthesizedExpression(a)) a = a.expression;
     // Literals lower against the slot's own shape: no copy to avoid.
@@ -2242,7 +2338,12 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
       if (!(e instanceof PoisonError)) throw e;
       return;
     }
-    if (!ir || typeEquals(ir, shape.type) || !carriesFields(L, ir, shape.type.shapeId)) return;
+    if (!ir || typeEquals(ir, shape.type)) return;
+    if (shape.type.kind === "array") {
+      const pe = shape.type.elem;
+      if (ir.kind !== "array" || pe.kind !== "record" || !carriesFields(L, ir.elem, pe.shapeId)) return;
+      if (!arrayParamUsesBindable(L, decl.body!, psym, param.name.text)) return;
+    } else if (shape.type.kind !== "record" || !carriesFields(L, ir, shape.type.shapeId)) return;
     bindings.set(psym, at);
     shapes[i] = { type: ir, mode: "required" };
   });
@@ -2382,9 +2483,18 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
  * every field of record shape `shapeId`, each with exactly its type — and
  * does the shape hold data only (no methods, accessors, index signature
  * or tuple positions)? */
-function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
+export function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
   const target = L.shapes.get(shapeId);
-  if (!target || target.tuple || target.indexValue) return false;
+  if (!target || target.tuple) return false;
+  if (target.indexValue) {
+    // (paperclip's managed-agent helpers: a hybrid `{ id?: string; [key:
+    // string]: unknown }` into `Record<string, unknown>` — a pure
+    // index-signature target over an `unknown` value holds every key the
+    // source has, declared or added, so the body reads the caller's record)
+    if (target.fields.length > 0 || target.indexValue.kind !== "dyn" || t.kind !== "record") return false;
+    const src = L.shapes.get(t.shapeId);
+    return src !== undefined && !src.tuple && src.indexValue?.kind === "dyn" && !shapeHasAccessorSlots(src);
+  }
   if (target.fields.some((f) => f.name.startsWith("%"))) return false;
   if (t.kind === "object") {
     const cls = L.classes.get(t.className);
@@ -2401,7 +2511,9 @@ function carriesFields(L: Lowerer, t: IrType, shapeId: string): boolean {
   }
   if (t.kind === "record") {
     const src = L.shapes.get(t.shapeId);
-    if (!src || src.tuple || src.indexValue || shapeHasAccessorSlots(src)) return false;
+    // (a hybrid source carries its declared fields like any record: the
+    // paperclip config handed to a `Pick<PaperclipConfig, "secrets">`)
+    if (!src || src.tuple || shapeHasAccessorSlots(src)) return false;
     return target.fields.every((f) => {
       const sf = src.fields.find((x) => x.name === f.name);
       return sf !== undefined && typeEquals(sf.type, f.type);
@@ -8024,6 +8136,12 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       const ctxIr = L.mapTypeOf(L.checker.getContextualType(call) ?? callT);
       if (ctxIr?.kind === "array" && typeEquals(ctxIr.elem, elem)) outElem = elem;
     }
+    // (S125 (a): inside a per-call-site instance whose array-of-record
+    // parameter is bound to the caller's wider elements, the checker still
+    // types the result by the declared element — a width difference, not a
+    // narrowing: the generic path keeps the receiver's elements)
+    if (outElem !== null && outElem.kind === "record" && elem.kind === "record" && !typeEquals(outElem, elem) &&
+        L.implicitParamTypes !== null && carriesFields(L, elem, outElem.shapeId)) outElem = elem;
     const narrowed = outElem !== null && !typeEquals(outElem, elem);
     if (!narrowed && !isBooleanArg) return null;
 

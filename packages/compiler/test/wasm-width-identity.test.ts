@@ -226,7 +226,9 @@ const ys = f(rs); ys[0].n = 5; console.log(rs[0].n);`,
     src: `const rs = [{ n: 0, m: 1 }];
 function f(xs: { n: number }[]) { xs.forEach((x) => { x.n++; }); }
 f(rs); console.log(rs[0].n);`,
-    refused: 1,
+    // S125 (a), paperclip slice: the array parameter binds to the caller's
+    // elements and the forEach callback's element to each of them — the
+    // write reaches the original, as in Node.
   },
   {
     id: "checked-record-narrow-printed",

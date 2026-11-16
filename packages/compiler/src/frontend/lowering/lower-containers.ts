@@ -13,7 +13,7 @@ import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
-import { DYN_DISPATCH_METHODS, islandPrimitiveExit } from "./lower-calls.js";
+import { DYN_DISPATCH_METHODS, carriesFields, castsParam, islandPrimitiveExit, paramWrittenInBody } from "./lower-calls.js";
 import { typeKey } from "../types.js";
 import { dynUndefinedExpr, isPrimitiveArgType, own, WidthLift, withEsFnName } from "./lowerer.js";
 
@@ -795,6 +795,25 @@ function lowerOptionalDefaultArg(
         if (!ts.isIdentifier(p.name) || p.type || p.initializer || p.dotDotDotToken) return;
         L.jsvalParamOverrides.add(p);
       });
+    }
+    // S125 (a): inside a per-call-site instance whose array-of-record
+    // parameter is bound to the caller's wider elements (paperclip's
+    // summarizePlanCounts), an unannotated callback's element parameter is
+    // the caller's element too — bound like the instance's own parameter.
+    if (L.implicitParamTypes !== null && lead[0]?.kind === "record" && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode)) &&
+        ts.isCallExpression(argNode.parent) && ts.isPropertyAccessExpression(argNode.parent.expression)) {
+      const p = argNode.parameters[0];
+      const recvT = L.typeOf(argNode.parent.expression.expression);
+      const elemT = L.checker.isArrayType(recvT) ? L.checker.getTypeArguments(recvT as ts.TypeReference)[0] : undefined;
+      const psym = p !== undefined && ts.isIdentifier(p.name) ? L.checker.getSymbolAtLocation(p.name) : undefined;
+      if (p !== undefined && elemT !== undefined && psym !== undefined && ts.isIdentifier(p.name) && !p.type && !p.initializer && !p.dotDotDotToken &&
+          !L.implicitParamTypes.has(psym) && !paramWrittenInBody(L, argNode.body, psym, p.name.text) && !castsParam(L, argNode.body, psym, p.name.text)) {
+        const declared = L.mapTypeOf(L.checker.getTypeAtLocation(p.name));
+        if (declared?.kind === "record" && !typeEquals(declared, lead[0]) && carriesFields(L, lead[0], declared.shapeId)) {
+          L.implicitParamTypes.set(psym, elemT);
+          L.widthBoundParams.add(psym);
+        }
+      }
     }
     let fnArg: IrExpr;
     try {
