@@ -12,6 +12,7 @@ import { isDtsMirrorPath } from "../npm-static.js";
 import { classLiftIn, fencedValue } from "./class-views.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
+import { moduleNsSourceFileOf } from "./lower-namespaces.js";
 import { PoisonError, boxFactsOf, esFuncNameOf, evaluatedOnce, fnDefinitionOf, newFnCtx, own } from "./lowerer.js";
 import { regexCrossingChecked } from "./lower-regex.js";
 
@@ -30,6 +31,13 @@ import { regexCrossingChecked } from "./lower-regex.js";
     // value (its IArguments type absorbs to jsval through the `any` index
     // signature once `any` maps — unit U1a); its own lowerings claim it.
     if (L.sharedDynamic && ts.isIdentifier(node) && node.text === "arguments" && L.typeOf(node).getSymbol()?.name === "IArguments") return false;
+    // A program module's namespace binding (`core` under `import * as core`,
+    // or a nested `core.util`) is never an island value, whatever its
+    // namespace type maps to (one `any`-typed export makes it jsval): its
+    // members resolve statically at their qualified access sites, and a
+    // value use takes the namespace fences. zod's `core.$constructor(...)`
+    // and `core.config()` inside its JS functions.
+    if (moduleNsSourceFileOf(L, node) !== null) return false;
     // One world without the engine (U1b): a member of a BUILTIN value
     // (`EventEmitter.setMaxListeners`, `events.EventEmitter.x`,
     // `URL.revokeObjectURL`) that a JS source's checker types 'any' is
