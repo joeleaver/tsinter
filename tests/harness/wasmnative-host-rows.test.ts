@@ -243,7 +243,13 @@ describe(`the wasm lane's host rows on the wasm-native lane (${rows.length} rows
     }
   });
 
-  test.concurrent.for(rows.map((r, i) => [`${r.id} (#${i})`, r] as const))("%s", async ([, row], { skip }) => {
+  // The per-row budget counts the wait for a slot() beside the row's own
+  // compile and two runs (each run is SIGKILLed at 120 s, the hang guard).
+  // The TLS rows next to U4-VERIFY-01 took 185-215 s in the gates at
+  // 3a10df39 and 570882f6 and crossed 300 s in the gates at fe241dc1 and
+  // f3c1eea8 (nico-top at load average ~23), while their compile did not
+  // slow down (U4-REG-01: 7.3 s at 570882f6, 5.8 s at f3c1eea8).
+  test.concurrent.for(rows.map((r, i) => [`${r.id} (#${i})`, r] as const))("%s", { timeout: 600_000 }, async ([, row], { skip }) => {
     const need = NEEDS[row.id];
     if (need !== undefined) skip(!need[0], need[1]);
     await slot(async () => {

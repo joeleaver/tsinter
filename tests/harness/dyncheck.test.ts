@@ -1113,17 +1113,17 @@ console.log(has(eng));
     expect(r.stderr).toContain("'in' on an island value held in 'unknown' is not supported yet");
   });
 
-  test("a wrapped island value RC-balances through catch-and-continue unwinds (c); wasm-native fences the clone by name", async () => {
+  test("a wrapped island value RC-balances through catch-and-continue unwinds (c); wasm-native clones as Node (DataCloneError, caught)", async () => {
     // The engine clone's DataCloneError (a function member) is catchable;
     // the wrapped cell must release cleanly through the unwind (the SAN
-    // lane's RC audit is the check). GH #113: on wasm-native a function
-    // value reaching structuredClone under --dynamic carries no source
-    // text, so the clone is S122's fence (Node: "done 100").
+    // lane's RC audit is the check). GH #113 fenced the wasm-native clone
+    // (a function value carried no source text, S122); since the Function
+    // type unit (debb67c6) a function value crossing into the dynamic
+    // world clones as Node's DataCloneError, caught, so the program prints
+    // Node's "done 100" (checked against Node below).
     // The crossing rides a real dyn PARAM slot — a local initialized from
     // an island value stays island-world by the runtime-world dispatch.
-    const r = await compileAndRun(
-      "jsval-fence-unwind",
-      `const eng: any = { a: 1, f() { return 1; } };
+    const src = `const eng: any = { a: 1, f() { return 1; } };
 let caught = 0;
 function probe(u: unknown): void {
   try {
@@ -1134,17 +1134,10 @@ function probe(u: unknown): void {
 }
 for (let i = 0; i < 100; i++) probe(eng);
 console.log("done", caught);
-`,
-      "ts",
-      true,
-    );
-    if (!LEGACY_LANES) {
-      expect(r.exitCode).toBe(1);
-      expect(r.stdout).toBe("");
-      expect(r.stderr).toBe("tsinter: unsupported: structuredClone of a function value is not supported yet [SC1090]\n");
-      return;
-    }
+`;
+    const r = await compileAndRun("jsval-fence-unwind", src, "ts", true);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("done 100\n");
+    if (!LEGACY_LANES) await expectAsNode(r, "jsval-fence-unwind", src, "ts");
   });
 });
