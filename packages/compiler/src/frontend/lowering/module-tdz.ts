@@ -1144,6 +1144,15 @@ function analyzeFile(
       flagId = `%g.${tag}%tdzc.${c.name}`;
     } else if (c.flagOnly === true) {
       flagId = `%g.${tag}%tdzf.${c.name}`;
+    } else if (c.global === null && L.genericFnsBySymbol.has(sym)) {
+      // A function binding with no storage: a generic or implicit-any
+      // binding, its alias, or a called-only rest arrow
+      // (bindingRestFnNodeOf). Calls resolve statically to the compiled
+      // function, so no read exists for the IR pass to guard; Node still
+      // throws its TDZ ReferenceError on an early call. A flag of its own,
+      // set after the declarator (withModuleTdzFlags); owedChecks places
+      // the check at each early call site (GH #241).
+      flagId = `%g.${tag}%tdzf.${c.name}`;
     } else {
       if (c.global === null) continue; // alias plumbing / no storage
       flagId = `${c.global.id}%tdz`;

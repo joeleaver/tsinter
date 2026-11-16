@@ -10102,6 +10102,84 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
     return null;
   }
 
+/** A REST-PARAMETER arrow that only ever gets CALLED — paperclip's
+   * `const one = (...scopes: string[]) => [scopes.map(auth)]`
+   * (google-workspace-connectors.ts). A function value with a rest
+   * convention has no compiled spelling (requireExactArityValue), but this
+   * binding never becomes a value. It is a module-scope `const` in a
+   * TypeScript file, not exported, and every reference to it in its file is
+   * the callee of a plain call `one(…)`. So it lowers like a function
+   * declaration: the binding has no runtime value, and each call packs its
+   * surplus arguments into the rest array (completeArgs) and calls the one
+   * module function compiled from the initializer. Calls go through the
+   * generic-binding machinery with no type parameters (bindingRestFnInfoOf).
+   * An arrow has no `arguments` of its own, and its `length` is observable
+   * only through a value reference, which keeps the refusal. Any other shape
+   * answers null and keeps it too: a value reference, an export, a `let`, a
+   * binding inside a function, a function expression, an async or generic
+   * arrow, an arrow reading `this`, an untyped rest. */
+  export function bindingRestFnNodeOf(L: Lowerer, decl: ts.VariableDeclaration): ts.ArrowFunction | null {
+    if (!ts.isIdentifier(decl.name) || decl.initializer === undefined) return null;
+    if ((ts.getCombinedNodeFlags(decl) & ts.NodeFlags.Const) === 0) return null;
+    let init: ts.Expression = decl.initializer;
+    while (ts.isParenthesizedExpression(init)) init = init.expression;
+    if (!ts.isArrowFunction(init) || init.typeParameters !== undefined) return null;
+    if (init.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true) return null;
+    const last = init.parameters[init.parameters.length - 1];
+    if (last === undefined || last.dotDotDotToken === undefined || last.type === undefined || !ts.isIdentifier(last.name)) return null;
+    const sf = decl.getSourceFile();
+    if (isJsSourceFile(sf)) return null;
+    const stmt = decl.parent.parent;
+    if (!ts.isVariableStatement(stmt) || stmt.parent !== sf) return null;
+    if (stmt.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true) return null;
+    if (arrowReadsThis(init)) return null;
+    const sym = L.checker.getSymbolAtLocation(decl.name);
+    if (!sym || L.checker.declarationsOf(sym).length !== 1) return null;
+    const name = decl.name.text;
+    let onlyCalled = true;
+    ts.walkPreorder(sf, (n) => {
+      if (!onlyCalled) return "stop";
+      if (!ts.isIdentifier(n) || n.text !== name || n === decl.name) return undefined;
+      // An export clause names the binding as a value; `export { one }`'s
+      // own symbol is an alias, so judge it by its spelling.
+      if (ts.isExportSpecifier(n.parent) || ts.isExportAssignment(n.parent)) {
+        onlyCalled = false;
+        return "stop";
+      }
+      if (L.resolveValueSymbol(n) !== sym) return undefined;
+      const p = n.parent;
+      if (!(ts.isCallExpression(p) && p.expression === n && p.questionDotToken === undefined)) {
+        onlyCalled = false;
+        return "stop";
+      }
+      return undefined;
+    });
+    return onlyCalled ? init : null;
+  }
+
+/** Registers bindingRestFnNodeOf's binding: a GenericFnInfo with no type
+   * parameters, entered under the binding's symbol, so calls resolve
+   * through genericFnOf (lowerGenericCall: one instance per resolved
+   * signature, which here is always the one declared signature). */
+  export function bindingRestFnInfoOf(L: Lowerer, decl: ts.VariableDeclaration, fnNode: ts.ArrowFunction): GenericFnInfo {
+    const existing = L.bindingGenericFns.get(fnNode);
+    if (existing) return existing;
+    const name = (decl.name as ts.Identifier).text;
+    const sym = L.checker.getSymbolAtLocation(decl.name);
+    if (!sym) L.unsupported("SC1090", decl.name, "this binding form");
+    const stmt = decl.parent.parent;
+    const info: GenericFnInfo = {
+      decl: fnNode,
+      baseName: name,
+      qualifiedName: L.qualify(decl.getSourceFile(), nsPathPrefix(stmt, decl) + name),
+      typeParams: [],
+      instances: new Map(),
+    };
+    L.bindingGenericFns.set(fnNode, info);
+    L.genericFnsBySymbol.set(sym, info);
+    return info;
+  }
+
 /** The CONTEXTUAL twin of bindingGenericFnNodeOf: `const g: Mapper = (x)
    * => x` where `type Mapper = <T>(x: T) => T` — the initializer declares
    * no type parameters of its own, but the ANNOTATION's one call signature
