@@ -13,6 +13,22 @@ const DEP = `export function option(fn, init) {
   return { same: r1 === init, r2 };
 }`;
 
+/** The A4 extension's dynamic code: commander's option collector and an
+ * async action runner, plus identity probes. */
+const DEP2 = `export function option(fn, init) {
+  const r1 = fn("a", init);
+  const r2 = fn("b", r1);
+  return { same: r1 === init, r2 };
+}
+let saved = null;
+export function keep(fn) { saved = fn; return fn; }
+export function isKept(fn) { return saved === fn; }
+export function same(a, b) { return a === b; }
+export async function action(fn, opts) {
+  await fn(opts);
+  return opts;
+}`;
+
 defineRows("S125 share-vs-copy", [
   {
     id: "S125-A4-01 a declared collector pushing into its array parameter, handed to dynamic code: one array; a direct call stays typed",
@@ -266,5 +282,65 @@ console.log(r);
 type Q = { id?: string; [k: string]: unknown };
 const q: Q = { name: "n", id: undefined };
 console.log(q);`,
+  },
+  {
+    id: "S125-A4-03 (A4 extension) deepseek's const-bound arrow collector with a defaulted array parameter, handed to dynamic code: the default applies, the result shares",
+    entry: "main.ts",
+    files: { "dep.mjs": DEP2 },
+    src: `import { option } from "./dep.mjs";
+const collect = (value: string, previous: string[] = []): string[] => [...previous, value];
+const res = option(collect, ["x"]);
+console.log(res.same, res.r2);
+const r0 = option(collect, undefined);
+console.log(r0.r2, collect("direct"));`,
+  },
+  {
+    id: "S125-A4-04 (A4 extension) an async arrow action writing through its options parameter (commander's .action): the caller's object sees the write",
+    entry: "main.ts",
+    files: { "dep.mjs": DEP2 },
+    src: `import { action } from "./dep.mjs";
+interface Opts { config?: string; json?: boolean }
+async function main(): Promise<void> {
+  const out = await action(async (opts: Opts) => { opts.json = true; console.log("act", opts.config); }, { config: "c" });
+  console.log(out);
+}
+main();`,
+  },
+  {
+    id: "S125-A4-05 (A4 extension) an async DECLARED action handed to dynamic code: its boxed instance shares the options object; a direct call stays typed",
+    entry: "main.ts",
+    files: { "dep.mjs": DEP2 },
+    src: `import { action } from "./dep.mjs";
+interface Opts { config?: string; json?: boolean }
+async function doctor(opts: Opts): Promise<void> { opts.json = true; console.log("doc", opts.config); }
+async function main(): Promise<void> {
+  const out = await action(doctor, { config: "c" });
+  console.log(out);
+  const mine: Opts = { config: "d" };
+  await doctor(mine);
+  console.log(mine);
+}
+main();`,
+  },
+  {
+    id: "S125-A4-06 (A4 extension) a const-bound function expression pushing into its array parameter, handed to dynamic code: one array",
+    entry: "main.ts",
+    files: { "dep.mjs": DEP2 },
+    src: `import { option } from "./dep.mjs";
+const push = function (value: string, previous: string[]): string[] { previous.push(value); return previous; };
+const init: string[] = [];
+const res = option(push, init);
+console.log(res.same, res.r2, init);`,
+  },
+  {
+    id: "S125-A4-07 (A4 extension) a const-bound collector crossing twice is one function to dynamic code (identity kept), and its direct call stays typed",
+    entry: "main.ts",
+    files: { "dep.mjs": DEP2 },
+    src: `import { keep, isKept, same, option } from "./dep.mjs";
+const collect = (value: string, previous: string[] = []): string[] => [...previous, value];
+keep(collect);
+console.log(isKept(collect), same(collect, collect));
+const r = option(collect, ["x"]);
+console.log(r.r2, collect("direct"));`,
   },
 ]);

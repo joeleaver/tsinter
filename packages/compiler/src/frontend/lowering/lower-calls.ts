@@ -253,9 +253,13 @@ export interface GenericInstance {
     }
     // Unit U2a (dyn-arm.ts): a function literal's parameter on the dynamic
     // arm holds the dynamic argument itself.
-    if (ts.isIdentifier(param.name) && !param.dotDotDotToken && !param.initializer && dynArmParam(L, param)) {
+    if (ts.isIdentifier(param.name) && !param.dotDotDotToken && dynArmParam(L, param)) {
       // (A JavaScript source's in checked-dynamic storage: S014's U1b amendment.)
-      return { type: isJsSourceFile(param.getSourceFile()) ? DYN : JSVAL, mode: param.questionToken ? "omittable" : "required" };
+      const t = isJsSourceFile(param.getSourceFile()) ? DYN : JSVAL;
+      // A defaulted one (S125 A4 extension: deepseek's `previous = []`) picks
+      // its default on the dynamic tier's undefined (declareParams).
+      if (param.initializer) return { type: t, mode: "omittable", bodyType: t };
+      return { type: t, mode: param.questionToken ? "omittable" : "required" };
     }
     if (ts.isIdentifier(param.name) && L.dynParamOverrides.has(param)) {
       return { type: DYN, mode: param.questionToken ? "omittable" : "required" };
@@ -2242,21 +2246,25 @@ export function dynboxClosure(L: Lowerer, e: IrExpr): IrExpr {
   const hit = L.declByFnName(e.fnName);
   if (hit === undefined) return e;
   const { decl, sig } = hit;
-  if (decl.typeParameters !== undefined || sig.isAsync || sig.generator !== undefined || decl.asteriskToken !== undefined) return e;
+  // (S125 A4 extension: an async declared function too — commander's async
+  // actions; its promise result stays typed)
+  if (decl.typeParameters !== undefined || sig.generator !== undefined || decl.asteriskToken !== undefined) return e;
   if (bodyReadsArguments(decl) || decl.parameters.length !== sig.params.length) return e;
   const js = isJsSourceFile(decl.getSourceFile());
   const bindings = new Map<ts.Symbol, ts.Type>();
   const shapes: ParamShape[] = sig.params.slice();
   decl.parameters.forEach((param, i) => {
-    if (!ts.isIdentifier(param.name) || param.dotDotDotToken || param.initializer || isThisParameter(param)) return;
+    if (!ts.isIdentifier(param.name) || param.dotDotDotToken || isThisParameter(param)) return;
     if (!L.dynArmSites.has(`dparam:${dynArmKey(param)}`)) return;
     const psym = L.checker.getSymbolAtLocation(param.name);
     if (psym === undefined) return;
     bindings.set(psym, L.checker.getAnyType());
-    shapes[i] = { type: js ? DYN : JSVAL, mode: shapes[i]!.mode };
+    const t = js ? DYN : JSVAL;
+    // (a defaulted parameter picks its default on the dynamic tier's undefined)
+    shapes[i] = param.initializer ? { type: t, mode: "omittable", bodyType: t } : { type: t, mode: shapes[i]!.mode };
   });
   // a refused composite result: the boxed instance returns the dynamic value
-  const retArm = sig.returnType.kind !== "void" && L.dynArmSites.has(`dret:${dynArmKey(decl)}`) ? (js ? DYN : JSVAL) : undefined;
+  const retArm = !sig.isAsync && sig.returnType.kind !== "void" && L.dynArmSites.has(`dret:${dynArmKey(decl)}`) ? (js ? DYN : JSVAL) : undefined;
   if (bindings.size === 0 && retArm === undefined) return e;
   let info = L.widthSpecInfos.get(decl);
   if (!info) {
@@ -7010,7 +7018,12 @@ const inliningPredicates = new Set<ts.Symbol>();
         loc,
       };
     }
-    return lowerLambdaInner(L, node, opts);
+    const lam = lowerLambdaInner(L, node, opts);
+    // S125 A4 extension: a capture-free function literal, remembered so a
+    // const binding holding it can cross into dynamic code as the closure
+    // itself (its dynamic-arm parameters and result included).
+    if (lam.kind === "closure" && lam.captures.length === 0 && (ts.isArrowFunction(node) || ts.isFunctionExpression(node))) L.lambdaClosures.set(node, lam);
+    return lam;
   }
 
 /** Does this arrow read `this` — its own body or a nested arrow's (nested

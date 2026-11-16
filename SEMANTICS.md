@@ -10823,7 +10823,14 @@ not build:
   or result would be copies boxes a second instance of itself. In that
   instance those parameters, and the result, hold the dynamic values
   themselves, so dynamic code and the body share the array. Direct calls
-  from typed code keep the typed function.
+  from typed code keep the typed function. (Extension, 2026-11-16: an
+  ASYNC declared function too — commander's async actions; its promise
+  result stays typed. A function literal's defaulted parameter takes the
+  arm as well, picking its default on the dynamic tier's undefined —
+  deepseek's `const collect = (v, previous = []) => …`. And a `const`
+  binding initialized with a capture-free function literal crosses into
+  dynamic code as that literal's own closure, so its dynamic-arm
+  parameters and result are what dynamic code calls.)
 - **A typed record a dynamic slot holds is the same value to the
   printer.** A record or array whose field, element or index value is
   dynamic prints Node's `<ref *N>`/`[Circular *N]` when it holds itself

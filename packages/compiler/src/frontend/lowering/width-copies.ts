@@ -3155,7 +3155,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const transient = !reachFns.suspends && db !== null && !db.uses.includes("other");
         const what = `its parameter '${p.name}' typed '${L.fmt(p.type)}'`;
         const sp = srcParams?.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
-        const dp = declHit?.decl.parameters.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken && !q.initializer);
+        const dp = declHit?.decl.parameters.find((q) => ts.isIdentifier(q.name) && q.name.text === p.name && !q.dotDotDotToken);
         const param = sp !== undefined ? `param:${dynArmKey(sp)}` : dp !== undefined ? `dparam:${dynArmKey(dp)}` : undefined;
         const out = (why: string): { why: string; what: string; param?: string } => (param !== undefined ? { why, what, param } : { why, what });
         if (typedSideWritten(ps, p.type, null)) return out(COPY_WRITTEN);

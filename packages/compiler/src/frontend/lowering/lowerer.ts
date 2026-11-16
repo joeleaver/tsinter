@@ -7651,10 +7651,34 @@ export class Lowerer {
     return dynboxClosure(this, e);
   }
 
+  /** S125 A4 extension: the capture-free function literals lowered so far
+   * (their closure IR), by node. */
+  readonly lambdaClosures = new WeakMap<ts.Node, IrExpr>();
+
+  /** A read of a `const` binding whose initializer is a capture-free
+   * function literal, crossing into dynamic code: the literal's closure
+   * itself, so its dynamic-arm parameters and result are the boxed
+   * function's (deepseek's `const collect = (v, prev = []) => …` handed to
+   * commander's `.option`). Null otherwise. */
+  constLambdaClosure(e: IrExpr, node: ts.Node): IrExpr | null {
+    if (e.kind !== "varRef" || this.dynArmSites.size === 0) return null;
+    let n: ts.Node = node;
+    while (ts.isParenthesizedExpression(n)) n = n.expression;
+    if (!ts.isIdentifier(n)) return null;
+    const sym = this.checker.getSymbolAtLocation(n);
+    const d = sym !== undefined ? this.checker.valueDeclarationOf(sym) : undefined;
+    if (d === undefined || !ts.isVariableDeclaration(d) || d.initializer === undefined) return null;
+    if (!ts.isVariableDeclarationList(d.parent) || (d.parent.flags & ts.NodeFlags.Const) === 0) return null;
+    let init: ts.Node = d.initializer;
+    while (ts.isParenthesizedExpression(init)) init = init.expression;
+    const lam = this.lambdaClosures.get(init);
+    return lam !== undefined && lam.kind === "closure" ? { ...lam, loc: e.loc } : null;
+  }
+
   jsvalIn(e0: IrExpr, node: ts.Node): IrExpr {
     // S125 A4: a declared function boxed into dynamic code boxes its boxed
     // instance (dynboxClosure) where its parameters are dynamic-arm slots.
-    const e = dynboxClosure(this, e0);
+    const e = dynboxClosure(this, this.constLambdaClosure(e0, node) ?? e0);
     this.lastHostShallow = false;
     const fresh = this.dynamic && e.type.kind === "func" ? this.checkHostFunctionCopies(node, e.type) : true;
     const shallow = this.lastHostShallow;
@@ -8066,7 +8090,10 @@ export class Lowerer {
         }
       }
     }
-    const e = this.lowerExpr(node);
+    const e0 = this.lowerExpr(node);
+    // S125 A4 extension: a const-bound function literal crossing into a
+    // dynamic slot crosses as its own closure (its dynamic-arm parameters).
+    const e = (expected?.kind === "dyn" || expected?.kind === "jsval") ? (this.constLambdaClosure(e0, node) ?? e0) : e0;
     return expected ? this.coerceInto(node, e, expected) : e;
   }
 
