@@ -2784,6 +2784,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (childShaped && core >= 2) return CHILD_T;
   }
   if (flags & (ts.TypeFlags.Object | ts.TypeFlags.Intersection) && callSigs.length === 0) {
+    if (declaredInterfaceOverDynamic(widened, ctx)) return JSVAL;
     const viaAlias = mapGenericUtilityAlias(widened, ctx);
     if (viaAlias) return viaAlias;
     const record = mapRecordType(widened, ctx);
@@ -3519,6 +3520,39 @@ interface RecordShapeParts {
   fields: { name: string; type: IrType; optional?: true }[];
   indexValue?: IrType;
   declaredOrder?: string[];
+}
+
+/** SEMANTICS.md S133 (k), "a declared interface over a dynamic
+ * implementation": on the one-world lanes, an interface (or object type
+ * alias) a viewed package's shipped declarations declare, with a member
+ * that is a function (a method, or a function-typed property), is the
+ * implementation's own dynamic value — zod's ZodString, ZodObject<Shape>,
+ * whose instances are built per-instance by `$constructor` and carry
+ * overloaded and generic methods no record shape holds. Identity is kept
+ * and nothing is copied: member reads and calls dispatch dynamically, and
+ * their results cross into the declared member types at the use. Data-only
+ * interfaces keep their record mapping (a checked conversion), declared
+ * classes their S115 views, and the program's own types are untouched. */
+export function declaredInterfaceOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
+  if (ctx.sharedDynamic !== true) return false;
+  const sym = widened.getSymbol() ?? widened.getAliasSymbol();
+  if (sym === undefined) return false;
+  const checker = ctx.checker;
+  // The RAW declarations: the declared-surface redirect would answer a merged
+  // `const` export's JS implementation for the symbol (dts-bridge.ts).
+  const decls = checker.rawDeclarationsOf(sym);
+  if (decls.length === 0) return false;
+  // Every declaration comes from the view's mirror, and the TYPE side is an
+  // interface or object type (zod merges `interface ZodString` with a
+  // `const ZodString` value of the same name; a class is never this case).
+  if (!decls.every((d) => isDtsMirrorPath(d.getSourceFile().fileName))) return false;
+  if (decls.some((d) => ts.isClassDeclaration(d))) return false;
+  if (!decls.some((d) => ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d) || ts.isTypeLiteralNode(d))) return false;
+  return checker.getPropertiesOfType(widened).some((p) => {
+    const pd = checker.declarationsOf(p)[0];
+    if (pd !== undefined && (pd.kind === ts.SyntaxKind.MethodSignature || ts.isMethodDeclaration(pd))) return true;
+    return checker.getCallSignatures(checker.getNonNullableType(checker.getTypeOfSymbol(p))).length > 0;
+  });
 }
 
 function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {

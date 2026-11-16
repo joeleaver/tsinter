@@ -406,6 +406,19 @@ function membersOf(info: ClassInfo): Member[] {
   return out;
 }
 
+/** The names of the per-call-site methods (ClassInfo.genericMethods) on
+ * the class chain. */
+function genericMemberNames(info: ClassInfo): string[] {
+  const out = new Set<string>();
+  for (let c: ClassInfo | null = info; c; c = c.base) {
+    for (const key of c.genericMethods?.keys() ?? []) {
+      if (key.includes("#") || key === "constructor") continue;
+      out.add(key.startsWith("get:") || key.startsWith("set:") ? key.slice(4) : key);
+    }
+  }
+  return [...out];
+}
+
 /** A call of instance method `key` (a method name or "get:x") on `recv`,
  * dispatched like the lowering's own method calls. */
 function methodCall(L: Lowerer, info: ClassInfo, key: string, recv: IrExpr, args: IrExpr[], loc: SrcLoc): IrExpr | null {
@@ -649,6 +662,17 @@ export function classViewFactory(L: Lowerer, className: string, loc: SrcLoc): st
     getBody.push({ kind: "if", cond: keyIs(proto), then: [fence(`reading the inherited member '${proto}' through a '${label}' instance shared with dynamic code is not supported yet`, loc), { kind: "return", value: undef(loc), loc }], else_: null, loc });
   }
   getBody.push({ kind: "return", value: undef(loc), loc });
+  // A method compiled per call site (a JavaScript method with untyped
+  // parameters, or a generic one: ClassInfo.genericMethods) has no single
+  // function to hand out, so the view cannot answer it: reading or testing
+  // it through the view stops by name instead of answering undefined
+  // (Node would find the prototype method).
+  const perSite = genericMemberNames(info).filter((g) => !fields.some((f) => f.name === g) && !members.some((m) => m.name === g));
+  const perSiteFence = (g: string): IrStmt =>
+    fence(`reading the method '${g}' (compiled per call site: untyped or generic parameters) through a '${label}' instance shared with dynamic code is not supported yet`, loc);
+  for (const g of perSite) {
+    getBody.splice(getBody.length - 1, 0, { kind: "if", cond: keyIs(g), then: [perSiteFence(g), { kind: "return", value: undef(loc), loc }], else_: null, loc });
+  }
 
   // set(k, v)
   const setBody: IrStmt[] = [];
@@ -688,6 +712,7 @@ export function classViewFactory(L: Lowerer, className: string, loc: SrcLoc): st
   // (dyn.ts classViewPrintFence).
   const bool = (b: boolean): IrExpr => ({ kind: "jsMarshal", value: { kind: "boolLit", value: b, type: BOOL, loc }, type: JSVAL, loc });
   const hasBody: IrStmt[] = members.map((m) => ({ kind: "if", cond: keyIs(m.name), then: [{ kind: "return", value: bool(true), loc }], else_: null, loc }) as IrStmt);
+  for (const g of perSite) hasBody.push({ kind: "if", cond: keyIs(g), then: [perSiteFence(g), { kind: "return", value: bool(true), loc }], else_: null, loc });
   hasBody.push({ kind: "return", value: bool(false), loc });
 
   const impls: { suffix: string; params: { id: string; type: IrType }[]; ret: IrType; locals?: { id: string; type: IrType }[]; body: IrStmt[] }[] = [
