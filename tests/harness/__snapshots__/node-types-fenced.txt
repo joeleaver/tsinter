@@ -7,22 +7,6 @@ fenced.ts:5:13 - error SC2020: 'process.memoryUsage' is typed by @types/node but
 
   hint: the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)
 
-fenced.ts:6:7 - error SC2001: values of type 'bigint' cannot be compiled yet (supported: number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
-  5 | console.log(process.memoryUsage()); // uptime/cpuUsage/resourceUsage lower now; the V8-heap report does not
-  6 | const buf = Buffer.from("bytes").readBigUInt64BE(0); // from, fill, and the numeric families lower; the bigint reads fence
-    |       ^~~
-  7 | console.log(Buffer.poolSize);
-
-fenced.ts:6:13 - error SC2020: 'Buffer<ArrayBuffer>.readBigUInt64BE' is typed by @types/node but has no scriptc lowering yet
-
-  5 | console.log(process.memoryUsage()); // uptime/cpuUsage/resourceUsage lower now; the V8-heap report does not
-  6 | const buf = Buffer.from("bytes").readBigUInt64BE(0); // from, fill, and the numeric families lower; the bigint reads fence
-    |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  7 | console.log(Buffer.poolSize);
-
-  hint: the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)
-
 fenced.ts:7:13 - error SC2020: 'Buffer.poolSize' is typed by @types/node but has no scriptc lowering yet
 
   6 | const buf = Buffer.from("bytes").readBigUInt64BE(0); // from, fill, and the numeric families lower; the bigint reads fence
@@ -103,15 +87,6 @@ fenced.ts:31:13 - error SC2020: 'PlatformPath.sep' is typed by @types/node but h
   32 | /* URL members beyond the supported getters (protocol/pathname/href/
 
   hint: the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)
-
-fenced.ts:37:13 - error SC2020: 'URL.hash' is typed by @types/node but has no scriptc lowering yet
-
-  36 | const u = new URL("https://example.com/x?a=1");
-  37 | console.log(u.hash);
-     |             ^~~~~~
-  38 | u.searchParams.get("a");
-
-  hint: protocol, pathname, href, host, hostname, search, searchParams, and toString() are the supported URL members
 
 fenced.ts:44:13 - error SC2020: 'deflateSync of 'string' data' is part of the standard library types but has no scriptc lowering yet
 
