@@ -186,6 +186,20 @@ const ms: any[] = [new H2(), new G()];
 console.log(ms[1].a.call(ms[0]), ms[0].a.call(ms[0]));`,
   },
   {
+    id: "CV-CALL-05 an abstract base's method on views of its subclasses: .call with a sibling subclass instance runs as in Node (the abstract signature builds no bound method)",
+    src: `abstract class B {
+  n = "B";
+  abstract a(): string;
+  run(): string { return this.a(); }
+}
+class C extends B { n = "C"; a(): string { return "C.a/" + this.n; } }
+class D extends B { n = "D"; a(): string { return "D.a/" + this.n; } }
+const bs: B = new C();
+const x: any = bs;
+const d: any = new D();
+console.log(x.a.call(d), x.a.call(x), x.run(), d.a.call(x));`,
+  },
+  {
     id: "CV-CALL-03 a method read off a view and called detached stops by name (Node runs it with this undefined; GH #186)",
     src: `class G {
   n = 3;
@@ -195,7 +209,7 @@ const one: any = new G();
 const h = one.a;
 console.log(one.a("x"));
 console.log(h("2"));`,
-    fence: { text: /calling the method 'a' of a 'G' instance shared with dynamic code without that instance as 'this'/, stdout: "x3\n" },
+    fence: { text: /calling the method 'a' of a 'G' instance shared with dynamic code with a 'this' that is no 'G' instance/, stdout: "x3\n" },
   },
   {
     id: "CV-ERR-01 a callback over a user error class crosses into dynamic code: the error it is called with arrives as itself; another error stops by name",

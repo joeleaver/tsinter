@@ -5205,6 +5205,16 @@ documents both" — the pid and the timing) cites THIS entry; filing it
 closes the leak-warning half of board #66 (the rawListeners half closed
 with S052).
 
+**Amendment (the dynamic-emitter unit, GH #208; wasm and wasm-native).**
+The wasm tier's silence is replaced by a named stop: an add that leaves
+more listeners on one event than a positive `getMaxListeners()` allows
+ends the program with `tsinter: unsupported: EventEmitter's
+MaxListenersExceededWarning ... (GH #208)` (events.ts's `leakStop`, on
+every registration path — static, dynamic and the 'error' bucket). Node
+prints a deferred, pid-stamped warning there and continues; the warning
+itself stays unbuilt until a workload reaches it. **Tested by:**
+`packages/compiler/test/wasm-emitter-dynamic.test.ts` (EDYN-S3).
+
 ## S056 — `deepStrictEqual`'s cycle memo runs ALWAYS; Node runs it only after a stack overflow, so a fresh Node process can answer EQUAL where this tier throws on one class of terminating cyclic shape *(all three lanes)*
 
 `assert.deepStrictEqual`/`notDeepStrictEqual` over cycle-capable static
@@ -11843,3 +11853,19 @@ that cannot grow) stops by name, never wraps.
 **Tested by:** tests/harness/wasm-library.test.ts rows `p2-memory`,
 `p2-heap-1`..`p2-heap-6`, `p2-heap-scratch-fence`, `p2-first-call-arg`,
 `p2-mem-fence-*`.
+
+## S148 — The unhandled-'error' throw of a dynamic-mode emitter carries no `context` property *(wasm and wasm-native)*
+
+Node's `emit('error', er)` with no 'error' listener throws `er` itself
+when it is an Error; otherwise it throws `ERR_UNHANDLED_ERROR`
+("Unhandled error. (<inspect(er)>)", an `Error` with that `code`) and
+sets the thrown error's `context` property to `er`. An emitter whose
+class family uses dynamic event names (lower-emitter.ts's family rule)
+throws the same error with the same name, code and message, but without
+`context`: reading `e.context` answers `undefined` where Node answers the
+emitted value. Everything else about the throw (an Error argument thrown
+as itself, the message's inspect rendering, `undefined` for no argument)
+is Node's. **Rationale:** the builtin error encoding has no slot for an
+arbitrary extra property; no workload reads it. **Tested by:**
+`packages/compiler/test/wasm-emitter-dynamic.test.ts` (EDYN-07 pins the
+code, name and messages; `context` itself is unpinned, by construction).

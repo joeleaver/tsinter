@@ -39,9 +39,9 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { dynFallbackType, jsFuncNameOf, newFnCtx } from "./lowerer.js";
-import type { ClassInfo } from "./lower-classes.js";
+import { EMITTER_API_MEMBERS, type ClassInfo } from "./lower-classes.js";
 import { isJsSourceFile, locOf } from "../program.js";
-import { arrayOf, BOOL, canBoxFuncIntoDyn, canConvertToDyn, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, isUnitType, STRING, SrcLoc, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canBoxFuncIntoDyn, canConvertToDyn, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, isUnitType, STRING, SrcLoc, typeEquals, typeKey, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { undefFnParamGuard } from "./lower-exprs.js";
 import { streamForcedTuple, streamSidesOf } from "./lower-stream.js";
 
@@ -177,6 +177,9 @@ function emitterEvents(L: Lowerer): Map<string, EventSig> {
         return; // checker trouble is the lowering's business, not the scan's
       }
       if (recvT?.kind !== "object" || !emitterRooted(L, L.classes.get(recvT.className))) return;
+      // A dynamic-mode family keeps no tuples (its sites box every
+      // argument) — its names never constrain a static family's.
+      if (isDynamicEmitter(L, L.classes.get(recvT.className))) return;
       if (!nameT.isStringLiteralType()) return;
       const name = nameT.value;
       if (META_EVENTS.has(name) || name === "error") return; // forced tuples
@@ -610,6 +613,10 @@ export function lowerEmitterMethodCall(L: Lowerer, call: ts.CallExpression,
       "instance emitters lower this member; the class-value statics have no lowering yet",
     );
   }
+  if (isDynamicEmitter(L, info)) {
+    const dynamic = lowerDynamicEmitterCall(L, call, member, info, lowerReceiver, loc);
+    if (dynamic !== null) return dynamic;
+  }
   const table = emitterEvents(L);
 
   if (REGISTER_MEMBERS.has(member) || member === "off" || member === "removeListener") {
@@ -884,6 +891,411 @@ export function lowerEmitterMethodCall(L: Lowerer, call: ts.CallExpression,
     return { kind: "libCall", fn: "emitter.getMax", args: [receiver], type: F64, loc };
   }
 
+  return null;
+}
+
+/* ── dynamic-mode emitters (computed event names) ─────────────────────
+ * The family rule (the dynamic-emitter unit's ruling 2): a non-literal
+ * event name at any registration/removal/emit site of an emitter class
+ * FAMILY (the classes under one topmost user class extending
+ * EventEmitter; plain `new EventEmitter()` objects are the root's own
+ * family) puts that whole family in dynamic mode. A dynamic-mode object
+ * keeps ONE general table keyed by the run-time name string — 'error'
+ * included, so the static path's dedicated 'error' bucket never holds
+ * its listeners — and every listener registers as a dynamic value (a
+ * typed listener boxes; its own parameters check what reaches them,
+ * S128). Emits box their arguments; the no-listener 'error' throw is
+ * decided at run time by the name.
+ *
+ * Receivers that can see objects of several families must agree with
+ * every one of them: a non-literal site through a root-typed
+ * (`EventEmitter`) receiver makes every family dynamic, and so does ANY
+ * root-typed site once some family is dynamic (otherwise a literal
+ * `.on('error', fn)` through the root type would reach the dedicated
+ * bucket of an object whose own family keeps 'error' in the general
+ * table). The runtime stream classes stay static (their runtime emits
+ * use the forced tuples and the 'error' bucket); a stream never reaches
+ * a root-typed receiver — that upcast refuses by name at compile time
+ * (EDYN-S4 pins it). */
+
+interface EmitterDynModes {
+  all: boolean;
+  families: Set<ClassInfo>;
+}
+
+/** The topmost class below the runtime root on `info`'s chain (the root
+ * itself for the root). */
+function emitterFamilyOf(info: ClassInfo): ClassInfo {
+  let c = info;
+  while (c.base !== null && !c.base.builtinEmitter) c = c.base;
+  return c;
+}
+
+function streamRootedInfo(info: ClassInfo): boolean {
+  for (let c: ClassInfo | null = info; c; c = c.base) if (c.builtinStream !== undefined) return true;
+  return false;
+}
+
+function emitterDynModes(L: Lowerer): EmitterDynModes {
+  const holder = L as unknown as { emitterDynModes?: EmitterDynModes };
+  if (holder.emitterDynModes) return holder.emitterDynModes;
+  const modes: EmitterDynModes = { all: false, families: new Set() };
+  holder.emitterDynModes = modes;
+  let rootSite = false;
+  for (const sf of L.program.getSourceFiles()) {
+    if (sf.isDeclarationFile) continue;
+    const walk = (node: ts.Node): void => {
+      ts.forEachChild(node, walk);
+      if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return;
+      const member = node.expression.name.text;
+      if (!EMITTER_API_MEMBERS.has(member)) return;
+      let info: ClassInfo | undefined;
+      let nameIsLiteral = true;
+      try {
+        const recvT = L.mapTypeOf(L.typeOf(node.expression.expression));
+        if (recvT?.kind !== "object") return;
+        info = L.classes.get(recvT.className);
+        if (!info || !emitterRooted(L, info) || streamRootedInfo(info)) return;
+        // The class VALUE's statics are not instance sites.
+        if (L.checker.getConstructSignatures(L.typeOf(node.expression.expression)).length > 0) return;
+        const arg0 = node.arguments[0];
+        if (arg0 && (REGISTER_MEMBERS.has(member) || member === "off" || member === "removeListener" || member === "emit")) {
+          // An emit override's own forward (`super.emit(event, ...args)`,
+          // event = the override's first parameter) is pinned per event by
+          // the override's specialization — not a computed name.
+          nameIsLiteral = L.typeOf(arg0).isStringLiteralType() || isOverrideForwardName(L, node, arg0);
+        }
+      } catch {
+        return; // checker trouble is the lowering's business
+      }
+      if (info.builtinEmitter) rootSite = true;
+      if (!nameIsLiteral) {
+        if (info.builtinEmitter) modes.all = true;
+        else modes.families.add(emitterFamilyOf(info));
+      }
+    };
+    walk(sf);
+  }
+  if (rootSite && modes.families.size > 0) modes.all = true;
+  return modes;
+}
+
+/** `super.emit(event, ...)` inside a method `emit(event, ...args)`: the
+ * forwarding shape emit overrides lower per literal event. */
+function isOverrideForwardName(L: Lowerer, call: ts.CallExpression, arg0: ts.Expression): boolean {
+  if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.kind !== ts.SyntaxKind.SuperKeyword) return false;
+  if (call.expression.name.text !== "emit" || !ts.isIdentifier(arg0)) return false;
+  let m: ts.Node | undefined = call.parent;
+  while (m !== undefined && !ts.isMethodDeclaration(m)) {
+    if (ts.isFunctionLike(m) && !ts.isArrowFunction(m)) return false;
+    m = m.parent;
+  }
+  if (m === undefined || !ts.isMethodDeclaration(m) || !ts.isIdentifier(m.name) || m.name.text !== "emit") return false;
+  const p0 = m.parameters[0];
+  if (p0 === undefined || !ts.isIdentifier(p0.name)) return false;
+  try {
+    return L.checker.getSymbolAtLocation(arg0) === L.checker.getSymbolAtLocation(p0.name);
+  } catch {
+    return false;
+  }
+}
+
+/** True when `info`'s family is in dynamic mode (the header above). */
+export function isDynamicEmitter(L: Lowerer, info: ClassInfo | undefined | null): boolean {
+  if (!info || !emitterRooted(L, info) || streamRootedInfo(info)) return false;
+  const modes = emitterDynModes(L);
+  return modes.all || modes.families.has(emitterFamilyOf(info));
+}
+
+/** A run-time fence statement (SC1090). */
+function emitterFence(message: string, loc: SrcLoc): IrStmt {
+  return { kind: "runtimeFence", code: "SC1090", message: `${message} [SC1090 at an emitter with dynamic event names]`, loc };
+}
+
+/** A value crossing into the emitter's dynamic world (a listener, an
+ * emitted argument, the listener's `this`). */
+function emitterToDyn(L: Lowerer, node: ts.Node, e: IrExpr): IrExpr | null {
+  if (e.type.kind === "dyn") return e;
+  if (e.type.kind === "jsval") return { kind: "dynFromJsval", value: e, type: DYN, loc: e.loc };
+  const c = L.coerceInto(node, e, DYN);
+  return c.type.kind === "dyn" ? c : null;
+}
+
+/** The event name as a string: a string-typed expression as is; a
+ * dynamic one through a helper that stops by name on a non-string (a
+ * symbol name, a number — Node keys those too; not built). */
+function emitterNameExpr(L: Lowerer, member: string, arg: ts.Expression): IrExpr {
+  const e = L.lowerExpr(arg);
+  if (e.type.kind === "string") return e;
+  const loc = locOf(arg);
+  if (e.type.kind === "dyn" || e.type.kind === "jsval") {
+    const d: IrExpr = e.type.kind === "dyn" ? e : { kind: "dynFromJsval", value: e, type: DYN, loc };
+    const key = "emitter.nameOf";
+    let helper = L.arrHofHelpers.get(key);
+    if (!helper) {
+      helper = `%emitter.nameOf.${L.arrHofHelpers.size}`;
+      L.arrHofHelpers.set(key, helper);
+      const v: IrExpr = { kind: "varRef", localId: "v.0", type: DYN, loc };
+      L.liftedFns.push({
+        name: helper,
+        params: [{ localId: "v.0", name: "v", type: DYN }],
+        returnType: STRING,
+        locals: [{ id: "v.0", name: "v", type: DYN, mutable: false }],
+        body: [
+          {
+            kind: "if",
+            cond: { kind: "dynTest", test: "string", negated: true, value: v, type: BOOL, loc },
+            then: [emitterFence("an EventEmitter event name that is not a string (symbol and number names are not built)", loc)],
+            else_: null,
+            loc,
+          },
+          { kind: "return", value: { kind: "dynCheck", value: v, type: STRING, loc }, loc },
+        ],
+        loc,
+      });
+    }
+    return { kind: "call", callee: helper, args: [d], type: STRING, loc };
+  }
+  L.noLowering(
+    `${member} with a '${L.fmt(e.type)}' event name`,
+    arg,
+    "event names here are strings (symbol names have no lowering)",
+  );
+}
+
+/** One member over a dynamic-mode receiver, or null for the members whose
+ * lowering does not depend on the mode (eventNames, get/setMaxListeners). */
+function lowerDynamicEmitterCall(
+  L: Lowerer,
+  call: ts.CallExpression,
+  member: string,
+  info: ClassInfo,
+  lowerReceiver: () => IrExpr,
+  loc: SrcLoc,
+): IrExpr | null {
+  const args = call.arguments;
+  const nameIndependent = member === "eventNames" || member === "setMaxListeners" || member === "getMaxListeners";
+  if (nameIndependent) return null;
+  if (args.some(ts.isSpreadElement)) {
+    L.noLowering(`${member} with a spread argument`, call);
+  }
+  const ov = emitOverrideComparable(info);
+  if (ov) {
+    L.noLowering(
+      `'${member}' on an emitter class family with dynamic event names while '${ov.def.jsName || ov.def.name}' overrides emit`,
+      call,
+      "emit overrides are lowered per literal event name only",
+    );
+  }
+  if (member === "listeners" || member === "rawListeners") {
+    L.noLowering(
+      `${member}() on an emitter whose class family uses dynamic event names`,
+      call,
+      "the listener array is not built for dynamic-mode emitters (GH #208) — listenerCount(name) counts",
+    );
+  }
+  const ref = (localId: string, type: IrType): IrExpr => ({ kind: "varRef", localId, type, loc });
+  if (REGISTER_MEMBERS.has(member) || member === "off" || member === "removeListener") {
+    const extrasPure = args.slice(2).every((a) => ts.isIdentifier(a) || ts.isLiteralExpression(a));
+    if (args.length < 2 || !extrasPure) {
+      L.noLowering(`${member} with ${args.length} arguments`, call, "the supported form is (eventName, listener)");
+    }
+    const receiver = lowerReceiver();
+    const name = emitterNameExpr(L, member, args[0]!);
+    const cbRaw = L.lowerExpr(args[1]!);
+    const cb = emitterToDyn(L, args[1]!, cbRaw);
+    if (cb === null) {
+      L.noLowering(
+        `'${member}' with a listener of type '${L.fmt(cbRaw.type)}'`,
+        args[1]!,
+        "a listener of an emitter with dynamic event names crosses as a dynamic value; this type does not",
+      );
+    }
+    const registering = REGISTER_MEMBERS.has(member);
+    const recvT = receiver.type;
+    const key = `${registering ? "emitter.onGen" : "emitter.offGen"}:${typeKey(recvT)}`;
+    let helper = L.arrHofHelpers.get(key);
+    if (!helper) {
+      helper = `%emitter.${registering ? "onGen" : "offGen"}.${L.arrHofHelpers.size}`;
+      L.arrHofHelpers.set(key, helper);
+      const params: IrParam[] = [
+        { localId: "r.0", name: "r", type: recvT },
+        { localId: "n.0", name: "n", type: STRING },
+        { localId: "cb.0", name: "cb", type: DYN },
+        ...(registering
+          ? [
+              { localId: "o.0", name: "o", type: BOOL },
+              { localId: "p.0", name: "p", type: BOOL },
+            ]
+          : []),
+      ];
+      const locals: IrLocal[] = params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: false }));
+      const body: IrStmt[] = [
+        { kind: "exprStmt", expr: { kind: "libCall", fn: "emitter.checkListener", args: [ref("cb.0", DYN)], type: VOID, loc }, loc },
+      ];
+      if (registering) {
+        // `this` inside the listener: the emitter as a dynamic value (a
+        // class view), or undefined where the class has none.
+        const self = emitterToDyn(L, call, ref("r.0", recvT)) ??
+          { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
+        body.push({
+          kind: "return",
+          value: {
+            kind: "libCall",
+            fn: "emitter.onGen",
+            args: [ref("r.0", recvT), ref("n.0", STRING), ref("cb.0", DYN), self, ref("o.0", BOOL), ref("p.0", BOOL)],
+            type: recvT,
+            loc,
+          },
+          loc,
+        });
+      } else {
+        body.push({
+          kind: "return",
+          value: { kind: "libCall", fn: "emitter.offGen", args: [ref("r.0", recvT), ref("n.0", STRING), ref("cb.0", DYN)], type: recvT, loc },
+          loc,
+        });
+      }
+      L.liftedFns.push({ name: helper, params, returnType: recvT, locals, body, loc });
+    }
+    const once = member === "once" || member === "prependOnceListener";
+    const prepend = member === "prependListener" || member === "prependOnceListener";
+    return {
+      kind: "call",
+      callee: helper,
+      args: registering ? [receiver, name, cb, boolLit(once, loc), boolLit(prepend, loc)] : [receiver, name, cb],
+      type: recvT,
+      loc,
+    };
+  }
+
+  if (member === "emit") {
+    if (args.length === 0) L.noLowering("emit without an event name", call);
+    const receiver = lowerReceiver();
+    const name = emitterNameExpr(L, member, args[0]!);
+    const payload = args.slice(1).map((a) => {
+      const raw = L.lowerExpr(a);
+      const d = emitterToDyn(L, a, raw);
+      if (d === null) {
+        L.noLowering(
+          `emit with a '${L.fmt(raw.type)}' argument`,
+          a,
+          "the arguments of an emitter with dynamic event names cross as dynamic values; this type does not",
+        );
+      }
+      return d;
+    });
+    const recvT = receiver.type;
+    const plain = name.kind === "strLit" && name.value !== "error";
+    if (plain) {
+      return { kind: "libCall", fn: "emitter.emitGen", args: [receiver, name, ...payload], type: BOOL, loc };
+    }
+    const key = `emitter.emitGen:${typeKey(recvT)}:${payload.length}`;
+    let helper = L.arrHofHelpers.get(key);
+    if (!helper) {
+      helper = `%emitter.emitGen.${L.arrHofHelpers.size}`;
+      L.arrHofHelpers.set(key, helper);
+      const params: IrParam[] = [
+        { localId: "r.0", name: "r", type: recvT },
+        { localId: "n.0", name: "n", type: STRING },
+        ...payload.map((_, i) => ({ localId: `a${i}.0`, name: `a${i}`, type: DYN })),
+      ];
+      const locals: IrLocal[] = params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: false }));
+      const er = (): IrExpr => payload.length > 0
+        ? ref("a0.0", DYN)
+        : { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
+      // Node's emit('error') with no 'error' listener: an Error argument
+      // throws as itself; anything else throws ERR_UNHANDLED_ERROR,
+      // "Unhandled error. (<inspect(er)>)" — without Node's `context`
+      // property (SEMANTICS.md S148).
+      const message: IrExpr = {
+        kind: "strConcat",
+        left: {
+          kind: "strConcat",
+          left: strLit("Unhandled error. (", loc),
+          right: { kind: "libCall", fn: "insp.dyn", args: [er(), { kind: "numLit", value: 0, type: F64, loc }, { kind: "numLit", value: 2, type: F64, loc }], type: STRING, loc },
+          type: STRING,
+          loc,
+        },
+        right: strLit(")", loc),
+        type: STRING,
+        loc,
+      };
+      const unhandled: IrStmt = {
+        kind: "if",
+        cond: { kind: "dynTest", test: "error", value: er(), type: BOOL, loc },
+        then: [{ kind: "throw", value: er(), loc }],
+        else_: [{
+          kind: "exprStmt",
+          expr: {
+            kind: "libCall",
+            fn: "error.nodeThrow",
+            args: [{ kind: "numLit", value: 0, type: F64, loc }, strLit("ERR_UNHANDLED_ERROR", loc), message],
+            type: VOID,
+            loc,
+          },
+          loc,
+        }],
+        loc,
+      };
+      const body: IrStmt[] = [
+        {
+          kind: "if",
+          cond: { kind: "strEq", negated: false, left: ref("n.0", STRING), right: strLit("error", loc), type: BOOL, loc },
+          then: [{
+            kind: "if",
+            cond: {
+              kind: "bin",
+              op: "===",
+              left: { kind: "libCall", fn: "emitter.countGen", args: [ref("r.0", recvT), strLit("error", loc)], type: F64, loc },
+              right: { kind: "numLit", value: 0, type: F64, loc },
+              type: BOOL,
+              loc,
+            },
+            then: [unhandled],
+            else_: null,
+            loc,
+          }],
+          else_: null,
+          loc,
+        },
+        {
+          kind: "return",
+          value: {
+            kind: "libCall",
+            fn: "emitter.emitGen",
+            args: [ref("r.0", recvT), ref("n.0", STRING), ...payload.map((_, i) => ref(`a${i}.0`, DYN))],
+            type: BOOL,
+            loc,
+          },
+          loc,
+        },
+      ];
+      L.liftedFns.push({ name: helper, params, returnType: BOOL, locals, body, loc });
+    }
+    return { kind: "call", callee: helper, args: [receiver, name, ...payload], type: BOOL, loc };
+  }
+
+  if (member === "removeAllListeners") {
+    if (args.length > 1) L.noLowering(`removeAllListeners with ${args.length} arguments`, call);
+    const receiver = lowerReceiver();
+    const all = args.length === 0;
+    const name = all ? strLit("", loc) : emitterNameExpr(L, member, args[0]!);
+    return { kind: "libCall", fn: "emitter.removeAllGen", args: [receiver, name, boolLit(all, loc)], type: receiver.type, loc };
+  }
+
+  if (member === "listenerCount") {
+    if (args.length !== 1 && args.length !== 2) L.noLowering(`listenerCount with ${args.length} arguments`, call);
+    const receiver = lowerReceiver();
+    const name = emitterNameExpr(L, member, args[0]!);
+    if (args.length === 2) {
+      const raw = L.lowerExpr(args[1]!);
+      const cb = emitterToDyn(L, args[1]!, raw);
+      if (cb === null) L.noLowering(`listenerCount with a '${L.fmt(raw.type)}' filter`, args[1]!);
+      return { kind: "libCall", fn: "emitter.countFnGen", args: [receiver, name, cb], type: F64, loc };
+    }
+    return { kind: "libCall", fn: "emitter.countGen", args: [receiver, name], type: F64, loc };
+  }
   return null;
 }
 

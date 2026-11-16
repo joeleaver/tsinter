@@ -6411,6 +6411,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "process.clearExitCode":
           case "process.exitCodeOr0":
             throw new Error("process.exitCode writes are lowered for the WasmGC lanes only (use --backend wasm)");
+          case "emitter.onGen":
+          case "emitter.offGen":
+          case "emitter.emitGen":
+          case "emitter.countGen":
+          case "emitter.countFnGen":
+          case "emitter.removeAllGen":
+            throw new Error("emitters with dynamic event names are not supported on the legacy C/LLVM lanes (use --backend wasm)");
           case "dyn.iterHole":
             // GH #183/#185: no live Map walk on the legacy lanes (their
             // packs are arrays): never a hole.

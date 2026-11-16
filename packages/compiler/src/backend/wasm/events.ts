@@ -137,6 +137,10 @@ export const ENTRY_ONCE = 3;
 export const ENTRY_FIRED = 4;
 export const ENTRY_NEXT = 5;
 
+/** `$eeLenv`'s field indices (the dynamic-mode listener env). */
+export const LENV_FN = 0;
+export const LENV_SELF = 1;
+
 /** The emitter ROOT struct's own two injected fields, past `vt` — the
  * WasmGC nominal-supertype translation of C's ScrEmitter prefix (registry
  * pointer, display-name slot). classes.ts's gate lift places these at
@@ -234,6 +238,14 @@ export interface EventsDeps {
    * project's own board #20 class), so finalization is unconditional
    * once the function was ever referenced. */
   listenerUnwrap: () => number;
+  /** DYNAMIC-MODE EMITTERS (lower-emitter.ts's family rule): the dyn
+   * value reference type, the ambient-receiver push/pop (dyn.this) and
+   * the checked-dynamic call (`(fn, args, what) -> dyn`) — what the
+   * listener-env thunk calls a dynamic listener through. */
+  dynRef: () => ValType;
+  thisPush: () => number;
+  thisPop: () => number;
+  callFn: () => number;
 }
 
 export class EventsBuilder {
@@ -244,6 +256,7 @@ export class EventsBuilder {
   private bucketErrTField: number | null = null;
   private entryErrTField: number | null = null;
   private errThunkSigField: number | null = null;
+  private listenerEnvTField: number | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -605,20 +618,113 @@ export class EventsBuilder {
    * so there is no separate "has listener" gate to keep in sync with it. */
   private fireMetaHelper(metaLit: "newListener" | "removeListener"): number {
     return this.cached(`fireMeta:${metaLit}`, () => {
-      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef()], []), `%w.ee.fireMeta.${metaLit}`);
+      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef(), EQ_REF], []), `%w.ee.fireMeta.${metaLit}`);
       const c = new Code();
-      const ROOT = 0, NAME = 1, ARR = 2;
+      const ROOT = 0, NAME = 1, CLOS = 2, ARR = 3;
+      const envT = this.listenerEnvT();
+      // A dynamic-mode entry (its clos is a listener env) carries the
+      // listener as a dyn value: Node's (eventName, listener) pair. Every
+      // other entry is a typed/static registration whose meta listeners
+      // take at most the name (lower-emitter.ts's own fence).
+      c.localGet(CLOS);
+      c.refTest(envT);
+      c.ifVoid();
+      c.i32Const(2);
+      this.deps.boxStr(c, (x) => x.localGet(NAME));
+      c.localGet(CLOS);
+      c.refCast(envT);
+      c.structGet(envT, LENV_FN);
+      c.arrayNewFixed(this.deps.dynArrBufType(), 2);
+      c.structNew(this.deps.dynArrStructType());
+      c.localSet(ARR);
+      c.else_();
       c.i32Const(1);
       this.deps.boxStr(c, (x) => x.localGet(NAME));
       c.arrayNewFixed(this.deps.dynArrBufType(), 1);
       c.structNew(this.deps.dynArrStructType());
       c.localSet(ARR);
+      c.end();
       c.localGet(ROOT);
       this.deps.lit(c, metaLit);
       c.localGet(ARR);
       c.call(this.emitDispatch());
       c.drop(); // hadListeners is not observed here
       this.mb.setBody(idx, [this.deps.dynArrRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── dynamic-mode listeners (lower-emitter.ts's family rule) ────────── */
+
+  /** `$eeLenv {fn: dyn, self: dyn}` — the closure a dynamic-mode
+   * registration stores as its entry's `clos`: the listener as a dyn
+   * value and the emitter as the dyn value `this` reads inside it (a
+   * class view; boxed undefined when the receiver has no view). */
+  listenerEnvT(): number {
+    if (this.listenerEnvTField !== null) return this.listenerEnvTField;
+    this.listenerEnvTField = this.mb.openStructType("%w.ee.lenv", [
+      { storage: this.deps.dynRef(), mutable: false }, // LENV_FN
+      { storage: this.deps.dynRef(), mutable: false }, // LENV_SELF
+      { storage: I32, mutable: false }, // a distinct shape: the marker against other (dyn, dyn) structs
+    ]);
+    return this.listenerEnvTField;
+  }
+
+  /** The entry thunk of a dynamic-mode registration (thunkSig's shape):
+   * `this` = the emitter for the call's duration, then the listener
+   * through the checked-dynamic call with the emitted arguments as they
+   * are — JS-exact arity, no tuple. A throw stays pending for the
+   * dispatch loop (which stops the pass), and the pop runs on that path
+   * too (dyn.this's own bracket contract). */
+  listenerEnvThunk(): number {
+    return this.cached("listenerEnvThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.thunkSig(), "%w.ee.lenvThunk");
+      const envT = this.listenerEnvT();
+      const c = new Code();
+      const CLOS = 0, ARGS = 1, ENV = 2, R = 3;
+      c.localGet(CLOS);
+      c.refCast(envT);
+      c.localSet(ENV);
+      c.localGet(ENV);
+      c.structGet(envT, LENV_SELF);
+      c.call(this.deps.thisPush());
+      c.localGet(ENV);
+      c.structGet(envT, LENV_FN);
+      c.localGet(ARGS);
+      this.deps.lit(c, "listener");
+      c.call(this.deps.callFn());
+      c.localSet(R);
+      c.call(this.deps.thisPop());
+      c.localGet(R);
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: envT }, this.deps.dynRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root, n) -> void` — GH #208's named stop for Node's
+   * MaxListenersExceededWarning: an add that leaves `n` listeners on one
+   * event past a positive getMaxListeners() ends the program by name
+   * (Node prints a pid-stamped deferred warning — SEMANTICS.md S055). */
+  leakStop(): number {
+    return this.cached("leakStop", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), I32], []), "%w.ee.leakStop");
+      const c = new Code();
+      const ROOT = 0, N = 1, M = 2;
+      c.localGet(ROOT);
+      c.call(this.getMaxOf());
+      c.localTee(M);
+      c.f64Const(0);
+      c.f64Gt();
+      c.localGet(N);
+      c.f64ConvertI32U();
+      c.localGet(M);
+      c.f64Gt();
+      c.i32And();
+      c.ifVoid();
+      this.deps.fence(c, (x) =>
+        this.deps.lit(x, "EventEmitter's MaxListenersExceededWarning (more listeners on one event than getMaxListeners() allows) is not built (GH #208)"));
+      c.end();
+      this.mb.setBody(idx, [F64], c.bytes());
       return idx;
     });
   }
@@ -650,6 +756,7 @@ export class EventsBuilder {
       // the add still happens (Node's addListener has no try around it).
       c.localGet(ROOT);
       c.localGet(NAME);
+      c.localGet(CLOS);
       c.call(this.fireMetaHelper("newListener"));
       c.localGet(REG);
       c.localGet(NAME);
@@ -709,6 +816,10 @@ export class EventsBuilder {
       c.i32Const(1);
       c.i32Add();
       c.structSet(this.bucketT(), BUCKET_N);
+      c.localGet(ROOT);
+      c.localGet(B);
+      c.structGet(this.bucketT(), BUCKET_N);
+      c.call(this.leakStop());
       this.mb.setBody(idx, [this.regRef(), this.bucketRef(), this.entryRef()], c.bytes());
       return idx;
     });
@@ -816,6 +927,8 @@ export class EventsBuilder {
       c.end();
       c.localGet(ROOT);
       c.localGet(NAME);
+      c.localGet(CUR);
+      c.structGet(this.entryT(), ENTRY_CLOS);
       c.call(this.fireMetaHelper("removeListener"));
       this.mb.setBody(idx, [this.entryRef(), this.entryRef(), I32, this.deps.strRef()], c.bytes());
       return idx;
@@ -1846,6 +1959,7 @@ export class EventsBuilder {
       const ROOT = 0, CLOS = 1, THUNK = 2, ONCE = 3, PREPEND = 4, EB = 5, E = 6;
       c.localGet(ROOT);
       this.deps.lit(c, "error");
+      c.refNull(EQ_HEAP);
       c.call(this.fireMetaHelper("newListener"));
       c.localGet(ROOT);
       c.i32Const(0); // reserved: ordinary registration never creates one
@@ -1901,6 +2015,10 @@ export class EventsBuilder {
       c.i32Const(1);
       c.i32Add();
       c.structSet(this.bucketErrT(), BUCKETERR_N);
+      c.localGet(ROOT);
+      c.localGet(EB);
+      c.structGet(this.bucketErrT(), BUCKETERR_N);
+      c.call(this.leakStop());
       this.mb.setBody(idx, [this.bucketErrRef(), this.entryErrRef()], c.bytes());
       return idx;
     });
@@ -2024,6 +2142,7 @@ export class EventsBuilder {
       c.end();
       c.localGet(ROOT);
       this.deps.lit(c, "error");
+      c.refNull(EQ_HEAP);
       c.call(this.fireMetaHelper("removeListener"));
       this.mb.setBody(idx, [this.entryErrRef(), this.entryErrRef(), I32, this.regRef()], c.bytes());
       return idx;

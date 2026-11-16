@@ -3971,6 +3971,18 @@ export type IrLibFn =
   | "emitter.emitError"
   | "emitter.count"
   | "emitter.countFn"
+  /** Dynamic-mode emitters (lower-emitter.ts's family rule): one general
+   * table keyed by the name string, 'error' included. onGen: (recv, name,
+   * cb dyn, self dyn, once, prepend) — checkListener already ran; offGen:
+   * (recv, name, cb dyn); emitGen: (recv, name, ...dyn args), VARIADIC;
+   * countGen: (recv, name); countFnGen: (recv, name, cb dyn);
+   * removeAllGen: (recv, name, all). */
+  | "emitter.onGen"
+  | "emitter.offGen"
+  | "emitter.emitGen"
+  | "emitter.countGen"
+  | "emitter.countFnGen"
+  | "emitter.removeAllGen"
   | "emitter.names"
   | "emitter.listeners"
   | "emitter.setMax"
@@ -7816,6 +7828,10 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "emitter.checkListener",
   "emitter.onDyn",
   "emitter.offDyn",
+  "emitter.onGen",
+  "emitter.offGen",
+  "emitter.emitGen",
+  "emitter.removeAllGen",
   "emitter.onData",
   "emitter.onDataDyn",
   "emitter.emitData",

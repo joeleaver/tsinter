@@ -517,7 +517,7 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
         kind: "if",
         cond: { kind: "unary", op: "!", operand: { kind: "jsViewOfClass", value: th(), className: t.className, type: BOOL, loc }, type: BOOL, loc },
         then: [
-          fence(`calling the method '${name}' of a '${label}' instance shared with dynamic code without that instance as 'this' (a method read off the instance and called detached) is not supported yet (SEMANTICS.md S115)`, loc),
+          fence(`calling the method '${name}' of a '${label}' instance shared with dynamic code with a 'this' that is no '${label}' instance (a method read off the instance and called detached, or through .call/.apply with another value) is not supported yet (SEMANTICS.md S115)`, loc),
           { kind: "return", value: undef(loc), loc },
         ],
         else_: null,
@@ -529,9 +529,16 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
       // never a virtual dispatch on the receiver: `g.a.call(h)` with h a
       // subclass instance overriding `a` still runs G's `a` (GH #186).
       const call = receiverFromThis
-        ? declarerCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!
-        : methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)!;
-      if (call.type.kind === "void") {
+        ? declarerCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)
+        : methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc);
+      if (call === null) {
+        // An ABSTRACT signature: no instance has this exact class (the
+        // view factory dispatches to the concrete subclass's own view
+        // first, whose lookup finds the override), so this body is never
+        // reached; it stops by name rather than calling nothing.
+        body.push(fence(`calling the abstract method '${name}' of '${label}' through a class instance shared with dynamic code`, loc));
+        body.push({ kind: "return", value: undef(loc), loc });
+      } else if (call.type.kind === "void") {
         body.push({ kind: "exprStmt", expr: call, loc }, { kind: "return", value: undef(loc), loc });
       } else {
         body.push({ kind: "return", value: liftOut(L, call, loc), loc });

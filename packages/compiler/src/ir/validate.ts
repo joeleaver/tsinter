@@ -1006,6 +1006,12 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "emitter.checkListener": { argTypes: [DYN], result: VOID },
   "emitter.onDyn": { argTypes: [null, STRING, DYN, null, BOOL, BOOL], result: VOID },
   "emitter.offDyn": { argTypes: [null, STRING, DYN], result: VOID },
+  "emitter.onGen": { argTypes: [null, STRING, DYN, DYN, BOOL, BOOL], result: VOID },
+  "emitter.offGen": { argTypes: [null, STRING, DYN], result: VOID },
+  "emitter.emitGen": { argTypes: [null, STRING], result: BOOL },
+  "emitter.countGen": { argTypes: [null, STRING], result: F64 },
+  "emitter.countFnGen": { argTypes: [null, STRING, DYN], result: F64 },
+  "emitter.removeAllGen": { argTypes: [null, STRING, BOOL], result: VOID },
   "emitter.removeAll": { argTypes: [null, STRING, BOOL], result: VOID },
   "emitter.emit": { argTypes: [null, STRING], result: BOOL },
   "emitter.emitError": { argTypes: [null, STRING, null], result: BOOL },
@@ -3790,7 +3796,7 @@ function validateFunction(
         // (the optional chunk/cb tail), and unpipe (the optional
         // destination) admit a longer list the same way.
         const variadic =
-          e.fn === "emitter.emit" ||
+          e.fn === "emitter.emit" || e.fn === "emitter.emitGen" ||
           e.fn === "readable.new" || e.fn === "writable.new" ||
           e.fn === "duplex.new" || e.fn === "transform.new" ||
           e.fn === "passthrough.new" ||
@@ -4777,6 +4783,8 @@ function validateFunction(
           // The chaining forms return the receiver's own static class.
           if (e.fn === "emitter.on" || e.fn === "emitter.off" ||
               e.fn === "emitter.onDyn" || e.fn === "emitter.offDyn" ||
+              e.fn === "emitter.onGen" || e.fn === "emitter.offGen" ||
+              e.fn === "emitter.removeAllGen" ||
               e.fn === "emitter.onData" || e.fn === "emitter.onDataDyn" ||
               e.fn === "emitter.removeAll" || e.fn === "emitter.setMax" ||
               e.fn === "emitter.setMaxChk") {

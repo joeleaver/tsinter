@@ -10350,6 +10350,10 @@ class Assembler {
         c.call(this.reportUncaughtHelper());
       },
       listenerUnwrap: () => this.universalUnwrapFn(),
+      dynRef: () => this.dyn.dynRef(),
+      thisPush: () => this.dyn.thisPush(),
+      thisPop: () => this.dyn.thisPop(),
+      callFn: () => this.dyn.callFn(),
     });
     return this.eventsField;
   }
@@ -44028,13 +44032,124 @@ class Assembler {
         this.releaseScratch(this.dyn.dynRef(), cbLocalD);
         return true;
       }
+      /* ── DYNAMIC-MODE EMITTERS (lower-emitter.ts's family rule) ───────
+       * A class family with any computed event name keeps ONE general
+       * table keyed by the name string — 'error' included (no dedicated
+       * bucket), which is why every arm below ignores the name's value.
+       * The lifted helpers (lower-emitter.ts) already ran checkListener
+       * and the root-receiver stream guard; the 'error' no-listener throw
+       * is theirs too. */
+      case "emitter.onGen": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const thunk = this.events.listenerEnvThunk();
+        this.mb.declareFuncRef(thunk);
+        const envT = this.events.listenerEnvT();
+        const recv = this.acquireScratch(recvVal);
+        const cbL = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        this.walkExpr(e.args[1]!); // name
+        this.walkExpr(e.args[2]!); // cb (a FUNC: checkListener ran)
+        code.localTee(cbL);
+        this.walkExpr(e.args[3]!); // self: the dyn `this`
+        code.i32Const(0);
+        code.structNew(envT); // clos: the listener env
+        code.refFunc(thunk);
+        this.dyn.fnPayload(code, (x) => x.localGet(cbL));
+        code.structGet(this.dyn.fnT(), FN_CLOS); // orig: the listener's identity
+        this.walkExpr(e.args[4]!);
+        this.walkExpr(e.args[5]!);
+        code.call(this.events.entryAppend());
+        this.emitPendingCheck(); // a newListener meta handler may have thrown
+        code.localGet(recv);
+        this.releaseScratch(this.dyn.dynRef(), cbL);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.emitGen": {
+        const payload = e.args.slice(2);
+        const dynArrRef = this.dyn.arrRef();
+        const argsLocal = this.acquireScratch(dynArrRef);
+        code.i32Const(payload.length);
+        for (const a of payload) this.walkExpr(a);
+        code.arrayNewFixed(this.dynArgsBufType(), payload.length);
+        code.structNew(this.dynArrStructType());
+        code.localSet(argsLocal);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.localGet(argsLocal);
+        code.call(this.events.emitDispatch());
+        this.releaseScratch(dynArrRef, argsLocal);
+        this.emitPendingCheck();
+        return true;
+      }
+      case "emitter.countGen": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.events.countOf());
+        return true;
+      }
+      case "emitter.countFnGen": {
+        // Identity: a FUNC's own closure; any other value matches nothing
+        // (Node compares `listener === fn`).
+        const cbL = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.localTee(cbL);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        code.i32Const(DK.FUNC);
+        code.i32Eq();
+        this.openIfResult(EQ_REF);
+        this.dyn.fnPayload(code, (x) => x.localGet(cbL));
+        code.structGet(this.dyn.fnT(), FN_CLOS);
+        code.else_();
+        code.refNull(EQ_HEAP);
+        this.close();
+        code.call(this.events.countFnOf());
+        this.releaseScratch(this.dyn.dynRef(), cbL);
+        return true;
+      }
+      case "emitter.removeAllGen": {
+        const allArg = e.args[2]!;
+        if (allArg.kind !== "boolLit") {
+          this.refuse("libCall:emitter.removeAllGen:dynamic-all", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        if (allArg.value) {
+          code.call(this.events.removeAllWhole());
+        } else {
+          this.walkExpr(e.args[1]!);
+          code.call(this.events.removeAllNamed());
+        }
+        this.emitPendingCheck(); // a removeListener meta handler may have thrown
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.offGen":
       case "emitter.offDyn": {
         // off/removeListener with a dyn-adapted listener: identity is
         // the box's underlying closure (checkListener already ran) —
         // the SAME extraction onDyn's registration uses, matching
         // Node's own `cb->v.fn.clo` identity rule.
         const nameArgOd = e.args[1]!;
-        if (nameArgOd.kind === "strLit" && nameArgOd.value === "error") {
+        if (e.fn === "emitter.offDyn" && nameArgOd.kind === "strLit" && nameArgOd.value === "error") {
           this.refuse("libCall:emitter.offDyn:error", e.loc);
           code.unreachable();
           return true;

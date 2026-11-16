@@ -34,7 +34,7 @@ import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
-import { assignsThisMemberConditionally, classInstanceMemberNames, findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
+import { assignsThisMemberConditionally, classInstanceMemberNames, findGenericMethodOn, lowerStaticFieldRead, type ClassInfo } from "./lower-classes.js";
 import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver, staticKindTest } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
@@ -2940,6 +2940,22 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             expr,
           );
         }
+        // A key the shape does not declare, in a JavaScript source (a
+        // TypeScript source cannot spell it): a record value has exactly
+        // its type's shape (SEMANTICS.md S128), so the key is absent and
+        // the read answers undefined, as in Node — commander's
+        // `!!config.mandatory` on its `_optionEx({}, ...)` instance. A
+        // receiver slot holding undefined throws Node's "Cannot read
+        // properties of undefined" TypeError first.
+        if (
+          recvShape !== undefined && recvShape.indexValue === undefined && !recvShape.tuple &&
+          isJsSourceFile(expr.getSourceFile())
+        ) {
+          const undef: IrExpr = { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc };
+          if (recvLowered.kind === "varRef" && !mayHoldSlotUndef(L, recvLowered)) return undef;
+          const checked = undefRecvGuard(L, recvLowered, expr.name.text, loc);
+          return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: checked, loc }], result: undef, type: UNDEFINED_T, loc };
+        }
       }
       // An ABSTRACT property through an abstract-typed receiver: the
       // declaration is erased at runtime — Node defines no field for it,
@@ -3676,6 +3692,40 @@ function parenIsWriteReceiver(paren: ts.Expression): boolean {
  * undefSlots, the kind has a plain-slot undefined, and `e` is not a
  * fresh value that never is one (literals, arithmetic, comparisons,
  * conversions, fresh allocations). */
+/** Could the class (or an ancestor) carry a static `[Symbol.hasInstance]`?
+ * Its `instanceof` answer is that member's, never the prototype walk's,
+ * so the primitive fold below must not decide it. Conservatively: any
+ * static member — method, accessor or property — whose key is computed
+ * and not a string or numeric literal (`[Symbol.hasInstance]`,
+ * `[Symbol["hasInstance"]]`, `get [Symbol.hasInstance]()`, ...). */
+function declaresHasInstance(info: ClassInfo | undefined | null): boolean {
+  for (let c: ClassInfo | null = info ?? null; c; c = c.base) {
+    const decl = c.decl;
+    if (decl === null) continue;
+    for (const m of decl.members) {
+      if (!ts.isMethodDeclaration(m) && !ts.isPropertyDeclaration(m) && !ts.isGetAccessor(m) && !ts.isSetAccessor(m)) continue;
+      const isStatic = (m.modifiers ?? []).some((x: ts.Node) => x.kind === ts.SyntaxKind.StaticKeyword);
+      if (!isStatic || !ts.isComputedPropertyName(m.name)) continue;
+      const k = m.name.expression;
+      if (ts.isStringLiteral(k) || ts.isNumericLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/** `x instanceof C` over a left operand that can never be an instance: a
+ * primitive-typed (string, number, boolean, undefined/null) value. Node
+ * answers false without looking at the class; the operand still
+ * evaluates (a pure read folds away). Null for any other operand. */
+function primitiveInstanceofFalse(e: IrExpr, loc: SrcLoc): IrExpr | null {
+  const k = e.type.kind;
+  if (!(k === "string" || k === "f64" || k === "bool" || isUnitType(e.type))) return null;
+  const no: IrExpr = { kind: "boolLit", value: false, type: BOOL, loc };
+  const pure = e.kind === "varRef" || e.kind === "strLit" || e.kind === "numLit" || e.kind === "boolLit" || e.kind === "unitLit";
+  return pure ? no : { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: e, loc }], result: no, type: BOOL, loc };
+}
+
 export function mayHoldSlotUndef(L: Lowerer, e: IrExpr): boolean {
   if (!L.undefSlots) return false;
   if (definedReads.has(e)) return false;
@@ -11809,6 +11859,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
           );
         }
         const left = L.lowerExpr(expr.left);
+        const primFalse = declaresHasInstance(targetInfo) ? null : primitiveInstanceofFalse(left, loc);
+        if (primFalse !== null) return primFalse;
         if (left.type.kind !== "object") {
           L.unsupported(
             "SC1090",
@@ -11925,6 +11977,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         `'instanceof ${target.def.name.replace(/^%/, "")}' on 'unknown' values (only the Error classes answer — test 'instanceof Error' and read '.name')`,
       );
     }
+    // A primitive is never an instance of any class (Node answers false
+    // without looking at the class): a string/number/boolean/unit operand
+    // that is a pure read folds — commander's `typeof flags === 'object'
+    // && flags instanceof Option` on its string-flags instance.
+    const primFalse = declaresHasInstance(target) ? null : primitiveInstanceofFalse(left, loc);
+    if (primFalse !== null) return primFalse;
     if (left.type.kind !== "object") {
       L.unsupported(
         "SC1090",
