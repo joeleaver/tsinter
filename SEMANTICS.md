@@ -11448,6 +11448,33 @@ cross", so the use refuses by name instead of the walk overflowing the
 compiler's stack (drizzle-orm's generated table types reached that).
 **Tested by:** `packages/compiler/test/npm-dual-view.test.ts` (DV-01..18).
 
+**Amendment (k) — a declared interface over a dynamic implementation
+(2026-11-15, Joe-approved design).** On the WasmGC lanes, an interface or
+object type alias that a viewed package's declarations declare (and only
+they), with at least one function-valued member (a method, or a
+function-typed property), is the implementation's OWN dynamic value on
+the program side, not a record. zod is the case: `ZodString`,
+`ZodObject<Shape>` and the rest are declared interfaces with overloaded and
+generic methods and a self-referential `~standard` member, and every
+instance is built per instance by `$constructor` (no class body exists to
+view, S115). So:
+- identity is kept and nothing is copied: a schema stored, passed through a
+  typed parameter or compared with `===` is the implementation's object;
+- member reads and method calls dispatch dynamically (own members, the
+  prototype chain, `this` bound), so overloads and generics are decided by
+  the implementation, as in Node;
+- results cross into the declared member types at the use, by S133's
+  crossing: a declared primitive (`safeParse(v).success` as `boolean`)
+  checks its kind and stops by name when the implementation produces
+  another; a declared interface result stays dynamic; a data-only result
+  is read dynamically and converted where it reaches a typed slot.
+Data-only interfaces keep their record mapping, declared classes their
+S115 views, and the program's own types are untouched. What is trusted is
+the declarations' claim, as everywhere in S133: a wrong claim surfaces
+only where a crossing checks it.
+**Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
+(DD-01, DD-02).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would

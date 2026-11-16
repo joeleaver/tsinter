@@ -2902,11 +2902,15 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // on undefined/null receivers unless an earlier `?.` guards the
       // chain. Scalar-narrowed occurrences bridge via maybeNarrow's
       // validated dynCheck as usual.
-      if (recvLowered.type.kind === "dyn") {
+      // (S133 (k): on the one-world lanes a jsval receiver — the result of
+      // a call through a declared interface over a dynamic implementation,
+      // `schema.safeParse(v).success` — is that same dynamic value.)
+      if (recvLowered.type.kind === "dyn" || (L.sharedDynamic && recvLowered.type.kind === "jsval")) {
+        const recvDyn: IrExpr = recvLowered.type.kind === "dyn" ? recvLowered : { kind: "dynFromJsval", value: recvLowered, type: DYN, loc };
         const key: IrExpr = { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) };
         const opt = chainGuardedByQuestionDot(expr.expression);
         return L.maybeNarrow(
-          checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recvLowered, type: DYN, loc }),
+          checkedDynKeyGet(L, { kind: "dynKeyGet", key, ...(opt ? { optional: true as const } : {}), value: recvDyn, type: DYN, loc }),
           expr,
         );
       }

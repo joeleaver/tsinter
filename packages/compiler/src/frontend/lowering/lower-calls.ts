@@ -11,7 +11,7 @@ import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
-import { isGenericCallableMemberType, typeKey } from "../types.js";
+import { declaredInterfaceOverDynamic, isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr } from "./lowerer.js";
 import { armRooted, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
@@ -3721,7 +3721,12 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       // Only the dynamic types themselves route: a library-typed island
       // value (a fetch Response, Headers) keeps the island dispatch that
       // serves its own members.
-      const recvDynamic = recvAny || (recvTs0.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0;
+      // A declared interface over a dynamic implementation (S133 (k)) is
+      // that dynamic value too: its methods are the implementation's own.
+      const recvDynamic =
+        recvAny ||
+        (recvTs0.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0 ||
+        declaredInterfaceOverDynamic(L.checker.getNonNullableType(recvTs0), L.typeCtx);
       if (L.sharedDynamic && recvDynamic && !(L.engine && recvAny)) {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
