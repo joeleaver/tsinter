@@ -5189,7 +5189,9 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
       }
       const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
-      return { kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc: locOf(call) };
+      // The result crosses into the declared return type at the use: a
+      // declared primitive (`error.format(): string`) checks its kind.
+      return L.maybeNarrow({ kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc: locOf(call) }, call);
     }
     // Typed-destination filter first (validated extraction into a real
     // T[]); an untyped destination falls through to the runtime dispatch

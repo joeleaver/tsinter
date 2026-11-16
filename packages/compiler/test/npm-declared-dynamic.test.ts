@@ -21,10 +21,11 @@ const DECL_DTS = (kindType: string): string => `export interface StandardSchema<
   readonly vendor: string;
   readonly self: S;
 }
-export interface SafeResult<T> {
-  success: boolean;
-  data?: T;
+export interface SchemaError {
+  readonly issues: { message: string }[];
+  format(): string;
 }
+export type SafeResult<T> = { success: true; data: T } | { success: false; error: SchemaError };
 export interface Schema<T> {
   readonly "~standard": StandardSchema<this>;
   readonly kind: ${kindType};
@@ -41,6 +42,7 @@ export interface Schema<T> {
 export declare function string(): Schema<string>;
 export declare function number(): Schema<number>;
 export declare const Schema: { readonly typeName: string };
+export declare function person(): Schema<{ name: string; age: number }>;
 `;
 
 const DECL_JS = `function $constructor(name, init) {
@@ -50,7 +52,13 @@ const DECL_JS = `function $constructor(name, init) {
   Object.defineProperty(Made, "name", { value: name });
   return (def) => new Made(def);
 }
+function issue(message) {
+  const e = { issues: [{ message }] };
+  e.format = () => e.issues.map((i) => i.message).join("; ");
+  return e;
+}
 function matches(kind, x) {
+  if (kind === "object") return typeof x === "object" && x !== null;
   return kind === "string" ? typeof x === "string" : typeof x === "number";
 }
 const make = $constructor("Schema", (inst, def) => {
@@ -59,7 +67,7 @@ const make = $constructor("Schema", (inst, def) => {
     if (!matches(def.kind, x)) throw new Error("expected " + def.kind);
     return x;
   };
-  inst.safeParse = (x) => (matches(def.kind, x) ? { success: true, data: x } : { success: false });
+  inst.safeParse = (x) => (matches(def.kind, x) ? { success: true, data: x } : { success: false, error: issue("expected " + def.kind) });
   inst.optional = () => make({ kind: def.kind });
   inst.email = (params) => make({ kind: def.kind, message: params });
   inst.refine = (check) => make({ kind: def.kind, check });
@@ -76,6 +84,9 @@ export function number() {
   return make({ kind: "number" });
 }
 export const Schema = { typeName: "Schema" };
+export function person() {
+  return make({ kind: "object" });
+}
 `;
 
 const DECL = (kindType = "string"): Record<string, string> => ({
@@ -123,6 +134,44 @@ const ROWS: Row[] = [
         `import { string } from "decl";`,
         `const s = string().trim().toLowerCase().startsWith("x");`,
         `console.log(s.steps, s.kind, s.safeParse("ok").success);`,
+      ].join("\n"),
+    },
+  },
+  {
+    id: "DD-05 a safeParse result narrowed by .success (zod's headline pattern)",
+    npmStatic: ["decl"],
+    files: {
+      ...DECL(),
+      "main.ts": [
+        `import { string, number, type SafeResult } from "decl";`,
+        `function show(r: SafeResult<string>): string {`,
+        `  if (!r.success) return "error: " + r.error.format() + " (" + r.error.issues.length + ")";`,
+        `  return "data: " + r.data.toUpperCase();`,
+        `}`,
+        `console.log(show(string().safeParse("ok")));`,
+        `console.log(show(string().safeParse(5)));`,
+        `const n = number().safeParse(41);`,
+        `if (n.success) console.log(n.data + 1);`,
+        `const bad = number().safeParse("x");`,
+        `console.log(bad.success ? "?" : bad.error.issues[0]!.message);`,
+      ].join("\n"),
+    },
+  },
+  {
+    id: "DD-06 a safeParse result whose data is an object type: fields read off the narrowed data, and the data stored in a typed slot",
+    npmStatic: ["decl"],
+    files: {
+      ...DECL(),
+      "main.ts": [
+        `import { person } from "decl";`,
+        `const r = person().safeParse({ name: "ann", age: 3 });`,
+        `if (r.success) {`,
+        `  console.log(r.data.name, r.data.age + 1);`,
+        `  const p: { name: string; age: number } = r.data;`,
+        `  console.log(p.name.toUpperCase(), p.age);`,
+        `}`,
+        `const bad = person().safeParse(7);`,
+        `console.log(bad.success);`,
       ].join("\n"),
     },
   },
