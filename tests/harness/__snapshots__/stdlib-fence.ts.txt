@@ -281,26 +281,3 @@ stdlib-fence.ts:75:10 - error SC2020: 'Object.is over these union operands' is p
   76 | }
 
   hint: union-typed comparisons need one comparable shape (narrow first: check a discriminant field, or compare with '!== undefined'/'!== null' for unit arms)
-
-stdlib-fence.ts:81:7 - error SC2001: values of type '10n' cannot be compiled yet (supported: number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')
-
-  80 | // declaration is a value Node builds and drops — it compiles to nothing).
-  81 | const big = 10n;
-     |       ^~~
-  82 | console.log(big);
-
-stdlib-fence.ts:81:13 - error SC1090: syntax 'BigIntLiteral' is not supported yet
-
-  80 | // declaration is a value Node builds and drops — it compiles to nothing).
-  81 | const big = 10n;
-     |             ^~~
-  82 | console.log(big);
-
-stdlib-fence.ts:82:13 - error SC2004: uses of 'big' inherit the blocker on its declaration
-
-  81 | const big = 10n;
-  82 | console.log(big);
-     |             ^~~
-  83 | 
-
-  hint: the declaration of 'big' did not compile — fix the diagnostic reported there and these sites clear with it

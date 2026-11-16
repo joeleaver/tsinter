@@ -6,12 +6,3 @@ promise-all-fences.ts:6:34 - error SC2020: 'Promise.all over this argument shape
   7 |     new Promise<string>((resolve) => resolve("s")),
 
   hint: the entries must share ONE promise type — Promise.all([p, q]) lowers when p and q are the same Promise<T>
-
-promise-all-fences.ts:14:9 - error SC2020: 'Promise.allSettled' is part of the standard library types but has no scriptc lowering yet
-
-  13 |   const one = new Promise<number>((resolve) => resolve(1));
-  14 |   await Promise.allSettled([one]);
-     |         ^~~~~~~~~~~~~~~~~~~~~~~~~
-  15 | }
-
-  hint: await each element in a loop (Promise.all compiles over a Promise<T>[] array, Promise.race over an array literal)

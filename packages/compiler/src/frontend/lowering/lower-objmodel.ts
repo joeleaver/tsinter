@@ -711,16 +711,17 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
     }
   }
   // `class X extends <dynamic> {}`: a dynamic value (objmodel.ts dynClass).
+  // Iterative (walk): a thousands-deep expression must not overflow the
+  // compiler's stack before the expression lowering's depth fence fires.
   for (const sf of jsFiles) {
-    const visit = (n: ts.Node): void => {
+    walk(sf, (n) => {
       if ((ts.isClassDeclaration(n) || ts.isClassExpression(n)) && isDynClassDecl(L, n)) {
         const nameNode = n.name ?? (ts.isVariableDeclaration(n.parent) ? n.parent.name : undefined);
         const s = nameNode !== undefined ? checker.getSymbolAtLocation(nameNode) : undefined;
         if (s !== undefined) info.ctors.add(s);
       }
-      ts.forEachChild(n, visit);
-    };
-    visit(sf);
+      return true;
+    });
   }
   // A literal marked in place whose declaration binds it: the binding too.
   for (const sf of jsFiles) {
@@ -1172,6 +1173,21 @@ export function isDynClassDecl(L: Lowerer, node: ts.ClassLikeDeclaration): boole
   const sym = ts.isIdentifier(base) ? L.checker.getSymbolAtLocation(base) : undefined;
   const decl = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
   if (decl !== undefined && (ts.isClassDeclaration(decl) || ts.isClassExpression(decl))) return false;
+  // a PROPERTY-ASSIGNED class base (`exports.O = class extends exports.I {}`)
+  // keeps the class machinery too: it pins a single assignment, fences a
+  // base assigned below the class (Node's TypeError) and a reassigned one
+  // by name, where the dynamic read would refuse the class value crossing
+  if (ts.isPropertyAccessExpression(base) && ts.isIdentifier(base.name)) {
+    const ms = L.checker.getSymbolAtLocation(base.name);
+    const rs = ms !== undefined && (ms.flags & ts.SymbolFlags.Alias) !== 0 ? L.checker.getAliasedSymbol(ms) : ms;
+    const classValued = (d: ts.Node): boolean => {
+      if (ts.isClassDeclaration(d) || ts.isClassExpression(d)) return true;
+      if (!ts.isBinaryExpression(d) || d.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+      const r = strip(d.right);
+      return ts.isClassExpression(r);
+    };
+    if (rs !== undefined && L.checker.declarationsOf(rs).some(classValued)) return false;
+  }
   if (ts.isIdentifier(base) && (L.isStdlibGlobal(base, "Error") || L.isStdlibGlobal(base, "TypeError") || L.isStdlibGlobal(base, "RangeError"))) return false;
   return true;
 }
