@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { compile } from "../src/index.js";
-import { checkRow, nativeRun, type Row, scratchDir } from "./top10-paperclip-rows.js";
+import { checkFenced, checkRow, nativeRun, type Row, scratchDir } from "./top10-paperclip-rows.js";
 
 const scratch = scratchDir("npm-declared-dynamic");
 const pj = (o: unknown): string => JSON.stringify(o);
@@ -28,11 +28,15 @@ export interface SafeResult<T> {
 export interface Schema<T> {
   readonly "~standard": StandardSchema<this>;
   readonly kind: ${kindType};
+  readonly steps: string;
   parse(x: unknown): T;
   safeParse(x: unknown): SafeResult<T>;
   optional(): Schema<T | undefined>;
   email(params?: string | { message?: string }): Schema<T>;
   refine<U extends T>(check: (v: T) => v is U): Schema<U>;
+  trim(): Schema<T>;
+  toLowerCase(): Schema<T>;
+  startsWith(prefix: string): Schema<T>;
 }
 export declare function string(): Schema<string>;
 export declare function number(): Schema<number>;
@@ -59,6 +63,10 @@ const make = $constructor("Schema", (inst, def) => {
   inst.optional = () => make({ kind: def.kind });
   inst.email = (params) => make({ kind: def.kind, message: params });
   inst.refine = (check) => make({ kind: def.kind, check });
+  inst.trim = () => make({ kind: def.kind, steps: (def.steps ?? "") + "trim;" });
+  inst.toLowerCase = () => make({ kind: def.kind, steps: (def.steps ?? "") + "lower;" });
+  inst.startsWith = (prefix) => make({ kind: def.kind, steps: (def.steps ?? "") + "starts:" + prefix + ";" });
+  inst.steps = def.steps ?? "";
   inst["~standard"] = { vendor: "decl", self: inst };
 });
 export function string() {
@@ -106,6 +114,18 @@ const ROWS: Row[] = [
       ].join("\n"),
     },
   },
+  {
+    id: "DD-03 declared methods named like String.prototype methods are the implementation's own (zod's z.string().trim().toLowerCase())",
+    npmStatic: ["decl"],
+    files: {
+      ...DECL(),
+      "main.ts": [
+        `import { string } from "decl";`,
+        `const s = string().trim().toLowerCase().startsWith("x");`,
+        `console.log(s.steps, s.kind, s.safeParse("ok").success);`,
+      ].join("\n"),
+    },
+  },
 ];
 
 describe("S133 (k): a declared interface over a dynamic implementation (wasm lane vs Node)", () => {
@@ -140,5 +160,23 @@ describe("S133 (k): a declared primitive the implementation does not produce sto
     expect(got.stdout).not.toContain("before\nNaN");
     expect(got.exitCode).not.toBe(0);
     expect(got.stderr).toMatch(/number|string/);
+  }, 600_000);
+});
+
+describe("S133 (k): a package class instance behind a declared interface whose methods compile per call site stops by name", () => {
+  test("DD-04 untyped prototype methods of a JavaScript class (follow-up: real prototype dispatch)", async () => {
+    const row: Row = {
+      id: "DD-04",
+      npmStatic: ["gp"],
+      files: {
+        "package.json": pj({ type: "module" }),
+        "tsconfig.json": pj({ compilerOptions: { strict: true, module: "nodenext", skipLibCheck: true, noEmit: true } }),
+        "node_modules/gp/package.json": pj({ name: "gp", version: "1.0.0", type: "module", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } }),
+        "node_modules/gp/index.d.ts": `export interface Gen<T> { refine(c: (v: T) => boolean): Gen<T>; parse(x: unknown): T; }\nexport declare function gen(): Gen<string>;`,
+        "node_modules/gp/index.js": `class GenT { constructor() { this.checks = 0; } refine(c) { this.checks++; return this; } parse(x) { return x; } }\nexport function gen() { return new GenT(); }`,
+        "main.ts": `import { gen } from "gp";\nconsole.log("before");\nconst g = gen().refine((v) => v.length > 0);\nconsole.log(g.parse("a"));`,
+      },
+    };
+    await checkFenced(scratch, row, "wasm-native", "before\n", "reading the method 'refine' (compiled per call site");
   }, 600_000);
 });

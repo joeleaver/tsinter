@@ -11469,11 +11469,17 @@ view, S115). So:
   another; a declared interface result stays dynamic; a data-only result
   is read dynamically and converted where it reaches a typed slot.
 Data-only interfaces keep their record mapping, declared classes their
-S115 views, and the program's own types are untouched. What is trusted is
+S115 views, and the program's own types are untouched. A declared method
+whose name is a String.prototype method (zod's `trim()`, `toLowerCase()`)
+is the implementation's own member: the call dispatches on the receiver's
+kind. When the implementation is a compiled class instance (an S115 view),
+a method the class compiles per call site (untyped or generic parameters)
+has no function to hand out yet: reading it through the view stops by name
+(follow-up: real prototype dispatch for such methods). What is trusted is
 the declarations' claim, as everywhere in S133: a wrong claim surfaces
 only where a crossing checks it.
 **Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
-(DD-01, DD-02).
+(DD-01..04).
 
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
