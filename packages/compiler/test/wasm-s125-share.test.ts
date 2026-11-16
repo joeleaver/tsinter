@@ -179,6 +179,20 @@ const e: Rec = { id: undefined };
 console.log(e, { id: "x", tags: ["a"], n: { deep: 1 } } as Rec);`,
   },
   {
+    id: "S125-B-10 (main gate) a hybrid record's added array-index keys print before its declared fields, ascending, as Node orders integer keys",
+    entry: "main.ts",
+    src: `type Odd = { a?: boolean; [k: string]: boolean | string | undefined };
+const nums: Odd = { a: false, "2": "two", z: "zz", "1": true };
+console.log(nums);
+nums["0"] = "zero";
+nums["4294967295"] = "not an index";
+nums["01"] = "not canonical";
+nums["7"] = true;
+console.log(nums);
+const two: Odd = { a: true, b: "x", c: false };
+console.log(two);`,
+  },
+  {
     id: "S125-B-02 (review) a hybrid record holding itself under an added key prints Node's <ref *1> / [Circular *1]",
     entry: "main.ts",
     src: `type R = { id: string; [k: string]: unknown };

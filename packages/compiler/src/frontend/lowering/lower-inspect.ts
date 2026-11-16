@@ -765,23 +765,20 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
         });
       }
       if (shape.indexValue) {
-        // A hybrid: the declared fields above, then the overflow keys in
-        // their own order, each through insp.key and the keyed get — Node's
-        // order exactly when every declared field precedes every added key,
-        // which hybridOrderPass proves for the whole program or refuses.
+        // A hybrid: the added array-index keys, the declared fields above,
+        // then the other added keys in their own order, each through
+        // insp.key and the keyed get — Node's order exactly when every
+        // declared field precedes every added non-index key, which
+        // hybridOrderPass proves for the whole program or refuses.
         if (!L.hybridInspects.has(t.shapeId)) L.hybridInspects.set(t.shapeId, loc);
         const iv = shape.indexValue;
         const ksT: IrType = { kind: "array", elem: STRING };
         for (const l of [
           { id: "ks.0", name: "ks", type: ksT, mutable: false },
           { id: "n.0", name: "n", type: F64, mutable: false },
-          { id: "i.0", name: "i", type: F64, mutable: true },
-          { id: "k.0", name: "k", type: STRING, mutable: false },
         ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
         const ks = (): IrExpr => ref("ks.0", ksT);
         const n = (): IrExpr => ref("n.0", F64);
-        const i = (): IrExpr => ref("i.0", F64);
-        const k = (): IrExpr => ref("k.0", STRING);
         // `{}` only when no declared field is present AND no overflow key
         const first = body[0];
         if (first !== undefined && first.kind === "if") {
@@ -791,23 +788,58 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
           { kind: "varDecl", localId: "ks.0", init: { kind: "recordOvfKeys", obj: v(), shapeId: t.shapeId, type: ksT, loc }, loc },
           { kind: "varDecl", localId: "n.0", init: { kind: "arrIntrinsic", method: "length", receiver: ks(), args: [], type: F64, loc }, loc },
         );
-        const keyedRead = (): IrExpr =>
-          ({ kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key: k(), overflowOnly: true, type: iv, loc });
-        const overflowLoop: IrStmt = {
-          kind: "for",
-          init: { kind: "varDecl", localId: "i.0", init: num(0, loc), loc },
-          cond: { kind: "bin", op: "<", left: i(), right: n(), type: BOOL, loc },
-          update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: i(), right: num(1, loc), type: F64, loc }, loc },
-          body: [
-            { kind: "varDecl", localId: "k.0", init: { kind: "arrayGet", arr: ks(), index: i(), type: STRING, loc }, loc },
-            entry(
-              concatAll([{ kind: "libCall", fn: "insp.key", args: [k()], type: STRING, loc }, str(": ", loc), child(iv, keyedRead())], loc),
-              boolLit(false, loc),
+        // Node prints an object's array-index keys first (ascending), then
+        // its other keys in insertion order. Declared field names are never
+        // array indices (the fence above), so the added keys that ARE print
+        // before the declared fields and the rest after them (the overflow
+        // keys arrive in JS order, indices first). A key is an array index
+        // when ToString(ToNumber(k)) is k and the number is an integer in
+        // [0, 2**32 - 2].
+        const overflowLoop = (sfx: string, wantIndex: boolean): IrStmt => {
+          const ii = `i${sfx}.0`, kk = `k${sfx}.0`, nn = `kn${sfx}.0`;
+          for (const l of [
+            { id: ii, name: `i${sfx}`, type: F64, mutable: true },
+            { id: kk, name: `k${sfx}`, type: STRING, mutable: false },
+            { id: nn, name: `kn${sfx}`, type: F64, mutable: false },
+          ]) if (!locals.some((x) => x.id === l.id)) locals.push(l);
+          const iR = (): IrExpr => ref(ii, F64);
+          const kR = (): IrExpr => ref(kk, STRING);
+          const nR = (): IrExpr => ref(nn, F64);
+          const and = (a: IrExpr, b: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: a, right: b, type: BOOL, loc });
+          const isIndex: IrExpr = and(
+            and(
+              { kind: "strEq", negated: false, left: { kind: "toString", operand: nR(), type: STRING, loc }, right: kR(), type: BOOL, loc },
+              { kind: "bin", op: "===", left: { kind: "libCall", fn: "math.floor", args: [nR()], type: F64, loc }, right: nR(), type: BOOL, loc },
             ),
-          ],
-          loc,
+            and(
+              { kind: "bin", op: ">=", left: nR(), right: num(0, loc), type: BOOL, loc },
+              { kind: "bin", op: "<=", left: nR(), right: num(4294967294, loc), type: BOOL, loc },
+            ),
+          );
+          const keyedRead: IrExpr = { kind: "recordKeyGet", obj: v(), shapeId: t.shapeId, key: kR(), overflowOnly: true, type: iv, loc };
+          return {
+            kind: "for",
+            init: { kind: "varDecl", localId: ii, init: num(0, loc), loc },
+            cond: { kind: "bin", op: "<", left: iR(), right: n(), type: BOOL, loc },
+            update: { kind: "assign", localId: ii, value: { kind: "bin", op: "+", left: iR(), right: num(1, loc), type: F64, loc }, loc },
+            body: [
+              { kind: "varDecl", localId: kk, init: { kind: "arrayGet", arr: ks(), index: iR(), type: STRING, loc }, loc },
+              { kind: "varDecl", localId: nn, init: { kind: "libCall", fn: "num.fromString", args: [kR()], type: F64, loc }, loc },
+              {
+                kind: "if",
+                cond: wantIndex ? isIndex : { kind: "unary", op: "!", operand: isIndex, type: BOOL, loc },
+                then: [entry(
+                  concatAll([{ kind: "libCall", fn: "insp.key", args: [kR()], type: STRING, loc }, str(": ", loc), child(iv, keyedRead)], loc),
+                  boolLit(false, loc),
+                )],
+                else_: null,
+                loc,
+              },
+            ],
+            loc,
+          };
         };
-        body.push(depthGate("[Object]"), ...begin(), ...ordered, overflowLoop);
+        body.push(depthGate("[Object]"), ...begin(), overflowLoop("x", true), ...ordered, overflowLoop("y", false));
       } else {
         body.push(depthGate("[Object]"), ...begin(), ...ordered);
       }

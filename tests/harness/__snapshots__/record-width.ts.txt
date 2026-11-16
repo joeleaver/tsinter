@@ -40,10 +40,3 @@ record-width.ts:40:18 - error SC2002: record shapes must match exactly or width-
   41 | console.log(odd);
 
   hint: width subtyping compiles as a copy (each expected field copied off the source; extra fields drop) — this pair is outside the copy's rules; build a literal with exactly the expected fields instead
-
-record-width.ts:41:13 - error SC1090: console.log of '{ a: boolean | undefined; [key: string]: boolean | string | undefined }' values (index-signature records with declared fields have no inspect lowering yet (JS interleaves integer keys across the declared and dynamic key sets)) are not supported yet
-
-  40 | const odd: Odd = plain;
-  41 | console.log(odd);
-     |             ^~~
-  42 | 
