@@ -5505,7 +5505,7 @@ export type IrExpr =
    * `"object"` test, JS-exact. */
   /** `view`: ArrayBuffer.isView — the bytes kind or a dynamic typed array
    * of any element kind (`bytes` alone is the Uint8Array/Buffer test). */
-  | { kind: "dynTest"; test: "string" | "number" | "boolean" | "undefined" | "null" | "nullish" | "bytes" | "view" | "object" | "array" | "truthy" | "error" | "function"; negated?: true; value: IrExpr; type: IrType; loc: SrcLoc }
+  | { kind: "dynTest"; test: "string" | "number" | "boolean" | "undefined" | "null" | "nullish" | "bytes" | "view" | "object" | "array" | "truthy" | "error" | "function" | "regex"; negated?: true; value: IrExpr; type: IrType; loc: SrcLoc }
   /** Keyed read on a dyn value — `pkg.name` / `pkg["k"]` / the
    * `pkg?.scripts` chain step on a JSON.parse result. `key` is
    * string-typed (a strLit for the dot form); `type` is always dyn. An

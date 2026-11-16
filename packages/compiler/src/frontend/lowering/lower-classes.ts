@@ -2298,6 +2298,23 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
                   const shape = L.shapes.get(type.shapeId);
                   if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;
                 }
+                // An object-literal-initialized JavaScript field the class
+                // REASSIGNS with a dynamic value elsewhere (commander's
+                // configureOutput: `this._outputConfiguration = {
+                // ...this._outputConfiguration, ...configuration }` over its
+                // untyped parameter): the field holds the dynamic object, as
+                // the empty literal above does — never a record the
+                // reassignment could only copy into.
+                if (L.sharedDynamic && type.kind === "record" && ts.isObjectLiteralExpression(rhs0) &&
+                  isJsSourceFile(stmt.getSourceFile()) && classReassignsDynamically(L, stmt, name)) {
+                  type = DYN;
+                }
+                // A null-initialized JavaScript field the class later assigns
+                // such a dynamic object (saveStateBeforeParse's `_savedState`).
+                if (L.sharedDynamic && rhs0.kind === ts.SyntaxKind.NullKeyword && (type.kind === "union" || type.kind === "record") &&
+                  isJsSourceFile(stmt.getSourceFile()) && classReassignsDynamically(L, stmt, name)) {
+                  type = DYN;
+                }
               }
               // A JSDoc claim the BODY contradicts (`@type {Command}`
               // assigned `undefined` — the lazy-init idiom): the
@@ -3988,6 +4005,67 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
     }
     return out;
   }
+
+/** Does the class around `stmt` assign `this.<name>` a dynamic value — an
+ * `any`-typed one, or an object literal spreading an any/unknown/object
+ * value — anywhere outside `stmt` itself? */
+function classReassignsDynamically(L: Lowerer, stmt: ts.Node, name: string): boolean {
+  let cls: ts.Node | undefined = stmt.parent;
+  while (cls !== undefined && !ts.isClassDeclaration(cls) && !ts.isClassExpression(cls)) cls = cls.parent;
+  if (cls === undefined) return false;
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found) return;
+    if (
+      ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(n.left) && n.left.expression.kind === ts.SyntaxKind.ThisKeyword &&
+      n.left.name.text === name && n.parent !== stmt
+    ) {
+      try {
+        const dynFlags = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive;
+        if ((L.checker.getTypeAtLocation(n.right).flags & ts.TypeFlags.Any) !== 0) found = true;
+        // An object literal spreading a dynamic value (commander's JSDoc
+        // `@param {object} [configuration]`, spread into the merge): the
+        // literal is built as the dynamic object.
+        // So does a literal holding such a literal (saveStateBeforeParse's
+        // `{ _name, _optionValues: { ...this._optionValues } }`).
+        else {
+          const spreadsDynamic = (lit: ts.ObjectLiteralExpression): boolean => lit.properties.some((p) => {
+            if (ts.isSpreadAssignment(p)) {
+              const e = p.expression;
+              if ((L.checker.getTypeAtLocation(e).flags & dynFlags) !== 0) return true;
+              // A spread of a field the class itself holds dynamically
+              // (initialized with an empty literal: the rule above).
+              return ts.isPropertyAccessExpression(e) && e.expression.kind === ts.SyntaxKind.ThisKeyword &&
+                classInitsEmptyLiteral(cls!, e.name.text);
+            }
+            return ts.isPropertyAssignment(p) && ts.isObjectLiteralExpression(p.initializer) && spreadsDynamic(p.initializer);
+          });
+          if (ts.isObjectLiteralExpression(n.right) && spreadsDynamic(n.right)) found = true;
+        }
+      } catch {
+        /* checker trouble: not a dynamic assignment */
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(cls, visit);
+  return found;
+}
+
+/** Does the class's constructor initialize `this.<name>` with an empty
+ * object literal (the dynamic-dictionary field rule)? */
+function classInitsEmptyLiteral(cls: ts.Node, name: string): boolean {
+  if (!ts.isClassDeclaration(cls) && !ts.isClassExpression(cls)) return false;
+  const ctor = cls.members.find(ts.isConstructorDeclaration);
+  return ctor?.body?.statements.some((st) =>
+    ts.isExpressionStatement(st) && ts.isBinaryExpression(st.expression) &&
+    st.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isPropertyAccessExpression(st.expression.left) &&
+    st.expression.left.expression.kind === ts.SyntaxKind.ThisKeyword &&
+    st.expression.left.name.text === name &&
+    ts.isObjectLiteralExpression(st.expression.right) && st.expression.right.properties.length === 0) ?? false;
+}
 
 /** The constructor function `%C.constructor`. Synthesized when absent: a
    * base class runs just its field initializers; a derived class inherits

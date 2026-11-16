@@ -2268,8 +2268,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                       `(${d.name}->kind == SCR_DYN_ARR || scr_dyn_isl_is_array(${d.name}))`
                     : e.test === "function"
                       ? `(${d.name}->kind == SCR_DYN_FUNC || scr_dyn_isl_typeof_is(${d.name}, "function"))`
-                      : `${d.name}->kind == ${
-                          { string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES", view: "SCR_DYN_BYTES" }[e.test]
+                      : e.test === "regex"
+                        ? (() => {
+                            // Minted on the one-world WasmGC lanes only.
+                            throw new Error("internal compiler error: dynTest regex reached the C emitter");
+                          })()
+                        : `${d.name}->kind == ${
+                          { string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES", view: "SCR_DYN_BYTES" }[e.test as "string"]
                         }`;
         return E.newTemp(e.type, e.negated ? `!(${test})` : test);
       }

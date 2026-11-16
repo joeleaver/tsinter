@@ -3120,7 +3120,7 @@ type DynTestKind = Extract<IrExpr, { kind: "dynTest" }>["test"];
  * wart — alongside every object-shaped kind. The two tests that are not
  * kind compares (`truthy` runs the ToBoolean ladder, `error` reads the
  * dyn tree's "%error" encoding) are excluded by the type. */
-const DYN_TEST_KINDS: Record<Exclude<DynTestKind, "truthy" | "error">, readonly number[]> = {
+const DYN_TEST_KINDS: Record<Exclude<DynTestKind, "truthy" | "error" | "regex">, readonly number[]> = {
   string: [DK.STR],
   number: [DK.NUM],
   boolean: [DK.BOOL],
@@ -32584,6 +32584,31 @@ class Assembler {
           this.walkExpr(e.value);
           code.call(this.dyn.truthy());
           if (e.negated === true) code.i32Eqz();
+          return;
+        }
+        // `u instanceof RegExp` (one-world lanes): an island RegExp is an
+        // OBJ-kind dynamic value whose payload is the regex wrapper. In a
+        // module that boxes no regex, no dynamic value is one.
+        if (e.test === "regex") {
+          this.walkExpr(e.value);
+          if (!this.dyn.regexLive) {
+            code.drop();
+            code.i32Const(e.negated === true ? 1 : 0);
+            return;
+          }
+          const d = this.acquireScratch(this.dyn.dynRef());
+          code.localTee(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.OBJ);
+          code.i32Eq();
+          code.ifResult(I32);
+          this.dyn.objPayload(code, (x) => x.localGet(d));
+          code.refTest(this.dyn.objRegexT());
+          code.else_();
+          code.i32Const(0);
+          code.end();
+          if (e.negated === true) code.i32Eqz();
+          this.releaseScratch(this.dyn.dynRef(), d);
           return;
         }
         // ArrayBuffer.isView: the bytes kind, or (where they can exist) a

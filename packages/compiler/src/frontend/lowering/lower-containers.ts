@@ -880,7 +880,10 @@ function lowerOptionalDefaultArg(
         "'.map()' with a callback returning 'unknown'-typed values (the result array has no static element type — annotate the callback's return)",
       );
     }
-    if (method === "filter" && fnRet.kind !== "bool") L.badType(argNode, L.typeOf(argNode));
+    // A predicate's result is tested for truthiness: a boolean as is, a
+    // dynamic value (a JavaScript predicate whose `&&` chain ends in an
+    // untyped read — commander's _prepareForParse filter) by JS's ToBoolean.
+    if (method === "filter" && fnRet.kind !== "bool" && fnRet.kind !== "dyn" && fnRet.kind !== "jsval") L.badType(argNode, L.typeOf(argNode));
     const helper = arrayHofHelper(L, method, elem, fnRet, arity, loc);
     const resultType: IrType =
       method === "map" ? arrayOf(fnRet) : method === "filter" ? arrayOf(elem) : VOID;
@@ -1373,7 +1376,15 @@ function tupleArrayParamReadOnly(L: Lowerer, fn: ts.Expression): boolean {
             { kind: "varDecl", localId: "v.0", init: getElem, loc },
             {
               kind: "if",
-              cond: callF(ref("v.0", elem)),
+              cond: fnRet.kind === "bool"
+                ? callF(ref("v.0", elem))
+                : {
+                  kind: "dynTest",
+                  test: "truthy",
+                  value: fnRet.kind === "jsval" ? { kind: "dynFromJsval", value: callF(ref("v.0", elem)), type: DYN, loc } : callF(ref("v.0", elem)),
+                  type: BOOL,
+                  loc,
+                },
               then: [push(arrT, ref("v.0", elem))],
               else_: null,
               loc,

@@ -37,7 +37,7 @@ import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
 import { isDtsMirrorPath, npmStaticPackageOfPath } from "../npm-static.js";
 import { dtsCallResult } from "./lower-dts.js";
-import { classViewOf, viewableClass } from "./class-views.js";
+import { classViewOf, liftClassReceiver, viewableClass } from "./class-views.js";
 import { lowerVoidTernaryStatement } from "./lower-stmts.js";
 import { onlyStubTouches } from "./stub-builtins.js";
 
@@ -757,6 +757,19 @@ export interface GenericInstance {
     ) {
       return;
     }
+    // The same boundary through a package's SHIPPED DECLARATIONS
+    // (SEMANTICS.md S133): an argument of a call that resolves to an
+    // npm-static package's .d.ts lands in the package's JavaScript, which
+    // takes the value with its OWN completed signature (the per-call-site
+    // instance, or the checked-dynamic box) and calls it with JS argument
+    // semantics — commander's `.option(flags, desc, collect)` with
+    // `collect = (value, previous = []) => ...` under the declared
+    // `(value: string, previous: T) => T`.
+    if (contextual !== null && intoNpmStaticDeclaration(L, contextual) &&
+      canBoxFuncIntoDyn(funcType, (id) => L.shapes.get(id), (id) => L.unions.get(id))
+    ) {
+      return;
+    }
     L.unsupported(
       "SC1090",
       blame,
@@ -767,6 +780,25 @@ export interface GenericInstance {
         "boundary; otherwise call the function directly)",
     );
   }
+
+/** Is `arg` an argument of a call whose resolved signature is declared in
+ * an npm-static package's shipped declarations (its JavaScript runs the
+ * call)? */
+function intoNpmStaticDeclaration(L: Lowerer, arg: ts.Expression): boolean {
+  let e: ts.Node = arg;
+  while (ts.isParenthesizedExpression(e.parent)) e = e.parent;
+  const call = e.parent;
+  if (!ts.isCallExpression(call) || !call.arguments.includes(e as ts.Expression)) return false;
+  try {
+    const sig = L.checker.getResolvedSignature(call);
+    const decl = sig ? L.checker.signatureDeclaration(sig) : undefined;
+    if (decl === undefined) return false;
+    const sf = decl.getSourceFile();
+    return sf.isDeclarationFile && npmStaticPackageOfPath(sf.fileName) !== null;
+  } catch {
+    return false;
+  }
+}
 
 /** The BODY-facing return type of a (possibly async) function: an async
    * body's `return v` fulfills its promise with v, so the body returns the
@@ -3818,7 +3850,11 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
       }
-      const receiver = L.lowerExpr(expr.expression.expression);
+      // A typed class instance behind the checker's `any` (commander's
+      // `this.parent?._findCommand(alias)` over a `Command | null` field):
+      // its live view, made here while lowering — never the late boundary
+      // pass, whose view factories would miss their method bodies.
+      const receiver = liftClassReceiver(L, L.lowerExpr(expr.expression.expression));
       // A checker-`any` receiver whose VALUE lives in the checked-dynamic tree (a
       // checked-dynamic local behind the any-typed spelling — the JS
       // WeakSet placeholder, rest-args arrays): the checked-dynamic

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { compile } from "../src/index.js";
-import { checkFenced, checkRow, nativeRun, type Row, scratchDir } from "./top10-paperclip-rows.js";
+import { checkRow, nativeRun, type Row, scratchDir } from "./top10-paperclip-rows.js";
 
 const scratch = scratchDir("npm-declared-dynamic");
 const pj = (o: unknown): string => JSON.stringify(o);
@@ -212,8 +212,8 @@ describe("S133 (k): a declared primitive the implementation does not produce sto
   }, 600_000);
 });
 
-describe("S133 (k): a package class instance behind a declared interface whose methods compile per call site stops by name", () => {
-  test("DD-04 untyped prototype methods of a JavaScript class (follow-up: real prototype dispatch)", async () => {
+describe("S133 (k): a package class instance behind a declared interface whose methods compile per call site", () => {
+  test("DD-04 untyped prototype methods of a JavaScript class are members of its view (its default instance)", async () => {
     const row: Row = {
       id: "DD-04",
       npmStatic: ["gp"],
@@ -226,6 +226,6 @@ describe("S133 (k): a package class instance behind a declared interface whose m
         "main.ts": `import { gen } from "gp";\nconsole.log("before");\nconst g = gen().refine((v) => v.length > 0);\nconsole.log(g.parse("a"));`,
       },
     };
-    await checkFenced(scratch, row, "wasm-native", "before\n", "reading the method 'refine' (compiled per call site");
+    await checkRow(scratch, row, "wasm-native");
   }, 600_000);
 });

@@ -4331,6 +4331,99 @@ export class Lowerer {
       }
       for (const v of Object.values(n as Record<string, unknown>)) writes(v);
     };
+    // A function-typed PARAMETER of a function only ever called directly,
+    // every call passing a closure there: its candidates (a compiled
+    // package's per-call-site instance reading its callback's `length` gets
+    // Node's length, never the completed signature's count). One candidate
+    // is that function; several stamp the length they agree on.
+    // (keyed by function then local: a parameter's local id is its own
+    // function's, and per-call-site instances share spellings like `f.0`)
+    const paramFns = new Map<string, Set<string>>();
+    const paramBound = new Map<string, string>();
+    const pkey = (fn: string, local: string): string => `${fn}\u0000${local}`;
+    let curFn = "";
+    // func-typed parameters of each function, by local id
+    const funcParams = new Map<string, Map<string, IrType>>();
+    {
+      // Pass 1: closure bindings (a local or module global every write of
+      // which is one closure).
+      const bindKey = (fn: string, local: string): string => (local.startsWith("%g.") ? `\u0000${local}` : pkey(fn, local));
+      const localBind = new Map<string, string | null>();
+      const binds = (n: unknown): void => {
+        if (n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) {
+          for (const item of n) binds(item);
+          return;
+        }
+        const rec = n as { kind?: unknown; localId?: unknown; init?: { kind?: unknown; fnName?: unknown } | null; value?: { kind?: unknown; fnName?: unknown } };
+        if ((rec.kind === "varDecl" || rec.kind === "assign") && typeof rec.localId === "string") {
+          const v = rec.kind === "varDecl" ? rec.init : rec.value;
+          if (rec.kind !== "varDecl" || v !== null) {
+            const name = v?.kind === "closure" && typeof v.fnName === "string" ? v.fnName : null;
+            const k = bindKey(curFn, rec.localId);
+            const had = localBind.get(k);
+            localBind.set(k, had === undefined || had === name ? name : null);
+          }
+        }
+        for (const v of Object.values(n as Record<string, unknown>)) binds(v);
+      };
+      for (const f of functions) {
+        curFn = f.name;
+        binds(f.body);
+      }
+      // Pass 2: what each direct call passes.
+      const argNames = new Map<string, (Set<string> | null)[]>();
+      // (a function also taken as a value has callers this walk cannot see)
+      const asValue = new Set<string>();
+      const calls = (n: unknown): void => {
+        if (n === null || typeof n !== "object") return;
+        if (Array.isArray(n)) {
+          for (const item of n) calls(item);
+          return;
+        }
+        const rec = n as { kind?: unknown; callee?: unknown; fnName?: unknown; args?: { kind?: unknown; fnName?: unknown; localId?: unknown }[] };
+        if (rec.kind === "closure" && typeof rec.fnName === "string") asValue.add(rec.fnName);
+        if (rec.kind === "call" && typeof rec.callee === "string" && Array.isArray(rec.args)) {
+          const had = argNames.get(rec.callee);
+          const next = rec.args.map((arg, i) => {
+            const prev = had === undefined ? new Set<string>() : had[i] ?? null;
+            if (prev === null) return null;
+            const nm = arg?.kind === "closure" && typeof arg.fnName === "string"
+              ? arg.fnName
+              : arg?.kind === "varRef" && typeof arg.localId === "string"
+                ? localBind.get(bindKey(curFn, arg.localId)) ?? null
+                : null;
+            if (nm === null) return null;
+            prev.add(nm);
+            return prev;
+          });
+          argNames.set(rec.callee, next);
+        }
+        for (const v of Object.values(n as Record<string, unknown>)) calls(v);
+      };
+      for (const f of functions) {
+        curFn = f.name;
+        calls(f.body);
+        const fp = new Map<string, IrType>();
+        for (const p of f.params) if (p.type.kind === "func") fp.set(p.localId, p.type);
+        if (fp.size > 0) funcParams.set(f.name, fp);
+      }
+      for (const f of functions) {
+        const sets = argNames.get(f.name);
+        if (sets === undefined || asValue.has(f.name)) continue;
+        f.params.forEach((p, i) => {
+          const set = sets[i];
+          if (p.type.kind !== "func" || set === null || set === undefined || set.size === 0) return;
+          if (set.size === 1) paramBound.set(pkey(f.name, p.localId), [...set][0]!);
+          else paramFns.set(pkey(f.name, p.localId), set);
+        });
+      }
+    }
+    // Does a function type take a parameter that may be omitted (an
+    // undefined-armed slot: a default or a `?`)? Only then can Node's
+    // length differ from the declared count.
+    const omittable = (t: IrType): boolean =>
+      t.kind === "func" && t.params.some((pt) => pt.kind === "union" && (this.unions.get(pt.unionId)?.arms ?? []).some((a) => a.kind === "undefinedT"));
     writes(functions);
     const seen = new Set<unknown>();
     const visit = (n: unknown): void => {
@@ -4342,7 +4435,12 @@ export class Lowerer {
       }
       const rec = n as { kind?: unknown; value?: { kind?: unknown; fnName?: unknown; localId?: unknown }; srcText?: string; fnProto?: number; fnLength?: number };
       if ((rec.kind === "dynFrom" || rec.kind === "jsMarshal") && (rec.value?.kind === "closure" || rec.value?.kind === "varRef")) {
-        const fnName = rec.value.kind === "closure" ? rec.value.fnName : boundFn.get(rec.value.localId as string);
+        const fnName = rec.value.kind === "closure"
+          ? rec.value.fnName
+          : paramBound.get(pkey(curFn, rec.value.localId as string)) ??
+            // (a parameter's local id is its own function's: the module-wide
+            // binding table can only confuse it with another function's)
+            (funcParams.get(curFn)?.has(rec.value.localId as string) === true ? undefined : boundFn.get(rec.value.localId as string));
         const loc0 = typeof fnName === "string" ? byName.get(fnName)?.loc : undefined;
         // Only an IR function whose span starts at a function-like node is
         // that function's definition (a call-time fence stub, `%fn_islfence`,
@@ -4350,6 +4448,24 @@ export class Lowerer {
         // facts itself, boxFactsOf).
         const k = loc0 === undefined ? undefined : kindsOf(loc0.file).get(loc0.start);
         const loc = k === undefined ? undefined : loc0;
+        const cands = fnName === undefined && rec.value.kind === "varRef" ? paramFns.get(pkey(curFn, rec.value.localId as string)) : undefined;
+        const ptype = rec.value.kind === "varRef" ? funcParams.get(curFn)?.get(rec.value.localId as string) : undefined;
+        if (fnName === undefined && cands === undefined && ptype !== undefined && omittable(ptype) && rec.fnLength === undefined) {
+          // A callback parameter whose function this pass cannot name: the
+          // declared count can differ from Node's length, so reading the
+          // box's length stops by name.
+          rec.fnLength = -1;
+        }
+        if (cands !== undefined) {
+          const lens = [...cands].map((nm) => {
+            const l0 = byName.get(nm)?.loc;
+            return l0 !== undefined && kindsOf(l0.file).get(l0.start) !== undefined ? lengths.get(`${l0.file}:${l0.start}`) : undefined;
+          });
+          if (lens.every((l) => l !== undefined && l === lens[0])) rec.fnLength = lens[0]!;
+          // Callers whose functions Node gives different lengths: the box
+          // cannot carry the right one; reading its length stops by name.
+          else rec.fnLength = -1;
+        }
         if (loc !== undefined && k !== undefined) {
           rec.fnProto = k;
           const len = lengths.get(`${loc.file}:${loc.start}`);
@@ -4370,7 +4486,10 @@ export class Lowerer {
       }
       for (const v of Object.values(n as Record<string, unknown>)) visit(v);
     };
-    visit(functions);
+    for (const f of functions) {
+      curFn = f.name;
+      visit(f);
+    }
   }
 
   /** GH #86: a runtime fence ENDS the program with its diagnostic on

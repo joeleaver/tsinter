@@ -30,7 +30,8 @@ import type { Lowerer } from "./lowerer.js";
 import * as ts from "../ts7/adapter.js";
 import { isUndefExpr } from "./lower-exprs.js";
 import { emitterRooted } from "./lower-emitter.js";
-import { EMITTER_API_MEMBERS, type ClassInfo } from "./lower-classes.js";
+import { EMITTER_API_MEMBERS, findGenericMethodOn, type ClassInfo } from "./lower-classes.js";
+import { implicitDefaultInstance, type GenericInstance } from "./lower-calls.js";
 import { BOOL, DYN, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 
 const str = (value: string, loc: SrcLoc): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
@@ -118,6 +119,16 @@ export function classUnionExitHelper(L: Lowerer, unionId: string, loc: SrcLoc): 
     loc,
   });
   return name;
+}
+
+/** An island member op's receiver (getProp / callMethod over a value the
+ * checker types `any`) that lowered to a typed class instance, or a union
+ * of one with units and scalars: its live view, made during lowering.
+ * Anything else passes unchanged. */
+export function liftClassReceiver(L: Lowerer, e: IrExpr): IrExpr {
+  if (!L.sharedDynamic || e.type.kind === "jsval" || e.type.kind === "dyn") return e;
+  if (e.type.kind !== "object" && e.type.kind !== "union") return e;
+  return classLiftIn(L, e, e.loc) ?? e;
 }
 
 /** The class-aware lift into a dynamic slot: an instance as its view, a
@@ -404,6 +415,14 @@ function membersOf(info: ClassInfo): Member[] {
       seen.add(name);
       out.push({ name, kind: getter ? "getter" : "method" });
     }
+    // Implicit-any methods (a compiled package's JavaScript — commander's
+    // whole Command surface): instanced per call site, so they live in the
+    // generic-method table; the view calls their all-dynamic instance.
+    for (const [name, gm] of c.genericMethods ?? []) {
+      if (gm.implicitParams === undefined || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, kind: "method" });
+    }
   }
   return out;
 }
@@ -419,6 +438,14 @@ function genericMemberNames(info: ClassInfo): string[] {
     }
   }
   return [...out];
+}
+
+/** An implicit-any method's all-dynamic instance (the one a function value
+ * of it names), with its declaring class. */
+function implicitMethodOf(L: Lowerer, info: ClassInfo, name: string): { declarer: ClassInfo; inst: GenericInstance } | null {
+  const g = findGenericMethodOn(L, info, name);
+  if (g === null || g.info.implicitParams === undefined) return null;
+  return { declarer: g.declarer, inst: implicitDefaultInstance(L, g.info.decl, g.info) };
 }
 
 /** A call of instance method `key` (a method name or "get:x") on `recv`,
@@ -492,9 +519,10 @@ function exitArg(L: Lowerer, v: IrExpr, t: IrType): IrExpr | null {
  * every parameter takes a dynamic value (checked into the method's own
  * parameter types), the result crosses back lifted. */
 function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: string, x: () => IrExpr, cap: { localId: string; name: string; type: IrType }, capLocal: { id: string; name: string; type: IrType; mutable: false; boxed: true }, loc: SrcLoc, receiverFromThis = true): IrExpr {
-  const found = L.findMethodOn(info, name)!;
+  const found = L.findMethodOn(info, name);
+  const implicit = found === null ? implicitMethodOf(L, info, name) : null;
   const fnName = `${factory}.m.${name.replace(/[^A-Za-z0-9_$]/g, "_")}`;
-  const shapes = found.sig.params;
+  const shapes = found !== null ? found.sig.params : implicit!.inst.params;
   const fixed = shapes.filter((p) => p.mode === "required" || p.mode === "omittable");
   const body: IrStmt[] = [];
   const params = fixed.map((_, i) => ({ localId: `a.${i}`, name: `a${i}`, type: JSVAL as IrType }));
@@ -543,9 +571,13 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
       // declarer the view's own class looks up (Node's `G.prototype.a`),
       // never a virtual dispatch on the receiver: `g.a.call(h)` with h a
       // subclass instance overriding `a` still runs G's `a` (GH #186).
-      const call = receiverFromThis
-        ? declarerCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc)
-        : methodCall(L, info, name, { kind: "varRef", localId: "r.0", type: t, loc }, args, loc);
+      const recvRef: IrExpr = { kind: "varRef", localId: "r.0", type: t, loc };
+      const call = implicit !== null
+        ? (L.noteEdge(implicit.inst.name),
+          { kind: "call", callee: implicit.inst.name, args: [L.upcastTo(recvRef, implicit.declarer.def.name), ...args], type: implicit.inst.returnType, loc } as IrExpr)
+        : receiverFromThis
+          ? declarerCall(L, info, name, recvRef, args, loc)
+          : methodCall(L, info, name, recvRef, args, loc);
       if (call === null) {
         // An ABSTRACT signature: no instance has this exact class (the
         // view factory dispatches to the concrete subclass's own view

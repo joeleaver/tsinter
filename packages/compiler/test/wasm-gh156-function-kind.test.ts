@@ -116,11 +116,13 @@ function plain() {}
 console.log(plain);`,
   },
   {
-    id: "GH156-TS-02 an async function seen only as a parameter prints as Function (S020)",
+    id: "GH156-TS-02 an async function seen only as a parameter whose callers pass different functions prints as Function (S020)",
     src: `async function af() {}
-function show(f: () => Promise<void>): void { console.log(f); }
-show(af);`,
-    diverges: { stdout: "[Function: f]\n", node: "[AsyncFunction: af]\n", entry: "S020" },
+function pf() {}
+function show(f: () => unknown): void { console.log(f); }
+show(af);
+show(pf);`,
+    diverges: { stdout: "[Function: f]\n[Function: f]\n", node: "[AsyncFunction: af]\n[Function: pf]\n", entry: "S020" },
   },
 ];
 

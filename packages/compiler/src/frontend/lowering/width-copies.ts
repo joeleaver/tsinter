@@ -3354,7 +3354,10 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         const node = s.node as unknown as Record<string, unknown>;
         const orig = { ...node };
         for (const k of Object.keys(node)) delete node[k];
-        Object.assign(node, fencedValue(L, orig as unknown as IrExpr, diag.code, `${diag.message} [${diag.code} at ${s.loc.file}]`, s.loc));
+        // file:line, as every other deferred fence names its site
+        const sf = L.program.getSourceFile(s.loc.file);
+        const line = sf !== undefined ? `:${ts.getLineAndCharacterOfPosition(sf, s.loc.start).line + 1}` : "";
+        Object.assign(node, fencedValue(L, orig as unknown as IrExpr, diag.code, `${diag.message} [${diag.code} at ${s.loc.file}${line}]`, s.loc));
         if (!reportedDyn.has(at)) L.runtimeFences.push(diag);
         reportedDyn.add(at);
         continue;

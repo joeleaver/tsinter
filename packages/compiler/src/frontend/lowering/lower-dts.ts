@@ -31,7 +31,8 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isDtsMirrorPath, npmStaticDtsViews } from "../npm-static.js";
 import { npmPackageNameOf } from "../shared.js";
-import { isUnitType, typeEquals, type IrExpr, type IrType } from "../../ir/nodes.js";
+import { isUnitType, JSVAL, typeEquals, type IrExpr, type IrType } from "../../ir/nodes.js";
+import { classUnionExitHelper, classUnview, viewableClass } from "./class-views.js";
 
 /** Is the declared-surface view active in this compile at all? */
 export function dtsViewsActive(): boolean {
@@ -67,7 +68,24 @@ function siteText(expr: ts.Expression): string {
 /** Cross an implementation-typed value into its declared type. */
 function crossInto(L: Lowerer, node: ts.Expression, out: IrExpr, declared: IrType | null, pkg: string, what: string): IrExpr {
   if (declared === null || declared.kind === "void" || isUnitType(declared) || typeEquals(declared, out.type)) return out;
-  if (out.type.kind === "jsval" || out.type.kind === "dyn") return out;
+  if (out.type.kind === "jsval" || out.type.kind === "dyn") {
+    // A CLASS the declaration names (commander's `this`-returning builder
+    // methods, a `parent: Command | null` field) — and that class's union
+    // with unit and scalar arms: the instance the dynamic value views is
+    // extracted with a check, exactly the typed exit every dynamic value
+    // takes into a class slot (S115 (a)); any other kind ends the program
+    // by name — the declaration's claim was false for this value. The
+    // program then calls its methods and reads its fields as typed code.
+    if (L.sharedDynamic) {
+      const v: IrExpr = out.type.kind === "jsval" ? out : { kind: "jsMarshal", value: out, type: JSVAL, loc: out.loc };
+      if (declared.kind === "object" && viewableClass(L, declared) !== null) return classUnview(L, v, declared, out.loc);
+      if (declared.kind === "union") {
+        const helper = classUnionExitHelper(L, declared.unionId, out.loc);
+        if (helper !== null) return { kind: "call", callee: helper, args: [v], type: declared, loc: out.loc };
+      }
+    }
+    return out;
+  }
   // A promise of a dynamic value (an async method inference types
   // `Promise<any>`): it stays that promise — its settled value is the
   // dynamic value, which crosses where the program uses it.

@@ -5503,6 +5503,20 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     return name;
   }
 
+  /** `process.versions.<runtime>` for a runtime a compiled binary is not
+   * (sqlite, bun, deno, electron): undefined, Node's own answer. Claimed
+   * ahead of the optional-chain gate too (`process.versions?.electron`). */
+  export function lowerProcessVersionsProbe(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (
+      ts.isPropertyAccessExpression(expr.expression) &&
+      ["sqlite", "bun", "deno", "electron"].includes(expr.name.text) &&
+      L.stdlibGlobalMember(expr.expression, "process") === "versions"
+    ) {
+      return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
+    }
+    return null;
+  }
+
   export function lowerProcessProperty(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     // process.versions.node — the ONE lowered member of process.versions:
     // there is no Node under the binary, so the honest answer is the
@@ -5531,15 +5545,18 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     // .sqlite), no gyp build config (process.config.variables.* — no ICU,
     // no QUIC — and process.config.target_defaults), no feature flags
     // (process.features.* — no inspector, not a debug build).
+    // versions.bun / versions.deno / versions.electron are the
+    // OTHER-runtime probes (a formatter's config loader picks its
+    // package.json reader by them; commander's parse() reads
+    // `process.versions?.electron` to pick its argv convention): a compiled
+    // binary is none of them, so each reads undefined — exactly Node's own
+    // answer. (`versions` is never nullish, so `?.` reads the same.)
+    {
+      const probe = lowerProcessVersionsProbe(L, expr);
+      if (probe) return probe;
+    }
     if (!expr.questionDotToken && ts.isPropertyAccessExpression(expr.expression)) {
       const container = L.stdlibGlobalMember(expr.expression, "process");
-      if (container === "versions" && (expr.name.text === "sqlite" || expr.name.text === "bun" || expr.name.text === "deno")) {
-        // versions.bun / versions.deno are the OTHER-runtime probes (a
-        // formatter's config loader picks its package.json reader by
-        // them): a compiled binary is neither, so both read undefined —
-        // exactly Node's own answer.
-        return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
-      }
       if (container === "features") {
         return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
       }

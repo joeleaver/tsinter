@@ -8413,6 +8413,17 @@ export class DynBuilder {
           this.pushIsLength(c, (x) => x.localGet(1));
           c.ifVoid();
           this.stubFence(c, "length");
+          // An arity of -1: a callback whose function the compiler could not
+          // resolve (several, or none it can name) — its Node length is not
+          // known, so the read stops by name.
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(this.fnT(), FN_ARITY);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.ifVoid();
+          this.deps.fence(c, (x) => this.deps.lit(x, "reading the length of a callback parameter whose function this build cannot resolve (an optional or defaulted parameter makes it differ per function) is not supported yet"));
+          c.unreachable();
+          c.end();
           this.boxNum(c, (x) => {
             this.fnPayload(x, (y) => y.localGet(0));
             x.structGet(this.fnT(), FN_ARITY);

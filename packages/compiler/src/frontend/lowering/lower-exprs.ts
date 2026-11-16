@@ -19,14 +19,14 @@ import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
-import { fencedValue, lowerConstructorName, viewableClass } from "./class-views.js";
+import { fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
-import { isTimerHandleTyped } from "./lower-builtins.js";
+import { isTimerHandleTyped, lowerProcessVersionsProbe } from "./lower-builtins.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, stubBuiltinModuleOf, unsupportedModuleFeatureOf } from "../shared.js";
 import { onlyStubTouches, stubExprFence, stubMissingExport, stubModuleOf, stubTouch, stubTouchCheck } from "./stub-builtins.js";
@@ -2493,6 +2493,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // the plain property lowering below); the handled marker keeps this
       // re-entrant dispatch from looping.
       if (expr.questionDotToken && !L.chainHandled.has(expr)) {
+        // (`process.versions?.electron`: versions is never nullish, and the
+        // probe reads undefined — no guard to build.)
+        const probe = lowerProcessVersionsProbe(L, expr);
+        if (probe) return probe;
         return L.lowerOptionalChain(expr);
       }
       // `a?.b.c` — the tail of a chain whose token sits deeper: the whole
@@ -2525,7 +2529,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         L.unsupported("SC1090", expr, "reading 'constructor' of a function's 'arguments' object (Node answers Object; this tier's arguments is an array, SEMANTICS.md S081)");
       }
       if (L.isIslandExpr(expr.expression)) {
-        const receiver = L.lowerExpr(expr.expression);
+        // (A typed class instance behind the checker's `any`: its live view,
+        // made while lowering — liftClassReceiver.)
+        const receiver = liftClassReceiver(L, L.lowerExpr(expr.expression));
         // The checker said 'any' but the VALUE lives in the checked-dynamic tree (`this`
         // in a plain JS function — dyn.this — or a checked-dynamic local
         // behind an any-typed spelling): the property read is the checked-dynamic tree's
@@ -6420,15 +6426,69 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
    * (dynFrom's domain, functions box); a value with no dyn representation
    * fences per property. Spreads, accessors, and methods stay fenced —
    * none co-occur with the computed-key idiom in the wild. */
+/** A JavaScript object literal the one-world lanes build as the dynamic
+ * object: it spreads a dynamic value (`{ ...this._optionValues }`), or a
+ * member's value is itself such a literal (commander's saveStateBeforeParse).
+ * (A dynamic field read the checker narrows to its `{}` type is a checked
+ * copy of the dynamic value; the dynamic value is the source.) */
+function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
+  return lit.properties.some((p) => {
+    if (ts.isPropertyAssignment(p)) {
+      let init: ts.Expression = p.initializer;
+      while (ts.isParenthesizedExpression(init)) init = init.expression;
+      return ts.isObjectLiteralExpression(init) && jsLiteralBuildsDynamic(L, init);
+    }
+    if (!ts.isSpreadAssignment(p)) return false;
+    // A source whose type declares fields keeps the field-by-field record
+    // copy (corpus 2300's `{ ...conf, proto }` over a file-scope literal);
+    // one whose type declares none (`{}`, `object`, `any`: commander's
+    // option-value dictionary) can only be built as the dynamic object.
+    try {
+      if (L.checker.getPropertiesOfType(L.checker.getTypeAtLocation(p.expression)).length > 0) return false;
+    } catch {
+      return false;
+    }
+    const pr = probeLower(L, p.expression);
+    const k = pr?.kind === "dynCheck" ? pr.value.type.kind : pr?.type.kind;
+    return k === "dyn" || k === "jsval";
+  });
+}
+
   export function lowerDynObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
     const loc = locOf(expr);
     const fields: { key: IrExpr; value: IrExpr }[] = [];
+    // A SPREAD of a dynamic value (commander's configureOutput: `{
+    // ...this._outputConfiguration, ...configuration }`): the properties
+    // before the first spread build the object; each later spread copies
+    // its source's own enumerable members onto it in order (dyn.assign —
+    // Object.assign's copy, which on a fresh object is the spread's
+    // CopyDataProperties, null/undefined sources skipped), and each later
+    // property sets its key — JS's left-to-right evaluation exactly.
+    let tail: IrStmt[] | null = null;
+    let objLocal: IrLocal | null = null;
+    const objRef = (): IrExpr => ({ kind: "varRef", localId: objLocal!.id, type: DYN, loc });
     for (const prop of expr.properties) {
+      if (ts.isSpreadAssignment(prop) && L.sharedDynamic) {
+        const raw = L.lowerExpr(prop.expression);
+        // A checked copy of a dynamic value (a dynamic field read narrowed to
+        // the checker's type): spread the dynamic value itself.
+        const unwrapped = raw.kind === "dynCheck" && raw.value.type.kind === "dyn" ? raw.value : raw;
+        const src = L.coerceToExpected(asDynOperand(unwrapped), DYN);
+        if (src.type.kind !== "dyn") {
+          L.unsupported("SC1090", prop, `spreading '${L.fmt(src.type)}' values into a runtime-keyed object literal`);
+        }
+        if (tail === null) {
+          objLocal = L.declareHiddenLocal("%spreadObj", DYN);
+          tail = [{ kind: "varDecl", localId: objLocal.id, init: { kind: "dynObjLit", fields: fields.splice(0), type: DYN, loc }, loc }];
+        }
+        tail.push({ kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.assign", args: [objRef(), src], type: DYN, loc: locOf(prop) }, loc: locOf(prop) });
+        continue;
+      }
       if (!ts.isPropertyAssignment(prop) && !ts.isShorthandPropertyAssignment(prop)) {
         L.unsupported(
           "SC1090",
           prop,
-          "spreads, accessors, and methods in a runtime-keyed (computed-key) object literal",
+          "accessors, methods and non-dynamic spreads in a runtime-keyed (computed-key) object literal",
         );
       }
       const name = prop.name;
@@ -6562,6 +6622,25 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
             L.program.getSourceFile(first.loc.file) ?? expr.getSourceFile(),
             first.loc.start,
           );
+          const message = `${first.message} [${first.code} at ${first.loc.file}:${pos.line + 1}]`;
+          // A value that is no function (a RegExp, a Map): a stand-in
+          // function box would answer typeof/instanceof wrongly, so the
+          // literal stops by name where it is built.
+          const fnLike = v.type.kind === "func" || v.type.kind === "record" || v.type.kind === "object" ||
+            v.type.kind === "union" || v.type.kind === "jsval";
+          if (!fnLike) {
+            const stopName = `%fn${L.lambdaCounter++}_dynstop`;
+            L.liftedFns.push({
+              name: stopName,
+              params: [],
+              returnType: DYN,
+              locals: [],
+              captures: [],
+              body: [{ kind: "runtimeFence", code: first.code, message, loc: locOf(prop) }],
+              loc: locOf(prop),
+            });
+            v = { kind: "call", callee: stopName, args: [], type: DYN, loc: locOf(prop) };
+          } else {
           const fnName = `%fn${L.lambdaCounter++}_dynfence`;
           L.liftedFns.push({
             name: fnName,
@@ -6573,7 +6652,7 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
               {
                 kind: "runtimeFence",
                 code: first.code,
-                message: `${first.message} [${first.code} at ${first.loc.file}:${pos.line + 1}]`,
+                message,
                 loc: locOf(prop),
               },
             ],
@@ -6581,10 +6660,16 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           });
           const fence: IrExpr = { kind: "closure", fnName, captures: [], type: funcOf([], VOID), loc: locOf(prop) };
           v = L.coerceToExpected(fence, DYN);
+          }
         }
+      }
+      if (tail !== null) {
+        tail.push({ kind: "exprStmt", expr: { kind: "libCall", fn: "dyn.keySet", args: [objRef(), key, v], type: VOID, loc: locOf(prop) }, loc: locOf(prop) });
+        continue;
       }
       fields.push({ key, value: v });
     }
+    if (tail !== null) return { kind: "seqExpr", stmts: tail, result: objRef(), type: DYN, loc };
     return { kind: "dynObjLit", fields, type: DYN, loc };
   }
 
@@ -6781,6 +6866,16 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         },
       )
     ) {
+      return lowerDynObjectLiteral(L, expr);
+    }
+    // A JavaScript literal SPREADING a dynamic value (commander's
+    // saveStateBeforeParse: `{ ...this._optionValues }` over its dynamic
+    // option-value object): the literal is the dynamic object too — the
+    // spread copies the source's own members in order (lowerDynObjectLiteral).
+    // So is a literal HOLDING such a literal (the same method's outer
+    // `this._savedState = { _name, _optionValues: { ...dyn }, … }`): its
+    // member is the dynamic object, which no record field can share.
+    if (L.sharedDynamic && isJsSourceFile(expr.getSourceFile()) && jsLiteralBuildsDynamic(L, expr)) {
       return lowerDynObjectLiteral(L, expr);
     }
     // Syntax fence FIRST: unsupported member forms get their specific
@@ -11963,6 +12058,13 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         if (left.type.kind === "regex" && left.kind === "varRef" && ts.isIdentifier(expr.left)) {
           if (mayHoldSlotUndef(L, left)) return isUndefExpr(left, true, loc);
           return { kind: "boolLit", value: true, type: BOOL, loc };
+        }
+        // A dynamic value on the one-world lanes: a run-time test for an
+        // island RegExp (commander's `fn instanceof RegExp`, command.js:742,
+        // over its `any` parser argument — a function, a RegExp or a value).
+        if (L.sharedDynamic && (left.type.kind === "dyn" || left.type.kind === "jsval")) {
+          const value: IrExpr = left.type.kind === "dyn" ? left : { kind: "dynFromJsval", value: left, type: DYN, loc };
+          return { kind: "dynTest", test: "regex", value, type: BOOL, loc };
         }
       }
       // `x instanceof X` where X is a class VALUE (a classval-typed

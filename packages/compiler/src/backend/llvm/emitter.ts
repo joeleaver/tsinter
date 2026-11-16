@@ -6636,6 +6636,9 @@ class LlEmitter {
             test = orIsl(oneOf([DK.ARR]), "scr_dyn_isl_is_array");
           } else if (e.test === "function") {
             test = orIsl(oneOf([DK.FUNC]), "scr_dyn_isl_typeof_is", this.cstr("function"));
+          } else if (e.test === "regex") {
+            // Minted on the one-world WasmGC lanes only.
+            throw new Error("internal compiler error: dynTest regex reached the LLVM emitter");
           } else {
             const kindOf: Record<string, number> = {
               string: DK.STR,

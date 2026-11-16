@@ -4153,22 +4153,42 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
 
   /** lowerSwitch's dynamic-arm discriminant (see there), or null when the
    * cases are not all string or all number literals. */
-  function armSwitchDisc(L: Lowerer, stmt: ts.SwitchStatement, disc: IrExpr): IrExpr | null {
+  function armSwitchDisc(L: Lowerer, stmt: ts.SwitchStatement, disc: IrExpr, undefCase?: { value: string | null }): IrExpr | null {
     const cases = stmt.caseBlock.clauses.filter((c): c is ts.CaseClause => ts.isCaseClause(c));
     if (cases.length === 0) return null;
     const lit = (e: ts.Expression): ts.Expression => (ts.isParenthesizedExpression(e) ? lit(e.expression) : e);
-    const strs = cases.every((c) => ts.isStringLiteral(lit(c.expression)) || ts.isNoSubstitutionTemplateLiteral(lit(c.expression)));
-    const nums = cases.every((c) => ts.isNumericLiteral(lit(c.expression)));
+    const isStr = (e: ts.Expression): boolean => ts.isStringLiteral(lit(e)) || ts.isNoSubstitutionTemplateLiteral(lit(e));
+    // `case undefined:` among string cases (commander's parse():
+    // `switch (parseOptions.from) { case undefined: case 'node': … }`), in a
+    // checked-dynamic switch: an undefined discriminant takes a reserved
+    // string only that case spells.
+    const isUndef = (e: ts.Expression): boolean => {
+      const x = lit(e);
+      if (undefCase === undefined || !ts.isIdentifier(x) || x.text !== "undefined") return false;
+      // The global `undefined` (no declaration), never a shadowing binding.
+      const sym = L.checker.getSymbolAtLocation(x);
+      return sym === undefined || (sym.declarations ?? []).length === 0;
+    };
+    const hasUndef = cases.some((c) => isUndef(c.expression));
+    const strs = cases.every((c) => isStr(c.expression) || isUndef(c.expression)) && cases.some((c) => isStr(c.expression));
+    const nums = !hasUndef && cases.every((c) => ts.isNumericLiteral(lit(c.expression)));
     if (!strs && !nums) return null;
     const loc = disc.loc;
     const tmp = L.declareHiddenLocal("%armswitch", DYN);
     const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
     let sentinel: IrExpr;
+    let undefExpr: IrExpr | null = null;
     if (strs) {
-      const taken = new Set(cases.map((c) => (lit(c.expression) as ts.StringLiteral).text));
+      const taken = new Set(cases.filter((c) => isStr(c.expression)).map((c) => (lit(c.expression) as ts.StringLiteral).text));
       let s = "\u0000%no-case";
       while (taken.has(s)) s += "\u0000";
       sentinel = { kind: "strLit", value: s, type: STRING, loc };
+      if (hasUndef) {
+        let u = "\u0000%undefined-case";
+        while (taken.has(u) || u === s) u += "\u0000";
+        undefCase!.value = u;
+        undefExpr = { kind: "strLit", value: u, type: STRING, loc };
+      }
     } else {
       // A number no case spells (the IR carries no NaN literal).
       const taken = new Set(cases.map((c) => Number((lit(c.expression) as ts.NumericLiteral).text.replace(/_/g, ""))));
@@ -4184,7 +4204,14 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
         kind: "ternary",
         cond: { kind: "dynTest", test: strs ? "string" : "number", value: ref(), type: BOOL, loc },
         then: { kind: "dynCheck", value: ref(), type: t, loc },
-        else_: sentinel,
+        else_: undefExpr === null ? sentinel : {
+          kind: "ternary",
+          cond: { kind: "dynTest", test: "undefined", value: ref(), type: BOOL, loc },
+          then: undefExpr,
+          else_: sentinel,
+          type: t,
+          loc,
+        },
         type: t,
         loc,
       },
@@ -4207,7 +4234,8 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // A checked-dynamic discriminant (a JavaScript source's `any`) under the
     // same rule: all-string or all-number literal cases switch on the typed
     // value, any other kind matching none of them (strict equality).
-    if (L.sharedDynamic && disc.type.kind === "dyn") disc = armSwitchDisc(L, stmt, disc) ?? disc;
+    const undefCase: { value: string | null } = { value: null };
+    if (L.sharedDynamic && disc.type.kind === "dyn") disc = armSwitchDisc(L, stmt, disc, undefCase) ?? disc;
     const dk = disc.type.kind;
     if (dk === "dyn") {
       L.unsupported("SC1100", stmt.expression, "switch statements on 'unknown' values");
@@ -4226,7 +4254,11 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
       for (const clause of stmt.caseBlock.clauses) {
         let test: IrExpr | null = null;
         if (ts.isCaseClause(clause)) {
-          test = L.lowerExpr(clause.expression);
+          let ce: ts.Expression = clause.expression;
+          while (ts.isParenthesizedExpression(ce)) ce = ce.expression;
+          test = undefCase.value !== null && ts.isIdentifier(ce) && ce.text === "undefined"
+            ? { kind: "strLit", value: undefCase.value, type: STRING, loc: locOf(ce) }
+            : L.lowerExpr(clause.expression);
           if (test.type.kind !== dk) {
             L.unsupported(
               "SC1090",

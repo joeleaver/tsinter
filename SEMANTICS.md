@@ -1606,10 +1606,12 @@ function's KIND, as Node's does — `[AsyncFunction: f]`,
 budget — where it always said `Function`. The kind is known exactly where
 this entry's own `prototype` answer is: a box built from a function the
 lowering can see by name (a declaration, a literal, a binding every write
-of which is one function). A box whose function the lowering cannot see —
-a parameter, a binding written with different functions, a function
-handed back out of a boxed call — prints `Function` whatever it is,
-beside this entry's name rule. **Tested by:**
+of which is one function, a parameter of a function only ever called
+directly whose callers all pass that one function). A box whose function
+the lowering cannot see — a parameter whose callers pass different
+functions, a binding written with different functions, a function handed
+back out of a boxed call — prints `Function` whatever it is, beside this
+entry's name rule. **Tested by:**
 `packages/compiler/test/wasm-gh156-function-kind.test.ts` (both lanes,
 against Node; the unseen-kind row pins this tier's answer with Node's
 beside it).
@@ -11646,13 +11648,39 @@ S115 views, and the program's own types are untouched. A declared method
 whose name is a String.prototype method (zod's `trim()`, `toLowerCase()`)
 is the implementation's own member: the call dispatches on the receiver's
 kind. When the implementation is a compiled class instance (an S115 view),
-a method the class compiles per call site (untyped or generic parameters)
-has no function to hand out yet: reading it through the view stops by name
-(follow-up: real prototype dispatch for such methods). What is trusted is
+a method the class compiles per call site (untyped parameters) is a member
+of the view through its default instance, its parameters dynamic (amended
+2026-11-16; generic methods with declared type parameters keep their
+fence). What is trusted is
 the declarations' claim, as everywhere in S133: a wrong claim surfaces
 only where a crossing checks it.
 **Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
 (DD-01..06).
+
+**Amendment — a dynamic result under a declared class (2026-11-16).** On
+the WasmGC lanes, when the implementation hands back a dynamic value where
+the declarations name a program-compiled class (commander's `this`-returning
+builder methods, a `parent: Command | null` field), or that class's union
+with unit and scalar arms, the crossing extracts the class instance the
+dynamic value views. The check is the one every dynamic value takes into a
+class slot (S115 (a)). Any other kind ends the program by name, because the
+declaration's claim was false for that value. The program then calls the
+instance's methods and reads its fields as typed code. A function value
+passed to a parameter that the package's declarations type (deepseek's
+profile parser) keeps Node's arity rules. A callback with defaulted or
+optional parameters is passed as the function itself, not refused, and its
+`length` is Node's: the parameters before the first default or rest, with
+TypeScript's `?` counted. The length is that of the closure the package
+function's callers pass, inline or bound to a binding. If the callers pass
+functions whose lengths differ, or functions the compiler cannot name, and
+the callback has optional or defaulted parameters, reading its `length`
+stops by name. A rest-parameter callback value stays refused by name.
+`x instanceof RegExp` over a dynamic value is tested at run time. A RegExp
+that cannot enter dynamic code stops by name where it would, including a
+member of a runtime-keyed object literal, which stops where the literal is
+built.
+**Tested by:** `packages/compiler/test/wasm-commander-typed-chain.test.ts`
+(CMDT-01..11).
 
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
