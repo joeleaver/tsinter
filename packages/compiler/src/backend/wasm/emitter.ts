@@ -2287,7 +2287,11 @@ interface RecordInfo {
  * gain its key late or hold an explicit undefined). Its index: past the
  * fields and the overflow. */
 function recordOrderSlot(shape: IrRecordShape): number | null {
-  if (shape.tuple === true || shape.indexValue !== undefined || shape.id.startsWith(FRAME_SHAPE_PREFIX)) return null;
+  if (shape.tuple === true || shape.id.startsWith(FRAME_SHAPE_PREFIX)) return null;
+  // GH #227: a hybrid with declared fields — any of its keys can be created
+  // out of declared-then-added order (a literal, a capture, a late field).
+  // Its slots come past the fields and the overflow.
+  if (shape.indexValue !== undefined) return shape.fields.some((f) => f.internal !== true) ? shape.fields.length + 1 : null;
   if (!shape.fields.some((f) => f.optional === true && f.internal !== true)) return null;
   return shape.fields.length; // the order vector; the high-water mark at +1
 }
@@ -8589,6 +8593,86 @@ class Assembler {
    * order (IR recordOrder — presence flags, then field numbers) instead
    * runs `one(f)` per stored field number, in order, through a br_table
    * on the number (recordOrderFields numbering). */
+  /** GH #227: `%w.rec.ovfPart:<part>(keys) -> keys` — of an overflow key
+   * list in JS own-key order, the canonical array-index prefix ("index") or
+   * the rest ("named"), as a fresh vector. */
+  private ovfKeysPartHelper(v: VecInfo, part: "index" | "named"): number {
+    const key = `ovfPart:${part}:${v.key}`;
+    const hit = this.ovfPartFns.get(key);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.vecs.vecRef(v)], [this.vecs.vecRef(v)]), `%w.rec.ovfPart:${part}`);
+    this.ovfPartFns.set(key, idx);
+    const c = new Code();
+    const K = 0;
+    const N = 1;
+    const P = 2; // the index prefix length
+    const I = 3;
+    const O = 4;
+    c.localGet(K);
+    c.structGet(v.struct, 0);
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(P);
+    c.block();
+    c.loop();
+    c.localGet(P);
+    c.localGet(N);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(K);
+    c.structGet(v.struct, 1);
+    c.localGet(P);
+    this.vecs.emitElemRead(c, v);
+    this.emitFlat(c);
+    c.call(this.dyn.idxKey());
+    c.f64Const(0);
+    c.f64Lt();
+    c.brIf(1);
+    c.localGet(P);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(P);
+    c.br(0);
+    c.end();
+    c.end();
+    c.f64Const(0);
+    c.call(this.vecs.newLen(v));
+    c.localSet(O);
+    // [lo, hi): the index prefix, or the rest
+    if (part === "index") {
+      c.i32Const(0);
+      c.localSet(I);
+    } else {
+      c.localGet(P);
+      c.localSet(I);
+    }
+    c.block();
+    c.loop();
+    c.localGet(I);
+    if (part === "index") c.localGet(P);
+    else c.localGet(N);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(O);
+    c.localGet(K);
+    c.structGet(v.struct, 1);
+    c.localGet(I);
+    this.vecs.emitElemRead(c, v);
+    c.call(this.vecs.pushOne(v));
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(O);
+    this.mb.setBody(idx, [I32, I32, I32, this.vecs.vecRef(v)], c.bytes());
+    return idx;
+  }
+
+  private readonly ovfPartFns = new Map<string, number>();
+
   private emitOrderedRecordWalk(
     c: Code,
     w: WalkerCtx,
@@ -8597,23 +8681,117 @@ class Assembler {
     loc: SrcLoc | undefined,
     fast: () => boolean,
     one: (f: IrRecordShape["fields"][number]) => boolean,
+    /** GH #227: a hybrid's added keys — `one()` emits the key held in
+     * local `okey` (a flat string). The walk then lists every own key: the
+     * fast path (no order: it holds no index added key) its declared
+     * fields, then every added key; an ordered record its index added keys,
+     * then its declared fields and named added keys as created. */
+    ovf?: { okey: number; one: () => boolean },
   ): boolean {
-    if (info.order === null) return fast();
+    let keys = -1;
+    let kn = -1;
+    let cur = -1;
+    let keysVec: VecInfo | null = null;
+    const merged = ovf !== undefined && info.overflow !== null;
+    if (merged) {
+      keysVec = this.vecInfoFor({ kind: "array", elem: { kind: "string" } }, loc);
+      if (keysVec === null) return false;
+      keys = this.wlocal(w, this.vecs.vecRef(keysVec));
+      kn = this.wlocal(w, I32);
+      cur = this.wlocal(w, I32);
+    }
+    /** keys := the overflow's keys in JS own-key order (one snapshot). */
+    const snapshot = (): void => {
+      c.localGet(0);
+      c.structGet(info.struct, info.fieldIndex.size);
+      c.call(this.maps.keysJsOrder(info.overflow!, keysVec!.struct, keysVec!.bufType));
+      c.localTee(keys);
+      c.structGet(keysVec!.struct, 0);
+      c.localSet(kn);
+      c.i32Const(0);
+      c.localSet(cur);
+    };
+    const emitKeyAtCur = (): boolean => {
+      c.localGet(keys);
+      c.structGet(keysVec!.struct, 1);
+      c.localGet(cur);
+      this.vecs.emitElemRead(c, keysVec!);
+      this.emitFlat(c);
+      c.localSet(ovf!.okey);
+      if (!ovf!.one()) return false;
+      c.localGet(cur);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(cur);
+      return true;
+    };
+    /** while (cur < bound) emit — bound: a local. */
+    const keyLoop = (bound: number): boolean => {
+      c.block();
+      c.loop();
+      c.localGet(cur);
+      c.localGet(bound);
+      c.i32GeS();
+      c.brIf(1);
+      if (!emitKeyAtCur()) return false;
+      c.br(0);
+      c.end();
+      c.end();
+      return true;
+    };
+    /** The fast path: the fields, then every added key. */
+    const fastAll = (): boolean => {
+      if (!fast()) return false;
+      if (!merged) return true;
+      snapshot();
+      return keyLoop(kn);
+    };
+    if (info.order === null) return fastAll();
     const vec = this.vecInfoFor({ kind: "array", elem: { kind: "f64" } }, loc);
     if (vec === null) return false;
     const fields = recordOrderFields(shape);
     const nf = fields.length;
-    const keys = this.wlocal(w, this.vecs.vecRef(vec));
+    const ord = this.wlocal(w, this.vecs.vecRef(vec));
     const k = this.wlocal(w, I32);
     const n = this.wlocal(w, I32);
     c.localGet(0);
     c.structGet(info.struct, info.order);
-    c.localTee(keys);
+    c.localTee(ord);
     c.refIsNull();
     c.ifVoid();
-    if (!fast()) return false;
+    if (!fastAll()) return false;
     c.else_();
-    c.localGet(keys);
+    if (merged) {
+      // the index prefix, in place (keysJsOrder lists the index keys first)
+      const p = this.wlocal(w, I32);
+      snapshot();
+      c.i32Const(0);
+      c.localSet(p);
+      c.block();
+      c.loop();
+      c.localGet(p);
+      c.localGet(kn);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(keys);
+      c.structGet(keysVec!.struct, 1);
+      c.localGet(p);
+      this.vecs.emitElemRead(c, keysVec!);
+      this.emitFlat(c);
+      c.call(this.dyn.idxKey());
+      c.f64Const(0);
+      c.f64Lt();
+      c.brIf(1);
+      c.localGet(p);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(p);
+      c.br(0);
+      c.end();
+      c.end();
+      if (!keyLoop(p)) return false;
+    }
+    c.localGet(ord);
     c.structGet(vec.struct, 0);
     c.localSet(n);
     c.i32Const(nf);
@@ -8624,9 +8802,31 @@ class Assembler {
     c.localGet(n);
     c.i32GeS();
     c.brIf(1);
+    // GH #227: a marker (-1) — the next named added key
+    c.localGet(ord);
+    c.structGet(vec.struct, 1);
+    c.localGet(k);
+    this.vecs.emitElemRead(c, vec);
+    c.f64Const(0);
+    c.f64Lt();
+    c.ifVoid();
+    if (merged) {
+      c.localGet(cur);
+      c.localGet(kn);
+      c.i32LtS();
+      c.ifVoid();
+      if (!emitKeyAtCur()) return false;
+      c.end();
+    }
+    c.localGet(k);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(k);
+    c.br(1); // the loop
+    c.end();
     c.block(); // $next
     for (let j = 0; j < nf; j++) c.block();
-    c.localGet(keys);
+    c.localGet(ord);
     c.structGet(vec.struct, 1);
     c.localGet(k);
     this.vecs.emitElemRead(c, vec);
@@ -8645,6 +8845,8 @@ class Assembler {
     c.br(0);
     c.end();
     c.end();
+    // the named added keys not yet listed
+    if (merged && !keyLoop(kn)) return false;
     c.end();
     return true;
   }
@@ -18806,7 +19008,9 @@ class Assembler {
           c.call(dyn.objPut());
           return true;
         };
-        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, dynFast, dynOne)) return false;
+        // GH #227: the added keys join the walk (index keys first, then as
+        // created among the declared fields).
+        let dynOvf: { okey: number; one: () => boolean } | undefined;
         if (info.overflow !== null) {
           // The overflow TAIL: unlike dynCheck/dynMatch's width-CAPTURE
           // loops (which scan a SOURCE dyn object's raw storage order),
@@ -18819,35 +19023,10 @@ class Assembler {
           const ovfType = shape.indexValue!;
           const ovfFromHelper = this.dynFromHelper(ovfType, loc);
           if (ovfFromHelper === null) return false;
-          const keysArrType: IrType = { kind: "array", elem: { kind: "string" } };
-          const keysVec = this.vecInfoFor(keysArrType, loc);
-          if (keysVec === null) return false;
-          const keys = this.wlocal(w, this.vecs.vecRef(keysVec));
-          c.localGet(0);
-          c.structGet(info.struct, info.fieldIndex.size);
-          c.call(this.maps.keysJsOrder(info.overflow, keysVec.struct, keysVec.bufType));
-          c.localSet(keys);
-          const oi = this.wlocal(w, I32);
-          const on = this.wlocal(w, I32);
           const okey = this.wlocal(w, this.strRef);
           const oval = this.wlocal(w, info.overflow.valVal);
-          c.localGet(keys);
-          c.structGet(keysVec.struct, 0);
-          c.localSet(on);
-          c.i32Const(0);
-          c.localSet(oi);
-          c.block();
-          c.loop();
-          c.localGet(oi);
-          c.localGet(on);
-          c.i32GeS();
-          c.brIf(1);
-          c.localGet(keys);
-          c.structGet(keysVec.struct, 1);
-          c.localGet(oi);
-          this.vecs.emitElemRead(c, keysVec);
-          this.emitFlat(c);
-          c.localSet(okey);
+          const ovfInfo = info.overflow;
+          dynOvf = { okey, one: (): boolean => {
           // The found flag is always true here — okey came from this
           // exact map's own keysJsOrder scan moments ago, and nothing
           // else runs between that scan and this read to mutate it (same
@@ -18855,7 +19034,7 @@ class Assembler {
           c.localGet(0);
           c.structGet(info.struct, info.fieldIndex.size);
           c.localGet(okey);
-          c.call(this.maps.get(info.overflow));
+          c.call(this.maps.get(ovfInfo));
           c.localSet(oval);
           c.drop();
           c.localGet(o);
@@ -18863,14 +19042,10 @@ class Assembler {
           c.localGet(oval);
           c.call(ovfFromHelper);
           c.call(dyn.objPut());
-          c.localGet(oi);
-          c.i32Const(1);
-          c.i32Add();
-          c.localSet(oi);
-          c.br(0);
-          c.end();
-          c.end();
+          return true;
+          } };
         }
+        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, dynFast, dynOne, dynOvf)) return false;
         dyn.boxObj(c, (x) => x.localGet(o));
         return true;
       }
@@ -19382,7 +19557,9 @@ class Assembler {
                   return true;
         };
         const jsonFast = (): boolean => fields.every((f) => jsonOne(f));
-        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, jsonFast, jsonOne)) return false;
+        // GH #227: the added keys join the walk (index keys first, then as
+        // created among the declared fields).
+        let jsonOvf: { okey: number; one: () => boolean } | undefined;
         if (info.overflow !== null) {
           // OVERFLOW entries in JS own-key order, after every declared
           // field (nodes.ts's IrRecordShape.indexValue doc: "JSON
@@ -19416,35 +19593,10 @@ class Assembler {
           const ovfIsDyn = ovfType.kind === "dyn";
           const ovfWriter = ovfIsDyn ? null : this.jsonWriteHelper(ovfType, loc);
           if (!ovfIsDyn && ovfWriter === null) return false;
-          const keysArrType: IrType = { kind: "array", elem: { kind: "string" } };
-          const keysVec = this.vecInfoFor(keysArrType, loc);
-          if (keysVec === null) return false;
-          const keys = this.wlocal(w, this.vecs.vecRef(keysVec));
-          c.localGet(0);
-          c.structGet(info.struct, info.fieldIndex.size);
-          c.call(this.maps.keysJsOrder(info.overflow, keysVec.struct, keysVec.bufType));
-          c.localSet(keys);
-          const oi = this.wlocal(w, I32);
-          const on = this.wlocal(w, I32);
           const okey = this.wlocal(w, this.strRef);
           const oval = this.wlocal(w, info.overflow.valVal);
-          c.localGet(keys);
-          c.structGet(keysVec.struct, 0);
-          c.localSet(on);
-          c.i32Const(0);
-          c.localSet(oi);
-          c.block();
-          c.loop();
-          c.localGet(oi);
-          c.localGet(on);
-          c.i32GeS();
-          c.brIf(1);
-          c.localGet(keys);
-          c.structGet(keysVec.struct, 1);
-          c.localGet(oi);
-          this.vecs.emitElemRead(c, keysVec);
-          this.emitFlat(c);
-          c.localSet(okey);
+          const ovfInfo = info.overflow;
+          jsonOvf = { okey, one: (): boolean => {
           // The found flag is always true here — okey came from this
           // exact map's own keysJsOrder scan moments ago, and nothing
           // else runs (no user code, no async gap) between that scan
@@ -19452,7 +19604,7 @@ class Assembler {
           c.localGet(0);
           c.structGet(info.struct, info.fieldIndex.size);
           c.localGet(okey);
-          c.call(this.maps.get(info.overflow));
+          c.call(this.maps.get(ovfInfo));
           c.localSet(oval);
           c.drop();
           const ovfUtag = this.undefinedArmTag2(ovfType);
@@ -19521,14 +19673,10 @@ class Assembler {
             c.call(ovfWriter);
           }
           if (ovfIsDyn || ovfSlotDrop || ovfUtag >= 0) c.end();
-          c.localGet(oi);
-          c.i32Const(1);
-          c.i32Add();
-          c.localSet(oi);
-          c.br(0);
-          c.end();
-          c.end();
+          return true;
+          } };
         }
+        if (!this.emitOrderedRecordWalk(c, w, info, shape, loc, jsonFast, jsonOne, jsonOvf)) return false;
         this.pushStrLitInto(c, "}");
         c.call(json.jbPuts());
         if (cyclic) c.call(json.jbLeave());
@@ -20682,6 +20830,112 @@ class Assembler {
             c.br(0);
             c.end();
             c.end();
+            if (info.order !== null) {
+              // GH #227: the captured record's own keys take the source's
+              // order when it is not the fast path's (an added key before a
+              // declared one, or declared keys out of declared order): a
+              // presence flag and a field number per declared key, a marker
+              // per non-index added key, in the source's entry order.
+              const ordVec = this.vecInfoFor({ kind: "array", elem: { kind: "f64" } }, loc);
+              if (ordVec === null) return false;
+              const ofields = recordOrderFields(shape);
+              const nf = ofields.length;
+              const A = this.wlocal(w, this.vecs.vecRef(ordVec));
+              const saw = this.wlocal(w, I32);
+              const re = this.wlocal(w, I32);
+              const last = this.wlocal(w, I32);
+              c.f64Const(nf);
+              c.call(this.vecs.newLen(ordVec));
+              c.localSet(A);
+              c.i32Const(0);
+              c.localSet(saw);
+              c.i32Const(0);
+              c.localSet(re);
+              c.i32Const(-1);
+              c.localSet(last);
+              c.i32Const(0);
+              c.localSet(oI);
+              c.block();
+              c.loop();
+              c.localGet(oI);
+              c.localGet(oN);
+              c.i32GeU();
+              c.brIf(1);
+              c.localGet(o);
+              c.structGet(objT, OBJ_ENTRIES);
+              c.localGet(oI);
+              c.arrayGet(entries);
+              c.localSet(oE);
+              c.block(); // $next
+              ofields.forEach((f, j) => {
+                c.localGet(oE);
+                c.structGet(entryT, ENTRY_KEY);
+                this.pushStrLitInto(c, f.name);
+                c.call(this.strEqHelper());
+                c.ifVoid();
+                // first sighting: flag, append, note a reorder
+                c.localGet(A);
+                c.structGet(ordVec.struct, 1);
+                c.i32Const(j);
+                this.vecs.emitElemRead(c, ordVec);
+                c.f64Const(0);
+                c.f64Eq();
+                c.ifVoid();
+                c.localGet(A);
+                c.structGet(ordVec.struct, 1);
+                c.i32Const(j);
+                c.f64Const(1);
+                c.arraySet(ordVec.bufType);
+                c.localGet(A);
+                c.f64Const(j);
+                c.call(this.vecs.pushOne(ordVec));
+                c.localGet(saw);
+                c.localGet(last);
+                c.i32Const(j);
+                c.i32GtS();
+                c.i32Or();
+                c.ifVoid();
+                c.i32Const(1);
+                c.localSet(re);
+                c.end();
+                c.i32Const(j);
+                c.localSet(last);
+                c.end();
+                c.br(1); // $next
+                c.end();
+              });
+              // an added key: a marker unless it is an index key
+              c.localGet(oE);
+              c.structGet(entryT, ENTRY_KEY);
+              c.call(this.dyn.idxKey());
+              c.f64Const(0);
+              c.f64Lt();
+              c.ifVoid();
+              c.localGet(A);
+              c.f64Const(-1);
+              c.call(this.vecs.pushOne(ordVec));
+              c.i32Const(1);
+              c.localSet(saw);
+              c.else_();
+              // an index added key: the fast path holds none
+              c.i32Const(1);
+              c.localSet(re);
+              c.end();
+              c.end(); // $next
+              c.localGet(oI);
+              c.i32Const(1);
+              c.i32Add();
+              c.localSet(oI);
+              c.br(0);
+              c.end();
+              c.end();
+              c.localGet(re);
+              c.ifVoid();
+              c.localGet(r);
+              c.localGet(A);
+              c.structSet(info.struct, info.order);
+              c.end();
+            }
           }
           c.localGet(r);
         }
@@ -25112,6 +25366,7 @@ class Assembler {
         this.walkExpr(e.obj);
         code.structGet(info.struct, info.fieldIndex.size);
         code.call(this.maps.keysJsOrder(info.overflow, vecInfo.struct, vecInfo.bufType));
+        if (e.part !== undefined) code.call(this.ovfKeysPartHelper(vecInfo, e.part));
         return;
       }
 

@@ -4673,15 +4673,12 @@ test("throw: a non-error class survives the round trip, synchronously and throug
   );
 });
 
-test("S031: hybrid record own-key order is declared-then-overflow", async () => {
-  // No corpus program can pin this: Node's single ordered table puts
-  // integer-like keys ascending FIRST regardless of which "store" (JS has
-  // none) a key came from, so a program exercising the split fails the
-  // differential on every lane by construction. Measured on Node 24.18
-  // against the C lane (SEMANTICS.md S031): the declared field sorts
-  // BEFORE the integer-like overflow keys here, and integer-like keys
-  // still sort ascending WITHIN the overflow half.
-  const res = await buildWasm(
+test("S031 (retired on the WasmGC lanes, GH #227): a hybrid record lists its index keys first, then its keys as created — Node's order", async () => {
+  // GH #227: the hybrid's order slot and merged walk give Node's single
+  // ordered table — integer-like keys ascending first, then the declared
+  // field and the added keys in creation order. Compared with Node's own
+  // run of the same source.
+  await expectNodeRow(
     "hybrid-key-order.ts",
     [
       "interface Basic {",
@@ -4697,11 +4694,6 @@ test("S031: hybrid record own-key order is declared-then-overflow", async () => 
       "console.log(JSON.stringify(r));",
       "",
     ].join("\n"),
-  );
-  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(
-    ["known|1|3|b|a", '{"known":1,"1":5,"3":3,"b":2,"a":4}', ""].join("\n"),
   );
 });
 

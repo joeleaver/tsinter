@@ -7846,7 +7846,6 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         // `{ plugins: unknown, ... }` — a JS caller the checker admits).
         const absent = L.wrappedUndefined(f.type, loc) ?? (f.type.kind === "dyn" ? dynUndefinedExpr(loc) : null);
         if (!absent) throw shapeMismatch(expr); // only optional (undefined-armed) and 'unknown' fields may be omitted
-        L.omittedLitValues.add(absent);
         fields.push({ name: f.name, value: absent });
       }
     }

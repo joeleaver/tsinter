@@ -216,34 +216,31 @@ e.self = e;
 console.log(e);`,
   },
   {
-    id: "S125-B-04 (review) a hybrid literal that sets an added key before a declared field refuses its print by name (Node prints insertion order)",
+    id: "S125-B-04 (review) a hybrid literal that sets an added key before a declared field prints in Node's insertion order (GH #227)",
     entry: "main.ts",
     src: `type R = { id: string; [k: string]: unknown };
 const r: R = { name: "n", id: "a1" };
 console.log(r);`,
-    refused: /printing an index-signature record with declared fields whose added keys may come before a declared field/,
   },
   {
-    id: "S125-B-05 (review) a hybrid whose optional declared field is assigned after an added key refuses its print by name",
+    id: "S125-B-05 (review) a hybrid whose optional declared field is assigned after an added key prints in Node's order (GH #227)",
     entry: "main.ts",
     src: `type R = { id: string; tag?: string; [k: string]: unknown };
 const r: R = { id: "a" };
 r.extra = 1;
 r.tag = "t";
 console.log(r);`,
-    refused: /printing an index-signature record with declared fields whose added keys may come before a declared field/,
   },
   {
-    id: "S125-B-06 (review) a hybrid checked out of JSON (keys in the source's order) refuses its print by name",
+    id: "S125-B-06 (review) a hybrid checked out of JSON (keys in the source's order) prints in Node's order (GH #227)",
     entry: "main.ts",
     src: `type R = { id: string; [k: string]: unknown };
 function load(s: string): R { return JSON.parse(s) as R; }
 const r = load('{"name":"n","id":"a1"}');
 console.log(r);`,
-    refused: /printing an index-signature record with declared fields/,
   },
   {
-    id: "S125-B-07 (re-check) a computed-key write on a hybrid with an optional declared field may set it after an added key: the print refuses by name",
+    id: "S125-B-07 (re-check) a computed-key write on a hybrid with an optional declared field may set it after an added key: prints in Node's order (GH #227)",
     entry: "main.ts",
     src: `type R = { id?: string; [k: string]: unknown };
 const r: R = {};
@@ -251,19 +248,17 @@ r.x = 1;
 const k = ["i", "d"].join("");
 r[k] = "a";
 console.log(r);`,
-    refused: /a computed key may set an optional declared field after an added key/,
   },
   {
-    id: "S125-B-08 (re-check) keys from data written into a hybrid with an optional declared field: the print refuses by name",
+    id: "S125-B-08 (re-check) keys from data written into a hybrid with an optional declared field: prints in Node's order (GH #227)",
     entry: "main.ts",
     src: `type R = { id?: string; [k: string]: unknown };
 const r: R = {};
 for (const k of JSON.parse('["x","id"]') as string[]) r[k] = k;
 console.log(r);`,
-    refused: /a computed key may set an optional declared field after an added key/,
   },
   {
-    id: "S125-B-09 (re-check) an explicit undefined written after an added key in a literal is a key: the print refuses by name (required and optional declared fields)",
+    id: "S125-B-09 (re-check) an explicit undefined written after an added key in a literal is a key: printed in Node's order (GH #227; required and optional declared fields)",
     entry: "main.ts",
     src: `type R = { id: string | undefined; [k: string]: unknown };
 const r: R = { name: "n", id: undefined };
@@ -271,6 +266,5 @@ console.log(r);
 type Q = { id?: string; [k: string]: unknown };
 const q: Q = { name: "n", id: undefined };
 console.log(q);`,
-    refused: /a literal sets a declared field after an added key/,
   },
 ]);
