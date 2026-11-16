@@ -11682,6 +11682,38 @@ built.
 **Tested by:** `packages/compiler/test/wasm-commander-typed-chain.test.ts`
 (CMDT-01..11).
 
+**Amendment (m) — a viewed package's declarations that import another
+opted-in package (2026-11-16).** A view's declaration files may import
+another opted-in package's types (`@clack/prompts`' `index.d.mts` names
+`@clack/core`'s). That package then gets a declared-surface view too,
+resolved from the declaring package's own location (its copy of the
+dependency), when the declaring package's JavaScript imports it as well,
+so Node loads it. Under its inferred surface the type-only names the
+declarations import do not exist, and the program fails to typecheck. A
+package that only the types reference brings no JS into the build. The
+rule repeats to a fixpoint along a chain of packages. When the declaring
+packages, or the program's own imports, resolve the dependency to
+different copies, no view is registered and the fallback note names the
+copies (as for (j)).
+On the WasmGC lanes, `--npm-static=auto` (which opts in the packages the
+program imports) also follows the opted-in packages' own imports: a package
+that an opted-in package's JavaScript imports is judged by auto's own
+eligibility bar and joins when it passes (the program imports only
+@clack/prompts; @clack/core joins through it). The opted-in list follows
+Node's evaluation order (dependencies first, a diamond's shared dependency
+before both importers). A transitive package that fails the bar is not
+opted in; on these lanes, which have no island engine, its importer's build
+then fails with SC2013, as before. On the same lanes auto stops declining
+a package for minified JavaScript when the package ships its own
+declarations (@clack/prompts ships one mangled single-file dist): the
+program types against the declarations, so mangled internal names never
+reach it. JavaScript in such a package that does not compile is refused by
+name at build time (an `arguments` use) or becomes an S122 runtime fence at
+the construct (a module.exports method entry, a non-literal require), as in
+any opted-in package. Library mode and the legacy C/LLVM lanes keep the
+minified check and auto's direct-imports-only selection.
+**Tested by:** `packages/compiler/test/npm-dts-chain.test.ts` (DCH-01..03).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would

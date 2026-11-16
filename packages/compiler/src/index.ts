@@ -32,7 +32,7 @@ import { npmStaticDtsViewRefusalOf, npmStaticHasDtsView, npmStaticIneligibleReas
 import { EntryLoadError, canonicalBuiltinModule, checkPreflight, clearImportEdgeMemo, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
 import { provenanceSources } from "./frontend/provenance-registry.js";
 import { resolveBareModule } from "./frontend/resolve.js";
-import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
+import { isJsSourceFileName, isRelativeSpecifier, npmPackageNameOf } from "./frontend/shared.js";
 import { lowerToIr, type LowerOptions, type LowerResult } from "./frontend/lowering/lowerer.js";
 import { LibHostState, setLibHost } from "./frontend/lib-host.js";
 import { DEFAULT_MAX_DEPTH, loadWasmProfile, type WasmLibProfile } from "./library/wasm-profile.js";
@@ -349,9 +349,10 @@ interface Frontend {
 function detectAutoPackages(
   load: LoadResult,
   statuses: NpmStaticStatus[],
-  mode: "auto" | "lib" = "auto",
+  mode: "auto" | "lib" | "deps" = "auto",
   judged?: Set<string>,
   sites?: Map<string, SrcLoc>,
+  wasmGc = false,
 ): string[] {
   // package → the resolved types file AND the file whose import found it:
   // the runtime-JS probe below must resolve from the SAME importing file,
@@ -361,11 +362,14 @@ function detectAutoPackages(
   const seen = new Map<string, { typesFile: string; fromFile: string }>();
   for (const sf of [...load.moduleOrder, load.entry]) {
     if (mode === "auto" && sf.fileName.includes("/node_modules/")) continue;
+    // Auto's transitive pass (SEMANTICS.md S133 (m)): only the files of a
+    // package already opted in, whose own imports Node follows.
+    if (mode === "deps" && npmStaticPackageOfPath(sf.fileName) === null) continue;
     const edges: { spec: string; loc: SrcLoc }[] = [];
     for (const stmt of sf.statements) {
       if (ts7IsImportWithStringSpec(stmt)) {
         edges.push({ spec: (stmt as { moduleSpecifier: { text: string } }).moduleSpecifier.text, loc: locOf(stmt) });
-      } else if (mode === "lib") {
+      } else if (mode === "lib" || mode === "deps") {
         // CJS packages spell their dep edges as top-level requires; the
         // import-statement scan alone would miss every one of them.
         for (const req of requiresOf(stmt)) edges.push({ spec: req.spec, loc: locOf(req.node) });
@@ -377,7 +381,7 @@ function detectAutoPackages(
       // business (and the SC4005 async_free gate's, in library mode) —
       // never npm candidates. Auto keeps its original path (the
       // @types/node answer skips them below), byte-for-byte.
-      if (mode === "lib" && canonicalBuiltinModule(spec) !== null) continue;
+      if (mode !== "auto" && canonicalBuiltinModule(spec) !== null) continue;
       const npm = resolveNpmImport(sf.fileName, spec);
       if (npm !== null && isNodeTypesPath(npm.typesFile)) continue;
       if (npm === null) {
@@ -408,11 +412,28 @@ function detectAutoPackages(
       pkg,
       typesFile,
       jsEntry !== null && isJsSourceFileName(jsEntry.typesFile) ? jsEntry.typesFile : null,
+      mode !== "lib" && wasmGc,
     );
     if (reason === null) chosen.push(pkg);
-    else statuses.push({ package: pkg, status: "fallback", detail: mode === "lib" ? reason : `auto: ${reason}` });
+    // (A transitive dependency auto judges ineligible stays where it was —
+    // its importer's JS loads it from the island — with no status line of
+    // its own: the program never imports it.)
+    else if (mode !== "deps") statuses.push({ package: pkg, status: "fallback", detail: mode === "lib" ? reason : `auto: ${reason}` });
   }
   return chosen;
+}
+
+/** The opted-in packages in the order the loaded program first evaluates
+ * a module of each (load.moduleOrder is Node's evaluation order); packages
+ * with no module in the program keep their relative order, last. */
+function byEvaluationOrder(pkgs: readonly string[], load: LoadResult): string[] {
+  const first = new Map<string, number>();
+  load.moduleOrder.forEach((sf, i) => {
+    const pkg = npmPackageNameOf(sf.fileName);
+    if (pkg !== null && !first.has(pkg)) first.set(pkg, i);
+  });
+  const rank = (pk: string): number => first.get(pk) ?? Number.MAX_SAFE_INTEGER;
+  return pkgs.map((pk, i) => ({ pk, i })).sort((a, b) => rank(a.pk) - rank(b.pk) || a.i - b.i).map((x) => x.pk);
 }
 
 /** Duck-typed import-declaration test (the ts7 AST types stay inside the
@@ -462,26 +483,30 @@ function packagesNamedByDiag(message: string, optedIn: ReadonlySet<string>): Set
  * packages' own bare edges (no island exists to serve a dep from). */
 /** runFrontend, with an entry the checker's program does not contain
  * answered as the SC0005 gate instead of a thrown error. */
-function frontendOrGate(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend | ScrDiagnostic {
+function frontendOrGate(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib", wasmGc = false): Frontend | ScrDiagnostic {
   try {
-    return runFrontend(entryPath, npmStatic);
+    return runFrontend(entryPath, npmStatic, wasmGc);
   } catch (e) {
     if (!(e instanceof EntryLoadError)) throw e;
     return entryLoadDiag(entryPath, existsSync(entryPath));
   }
 }
 
-function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
+function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib", wasmGc = false): Frontend {
   clearImportEdgeMemo();
   try {
-    return runFrontendLoads(entryPath, npmStatic);
+    return runFrontendLoads(entryPath, npmStatic, wasmGc);
   } finally {
     // The reloads are over: the memo's file texts need not outlive them.
     clearImportEdgeMemo();
   }
 }
 
-function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
+/** `wasmGc`: the build targets the WasmGC lanes, where no island engine
+ * exists (a package left out of --npm-static is a build-time refusal, never
+ * a working --dynamic fallback). Auto's transitive pass and its minified
+ * exemption (SEMANTICS.md S133 (m)) apply there only. */
+function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib", wasmGc = false): Frontend {
   const statuses: NpmStaticStatus[] = [];
   const npmSites = new Map<string, SrcLoc>();
   const judged = new Set<string>();
@@ -496,7 +521,7 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
       requested =
         npmStatic === "lib"
           ? detectAutoPackages(scout, statuses, "lib", judged, npmSites)
-          : detectAutoPackages(scout, statuses);
+          : detectAutoPackages(scout, statuses, "auto", judged, undefined, wasmGc);
     } finally {
       scout.dispose();
     }
@@ -540,6 +565,36 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
       load.dispose();
       load = loadProgram(entryPath, { npmStatic: requested });
       preflight = checkPreflight(load);
+    }
+  }
+  // Auto's transitive pass (SEMANTICS.md S133 (m)): a package an opted-in
+  // package's JavaScript imports (@clack/prompts importing @clack/core) is
+  // judged by auto's own bar and joins when eligible, so the importer's
+  // declarations type against it and its JS compiles with the importer's.
+  // Bounded like the library fixpoint above.
+  if (npmStatic === "auto" && wasmGc) {
+    let grewAny = false;
+    for (;;) {
+      const grown = detectAutoPackages(load, statuses, "deps", judged, undefined, true);
+      if (grown.length === 0) break;
+      grewAny = true;
+      requested = [...requested, ...grown];
+      load.dispose();
+      load = loadProgram(entryPath, { npmStatic: requested });
+      preflight = checkPreflight(load);
+    }
+    // The opt-in list in Node's evaluation order (each package's first
+    // module in the loaded program's module order: dependencies first, a
+    // diamond's shared dependency before both importers). The build is not
+    // yet independent of that order (GH #237).
+    if (grewAny) {
+      const ordered = byEvaluationOrder(requested, load);
+      if (ordered.some((pk, i) => pk !== requested[i])) {
+        requested = ordered;
+        load.dispose();
+        load = loadProgram(entryPath, { npmStatic: requested });
+        preflight = checkPreflight(load);
+      }
     }
   }
   const effective = new Set(requested);
@@ -718,7 +773,7 @@ export function analyze(entryPath: string, opts: AnalyzeOptions = {}): AnalyzeRe
     }
     ffi = loaded.profile;
   }
-  const fe = frontendOrGate(entryPath, opts.npmStatic);
+  const fe = frontendOrGate(entryPath, opts.npmStatic, opts.backend === "wasm" || opts.backend === "wasm-native");
   if (!("preflight" in fe)) {
     return {
       coverage: {
@@ -809,7 +864,7 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     }
     ffi = loaded.profile;
   }
-  const fe = frontendOrGate(entryPath, opts.npmStatic);
+  const fe = frontendOrGate(entryPath, opts.npmStatic, opts.backend === "wasm" || opts.backend === "wasm-native");
   if (!("preflight" in fe)) return { ok: false, diagnostics: [fe], sourceTexts: new Map() };
   let lowered: LowerResult;
   let entryText: string;
@@ -1779,7 +1834,7 @@ async function compileWasmLibrary(entryPath: string, opts: CompileOptions, lib: 
   let lowered: LowerResult;
   let sourceTexts: Map<string, string>;
   try {
-    const fe = frontendOrGate(entryPath, opts.npmStatic);
+    const fe = frontendOrGate(entryPath, opts.npmStatic, true);
     if (!("preflight" in fe)) return { ok: false, diagnostics: [fe], sourceTexts: new Map() };
     try {
       const fail = (diagnostics: ScrDiagnostic[]): CompileResult => ({ ok: false, diagnostics, sourceTexts: fe.sourceTexts() });

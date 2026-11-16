@@ -655,11 +655,20 @@ export function hasTransformMarkers(source: string): boolean {
 /** Auto-mode eligibility for one candidate package: `typesFile` is what
  * the ordinary (types-first) resolution answered for the import,
  * `jsEntry` what the js-only resolution answers. Returns null when
- * eligible, else the human-readable reason it is not. */
+ * eligible, else the human-readable reason it is not.
+ *
+ * `minifiedOk` (--npm-static=auto, SEMANTICS.md S133 (m)): a package that
+ * ships its OWN declarations is not declined for minified JS. The program
+ * types against those declarations, so the implementation's mangled names
+ * never reach it, and a JS body that does not compile still drops the
+ * package at preflight, as for any offender (@clack/prompts ships one
+ * mangled single-file dist). Library mode keeps the check (its
+ * static-or-refuse posture names minified packages). */
 export function npmStaticIneligibleReason(
   pkgName: string,
   typesFile: string,
   jsEntry: string | null,
+  minifiedOk = false,
 ): string | null {
   // The package's own declarations, or its @types twin (the declared-
   // surface view serves either — S133); any other package's types are a
@@ -678,7 +687,7 @@ export function npmStaticIneligibleReason(
   } catch {
     return `its runtime entry ${jsEntry} cannot be read`;
   }
-  if (!looksUnminified(source)) return "its shipped JS looks minified";
+  if (!(minifiedOk && typesPkg === pkgName) && !looksUnminified(source)) return "its shipped JS looks minified";
   if (hasTransformMarkers(source)) {
     return "its shipped JS carries build-transform markers (bundled/transpiled dist)";
   }
