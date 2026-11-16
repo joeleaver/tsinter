@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { analyze, compile } from "../src/index.js";
 import { isJsonSafeType, JSON_SAFE_DEPTH_BUDGET, STRING, type IrRecordShape, type IrType } from "../src/ir/nodes.js";
-import { checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";
+import { checkRow, nativeRun, type Row, scratchDir } from "./top10-paperclip-rows.js";
 
 const scratch = scratchDir("npm-dual-view");
 
@@ -276,6 +276,64 @@ describe("S133 (j): a nested namespace member the JS lacks refuses at build time
     expect(text).toContain(DECLARED_ONLY);
     expect(text).toContain("'time'");
     expect(text).not.toContain("'date'");
+  }, 600_000);
+});
+
+const NSTHIS: Record<string, string> = under("node_modules/nsthis", {
+  "package.json": pj({ name: "nsthis", version: "1.0.0", type: "module", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } }),
+  "index.d.ts": `export * as ns from "./ns.js";`,
+  "ns.d.ts": `export declare function who(): string;\nexport declare const plain: () => string;`,
+  "index.js": `export * as ns from "./ns.js";`,
+  "ns.js": `export function who() { return this === undefined ? "undef" : typeof this; }\nexport const plain = () => "plain";`,
+});
+const THIS_FENCE = "through its namespace when its body reads 'this'";
+
+describe("a namespace-qualified call of a function that reads `this` refuses by name (Node passes the namespace object)", () => {
+  const cases: [string, string[], Record<string, string>][] = [
+    ["DV-19 a nested namespace export of a viewed package", ["nsthis"], { ...NSTHIS, "main.ts": `import { ns } from "nsthis";\nconsole.log(ns.plain());\nconsole.log(ns.who());` }],
+    [
+      "DV-20 a program module's namespace import",
+      [],
+      {
+        "package.json": pj({ type: "module" }),
+        "m.js": `export function who() { return this === undefined ? "undef" : typeof this; }`,
+        "main.js": `import * as m from "./m.js";\nconsole.log(m.who());`,
+      },
+    ],
+  ];
+  test.for(cases)("%s", async ([id, pkgs, files]) => {
+    const tsEntry = project(id.split(" ")[0]!, files);
+    const dir = join(tsEntry, "..");
+    const entry = files["main.ts"] !== undefined ? tsEntry : join(dir, "main.js");
+    const res = await compile(entry, { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: pkgs });
+    if (res.ok) {
+      const got = await nativeRun(res.binaryPath!, []);
+      expect(got.stderr).toContain(THIS_FENCE);
+      expect(got.exitCode).toBe(1);
+    } else {
+      expect((res.diagnostics ?? []).map((d) => d.message).join("\n")).toContain(THIS_FENCE);
+    }
+  }, 600_000);
+});
+
+const ROWS3: Row[] = [
+  {
+    id: "DV-21 control: the same function called through a named import runs (this is undefined, as Node)",
+    npmStatic: [],
+    files: {
+      "package.json": pj({ type: "module" }),
+      "m.js": `export function who() { return this === undefined ? "undef" : typeof this; }`,
+      "main.js": `import { who } from "./m.js";\nconsole.log(who());`,
+    },
+  },
+];
+
+describe("namespace `this` control (both lanes vs Node)", () => {
+  test.for(ROWS3.map((r) => [r.id, r] as const))("%s wasm", async ([, row]) => {
+    await checkRow(scratch, row, "wasm");
+  }, 600_000);
+  test.for(ROWS3.map((r) => [r.id, r] as const))("%s wasm-native", async ([, row]) => {
+    await checkRow(scratch, row, "wasm-native");
   }, 600_000);
 });
 

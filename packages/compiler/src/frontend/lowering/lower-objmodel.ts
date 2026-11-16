@@ -473,7 +473,7 @@ function walk(root: ts.Node, visit: (n: ts.Node) => boolean): void {
   }
 }
 
-function usesThis(fn: ts.Node): boolean {
+export function usesThis(fn: ts.Node): boolean {
   let found = false;
   walk(fn, (n) => {
     if (found) return false;
