@@ -11565,8 +11565,12 @@ view, S115). So:
 - results cross into the declared member types at the use, by S133's
   crossing: a declared primitive (`safeParse(v).success` as `boolean`)
   checks its kind and stops by name when the implementation produces
-  another; a declared interface result stays dynamic; a data-only result
-  is read dynamically and converted where it reaches a typed slot.
+  another, for a member read and a method call's result alike
+  (`error.format(): string`); a declared interface result stays dynamic;
+  a data-only result is read dynamically and converted where it reaches a
+  typed slot. zod's headline pattern, a `safeParse` result narrowed by
+  `.success` (`if (!r.success) … r.error … else … r.data`), is exactly
+  these reads: the discriminant and each member cross at their own use.
 Data-only interfaces keep their record mapping, declared classes their
 S115 views, and the program's own types are untouched. A declared method
 whose name is a String.prototype method (zod's `trim()`, `toLowerCase()`)
@@ -11578,7 +11582,7 @@ has no function to hand out yet: reading it through the view stops by name
 the declarations' claim, as everywhere in S133: a wrong claim surfaces
 only where a crossing checks it.
 **Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
-(DD-01..04).
+(DD-01..06).
 
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
