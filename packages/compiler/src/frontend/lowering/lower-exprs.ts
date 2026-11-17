@@ -43,6 +43,7 @@ import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssert
 import { lowerYield } from "./lower-generators.js";
 import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
+import { dtsAwaitedResult } from "./lower-dts.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
  * class ACCESSOR property (reads become getter calls, writes setter calls;
@@ -2410,7 +2411,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           };
         }
       }
-      return { kind: "awaitExpr", value, type: value.type.inner, loc };
+      return dtsAwaitedResult(L, expr, { kind: "awaitExpr", value, type: value.type.inner, loc });
     }
     if (ts.isYieldExpression(expr)) return lowerYield(L, expr);
     if (ts.isPrefixUnaryExpression(expr)) return L.lowerPrefixUnary(expr);

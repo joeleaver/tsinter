@@ -31,7 +31,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isDtsMirrorPath, npmStaticDtsViews } from "../npm-static.js";
 import { npmPackageNameOf } from "../shared.js";
-import { isUnitType, JSVAL, typeEquals, type IrExpr, type IrType } from "../../ir/nodes.js";
+import { BOOL, isUnitType, JSVAL, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { classUnionExitHelper, classUnview, viewableClass } from "./class-views.js";
 
 /** Is the declared-surface view active in this compile at all? */
@@ -90,8 +90,34 @@ function crossInto(L: Lowerer, node: ts.Expression, out: IrExpr, declared: IrTyp
   // `Promise<any>`): it stays that promise — its settled value is the
   // dynamic value, which crosses where the program uses it.
   if (out.type.kind === "promise" && declared.kind === "promise" && (out.type.inner.kind === "jsval" || out.type.inner.kind === "dyn")) return out;
+  // A promise whose settled type the declarations narrow only by unit arms
+  // (@clack/prompts' `confirm(): Promise<boolean | symbol>` over an
+  // implementation inferred `Promise<boolean | symbol | undefined>`): the
+  // implementation's promise is handed over UNCHANGED (its identity, and
+  // the ticks it settles on, are Node's: a wrapper settling it again would
+  // run late beside other promise jobs). Only for a call the program
+  // AWAITS directly: the settled value crosses at that await
+  // (dtsAwaitedResult). Every other consumer (Promise.all/race entries, a
+  // .then callback, a stored promise) keeps the exactness fence below; a
+  // wider gap (an arm the declarations lack that is not a unit) too.
+  if (out.type.kind === "promise" && declared.kind === "promise") {
+    const armsOf = (t: IrType): IrType[] => (t.kind === "union" ? (L.unions.get(t.unionId)?.arms ?? []) : [t]);
+    const declaredArms = armsOf(declared.inner);
+    const onlyUnits = armsOf(out.type.inner).every((a) => isUnitType(a) || declaredArms.some((d) => typeEquals(d, a)));
+    let parent: ts.Node | undefined = node.parent;
+    while (parent !== undefined && ts.isParenthesizedExpression(parent)) parent = parent.parent;
+    if (onlyUnits && parent !== undefined && ts.isAwaitExpression(parent)) return out;
+  }
   const mismatch = (got: string): string =>
     `${pkg}'s declarations type ${what} as '${L.fmt(declared)}', but its implementation produced ${got} (SEMANTICS.md S133) [SC1090 at a declared npm crossing]`;
+  // A union the declarations narrow by arms (the settled value of a
+  // declared promise: `boolean | symbol | undefined` into `boolean |
+  // symbol`): the arms the declared union carries re-tag, an undefined
+  // rides (S119), and any other arm ends the program naming the claim.
+  if (out.type.kind === "union" && declared.kind === "union") {
+    const helper = narrowUnionHelper(L, out.type.unionId, declared.unionId, out.loc, mismatch);
+    if (helper !== null) return { kind: "call", callee: helper, args: [out], type: declared, loc: out.loc };
+  }
   if (out.type.kind === "union" && declared.kind !== "union") {
     const helper = L.narrowedArmHelper(out.type.unionId, declared, out.loc, mismatch);
     if (helper) return { kind: "call", callee: helper, args: [out], type: declared, loc: out.loc };
@@ -110,6 +136,68 @@ function crossInto(L: Lowerer, node: ts.Expression, out: IrExpr, declared: IrTyp
     }
   }
   return L.coerceInto(node, out, declared);
+}
+
+/** The interned checked narrowing of union `fromId` into union `toId` for a
+ * declared crossing: each source arm the target carries re-tags into it,
+ * an undefined rides (S119's slot undefined) when the target lacks it, and
+ * any other arm ends the program with `mismatch`. Null when no source arm
+ * fits the target (nothing to narrow to). */
+function narrowUnionHelper(L: Lowerer, fromId: string, toId: string, loc: SrcLoc, mismatch: (what: string) => string): string | null {
+  const from = L.unions.get(fromId)?.arms ?? [];
+  const to = L.unions.get(toId)?.arms ?? [];
+  if (!from.some((a) => to.some((b) => typeEquals(a, b)))) return null;
+  const key = `dtsU:${fromId}=>${toId}:${mismatch("%what%")}`;
+  const hit = L.jsinHelpers.get(key);
+  if (hit !== undefined) return hit;
+  const name = `%dtsU${L.jsinHelpers.size}`;
+  L.jsinHelpers.set(key, name);
+  const fromT: IrType = { kind: "union", unionId: fromId };
+  const toT: IrType = { kind: "union", unionId: toId };
+  const u: IrExpr = { kind: "varRef", localId: "u.0", type: fromT, loc };
+  const body: IrStmt[] = [];
+  from.forEach((arm, i) => {
+    const isTag: IrExpr = { kind: "unionIsTag", unionId: fromId, tag: i, negated: false, value: u, type: BOOL, loc };
+    let then: IrStmt[];
+    if (to.some((b) => typeEquals(b, arm))) {
+      const payload: IrExpr = isUnitType(arm) ? { kind: "unitLit", type: arm, loc } as IrExpr : { kind: "unionNarrow", unionId: fromId, tag: i, value: u, type: arm, loc };
+      then = [{ kind: "return", value: L.coerceToExpected(payload, toT), loc }];
+    } else if (L.undefSlots && arm.kind === "undefinedT") {
+      then = [{ kind: "return", value: { kind: "slotUndef", type: toT, loc }, loc }];
+    } else {
+      const what = isUnitType(arm) ? (arm.kind === "undefinedT" ? "undefined" : "null") : `a '${L.fmt(arm)}' value`;
+      then = [
+        { kind: "runtimeFence", code: "SC1090", message: mismatch(what), loc },
+        { kind: "return", value: { kind: "slotUndef", type: toT, loc }, loc },
+      ];
+    }
+    body.push({ kind: "if", cond: isTag, then, else_: null, loc });
+  });
+  body.push({ kind: "return", value: { kind: "slotUndef", type: toT, loc }, loc });
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "u.0", name: "u", type: fromT }],
+    returnType: toT,
+    locals: [{ id: "u.0", name: "u", type: fromT, mutable: false }],
+    body,
+    loc,
+  });
+  return name;
+}
+
+/** `await <declared call>` whose call handed over the implementation's
+ * promise (crossInto): the settled value crosses into the declared payload
+ * at the await, naming the package's claim when it does not fit. */
+export function dtsAwaitedResult(L: Lowerer, expr: ts.AwaitExpression, awaited: IrExpr): IrExpr {
+  if (!dtsViewsActive()) return awaited;
+  let operand: ts.Expression = expr.expression;
+  while (ts.isParenthesizedExpression(operand)) operand = operand.expression;
+  if (!ts.isCallExpression(operand)) return awaited;
+  const decl = declaredSignatureDecl(L, operand);
+  if (decl === undefined) return awaited;
+  const declared = L.mapTypeOf(L.typeOf(expr));
+  if (declared === null || typeEquals(declared, awaited.type)) return awaited;
+  return crossInto(L, expr, awaited, declared, packageOf(decl), `the settled value of ${siteText(operand)}`);
 }
 
 /** A call (or `new`) the checker resolved against a mirrored declaration:
