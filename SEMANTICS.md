@@ -1581,23 +1581,68 @@ dynamic value (an `any`-typed literal, a literal passed straight into an
 `any` parameter, a JavaScript source's literal handed on), and where a
 JavaScript source reads `o.h.name` / `o["q-r"].name` of a literal member
 it can resolve, the box now carries that name, so `f.name`, `[Function: m]`
-under util.inspect and the error texts answer as Node's. Not covered, and
-still answering this entry's empty name (`[Function (anonymous)]`): every
-member of a literal that has a COMPUTED key (`{ m() {}, [k]: () => 7 }`)
-and the computed member itself, and a member of a NESTED literal read
-through its parent (`{ inner: { deep() {} } }`, then `o.inner.deep.name`
-reads `""`). A JavaScript `o.h.name` answers the member's definition even
+under util.inspect and the error texts answer as Node's. *(GH #246: the
+same names now reach every literal built as a dynamic value, nested ones
+too — a JavaScript literal of function expressions and arrows only, a
+`const` holding one, async function expressions, `{ inner: { deep() {} }
+}` read as `o.inner.deep.name` — because a function boxed right where it
+is created carries its definition's name: its own, else the key, the
+variable it initializes or the identifier it is assigned to; so does a
+read of a `let`/`var` every FUNCTION written to which is an anonymous
+function or arrow assigned straight to it (its initializer or `x = …`;
+writes of numbers, strings and other non-functions do not matter), a
+`const` alias chain to such a binding or to a function definition, and an
+assignment's value (`const r = (q = () => 1)` answers `q`). A JavaScript
+literal's member names nothing from a binding's mere spelling: `{ f: cond
+}` with `const cond = c ? () => 1 : () => 2`, `{ f: got }` with `const got
+= make()` answer `""` as Node does, and so does a binding written by
+ARRAY destructuring (`let e; [e] = [() => 1]`, `const [c] = [() => 2]`:
+an array element's function has no name); one written by OBJECT
+destructuring (`let k; ({ k } = { k: () => 3 })`) answers `""` too, where
+Node answers the source member's name (`k`). A read (or a `const` alias) of a
+`let`/`var` that is also written a NAMED function expression, another
+function value (`x = handler`, a call's result) or a value of unknown
+type, or written by destructuring or `for…of`, may answer `""` where Node
+has a name: `let x; x = () => 1; const first = x; x = function other()
+{}` answers `""` for `first` where Node answers `x` (the lowering does not
+follow which write a read sees). `length` and `String(f)` already answered
+Node's there. A TypeScript literal built as the island literal keeps this
+entry's binding spelling for a reference to a binding that is not itself
+a function's definition (`{ f: cond }` answers `cond` where Node answers
+`""`, `{ f: got }` answers `got`, `{ f: alias }` with `const alias =
+realName` answers `alias` where Node answers `realName`, `{ f: y1 }` with
+`const y1 = y` over such a `let` answers `y1` where Node answers `y`, and
+the `let` above answers `first`, `let e: () => number; [e] = [() => 1]`
+answers `e` where Node answers `""`), and so does a direct `.name` read of a
+`const` alias in either language (`y1.name` answers `y1`).)* Not covered, and still answering this entry's empty name
+(`[Function (anonymous)]`): a member under a COMPUTED key the lowering
+does not fold to one string (`{ [k]: () => 7 }` with `k` a `const "zz"`
+is named `zz`, as in Node; with a key known only at run time the member
+answers `""` where Node answers the key's string, though many such
+literals refuse by name or stop where they are read instead). A JavaScript `o.h.name` answers the member's definition even
 after `o.h = function other() {}` reassigned it, where Node answers
 `other` — this entry's alias case. A STATIC record value that crosses later as
-a whole (`const r = { run() {} }; take(r)`) names each function member by
-its field's key: exact for a method or an anonymous function defined
-there, but a named function expression or a function stored from elsewhere
-(`{ h: function named() {} }`, `{ cb: handler }`) answers the key where
-Node answers `named` / `handler` — the alias case above. Tuple and array
-elements stay anonymous, as in Node. **Tested by:**
+a whole (`const r = { run() {} }; take(r)`, also nested in a fresh literal,
+`take({ v: r })`, and a spread copy of one, `take({ v: { ...r } })`)
+names each function member by its field's key: exact for
+a method or an anonymous function defined there, but a named function
+expression or a function stored from elsewhere (`{ h: function named() {}
+}`, `{ cb: handler }`) answers the key where Node answers `named` /
+`handler` — the alias case above. A static record is one in TypeScript, or
+a JavaScript literal holding a method beside such a member (`const r = {
+h: function hh() {}, m() {} }`); one view serves every record of the
+shape, and a compiled function value carries no name of its own, so a
+per-value answer would need a name slot in every closure — not taken.
+Tuple and array elements stay anonymous, as in Node. **Tested by:**
 `packages/compiler/test/wasm-gh140-method-names.test.ts` (both lanes,
 against Node; the record-alias row pins this tier's answer with Node's
-beside it).
+beside it) and `packages/compiler/test/wasm-silent-dyn.test.ts` SD-07 to
+SD-14t (GH #246; SD-11, SD-11b and SD-11c pin the nested static record
+and its spread copies, SD-13b a
+`let` also written a named function expression, SD-14o an object
+destructuring write, SD-13bt, SD-13t and
+SD-12b, SD-14t the TypeScript binding spelling, SD-13d a direct `.name`
+read).
 
 **Amendment (GH #156, wasm lanes):** the inspect header names the
 function's KIND, as Node's does — `[AsyncFunction: f]`,

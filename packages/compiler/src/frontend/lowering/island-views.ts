@@ -714,7 +714,12 @@ export function viewOf(L: Lowerer, e: IrExpr, loc: SrcLoc, frozen = false): IrEx
       const args: IrExpr[] = [];
       for (const f of e.fields) {
         if (isUndef(f.value)) continue;
-        args.push({ kind: "jsMarshal", value: str(f.name, loc), type: JSVAL, loc }, L.jsvalLiftExpr(f.value, loc));
+        // GH #246: a member a spread copied out of a static record
+        // (`{ ...rec }`) is named as that record's view names it: by its
+        // key (S020's GH #140 amendment — exact for a method or an
+        // anonymous function defined there).
+        const spreadMember = f.value.kind === "recordGet" && (f.value as { spreadCopy?: boolean }).spreadCopy === true;
+        args.push({ kind: "jsMarshal", value: str(f.name, loc), type: JSVAL, loc }, spreadMember ? liftField(L, f.value, f.name, loc) : L.jsvalLiftExpr(f.value, loc));
       }
       return { kind: "jsOp", op: "objLit", args, type: JSVAL, loc };
     }
