@@ -10774,6 +10774,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // equality compares identity like any reference kind
       if (left.type.kind === "symbol") left = { kind: "dynFrom", value: left, type: DYN, loc: left.loc } as IrExpr;
       if (right.type.kind === "symbol") right = { kind: "dynFrom", value: right, type: DYN, loc: right.loc } as IrExpr;
+      // a process stream beside a dynamic value (`o === process.stdout`):
+      // its HANDLE box, whose tag is its identity
+      if (left.type.kind === "procStream") left = { kind: "dynFrom", value: left, type: DYN, loc: left.loc } as IrExpr;
+      if (right.type.kind === "procStream") right = { kind: "dynFrom", value: right, type: DYN, loc: right.loc } as IrExpr;
     }
     if (left.type.kind === "dyn" || right.type.kind === "dyn") {
       // The narrowing unit comparisons ARE answerable on unknown: `v ===

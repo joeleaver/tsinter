@@ -1788,8 +1788,8 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // TypeError, the compile-time spelling when the source has one),
       // then positions bind the pack's index keys as dyn values — reads
       // past the end bind undefined, exactly JS. Defaults fire on the checked-dynamic tree
-      // undefined (JS's rule); rest elements keep the fence (surplus
-      // packing over the checked-dynamic tree needs a slice the IR does not spell yet).
+      // undefined (JS's rule); a rest element binds the pack's tail (its
+      // slice, a fresh array).
       if (srcType.kind === "dyn") {
         const loc = locOf(pattern);
         const pack = L.declareHiddenLocal("%dpack", DYN);
@@ -1809,7 +1809,20 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           if (ts.isOmittedExpression(el) || el.name === undefined) return; // hole: the position skips
           const elLoc = locOf(el);
           if (el.dotDotDotToken) {
-            L.unsupported("SC1031", el, "rest elements over checked-dynamic sources");
+            // `const [i, ...y] = g` (clack's log.message): the pack is the
+            // fresh array the iteration built, so the rest is its tail —
+            // Array.prototype.slice over it, a new array as in Node.
+            if (el.initializer) L.unsupported("SC1031", el, "defaults on rest elements"); // tsc rejects; defensive
+            L.bindPatternTarget(el.name, {
+              kind: "dynInvoke",
+              recv: { kind: "varRef", localId: pack.id, type: DYN, loc: elLoc },
+              method: "slice",
+              calleeName: "slice",
+              args: [{ kind: "dynFrom", value: { kind: "numLit", value: i, type: F64, loc: elLoc }, type: DYN, loc: elLoc }],
+              type: DYN,
+              loc: elLoc,
+            }, isLet, out);
+            return;
           }
           let value: IrExpr = {
             kind: "dynKeyGet",

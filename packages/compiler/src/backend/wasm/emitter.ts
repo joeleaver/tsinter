@@ -185,6 +185,7 @@ import {
   OBJ_PROTO_WEAKMAP,
   OBJ_PROTO_WEAKSET,
   BUILTIN_OBJ_PROTO,
+  type DynHandleDeps,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
@@ -1186,7 +1187,10 @@ function hostNumReachable(mod: WModule): boolean {
         node.startsWith("writable.") ||
         node.startsWith("duplex.") ||
         node.startsWith("transform.") ||
-        node.startsWith("passthrough.")
+        node.startsWith("passthrough.") ||
+        // A process stream held as a value: a dynamic one answers isTTY
+        // and columns through hostNum (procStreamReachable).
+        node === "procStream"
       ) {
         found = true;
       }
@@ -1205,6 +1209,39 @@ function hostNumReachable(mod: WModule): boolean {
   }
   return found;
 }
+
+/** Does any reachable function hold a process output stream as a value
+ * (the procStream type or its write)? Such a module boxes the streams as
+ * dynamic HANDLEs (PS_TAG_STDOUT / PS_TAG_STDERR) when they cross into a
+ * dynamic value, so its HANDLE surface carries the process-stream arms. */
+function procStreamReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "procStream" || node === "procStream.write") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn);
+  }
+  for (const g of mod.globals ?? []) scan(g);
+  return found;
+}
+
+/** The dynamic HANDLE tags of the process output streams: fd + 10, past
+ * the net (1, 2), http (3..6) and fetch (7..10) families. */
+const PS_TAG_STDOUT = 11;
+const PS_TAG_STDERR = 12;
 
 /** Does any reachable function reach `process.emitWarning` specifically?
  * INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1) — a DEDICATED,
@@ -3235,6 +3272,9 @@ class Assembler {
   /** INC-29 U1: the module reaches node:net's host I/O (netModuleReachable):
    * an event module whose poll phase reads the net kinds (net.ts). */
   private readonly netModule: boolean;
+  /** The module holds a process output stream as a value (procStream):
+   * the dynamic HANDLE surface carries the process-stream arms. */
+  private readonly procStreamModule: boolean;
   /** The module carries a bigint (moduleUsesBigint): the dynamic world
    * gets its BIGINT kind's arms. */
   private readonly bigModule: boolean;
@@ -3643,6 +3683,7 @@ class Assembler {
     // event modules only, minted LAST so no earlier import index moves.
     this.cpEventModule = eventModuleReachable(mod);
     this.netModule = netMod;
+    this.procStreamModule = procStreamReachable(mod);
     this.bigModule = moduleUsesBigint(asIrModule(mod));
     this.symModule = moduleUsesSymbol(asIrModule(mod));
     this.reservedKeysLive = this.symModule || irHasReservedKeyLit(mod);
@@ -6893,7 +6934,7 @@ class Assembler {
     // HANDLE and JSVAL are unconstructible on this tier (dyn.ts header).
     // INC-29 U1: a node:net handle does not clone (Node's DataCloneError
     // names it; this tier fences it, loudly).
-    if (this.netModule || this.fetchModule) {
+    if (this.netModule || this.fetchModule || this.procStreamModule) {
       kindIn([DK.HANDLE]);
       c.ifVoid();
       this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, `structuredClone of a ${this.dyn.handleNoun()} is not supported yet`), null);
@@ -12397,7 +12438,9 @@ class Assembler {
           }
         : {}),
       // INC-29 U1: a net module boxes its Sockets and Servers as HANDLEs.
-      ...(this.netModule
+      // A module holding process.stdout/stderr as values boxes those as
+      // HANDLEs too (PS_TAG_*), composed in front of the family's surface.
+      ...this.composeProcStreamHandle(this.netModule
         ? {
             handle: this.httpModule
               ? {
@@ -15346,6 +15389,261 @@ class Assembler {
       );
     });
     this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /* ── process output streams as dynamic values ─────────────────────────
+   * process.stdout / process.stderr crossing into a dynamic value box as a
+   * HANDLE tagged PS_TAG_STDOUT / PS_TAG_STDERR (fd + 10), no payload. The
+   * surface is what @clack/prompts reads off its `output` option: write(one
+   * string), isTTY and columns (absent off a terminal, as Node's piped
+   * streams have neither), fd, and `in` over those. Everything else stops
+   * by name. The functions here run FIRST on any HANDLE of a module that
+   * holds a process stream as a value, delegating every other tag to the
+   * module's own handle family (net/http/fetch), when it has one. */
+
+  /** The DynDeps handle entry with the process-stream arms in front of
+   * the module's own family (or alone), in a module that holds a process
+   * stream as a value; otherwise the family's entry unchanged. */
+  private composeProcStreamHandle(family: { handle?: DynHandleDeps; bytesMethods?: { bufType: () => number } }): { handle?: DynHandleDeps; bytesMethods?: { bufType: () => number } } {
+    if (!this.procStreamModule) return family;
+    const fam = family.handle;
+    const famKeySet = fam?.keySet;
+    return {
+      ...family,
+      handle: {
+        keyGet: () => this.psKeyGetFn(fam ? fam.keyGet : null),
+        invoke: (m: string) => this.psInvokeFn(m, fam ? fam.invoke : null),
+        ...(famKeySet !== undefined ? { keySet: famKeySet } : {}),
+        classNames: [...(fam?.classNames ?? []), [PS_TAG_STDOUT, "WriteStream"], [PS_TAG_STDERR, "WriteStream"]],
+        noun: fam?.noun ?? (fam ? "net handle" : "process stream"),
+        ...(fam?.toStringTags === true ? { toStringTags: true } : {}),
+      },
+    };
+  }
+
+  /** Pushes i32: is local `d`'s HANDLE one of the process streams? */
+  private psIsStream(c: Code, d: number): void {
+    c.localGet(d);
+    c.structGet(this.dyn.dynT(), DYN_NUM);
+    c.f64Const(PS_TAG_STDOUT);
+    c.f64Ge();
+    c.localGet(d);
+    c.structGet(this.dyn.dynT(), DYN_NUM);
+    c.f64Const(PS_TAG_STDERR);
+    c.f64Le();
+    c.i32And();
+  }
+
+  /** Pushes i32: the fd of local `d`'s process-stream HANDLE. */
+  private psFd(c: Code, d: number): void {
+    c.localGet(d);
+    c.structGet(this.dyn.dynT(), DYN_NUM);
+    c.f64Const(PS_TAG_STDOUT - 1);
+    c.f64Sub();
+    c.i32TruncF64S();
+  }
+
+  private psFence(c: Code, what: (c: Code) => void): void {
+    this.emitFenceFatal(c, (c2) => {
+      what(c2);
+    }, null);
+  }
+
+  private psKeyGetField: number | null = null;
+
+  /** `(d, key) -> dyn` over the module's HANDLEs: the process streams'
+   * members, else the family's keyGet (`delegate`), else a fence. */
+  private psKeyGetFn(delegate: (() => number) | null): number {
+    if (this.psKeyGetField !== null) return this.psKeyGetField;
+    const dynRefT = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT, this.strRef], [dynRefT]), "%w.ps.handleKeyGet");
+    this.psKeyGetField = idx;
+    const c = new Code();
+    const D = 0;
+    const KEY = 1;
+    const V = 2;
+    const dynT = this.dyn.dynT();
+    const is = (key: string): void => {
+      c.localGet(KEY);
+      this.pushStrLitInto(c, key);
+      c.call(this.strEqHelper());
+    };
+    this.psIsStream(c, D);
+    c.ifVoid();
+    // isTTY: true on a terminal; Node's non-TTY stream has no isTTY
+    // property at all (undefined).
+    is("isTTY");
+    c.ifVoid();
+    c.i32Const(HOST_NUM_KIND_IS_TTY);
+    this.psFd(c, D);
+    c.call(this.hostNumFuncOrThrow());
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifResult(dynRefT);
+    this.dyn.boxBool(c, (x) => x.i32Const(1));
+    c.else_();
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.end();
+    c.return_();
+    c.end();
+    // columns: the terminal's width; absent off a terminal (the host's -1).
+    is("columns");
+    c.ifVoid();
+    c.i32Const(HOST_NUM_KIND_COLUMNS);
+    this.psFd(c, D);
+    c.call(this.hostNumFuncOrThrow());
+    c.localTee(V);
+    c.f64Const(-1);
+    c.f64Eq();
+    c.ifResult(dynRefT);
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.else_();
+    this.dyn.boxNum(c, (x) => x.localGet(V));
+    c.end();
+    c.return_();
+    c.end();
+    is("fd");
+    c.ifVoid();
+    this.dyn.boxNum(c, (x) => {
+      this.psFd(x, D);
+      x.f64ConvertI32S();
+    });
+    c.return_();
+    c.end();
+    this.psFence(c, (x) => {
+      this.pushStrLitInto(x, "reading the property '");
+      x.localGet(KEY);
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, "' of a process stream is not supported yet");
+      x.call(this.concatHelper());
+    });
+    c.refNull(dynT);
+    c.return_();
+    c.end();
+    if (delegate !== null) {
+      c.localGet(D);
+      c.localGet(KEY);
+      c.call(delegate());
+    } else {
+      c.unreachable();
+    }
+    this.mb.setBody(idx, [F64], c.bytes());
+    return idx;
+  }
+
+  private psInField: number | null = null;
+
+  /** `(d, key) -> i32` — `key in d` over a process-stream HANDLE: isTTY
+   * and columns are own properties exactly on a terminal (Node's piped
+   * streams have neither), fd and write always answer; any other key
+   * stops by name. The caller has established the stream tag. */
+  private psInFn(): number {
+    if (this.psInField !== null) return this.psInField;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef(), this.strRef], [I32]), "%w.ps.handleIn");
+    this.psInField = idx;
+    const c = new Code();
+    const D = 0;
+    const KEY = 1;
+    const is = (key: string): void => {
+      c.localGet(KEY);
+      this.pushStrLitInto(c, key);
+      c.call(this.strEqHelper());
+    };
+    is("isTTY");
+    is("columns");
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(HOST_NUM_KIND_IS_TTY);
+    this.psFd(c, D);
+    c.call(this.hostNumFuncOrThrow());
+    c.f64Const(0);
+    c.f64Ne();
+    c.return_();
+    c.end();
+    is("fd");
+    is("write");
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(1);
+    c.return_();
+    c.end();
+    this.psFence(c, (x) => {
+      this.pushStrLitInto(x, "'in' with the key '");
+      x.localGet(KEY);
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, "' on a process stream is not supported yet");
+      x.call(this.concatHelper());
+    });
+    c.i32Const(0);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private readonly psInvokeFns = new Map<string, number>();
+
+  /** `(d, args, what) -> dyn` for `d.<method>(...args)` over the module's
+   * HANDLEs: on a process stream, write(one string) writes it to the fd
+   * and answers Node's `true` (this runtime never applies backpressure);
+   * any other method or argument shape stops by name. Other tags go to
+   * the family's invoke (`delegate`), or its fence. */
+  private psInvokeFn(method: string, delegate: ((m: string) => number | null) | null): number {
+    const hit = this.psInvokeFns.get(method);
+    if (hit !== undefined) return hit;
+    const dynRefT = this.dyn.dynRef();
+    const arrRefT = this.dyn.arrRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT, arrRefT, this.strRef], [dynRefT]), `%w.ps.handleInvoke:${method}`);
+    this.psInvokeFns.set(method, idx);
+    const c = new Code();
+    const D = 0;
+    const ARGS = 1;
+    const A0 = 3;
+    const dynT = this.dyn.dynT();
+    this.psIsStream(c, D);
+    c.ifVoid();
+    if (method === "write") {
+      // exactly one argument, a string
+      this.dyn.arrLen(c, (x) => x.localGet(ARGS));
+      c.i32Const(1);
+      c.i32Eq();
+      c.ifVoid();
+      this.dyn.arrAt(c, (x) => x.localGet(ARGS), (x) => x.i32Const(0));
+      c.localTee(A0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A0);
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.strType);
+      const helpers = this.ensureHelpers();
+      c.call(helpers.stage);
+      this.psFd(c, D);
+      c.call(helpers.flush);
+      this.dyn.boxBool(c, (x) => x.i32Const(1));
+      c.return_();
+      c.end();
+      c.end();
+      this.psFence(c, (x) => this.pushStrLitInto(x, "write() on a process stream with other than one string argument is not supported yet"));
+    } else {
+      this.psFence(c, (x) => this.pushStrLitInto(x, `'${method}' on a process stream is not supported yet`));
+    }
+    c.refNull(dynT);
+    c.return_();
+    c.end();
+    const fam = delegate === null ? null : delegate(method);
+    if (fam !== null) {
+      c.localGet(D);
+      c.localGet(ARGS);
+      c.localGet(2);
+      c.call(fam);
+    } else if (delegate !== null) {
+      this.emitFenceFatal(c, (x) => this.pushStrLitInto(x, `'${method}' on a ${this.dyn.handleNoun()} is not supported yet`), null);
+      c.refNull(dynT);
+    } else {
+      c.unreachable();
+    }
+    this.mb.setBody(idx, [dynRefT], c.bytes());
     return idx;
   }
 
@@ -19224,6 +19522,20 @@ class Assembler {
         c.localGet(0);
         c.structNew(dyn.dynT());
         return true;
+      // A process output stream boxes as a HANDLE whose tag names it
+      // (PS_TAG_STDOUT / PS_TAG_STDERR: fd + 10); no payload.
+      case "procStream":
+        if (!this.procStreamModule) {
+          this.refuse(`dynFrom:${t.kind}`, loc);
+          return false;
+        }
+        c.i32Const(DK.HANDLE);
+        c.localGet(0);
+        c.f64Const(PS_TAG_STDOUT - 1);
+        c.f64Add();
+        c.refNull(EQ_HEAP);
+        c.structNew(dyn.dynT());
+        return true;
       // INC-29 U2: IncomingMessage (3), ServerResponse (4), ClientRequest
       // (5) box by reference too (the Agent, 6, is born a handle).
       case "httpReq":
@@ -22130,6 +22442,9 @@ class Assembler {
     switch (t.kind) {
       case "f64":
         return F64;
+      // A process output stream as a value: its fd, a scalar (nodes.ts).
+      case "procStream":
+        return F64;
       case "bool":
         return I32;
       case "string":
@@ -22356,6 +22671,9 @@ class Assembler {
   private mapTypeSoft(t: WType): ValType {
     switch (t.kind) {
       case "f64":
+        return F64;
+      // mapType's procStream arm, in lockstep.
+      case "procStream":
         return F64;
       case "bool":
         // I32 out of this whole switch means EITHER this arm (a genuine
@@ -28288,6 +28606,19 @@ class Assembler {
           this.releaseScratch(this.strRef, tmp);
           return;
         }
+        if (e.fn === "procStream.write") {
+          // The stream value IS its fd: stage the text, flush to that fd
+          // (the process.stdoutWrite/stderrWrite path), Node's constant
+          // `true` for this synchronous runtime.
+          this.walkExpr(e.args[1]!);
+          const helpers = this.ensureHelpers();
+          code.call(helpers.stage);
+          this.walkExpr(e.args[0]!);
+          code.i32TruncF64S();
+          code.call(helpers.flush);
+          code.i32Const(1);
+          return;
+        }
         if (e.fn === "process.stdoutWrite" || e.fn === "process.stderrWrite") {
           const fd = e.fn === "process.stdoutWrite" ? FD_STDOUT : FD_STDERR;
           this.walkExpr(e.args[0]!);
@@ -31743,7 +32074,8 @@ class Assembler {
           case "netServer":
           case "httpReq":
           case "httpRes":
-          case "httpClientReq": {
+          case "httpClientReq":
+          case "procStream": {
             // The composite conversion is a per-typeKey WALKER (the C
             // emitter's sc_td_N): a deep copy for the structured kinds, a
             // reference box for a promise, the `%error` encoding for an
@@ -31987,7 +32319,24 @@ class Assembler {
           this.emitUnwind();
           this.close();
         }
-        const handleIn = (this.netModule || this.fetchModule) && this.dyn.handleLive();
+        const handleIn = (this.netModule || this.fetchModule || this.procStreamModule) && this.dyn.handleLive();
+        // `"columns" in process.stdout` (clack's getColumns): a process
+        // stream answers its own members (psInFn); every other value takes
+        // the arms below.
+        const psIn = handleIn && this.procStreamModule;
+        if (psIn) {
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.HANDLE);
+          code.i32Eq();
+          this.psIsStream(code, d);
+          code.i32And();
+          this.openIfResult(I32);
+          code.localGet(d);
+          this.pushStrLit(e.key);
+          code.call(this.psInFn());
+          code.else_();
+        }
         if (handleIn) {
           code.localGet(d);
           code.structGet(this.dyn.dynT(), DYN_KIND);
@@ -32131,6 +32480,7 @@ class Assembler {
           this.close();
         }
         this.close();
+        if (psIn) this.close();
         if (typedK >= 0) {
           this.close();
           this.releaseScratch(I32, typedK);

@@ -12168,3 +12168,40 @@ is Node's. **Rationale:** the builtin error encoding has no slot for an
 arbitrary extra property; no workload reads it. **Tested by:**
 `packages/compiler/test/wasm-emitter-dynamic.test.ts` (EDYN-07 pins the
 code, name and messages; `context` itself is unpinned, by construction).
+
+## S150 — A process output stream held in a dynamic value answers only the members @clack/prompts reads; the rest stop by name *(wasm and wasm-native)*
+
+`process.stdout` / `process.stderr` can be held as values only through a
+dynamic value. That covers an `any`-typed binding in JavaScript
+(`const i = t?.output ?? process.stdout`, a defaulted `output = process.stdout`
+parameter or destructured option, a stream passed to an untyped function).
+Such a value is a handle that names its stream, and it answers what Node
+answers for:
+- `write(s)` with exactly one string: the text goes to the fd, and the call
+  answers `true`. Node also answers `true` for these streams on Linux, which
+  write pipes, files and terminals synchronously.
+- `isTTY` and `columns`: `true` and the terminal's width on a terminal. Off
+  one they are absent (`undefined`, and `in` answers `false`), as on Node's
+  piped streams.
+- `fd`, `"write" in s`, `typeof` (`'object'`), truthiness, `String(s)`
+  (`[object Object]`), and strict equality, which compares identity.
+
+Everything else stops the program by name where it runs, where Node would
+proceed:
+- any other member read, method or `in` key;
+- `write` with a callback, an encoding or bytes;
+- `Object.keys`/assign/spread/`structuredClone` of the stream.
+
+Loose equality and a static `process.stdout === process.stderr` keep their
+existing named stops. So do spellings that bind the stream directly to
+its declared type, where Node simply writes:
+- in JavaScript, `const out = process.stdout; out.write(s)` stops at the
+  `write`. The binding is typed `WriteStream & { fd: 1 }`, whose members
+  have no lowering.
+- in TypeScript, a binding of that type refuses at build time (SC2008).
+
+A stream exported from one module and used in another is not covered. **Rationale:** these are the surfaces paperclip's
+@clack/prompts output path uses (intro/note/log/outro/cancel, getColumns);
+a member the build does not model would otherwise answer wrong.
+**Tested by:** `packages/compiler/test/wasm-proc-streams.test.ts` (PS-01,
+PS-02, PS-04 on both lanes vs Node; PS-R1..R7 the stops and refusals).

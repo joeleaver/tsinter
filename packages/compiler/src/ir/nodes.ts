@@ -6405,6 +6405,9 @@ export function canConvertToDyn(
   if (t.kind === "object" && t.className === "%Error") return true;
   if (t.kind === "func") return canBoxFuncIntoDyn(t, getRecord, getUnion);
   if (DYN_HANDLE_KINDS.has(t.kind)) return true;
+  // process.stdout/stderr box as a dynamic HANDLE named by its fd (the
+  // WasmGC lanes; backend/wasm emitter.ts PS_TAG_*).
+  if (t.kind === "procStream") return true;
   // Promises box by REFERENCE (SCR_DYN_PROMISE): promise<dyn> carries its
   // ScrPromise directly (the payload is already a dyn value), any other
   // convertible-or-void inner boxes an ADAPTER promise whose emitted
@@ -6428,7 +6431,7 @@ export function canConvertToDyn(
     // union's func arm crosses through the checked-dynamic function
     // boundary exactly like a bare func dynFrom).
     return !!def && def.arms.every((a) =>
-      a.kind === "undefinedT" || isJsonSafeType(a, getRecord, getUnion) ||
+      a.kind === "undefinedT" || isJsonSafeType(a, getRecord, getUnion) || a.kind === "procStream" ||
       (a.kind === "func" && canBoxFuncIntoDyn(a, getRecord, getUnion)),
     );
   }

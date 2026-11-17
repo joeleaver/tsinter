@@ -5389,13 +5389,20 @@ export class DynBuilder {
       // this tier, so neither may borrow the box-identity answer below —
       // that would be a wrong answer rather than a loud one.
       if (this.deps.handle !== undefined) {
-        // INC-29 U1: a handle is its payload (C's tag + pointer compare).
+        // INC-29 U1: a handle is its payload (C's tag + pointer compare);
+        // the process streams carry no pointer, so the tag decides them.
         this.arm(c, K, [DK.HANDLE], () => {
           c.localGet(0);
           c.structGet(dynT, DYN_REF);
           c.localGet(1);
           c.structGet(dynT, DYN_REF);
           c.refEq();
+          c.localGet(0);
+          c.structGet(dynT, DYN_NUM);
+          c.localGet(1);
+          c.structGet(dynT, DYN_NUM);
+          c.f64Eq();
+          c.i32And();
         });
         this.arm(c, K, [DK.JSVAL], () => this.unmodeledKindFence(c, [DK.JSVAL]));
       } else {
@@ -5801,6 +5808,12 @@ export class DynBuilder {
         c.localGet(B);
         c.structGet(dynT, DYN_REF);
         c.refEq();
+        c.localGet(A);
+        c.structGet(dynT, DYN_NUM);
+        c.localGet(B);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Eq();
+        c.i32And();
         c.ifVoid();
         c.i32Const(1);
         c.return_();
@@ -6433,7 +6446,8 @@ export class DynBuilder {
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "[object Promise]"));
       // The runtime handles inherit Object.prototype.toString.
       this.arm(c, K, [DK.HANDLE], () => {
-        const tags = this.deps.handle?.toStringTags === true ? this.deps.handle.classNames ?? [] : [];
+        // (The process streams, tags 11 and 12, have no toStringTag.)
+        const tags = this.deps.handle?.toStringTags === true ? (this.deps.handle.classNames ?? []).filter(([t]) => t < 11) : [];
         // #227: a fetch value's toStringTag, by tag.
         for (const [tag, name] of tags) {
           c.localGet(0);
