@@ -14,6 +14,7 @@ import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, 
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
+import { INSTANTIATION_WRITES } from "./module-tdz.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
@@ -2214,7 +2215,12 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
     for (const gs of L.varGlobalEntryInits.values()) {
       for (const g of gs) {
         const wrapped = g.type.kind === "dyn" ? dynUndefinedExpr(loc) : L.unassignedSlotInit(g.type, loc);
-        if (wrapped) varInits.push({ kind: "assign", localId: g.id, value: wrapped, loc });
+        if (wrapped) {
+          const init: IrStmt = { kind: "assign", localId: g.id, value: wrapped, loc };
+          // GH #256: not a source write — the TDZ pass leaves it unguarded
+          INSTANTIATION_WRITES.add(init);
+          varInits.push(init);
+        }
       }
     }
     const body: IrStmt[] =

@@ -1180,6 +1180,15 @@ function analyzeFile(
  * enclosing unit the analysis could not prove late enough. Rewrites the
  * lowered functions in place (shared subtrees are visited once; the
  * wrappers this pass creates are never re-entered). */
+/** GH #256: stores the program makes at INSTANTIATION, before any module
+ * evaluates — the entry's module-`var` hoisting, which also gives a
+ * checked-dynamic `let` slot its dyn undefined (buildMain). They are not
+ * source accesses, so the TDZ pass never guards them: a guard there threw
+ * the binding's ReferenceError at program start, outside every try (its
+ * synthesized loc, the file's first position, can fall inside a function
+ * unit that starts there). */
+export const INSTANTIATION_WRITES = new WeakSet<object>();
+
 export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], globals: IrGlobal[]): void {
   if (tdz.bySymbol.size === 0) return;
   for (const fn of functions) {
@@ -1219,6 +1228,7 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
         return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!, tdz.nameAt(b, loc!))], result: node, type: node["type"], loc });
       }
       if (kind === "assign" || kind === "assignExpr") {
+        if (INSTANTIATION_WRITES.has(node)) return node;
         const b = guarded(node["localId"] as string, loc);
         if (b === null) return node;
         if (b.fence !== null) {
