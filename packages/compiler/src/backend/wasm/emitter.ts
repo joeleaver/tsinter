@@ -2329,7 +2329,9 @@ function recordOrderSlot(shape: IrRecordShape): number | null {
   // out of declared-then-added order (a literal, a capture, a late field).
   // Its slots come past the fields and the overflow.
   if (shape.indexValue !== undefined) return shape.fields.some((f) => f.internal !== true) ? shape.fields.length + 1 : null;
-  if (!shape.fields.some((f) => f.optional === true && f.internal !== true)) return null;
+  // GH #235: a literal-key mapped shape (`Record<"a" | "b", V>`) — a
+  // literal may spell its keys in any order.
+  if (shape.literalKeys !== true && !shape.fields.some((f) => f.optional === true && f.internal !== true)) return null;
   return shape.fields.length; // the order vector; the high-water mark at +1
 }
 
