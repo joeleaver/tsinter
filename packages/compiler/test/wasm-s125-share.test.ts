@@ -52,6 +52,18 @@ const ZDEP = `export function refine(fn, input) {
   input.push("late");
   return ok;
 }`;
+/** fb73ae21 review: a width copy widened into an `object`-typed slot (a
+ * Set<object> element, a WeakMap<object, …> key, an `object` variable
+ * compared by identity) — one object, as in Node. */
+const IT = `export type A = { enabled?: boolean; n?: number };
+export type W = A & { max?: number };`;
+const IM = (body: string, imp: string): string => `${imp}
+import type { A } from "./types.ts";
+const o: A = { enabled: false, n: 1 };
+${body}
+console.log(o, JSON.stringify(o));`;
+const IW = (code: string) => ({ "types.ts": IT, "w.ts": `import type { A, W } from "./types.ts";\n${code}` });
+const IH = `type A = { enabled?: boolean; n?: number };\ntype W = A & { max?: number };\n`;
 
 defineRows("S125 share-vs-copy", [
   {
@@ -487,4 +499,44 @@ const ids = ["x", "y", "x"];
 console.log(refine((v: string[]) => [...new Set(v)].length === 2, ids), ids);
 console.log(refine((v: string[]) => { const s = new Set(v); v.push("w"); return s.size === v.length; }, ["p"]));`,
   },
+  {
+    id: "S125-M-01 (paperclip's telemetry, two modules) a record handed to another module's function, which widens it into an intersection parameter of a third: no escape through the tagged module's call",
+    entry: "main.ts",
+    files: {
+      "config.ts": `export type Overrides = { maxEvents?: number; backoff?: { base: number } };
+export function resolveCaps(o?: Overrides): { maxEvents: number; base: number } {
+  return { maxEvents: o?.maxEvents ?? 50, base: o?.backoff?.base ?? 1000 };
+}
+export function resolveConfig(fileConfig?: { enabled?: boolean } & Overrides): { enabled: boolean; maxEvents: number; base: number } {
+  const caps = resolveCaps(fileConfig);
+  if (fileConfig?.enabled === false) return { enabled: false, ...caps };
+  return { enabled: true, ...caps };
+}`,
+      "telemetry.ts": `import { resolveConfig } from "./config.ts";
+export function initTelemetry(fileConfig?: { enabled?: boolean }): string {
+  const config = resolveConfig(fileConfig);
+  return config.enabled ? "on " + config.maxEvents : "off";
+}`,
+    },
+    src: `import { initTelemetry } from "./telemetry.ts";
+const fc: { enabled?: boolean } = { enabled: false };
+console.log(initTelemetry(fc), initTelemetry(undefined), initTelemetry({}));
+const other: { enabled?: boolean } = { enabled: true };
+console.log(initTelemetry(other), other);`,
+  },
+  { id: "S125-M-02 (review) refused by name: another module stashes the widened record in a Set<object>" , entry: "main.ts", files: IW(`export const seen = new Set<object>();\nexport function f(p: W): void { seen.add(p); }`), src: IM(`f(o); console.log(seen.has(o));`, `import { f, seen } from "./w.ts";`), refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-03 (review) refused by name: the same in one module", entry: "main.ts", src: `type A = { enabled?: boolean; n?: number };\ntype W = A & { max?: number };\nconst seen = new Set<object>();\nfunction f(p: W): void { seen.add(p); }\nconst o: A = { enabled: false, n: 1 };\nf(o);\nconsole.log(seen.has(o), o);`, refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-04 (review) refused by name: another module keys a WeakMap<object, number> by the widened record", entry: "main.ts", files: IW(`export const wm = new WeakMap<object, number>();\nexport function f(p: W): void { wm.set(p, 7); }`), src: `import { f, wm } from "./w.ts";\nimport type { A } from "./types.ts";\nconst o: A = { enabled: false, n: 1 };\nf(o);\nconsole.log(wm.get(o));`, refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-05 (review) refused by name: another module keeps the widened record in an object-typed binding and compares by identity", entry: "main.ts", files: IW(`let last: object | null = null;\nexport function f(p: W): void { last = p; }\nexport function isLast(x: object): boolean { return last === x; }`), src: `import { f, isLast } from "./w.ts";\nimport type { A } from "./types.ts";\nconst o: A = { enabled: false, n: 1 };\nf(o);\nconsole.log(isLast(o));`, refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-06 (review) refused by name: one module: WeakMap<object, number> keyed by the widened record", entry: "main.ts", src: IH + `const wm = new WeakMap<object, number>();\nfunction f(p: W): void { wm.set(p, 7); }\nconst o: A = { enabled: false, n: 1 };\nf(o);\nconsole.log(wm.get(o));`, refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-07 (review) refused by name: one module: an object-typed binding compared by identity", entry: "main.ts", src: IH + `let last: object | null = null;\nfunction f(p: W): void { last = p; }\nfunction isLast(x: object): boolean { return last === x; }\nconst o: A = { enabled: false, n: 1 };\nf(o);\nconsole.log(isLast(o));`, refused: /COPY where JavaScript shares the object, and the program compares values of these types by identity/ },
+  { id: "S125-M-08 (review, fast-string-truncated-width) options widened into another module's `{}`-inferred defaulted parameter, whose reads of keys `{}` lacks would fold to undefined: refused by name, never a silent default", entry: "main.ts",
+    files: {
+      "node_modules/w/package.json": `{"name":"w","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"}}}`,
+      "node_modules/w/index.js": `export function measure(input, opts = {}) { const limit = opts.limit ?? Infinity; return Math.min(input.length, limit); }`,
+      "node_modules/w/index.d.ts": `export declare function measure(input: string, opts?: { limit?: number }): number;`,
+    },
+    npmStatic: ["w"],
+    src: `import { measure } from "w";\nconsole.log(measure("abcdef", { limit: 3 }), measure("ab"));`,
+    refused: /COPY where JavaScript shares the object.*(prints, serializes, lists the keys|keeps only the type's declared fields)/ },
 ]);

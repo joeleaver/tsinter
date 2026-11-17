@@ -6,7 +6,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
@@ -31,6 +31,8 @@ export interface Row {
   fence?: { text: RegExp; stdout: string };
   /** The program refuses at compile time with a diagnostic matching this. */
   refused?: RegExp;
+  /** Packages under node_modules whose JavaScript compiles (S133). */
+  npmStatic?: string[];
 }
 
 interface Out {
@@ -66,8 +68,8 @@ export function defineRows(title: string, rows: Row[]): void {
     mkdirSync(dir, { recursive: true });
     const entry = join(dir, row.entry ?? "main.js");
     writeFileSync(entry, row.src + "\n");
-    for (const [name, src] of Object.entries(row.files ?? {})) writeFileSync(join(dir, name), src + "\n");
-    const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend });
+    for (const [name, src] of Object.entries(row.files ?? {})) { mkdirSync(dirname(join(dir, name)), { recursive: true }); writeFileSync(join(dir, name), src + "\n"); }
+    const res = await compile(entry, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "program"), outDir: dir, backend, ...(row.npmStatic ? { npmStatic: row.npmStatic } : {}) });
     if (row.refused !== undefined) {
       expect(res.ok).toBe(false);
       expect(res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")).toMatch(row.refused);
