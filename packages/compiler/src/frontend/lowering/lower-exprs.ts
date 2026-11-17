@@ -16,7 +16,7 @@ import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 
 import type { Lowerer } from "./lowerer.js";
-import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
+import { orderNoteKeyedWrite, orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
@@ -9351,7 +9351,24 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
           }
           const value = L.coerceInto(expr.right, L.lowerExpr(expr.right), common);
           if (!typeEquals(value.type, common)) L.badType(expr.right, L.typeOf(expr.right));
-          return { kind: "recordKeySet", obj, shapeId: receiverIr.shapeId, key, value, loc: locOf(expr) };
+          const keyed: IrStmt = { kind: "recordKeySet", obj, shapeId: receiverIr.shapeId, key, value, loc: locOf(expr) };
+          // (#235 review) an ordered record gets a deleted key back
+          if (orderedShape(L, receiverIr.shapeId) !== null) {
+            const kloc = locOf(expr);
+            const stmts: IrStmt[] = [];
+            const once = (e: IrExpr, name: string): IrExpr => {
+              if (pureReemittable(e)) return e;
+              const t = L.declareHiddenLocal(name, e.type);
+              stmts.push({ kind: "varDecl", localId: t.id, init: e, loc: kloc });
+              return { kind: "varRef", localId: t.id, type: e.type, loc: kloc };
+            };
+            const o2 = once(obj, "%kwo");
+            const k2 = once(key, "%kwk");
+            const v2 = once(value, "%kwv");
+            stmts.push({ ...keyed, obj: o2, key: k2, value: v2 } as IrStmt, ...orderNoteKeyedWrite(L, o2, receiverIr.shapeId, k2, kloc));
+            return { kind: "block", body: stmts, loc: kloc };
+          }
+          return keyed;
         }
         // A LITERAL key naming no declared field is a pure overflow insert
         // — no collision to validate. Runtime keys must be able to collide
@@ -12816,7 +12833,8 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         );
         // GH #132: off the fast path the record's own order answers (a
         // re-readable receiver only; the guard above evaluates it first).
-        const present = field.optional !== true || !pureReemittable(recv)
+        // (#235 review: a required field's key too, which a `delete` removes)
+        const present = !pureReemittable(recv)
           ? marked
           : inGuard === recv
             ? orderedPresence(L, recv, recv.type.shapeId, key, marked, loc)
@@ -12830,7 +12848,9 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       // side-effect-free receiver read.
       if (recv.kind === "varRef" || recv.kind === "recordGet" || recv.kind === "fieldGet" || pureRecvNode) {
         const present = plainFieldPresent(L, { kind: "recordGet", obj: recv, shapeId: recv.type.shapeId, field: key, type: field.type, loc }, loc);
-        return guardedIn(present ?? { kind: "boolLit", value: true, type: BOOL, loc });
+        const base: IrExpr = present ?? { kind: "boolLit", value: true, type: BOOL, loc };
+        // (#235 review) an ordered record's key can have been deleted
+        return guardedIn(pureReemittable(recv) ? orderedPresence(L, recv, recv.type.shapeId, key, base, loc) : base);
       }
       L.unsupported("SC1090", expr, "statically-decided 'in' on computed receivers (bind the value to a variable first)");
     }
@@ -14240,7 +14260,8 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
 export function orderedRecordWrite(L: Lowerer, write: IrStmt & { kind: "recordSet" }, receiverGuard: boolean): IrStmt {
   const wrap = (w: IrStmt): IrStmt => (receiverGuard ? undefWriteGuard(L, w) : w);
   const shape = orderedShape(L, write.shapeId);
-  if (shape === null || shape.fields.find((f) => f.name === write.field)?.optional !== true) return wrap(write);
+  // (#235 review: a required field too — a `delete` can have removed its key)
+  if (shape === null || !shape.fields.some((f) => f.name === write.field)) return wrap(write);
   const loc = write.loc;
   const stmts: IrStmt[] = [];
   const once = (e: IrExpr): IrExpr => {

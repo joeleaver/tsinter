@@ -1270,6 +1270,13 @@ export interface IrRecordShape {
    * fields carry that declaredOrder OMITS are internal '%'-fields (Dirent's
    * %dtype) — hidden from every key-order surface, JSON included. */
   declaredOrder?: string[];
+  /** GH #235: the shape was first interned from a mapped type over literal
+   * keys (`Record<"a" | "b", V>`), whose checker order is the key union's,
+   * not any value's. Its records keep their own key order on the WasmGC
+   * lanes (record-order.ts orderedShape; the wasm emitter's
+   * recordOrderSlot), so a literal answers its spelling. Metadata like
+   * declaredOrder: set at first intern only, never later. */
+  literalKeys?: true;
 }
 
 /** Object-literal ACCESSOR properties (`{ get x() {...}, set x(v) {...} }`)
