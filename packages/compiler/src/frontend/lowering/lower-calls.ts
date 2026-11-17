@@ -8652,11 +8652,12 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       body.push({
         kind: "if",
         cond: { kind: "strEq", negated: false, left: kRef, right: { kind: "strLit", value: f.name, type: STRING, loc }, type: BOOL, loc },
+        // GH #132: off the fast path the record's own order answers.
         then: [{
           kind: "return",
           value: mode === "forIn" && OBJECT_PROTO_NAMES.has(f.name)
-            ? { kind: "logical", op: "||", left: answer, right: protoMissCall(L, kRef, loc), type: BOOL, loc }
-            : answer,
+            ? { kind: "logical", op: "||", left: orderedPresence(L, rRef, shapeId, f.name, answer, loc), right: protoMissCall(L, kRef, loc), type: BOOL, loc }
+            : orderedPresence(L, rRef, shapeId, f.name, answer, loc),
           loc,
         }],
         else_: null,

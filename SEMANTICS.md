@@ -3763,6 +3763,19 @@ push, and each surface dispatches on the field number in log n compares (br_tabl
 the dynamic conversion). Code grows linearly in the field count. **Tested by:**
 `packages/compiler/test/wasm-gh132-optional-key-order.test.ts` (wasm and wasm-native).
 
+**Amendment (GH #235): a mapped type over literal keys keeps each record's own order too.** The checker
+lists the keys of `Record<"gmail" | "drive", V>` (and of `Readonly<...>` of one) in its key union's order,
+which tsgo sorts — no value spells it — and a type built from such keys (a rest object of one, the literal
+type of `{ ...SERVICE_PROFILES, k: v }`) inherits that order. A shape FIRST interned from a type with a key
+that has no declaration of its own (no index signature, two or more keys) takes the order slot above whether
+or not a field is optional, so an object literal answers its spelling and a spread or rest object its
+source's order on every key surface, as Node does (paperclip's `SERVICE_PROFILES`, whose `Object.entries`
+builds a scope list at module load). Like `declaredOrder`, the mark is first-construction-wins and never
+added later: a shape first interned from an interface or literal type of the same fields keeps this entry's
+shape order, and the checked conversions above (a `structuredClone` of one included) still take the
+declared order. **Tested by:**
+`packages/compiler/test/wasm-gh235-literal-key-order.test.ts` (wasm and wasm-native).
+
 ## S042 — Bare `this` in a dyn-called plain function binds only through the MODELED dispatch set *(inherited; newly observable on the wasm tier)*
 
 The ambient-receiver bracket — the stack `dyn.this` reads (C:
