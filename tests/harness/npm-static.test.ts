@@ -24,6 +24,7 @@ import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { analyze, compile } from "@tsinter/compiler";
 import { LEGACY_LANES } from "./legacy-lanes.js";
+import { runWasm } from "../../packages/compiler/test/wasm-host.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -524,5 +525,31 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     expect(all).toContain("wscopied");
     expect(all).not.toContain("nothing installed resolves");
     expect(all).not.toContain("implicitly has an 'any' type");
+  }, 120_000);
+});
+
+// GH #248: a JavaScript read of a key a closed object lacks (a defaulted
+// `{}` parameter, a local `{}`) lowers to the unit undefined; `??` used to
+// answer that unit instead of its default (fast-string-truncated-width's
+// `widthOptions.regularWidth ?? 1` was undefined, every width NaN). Every
+// operator that tests the read — `??`, `||`, `?.`, destructuring defaults,
+// `typeof`, `===` — byte-matches Node on both WasmGC lanes.
+describe("GH #248 absent keys of a closed JavaScript object (both WasmGC lanes)", () => {
+  const entry = join(pilotRoot, "absentkeys-cli.ts");
+  test("wasm-native: byte-matches Node", async () => {
+    const binary = await buildStatic(entry, ["absentkeys"]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+  test("wasm: byte-matches Node", async () => {
+    const outDir = join(cacheDir, "npm-static-gh248-wasm");
+    mkdirSync(outDir, { recursive: true });
+    const result = await compile(entry, { outPath: join(outDir, "p.wasm"), outDir, npmStatic: ["absentkeys"], backend: "wasm" });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, wasmRes] = await Promise.all([runBinary("node", [entry]), runWasm(result.binaryPath)]);
+    expect(wasmRes.stdout).toBe(nodeRes.stdout.toString("utf8"));
+    expect(wasmRes.stderr).toBe("");
+    expect(wasmRes.exitCode).toBe(nodeRes.exitCode);
   }, 120_000);
 });
