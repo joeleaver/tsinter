@@ -663,6 +663,11 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
       // symbol's own identifier inside the pattern.
       return false;
     }
+    // A module-scope var is a module global (its own resolution path), never
+    // a function-root local: a local here would split the binding — the
+    // declaration writes the global while reads take the local (GH #255's
+    // number/boolean slots made such vars eligible).
+    if (L.globalsBySymbol.has(symbol)) return false;
     // The owning function: the innermost OPEN statement list containing an
     // ancestor of the declaration (statement lists never cross function
     // boundaries, so its ctx is the var's function).

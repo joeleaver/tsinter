@@ -10579,9 +10579,15 @@ describe("module forms rows", () => {
   // module ran. Node v24.18.1 prints "b undefined" for the var (and throws
   // a TypeError reading 'A' of undefined for the enum).
   const fenceA = 'import { peek } from "./b.ts";\nconsole.log("a start");\nexport var v = 7;\nexport enum E { A = 1 }\nconsole.log(peek());\n';
-  test("MF-04 S124: in a cycle, a `var` or enum read before its module ran ends the program by name (Node reads undefined); read after, both are Node's values", async () => {
+  test("MF-04 S124: in a cycle, an enum read before its module ran ends the program by name (Node throws reading undefined); a number `var` read there is Node's undefined (GH #255); read after, both are Node's values", async () => {
+    expect(
+      await sameAsNode({
+        "main.ts": 'import { v } from "./a.ts";\nconsole.log("main", v);\n',
+        "a.ts": fenceA,
+        "b.ts": 'import { v, E } from "./a.ts";\nexport function peek(): string { return `${v} ${E.A}`; }\nconsole.log("b", `${v}`);\n',
+      }),
+    ).toEqual({ stdout: "b undefined\na start\n7 1\nmain 7\n", exitCode: 0 });
     for (const [read, name, what] of [
-      ["`${v}`", "v", "a var binding"],
       ["`${E.A}`", "E", "an enum"],
     ] as const) {
       const dir = writeTree({
@@ -10674,19 +10680,20 @@ describe("module forms rows", () => {
     expect(await sameAsNode({ ...files, "b.ts": 'import { show } from "./a.ts";\nconsole.log("b");\nexport function later(): void {\n  show();\n}\n' })).toEqual({ stdout: "b\nshow 1.2.3\n", exitCode: 0 });
   }, 120000);
 
-  test("MF-10 S124: a module OUTSIDE the cycle that cycle code reaches before it ran is guarded too — its const is Node's TDZ, and its `var` (Node: NaN from undefined * 2) fences by name", async () => {
+  test("MF-10 S124: a module OUTSIDE the cycle that cycle code reaches before it ran is guarded too — its const is Node's TDZ; its number `var` reads Node's undefined (NaN from undefined * 2, GH #255) and a string `var` fences by name", async () => {
     const files = {
       "main.ts": 'import { fn } from "./a.ts";\nconsole.log("main", fn());\n',
       "a.ts": 'import "./b.ts";\nimport { read } from "./util.ts";\nexport function fn(): string { return read(); }\n',
       "b.ts": 'import { fn } from "./a.ts";\nconsole.log("b", fn());\n',
     };
     expect(await sameAsNode({ ...files, "util.ts": 'const K = "five";\nexport function read(): string { return K; }\n' })).toEqual({ stdout: "", exitCode: 1 });
-    const dir = writeTree({ ...files, "util.ts": "var K = 5;\nexport function read(): string { return String(K * 2); }\n" });
+    expect(await sameAsNode({ ...files, "util.ts": "var K = 5;\nexport function read(): string { return String(K * 2); }\n" })).toEqual({ stdout: "b NaN\nmain 10\n", exitCode: 0 });
+    const dir = writeTree({ ...files, "util.ts": 'var K = "five";\nexport function read(): string { return K.toUpperCase(); }\n' });
     try {
       const res = await buildIn(dir);
       if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
       const r = await runWasm(res.binaryPath);
-      // Node v24.18.1 prints "b NaN" then "main 10".
+      // Node v24.18.1 throws reading 'toUpperCase' of undefined.
       expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8").split(dir).join("<D>"), exitCode: r.exitCode }).toEqual({
         stdout: "",
         stderr: "tsinter: unsupported: a read of 'K' (a var binding, read by code of an import cycle) before its module ran — Node reads undefined there, which no typed slot holds (SEMANTICS.md S124) [SC1016 at <D>/util.ts:2]\n",

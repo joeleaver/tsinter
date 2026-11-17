@@ -1769,9 +1769,9 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
    * called above the declaration statement may read it — lowerFileInit
    * emits the assigns right after the run-once guard). Checked-dynamic
    * slots hold the dyn undefined the same way (a NULL dyn is a trap, not
-   * a value). Other types need nothing: tsc's flow analysis rejects their
-   * direct early reads, and closure reads share let's documented
-   * zero/NULL divergence window. */
+   * a value). On the WasmGC lanes a number or boolean slot holds its
+   * undefined the same way (GH #255: a closure may read it first); every
+   * ref-typed slot starts null, its undefined already. */
   function noteVarGlobalEntryInit(L: Lowerer, sf: ts.SourceFile, g: IrGlobal): void {
     // 'any' globals need the entry init exactly like undefined-armed
     // unions: tsc never guards `any` reads, so `var x: any;` is readable
@@ -1779,7 +1779,10 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
     // — the ENGINE's for jsval (--dynamic), the checked-dynamic tree's for dyn (static) —
     // rather than a C-level NULL (an op or validated exit on NULL is
     // memory-unsafe, not a TypeError).
-    if (g.type.kind !== "union" && g.type.kind !== "jsval" && g.type.kind !== "dyn") return;
+    // GH #255: on the WasmGC lanes a number or boolean var holds its slot's
+    // undefined from entry too (a closure may read it before the write).
+    const slotUndef = L.undefSlots && (g.type.kind === "f64" || g.type.kind === "bool");
+    if (g.type.kind !== "union" && g.type.kind !== "jsval" && g.type.kind !== "dyn" && !slotUndef) return;
     const inits = L.varGlobalEntryInits.get(sf) ?? [];
     inits.push(g);
     L.varGlobalEntryInits.set(sf, inits);
