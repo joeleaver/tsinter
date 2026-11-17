@@ -839,6 +839,20 @@ export function lowerNsIdentifierValue(L: Lowerer, ident: ts.Identifier): IrExpr
   // object itself has no runtime representation — Node's frozen,
   // alphabetically-keyed namespace object is not materialized. Named
   // residual of the SC1013 lowering.
+  // A MEMBER read that reached here (`p.default(...)`: no compiled binding
+  // answers the member) names the member, not the namespace as a value.
+  {
+    const parent = ident.parent;
+    const bound = L.checker.getSymbolAtLocation(ident);
+    const nsImport = bound !== undefined && L.checker.rawDeclarationsOf(bound).some((d) => ts.isNamespaceImport(d));
+    if (nsImport && parent !== undefined && ts.isPropertyAccessExpression(parent) && parent.expression === ident && ts.isIdentifier(parent.name)) {
+      L.unsupported(
+        "SC1013",
+        parent,
+        `reading the member '${parent.name.text}' through the namespace '${ident.text}' (no compiled binding answers it)`,
+      );
+    }
+  }
   if (moduleNsSourceFileOf(L, ident) !== null) {
     L.unsupported(
       "SC1013",
