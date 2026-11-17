@@ -814,7 +814,114 @@ export function checkPreflight(load: LoadResult): ScrDiagnostic[] {
   const { diags, moduleOrder, startupCrash } = preflight7(load);
   load.moduleOrder = moduleOrder;
   load.startupCrash = startupCrash;
-  return [...diags, ...declaredOnlyExportUses(load)];
+  return [...diags, ...declaredOnlyExportUses(load), ...starConflictUses(load)];
+}
+
+/** GH #243, SEMANTICS.md S133 (n): a name that two `export *` sources of a
+ * module both export (distinct bindings, no local export of it) is
+ * AMBIGUOUS. Node leaves it out of the module's namespace (`ns.dup` is
+ * undefined) and fails a named import of it at link time ("The requested
+ * module … contains conflicting star exports for name 'dup'"). Both uses
+ * refuse by name at build time, in TypeScript and JavaScript importers
+ * alike; a local export shadowing the stars, and stars that re-export the
+ * same binding, are not ambiguous. */
+function starConflictUses(load: LoadResult): ScrDiagnostic[] {
+  const checker = load.program.getTypeChecker();
+  const out: ScrDiagnostic[] = [];
+  const moduleOf = (spec: ts.Expression): ts.SourceFile | null => {
+    const sym = checker.getSymbolAtLocation(spec);
+    if (sym === undefined) return null;
+    // A viewed package's declaration module names its JS module through the
+    // declared-surface redirect (declarationsOf follows it).
+    const sf = checker.declarationsOf(sym).find((d): d is ts.SourceFile => ts.isSourceFile(d));
+    return sf !== undefined && !sf.isDeclarationFile ? sf : null;
+  };
+  const hasExportModifier = (n: ts.Node): boolean =>
+    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+  // Origins of export `name` from module `sf`: a set of binding keys, or
+  // "ambiguous" when two star sources disagree.
+  const memo = new Map<string, Set<string> | "ambiguous">();
+  const originsOf = (sf: ts.SourceFile, name: string, depth = 0): Set<string> | "ambiguous" => {
+    const key = `${sf.fileName}\u0000${name}`;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    memo.set(key, new Set()); // cycle guard
+    let local: Set<string> | null = null;
+    const stars: ts.SourceFile[] = [];
+    for (const st of sf.statements) {
+      if (ts.isExportDeclaration(st)) {
+        if (st.isTypeOnly) continue;
+        if (st.exportClause === undefined) {
+          const m = st.moduleSpecifier !== undefined ? moduleOf(st.moduleSpecifier) : null;
+          if (m !== null) stars.push(m);
+          continue;
+        }
+        if (ts.isNamedExports(st.exportClause)) {
+          for (const el of st.exportClause.elements) {
+            if (el.isTypeOnly || el.name.text !== name) continue;
+            const from = (el.propertyName ?? el.name) as ts.Identifier;
+            const m = st.moduleSpecifier !== undefined ? moduleOf(st.moduleSpecifier) : null;
+            local = m !== null && depth < 32 ? (() => {
+              const o = originsOf(m, from.text, depth + 1);
+              return o === "ambiguous" ? new Set([`${m.fileName}#${from.text}`]) : o;
+            })() : new Set([`${sf.fileName}#${from.text}`]);
+          }
+        } else if (st.exportClause.name.text === name) {
+          local = new Set([`${sf.fileName}#*${name}`]);
+        }
+      } else if (ts.isVariableStatement(st) && hasExportModifier(st)) {
+        for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name) && d.name.text === name) local = new Set([`${sf.fileName}#${name}`]);
+      } else if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) && hasExportModifier(st) && st.name?.text === name) {
+        local = new Set([`${sf.fileName}#${name}`]);
+      }
+    }
+    let result: Set<string> | "ambiguous";
+    if (local !== null || name === "default") {
+      result = local ?? new Set();
+    } else {
+      const union = new Set<string>();
+      let ambiguous = false;
+      for (const m of stars) {
+        if (depth >= 32) break;
+        const o = originsOf(m, name, depth + 1);
+        if (o === "ambiguous") ambiguous = true;
+        else for (const k of o) union.add(k);
+      }
+      result = ambiguous || union.size > 1 ? "ambiguous" : union;
+    }
+    memo.set(key, result);
+    return result;
+  };
+  for (const sf of load.program.getSourceFiles()) {
+    if (sf.isDeclarationFile || isNodeModulesPath(sf.fileName)) continue;
+    const stack: ts.Node[] = [sf];
+    while (stack.length > 0) {
+      const n = stack.pop()!;
+      if (ts.isImportSpecifier(n) && !n.isTypeOnly && (n.parent.parent as ts.ImportClause).phaseModifier !== ts.SyntaxKind.TypeKeyword) {
+        const decl = n.parent.parent.parent as ts.ImportDeclaration;
+        const m = moduleOf(decl.moduleSpecifier);
+        const name = (n.propertyName ?? n.name) as ts.Identifier;
+        if (m !== null && ts.isIdentifier(name) && originsOf(m, name.text) === "ambiguous") {
+          out.push(unsupportedDiag("SC1013", locOf7(n), `importing '${name.text}' from '${(decl.moduleSpecifier as ts.StringLiteral).text}', which two of its \`export *\` sources both export (Node fails the import at link time: the module contains conflicting star exports for that name)`));
+        }
+      } else if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.expression) && ts.isIdentifier(n.name)) {
+        const sym = checker.getSymbolAtLocation(n.expression);
+        const nsDecl = sym === undefined ? undefined : checker.rawDeclarationsOf(sym).find((d) => ts.isNamespaceImport(d));
+        if (nsDecl !== undefined) {
+          const decl = nsDecl.parent.parent as ts.ImportDeclaration;
+          const m = moduleOf(decl.moduleSpecifier);
+          if (m !== null && originsOf(m, n.name.text) === "ambiguous") {
+            out.push(unsupportedDiag("SC1013", locOf7(n), `reading '${n.name.text}' through the namespace of '${(decl.moduleSpecifier as ts.StringLiteral).text}', where two \`export *\` sources both export it (Node leaves it out of the namespace: undefined)`));
+          }
+        }
+      }
+      ts.forEachChild(n, (c) => {
+        stack.push(c);
+        return undefined;
+      });
+    }
+  }
+  return out;
 }
 
 /** SEMANTICS.md S133 (b): a program use of a value a viewed package's

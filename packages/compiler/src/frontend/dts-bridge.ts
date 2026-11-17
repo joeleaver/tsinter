@@ -49,6 +49,12 @@ export function installDtsBridge(program: ts.Program): void {
     return;
   }
   let exportsOfViews: ViewExports[] | null = null;
+  // A view's declaration MODULE → the JS module it describes: a namespace
+  // import (`import * as p from "@clack/prompts"`) binds the former, and its
+  // member reads then resolve as any program module's do, each member
+  // through the export mapping (SEMANTICS.md S133 (n)). Nested namespace
+  // exports map through `declared`/`js` already.
+  const moduleMap = new Map<Sym, Sym>();
   const moduleSymbolOf = (sf: ts.SourceFile | undefined): Sym | undefined =>
     sf === undefined ? undefined : checker.getSymbolAtLocation(sf);
   const exportsOf = (mod: Sym | undefined): readonly Sym[] => {
@@ -91,6 +97,7 @@ export function installDtsBridge(program: ts.Program): void {
         // type of module.exports); ES modules answer either way.
         const mod = moduleSymbolOf(program.getSourceFile(entry));
         if (mod === undefined) continue;
+        if (mirrorMod !== undefined && declaredEq === undefined && !moduleMap.has(mirrorMod)) moduleMap.set(mirrorMod, mod);
         // An ESM implementation of `export =` declarations (postgres: CommonJS
         // .d.ts over an ESM `export default`): the default-import binding the
         // declarations type as `module.exports` is the ESM default export.
@@ -153,7 +160,12 @@ export function installDtsBridge(program: ts.Program): void {
   };
 
   const computeRedirect = (sym: Sym): Sym | null => {
-    for (const v of viewExports()) {
+    const views = viewExports();
+    if (sym.flags & ts.SymbolFlags.ValueModule) {
+      const jsMod = moduleMap.get(sym);
+      if (jsMod !== undefined) return jsMod;
+    }
+    for (const v of views) {
       const name = v.declared.get(sym);
       if (name === undefined) continue;
       const j = v.js.get(name);

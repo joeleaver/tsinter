@@ -11714,6 +11714,28 @@ any opted-in package. Library mode and the legacy C/LLVM lanes keep the
 minified check and auto's direct-imports-only selection.
 **Tested by:** `packages/compiler/test/npm-dts-chain.test.ts` (DCH-01..03).
 
+**Amendment (n) — a namespace import of a viewed package (2026-11-16).**
+`import * as p from "pkg"` of a package that types against its declared
+surface binds the declarations' module; it now names the JavaScript module
+those declarations describe, as a namespace import of a program module
+does. Member reads and calls through `p` resolve to the implementation,
+each member through the export mapping: a function (`p.intro(…)`), a member
+of an exported object (`p.log.info(…)`), and a member of a nested namespace
+export (`p.util.width(…)`, under `export * as util`). The namespace used as
+a VALUE (stored, passed, enumerated) keeps the module-namespace fence by
+name. A package whose declarations are `export =` keeps its existing
+handling. Paperclip spells every @clack/prompts use this way.
+A name that two `export *` sources of a module both export (distinct
+bindings, and no local export of the name) is ambiguous: Node leaves it out
+of the namespace (`p.dup` is undefined) and fails a named import of it at
+link time ("contains conflicting star exports"). Both uses refuse by name at
+build time, for viewed packages and program modules alike, in TypeScript and
+JavaScript importers (GH #243). A local export shadowing the stars, and
+stars that re-export one binding, are not ambiguous. A member with no
+compiled binding (`p.default(…)`) refuses naming the member.
+**Tested by:** `packages/compiler/test/npm-dts-namespace.test.ts` (DNS-01,
+DNS-02, DNS-R1..R5).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would
