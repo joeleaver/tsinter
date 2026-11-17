@@ -3223,6 +3223,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           recvShape !== undefined && recvShape.indexValue === undefined && !recvShape.tuple &&
           isJsSourceFile(expr.getSourceFile())
         ) {
+          // (fb73ae21 review) the fold asks the record which keys it has: a
+          // KEY observation of its type (S125 (b)), so a width copy into
+          // this type — which would drop the key the original carries
+          // (fast-string-truncated-width's `truncationOptions.limit` on a
+          // `{}`-inferred parameter) — refuses by name instead of reading
+          // undefined.
+          L.keyObservedTypes.push(recvLowered.type);
           const undef: IrExpr = { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc };
           if (recvLowered.kind === "varRef" && !mayHoldSlotUndef(L, recvLowered)) return undef;
           const checked = undefRecvGuard(L, recvLowered, expr.name.text, loc);
