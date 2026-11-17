@@ -23,7 +23,7 @@ import { classViewOf, fencedValue, liftClassReceiver, lowerConstructorName, view
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, jsFuncNameOf, neverResidueTsBinding, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncNameOf, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, jsFuncNameOf, neverResidueTsBinding, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped, lowerProcessVersionsProbe } from "./lower-builtins.js";
@@ -6804,6 +6804,19 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
       if (raw.type.kind === "func" && v.kind === "dynFrom") {
         const k = fnProtoOfValueNode(L, valueExpr);
         if (k !== null) (v as { fnProto?: number }).fnProto = k;
+        // GH #246: and its ES name where a definition fixes it: a function
+        // or arrow defined here by its key (a named function expression by
+        // its own name, async ones too), a reference by its definition
+        // where that is certain (esDefinedFuncNameOf). A binding's mere
+        // spelling (a const holding a call's result, a conditional or an
+        // alias) names nothing here. (A computed key's
+        // function is named, where its key folds, by its definition at the
+        // end of lowering: stampCloneFunctionSources.)
+        const dv = v as { fnName?: string };
+        if (dv.fnName === undefined) {
+          const nm = esDefinedFuncNameOf(L, valueExpr);
+          if (nm !== null) dv.fnName = nm;
+        }
       }
       // GH #234: a record or class instance the checked-dynamic tree cannot
       // hold directly (a literal holding a method: `{ v: { toString() {…} } }`)

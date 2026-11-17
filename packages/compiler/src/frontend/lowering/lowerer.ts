@@ -1200,6 +1200,38 @@ export function jsFuncNameOf(node: ts.Node): string | null {
   return null;
 }
 
+/** GH #246: the `name` Node gives the function a definition creates,
+ * where the syntax alone fixes it: a declaration's or a function
+ * expression's own name; an anonymous function or arrow initializing a
+ * variable or an object-literal member (through parentheses and
+ * TypeScript-only wrappers), by that binding or key (a computed key only
+ * where `foldKey` folds it to one string); an object literal's method by
+ * its key. Null elsewhere (an unfolded computed key, an argument, a class
+ * member, a default parameter...), where the box keeps its site's rule. */
+export function syntacticFnName(n: ts.Node, foldKey?: (e: ts.Expression) => string | null): string | null {
+  // a computed key Node evaluates to one string the lowering folds too
+  const keyName = (k: ts.PropertyName): string | null =>
+    ts.isComputedPropertyName(k) ? (foldKey?.(k.expression) ?? null) : objLitKeyName(k);
+  if ((ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)) && n.name) return n.name.text;
+  if (ts.isMethodDeclaration(n)) return n.parent && ts.isObjectLiteralExpression(n.parent) ? keyName(n.name) : null;
+  if (!ts.isFunctionExpression(n) && !ts.isArrowFunction(n)) return null;
+  let p: ts.Node | undefined = n.parent;
+  let child: ts.Node = n;
+  while (p && (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertion(p) || ts.isSatisfiesExpression(p) || ts.isNonNullExpression(p))) {
+    child = p;
+    p = p.parent;
+  }
+  if (p && ts.isVariableDeclaration(p) && p.initializer === child && ts.isIdentifier(p.name)) return p.name.text;
+  if (p && ts.isPropertyAssignment(p) && p.initializer === child) return keyName(p.name);
+  // an assignment to a plain identifier (`late = () => 1`, `x ||= function () {}`)
+  if (
+    p && ts.isBinaryExpression(p) && p.right === child && ts.isIdentifier(p.left) &&
+    (p.operatorToken.kind === ts.SyntaxKind.EqualsToken || p.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken ||
+      p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandEqualsToken || p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken)
+  ) return p.left.text;
+  return null;
+}
+
 /** An object-literal key's string where the source spells it: an
  * identifier, a string literal, or a plain decimal number (its canonical
  * ToString); null for a computed key or another numeric spelling. */
@@ -1249,7 +1281,175 @@ export function esFuncNameOf(L: Lowerer, node: ts.Node): string | null {
       if (own !== null) return own;
     }
   }
+  // GH #246: an ARRAY destructuring target without a default (`[e] = [()
+  // => 1]`, `const [e] = …`, `for (const [e] of …)`) boxes an element whose
+  // name the pattern does not give (an array element's function has none
+  // unless defined elsewhere): it names nothing.
+  if (isArrayPatternTarget(n)) return null;
   return jsFuncNameOf(n);
+}
+
+/** Is `node` an element an ARRAY destructuring pattern writes, with no
+ * default value (`[e]`, `[a, e]`, `const [e]`, nested `[[e]]`)? */
+function isArrayPatternTarget(node: ts.Node): boolean {
+  const n: ts.Node = node;
+  const be = ts.isBindingElement(n) ? n : n.parent !== undefined && ts.isBindingElement(n.parent) && n.parent.name === n ? n.parent : undefined;
+  if (be !== undefined) return be.initializer === undefined && be.dotDotDotToken === undefined && ts.isArrayBindingPattern(be.parent);
+  if (!ts.isIdentifier(n)) return false;
+  let top: ts.Node = n;
+  while (top.parent !== undefined && ts.isParenthesizedExpression(top.parent)) top = top.parent;
+  const arr = top.parent;
+  if (arr === undefined || !ts.isArrayLiteralExpression(arr)) return false;
+  // the array literal is itself an assignment pattern: the left of `=`, a
+  // for-of head, or nested in such a pattern
+  let pat: ts.Node = arr;
+  for (;;) {
+    let up: ts.Node | undefined = pat.parent;
+    while (up !== undefined && ts.isParenthesizedExpression(up)) up = up.parent;
+    if (up === undefined) return false;
+    if (ts.isArrayLiteralExpression(up)) {
+      pat = up;
+      continue;
+    }
+    if (ts.isBinaryExpression(up)) return up.operatorToken.kind === ts.SyntaxKind.EqualsToken && (up.left === pat || stripParens(up.left) === pat);
+    if (ts.isForOfStatement(up)) return up.initializer === pat || stripParens(up.initializer) === pat;
+    return false;
+  }
+}
+
+function stripParens(e: ts.Node): ts.Node {
+  let x = e;
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  return x;
+}
+
+/** `=` and the logical assignments: the operators whose value is the
+ * right side's (and which name an anonymous function there by the target). */
+function isValueAssignment(k: ts.SyntaxKind): boolean {
+  return k === ts.SyntaxKind.EqualsToken || k === ts.SyntaxKind.BarBarEqualsToken ||
+    k === ts.SyntaxKind.AmpersandAmpersandEqualsToken || k === ts.SyntaxKind.QuestionQuestionEqualsToken;
+}
+
+const anonLetNames = new WeakMap<Lowerer, Map<ts.Symbol, string | null>>();
+
+/** GH #246: a `let`/`var` binding's name, when every FUNCTION ever written
+ * to it is an anonymous function or arrow assigned straight to it (its
+ * initializer or `x = …`): Node names each such function by the binding at
+ * creation, for good, so any function read from it (or from a `const`
+ * alias of it) answers that name. Writes of values that are certainly no
+ * function (`x = 5`, `x++`) do not matter. Null when a named function
+ * expression, another function value, a value of unknown type or a
+ * destructuring/for-of write reaches it (S020's GH #140 amendment). */
+function anonLetFnName(L: Lowerer, sym: ts.Symbol, d: ts.VariableDeclaration & { name: ts.Identifier }): string | null {
+  let memo = anonLetNames.get(L);
+  if (memo === undefined) anonLetNames.set(L, (memo = new Map()));
+  const hit = memo.get(sym);
+  if (hit !== undefined) return hit;
+  memo.set(sym, null);
+  if ((L.checker.declarationsOf(sym) ?? []).length !== 1) return null;
+  const K = ts.SyntaxKind;
+  let sawFn = false;
+  let ok = true;
+  const judge = (v: ts.Expression | undefined): void => {
+    if (v === undefined) return;
+    const e = stripTsWrappers(v);
+    if (ts.isFunctionExpression(e) || ts.isArrowFunction(e)) {
+      if (ts.isFunctionExpression(e) && e.name) ok = false;
+      else sawFn = true;
+      return;
+    }
+    const t = L.checker.getTypeAtLocation(e);
+    if ((t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 || L.checker.getCallSignatures(t).length > 0 ||
+      (t.isUnionType() && t.getTypes().some((a: ts.Type) => (a.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 || L.checker.getCallSignatures(a).length > 0))) ok = false;
+  };
+  judge(d.initializer);
+  const name = d.name.text;
+  ts.walkPreorder(d.getSourceFile(), (n) => {
+    if (!ok) return undefined;
+    if (!ts.isIdentifier(n) || n.text !== name || n === d.name) return undefined;
+    let top: ts.Node = n;
+    for (;;) {
+      const q = top.parent;
+      if (q !== undefined && (ts.isParenthesizedExpression(q) || ts.isArrayLiteralExpression(q) || ts.isObjectLiteralExpression(q) ||
+        ts.isShorthandPropertyAssignment(q) || ts.isSpreadElement(q) || ts.isSpreadAssignment(q) ||
+        (ts.isPropertyAssignment(q) && q.initializer === top))) {
+        top = q;
+        continue;
+      }
+      break;
+    }
+    const q = top.parent;
+    if (q === undefined) return undefined;
+    const assign = ts.isBinaryExpression(q) && q.left === top && q.operatorToken.kind >= K.FirstAssignment && q.operatorToken.kind <= K.LastAssignment;
+    const step = (ts.isPrefixUnaryExpression(q) || ts.isPostfixUnaryExpression(q)) && (q.operator === K.PlusPlusToken || q.operator === K.MinusMinusToken);
+    const forHead = (ts.isForOfStatement(q) || ts.isForInStatement(q)) && q.initializer === top;
+    if (!assign && !step && !forHead) return undefined;
+    const p = n.parent;
+    const s = p !== undefined && ts.isShorthandPropertyAssignment(p) ? L.checker.getShorthandAssignmentValueSymbol(p) : L.checker.getSymbolAtLocation(n);
+    if (s !== sym) return undefined;
+    if (step || (forHead && ts.isForInStatement(q))) return undefined; // numbers / key strings
+    if (forHead || top !== n) {
+      ok = false; // destructuring or for-of: values not seen here
+      return undefined;
+    }
+    const b = q as ts.BinaryExpression;
+    if (isValueAssignment(b.operatorToken.kind)) judge(b.right);
+    // compound arithmetic / string assignments yield no function
+    return undefined;
+  });
+  const out = ok && sawFn ? name : null;
+  memo.set(sym, out);
+  return out;
+}
+
+/** GH #246: esFuncNameOf's answer only where a DEFINITION fixes it — a
+ * function or arrow in place, an identifier resolving to a function
+ * declaration or to a `const` initialized with a function or arrow, an
+ * object literal's member read whose member is a method or a function or
+ * arrow defined there — and null where it would be only a binding's or a
+ * member's spelling (a `const` holding a call's result, a conditional, an
+ * alias): Node names those by the function they hold. */
+export function esDefinedFuncNameOf(L: Lowerer, node: ts.Node, depth = 0): string | null {
+  const n: ts.Node = stripTsWrappers(node);
+  if (depth > 8) return null;
+  if (ts.isFunctionExpression(n) || ts.isArrowFunction(n) || ts.isMethodDeclaration(n)) return syntacticFnName(n);
+  // a literal member (the island literal boxes by its property node)
+  if (ts.isPropertyAssignment(n)) return esDefinedFuncNameOf(L, n.initializer, depth + 1);
+  if (ts.isShorthandPropertyAssignment(n)) return esDefinedFuncNameOf(L, n.name, depth + 1);
+  // an assignment's value (`(q = () => 1)`): its right side's function
+  if (ts.isBinaryExpression(n) && isValueAssignment(n.operatorToken.kind)) return esDefinedFuncNameOf(L, n.right, depth + 1);
+  if (ts.isIdentifier(n)) {
+    const sym = L.resolveValueSymbol(n);
+    const d = sym !== null ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (d !== undefined && ts.isFunctionDeclaration(d) && d.name) return d.name.text;
+    if (d !== undefined && ts.isVariableDeclaration(d) && ts.isIdentifier(d.name)) {
+      if ((ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) === 0) return sym !== null ? anonLetFnName(L, sym, d as ts.VariableDeclaration & { name: ts.Identifier }) : null;
+      if (d.initializer === undefined) return null;
+      const init = stripTsWrappers(d.initializer);
+      if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return syntacticFnName(init);
+      // a const alias of such a binding (`const alias2 = named`, `const
+      // first = x` over a let), or of an assignment's value
+      if (ts.isIdentifier(init) || ts.isBinaryExpression(init)) return esDefinedFuncNameOf(L, init, depth + 1);
+    }
+    return null;
+  }
+  const keyNode = ts.isPropertyAccessExpression(n)
+    ? n.name
+    : ts.isElementAccessExpression(n) && (ts.isStringLiteral(n.argumentExpression) || ts.isNumericLiteral(n.argumentExpression))
+      ? n.argumentExpression
+      : null;
+  if (keyNode !== null) {
+    const sym = L.checker.getSymbolAtLocation(keyNode);
+    const d = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (d !== undefined && d.parent && ts.isObjectLiteralExpression(d.parent)) {
+      if (ts.isMethodDeclaration(d)) return syntacticFnName(d);
+      if (ts.isPropertyAssignment(d)) {
+        const init = stripTsWrappers(d.initializer);
+        if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return syntacticFnName(init);
+      }
+    }
+  }
+  return null;
 }
 
 /** A function-typed dynFrom box gets esFuncNameOf(node) as its fnName. */
@@ -4450,6 +4650,7 @@ export class Lowerer {
     const kinds = new Map<string, Map<number, number>>();
     const lengths = new Map<string, number>();
     const spans = new Map<string, [number, number]>();
+    const defNames = new Map<string, string>();
     const kindsOf = (file: string): Map<number, number> => {
       const hit = kinds.get(file);
       if (hit !== undefined) return hit;
@@ -4485,6 +4686,12 @@ export class Lowerer {
             len++;
           }
           for (const key of keys) lengths.set(`${file}:${key}`, len);
+          // GH #246: the name Node gives this definition where its syntax
+          // alone fixes it (its own name, else SetFunctionName's at a
+          // variable binding or a literal key) — a closure boxed where it
+          // is created is that definition's fresh function.
+          const nm = syntacticFnName(n, (e) => foldedStringKeyOf(this, e));
+          if (nm !== null) for (const key of keys) defNames.set(`${file}:${key}`, nm);
         }
         return undefined;
       });
@@ -4648,6 +4855,16 @@ export class Lowerer {
         }
         if (loc !== undefined && k !== undefined) {
           rec.fnProto = k;
+          // GH #246: a function boxed right where it is created (a literal
+          // member, an argument) carries its definition's name, as in Node,
+          // and so does a binding every write of which is that one function
+          // (`let late; late = () => 1`) or a parameter only ever passed it;
+          // a box already named by its site keeps that name.
+          const r2 = rec as { fnName?: string };
+          if (r2.fnName === undefined) {
+            const nm = defNames.get(`${loc.file}:${loc.start}`);
+            if (nm !== undefined) r2.fnName = nm;
+          }
           const len = lengths.get(`${loc.file}:${loc.start}`);
           if (len !== undefined) rec.fnLength = len;
           // The source text: Node's own `String(f)` (a JavaScript source,
