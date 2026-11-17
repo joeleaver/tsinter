@@ -877,6 +877,13 @@ failing assertion whose message would render an untyped Map, WeakMap or
 WeakSet (`assert.deepStrictEqual`'s diff), as before. A sloppy-mode
 `forEach` callback with no thisArg sees `this` undefined, S042's plain-call
 residue.)*
+*(Amended 2026-11-17, GH #247, wasm and wasm-native: `for...in` re-checks
+each key's presence just before visiting it, as Node does, so a key deleted
+earlier in the same loop is skipped. Over a record or a dynamic object the
+re-check is this entry's presence test, so a key naming an Object.prototype
+member that the loop deleted before its turn ends the program at the same
+named fence, where Node finds the inherited member and visits the key.
+Keys that were not deleted are visited as before.)*
 (`Object.hasOwn` is own-only by
 definition, so it agrees with Node wherever the member genuinely exists,
 string receivers included; it parts company only where S016's padding
