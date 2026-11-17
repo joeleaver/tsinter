@@ -10656,6 +10656,24 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         const parts = L.lowerDestructuringAssignParts(expr.left, expr.right, loc);
         return { kind: "seqExpr", stmts: parts.stmts, result: parts.value, type: parts.value.type, loc };
       }
+      // GH #254: `x ??= e` in VALUE position over a dynamic variable or a
+      // union one: the statement (e only when x is nullish), then x's value
+      // afterwards — the expression's value either way. A typed non-union
+      // variable keeps the refusal below: its slot can read a zero value
+      // where Node has undefined (`let m!: number`, GH #255).
+      if (op === ts.SyntaxKind.QuestionQuestionEqualsToken && ts.isIdentifier(expr.left)) {
+        const target = L.resolveWritable(expr.left);
+        if (target && (target.type.kind === "dyn" || target.type.kind === "jsval" || target.type.kind === "union")) {
+          const stmt = L.lowerExprStatement(expr);
+          return {
+            kind: "seqExpr",
+            stmts: [stmt],
+            result: { kind: "varRef", localId: target.id, type: target.type, loc: locOf(expr.left) },
+            type: target.type,
+            loc,
+          };
+        }
+      }
       L.unsupported(
         "SC1090",
         expr,
