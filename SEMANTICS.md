@@ -10000,7 +10000,9 @@ Node), `pop()` of an empty array, a
 missing key of a `Record<string, T>` or index signature, a write past an
 array's end (the gap), a `T | undefined = undefined` default the checker
 narrows to `T` (GH #77), a `T`-typed field read before its first assignment
-(`x!: number`), `Array.from({ length })`'s unassigned slots, and a lying
+(`x!: number`), a `let` or `var` binding read before its first assignment
+(`let n!: number`, or one a closure reads first; GH #255 — a number or
+boolean binding used to start at 0 / false), `Array.from({ length })`'s unassigned slots, and a lying
 `undefined!` / `undefined as any as T`. On the WasmGC lanes each slot kind
 has one `undefined`: an f64 holds one signaling NaN (bits
 `0xFFF4756E64656600` — arithmetic quiets it, so `undefined + 1` is an
