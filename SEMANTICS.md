@@ -12385,10 +12385,10 @@ stop, and so does any prototype-chain walk (a member lookup, `instanceof`, for-i
 from an error prototype is error-like in Node (`instanceof Error`, its
 `name`, `String(o)`), which this tier does not model. An object literal's
 `__proto__: value` entry (a plain or quoted key; not computed, not
-shorthand, not a method) is refused by name — at compile time in
-TypeScript, where it runs in JavaScript on every lowering path of the
-literal (the JavaScript deferral stance; an unreached literal still
-builds) — (GH #244: JavaScript sets the new object's
+shorthand, not a method) is refused by name: a TypeScript program does
+not compile, and in JavaScript (the deferral stance, on every lowering path
+of the literal) the program stops when the literal is evaluated, while an
+unreached literal still builds (GH #244: JavaScript sets the new object's
 prototype there, where a record would have made an own key `__proto__`; the
 full modelling is unpicked); the shorthand `{ __proto__ }`, the computed
 `{ ["__proto__"]: v }` and the method `{ __proto__() {} }` are own keys in
@@ -12406,3 +12406,22 @@ expression still refuses at compile time (SC2020), and a dynamic class
 extending the Error value keeps its own unlinked prototype. **Tested by:**
 `packages/compiler/test/wasm-gh238-error-proto.test.ts` (GH238-01..32, 25 and 27
 compile-time refusals; wasm and wasm-native, against Node).
+
+**Amendment (GH #245): the Error-family constructors' own properties.** `Error.name`, `Error.length` and
+the same reads of TypeError, RangeError, SyntaxError, ReferenceError, URIError, EvalError and
+AggregateError answer Node's values (the name; length 1, AggregateError 2) — they read undefined and the
+lowering's own function-value length before, silently. The other own-property questions about one of these
+constructor values stop by name: the `hasOwnProperty` / `propertyIsEnumerable` methods, `in` with a key
+other than its own data properties (`"captureStackTrace" in Error`, zod's module-load test, and `length`,
+`name`, `prototype`, `stackTraceLimit` answer true as in Node; a literal key naming nothing on the
+constructor's chain — Error's statics, Function.prototype's and Object.prototype's string-keyed
+members — keeps the dynamic value's answer, `"nope" in Error` false as in Node; the chain's other
+names, symbol keys and run-time keys stop), and the
+Object / Reflect reflection statics with one as any argument (`getOwnPropertyNames`, `getOwnPropertySymbols`,
+`assign`, `keys`, `getPrototypeOf`, `defineProperty`, `freeze`, …), `Error.toString()` and the other
+Object.prototype methods called on one, and `name` / `length` / `prototype` read through the global object
+(`globalThis.Error.name`). These refuse the build in TypeScript and stop when evaluated in JavaScript.
+The bracket and optional spellings (`Error["name"]`, `Error?.length`) answer like the dotted one.
+`getOwnPropertySymbols(Error)` crashed the compiler before, and so did `typeof` of an absent member of a
+JavaScript literal (`typeof o.stack`), which now answers "undefined". **Tested by:**
+`packages/compiler/test/wasm-gh245-error-ctor.test.ts` (wasm and wasm-native, against Node).

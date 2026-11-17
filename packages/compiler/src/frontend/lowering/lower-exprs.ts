@@ -814,9 +814,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       const recvName = ts.isPropertyAccessExpression(recv) ? recv.name.text
         : ts.isElementAccessExpression(recv) && ts.isStringLiteralLike(recv.argumentExpression) ? recv.argumentExpression.text : null;
       const base = ts.isPropertyAccessExpression(recv) || ts.isElementAccessExpression(recv) ? recv.expression : null;
-      if (key === "prototype" && recvName !== null && /^(Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError)$/.test(recvName) &&
+      if ((key === "prototype" || key === "name" || key === "length") && recvName !== null && /^(Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError)$/.test(recvName) &&
           base !== null && ts.isIdentifier(base) && stdlibGlobalNameOf(L, base) === "globalThis") {
-        L.unsupported("SC1090", expr, `${recvName}.prototype read through the global object (globalThis.${recvName}.prototype; only the plain Error.prototype spelling is modeled)`);
+        L.unsupported("SC1090", expr, `${recvName}.${key} read through the global object (globalThis.${recvName}.${key}; only the plain ${recvName}.${key} spelling is modeled)`);
       }
     }
     // GH #238 (review, round 3): a run-time key read of an Error-family
@@ -836,10 +836,64 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       }
       if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression) && ts.isIdentifier(expr.expression.expression) &&
           (expr.expression.expression.text === "Object" || expr.expression.expression.text === "Reflect") &&
-          /^(getOwnPropertyDescriptor|getOwnPropertyDescriptors|getOwnPropertyNames|hasOwn|keys|values|entries)$/.test(expr.expression.name.text) &&
-          expr.arguments.length >= 1 && !ts.isSpreadElement(expr.arguments[0]!)) {
-        const n = errCtor(expr.arguments[0]!);
-        if (n !== null) L.unsupported("SC1090", expr, `${expr.expression.expression.text}.${expr.expression.name.text} over the ${n} constructor (its own properties are not modeled)`);
+          /^(getOwnPropertyDescriptor|getOwnPropertyDescriptors|getOwnPropertyNames|getOwnPropertySymbols|ownKeys|has|hasOwn|keys|values|entries|assign|getPrototypeOf|setPrototypeOf|defineProperty|defineProperties|freeze|isFrozen|seal|isSealed|preventExtensions|isExtensible)$/.test(expr.expression.name.text) &&
+          expr.arguments.length >= 1) {
+        // (GH #245: any argument position — `Object.assign({}, Error)` reads
+        // its own enumerable properties as a source)
+        for (const a of expr.arguments) {
+          if (ts.isSpreadElement(a)) continue;
+          const n = errCtor(a);
+          if (n !== null) L.unsupported("SC1090", expr, `${expr.expression.expression.text}.${expr.expression.name.text} over the ${n} constructor (its own properties are not modeled)`);
+        }
+      }
+      // GH #245: the Error-family constructors' own `name` and `length`
+      // answer Node's values (they read undefined and the lowering's own
+      // function-value length); the other own-property questions — the
+      // hasOwnProperty / propertyIsEnumerable methods and `in` — stop by
+      // name.
+      const memberKey = ts.isPropertyAccessExpression(expr) ? expr.name.text
+        : ts.isElementAccessExpression(expr) && ts.isStringLiteralLike(expr.argumentExpression) ? expr.argumentExpression.text : null;
+      if ((ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) && (memberKey === "name" || memberKey === "length")) {
+        // (review: the bracket spelling and `?.` too — the constructor is
+        // never nullish)
+        const n = errCtor(expr.expression);
+        let up: ts.Node = expr.parent;
+        while (ts.isParenthesizedExpression(up)) up = up.parent;
+        const written = (ts.isBinaryExpression(up) && up.left === expr && up.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && up.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+          ((ts.isPrefixUnaryExpression(up) || ts.isPostfixUnaryExpression(up)) && (up.operator === ts.SyntaxKind.PlusPlusToken || up.operator === ts.SyntaxKind.MinusMinusToken)) ||
+          ts.isDeleteExpression(up);
+        if (n !== null && !written) {
+          const loc = locOf(expr);
+          return memberKey === "name"
+            ? { kind: "strLit", value: n, type: STRING, loc }
+            : { kind: "numLit", value: n === "AggregateError" ? 2 : 1, type: F64, loc };
+        }
+      }
+      if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression) &&
+          /^(hasOwnProperty|propertyIsEnumerable|toString|toLocaleString|valueOf)$/.test(expr.expression.name.text)) {
+        const n = errCtor(expr.expression.expression);
+        if (n !== null) L.unsupported("SC1090", expr, `${n}.${expr.expression.name.text}(…) (the ${n} constructor's own properties are not modeled)`);
+      }
+      if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.InKeyword) {
+        const n = errCtor(expr.right);
+        if (n !== null) {
+          // zod's module load asks `"captureStackTrace" in Error`: the
+          // constructors' own data properties (V8: length, name,
+          // prototype; Error's captureStackTrace and stackTraceLimit, which
+          // the other kinds inherit from Error) answer true, as in Node.
+          const k = ts.isStringLiteralLike(expr.left) ? expr.left.text : null;
+          if (k !== null && ["length", "name", "prototype", "captureStackTrace", "stackTraceLimit"].includes(k)) {
+            return { kind: "boolLit", value: true, type: BOOL, loc: locOf(expr) };
+          }
+          // A literal key that names nothing on the constructor's chain
+          // (its own statics, Function.prototype's and Object.prototype's
+          // members) keeps the dynamic value's answer, as before GH #245
+          // (U34B-ERR-01's `"nope" in Error` is false, as in Node); the
+          // chain's unmodeled names and run-time keys stop by name.
+          if (k === null || ERR_CTOR_CHAIN_KEYS.has(k)) {
+            L.unsupported("SC1090", expr, `'in' on the ${n} constructor for a key other than its own length, name, prototype, captureStackTrace or stackTraceLimit (its other properties are not modeled)`);
+          }
+        }
       }
     }
 
@@ -1737,6 +1791,28 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       let operand = L.lowerExpr(expr.expression);
       if (operand.type.kind === "jsval") {
         return { kind: "jsOp", op: "typeof", args: [operand], type: STRING, loc };
+      }
+      // (GH #245 review) a read that lowered to the bare undefined / null
+      // unit (an absent member of a JavaScript literal: `typeof o.stack`)
+      // has no side effect: its typeof folds (it was an internal compiler
+      // error).
+      {
+        // (through the pass-through wrappers a slot coercion may add, and a
+        // sequence whose statements run first — Unit U's undefined-receiver
+        // guard: `typeof o.missing`)
+        const stmts: IrStmt[] = [];
+        let u0: IrExpr = operand;
+        for (;;) {
+          if (u0.kind === "upcast" || u0.kind === "downcast" || u0.kind === "unionWrap") u0 = (u0 as unknown as { value: IrExpr }).value;
+          else if (u0.kind === "seqExpr") {
+            stmts.push(...(u0 as IrExpr & { kind: "seqExpr" }).stmts);
+            u0 = (u0 as IrExpr & { kind: "seqExpr" }).result;
+          } else break;
+        }
+        if (u0.kind === "unitLit") {
+          const lit: IrExpr = { kind: "strLit", value: u0.unit === "null" ? "object" : "undefined", type: STRING, loc };
+          return stmts.length === 0 ? lit : { kind: "seqExpr", stmts, result: lit, type: STRING, loc };
+        }
       }
       // A checker-narrowed dyn read arrives as a VALIDATED extraction
       // (maybeNarrow's dynCheck bridge). typeof needs no extraction — the
@@ -14307,6 +14383,16 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
  * Node's (record-order.ts) — the write itself, preceded by the order note
  * when the field is optional on an ordered shape. `receiverGuard` wraps it
  * in Unit U's undefined-receiver throw (the dot spelling's). */
+/** GH #245: the names an Error-family constructor answers `in` for
+ * through its own statics or its prototype chain (Function.prototype,
+ * Object.prototype) beyond the five own data keys the lowering answers. */
+const ERR_CTOR_CHAIN_KEYS = new Set([
+  "prepareStackTrace", "isError",
+  "arguments", "caller", "constructor", "apply", "bind", "call", "toString",
+  "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__", "__lookupSetter__",
+  "isPrototypeOf", "propertyIsEnumerable", "valueOf", "__proto__", "toLocaleString",
+]);
+
 export function orderedRecordWrite(L: Lowerer, write: IrStmt & { kind: "recordSet" }, receiverGuard: boolean): IrStmt {
   const wrap = (w: IrStmt): IrStmt => (receiverGuard ? undefWriteGuard(L, w) : w);
   const shape = orderedShape(L, write.shapeId);
