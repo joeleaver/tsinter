@@ -1694,6 +1694,13 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       if (operand.type.kind === "jsval") {
         return { kind: "jsOp", op: "typeof", args: [operand], type: STRING, loc };
       }
+      // GH #248: an operand that is statically a unit behind its receiver
+      // guard (a JavaScript source's read of a key its record lacks): the
+      // guard runs, then the unit's answer.
+      if (operand.kind === "seqExpr" && operand.result.kind === "unitLit") {
+        const answer: IrExpr = { kind: "strLit", value: operand.result.unit === "null" ? "object" : "undefined", type: STRING, loc };
+        return { kind: "seqExpr", stmts: operand.stmts, result: answer, type: STRING, loc };
+      }
       // A checker-narrowed dyn read arrives as a VALIDATED extraction
       // (maybeNarrow's dynCheck bridge). typeof needs no extraction — the
       // dyn kind table answers the question directly, and answers it even
@@ -4816,6 +4823,22 @@ export function pureReemittable(e: IrExpr): boolean {
       // marshals in (the emitter's jsval nullish arm).
       const right = L.jsvalIn(L.lowerExpr(expr.right), expr.right);
       return { kind: "nullish", left, right, type: JSVAL, loc };
+    }
+    // A left that IS undefined or null (a JavaScript source's read of a key
+    // its record lacks — `widthOptions.regularWidth` over a `{}` instance —
+    // lowers to the unit itself): always nullish, so the value is the
+    // default's, after the left's own effects.
+    if (left.type.kind === "undefinedT" || left.type.kind === "nullT") {
+      // The default lands where the whole expression's type puts it (the
+      // checker's `any` for an absent key: the dynamic value).
+      const whole = L.mapTypeOf(L.typeOf(expr));
+      const right = whole !== null && whole.kind !== "void" ? L.lowerExprExpecting(expr.right, whole) : L.lowerExpr(expr.right);
+      if (left.kind === "unitLit" || droppableStatic(left)) return right;
+      // (The guarded form: the receiver check's statements, then the unit.)
+      if (left.kind === "seqExpr" && left.result.kind === "unitLit") {
+        return { kind: "seqExpr", stmts: left.stmts, result: right, type: right.type, loc };
+      }
+      L.unsupported("SC1090", expr, "'??' whose left operand is always nullish but has effects");
     }
     const unitFree = left.type.kind === "union" && !(L.unions.get(left.type.unionId)?.arms.some(isUnitType) ?? true);
     if (left.type.kind !== "union" || unitFree) {
@@ -10560,6 +10583,12 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       if (left.kind === "unitLit") {
         return op === ts.SyntaxKind.BarBarToken ? right : left;
       }
+      // (GH #248: the same unit behind its receiver guard — a JavaScript
+      // source's read of a key its record lacks, `o.w || 2` over a `{}`
+      // instance: the guard's statements run, then the fold.)
+      if (left.kind === "seqExpr" && left.result.kind === "unitLit" && op === ts.SyntaxKind.BarBarToken) {
+        return { kind: "seqExpr", stmts: left.stmts, result: right, type: right.type, loc };
+      }
       if (left.type.kind === "dyn" || right.type.kind === "dyn") {
         // A checked-dynamic operand (`fn.name || '<anonymous>'` —
         // test/common's _mustCallInner): both sides live in the checked-dynamic tree and
@@ -11036,6 +11065,20 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         // `desired.lanMode !== actual.lanMode` shape).
         if (left.type.kind === "bool" && right.type.kind === "bool") {
           return { kind: "bin", op: negated ? "!==" : "===", left, right, type: BOOL, loc };
+        }
+        // GH #248: two operands that are each statically one unit (a
+        // literal, or a JavaScript source's read of a key its record lacks
+        // — the unit behind its receiver guard): strict equality is known,
+        // after both operands' statements.
+        {
+          const unitOf = (e: IrExpr): { stmts: IrStmt[]; unit: string } | null =>
+            e.kind === "unitLit" ? { stmts: [], unit: e.unit } : e.kind === "seqExpr" && e.result.kind === "unitLit" ? { stmts: e.stmts, unit: e.result.unit } : null;
+          const lu = unitOf(left);
+          const ru = unitOf(right);
+          if (lu !== null && ru !== null && (lu.stmts.length > 0 || ru.stmts.length > 0)) {
+            const value: IrExpr = { kind: "boolLit", value: (lu.unit === ru.unit) !== negated, type: BOOL, loc };
+            return { kind: "seqExpr", stmts: [...lu.stmts, ...ru.stmts], result: value, type: BOOL, loc };
+          }
         }
         const unitTest = L.lowerUnitComparison(left, right, negated, loc);
         if (unitTest) return unitTest;
