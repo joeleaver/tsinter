@@ -23,7 +23,7 @@ import { mixinFnShapeOf } from "./lower-mixins.js";
 import { lowerBigIntGlobalCall, lowerBigIntMethodCall, lowerBigIntStaticCall } from "./lower-bigint.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerTypedArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
+import { codePointAtOn, lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
 import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
@@ -5363,7 +5363,12 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // chained form — `cfg.host.trim().toLowerCase()`, where the first step
     // extracted): no validation needed, ride the string tables directly.
     if (recv.type.kind === "string") {
-      return lowerRegexMethodCall(L, call, access, () => recv) ?? lowerStringMethodCall(L, call, access, () => recv);
+      // (codePointAt: a number or undefined, which an f64 slot holds on
+      // the WasmGC lanes — S119.)
+      const cpAt = access.name.text === "codePointAt" && L.undefSlots && call.arguments.length === 1 && !call.arguments.some(ts.isSpreadElement) && !call.questionDotToken && !access.questionDotToken
+        ? codePointAtOn(L, call, recv, F64)
+        : null;
+      return cpAt ?? lowerRegexMethodCall(L, call, access, () => recv) ?? lowerStringMethodCall(L, call, access, () => recv);
     }
     if (recv.type.kind !== "dyn") return null;
     // A declared interface over a dynamic implementation (S133 (k)): the
@@ -5411,6 +5416,15 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
     // these, "the receiver is a string, or the call throws V8's TypeError"
     // IS Node's semantics for every possible dyn value. Shared names would
     // need a receiver-kind dispatch — they keep the fence.
+    // codePointAt is String.prototype's alone too; its result is a number
+    // or undefined, which an f64 slot holds on the WasmGC lanes (S119).
+    if (
+      access.name.text === "codePointAt" && L.undefSlots && call.arguments.length === 1 &&
+      !call.arguments.some(ts.isSpreadElement) && !call.questionDotToken && !access.questionDotToken
+    ) {
+      const cp = codePointAtOn(L, call, dynStringReceiver(L, recv, access), F64);
+      if (cp) return cp;
+    }
     if (DYN_STRING_ONLY_METHODS.has(access.name.text)) {
       const checked = (): IrExpr => dynStringReceiver(L, recv, access);
       return lowerRegexMethodCall(L, call, access, checked) ?? lowerStringMethodCall(L, call, access, checked);

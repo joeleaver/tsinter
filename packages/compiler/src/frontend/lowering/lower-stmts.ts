@@ -3373,7 +3373,26 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       return { kind: "block", body: out, loc: locOf(list) };
     }
     if (list.declarations.length !== 1) {
-      L.unsupported("SC1090", list, "multi-declaration for-loop initializers");
+      // Several let/const declarators no closure captures
+      // (`for (let i = 0, l = xs.length; i < l; i++)`): each iteration's
+      // fresh copy of the bindings is unobservable without a capture, so
+      // they are plain locals declared in order — what the single
+      // declarator lowers to when uncaptured. A captured one (a closure
+      // anywhere in the loop naming it) keeps the fence: the per-iteration
+      // copies would be observable.
+      if (!forInitCaptured(L, list)) {
+        const out: IrStmt[] = [];
+        for (const decl of list.declarations) {
+          if (!ts.isIdentifier(decl.name)) {
+            L.unsupported("SC1031", decl.name, "let/const destructuring in for-loop initializers (declare the pattern before the loop, or use var)");
+          }
+          const lowered = L.lowerVarDecl(decl, isLet);
+          if (!lowered) throw new Error("lowerer bug: for-init declarator resolved to a global");
+          out.push(lowered);
+        }
+        return { kind: "block", body: out, loc: locOf(list) };
+      }
+      L.unsupported("SC1090", list, "multi-declaration for-loop initializers whose bindings a closure captures");
     }
     const decl = list.declarations[0]!;
     if (ts.isArrayBindingPattern(decl.name) || ts.isObjectBindingPattern(decl.name)) {
@@ -3393,6 +3412,35 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     if (!lowered) throw new Error("lowerer bug: for-init declarator resolved to a global");
     return lowered;
   }
+
+/** Does a function, class or other closure anywhere in the for statement
+ * owning `list` (its initializers, condition, update and body) name one
+ * of the bindings `list` declares? */
+function forInitCaptured(L: Lowerer, list: ts.VariableDeclarationList): boolean {
+  const syms = new Set<ts.Symbol>();
+  for (const decl of list.declarations) {
+    for (const id of boundIdentifiersOf(decl.name)) {
+      const s = L.checker.getSymbolAtLocation(id);
+      if (s) syms.add(s);
+    }
+  }
+  const loop: ts.Node = list.parent ?? list;
+  let captured = false;
+  const visit = (n: ts.Node, inClosure: boolean): void => {
+    if (captured) return;
+    const closure = inClosure || ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n);
+    if (closure && (ts.isIdentifier(n) || ts.isShorthandPropertyAssignment(n))) {
+      const s = ts.isShorthandPropertyAssignment(n) ? L.checker.getShorthandAssignmentValueSymbol(n) : L.checker.getSymbolAtLocation(n);
+      if (s && syms.has(s)) {
+        captured = true;
+        return;
+      }
+    }
+    ts.forEachChild(n, (c) => visit(c, closure));
+  };
+  visit(loop, false);
+  return captured;
+}
 
 /** The union a JavaScript `let` binding of class type `t` must hold: the
  * mapped type of some later assignment's right-hand side that is `t` plus

@@ -49,6 +49,13 @@ import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
+/** `eq`'s s33 heap type (dyn.ts's EQ_HEAP): the dynBox field's type. */
+const EQ_HEAP = -0x13;
+
+/** The regex struct's field indices past the five immutable ones. */
+export const RE_F_LAST_INDEX = 5;
+export const RE_F_DYN_BOX = 6;
+
 export class RegexBuilder {
   private readonly literals = new Map<string, number>();
   private escapeFn: number | null = null;
@@ -100,7 +107,20 @@ export class RegexBuilder {
       // raw number (ToLength applies where RegExpBuiltinExec reads it).
       // Every construction site pushes f64 0 last (pushLastIndexInit).
       ...(hasLastIndex ? [{ storage: F64, mutable: true }] : []), // lastIndex
+      // The value's dynamic box (dyn.ts regexBox), made at its first
+      // crossing into dynamic code and reused by every later one, so the
+      // shared value keeps ONE identity there (Node's object identity).
+      // Every construction site pushes a null eq ref after lastIndex.
+      ...(hasLastIndex ? [{ storage: { kind: "ref" as const, nullable: true, typeIndex: EQ_HEAP }, mutable: true }] : []), // dynBox
     ]);
+  }
+
+  /** The mutable tail every construction pushes last: lastIndex 0 and no
+   * dynamic box yet (output modules only). */
+  pushStateInit(c: Code): void {
+    if (!this.hasLastIndex) return;
+    c.f64Const(0); // lastIndex
+    c.refNull(EQ_HEAP); // dynBox
   }
 
   private strRef(): ValType {
@@ -185,7 +205,7 @@ export class RegexBuilder {
       for (const name of groupNames) this.pushStrLit(c, name);
       c.arrayNewFixed(this.strArrType, groupNames.length);
     }
-    if (this.hasLastIndex) c.f64Const(0); // lastIndex
+    this.pushStateInit(c);
     c.structNew(this.regexType);
     c.globalSet(g);
     c.end();
@@ -213,7 +233,7 @@ export class RegexBuilder {
       c.localGet(0);
       c.structGet(this.regexType, f);
     }
-    c.f64Const(0);
+    this.pushStateInit(c);
     c.structNew(this.regexType);
     this.mb.setBody(idx, [], c.bytes());
     return idx;
@@ -246,7 +266,7 @@ export class RegexBuilder {
       for (const name of groupNames) this.pushStrLit(c, name);
       c.arrayNewFixed(this.strArrType, groupNames.length);
     }
-    if (this.hasLastIndex) c.f64Const(0); // lastIndex
+    this.pushStateInit(c);
     c.structNew(this.regexType);
   }
 

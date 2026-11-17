@@ -264,67 +264,79 @@ export function lowerStringMemberExtra(L: Lowerer, call: ts.CallExpression, acce
     return out;
   }
 
-  if (name === "codePointAt") {
-    // codePointAt(pos): ToIntegerOrInfinity(pos); undefined outside
-    // [0, len); a lead surrogate followed by a trail answers the pair's
-    // code point, anything else the code unit itself.
-    const pos = optionalNumber(L, args[0]!, num(0, loc));
-    if (!pos) return null;
-    const resultT = L.irTypeOf(call);
-    if (resultT.kind !== "union") return null;
-    const undefTag = L.armTag(resultT.unionId, UNDEFINED_T);
-    const numTag = L.armTag(resultT.unionId, F64);
-    if (undefTag < 0 || numTag < 0) return null;
-    const helper = internHelper(
-      L,
-      `str.codePointAt:${typeKey(resultT)}`,
-      "str.codePointAt",
-      [{ id: "s.0", type: STRING }, { id: "i.0", type: F64 }],
-      [{ id: "n.0", type: F64 }, { id: "t.0", type: F64 }, { id: "c.0", type: F64 }, { id: "d.0", type: F64 }],
-      resultT,
-      loc,
-      () => {
-        const s = ref("s.0", STRING, loc);
-        const t = ref("t.0", F64, loc);
-        const nn = ref("n.0", F64, loc);
-        const c = ref("c.0", F64, loc);
-        const d = ref("d.0", F64, loc);
-        const wrapNum = (v: IrExpr): IrExpr => ({ kind: "unionWrap", unionId: resultT.unionId, tag: numTag, value: v, type: resultT, loc });
-        const miss: IrExpr = {
-          kind: "unionWrap",
-          unionId: resultT.unionId,
-          tag: undefTag,
-          value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
-          type: resultT,
-          loc,
-        };
-        const at = (i: IrExpr): IrExpr => ({ kind: "strIntrinsic", method: "charCodeAt", receiver: s, args: [i], type: F64, loc });
-        return [
-          decl("n.0", strLen(s, loc), loc),
-          decl("t.0", truncOf(ref("i.0", F64, loc), loc), loc),
-          ifThen(isNaNOf(t, loc), [assign("t.0", num(0, loc), loc)], loc),
-          ifThen(or(bin("<", t, num(0, loc), loc), bin(">=", t, nn, loc), loc), [ret(miss, loc)], loc),
-          decl("c.0", at(t), loc),
-          decl("d.0", num(0, loc), loc),
-          ifThen(
-            and(and(bin(">=", c, num(0xd800, loc), loc), bin("<=", c, num(0xdbff, loc), loc), loc), bin("<", bin("+", t, num(1, loc), loc), nn, loc), loc),
-            [
-              assign("d.0", at(bin("+", t, num(1, loc), loc)), loc),
-              ifThen(
-                and(bin(">=", d, num(0xdc00, loc), loc), bin("<=", d, num(0xdfff, loc), loc), loc),
-                [ret(wrapNum(bin("+", bin("+", bin("*", bin("-", c, num(0xd800, loc), loc), num(0x400, loc), loc), bin("-", d, num(0xdc00, loc), loc), loc), num(0x10000, loc), loc)), loc)],
-                loc,
-              ),
-            ],
-            loc,
-          ),
-          ret(wrapNum(c), loc),
-        ];
-      },
-    );
-    return { kind: "call", callee: helper, args: [recv, pos], type: resultT, loc };
-  }
+  if (name === "codePointAt") return codePointAtOn(L, call, recv, L.irTypeOf(call));
   return null;
+}
+
+/** `s.codePointAt(pos)` over the string `recv` (call's one argument), typed
+ * `resultT`: `number | undefined`, or — on the WasmGC lanes — a plain
+ * number whose miss is the slot's undefined (S119); null otherwise. */
+export function codePointAtOn(L: Lowerer, call: ts.CallExpression, recv: IrExpr, resultT: IrType): IrExpr | null {
+  const loc = locOf(call);
+  const args = call.arguments;
+  // codePointAt(pos): ToIntegerOrInfinity(pos); undefined outside
+  // [0, len); a lead surrogate followed by a trail answers the pair's
+  // code point, anything else the code unit itself.
+  const pos = optionalNumber(L, args[0]!, num(0, loc));
+  if (!pos) return null;
+  // Without strictNullChecks (a JavaScript source) the checker types the
+  // result `number`: on the WasmGC lanes an f64 slot holds the miss as
+  // the slot's undefined (S119), which reads back as Node's undefined.
+  const slotForm = resultT.kind === "f64" && L.undefSlots;
+  if (resultT.kind !== "union" && !slotForm) return null;
+  const undefTag = resultT.kind === "union" ? L.armTag(resultT.unionId, UNDEFINED_T) : -1;
+  const numTag = resultT.kind === "union" ? L.armTag(resultT.unionId, F64) : -1;
+  if (!slotForm && (undefTag < 0 || numTag < 0)) return null;
+  const helper = internHelper(
+    L,
+    `str.codePointAt:${typeKey(resultT)}`,
+    "str.codePointAt",
+    [{ id: "s.0", type: STRING }, { id: "i.0", type: F64 }],
+    [{ id: "n.0", type: F64 }, { id: "t.0", type: F64 }, { id: "c.0", type: F64 }, { id: "d.0", type: F64 }],
+    resultT,
+    loc,
+    () => {
+      const s = ref("s.0", STRING, loc);
+      const t = ref("t.0", F64, loc);
+      const nn = ref("n.0", F64, loc);
+      const c = ref("c.0", F64, loc);
+      const d = ref("d.0", F64, loc);
+      const wrapNum = (v: IrExpr): IrExpr => (resultT.kind === "union" ? { kind: "unionWrap", unionId: resultT.unionId, tag: numTag, value: v, type: resultT, loc } : v);
+      const miss: IrExpr = resultT.kind === "union"
+        ? {
+            kind: "unionWrap",
+            unionId: resultT.unionId,
+            tag: undefTag,
+            value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
+            type: resultT,
+            loc,
+          }
+        : ({ kind: "slotUndef", type: F64, loc } as IrExpr);
+      const at = (i: IrExpr): IrExpr => ({ kind: "strIntrinsic", method: "charCodeAt", receiver: s, args: [i], type: F64, loc });
+      return [
+        decl("n.0", strLen(s, loc), loc),
+        decl("t.0", truncOf(ref("i.0", F64, loc), loc), loc),
+        ifThen(isNaNOf(t, loc), [assign("t.0", num(0, loc), loc)], loc),
+        ifThen(or(bin("<", t, num(0, loc), loc), bin(">=", t, nn, loc), loc), [ret(miss, loc)], loc),
+        decl("c.0", at(t), loc),
+        decl("d.0", num(0, loc), loc),
+        ifThen(
+          and(and(bin(">=", c, num(0xd800, loc), loc), bin("<=", c, num(0xdbff, loc), loc), loc), bin("<", bin("+", t, num(1, loc), loc), nn, loc), loc),
+          [
+            assign("d.0", at(bin("+", t, num(1, loc), loc)), loc),
+            ifThen(
+              and(bin(">=", d, num(0xdc00, loc), loc), bin("<=", d, num(0xdfff, loc), loc), loc),
+              [ret(wrapNum(bin("+", bin("+", bin("*", bin("-", c, num(0xd800, loc), loc), num(0x400, loc), loc), bin("-", d, num(0xdc00, loc), loc), loc), num(0x10000, loc), loc)), loc)],
+              loc,
+            ),
+          ],
+          loc,
+        ),
+        ret(wrapNum(c), loc),
+      ];
+    },
+  );
+  return { kind: "call", callee: helper, args: [recv, pos], type: resultT, loc };
 }
 
 /** `String.fromCodePoint(...codePoints)` on THE String global: each code

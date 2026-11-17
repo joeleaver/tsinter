@@ -553,3 +553,30 @@ describe("GH #248 absent keys of a closed JavaScript object (both WasmGC lanes)"
     expect(wasmRes.exitCode).toBe(nodeRes.exitCode);
   }, 120_000);
 });
+
+// fast-string-truncated-width@3.0.3, vendored unmodified (a dependency of
+// @clack/prompts: paperclip's start-up evaluates its module-level regexes,
+// and its `env` case measures text with it). Built statically on BOTH
+// WasmGC lanes and byte-compared with Node: dist/index.js's
+// multi-declarator for-init, its [RegExp, number][] PARSE_BLOCKS read by
+// destructuring, its RegExp identity comparisons, its sticky /yu Script and
+// emoji regexes, and utils.js's closure-held global regex.
+describe("npm-static fast-string-truncated-width (both WasmGC lanes)", () => {
+  const entry = join(pilotRoot, "fstw-cli.ts");
+  test("wasm-native: compiles statically and byte-matches Node", async () => {
+    const binary = await buildStatic(entry, ["fast-string-truncated-width"]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+  test("wasm: compiles statically and byte-matches Node", async () => {
+    const outDir = join(cacheDir, "npm-static-fstw-wasm");
+    mkdirSync(outDir, { recursive: true });
+    const result = await compile(entry, { outPath: join(outDir, "p.wasm"), outDir, npmStatic: ["fast-string-truncated-width"], backend: "wasm" });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, wasmRes] = await Promise.all([runBinary("node", [entry]), runWasm(result.binaryPath)]);
+    expect(wasmRes.stdout).toBe(nodeRes.stdout.toString("utf8"));
+    expect(wasmRes.stderr).toBe("");
+    expect(wasmRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+});

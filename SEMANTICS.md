@@ -4170,6 +4170,39 @@ whose pattern is computed at run time before it reaches the boundary.
 **Tested by:** F1-RE-01..05 and F1-CORPUS-2172 in
 `packages/compiler/test/wasm-island-a.test.ts`.
 
+**Amendment (fast-string-truncated-width, wasm and wasm-native): a typed
+RegExp crossing into dynamic code is SHARED.** Any typed RegExp value — a
+literal, a binding, a `new RegExp`, an element of a typed array or a union
+arm — crossing into `any`/`unknown`/a JavaScript residue slot is no longer
+rebuilt from its source and flags (and no longer fenced when computed, or
+when global/sticky or holding a nonzero lastIndex, board #301's crossing
+fence): the island RegExp holds the SAME compiled value, boxed once per value
+and reused at every later crossing, so it is one object in both worlds as in
+Node — `===` against it (from either side) is identity, and lastIndex is the
+value's own. On that value: `lastIndex` reads the live index; storing a
+NUMBER into it sets it (any other value, and any other member write, keeps
+the named fence above); `test` is the typed `RegExp.prototype.test`
+(RegExpBuiltinExec: a global or sticky regex reads and moves lastIndex) —
+called as a method, and read as a value it is one interned function
+(`re.test === re2.test`, name `test`, length 1) that runs on its `this` (a
+receiver that is no island RegExp stops by name); deep equality compares
+source, flags and lastIndex (Node's areSimilarRegExps). `exec`, `compile`,
+reading `exec`/`toString`/`compile` as values, and `structuredClone` keep
+their fences. A dynamic string split by such a value splits with the regex
+(Symbol.split, its lastIndex untouched; a limit is ToUint32'd as Node's;
+a capture group that did not participate is `undefined`) — before, it
+split by the regex's TEXT, a silent wrong answer; a LIMIT with a
+non-RegExp separator on a dynamic string stops by name (it was ignored);
+`match`, `matchAll` and `search` called on a
+dynamic string stop by name (they threw a catchable "is not a function"
+where Node runs them). Two typed RegExps compare by identity with `===` too (every
+literal evaluation is a fresh value since board #301). Before this, a typed
+RegExp in an `any[]` (fast-string-truncated-width's `[[LATIN_RE, w], …]`)
+was an internal compiler error (GH #240).
+**Tested by:** the "npm-static fast-string-truncated-width" block of
+`tests/harness/npm-static.test.ts` (the package vendored unmodified, both
+lanes against Node).
+
 **Amendment (unit I): unions, URLs and typed arrays crossing into a
 dynamic value.** A union crosses by its runtime tag (each arm's own
 conversion; an `undefined`/`null` arm is the island's own unit), Node's

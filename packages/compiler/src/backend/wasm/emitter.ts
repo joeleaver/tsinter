@@ -3840,6 +3840,8 @@ class Assembler {
       });
     }
     this.regexIslandLive = this.irNodeReachable(mod, (rec) => {
+      // A typed RegExp shared into dynamic code (jsvalLiftExpr's regex arm).
+      if (rec["kind"] === "jsMarshal" && (rec["value"] as { type?: IrType } | undefined)?.type?.kind === "regex") return true;
       if (rec["kind"] !== "jsOp" || rec["op"] !== "construct") return false;
       const callee = (rec["args"] as Record<string, unknown>[] | undefined)?.[0];
       return callee?.["kind"] === "jsOp" && callee["op"] === "globalGet" && callee["name"] === "RegExp";
@@ -34867,6 +34869,11 @@ class Assembler {
           return;
         }
         switch (vt.kind) {
+          case "regex":
+            // A typed RegExp shared into dynamic code: the value's own
+            // island box (dyn.ts regexBox), the same object.
+            this.dyn.boxRegex(code, () => this.walkExpr(e.value));
+            return;
           case "f64":
             this.dyn.boxNum(code, () => this.walkExpr(e.value));
             return;
@@ -35843,15 +35850,80 @@ class Assembler {
               code.ifResult(this.dyn.dynRef());
               {
                 const vecOfStr = this.acquireScratch(vecOfStrType);
-                code.localGet(recv);
-                code.structGet(this.dyn.dynT(), DYN_REF);
-                emitFlatCast(code, this.strType);
                 this.walkExpr(e.args[1]!);
                 const sepRecv = this.acquireScratch(this.dyn.dynRef());
                 code.localSet(sepRecv);
-                code.localGet(sepRecv);
-                code.call(this.dyn.toStr());
-                code.call(this.strs.split());
+                // The limit (both arguments evaluate before the call): an
+                // undefined one is the no-limit form.
+                const limRecv = e.args.length >= 3 ? this.acquireScratch(this.dyn.dynRef()) : -1;
+                if (limRecv >= 0) {
+                  this.walkExpr(e.args[2]!);
+                  code.localSet(limRecv);
+                  for (let k = 3; k < e.args.length; k++) {
+                    this.walkExpr(e.args[k]!);
+                    code.drop();
+                  }
+                }
+                const limGiven = (): void => {
+                  code.localGet(limRecv);
+                  code.structGet(this.dyn.dynT(), DYN_KIND);
+                  code.i32Const(DK.UNDEF);
+                  code.i32Ne();
+                };
+                const splitByString = (): void => {
+                  if (limRecv >= 0) {
+                    // A string separator with a limit: not modelled here.
+                    limGiven();
+                    code.ifVoid();
+                    this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, "'String.prototype.split' with a limit on a dynamic string and a non-RegExp separator is not supported yet"));
+                    code.end();
+                  }
+                  code.localGet(recv);
+                  code.structGet(this.dyn.dynT(), DYN_REF);
+                  emitFlatCast(code, this.strType);
+                  code.localGet(sepRecv);
+                  code.call(this.dyn.toStr());
+                  code.call(this.strs.split());
+                };
+                if (this.dyn.regexLive) {
+                  // A RegExp separator held in a dynamic value (a typed
+                  // RegExp shared into dynamic code): Symbol.split with the
+                  // typed matcher (regex-state.ts), never its text.
+                  const rowVec = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+                  if (rowVec.struct !== vecInfo.struct) throw new Error("wasm emitter bug: regex split rows are not the string vector");
+                  const reT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+                  const reL = this.acquireScratch(reT);
+                  code.localGet(sepRecv);
+                  code.call(this.dyn.regexOrNull());
+                  code.localTee(reL);
+                  code.refIsNull();
+                  code.ifResult(vecOfStrType);
+                  splitByString();
+                  code.else_();
+                  code.localGet(recv);
+                  code.structGet(this.dyn.dynT(), DYN_REF);
+                  emitFlatCast(code, this.strType);
+                  code.localGet(reL);
+                  if (limRecv >= 0) {
+                    // ToNumber of the raw limit; the helper applies ToUint32.
+                    limGiven();
+                    code.ifResult(F64);
+                    code.localGet(limRecv);
+                    code.call(this.dynToNumberFn());
+                    code.else_();
+                    code.f64Const(0);
+                    code.end();
+                    limGiven();
+                  } else {
+                    code.f64Const(0);
+                    code.i32Const(0);
+                  }
+                  code.call(this.regexState.split());
+                  code.end();
+                  this.releaseScratch(reT, reL);
+                } else {
+                  splitByString();
+                }
                 code.localSet(vecOfStr);
                 const outArr = this.acquireScratch(this.dyn.arrRef());
                 code.f64Const(0);
@@ -35868,12 +35940,21 @@ class Assembler {
                 code.i32GeS();
                 code.brIf(1);
                 code.localGet(outArr);
-                this.dyn.boxStr(code, (c) => {
-                  c.localGet(vecOfStr);
-                  c.structGet(vecInfo.struct, 1); // VEC_BUF
-                  c.localGet(i);
-                  c.arrayGet(vecInfo.bufType);
-                });
+                // A capture group that did not participate is undefined
+                // (a null element of the typed row).
+                const elt = this.acquireScratch(strValType);
+                code.localGet(vecOfStr);
+                code.structGet(vecInfo.struct, 1); // VEC_BUF
+                code.localGet(i);
+                code.arrayGet(vecInfo.bufType);
+                code.localTee(elt);
+                code.refIsNull();
+                code.ifResult(this.dyn.dynRef());
+                code.globalGet(this.dyn.undefinedGlobal());
+                code.else_();
+                this.dyn.boxStr(code, (c) => c.localGet(elt));
+                code.end();
+                this.releaseScratch(strValType, elt);
                 code.call(this.dyn.arrPush());
                 code.localGet(i);
                 code.i32Const(1);
@@ -35886,6 +35967,7 @@ class Assembler {
                 this.releaseScratch(I32, i);
                 this.releaseScratch(this.dyn.arrRef(), outArr);
                 this.releaseScratch(this.dyn.dynRef(), sepRecv);
+                if (limRecv >= 0) this.releaseScratch(this.dyn.dynRef(), limRecv);
                 this.releaseScratch(vecOfStrType, vecOfStr);
               }
               code.else_();
@@ -37646,36 +37728,22 @@ class Assembler {
    * compiled regex from index 0, the static `.test` body (regexIntrinsic)
    * over a value whose receiver is the island RegExp's payload. The
    * global/sticky forms never reach it (dyn.ts fences them first). */
+  /** %w.dyn.regexTest(re, s) -> i32: RegExp.prototype.test on an island
+   * RegExp — the typed `re.test(s)` exactly (RegExpBuiltinExec: a global
+   * or sticky regex reads and moves the value's own lastIndex). */
   private dynRegexTestHelper(): number {
     if (this.dynRegexTestFn !== null) return this.dynRegexTestFn;
     const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
-    const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
     const idx = this.mb.declareFunc(this.mb.funcType([regexRefT, this.strRef], [I32]), "%w.dyn.regexTest");
     this.dynRegexTestFn = idx;
+    const rs = this.regexState;
     const c = new Code();
-    const BC = 2;
-    const N = 3;
     c.localGet(0);
-    c.structGet(this.regex.regexType, 2);
-    c.localSet(BC);
-    c.localGet(BC);
-    c.i32Const(RE_HEADER_REGISTER_COUNT);
-    c.call(this.regexInterp.readU8());
-    c.i32Const(1);
-    c.i32Add();
-    c.i32Const(1);
-    c.i32ShrU();
-    c.localGet(0);
-    c.structGet(this.regex.regexType, 3);
-    c.i32Add();
-    c.localSet(N);
-    c.localGet(BC);
     c.localGet(1);
-    c.i32Const(0);
-    c.localGet(N);
-    c.call(this.regexInterp.newCaptureArray());
-    c.call(this.regexInterp.exec());
-    this.mb.setBody(idx, [bcRefT, I32], c.bytes());
+    c.localGet(0);
+    c.call(rs.capNew());
+    c.call(rs.bexec());
+    this.mb.setBody(idx, [], c.bytes());
     return idx;
   }
 
@@ -40491,7 +40559,10 @@ class Assembler {
           // INC-29 U2: http's structs, the same.
           k === "httpReq" || k === "httpRes" || k === "httpClientReq" ||
           // INC-29 U3: a URL / URLSearchParams is one struct per object.
-          k === "url" || k === "searchParams"
+          k === "url" || k === "searchParams" ||
+          // A RegExp is one struct per evaluation (board #301's fresh
+          // literal copies, `new RegExp`'s own construction).
+          k === "regex"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and

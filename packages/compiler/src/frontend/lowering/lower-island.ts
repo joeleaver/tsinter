@@ -260,6 +260,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
       // and pure-read spellings lower (the rebuild reads the operand
       // twice); computed regex values keep the boundary fence.
       if (e.type.kind === "regex") {
+        if (L.regexSharesIntoDynamic()) return L.jsvalLiftExpr(e, e.loc);
         const re = islandRegexpOf(e, L);
         if (re) return re;
       }

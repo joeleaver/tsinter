@@ -5161,6 +5161,7 @@ export class Lowerer {
       // rebuild (see jsvalIn's regex rule); computed regex values fall
       // through to requireExactShape's fence.
       if (expr.type.kind === "regex") {
+        if (this.regexSharesIntoDynamic()) return this.jsvalLiftExpr(expr, expr.loc);
         const re = islandRegexpOf(expr, this);
         if (re) return re;
       }
@@ -7528,6 +7529,8 @@ export class Lowerer {
     if (depth > JSON_SAFE_DEPTH_BUDGET) return false;
     if (t.kind === "jsval") return true;
     if (this.boundarySafe(t)) return true;
+    // A RegExp shares by reference on the engine-free lanes (jsvalLiftExpr).
+    if (t.kind === "regex") return this.regexSharesIntoDynamic();
     // Typed arrays and URLs marshal IN without joining the round-trip
     // (JSON) set: an engine typed-array copy / an engine URL from href.
     if (t.kind === "bytes" || t.kind === "url") return true;
@@ -7575,6 +7578,16 @@ export class Lowerer {
     return false;
   }
 
+  /** Does a typed RegExp cross into dynamic code BY REFERENCE — the
+   * WasmGC lanes' one dynamic world (typed-slot undefined marks them;
+   * --dynamic there embeds no engine: an island RegExp is the dyn box
+   * holding the typed value itself). Elsewhere (the legacy lanes' engine)
+   * the engine gets a fresh RegExp rebuilt from source and flags
+   * (islandRegexpOf). */
+  regexSharesIntoDynamic(): boolean {
+    return this.sharedDynamic && (!this.engine || this.undefSlots);
+  }
+
   /** A jsval-typed expression carrying `e`'s value into the island —
    * jsvalLiftable's constructive side. Primitives and JSON-safe composites
    * keep the jsMarshal deep copy; jsval-bearing records and arrays go
@@ -7582,6 +7595,10 @@ export class Lowerer {
    * always evaluated exactly once (as the helper's argument). */
   jsvalLiftExpr(e: IrExpr, loc: SrcLoc): IrExpr {
     if (e.type.kind === "jsval") return e;
+    // A RegExp shares by reference: the island box of the SAME value
+    // (identity and lastIndex shared, SEMANTICS.md S043's unit F1
+    // amendment, as amended for shared RegExps).
+    if (e.type.kind === "regex" && this.regexSharesIntoDynamic()) return { kind: "jsMarshal", value: e, type: JSVAL, loc };
     // Typed storage crosses as a live VIEW (unit H, SEMANTICS.md S115).
     if (e.type.kind === "array" || e.type.kind === "record") return viewOf(this, e, loc);
     if (e.type.kind === "union" && isTypedComposite(this, e.type)) {

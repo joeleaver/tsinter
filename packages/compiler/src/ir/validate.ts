@@ -1948,6 +1948,8 @@ function validateFunction(
             e.left.type.kind === "bytes" ||
             e.left.type.kind === "arraybuffer" ||
             e.left.type.kind === "promise" ||
+            // RegExps (the WasmGC lanes: every evaluation a fresh value).
+            e.left.type.kind === "regex" ||
             // Runtime handles are objects to === (one handle per socket/
             // request — pointer identity is JS's object equality).
             DYN_HANDLE_KINDS.has(e.left.type.kind))
@@ -5133,6 +5135,10 @@ function validateFunction(
         if (
           src.kind !== "bytes" &&
           src.kind !== "url" &&
+          // A RegExp shares in by reference (the WasmGC lanes' island
+          // RegExp box of the same value; jsvalLiftExpr emits it only
+          // there — the engine lanes rebuild one instead).
+          src.kind !== "regex" &&
           src.kind !== "dyn" && // dyn values deep-copy in (data kinds; the runtime throws on boxes)
           // A STATIC promise crosses as a real engine thenable when its
           // fulfillment is in the reverse bridge's payload domain

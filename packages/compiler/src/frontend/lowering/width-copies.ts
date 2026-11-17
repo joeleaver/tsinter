@@ -433,15 +433,15 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
    * their keys — the record keeps only its own fields. */
   const spreadExits: { t: IrType; arms: IrType[]; loc: SrcLoc; dest: Site["dest"] }[] = [];
   /** Writes to dynamic values: where, and the receiver when one is known. */
-  const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[]; method?: string }[] = [];
-  const noteDynWrite = (recv: IrExpr | null, method?: string): void => {
+  const dynWrites: { fn: string; top: number; recv: IrExpr | null; anc: unknown[]; method?: string; key?: string }[] = [];
+  const noteDynWrite = (recv: IrExpr | null, method?: string, key?: string): void => {
     // A view's own accessors (island-views.ts) write only the fresh
     // values they build (a keys list, a snapshot); their stores into the
     // typed value are typed writes, noted as such.
     if (/^%view\./.test(curFn)) return;
     // The dynamic Object.fromEntries writes only the fresh object it builds.
     if (/^%obj\.fromEntries\.dyn\./.test(curFn)) return;
-    dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]), ...(method !== undefined ? { method } : {}) });
+    dynWrites.push({ fn: curFn, top: curTop, recv, anc: stack.map((e) => e[0]), ...(method !== undefined ? { method } : {}), ...(key !== undefined ? { key } : {}) });
   };
   /** The program compares dynamic values by identity somewhere. */
   let dynIdentity = false;
@@ -1174,7 +1174,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       case "libCall": {
         const fn = r["fn"] as string;
         const args = r["args"] as IrExpr[];
-        if (DYN_WRITER.test(fn)) noteDynWrite(args[0] ?? null);
+        if (DYN_WRITER.test(fn)) {
+          // A keyed store with a literal key names the one member it writes.
+          const k = fn === "dyn.keySet" && args[1]?.kind === "strLit" ? args[1].value : undefined;
+          noteDynWrite(args[0] ?? null, undefined, k);
+        }
         return;
       }
       case "dynInvoke": {
@@ -1223,7 +1227,13 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           const g0 = args[0]?.kind === "jsOp" && args[0].op === "globalGet" ? args[0].name : undefined;
           const readOnly = (op === "callMethod" || op === "optCallMethod") &&
             (JS_READING_METHODS.has(r["name"] as string) || (g0 !== undefined && staticReadsArgs(g0, r["name"] as string)) || (g0 === "Object" && r["name"] === "assign"));
-          if (!readOnly) noteDynWrite(args[0] ?? null, op === "callMethod" || op === "optCallMethod" ? (r["name"] as string) : undefined);
+          if (!readOnly) {
+            noteDynWrite(
+              args[0] ?? null,
+              op === "callMethod" || op === "optCallMethod" ? (r["name"] as string) : undefined,
+              op === "setProp" && typeof r["name"] === "string" ? (r["name"] as string) : undefined,
+            );
+          }
           // A method may write what it is handed (Object.assign's sources
           // are read, its target written — the receiver there is the
           // Object global); a store only stores.
@@ -2851,6 +2861,13 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         // the receiver, so the call cannot write it. (Not with --dynamic:
         // an engine object's own method of that name may be anything.)
         if (!opaqueCalls && refs !== null && w.method !== undefined && DYN_MUTATING.has(w.method) && refs.every((t) => recordLacks(t, w.method!))) return false;
+        // A store into a NAMED member changes only that member: a copy made
+        // of records with no member of that name (and no index signature)
+        // holds nothing the store could change, and whether the original
+        // carries the member is a width question (DYN_WIDTH, judged on its
+        // own). (`BLOCK_RE.lastIndex = i` over a RegExp shared into dynamic
+        // code against a copy of `{ width, index, truncated, ellipsed }`.)
+        if (!opaqueCalls && refs !== null && refs.length > 0 && w.key !== undefined && refs.every((t) => recordLacks(t, w.key!))) return false;
         if (value !== null && w.recv !== null && !alias.same(w.recv, w.fn, value.e, value.fn)) return false;
         if (freshRooted(w.recv, w.fn) && !(outOf !== null && rootKey(w.recv, w.fn) === outOf)) return false;
         if (during === null) return !(site !== null && w.fn === site.where && /^%init\.\d+$/.test(w.fn) && w.top < site.top);
@@ -3280,7 +3297,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // could tell it from the original.
           if (s.dest === null && boxedIntoDyn.has(s.where) && (dynWritten(null, null) || dynIdentity || anyIdentity(refs))) why = dynWritten(null, null) ? DYN_WRITE_FROM : DYN_SAME;
           else if (!viaHolder && typedSideWritten(s, s.t, null)) why = COPY_WRITTEN;
-          else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where })) {
+          else if (dynWritten(s, window, rootKey(s.arg, s.where), { e: s.arg!, fn: s.where }, null, refs)) {
             why = DYN_WRITE_FROM;
           }
           else if (anyIdentity(refs)) why = COPY_IDENTITY;

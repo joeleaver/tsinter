@@ -484,11 +484,11 @@ test("F1-RE-01 a RegExp held in an any: accessors, test, String(), inspect, keys
 
 // GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
 // (case k runs `for (const f of [() => g.test("x"), () => r.exec("x"), () => typeof r.exec, () => { r.lastIndex = 3; }].slice(${k}, ${k} + 1)) {` only). Node: ok true / ok x / ok function / ok undefined.
+// Cases 0 and 3 (test on a global regex, a number stored into lastIndex) answer as Node since a typed
+// RegExp crosses shared (F1-RE-06).
 for (const [k, msg] of [
-  [0, "'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet"],
   [1, "'RegExp.prototype.exec' on an island value is not supported yet"],
   [2, "'RegExp.prototype.exec' read as a value on an island value is not supported yet"],
-  [3, "assigning a member of an island RegExp is not supported yet"],
 ] as const) {
   test(`F1-RE-02 case ${k}: the unmodeled RegExp surface refuses by name`, async () => {
     const src = "// @dynamic\n// the unmodeled RegExp surface refuses by name\nconst g: any = /x/g;\nconst r: any = /x/;\n" + `for (const f of [() => g.test("x"), () => r.exec("x"), () => typeof r.exec, () => { r.lastIndex = 3; }].slice(${k}, ${k} + 1)) {` + "\n  try {\n    console.log(`ok ${f()}`);\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}";
@@ -501,10 +501,10 @@ for (const [k, msg] of [
 // GH #86 (SEMANTICS.md S122): a fence ends the program, so each fenced case of the original row is its own program
 // (case k runs `for (const t of tries.slice(${k}, ${k} + 1)) {` only). Node: ok true / ok X / ok 1 / "Cannot set property source of [object Object] which has only a getter" / "RegExp.prototype.source getter called on non-RegExp object" / true true X a.
 for (const [k, msg] of [
-  [0, "assigning a member of an island RegExp is not supported yet"],
-  [1, "assigning a member of an island RegExp is not supported yet"],
-  [2, "assigning a member of an island RegExp is not supported yet"],
-  [3, "assigning a member of an island RegExp is not supported yet"],
+  [0, "assigning a member of an island RegExp (other than a number into lastIndex) is not supported yet"],
+  [1, "assigning a member of an island RegExp (other than a number into lastIndex) is not supported yet"],
+  [2, "assigning a member of an island RegExp (other than a number into lastIndex) is not supported yet"],
+  [3, "assigning a member of an island RegExp (other than a number into lastIndex) is not supported yet"],
   [4, "Object.create over a null-prototype or built-in object on the island is not supported yet"],
 ] as const) {
   test(`F1-RE-04 case ${k}: an island RegExp holds no own members: member writes and Object.create over one refuse by name`, async () => {
@@ -515,6 +515,72 @@ for (const [k, msg] of [
   });
 }
 
+test("F1-RE-06 a typed RegExp crossing into dynamic code is shared: identity, lastIndex and test on global/sticky regexes, as in Node", async () => {
+  const src = [
+    "// @dynamic",
+    "const g = /a/g;",
+    "const y = /b+/y;",
+    "const arr: any[] = [g, y, 1];",
+    "const a0: any = arr[0];",
+    "console.log(`${a0 === g} ${arr[1] === y} ${a0 === y} ${a0 === arr[0]}`);",
+    "console.log(`${a0.test('xaa')} ${a0.lastIndex} ${g.lastIndex} ${a0.test('xaa')} ${g.lastIndex} ${a0.test('xaa')} ${a0.lastIndex}`);",
+    "const b: any = arr[1];",
+    "b.lastIndex = 1;",
+    "console.log(`${y.lastIndex} ${b.test('abbbc')} ${y.lastIndex} ${b.lastIndex} ${b.test('abbbc')} ${b.lastIndex}`);",
+    "y.lastIndex = 2;",
+    "console.log(`${b.lastIndex} ${y.test('abbbc')} ${b.lastIndex} ${b.test === a0.test} ${typeof b.test}`);",
+    "const t = b.test;",
+    "b.lastIndex = 1;",
+    "console.log(`${t.call(b, 'abc')} ${b.lastIndex} ${t.name} ${t.length}`);",
+  ].join("\n");
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-06", src, "ts");
+  // Node v24.18.1.
+  expect(stdout).toBe("true true false true\ntrue 2 2 true 3 false 0\n1 true 4 4 false 0\n2 true 4 true function\ntrue 2 test 1\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-07 a dynamic string split by a RegExp held in a dynamic value splits with the regex (Symbol.split), not its text; lastIndex untouched", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-07", "// @dynamic\nconst ds: any = \"aXaa\";\nconst seps: any[] = [/a/g, /a/, /X/y, /(a)/, /a*/u, \"a\", 1];\nfor (const s of seps) console.log(JSON.stringify(ds.split(s)));\nconst g: any = /a/g;\ng.lastIndex = 2;\nconsole.log(JSON.stringify(ds.split(g)), g.lastIndex);\nconst n: any = \"1a2a3\";\nconsole.log(JSON.stringify(n.split(/a/)), JSON.stringify(n.split(\"\")));\n", "ts");
+  // Node v24.18.1.
+  expect(stdout).toBe("[\"\",\"X\",\"\",\"\"]\n[\"\",\"X\",\"\",\"\"]\n[\"a\",\"aa\"]\n[\"\",\"a\",\"X\",\"a\",\"\",\"a\",\"\"]\n[\"\",\"X\",\"\"]\n[\"\",\"X\",\"\",\"\"]\n[\"aXaa\"]\n[\"\",\"X\",\"\",\"\"] 2\n[\"1\",\"2\",\"3\"] [\"1\",\"a\",\"2\",\"a\",\"3\"]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-08 typed RegExp === RegExp is object identity (every literal evaluation and every new RegExp a fresh value)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-08", "const A = /a/y;\nconst B = /a/y;\nconst C = A;\nconst mk = (): RegExp => /a/y;\nconsole.log(A === B, A === A, A !== B, C === A, mk() === mk(), new RegExp(\"a\") === new RegExp(\"a\"));\n", "ts");
+  // Node v24.18.1.
+  expect(stdout).toBe("false true true true false false\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+for (const m of ["match", "matchAll", "search"] as const) {
+  test(`F1-RE-09 ${m}: String.prototype.${m} on a dynamic string stops by name (no catchable wrong TypeError)`, async () => {
+    const src = `// @dynamic\nconst ds: any = "aXaa";\nconst g: any = /a/g;\ntry {\n  console.log(String(ds.${m}(g)));\n} catch (e) {\n  console.log("caught", (e as Error).message);\n}\n`;
+    const { stdout, stderr } = await runRowTrap(`F1-RE-09-${m}`, src, "ts");
+    expect(stdout).toBe("");
+    expect(stderr).toBe(`tsinter: unsupported: 'String.prototype.${m}' on a dynamic value is not supported yet [SC1090]\n`);
+  });
+}
+
+test("F1-RE-10 a dynamic split by a shared RegExp honors the limit (ToUint32) and answers undefined for a capture group that did not participate", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-10", "// @dynamic\nconst ds: any = \"aXaa\";\nconst lims: any[] = [0, 1, 2, 1.5, -1, 4294967297, \"2\", undefined, null, NaN, Infinity];\nconst res: any[] = [/a/, /a/g, /a/y, /(a)/];\nfor (const r of res) console.log(lims.map((l) => JSON.stringify(ds.split(r, l))).join(\" \"));\nconst t: any = \"a1b\";\nconsole.log(JSON.stringify(t.split(/(x)?1/)), t.split(/(x)?1/)[1] === undefined, t.split(/(x)?1/).length);\nconst u: any = \"a12b3c\";\nconsole.log(JSON.stringify(u.split(/(\\d)(\\d)?/)), JSON.stringify(u.split(/(\\d)(\\d)?/, 4)));\n", "ts");
+  // Node v24.18.1.
+  expect(stdout).toBe("[] [\"\"] [\"\",\"X\"] [\"\"] [\"\",\"X\",\"\",\"\"] [\"\"] [\"\",\"X\"] [\"\",\"X\",\"\",\"\"] [] [] []\n[] [\"\"] [\"\",\"X\"] [\"\"] [\"\",\"X\",\"\",\"\"] [\"\"] [\"\",\"X\"] [\"\",\"X\",\"\",\"\"] [] [] []\n[] [\"\"] [\"\",\"X\"] [\"\"] [\"\",\"X\",\"\",\"\"] [\"\"] [\"\",\"X\"] [\"\",\"X\",\"\",\"\"] [] [] []\n[] [\"\"] [\"\",\"a\"] [\"\"] [\"\",\"a\",\"X\",\"a\",\"\",\"a\",\"\"] [\"\"] [\"\",\"a\"] [\"\",\"a\",\"X\",\"a\",\"\",\"a\",\"\"] [] [] []\n[\"a\",null,\"b\"] true 3\n[\"a\",\"1\",\"2\",\"b\",\"3\",null,\"c\"] [\"a\",\"1\",\"2\",\"b\"]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-11 a dynamic split with a limit and a non-RegExp separator stops by name", async () => {
+  const src = "// @dynamic\nconst ds: any = \"aXaa\";\nconsole.log(JSON.stringify(ds.split(\"a\", 2)));\n";
+  // Node: ["","X"].
+  const { stdout, stderr } = await runRowTrap("F1-RE-11", src, "ts");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("tsinter: unsupported: 'String.prototype.split' with a limit on a dynamic string and a non-RegExp separator is not supported yet [SC1090]\n");
+});
+
 test("F1-RE-05 lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike", async () => {
   const { stdout, stderr, exitCode } = await runRow("F1-RE-05", "// @dynamic\n// lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike\nconst r: any = /a/;\nconst u: unknown = r;\nif (typeof u === \"object\" && u !== null) {\n  console.log(`${\"lastIndex\" in u} ${Object.hasOwn(u, \"lastIndex\")} ${\"foo\" in u} ${Object.hasOwn(u, \"source\")}`);\n}", "ts");
   expect(stdout).toBe("true true false false\n");
@@ -522,10 +588,12 @@ test("F1-RE-05 lastIndex is an own member of an island RegExp, for in and Object
   expect(exitCode).toBe(0);
 });
 
-test("F1-RE-03 a RegExp whose pattern is known only at run time still refuses by name", async () => {
-  const diags = await refuseRow("F1-RE-03", "// @dynamic\n// a RegExp whose pattern is known only at run time refuses by name\nfunction take(r: RegExp, s: string): boolean;\nfunction take(r: any, s: any): any {\n  return r.test(s);\n}\nconst src = process.argv.length > 99 ? \"a\" : \"b\";\nconsole.log(take(new RegExp(src), \"b\"));", "ts");
-  // Node: true.
-  expect(diags.some((d) => d.startsWith("SC1090:") && d.includes("passing a value of type 'RegExp'"))).toBe(true);
+test("F1-RE-03 a RegExp whose pattern is known only at run time crosses into an any parameter shared, as in Node", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-03", "// @dynamic\n// a RegExp whose pattern is known only at run time refuses by name\nfunction take(r: RegExp, s: string): boolean;\nfunction take(r: any, s: any): any {\n  return r.test(s);\n}\nconst src = process.argv.length > 99 ? \"a\" : \"b\";\nconsole.log(take(new RegExp(src), \"b\"));", "ts");
+  // Node: true. (It refused by name before typed RegExps crossed shared.)
+  expect(stdout).toBe("true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("F1-CORPUS-2172 the island RegExp boundary program", async () => {
