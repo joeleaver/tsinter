@@ -40,7 +40,7 @@
  * counted depth. Functions with results end in an explicit `ret`. */
 import { A, Fn, I32, type X } from "./asm.js";
 import type { ModuleBuilder, ValType } from "./module.js";
-import { canonPairs, classRangeDSW, fenceId, GC_LL_BIT, GC_LU_BIT, gcRowMask, RX_PATTERN_SIZE_LIMIT, gcAliasBlob, i32Bytes, identFirstRanges, identNextRanges, RX, RX_FENCE_KEY, RX_SYNTAX_TEXT, fenceMessage, fenceCode } from "./regex-compiler-tables.js";
+import { canonPairs, classRangeDSW, fenceId, GC_LL_BIT, GC_LU_BIT, gcRowMask, RX_PATTERN_SIZE_LIMIT, gcAliasBlob, i32Bytes, propAliasBlob, propRangeOffsets, propRanges, identFirstRanges, identNextRanges, RX, RX_FENCE_KEY, RX_SYNTAX_TEXT, fenceMessage, fenceCode } from "./regex-compiler-tables.js";
 import {
   CAPTURE_COUNT_MAX,
   LRE_FLAG_DOTALL,
@@ -244,8 +244,8 @@ export class RegexCompilerBuilder {
     g["bc"] = nul(this.bufT);
     g["aCr"] = nul(this.crT);
     g["names"] = nul(this.nameArrT);
-    for (const n of ["nameScope", "closed", "match", "tIdFirst", "tIdNext", "tCanon", "tCanonNF", "tGcMask"]) g[n] = nul(this.crT);
-    for (const n of ["tGc", "tAlias", "tOpSize", "tOpClass"]) g[n] = nul(this.bufT);
+    for (const n of ["nameScope", "closed", "match", "tIdFirst", "tIdNext", "tCanon", "tCanonNF", "tGcMask", "tProp", "tPropOff"]) g[n] = nul(this.crT);
+    for (const n of ["tGc", "tAlias", "tScAlias", "tBinAlias", "tOpSize", "tOpClass"]) g[n] = nul(this.bufT);
     this.g = g;
     return g;
   }
@@ -329,6 +329,10 @@ export class RegexCompilerBuilder {
       this.gs($, "tGcMask", this.dataI32($, GC_NAME_ROWS.map((_, i) => gcRowMask(i))));
       this.gs($, "tGc", this.dataU8($, Uint8Array.from(GC_TABLE)));
       this.gs($, "tAlias", this.dataU8($, gcAliasBlob()));
+      this.gs($, "tScAlias", this.dataU8($, propAliasBlob("sc")));
+      this.gs($, "tBinAlias", this.dataU8($, propAliasBlob("bin")));
+      this.gs($, "tProp", this.dataI32($, propRanges()));
+      this.gs($, "tPropOff", this.dataI32($, propRangeOffsets()));
       this.gs($, "tOpSize", this.dataU8($, opSize));
       this.gs($, "tOpClass", this.dataU8($, opcodeClasses()));
       this.gs($, "tablesReady", $.i(1));
@@ -903,15 +907,29 @@ export class RegexCompilerBuilder {
 
   /** A General_Category alias spelled by pattern[s..e) -> its row, or -1. */
   private get fGcLookup(): number {
-    return this.fn("gcLookup", [I32, I32], [I32], ($) => {
+    return this.aliasLookup("gcLookup", "tAlias");
+  }
+
+  /** A ported Script value / binary property alias spelled by
+   * pattern[s..e) -> its PROP_ROWS index, or -1. */
+  private get fScLookup(): number {
+    return this.aliasLookup("scLookup", "tScAlias");
+  }
+  private get fBinLookup(): number {
+    return this.aliasLookup("binLookup", "tBinAlias");
+  }
+
+  /** A lookup over one [len][bytes][value] alias blob global. */
+  private aliasLookup(name: string, blob: string): number {
+    return this.fn(name, [I32, I32], [I32], ($) => {
       const S = 0;
       const E = 1;
       const P = $.local(I32);
       const L = $.local(I32);
       const K = $.local(I32);
       const OK = $.local(I32);
-      const T = (x: X): X => $.agetU(this.bufT, this.gg($, "tAlias"), x);
-      $.while($.lt($.l(P), $.alen(this.gg($, "tAlias"))), () => {
+      const T = (x: X): X => $.agetU(this.bufT, this.gg($, blob), x);
+      $.while($.lt($.l(P), $.alen(this.gg($, blob))), () => {
         $.put(L, T($.l(P)));
         $.if($.eq($.l(L), $.sub($.l(E), $.l(S))), () => {
           $.put(OK, $.i(1));
@@ -926,6 +944,22 @@ export class RegexCompilerBuilder {
     });
   }
 
+  /** A fresh CharRange holding PROP_ROWS[row]'s ranges. */
+  private get fPropCr(): number {
+    return this.fn("propCr", [I32], [this.crRef()], ($) => {
+      const ROW = 0;
+      const OFF = $.local(I32);
+      const N = $.local(I32);
+      const RES = $.local(this.crRef());
+      $.put(OFF, $.aget(this.crT, this.gg($, "tPropOff"), $.l(ROW)));
+      $.put(N, $.sub($.aget(this.crT, this.gg($, "tPropOff"), $.add($.l(ROW), $.i(1))), $.l(OFF)));
+      $.put(RES, $.anew(this.crT, $.l(N)));
+      $.do($.l(RES), $.i(0), this.gg($, "tProp"), $.l(OFF), $.l(N));
+      $.c.arrayCopy(this.crT, this.crT);
+      $.ret($.l(RES));
+    });
+  }
+
   /** pattern[s..e) spells `word` exactly. */
   private spells($: RA, s: number, e: number, word: string): X {
     let acc = $.eq($.sub($.l(e), $.l(s)), $.i(word.length));
@@ -934,8 +968,8 @@ export class RegexCompilerBuilder {
   }
 
   /** parse_unicode_property (libregexp.c:882),
-   * `p` at the `{`. Sets aCr/aNext. A name outside General_Category is the
-   * unported-unicode-property fence. */
+   * `p` at the `{`. Sets aCr/aNext. A name outside General_Category and
+   * PROP_ROWS is the unported-unicode-property fence. */
   private get fUnicodeProperty(): number {
     return this.fn("unicodeProperty", [I32, I32], [I32], ($) => {
       const P = 0;
@@ -946,6 +980,7 @@ export class RegexCompilerBuilder {
       const VE = $.local(I32);
       const HAS_EQ = $.local(I32);
       const ROW = $.local(I32);
+      const PROP = $.local(I32);
       const CR = $.local(this.crRef());
       const propChar = (x: X): X => $.or($.or($.inR(x, 0x30, 0x39), $.inR(x, 0x41, 0x5a)), $.or($.inR(x, 0x61, 0x7a), $.eq(x, $.i(0x5f))));
       $.if($.ne(this.ch($, $.l(P)), $.i(C("{"))), () => $.ret($.i(RX.INVALID_PROP_NAME)));
@@ -975,25 +1010,45 @@ export class RegexCompilerBuilder {
       // or an invalid name V8 rejects right here) — is the
       // unported-unicode-property fence, reported WHERE MET: the name may be
       // invalid, and then V8's error is this one, not a later one.
-      const isSc = $.or($.or(this.spells($, NS, NE, "Script"), this.spells($, NS, NE, "sc")), $.or(this.spells($, NS, NE, "Script_Extensions"), this.spells($, NS, NE, "scx")));
+      //
+      // The ported subset (PROP_ROWS: a few Script values, a few binary
+      // properties; SEMANTICS.md S102) resolves from its pre-decoded
+      // ranges; Script_Extensions and every other Script value or binary
+      // name stay the fence.
+      const isScript = $.or(this.spells($, NS, NE, "Script"), this.spells($, NS, NE, "sc"));
+      const isScx = $.or(this.spells($, NS, NE, "Script_Extensions"), this.spells($, NS, NE, "scx"));
       const isGc = $.or(this.spells($, NS, NE, "General_Category"), this.spells($, NS, NE, "gc"));
       const pending = (): void => $.ret($.i(fenceId("unported-unicode-property")));
+      $.put(PROP, $.i(-1));
       $.if(
         $.l(HAS_EQ),
         () => {
           $.if($.eq($.l(VS), $.l(VE)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
-          $.if(isSc, pending);
-          $.if($.not(isGc), () => $.ret($.i(RX.INVALID_PROP_NAME)));
-          $.put(ROW, $.call(this.fGcLookup, $.l(VS), $.l(VE)));
-          $.if($.lt($.l(ROW), $.i(0)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          $.if(isScript, () => {
+            $.put(PROP, $.call(this.fScLookup, $.l(VS), $.l(VE)));
+            $.if($.lt($.l(PROP), $.i(0)), pending);
+          });
+          $.if($.lt($.l(PROP), $.i(0)), () => {
+            $.if(isScx, pending);
+            $.if($.not(isGc), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+            $.put(ROW, $.call(this.fGcLookup, $.l(VS), $.l(VE)));
+            $.if($.lt($.l(ROW), $.i(0)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          });
         },
         () => {
-          $.if($.or($.eq($.l(NS), $.l(NE)), $.or(isSc, isGc)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          $.if($.or($.eq($.l(NS), $.l(NE)), $.or($.or(isScript, isScx), isGc)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
           $.put(ROW, $.call(this.fGcLookup, $.l(NS), $.l(NE)));
-          $.if($.lt($.l(ROW), $.i(0)), pending);
+          $.if($.lt($.l(ROW), $.i(0)), () => {
+            $.put(PROP, $.call(this.fBinLookup, $.l(NS), $.l(NE)));
+            $.if($.lt($.l(PROP), $.i(0)), pending);
+          });
         },
       );
-      $.put(CR, $.call(this.fGc1, $.aget(this.crT, this.gg($, "tGcMask"), $.l(ROW))));
+      $.if(
+        $.ge($.l(PROP), $.i(0)),
+        () => $.put(CR, $.call(this.fPropCr, $.l(PROP))),
+        () => $.put(CR, $.call(this.fGc1, $.aget(this.crT, this.gg($, "tGcMask"), $.l(ROW)))),
+      );
       $.if($.l(INV), () => $.put(CR, $.call(this.fCrInvert, $.l(CR))));
       this.gs($, "aCr", $.l(CR));
       this.gs($, "aNext", $.l(P));
