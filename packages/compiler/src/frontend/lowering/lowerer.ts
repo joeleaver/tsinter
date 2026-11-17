@@ -55,7 +55,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID, JSON_SAFE_DEPTH_BUDGET, RUNTIME_EMITTER_CLASS, RUNTIME_STREAM_CLASSES } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canDynCheckTo, FN_PROTO_ASYNC, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, islandPromisePayloadTag, isReservedField, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID, JSON_SAFE_DEPTH_BUDGET, RUNTIME_EMITTER_CLASS, RUNTIME_STREAM_CLASSES } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -5201,7 +5201,12 @@ export class Lowerer {
       const funcOk =
         expected.kind === "func" &&
         canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic);
-      if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || funcOk) {
+      // Data with `unknown` leaves (a `{ status?: string; extra?: unknown }`
+      // record, a `[string, unknown]` entry): checked around its leaves,
+      // which stay the dynamic values they are.
+      const dynLeafOk = (expected.kind === "record" || expected.kind === "array" || expected.kind === "union") &&
+        canDynCheckTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id));
+      if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || funcOk || dynLeafOk) {
         return { kind: "dynCheck", value: expr, type: expected, loc: expr.loc };
       }
       // A class slot takes the instance a view holds (class-views.ts).

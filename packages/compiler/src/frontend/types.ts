@@ -1433,6 +1433,28 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     fields.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     return { kind: "record", shapeId: ctx.shapes.intern(fields, true) };
   }
+  // The "any string, with these suggestions" idiom (`"a" | "b" | (string &
+  // {})`, paperclip's AgentAdapterType): `string & {}` (likewise
+  // `number & {}`) holds exactly the primitive's values — the empty object
+  // type only stops the checker from collapsing the literal arms — so it
+  // is the primitive.
+  if (widened.isIntersectionType()) {
+    const parts = widened.getTypes();
+    if (parts.length === 2) {
+      const prim = parts.find((p) => (p.flags & (ts.TypeFlags.String | ts.TypeFlags.Number)) !== 0);
+      const rest = parts.find((p) => p !== prim);
+      if (
+        prim !== undefined && rest !== undefined &&
+        (rest.flags & ts.TypeFlags.Object) !== 0 &&
+        checker.getPropertiesOfType(rest).length === 0 &&
+        checker.getCallSignatures(rest).length === 0 &&
+        checker.getConstructSignatures(rest).length === 0 &&
+        checker.getIndexInfosOfType(rest).length === 0
+      ) {
+        return (prim.flags & ts.TypeFlags.String) !== 0 ? STRING : F64;
+      }
+    }
+  }
   // Class instances: the type's symbol is a class declared in the user's
   // file. The class NAME as a value has the *constructor* type — same
   // REFINED handle intersections — @types/node's idioms: `ServerResponse<

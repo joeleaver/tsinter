@@ -6087,7 +6087,12 @@ function isJsonSafeAt(
   inRecordField: boolean,
   visiting: Set<string>,
   depth: number,
+  /** canDynCheckTo's walk: an `unknown` (dyn) leaf inside a record, tuple
+   * or array validates as itself (the walker's pass-through arm) — never a
+   * JSON writer's question. */
+  allowDyn = false,
 ): boolean {
+  if (allowDyn && t.kind === "dyn") return true;
   // A type graph nested deeper than the budget (a package's generated
   // types — drizzle's table builders — can chain thousands of distinct
   // records): answered NOT JSON-safe, so the value refuses by name at its
@@ -6105,7 +6110,7 @@ function isJsonSafeAt(
     case "bigint":
       return true;
     case "array":
-      return isJsonSafeAt(t.elem, getRecord, getUnion, false, visiting, depth + 1);
+      return isJsonSafeAt(t.elem, getRecord, getUnion, false, visiting, depth + 1, allowDyn);
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
@@ -6118,7 +6123,7 @@ function isJsonSafeAt(
       // TUPLE positions are array slots, not droppable object keys: an
       // undefined-armed position would stringify as `null` in JS (not
       // drop), so tuples keep the array rule for their fields.
-      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, !shape.tuple, visiting, depth + 1))) {
+      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, !shape.tuple, visiting, depth + 1, allowDyn))) {
         return false;
       }
       // Overflow values sit in record-key position too: dyn is JSON-safe
@@ -6126,7 +6131,7 @@ function isJsonSafeAt(
       // like any undefined-valued key), everything else follows the
       // record-field rule.
       if (shape.indexValue && shape.indexValue.kind !== "dyn") {
-        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, true, visiting, depth + 1);
+        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, true, visiting, depth + 1, allowDyn);
       }
       return true;
     }
@@ -6136,7 +6141,7 @@ function isJsonSafeAt(
       const key = `${t.unionId}:${inRecordField}`;
       if (visiting.has(key)) return true; // the recursive knot, union-flavored
       visiting.add(key);
-      return def.arms.every((a) => isJsonSafeAt(a, getRecord, getUnion, inRecordField, visiting, depth + 1));
+      return def.arms.every((a) => isJsonSafeAt(a, getRecord, getUnion, inRecordField, visiting, depth + 1, allowDyn));
     }
     case "func":
     case "object":
@@ -6506,8 +6511,12 @@ export function canDynCheckTo(
   if (DYN_HANDLE_KINDS.has(t.kind)) return true;
   if (t.kind === "union") {
     const def = getUnion(t.unionId);
-    return !!def && def.arms.every((a) => a.kind === "undefinedT" || isJsonSafeType(a, getRecord, getUnion));
+    return !!def && def.arms.every((a) => a.kind === "undefinedT" || isJsonSafeAt(a, getRecord, getUnion, false, new Set(), 0, true));
   }
+  // Data holding `unknown` leaves (`[string, unknown]` entry tuples, a
+  // `{ status?: string; extra?: unknown }` record): the leaves pass
+  // through the check as the dynamic values they are.
+  if (t.kind === "record" || t.kind === "array") return isJsonSafeAt(t, getRecord, getUnion, false, new Set(), 0, true);
   return false;
 }
 
