@@ -100,7 +100,7 @@ import {
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { bigWidenTypeOf, programHoldsBigint } from "./big-widen.js";
-import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
+import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, forOfConstBinding, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
 import { validateModule } from "../../ir/validate.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -1657,8 +1657,10 @@ export class Lowerer {
     })();
     // (Review: the result's exit keeps the exact-fit guard below — a copy
     // taken from an arm value, or at a `ret:` slot whose arm did not build.)
-    const key = retFn !== null ? `ret:${dynArmKey(retFn)}` : dynArmKey(n);
-    const armable = contained || retFn !== null;
+    // S125: a `const` for-of loop binding (dyn-arm.ts forOfConstBinding).
+    const forOf = forOfConstBinding(n);
+    const key = forOf ? `forof:${dynArmKey(n)}` : retFn !== null ? `ret:${dynArmKey(retFn)}` : dynArmKey(n);
+    const armable = contained || retFn !== null || forOf;
     if (armable) this.dynArmExitNodes.set(exit, key);
     // Never a silent width copy where U2 is in play: a copy taken FROM a
     // dynamic-arm value, or one at a slot whose arm did not build (the

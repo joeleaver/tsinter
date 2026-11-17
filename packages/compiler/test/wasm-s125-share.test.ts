@@ -29,6 +29,22 @@ export async function action(fn, opts) {
   return opts;
 }`;
 
+
+/** zod's superRefine shape (paperclip's validators): dynamic code builds the
+ * value, hands it and a ctx whose addIssue writes dynamic values to the
+ * typed callback, and returns both. */
+const SDEP = `export function superRefine(fn, json) {
+  const value = JSON.parse(json);
+  const issues = [];
+  const ctx = JSON.parse("{}");
+  ctx.addIssue = (i) => { issues.push(i); };
+  fn(value, ctx);
+  return { issues, value };
+}`;
+const SCTX = `interface Task { clientKey: string; title: string; seen?: boolean }
+interface Payload { tasks: Task[] }
+const JSON3 = '{"tasks":[{"clientKey":"a","title":"x"},{"clientKey":"b","title":"y"},{"clientKey":"a","title":"z"}]}';`;
+
 defineRows("S125 share-vs-copy", [
   {
     id: "S125-A4-01 a declared collector pushing into its array parameter, handed to dynamic code: one array; a direct call stays typed",
@@ -402,4 +418,54 @@ function f(xs: Array<{ action: string }>) { xs.forEach((x) => { const r = x as {
 const ps: P[] = [{ action: "create", slug: "a" }];
 f(ps);
 console.log(ps);`, refused: /SC1090 .*COPY where JavaScript shares the object.*S125/ },
+  {
+    id: "S125-A7-01 paperclip's superRefine loop: for (const [index, task] of value.tasks.entries()) binds the dynamic element; a write through it reaches the caller's object",
+    entry: "main.ts",
+    files: { "dep.mjs": SDEP },
+    src: `import { superRefine } from "./dep.mjs";
+${SCTX}
+const r = superRefine((v: Payload, ctx: any) => {
+  const seen = new Set<string>();
+  for (const [index, task] of v.tasks.entries()) {
+    if (seen.has(task.clientKey)) {
+      ctx.addIssue({ message: "clientKey must be unique", path: ["tasks", index, "clientKey"] });
+      continue;
+    }
+    seen.add(task.clientKey);
+    task.seen = true;
+  }
+}, JSON3);
+console.log(JSON.stringify(r.issues));
+console.log(JSON.stringify(r.value));`,
+  },
+  {
+    id: "S125-A7-02 a superRefine loop that breaks mid-way, and a plain const loop variable over the dynamic array",
+    entry: "main.ts",
+    files: { "dep.mjs": SDEP },
+    src: `import { superRefine } from "./dep.mjs";
+${SCTX}
+const r = superRefine((v: Payload, ctx: any) => {
+  let n = 0;
+  for (const [i, t] of v.tasks.entries()) {
+    if (t.clientKey === "b") { ctx.addIssue({ message: "stop at " + t.title, path: [i] }); break; }
+    n++;
+  }
+  for (const t of v.tasks) t.title = t.title.toUpperCase();
+  console.log("counted", n);
+}, JSON3);
+console.log(JSON.stringify(r.issues), JSON.stringify(r.value.tasks.map((t: Task) => t.title)));`,
+  },
+  {
+    id: "S125-A7-03 for-of over .entries() of a dynamic array binds [index, element]; an untyped Map's entries keep their [key, value] walk (GH #183)",
+    entry: "main.mjs",
+    src: `const d = JSON.parse('["a","b"]');
+for (const [i, s] of d.entries()) console.log(i, s);
+const pick = (x) => x;
+const m = pick(new Map());
+m.set("k", 1);
+m.set({}, [2]);
+for (const [k, v] of m.entries()) console.log(typeof k, v);
+const o = JSON.parse('{"a":1}');
+try { for (const [k] of o.entries()) console.log(k); } catch (e) { console.log(e.constructor.name, e.message); }`,
+  },
 ]);

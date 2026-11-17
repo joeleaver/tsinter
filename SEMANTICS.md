@@ -11011,6 +11011,15 @@ whatever its shape. On these lanes the CONTAINED slots do the same:
   parameter typed by the argument's own type, `any` (*amended 2026-11-11:*
   a JavaScript function's JSDoc-typed parameter too, in checked-dynamic
   storage);
+- *(amended 2026-11-17, S125's paperclip superRefine loops)* a `const`
+  for-of loop binding — the loop variable itself, or a name inside its
+  array or object destructuring pattern (no default, no rest) — whose
+  element's checked copy S125 (c) refuses: the binding holds each dynamic
+  element itself (`for (const [index, task] of value.tasks.entries()) {
+  task.seen = true }` writes the caller's object, as in Node). With it,
+  `for (const … of d.entries())` over a dynamic receiver walks an array's
+  `[index, element]` pairs (Array.prototype.entries); a receiver that is
+  not an array at run time stops by name before the loop;
 - and, inside them, an unannotated callback parameter of a method called
   on such a value (`xs.map((x) => typeof x)` hands `x` whatever the array
   holds).
