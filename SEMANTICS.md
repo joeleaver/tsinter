@@ -10723,7 +10723,10 @@ made (`console.log(f())` over a `() => unknown` callback); a part read
 straight off an out-crossing into a local read only in the next
 statements, while nothing they run writes a dynamic value (`const c =
 (e as { cause: C }).cause; console.log(c.code)`); the source of an
-`Object.assign` whose property values are scalars; and a callback
+`Object.assign` whose property values are scalars; the seed of a `new
+Set(...)` whose elements are scalars (paperclip's zod refinements, `new
+Set(values).size === values.length` and `[...new Set(ids)]`: the Set reads
+the array once and keeps only its scalar elements); and a callback
 parameter that only reads its copy while the call cannot reach a write.
 An `Error` crosses through the identity cache (S021), an `any[]` crosses
 by reference, and a variadic callback's adapter is vetted by GH #22: none

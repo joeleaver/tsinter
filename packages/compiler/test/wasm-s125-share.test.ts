@@ -44,6 +44,14 @@ const SDEP = `export function superRefine(fn, json) {
 const SCTX = `interface Task { clientKey: string; title: string; seen?: boolean }
 interface Payload { tasks: Task[] }
 const JSON3 = '{"tasks":[{"clientKey":"a","title":"x"},{"clientKey":"b","title":"y"},{"clientKey":"a","title":"z"}]}';`;
+/** zod's refine/superRefine shape (paperclip's validators): a typed
+ * callback dynamic code calls with its own array, and writes to it after
+ * (the callback's parameter takes the dynamic arm, U2a). */
+const ZDEP = `export function refine(fn, input) {
+  const ok = fn(input);
+  input.push("late");
+  return ok;
+}`;
 
 defineRows("S125 share-vs-copy", [
   {
@@ -464,5 +472,16 @@ const m = JSON.parse('{"a":1}');
 console.log("before");
 for (const [k] of m.entries()) console.log(k);`,
     fence: { text: /for-of over \.entries\(\) of a dynamic value that is not an array/, stdout: "0 a\n1 b\nbefore\n" },
+  },
+  {
+    id: "S125-A6-01 paperclip's zod uniqueness refinements: a Set built from the callback's array (new Set(values).size === values.length, [...new Set(ids)]) reads it once",
+    entry: "main.ts",
+    files: { "dep.mjs": ZDEP },
+    src: `import { refine } from "./dep.mjs";
+const input: string[] = JSON.parse('["a","b","a"]');
+console.log(refine((values: string[]) => new Set(values).size === values.length, input), input);
+const ids = ["x", "y", "x"];
+console.log(refine((v: string[]) => [...new Set(v)].length === 2, ids), ids);
+console.log(refine((v: string[]) => { const s = new Set(v); v.push("w"); return s.size === v.length; }, ["p"]));`,
   },
 ]);
