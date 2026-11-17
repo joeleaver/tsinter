@@ -5626,6 +5626,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             loc,
           };
         }
+        if (target.type.kind === "dyn" || target.type.kind === "jsval") {
+          // GH #254: a dynamic slot (a JavaScript `let v;`, an `any`) can
+          // hold undefined or null whatever the checker says: `x = x ?? e`
+          // through the dynamic nullish test (e evaluates only when x is
+          // nullish; writing x's own value back is unobservable for a
+          // variable).
+          const read: IrExpr = { kind: "varRef", localId: target.id, type: target.type, loc: locOf(expr.left) };
+          const right = L.lowerExprExpecting(expr.right, target.type);
+          return { kind: "assign", localId: target.id, value: { kind: "nullish", left: read, right, type: target.type, loc }, loc };
+        }
         if (target.type.kind !== "union") {
           // The checker says never nullish: JS neither evaluates e nor
           // assigns — the statement is a no-op (lowerNullishCoalesce's
