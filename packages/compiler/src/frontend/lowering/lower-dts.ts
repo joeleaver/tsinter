@@ -31,7 +31,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isDtsMirrorPath, npmStaticDtsViews } from "../npm-static.js";
 import { npmPackageNameOf } from "../shared.js";
-import { BOOL, isUnitType, JSVAL, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, DYN, STRING, accessorSlotProp, isUnitType, JSVAL, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { classUnionExitHelper, classUnview, viewableClass } from "./class-views.js";
 
 /** Is the declared-surface view active in this compile at all? */
@@ -136,6 +136,82 @@ function crossInto(L: Lowerer, node: ts.Expression, out: IrExpr, declared: IrTyp
     }
   }
   return L.coerceInto(node, out, declared);
+}
+
+/** SEMANTICS.md S133 (o): an implementation's object literal of
+ * functions and getters (@clack/prompts' spinner result: `{ start, stop,
+ * …, get isCancelled() { return S; } }`) crossing into a declared type the
+ * program sees as a dynamic value. It becomes the dynamic object Node's
+ * literal is: the functions as its data members and each getter as an
+ * accessor property (enumerable, configurable, as a literal's are), in the
+ * literal's order. So a read of the member runs the getter, live, and is
+ * never a frozen copy. A literal holding data members (whose copy the
+ * program could tell from the original), a setter, or a getter before a
+ * function member keeps the ordinary refusal (null). */
+export function getterRecordIntoDynamic(L: Lowerer, out: IrExpr, declared: IrType): IrExpr | null {
+  if (out.type.kind !== "record") return null;
+  const shape = L.shapes.get(out.type.shapeId);
+  if (shape === undefined) return null;
+  const loc = out.loc;
+  // the literal's own member order (the shape's fields are name-sorted)
+  const ordered: { name: string; type: IrType; optional?: true }[] = [];
+  // (memberOrder: accessors at their own positions; an integer-like key
+  // would enumerate first in Node, which this order does not model)
+  if (shape.memberOrder === undefined || shape.memberOrder.some((n) => /^(0|[1-9][0-9]*)$/.test(n))) return null;
+  for (const n of shape.memberOrder) {
+    const f = shape.fields.find((x) => x.name === n) ?? shape.fields.find((x) => x.name === `%get:${n}`);
+    if (f !== undefined && !ordered.includes(f)) ordered.push(f);
+  }
+  if (ordered.length !== shape.fields.length) return null;
+  let sawGetter = false;
+  for (const f of ordered) {
+    const acc = accessorSlotProp(f.name);
+    if (acc !== null) {
+      if (acc.kind !== "get") return null;
+      sawGetter = true;
+      continue;
+    }
+    if (f.type.kind !== "func" || sawGetter || f.optional === true) return null;
+  }
+  if (!sawGetter) return null;
+  const recL = L.declareHiddenLocal("%getterRec", out.type);
+  const objL = L.declareHiddenLocal("%getterObj", DYN);
+  const rec = (): IrExpr => ({ kind: "varRef", localId: recL.id, type: out.type, loc });
+  const obj = (): IrExpr => ({ kind: "varRef", localId: objL.id, type: DYN, loc });
+  const read = (f: { name: string; type: IrType }): IrExpr => ({ kind: "recordGet", obj: rec(), shapeId: (out.type as { shapeId: string }).shapeId, field: f.name, type: f.type, loc });
+  const asDyn = (e: IrExpr): IrExpr | null => {
+    const d = L.coerceToExpected(e, DYN);
+    return d.type.kind === "dyn" ? d : null;
+  };
+  const str = (v: string): IrExpr => ({ kind: "dynFrom", value: { kind: "strLit", value: v, type: STRING, loc }, type: DYN, loc });
+  const tru = (): IrExpr => ({ kind: "dynFrom", value: { kind: "boolLit", value: true, type: BOOL, loc }, type: DYN, loc });
+  const js = (e: IrExpr): IrExpr => ({ kind: "jsMarshal", value: e, type: JSVAL, loc }) as IrExpr;
+  const fields: { key: IrExpr; value: IrExpr }[] = [];
+  const stmts: IrStmt[] = [{ kind: "varDecl", localId: recL.id, init: out, loc }];
+  const defines: IrStmt[] = [];
+  for (const f of ordered) {
+    const acc = accessorSlotProp(f.name);
+    const v = asDyn(read(f));
+    if (v === null) return null;
+    if (acc === null) {
+      fields.push({ key: { kind: "strLit", value: f.name, type: STRING, loc }, value: v });
+      continue;
+    }
+    const desc: IrExpr = {
+      kind: "dynObjLit",
+      fields: [
+        { key: { kind: "strLit", value: "get", type: STRING, loc }, value: v },
+        { key: { kind: "strLit", value: "enumerable", type: STRING, loc }, value: tru() },
+        { key: { kind: "strLit", value: "configurable", type: STRING, loc }, value: tru() },
+      ],
+      type: DYN,
+      loc,
+    };
+    defines.push({ kind: "exprStmt", expr: { kind: "libCall", fn: "om.defineProperty", args: [js(obj()), js(str(acc.prop)), js(desc)], type: JSVAL, loc }, loc });
+  }
+  stmts.push({ kind: "varDecl", localId: objL.id, init: { kind: "dynObjLit", fields, type: DYN, loc }, loc }, ...defines);
+  const built: IrExpr = { kind: "seqExpr", stmts, result: obj(), type: DYN, loc };
+  return declared.kind === "jsval" ? js(built) : built;
 }
 
 /** The interned checked narrowing of union `fromId` into union `toId` for a

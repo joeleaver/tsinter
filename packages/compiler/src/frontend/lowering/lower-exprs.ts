@@ -7925,7 +7925,12 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
         // closures is side-effect-free, so their position among the data
         // fields' source-order evaluation is unobservable — exactly JS,
         // where accessor definitions evaluate nothing.
-        if (isJsSourceFile(expr.getSourceFile())) continue;
+        // (an npm package's JS literal whose shape carries the slot — types.ts
+        // maps those accessors, @clack/prompts' spinner result — fills it too)
+        if (isJsSourceFile(expr.getSourceFile())) {
+          const jsName = ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) ? prop.name.text : null;
+          if (jsName === null || !fieldTypes.has(`${ts.isGetAccessorDeclaration(prop) ? "%get" : "%set"}:${jsName}`)) continue;
+        }
         const name = propNameText(L, prop.name); // key-form-checked above
         const slotName = `${ts.isGetAccessorDeclaration(prop) ? "%get" : "%set"}:${name}`;
         const slotT = fieldTypes.get(slotName);

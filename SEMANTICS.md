@@ -11757,6 +11757,35 @@ compiled binding (`p.default(…)`) refuses naming the member.
 **Tested by:** `packages/compiler/test/npm-dts-namespace.test.ts` (DNS-01,
 DNS-02, DNS-R1..R5).
 
+**Amendment (o) — getter results and destructured options of a package's
+JavaScript (2026-11-17).** @clack/prompts' `spinner` had no binding the
+program could reach, so paperclip's 15 `p.spinner()` sites refused the build.
+Its options parameter, `{ output: n = process.stdout, …, ...I } = {}`,
+inferred an object type that did not map. Its result is an object literal of
+functions with a getter (`get isCancelled() { return S; }`). On the WasmGC
+lanes:
+- A destructured parameter of a package's own JavaScript whose inferred
+  object type does not map is the caller's dynamic value. Its properties
+  read per site, defaults apply on `undefined`, and the rest is S117's fresh
+  object.
+- A getter or setter in such a package's object literal is the literal's
+  accessor slot, as in TypeScript. A read calls the getter, live.
+- Such a literal crossing into a dynamic slot becomes the dynamic object
+  Node's literal is. That covers the program's declared type when (k) makes
+  it the dynamic value, and a dynamic return. Its functions become data
+  members, and each getter becomes an enumerable, configurable accessor
+  property, in the literal's order. So `s.isCancelled` reads the current
+  value, never a frozen copy.
+
+Literal shapes outside this refuse by name where they would convert: at
+build time where the program's own crossing meets them, and through (e)'s
+run-time stop inside the package's JavaScript. That covers data members
+beside the getter (their copy could be told from the original), a setter,
+a getter before a function member, and an integer-like key. This adds no
+divergence.
+**Tested by:** `packages/compiler/test/npm-dts-spinner.test.ts` (SPB-01,
+SPB-02 both lanes vs Node; SPB-R1 the refusal).
+
 ## S137 — BigInt near V8's size limit: a power within two bits of 2^30 bits may compute where V8 throws, and very large operands are slower than V8 *(wasm and wasm-native)*
 
 V8 throws `RangeError: Maximum BigInt size exceeded` when a result would

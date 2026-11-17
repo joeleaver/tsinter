@@ -1270,6 +1270,10 @@ export interface IrRecordShape {
    * fields carry that declaredOrder OMITS are internal '%'-fields (Dirent's
    * %dtype) — hidden from every key-order surface, JSON included. */
   declaredOrder?: string[];
+  /** A shape with accessor slots: every member's PROPERTY name (accessors
+   * by their property, not their `%get:`/`%set:` slot) in declaration
+   * order — metadata like declaredOrder, which leaves accessors out. */
+  memberOrder?: string[];
 }
 
 /** Object-literal ACCESSOR properties (`{ get x() {...}, set x(v) {...} }`)

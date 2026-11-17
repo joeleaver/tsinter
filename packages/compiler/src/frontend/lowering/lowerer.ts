@@ -15,7 +15,7 @@
 import { lowerHostCall } from "./lower-host.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
-import { dtsCallResult, dtsPropertyRead } from "./lower-dts.js";
+import { dtsCallResult, dtsPropertyRead, getterRecordIntoDynamic } from "./lower-dts.js";
 import { isDtsMirrorPath } from "../npm-static.js";
 import { buildErrorViews, classFuncBox, classLiftIn, finishConstructorNames, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
 import { builtinBoxPosition, collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
@@ -4968,6 +4968,13 @@ export class Lowerer {
     // binding) on the engine-free WasmGC lanes: its DK.SYMBOL box.
     if (expected.kind === "dyn" && expr.type.kind === "symbol" && this.sharedDynamic && !this.engine) {
       return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc } as IrExpr;
+    }
+    // A record of functions and trailing getters (an npm package's JS
+    // literal, @clack/prompts' spinner result) into a dynamic slot: the
+    // dynamic object Node's literal is, getters live (lower-dts.ts).
+    if ((expected.kind === "dyn" || expected.kind === "jsval") && expr.type.kind === "record" && this.sharedDynamic && !this.engine) {
+      const live = getterRecordIntoDynamic(this, expr, expected);
+      if (live !== null) return live;
     }
     if (expected.kind === "jsval" && expr.type.kind !== "jsval") {
       // Bare unit literals: the engine's own undefined/null (units have no

@@ -115,7 +115,7 @@ export class ShapeRegistry {
    * registers the structural key (first writer wins — the key may already
    * belong to a structurally identical shape; the recursive id stays
    * authoritative for its own checker type either way). */
-  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true; internal?: true }[], indexValue?: IrType, declaredOrder?: string[]): string {
+  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true; internal?: true }[], indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[]): string {
     const id = this.recIds.get(t);
     if (id === undefined) throw new Error("shape registry bug: finalizeRecursive without a placeholder");
     if (this.pendingRec.has(id)) {
@@ -123,6 +123,7 @@ export class ShapeRegistry {
       shape.fields = fields;
       if (indexValue) shape.indexValue = indexValue;
       if (declaredOrder) shape.declaredOrder = declaredOrder;
+      if (memberOrder) shape.memberOrder = memberOrder;
       this.pendingRec.delete(id);
       const key = this.keyOf(fields, false, indexValue);
       if (!this.byKey.has(key)) this.byKey.set(key, id);
@@ -138,7 +139,7 @@ export class ShapeRegistry {
    * value type (`indexValue`) is part of the identity too: the same
    * declared fields with and without an overflow portion — or with
    * differently-typed ones — are different structs. */
-  intern(fields: { name: string; type: IrType; optional?: true; internal?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[],): string {
+  intern(fields: { name: string; type: IrType; optional?: true; internal?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[]): string {
     const key = this.keyOf(fields, tuple, indexValue);
     let id = this.byKey.get(key);
     if (id !== undefined) this.mergeOptional(id, fields);
@@ -153,6 +154,7 @@ export class ShapeRegistry {
         // IrRecordShape doc): a later structurally-equal type keeps the
         // first one's order.
         ...(declaredOrder ? { declaredOrder } : {}),
+        ...(memberOrder ? { memberOrder } : {}),
       };
       this.byKey.set(key, id);
       this.byId.set(id, shape);
@@ -2756,10 +2758,23 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         ts.isParameter(decl) &&
         (decl.questionToken !== undefined || decl.initializer !== undefined);
       let pt = mapType(checker.getTypeOfSymbol(p), ctx);
+      // A DESTRUCTURED options parameter of an npm package's own JavaScript
+      // whose inferred object type does not map (@clack/prompts' spinner:
+      // `{ output: n = process.stdout, …, ...I } = {}` infers its `output`
+      // as NodeJS.WriteStream): the parameter is the dynamic value the
+      // caller passes, destructured by the per-site dynamic reads (and
+      // their defaults) inside the body, as an implicit-any parameter is.
+      if (
+        pt === null && ctx.sharedDynamic === true && decl !== undefined && ts.isParameter(decl) &&
+        ts.isObjectBindingPattern(decl.name) && isJsSourceFile(decl.getSourceFile()) &&
+        decl.getSourceFile().fileName.includes("/node_modules/")
+      ) {
+        pt = DYN;
+      }
       // Belt and braces for non-strict type worlds: an optional param's
       // ABI slot is always the undefined-armed union (strictNullChecks
       // already spells it that way; arm it here if the world didn't).
-      if (optional && pt && pt.kind !== "void" && pt.kind !== "jsval") {
+      if (optional && pt && pt.kind !== "void" && pt.kind !== "jsval" && pt.kind !== "dyn") {
         const armed = withUndefinedArm(pt, ctx.unions);
         if (!armed) return null;
         pt = armed;
@@ -3574,6 +3589,7 @@ interface RecordShapeParts {
   fields: { name: string; type: IrType; optional?: true }[];
   indexValue?: IrType;
   declaredOrder?: string[];
+  memberOrder?: string[];
 }
 
 /** SEMANTICS.md S133 (k), "a declared interface over a dynamic
@@ -3963,10 +3979,10 @@ function mapRecordTypeWalk(widened: ts.Type, ctx: TypeMapperCtx, sensitivityAtEn
       if (contextResolutions !== sensitivityAtEntry) return null;
       return {
         kind: "record",
-        shapeId: shapes.finalizeRecursive(widened, inner.fields, inner.indexValue, inner.declaredOrder),
+        shapeId: shapes.finalizeRecursive(widened, inner.fields, inner.indexValue, inner.declaredOrder, inner.memberOrder),
       };
     }
-    return { kind: "record", shapeId: shapes.intern(inner.fields, false, inner.indexValue, inner.declaredOrder) };
+    return { kind: "record", shapeId: shapes.intern(inner.fields, false, inner.indexValue, inner.declaredOrder, inner.memberOrder) };
   } finally {
     shapes.inProgress.delete(widened);
     mapRecordStack.pop();
@@ -4184,7 +4200,12 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
                 ts.isInterfaceDeclaration(d.parent) ||
                 d.parent.kind === ts.SyntaxKind.TypeLiteral) &&
               !d.getSourceFile().isDeclarationFile &&
-              !isJsSourceFile(d.getSourceFile()),
+              // JS-file literals keep their paths — except, on the WasmGC
+              // lanes, an npm package's own literal (@clack/prompts'
+              // spinner result `{ start, …, get isCancelled() {} }`): its
+              // accessor slots are the TS literal's.
+              (!isJsSourceFile(d.getSourceFile()) ||
+                (ctx.sharedDynamic === true && d.getSourceFile().fileName.includes("/node_modules/") && ts.isObjectLiteralExpression(d.parent))),
           );
         if (!accessorOwned || (!getDecl && !setDecl)) return null;
         // Symbol-keyed accessors have no foldable literal name to fill at
@@ -4286,8 +4307,10 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     // enumerate FIRST ascending, then string keys in insertion order
     // (OrdinaryOwnPropertyKeys) — Object.keys/JSON/inspect all read it.
     const declaredOrder = esOwnKeyOrder(fields.filter((f) => accessorSlotProp(f.name) === null).map((f) => f.name));
+    const hasAccessors = fields.some((f) => accessorSlotProp(f.name) !== null);
+    const memberOrder = hasAccessors ? [...new Set(fields.map((f) => accessorSlotProp(f.name)?.prop ?? f.name))] : undefined;
     fields.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    return { fields, ...(indexValue ? { indexValue } : {}), declaredOrder };
+    return { fields, ...(indexValue ? { indexValue } : {}), declaredOrder, ...(memberOrder ? { memberOrder } : {}) };
   }
 }
 
