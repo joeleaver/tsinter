@@ -9347,7 +9347,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
               "dynamic keyed writes to records without an index signature (declared fields of ONE shared type dispatch by key — spell the field name otherwise)",
             );
           }
-          const obj = L.lowerExpr(target.expression);
+          const obj = keySetReceiver(L, L.lowerExpr(target.expression), receiverIr, target);
           let key: IrExpr =
             litKey !== null
               ? { kind: "strLit", value: litKey, type: STRING, loc: locOf(target.argumentExpression) }
@@ -9401,7 +9401,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
             `dynamic keyed writes to '${L.fmt(receiverIr)}' (a declared field's type cannot take the index signature's value at runtime)`,
           );
         }
-        const obj = L.lowerExpr(target.expression);
+        const obj = keySetReceiver(L, L.lowerExpr(target.expression), receiverIr, target);
         let key =
           litKey !== null
             ? ({ kind: "strLit", value: litKey, type: STRING, loc: locOf(target.argumentExpression) } satisfies IrExpr)
@@ -13958,7 +13958,7 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
           return declaredArms.every((a) => ivArms.some((b) => typeEquals(a, b)));
         };
         if (!nameSym || nameSym.name === ts.InternalSymbolName.Index || canonicalized()) {
-          const obj = L.lowerExpr(access.expression);
+          const obj = keySetReceiver(L, L.lowerExpr(access.expression), receiverIr, access);
           return { container: "recordOvf", obj, shapeId: receiverIr.shapeId, field: access.name.text, fieldType: shape.indexValue };
         }
       }
@@ -14273,6 +14273,20 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
  * Node's (record-order.ts) — the write itself, preceded by the order note
  * when the field is optional on an ordered shape. `receiverGuard` wraps it
  * in Unit U's undefined-receiver throw (the dot spelling's). */
+/** GH #239: a keyed write whose receiver's static type (a cast such as
+ * `x as Record<string, unknown>`) names an index-signature shape while the
+ * value is a record of another shape — a closed record keeps its own struct
+ * through the cast, so the key has nowhere to go. Node adds the property;
+ * the write refuses by name rather than miscompiling. */
+function keySetReceiver(L: Lowerer, obj: IrExpr, receiverIr: IrType, at: ts.Node): IrExpr {
+  if (typeEquals(obj.type, receiverIr)) return obj;
+  L.unsupported(
+    "SC1090",
+    at,
+    `a key added to a '${L.fmt(obj.type)}' through a cast to '${L.fmt(receiverIr)}' (the value keeps its own fixed fields, so the new key has nowhere to go — JavaScript adds the property)`,
+  );
+}
+
 export function orderedRecordWrite(L: Lowerer, write: IrStmt & { kind: "recordSet" }, receiverGuard: boolean): IrStmt {
   const wrap = (w: IrStmt): IrStmt => (receiverGuard ? undefWriteGuard(L, w) : w);
   const shape = orderedShape(L, write.shapeId);
