@@ -14,7 +14,7 @@
  * Each is computed once per process, on first use. */
 import { canonicalize } from "./regex-canon.js";
 import { isIdentFirst, isIdentNext } from "./regex-ident.js";
-import { GC_NAME_ROWS } from "./regex-unicode-tables.js";
+import { GC_NAME_ROWS, PROP_ROWS } from "./regex-unicode-tables.js";
 
 /* ── outcome vocabulary ─────────────────────────────────────────────── */
 
@@ -281,6 +281,34 @@ export function gcAliasBlob(): Uint8Array {
     }
   });
   return Uint8Array.from(bytes);
+}
+
+/** The ported Script values ("sc") or binary property names ("bin") as one
+ * alias blob in gcAliasBlob's layout; the trailing byte is the PROP_ROWS
+ * index, which keys propRangeOffsets. */
+export function propAliasBlob(kind: "sc" | "bin"): Uint8Array {
+  const bytes: number[] = [];
+  PROP_ROWS.forEach((row, i) => {
+    if (row.kind !== kind) return;
+    for (const alias of row.aliases.split(",")) {
+      bytes.push(alias.length);
+      for (let k = 0; k < alias.length; k++) bytes.push(alias.charCodeAt(k));
+      bytes.push(i);
+    }
+  });
+  return Uint8Array.from(bytes);
+}
+
+/** Every PROP_ROWS row's ranges, concatenated. */
+export function propRanges(): number[] {
+  return PROP_ROWS.flatMap((row) => row.ranges);
+}
+
+/** Row i's ranges are propRanges()[off[i] .. off[i + 1]). */
+export function propRangeOffsets(): number[] {
+  const off = [0];
+  for (const row of PROP_ROWS) off.push(off[off.length - 1]! + row.ranges.length);
+  return off;
 }
 
 /** Little-endian i32 bytes for array.new_data over an i32 array type. */

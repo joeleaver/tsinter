@@ -8299,6 +8299,17 @@ the program (S122), printing `tsinter: unsupported: <message> [<code>]`;
 "throws … catchable" below holds on the c and llvm lanes only. The
 SyntaxError arm is unchanged (it is Node's).*
 
+*Paperclip amendment (fast-string-truncated-width): five Script values —
+`Han`/`Hani`, `Hiragana`/`Hira`, `Katakana`/`Kana`, `Hangul`/`Hang`,
+`Tangut`/`Tang`, as `\p{Script=…}` or `\p{sc=…}` — and four binary
+properties — `Emoji`, `Emoji_Modifier_Base`/`EBase`,
+`Emoji_Modifier`/`EMod`, `Emoji_Presentation`/`EPres` — are no longer
+`unported-unicode-property`: they build, from ranges decoded out of the
+vendored quickjs-ng tables, which agree with Node v24.18.1's Unicode 17.0
+on every code point (the drift test enumerates all of them against Node).
+Every other Script value, every `Script_Extensions` / `scx` value
+(including these five), and every other binary property stay the fence.*
+
 `new RegExp(pattern, flags)` over strings known only at run time compiles
 in the module (S065's run-time arm). For a pattern outside the tier it
 throws an `Error` (name `Error`) whose message is `new RegExp(): '<key>'
@@ -8310,7 +8321,8 @@ build (a regex literal outside the tier still refuses at build time by
 `expr:regexLit:<key>`). Keys: `unicode-sets-flag` (/v), `unicode-casefold` (/i with
 /u), `modifiers` (a `(?ims-ims:…)` group that changes how an atom
 compiles), `unported-unicode-property` (a `\p{…}` name outside
-General_Category, including Script and binary properties Node knows),
+General_Category and the ported Script / binary subset in the amendment
+above, including Script and binary properties Node knows),
 the eight `annexb-*` families of legacy syntax (S065's literal arm
 refuses the same ones), `too-many-captures` (255; V8 allows more),
 `too-many-registers`, `too-many-ranges`, `nesting-depth` (256 nested

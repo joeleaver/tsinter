@@ -47,6 +47,15 @@ const ROWS: ReadonlyArray<readonly [pattern: string, flags: string, expected: st
   ["\\P{Alphabetic}", "u", "unported-unicode-property", "negated binary property"],
   ["\\p{Alphabetic}", "u", "unported-unicode-property", "binary property (Node accepts)"],
   ["\\p{L}", "u", "ok", "General_Category is supported"],
+  // the ported PROP_ROWS subset builds; its neighbours stay fenced
+  ["[\\p{Script=Han}\\p{sc=Hira}\\p{Script=Katakana}\\p{sc=Hang}\\p{Script=Tangut}]", "u", "ok", "the five ported Script values, long and short"],
+  ["\\P{Script=Hani}\\p{sc=Kana}\\P{sc=Tang}\\p{Script=Hangul}\\p{Script=Hiragana}", "u", "ok", "negated and short-alias Script values"],
+  ["\\p{Emoji}\\p{Emoji_Modifier_Base}\\p{EMod}\\P{EPres}\\p{EBase}\\p{Emoji_Modifier}\\p{Emoji_Presentation}", "u", "ok", "the four ported binary properties and their aliases"],
+  ["\\p{Script_Extensions=Han}", "u", "unported-unicode-property", "Script_Extensions of a ported script is not ported"],
+  ["\\p{scx=Hira}", "u", "unported-unicode-property", "scx of a ported script is not ported"],
+  ["\\p{sc=Latn}", "u", "unported-unicode-property", "an unported Script value next to the ported ones"],
+  ["\\p{Emoji_Component}", "u", "unported-unicode-property", "an unported emoji binary property"],
+  ["\\p{Extended_Pictographic}", "u", "unported-unicode-property", "an unported emoji binary property"],
   ["[\\p{L}\\d]", "u", "ok", "General_Category inside a class"],
   // #267: an escaped backslash followed by `p{…}` is no property escape
   ["[\\\\p{Script=Greek}]", "u", "ok", "#267: `\\\\` then literal p{Script=Greek} in a class"],
