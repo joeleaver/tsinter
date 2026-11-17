@@ -80,13 +80,6 @@ generic-value-bindings.ts:39:13 - error SC1090: results that are themselves gene
      |             ^~~~~~~~~~
   40 | 
 
-generic-value-bindings.ts:51:15 - error SC1090: calls of the generic method 'm' through this receiver (no compiled declaration with a body resolves statically here — ambient 'declare class' and interface-only methods are signature-only, and only class, static, and object-literal generic methods with bodies monomorphize) is not supported yet
-
-  50 | function throughParam(a: Amb): void {
-  51 |   console.log(a.m(4));
-     |               ^~~~~~
-  52 | }
-
 generic-value-bindings.ts:56:14 - error SC1090: generic arrow/function expressions outside a never-reassigned module-scope binding (only `const f = <T>(x: T) => ...` bindings and top-level generic function declarations monomorphize) is not supported yet
 
   55 | // A generic lambda outside any monomorphizable home (an IIFE).
