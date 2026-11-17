@@ -784,6 +784,13 @@ function lowerOptionalDefaultArg(
     if (L.sharedDynamic && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode))) {
       argNode.parameters.forEach((p, i) => {
         if (i >= lead.length || lead[i]!.kind !== "dyn") return;
+        // An unannotated ARRAY pattern over the dynamic element (`([, value])
+        // =>` on `Object.entries` of a dynamic record) binds the element
+        // as the dynamic value and destructures it at run time.
+        if (ts.isArrayBindingPattern(p.name) && !p.type && !p.initializer && !p.dotDotDotToken && !p.questionToken) {
+          L.dynParamOverrides.add(p);
+          return;
+        }
         if (!ts.isIdentifier(p.name) || p.initializer || p.dotDotDotToken) return;
         const declared = L.chainNarrowedType.get(p.name) ?? L.checker.getTypeAtLocation(p.name);
         if (L.mapTypeOf(declared)?.kind === "jsval") L.dynParamOverrides.add(p);
@@ -9612,6 +9619,18 @@ function dynRecvThrows(dRef: IrExpr, mRef: IrExpr, fullRef: IrExpr, loc: SrcLoc)
     if (call.arguments.length !== 1) return null;
     const argNode = call.arguments[0]!;
     const loc = locOf(call);
+    // A callback whose result type is `any[]` (paperclip's
+    // `([, value]) => (Array.isArray(value) ? value : [value])`: an array
+    // of whatever the dynamic element held) has no static return type: it
+    // returns the dynamic value, and the dynamic flatMap below decides per
+    // element whether it spreads, as Node does.
+    if (L.sharedDynamic && !L.engine && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode)) && !L.lambdaRetOverrides.has(argNode)) {
+      const sig = L.checker.getCallSignatures(L.checker.getTypeAtLocation(argNode))[0];
+      const retT = sig !== undefined ? L.checker.getReturnTypeOfSignature(sig) : undefined;
+      const anyEl = retT !== undefined && L.checker.isArrayType(retT) &&
+        (L.checker.getTypeArguments(retT as ts.TypeReference)[0]!.flags & ts.TypeFlags.Any) !== 0;
+      if (anyEl && L.mapTypeOf(retT!) === null) L.lambdaRetOverrides.set(argNode, DYN);
+    }
     const { fnArg, arity } = hofCallbackArg(L, argNode, [DYN], DYN);
     const ret = fnArg.type.ret;
     if (ret.kind !== "array") {

@@ -55,6 +55,27 @@ const ROWS: Row[] = [
     },
   },
   {
+    id: "POS-04 a dynamic flatMap whose callback returns any[] (paperclip's assertSafeManagedEnvironment chain)",
+    files: {
+      "main.ts": [
+        `function record(v: unknown): Record<string, unknown> {`,
+        `  return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {};`,
+        `}`,
+        `function installed(environment: Record<string, unknown>): unknown[] {`,
+        `  const packages = record(record(environment.config).packages);`,
+        `  return Object.entries(packages)`,
+        `    .filter(([key]) => key !== "type")`,
+        `    .flatMap(([, value]) => (Array.isArray(value) ? value : [value]))`,
+        `    .filter((value) => value !== undefined && value !== null);`,
+        `}`,
+        `const env = JSON.parse('{"config":{"packages":{"type":"x","pip":["a",["nested"],null],"npm":"c","apt":null,"go":[],"gem":{"k":1},"n":7}}}') as Record<string, unknown>;`,
+        `const out = installed(env);`,
+        `console.log(out.length, JSON.stringify(out));`,
+        `console.log(installed({}).length, JSON.stringify(installed(JSON.parse('{"config":{"packages":[1,2]}}') as Record<string, unknown>)));`,
+      ].join("\n"),
+    },
+  },
+  {
     id: "POS-03 a refine callback whose record parameter holds unknown, called by a package's dynamic implementation",
     npmStatic: ["pz"],
     files: {
