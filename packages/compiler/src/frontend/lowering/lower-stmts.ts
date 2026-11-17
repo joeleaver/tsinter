@@ -9,7 +9,7 @@ import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js"
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, importCallHandleType, neverResidueTsBinding, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
+import { dynArmForOf, lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
@@ -3245,6 +3245,16 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     out: IrStmt[],): void {
     const loc = value.loc;
     if (ts.isIdentifier(name)) {
+      // S125: a for-of loop binding on the dynamic arm holds the dynamic
+      // element itself, shared as in Node (dyn-arm.ts forOfConstBinding).
+      if (dynArmForOf(L, name) && (value.type.kind === "jsval" || value.type.kind === "dyn")) {
+        const js = isJsSourceFile(name.getSourceFile());
+        const t: IrType = js ? DYN : JSVAL;
+        const v: IrExpr = js ? asDynOperand(value) : value.type.kind === "dyn" ? { kind: "jsMarshal", value, type: JSVAL, loc } : value;
+        const local = L.declareLocal(name, name.text, t, isLet);
+        out.push({ kind: "varDecl", localId: local.id, init: v, loc });
+        return;
+      }
       const symbol = L.checker.getSymbolAtLocation(name);
       const g = symbol ? L.globalsBySymbol.get(symbol) : undefined;
       if (g) {
@@ -7155,6 +7165,26 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
       }
     }
+    // S125 (paperclip's superRefine loops): `for (const [i, x] of
+    // d.entries())` over a DYNAMIC receiver (an `any`, or a value on the
+    // dynamic arm) walks the array's [index, element] pairs.
+    if (L.sharedDynamic && !L.engine && !stmt.awaitModifier) {
+      let src: ts.Expression = stmt.expression;
+      while (ts.isParenthesizedExpression(src)) src = src.expression;
+      if (ts.isCallExpression(src) && src.arguments.length === 0 && !src.questionDotToken &&
+          ts.isPropertyAccessExpression(src.expression) && !src.expression.questionDotToken && src.expression.name.text === "entries") {
+        // (the typed containers keep their own projections below; a
+        // JavaScript source's checker type need not say `any` for a value
+        // the lowering keeps dynamic, so the receiver's lowering decides)
+        const recvT = L.mapTypeOf(L.typeOf(src.expression.expression));
+        const typedRecv = recvT !== null && ["map", "set", "array", "searchParams", "bytes", "record", "object", "string"].includes(recvT.kind);
+        const probe = typedRecv ? null : probeLower(L, src.expression.expression);
+        if (probe !== null && (probe.type.kind === "jsval" || probe.type.kind === "dyn")) {
+          const recv = L.lowerExpr(src.expression.expression);
+          if (recv.type.kind === "jsval" || recv.type.kind === "dyn") return lowerForOfDyn(L, stmt, asDynOperand(recv), labels, true);
+        }
+      }
+    }
     // `for (const k of m.keys())` / `.values()` / `.entries()`: the
     // iterator methods consumed DIRECTLY by a for-of head ride the
     // container's live walk — exactly `for..of m` with the projection
@@ -8046,7 +8076,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         : "";
   }
 
-  function lowerForOfDyn(L: Lowerer, stmt: ts.ForOfStatement, iterable: IrExpr, labels?: string[]): IrStmt {
+  function lowerForOfDyn(L: Lowerer, stmt: ts.ForOfStatement, iterable: IrExpr, labels?: string[], arrayEntries = false): IrStmt {
     const loc = locOf(stmt);
     const head = stmt.expression;
     // V8's for-of CallPrinter spellings (forOfSpelling).
@@ -8082,8 +8112,13 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     }
     const rawLocal = L.declareHiddenLocal("%dofraw", DYN);
     const rawRef = (): IrExpr => ({ kind: "varRef", localId: rawLocal.id, type: DYN, loc });
+    // S125 (paperclip's superRefine loops): `for (const [i, x] of d.entries())`
+    // over a dynamic ARRAY binds Array.prototype.entries' [index, element]
+    // pairs; any other receiver stops by name before the loop.
     const elemInit = (): IrExpr =>
-      half === null ? rawRef() : { kind: "libCall", fn: "dyn.arrAt", args: [rawRef(), { kind: "numLit", value: half, type: F64, loc }], type: DYN, loc };
+      arrayEntries
+        ? { kind: "dynArrLit", elems: [{ kind: "dynFrom", value: iRef(), type: DYN, loc } as IrExpr, rawRef()], type: DYN, loc }
+        : half === null ? rawRef() : { kind: "libCall", fn: "dyn.arrAt", args: [rawRef(), { kind: "numLit", value: half, type: F64, loc }], type: DYN, loc };
     L.scopes.push(new Map());
     try {
       const binds: IrStmt[] = [];
@@ -8154,9 +8189,23 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
       }
       const body = L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement), labels);
+      const entriesGuard: IrStmt[] = [];
+      if (arrayEntries) {
+        const recvL = L.declareHiddenLocal("%dofrecv", DYN);
+        entriesGuard.push({ kind: "varDecl", localId: recvL.id, init: iterable, loc });
+        iterable = { kind: "varRef", localId: recvL.id, type: DYN, loc };
+        entriesGuard.push({
+          kind: "if",
+          cond: { kind: "unary", op: "!", operand: { kind: "dynTest", test: "array", value: iterable, type: BOOL, loc }, type: BOOL, loc },
+          then: [{ kind: "runtimeFence", code: "SC1090", message: "for-of over .entries() of a dynamic value that is not an array (an array's [index, element] pairs are modeled) is not supported yet", loc } as IrStmt],
+          else_: null,
+          loc,
+        });
+      }
       return {
         kind: "block",
         body: [
+          ...entriesGuard,
           {
             kind: "varDecl",
             localId: pack.id,
