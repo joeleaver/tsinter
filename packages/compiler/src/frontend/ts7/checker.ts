@@ -44,7 +44,7 @@ import type {
   TypeReference,
 } from "typescript/unstable/sync";
 import { walkPreorder } from "./ast.js";
-import { SignatureKind, SyntaxKind, TypeFlags } from "./enums.js";
+import { SignatureKind, SymbolFlags, SyntaxKind, TypeFlags } from "./enums.js";
 
 /** Array-overload chunk size: large enough that per-request overhead
  * vanishes, small enough to keep any single JSON-RPC payload modest. */
@@ -484,6 +484,25 @@ export class CheckerFacade {
   }
 
   getAliasedSymbol(symbol: Ts7Symbol): Ts7Symbol {
+    // The declared-surface redirect answers at the FIRST alias hop it maps,
+    // not only at the chain's end: a viewed package's declarations that
+    // re-export another package's name (`export { isCancel } from "pcore"`)
+    // while its JS ships its own export of that name (a wrapper) answer with
+    // that package's own export, where Node's import lands (GH #237).
+    if (this.symbolRedirect !== null) {
+      // The alias ITSELF may be a viewed package's own export (a namespace
+      // member read, `pp.isCancel`, names pprompts' export alias directly).
+      const own = this.redirected(symbol, "alias");
+      if (own !== null) return own;
+      let s = symbol;
+      for (let hop = 0; hop < 32 && s.flags & SymbolFlags.Alias; hop++) {
+        const next = this.raw.getImmediateAliasedSymbol(s);
+        if (next === undefined || next === s) break;
+        const r = this.redirected(next, "alias");
+        if (r !== null) return r;
+        s = next;
+      }
+    }
     const aliased = this.rawGetAliasedSymbol(symbol);
     return this.redirected(aliased, "alias") ?? aliased;
   }

@@ -39,6 +39,8 @@ interface ViewExports {
 }
 
 const pathInMirror = (p: string): boolean => isDtsMirrorPath(p);
+/** The mirror directory segment (npm-static.ts DTS_MIRROR_SEGMENT). */
+const MIRROR_SEGMENT = "/__tsinter_dts__";
 
 export function installDtsBridge(program: ts.Program): void {
   const views = npmStaticDtsViews();
@@ -82,8 +84,15 @@ export function installDtsBridge(program: ts.Program): void {
         declaredEq !== undefined &&
         checker.rawDeclarationsOf(resolveAlias(declaredEq)).some((d) => ts.isVariableDeclaration(d));
       if (!eqIsConst) {
+        // Only the OWNING view maps a declaration (one under its own mirror):
+        // a re-export of another viewed package's name (`export { isCancel }
+        // from "pcore"`) maps through its own export alias only, so its JS
+        // export of that name (a wrapper, or the re-export itself) answers
+        // that package's uses, and pcore's view answers pcore's (GH #237).
+        const mirrorRoot = view.mirrorEntry.slice(0, view.mirrorEntry.indexOf(MIRROR_SEGMENT) + MIRROR_SEGMENT.length);
         for (const e of exportsOf(mirrorMod)) {
-          declared.set(resolveAlias(e), e.name);
+          const resolved = resolveAlias(e);
+          if (resolved === e || checker.symbolDeclaredIn(resolved, (p) => p.startsWith(mirrorRoot))) declared.set(resolved, e.name);
           declared.set(e, e.name);
         }
       }
@@ -170,7 +179,23 @@ export function installDtsBridge(program: ts.Program): void {
       if (name === undefined) continue;
       const j = v.js.get(name);
       if (j === undefined) return null;
-      const jr = resolveAlias(j);
+      // Hop by hop (the facade's redirect-aware alias resolution): a JS re-export
+      // of another viewed package's name stops at THAT package's own export
+      // (its wrapper), not at the declaration the raw chain ends on (GH #237).
+      let jr = j.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(j) : j;
+      // GH #237: the JS re-exports a binding of ANOTHER viewed package
+      // (@clack/prompts' `export { isCancel }` of @clack/core's import). That
+      // package's bare specifier types against its declarations program-wide,
+      // so the JS alias lands on a declaration: keep redirecting to the
+      // implementation, whatever order the views were registered in.
+      if (checker.symbolDeclaredIn(jr, pathInMirror)) {
+        // The alias leads back to this very declaration: another view (the
+        // declaring package's own) maps it.
+        if (jr === sym) continue;
+        const deeper = redirect(jr);
+        if (deeper === null) continue;
+        jr = deeper;
+      }
       if (sym.flags & ts.SymbolFlags.Class) return classOf(jr) ?? jr;
       return jr;
     }

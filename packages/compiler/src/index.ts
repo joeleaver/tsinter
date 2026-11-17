@@ -585,8 +585,8 @@ function runFrontendLoads(entryPath: string, npmStatic?: readonly string[] | "au
     }
     // The opt-in list in Node's evaluation order (each package's first
     // module in the loaded program's module order: dependencies first, a
-    // diamond's shared dependency before both importers). The build is not
-    // yet independent of that order (GH #237).
+    // diamond's shared dependency before both importers): a deterministic
+    // order, though the build no longer depends on it (GH #237).
     if (grewAny) {
       const ordered = byEvaluationOrder(requested, load);
       if (ordered.some((pk, i) => pk !== requested[i])) {

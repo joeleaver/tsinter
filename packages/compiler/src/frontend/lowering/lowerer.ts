@@ -126,7 +126,7 @@ import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from 
 import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
-import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
+import { fenceCrossBlockNsRef, moduleNsSourceFileOf, nsPathPrefix } from "./lower-namespaces.js";
 
 /** Entry function name. '%' cannot appear in a TS identifier, so a user
  * function can never collide with it (mangling is injective per prefix). */
@@ -2101,6 +2101,23 @@ export class Lowerer {
    * value reference resolves through here, so it doubles as the flush
    * point for deferred collection diagnostics: resolving a reference to a
    * broken declaration reports what collection deferred. */
+  /** `ns.name` where `ns` names a module namespace and the checker's answer
+   * for `name` is declared in a viewed package's mirror: the export of that
+   * name in the namespace's (JS) module, resolved through the redirect-aware
+   * alias chain; null otherwise. */
+  private namespaceMemberImplementation(ident: ts.Identifier, symbol: ts.Symbol): ts.Symbol | null {
+    const access = ident.parent;
+    if (access === undefined || !ts.isPropertyAccessExpression(access) || access.name !== ident) return null;
+    if (!this.checker.symbolDeclaredIn(symbol, isDtsMirrorPath)) return null;
+    const sf = moduleNsSourceFileOf(this, access.expression);
+    if (sf === null) return null;
+    const mod = this.checker.getSymbolAtLocation(sf);
+    if (mod === undefined) return null;
+    const e = mod.getExports().get(ident.text as ts.__String) ?? this.checker.raw.getExportsOfModule(mod).find((x) => x.name === ident.text);
+    if (e === undefined) return null;
+    return e.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(e) : e;
+  }
+
   resolveValueSymbol(ident: ts.Identifier): ts.Symbol | null {
     let symbol = this.checker.getSymbolAtLocation(ident);
     // A shorthand property's NAME resolves to the property symbol; the
@@ -2182,10 +2199,16 @@ export class Lowerer {
       }
       symbol = this.checker.getAliasedSymbol(symbol);
     } else {
-      // A viewed package's export reached without an alias hop (a member
-      // read through a namespace, `z.iso.date`): the implementation the
-      // declared-surface bridge maps it to (SEMANTICS.md S133).
-      symbol = this.checker.implementationOf(symbol);
+      // A member read through a NAMESPACE whose answer is a viewed package's
+      // declaration (`pp.isCancel` over `import * as pp from "pprompts"`, or
+      // a program module re-exporting it): the checker resolves the member to
+      // the end of the declared alias chain, past a re-exporting package's
+      // own export. Resolve it through the namespace's JS module instead, hop
+      // by hop, as a named import does (GH #237).
+      const viaModule = this.namespaceMemberImplementation(ident, symbol);
+      // A viewed package's export reached without an alias hop (`z.iso.date`):
+      // the implementation the declared-surface bridge maps it to (S133).
+      symbol = viaModule ?? this.checker.implementationOf(symbol);
     }
     // CommonJS export plumbing: a binding that resolved to a PROPERTY of a
     // top-level `module.exports = { ... }` literal (shorthand, or a plain
