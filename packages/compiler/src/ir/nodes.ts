@@ -3854,6 +3854,13 @@ export type IrLibFn =
   | "dyn.objKeys"
   | "dyn.hasOwn"
   | "dyn.assign"
+  /** The object REST copy over a dynamic source (`const { a, ...rest } =
+   * src` in JavaScript sources): (target, src, keys) copies src's own
+   * enumerable members onto the fresh target except the names in `keys`
+   * (a dyn array of strings: the pattern's other property names), never
+   * reading an excluded one; a source that is not a plain object stops by
+   * name. */
+  | "dyn.assignExcept"
   /** Variadic Object.assign over CHECKED-DYNAMIC targets (`Object.assign(
    * {}, ...arr.map(f), tail)` — the option-table merge): the lowering
    * builds one fresh dyn pack of sources (packPush retains a plain source
@@ -8020,6 +8027,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.objKeys",
   "dyn.hasOwn",
   "dyn.assign",
+  "dyn.assignExcept",
   // variadic Object.assign: spread flattening throws V8's spread-call
   // TypeErrors; the final copy throws ToObject on a nullish target
   "dyn.packPushSpread",

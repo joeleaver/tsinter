@@ -1682,8 +1682,10 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           const type = L.irTypeOf(member.name);
           if (type.kind === "void") L.badType(member.name, L.typeOf(member.name));
           // dyn stays out of class fields (KEEP NARROW; record
-          // fields and array elements are unmappable via mapType already).
-          if (type.kind === "dyn") {
+          // fields and array elements are unmappable via mapType already)
+          // — except a JavaScript source's implicit-any field on the
+          // WasmGC lanes' one dynamic world (dynClassFieldAdmitted).
+          if (type.kind === "dyn" && !dynClassFieldAdmitted(L, member)) {
             L.unsupported("SC1090", member.name, "'unknown'-typed class fields");
           }
           if (fields.has(member.name.text)) {
@@ -1731,7 +1733,8 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           const admitsUndefined =
             (type.kind === "union" &&
               (L.unions.get(type.unionId)?.arms.some((a) => a.kind === "undefinedT") ?? false)) ||
-            type.kind === "jsval";
+            type.kind === "jsval" ||
+            type.kind === "dyn";
           if (!member.initializer && !admitsUndefined) {
             const opts = L.program.getCompilerOptions();
             const spi = opts.strictPropertyInitialization ?? opts.strict ?? false;
@@ -1797,7 +1800,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
             const type = shape.bodyType ?? shape.type;
             if (type.kind === "void") L.badType(p.name, L.typeOf(p.name));
             // The class-field dyn rule verbatim (KEEP NARROW).
-            if (type.kind === "dyn") {
+            if (type.kind === "dyn" && !dynClassFieldAdmitted(L, p)) {
               L.unsupported("SC1090", p.name, "'unknown'-typed class fields");
             }
             // `override x` (and any same-named inherited member) would
@@ -4670,12 +4673,23 @@ function classInitsEmptyLiteral(cls: ts.Node, name: string): boolean {
     const out: IrStmt[] = [];
     let superSeen = false;
     for (const stmt of info.ctor!.body!.statements) {
+      // `super(…), this.x = …, this.on(…);` (minified JavaScript: clack's
+      // prompt constructors) is the same statement split at its commas:
+      // the comma operator evaluates its operands left to right and
+      // discards their values, so the super() call runs first, then (when
+      // it returns) the field initializers, then each remaining operand in
+      // source order — exactly the statements below. Only a LEADING
+      // super() splits; one anywhere else in the expression keeps the
+      // expression-position fence.
+      const operands = ts.isExpressionStatement(stmt) ? commaOperandsOf(stmt.expression) : [];
+      const head = operands[0];
       const superCall =
-        ts.isExpressionStatement(stmt) &&
-        ts.isCallExpression(stmt.expression) &&
-        stmt.expression.expression.kind === ts.SyntaxKind.SuperKeyword
-          ? stmt.expression
+        head !== undefined &&
+        ts.isCallExpression(head) &&
+        head.expression.kind === ts.SyntaxKind.SuperKeyword
+          ? head
           : null;
+      const trailing = superCall ? operands.slice(1) : [];
       if (!superCall) {
         out.push(...L.lowerStmts([stmt]));
         continue;
@@ -4698,6 +4712,7 @@ function classInitsEmptyLiteral(cls: ts.Node, name: string): boolean {
           out.push(...lowerStreamSuperCall(L, info, base, superCall.arguments, thisLocal, locOf(stmt), stmt));
           out.push(...L.fieldInitStmts(info, thisLocal));
           out.push(...paramPropInitStmts(L, info, thisLocal));
+          for (const op of trailing) out.push(L.lowerExprStatement(op));
           continue;
         }
         const args = forward !== undefined
@@ -4712,6 +4727,7 @@ function classInitsEmptyLiteral(cls: ts.Node, name: string): boolean {
         // assignments (Node's order, probed) → the rest of the body.
         out.push(...L.fieldInitStmts(info, thisLocal));
         out.push(...paramPropInitStmts(L, info, thisLocal));
+        for (const op of trailing) out.push(L.lowerExprStatement(op));
       } catch (e) {
         if (!(e instanceof PoisonError)) throw e;
         if (!L.suppressStats) {
@@ -6150,4 +6166,29 @@ export function genericFieldFnNodeOf(member: ts.PropertyDeclaration): ts.Functio
     return init;
   }
   return null;
+}
+
+/** A dynamic (dyn) class field is admitted only in a JavaScript source on
+ * the WasmGC lanes' one dynamic world: there a field inference leaves
+ * `any` (`class V { input; value; _subscribers = new Map(); }`) holds the
+ * dynamic value exactly as a record field does — the allocation seeds
+ * dyn's own undefined (emitFieldSeed: Node's fresh-instance read), every
+ * write crosses into dyn, and every read meets the per-site checked
+ * lowerings JavaScript sources get (SEMANTICS.md S115-S117). TypeScript
+ * sources and the other lanes keep the fence: an `unknown` field there is
+ * the program author's to annotate. */
+function dynClassFieldAdmitted(L: Lowerer, node: ts.Node): boolean {
+  return L.sharedDynamic && !L.engine && isJsSourceFile(node.getSourceFile());
+}
+
+/** The operands of a statement's comma expression, left to right (`a, b, c`
+ * parses as `(a, b), c`); a non-comma expression is its own single operand.
+ * Parentheses around the whole expression or a nested comma group are
+ * transparent (the grouping does not change the evaluation order). */
+function commaOperandsOf(e: ts.Expression): ts.Expression[] {
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return [...commaOperandsOf(e.left), ...commaOperandsOf(e.right)];
+  }
+  return [e];
 }

@@ -4716,6 +4716,12 @@ export class DynBuilder {
     });
   }
 
+  /** The object rest copy onto a fresh plain target (assignRaw's
+   * `except` form — the target is never a view). */
+  assignExcept(): number {
+    return this.assignRaw(true);
+  }
+
   /** Object.assign onto a view: member by member through keySet (the
    * accessors' checks), the source's own enumerable entries in order. */
   assign(): number {
@@ -10687,17 +10693,29 @@ export class DynBuilder {
    * not written: in a module that can mint one, such a put refuses by
    * name (board #198), as a direct member write does; every other key
    * copies. */
-  private assignRaw(): number {
-    return this.cached("assign", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+  /** With `except`, the object REST copy (`const { a, ...rest } = src`
+   * over a dynamic source): `%w.dyn.assignExcept(target, src, keys)`
+   * copies the source's own enumerable members onto the fresh target
+   * EXCEPT the names in `keys` (an ARR of STR boxes — the pattern's other
+   * property names), CopyDataProperties with its excluded list: an
+   * excluded member is never read, so its getter does not run. Only a
+   * plain-object (OBJ) source is modeled; any other kind stops by name
+   * (copying an array's, a string's or a function's members would
+   * otherwise need their own walks). */
+  private assignRaw(except = false): number {
+    const params = except ? [this.dynRef(), this.dynRef(), this.dynRef()] : [this.dynRef(), this.dynRef()];
+    return this.cached(except ? "assignExcept" : "assign", params, [this.dynRef()], (idx) => {
       const dynT = this.dynT();
       const c = new Code();
-      const K = 2;
-      const O = 3;
-      const N = 4;
-      const I = 5;
-      const E = 6;
-      const PAIRS = 7;
-      const P = 8;
+      const B = except ? 1 : 0; // the excluded-keys parameter shifts every local
+      const EX = 2; // (except only) the excluded-keys ARR
+      const K = 2 + B;
+      const O = 3 + B;
+      const N = 4 + B;
+      const I = 5 + B;
+      const E = 6 + B;
+      const PAIRS = 7 + B;
+      const P = 8 + B;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localTee(K);
@@ -10742,12 +10760,16 @@ export class DynBuilder {
       this.objPayload(c, (x) => x.localGet(0));
       c.localSet(O);
       const dx = this.deps.domexPut;
-      const DX = 9;
-      const KS = 10;
-      const ER = 11;
+      const DX = 9 + B;
+      const KS = 10 + B;
+      const ER = 11 + B;
       // Unit A2's two scratch members, after whichever frame is in use.
-      const TV = dx !== undefined ? 12 : 9;
+      const TV = (dx !== undefined ? 12 : 9) + B;
       const SV = TV + 1;
+      // (except only) the scan index and the excluded list's length, after
+      // every other local.
+      const XJ = 2 + B + 7 + (dx !== undefined ? 3 : 0) + (this.accessorsLive ? 2 : 0);
+      const XM = XJ + 1;
       if (dx !== undefined) {
         dx.isDomex(c, 0, ER);
         c.localSet(DX);
@@ -10758,6 +10780,18 @@ export class DynBuilder {
       // Unit I: copying FROM a dynamic typed array (its index keys) is not
       // modeled — it would otherwise copy nothing, silently.
       this.typedArm(c, 1, K, () => this.typedFence(c, "copying the members of", (x) => x.refNull(dynT)));
+      if (except) {
+        c.localGet(K);
+        c.i32Const(DK.OBJ);
+        c.i32Ne();
+        c.ifVoid();
+        this.deps.fence(c, (x) => this.deps.lit(x, "an object rest element over a dynamic value that is not a plain object is not supported yet"));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(EX)));
+        c.localSet(XM);
+      }
       this.arm(c, K, [DK.OBJ], () => {
         const objT = this.objT();
         const entries = this.entriesArrayType();
@@ -10785,6 +10819,45 @@ export class DynBuilder {
         c.localGet(I);
         c.arrayGet(entries);
         c.localSet(E);
+        // (except) the entry's body; an excluded key branches past it.
+        c.block();
+        if (except && this.symLive) {
+          // An own symbol-keyed member: Node's rest copies it after the
+          // string keys; this copy does not model that order — a named
+          // stop rather than a dropped member.
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          c.call(this.reservedKey());
+          c.ifVoid();
+          this.deps.fence(c, (x) => this.deps.lit(x, "an object rest element over a dynamic value with symbol-keyed members is not supported yet"));
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+        }
+        if (except) {
+          c.i32Const(0);
+          c.localSet(XJ);
+          c.block();
+          c.loop();
+          c.localGet(XJ);
+          c.localGet(XM);
+          c.i32GeU();
+          c.brIf(1);
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(EX)), (x) => x.localGet(XJ));
+          c.structGet(dynT, DYN_REF);
+          emitFlatCast(c, this.deps.strType());
+          c.call(this.deps.strEq());
+          c.brIf(2);
+          c.localGet(XJ);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(XJ);
+          c.br(0);
+          c.end();
+          c.end();
+        }
         if (dx !== undefined) {
           // Only an OBJ source can carry a non-index key; the index-keyed
           // sources below never spell a getter-only member.
@@ -10880,6 +10953,7 @@ export class DynBuilder {
           c.structGet(entryT, ENTRY_VALUE);
           c.call(this.objPutW()); // GH #137: through to an error
         }
+        c.end();
         c.localGet(I);
         c.i32Const(1);
         c.i32Add();
@@ -10956,6 +11030,7 @@ export class DynBuilder {
               this.deps.strRef(),
               { kind: "ref", nullable: true, typeIndex: this.deps.errT() },
               ...(this.accessorsLive ? [this.dynRef(), this.dynRef()] : []),
+              ...(except ? [I32, I32] : []),
             ]
           : [
               I32,
@@ -10966,6 +11041,7 @@ export class DynBuilder {
               this.dynRef(),
               this.dynRef(),
               ...(this.accessorsLive ? [this.dynRef(), this.dynRef()] : []),
+              ...(except ? [I32, I32] : []),
             ],
         c.bytes(),
       );

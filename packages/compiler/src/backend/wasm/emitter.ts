@@ -26874,6 +26874,14 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (e.fn === "dyn.assignExcept") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.dyn.assignExcept());
+          this.emitPendingCheck();
+          return;
+        }
         /* INC-27 U5: Object.create(null), variadic Object.assign's source
          * pack and structuredClone. */
         if (e.fn.startsWith("om.")) {

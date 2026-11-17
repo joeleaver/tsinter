@@ -63,8 +63,9 @@ console.log(c[s], c[t], Object.keys(c));
 console.log(o);`,
   },
   {
-    // An object rest over a dynamic source is not lowered yet (a gap that
-    // predates symbol keys): pinned at its named stop.
+    // An object rest over a dynamic source copies its string-keyed members;
+    // a symbol-keyed member (Node copies those after the string keys) is
+    // not modeled yet: pinned at its named stop.
     id: "SYMK-02c an object rest over the same dynamic object stops by name",
     src: `const s = Symbol.for('k');
 /** @type {any} */
@@ -72,7 +73,7 @@ const o = {[s]: 1, a: 2, b: 4};
 console.log(o[s]);
 const { a, ...rest } = o;
 console.log(a, rest[s], Object.keys(rest));`,
-    fence: { text: /rest elements over checked-dynamic sources/, stdout: "1\n" },
+    fence: { text: /an object rest element over a dynamic value with symbol-keyed members is not supported yet/, stdout: "1\n" },
   },
   {
     // The same program as real code writes it (no JSDoc `any` on the

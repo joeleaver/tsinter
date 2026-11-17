@@ -2724,7 +2724,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // Object.assign answers its target, which takes the sources' own
           // property values: fresh when the target is and those values
           // are scalars or themselves fresh.
-          if (e.fn === "dyn.assign" || e.fn === "dyn.assignAll") {
+          if (e.fn === "dyn.assign" || e.fn === "dyn.assignAll" || e.fn === "dyn.assignExcept") {
             return uniqueDyn(e.args[0], fn, depth + 1) && e.args.slice(1).every((a) => shallowFresh(a, fn, depth + 1));
           }
           return DYN_FRESH_LIB.test(e.fn);

@@ -959,6 +959,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "dyn.objKeys": { argTypes: [DYN], result: DYN },
   "dyn.hasOwn": { argTypes: [DYN, STRING], result: BOOL },
   "dyn.assign": { argTypes: [DYN, DYN], result: DYN },
+  "dyn.assignExcept": { argTypes: [DYN, DYN, DYN], result: DYN },
   "dyn.packPush": { argTypes: [DYN, DYN], result: VOID },
   "dyn.packPushSpread": { argTypes: [DYN, DYN, STRING], result: VOID },
   "dyn.packPushSpreadIter": { argTypes: [DYN, DYN], result: VOID },

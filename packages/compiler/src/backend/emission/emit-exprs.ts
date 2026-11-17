@@ -5433,6 +5433,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             // The flattened pack copies onto the target left to right;
             // the target returns (+1). Nullish targets throw like Node.
             return finish(`scr_dyn_assign_all(${arg(0)}, ${arg(1)})`);
+          case "dyn.assignExcept":
+            throw new Error("object rest over dynamic values is not supported on the legacy C/LLVM lanes (use --backend wasm)");
           case "dyn.objCreateNullProto":
             // Object.create(null): the fresh null-prototype dictionary
             // (+1). Never throws.

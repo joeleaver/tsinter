@@ -1976,11 +1976,48 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         if (el.name === undefined) continue;
         const loc = locOf(el);
         if (el.dotDotDotToken) {
-          L.unsupported(
-            "SC1031",
-            el,
-            "rest elements over checked-dynamic sources (the remaining-fields object has no lowering yet)",
-          );
+          // `{ mask: t, ...s }` (clack's prompt constructors, spinner's
+          // options): the rest binds a FRESH object holding the source's
+          // own enumerable members except the pattern's other names, in
+          // the source's order — CopyDataProperties with its excluded
+          // list (dyn.assignExcept never reads an excluded member). It
+          // runs after the other elements' reads, as the rest element is
+          // last; a nullish source has already thrown at the first of
+          // those reads, so a pattern with no other element (whose own
+          // RequireObjectCoercible would be the throw) keeps the fence.
+          if (!L.sharedDynamic || L.engine) {
+            L.unsupported(
+              "SC1031",
+              el,
+              "rest elements over checked-dynamic sources (the remaining-fields object has no lowering yet)",
+            );
+          }
+          const excluded: IrExpr[] = [];
+          for (const sib of pattern.elements) {
+            if (sib === el || sib.name === undefined || sib.dotDotDotToken) continue;
+            const keyNode = sib.propertyName ?? (ts.isIdentifier(sib.name) ? sib.name : null);
+            const folded = keyNode === null ? null : patternKeyNameOf(L, keyNode);
+            if (folded === null) {
+              L.unsupported("SC1031", el, "rest bindings beside computed keys (the consumed set is a runtime fact)");
+            }
+            excluded.push({ kind: "dynFrom", value: { kind: "strLit", value: folded, type: STRING, loc }, type: DYN, loc });
+          }
+          if (excluded.length === 0) {
+            L.unsupported("SC1031", el, "object patterns holding only a rest element over checked-dynamic sources");
+          }
+          const value: IrExpr = {
+            kind: "libCall",
+            fn: "dyn.assignExcept",
+            args: [
+              { kind: "dynObjLit", fields: [], type: DYN, loc },
+              srcRef(),
+              { kind: "dynArrLit", elems: excluded, type: DYN, loc },
+            ],
+            type: DYN,
+            loc,
+          };
+          L.bindPatternTarget(el.name, value, isLet, out);
+          continue;
         }
         const prop = el.propertyName ?? el.name;
         const propName = ts.isIdentifier(prop) || ts.isComputedPropertyName(prop) || ts.isStringLiteralLike(prop) || ts.isNumericLiteral(prop)
