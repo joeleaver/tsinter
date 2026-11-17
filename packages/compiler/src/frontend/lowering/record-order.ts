@@ -82,7 +82,7 @@ export function orderedShape(L: Lowerer, shapeId: string): IrRecordShape | null 
   // added keys.
   if (shape.indexValue !== undefined) {
     if (visible.length === 0) return null;
-  } else if (!visible.some((f) => f.optional === true)) return null;
+  } else if (!visible.some((f) => f.optional === true) && shape.literalKeys !== true) return null;
   if (visible.some((f) => f.name.startsWith("%get:") || f.name.startsWith("%set:"))) return null;
   if (visible.some((f) => f.optional === true && !testable(f.type))) return null;
   return shape;
@@ -282,7 +282,18 @@ export function orderNoteWrite(L: Lowerer, o: IrExpr, shapeId: string, field: st
   const fields = orderFields(shape);
   const i = fields.findIndex((x) => x.name === field);
   const f = fields[i];
-  if (f === undefined || f.optional !== true) return [];
+  if (f === undefined) return [];
+  // (#235 review) A REQUIRED field whose key a `delete` removed (the record
+  // then carries an order without it) gets its key back, appended as Node
+  // appends it; on the fast path every required key is present already.
+  if (f.optional !== true) {
+    const call: IrStmt = {
+      kind: "exprStmt",
+      expr: { kind: "call", callee: writeHelper(L, shape, loc), args: [o, num(i, loc), { kind: "boolLit", value: false, type: BOOL, loc }, { kind: "boolLit", value: false, type: BOOL, loc }, num(isArrayIndexKey(field) ? 1 : 0, loc)], type: VOID, loc },
+      loc,
+    };
+    return [ifThen(not(isUndef(ordOf(o, shapeId, loc), loc), loc), [call], loc)];
+  }
   const vUndef: IrExpr = isUnitType(value.type)
     ? { kind: "boolLit", value: value.type.kind === "undefinedT", type: BOOL, loc }
     : testable(value.type) ? undefTest(value, loc) : { kind: "boolLit", value: false, type: BOOL, loc };
@@ -294,6 +305,31 @@ export function orderNoteWrite(L: Lowerer, o: IrExpr, shapeId: string, field: st
     loc,
   };
   return [ifThen(cond, [call], loc)];
+}
+
+/** (#235 review) After a run-time keyed write `o[k] = v` on an ordered
+ * shape with no index signature (`k` a string, `o` and `k` pure reads): a
+ * key a `delete` removed comes back, appended as Node appends it. Only an
+ * ordered record can lack a declared key; on the fast path every required
+ * key is present and an optional one takes the dot write's note. */
+export function orderNoteKeyedWrite(L: Lowerer, o: IrExpr, shapeId: string, key: IrExpr, loc: SrcLoc): IrStmt[] {
+  const shape = orderedShape(L, shapeId);
+  if (shape === null || shape.indexValue !== undefined) return [];
+  const fields = orderFields(shape);
+  const recT: IrType = { kind: "record", shapeId };
+  const n = fields.length;
+  const helper = lift(L, `ord.kw:${shapeId}`, [{ id: "o.0", type: recT }, { id: "k.0", type: STRING }], [{ id: "a.0", type: NUMS }, { id: "c.0", type: F64 }, { id: "j.0", type: F64 }], VOID, loc, () => {
+    const r = ref("o.0", recT, loc);
+    const k = ref("k.0", STRING, loc);
+    const a = ref("a.0", NUMS, loc);
+    const body: IrStmt[] = [decl("a.0", ordOf(r, shapeId, loc), loc), ifThen(isUndef(a, loc), [ret(null, loc)], loc)];
+    fields.forEach((f, i) => {
+      const eq: IrExpr = { kind: "strEq", negated: false, left: k, right: { kind: "strLit", value: f.name, type: STRING, loc }, type: BOOL, loc } as IrExpr;
+      body.push(ifThen(eq, [...addKey(n, a, num(i, loc), num(isArrayIndexKey(f.name) ? 1 : 0, loc), "c.0", "j.0", loc), ret(null, loc)], loc));
+    });
+    return body;
+  });
+  return [{ kind: "exprStmt", expr: { kind: "call", callee: helper, args: [o, key], type: VOID, loc }, loc }];
 }
 
 /** `delete o.field` on an ordered record (after the slot write): the key
@@ -314,7 +350,13 @@ export function orderNoteDelete(L: Lowerer, o: IrExpr, shapeId: string, field: s
     const k = ref("k.0", F64, loc);
     return [
       decl("a.0", ordOf(r, shapeId, loc), loc),
-      ifThen(isUndef(a, loc), [setOrd(r, shapeId, { kind: "call", callee: materializeHelper(L, shape, loc), args: [r], type: NUMS, loc }, loc), ret(null, loc)], loc),
+      // (#235 review) off the fast path for the first time: the record's
+      // keys as the fast path sees them — a required field among them —
+      // then the deleted key leaves below like any other.
+      ifThen(isUndef(a, loc), [
+        assign("a.0", { kind: "call", callee: materializeHelper(L, shape, loc), args: [r], type: NUMS, loc }, loc),
+        setOrd(r, shapeId, a, loc),
+      ], loc),
       ifThen(bin("===", at(a, i, loc), num(0, loc), loc), [ret(null, loc)], loc),
       setAt(a, i, num(0, loc), loc),
       // find i among the keys, then close the gap

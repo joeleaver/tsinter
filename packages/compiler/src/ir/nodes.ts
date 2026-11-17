@@ -1274,6 +1274,13 @@ export interface IrRecordShape {
    * by their property, not their `%get:`/`%set:` slot) in declaration
    * order — metadata like declaredOrder, which leaves accessors out. */
   memberOrder?: string[];
+  /** GH #235: the shape was first interned from a mapped type over literal
+   * keys (`Record<"a" | "b", V>`), whose checker order is the key union's,
+   * not any value's. Its records keep their own key order on the WasmGC
+   * lanes (record-order.ts orderedShape; the wasm emitter's
+   * recordOrderSlot), so a literal answers its spelling. Metadata like
+   * declaredOrder: set at first intern only, never later. */
+  literalKeys?: true;
 }
 
 /** Object-literal ACCESSOR properties (`{ get x() {...}, set x(v) {...} }`)

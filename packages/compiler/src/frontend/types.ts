@@ -115,7 +115,7 @@ export class ShapeRegistry {
    * registers the structural key (first writer wins — the key may already
    * belong to a structurally identical shape; the recursive id stays
    * authoritative for its own checker type either way). */
-  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true; internal?: true }[], indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[]): string {
+  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true; internal?: true }[], indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[], literalKeys?: true): string {
     const id = this.recIds.get(t);
     if (id === undefined) throw new Error("shape registry bug: finalizeRecursive without a placeholder");
     if (this.pendingRec.has(id)) {
@@ -124,8 +124,11 @@ export class ShapeRegistry {
       if (indexValue) shape.indexValue = indexValue;
       if (declaredOrder) shape.declaredOrder = declaredOrder;
       if (memberOrder) shape.memberOrder = memberOrder;
-      this.pendingRec.delete(id);
       const key = this.keyOf(fields, false, indexValue);
+      // GH #235: like declaredOrder, first construction wins — a shape
+      // never gains the order slot after code was lowered against it.
+      if (literalKeys === true && !this.byKey.has(key)) shape.literalKeys = true;
+      this.pendingRec.delete(id);
       if (!this.byKey.has(key)) this.byKey.set(key, id);
     }
     return id;
@@ -139,7 +142,7 @@ export class ShapeRegistry {
    * value type (`indexValue`) is part of the identity too: the same
    * declared fields with and without an overflow portion — or with
    * differently-typed ones — are different structs. */
-  intern(fields: { name: string; type: IrType; optional?: true; internal?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[]): string {
+  intern(fields: { name: string; type: IrType; optional?: true; internal?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[], memberOrder?: string[], literalKeys?: true): string {
     const key = this.keyOf(fields, tuple, indexValue);
     let id = this.byKey.get(key);
     if (id !== undefined) this.mergeOptional(id, fields);
@@ -155,6 +158,8 @@ export class ShapeRegistry {
         // first one's order.
         ...(declaredOrder ? { declaredOrder } : {}),
         ...(memberOrder ? { memberOrder } : {}),
+        // GH #235: first construction wins, like declaredOrder.
+        ...(literalKeys === true && !tuple ? { literalKeys: true as const } : {}),
       };
       this.byKey.set(key, id);
       this.byId.set(id, shape);
@@ -3664,6 +3669,7 @@ interface RecordShapeParts {
   indexValue?: IrType;
   declaredOrder?: string[];
   memberOrder?: string[];
+  literalKeys?: true;
 }
 
 /** SEMANTICS.md S133 (k), "a declared interface over a dynamic
@@ -3938,7 +3944,7 @@ function mapRecursiveGroup(root: ts.Type, ctx: TypeMapperCtx): boolean {
       parts.push([k, inner]);
     }
     if (contextResolutions !== resolutionsAtEntry) return false;
-    for (const [k, inner] of parts) shapes.finalizeRecursive(k, inner.fields, inner.indexValue, inner.declaredOrder);
+    for (const [k, inner] of parts) shapes.finalizeRecursive(k, inner.fields, inner.indexValue, inner.declaredOrder, undefined, inner.literalKeys);
     done = true;
     return true;
   } finally {
@@ -4111,10 +4117,10 @@ function mapRecordTypeWalk(widened: ts.Type, ctx: TypeMapperCtx, sensitivityAtEn
       if (contextResolutions !== sensitivityAtEntry) return null;
       return {
         kind: "record",
-        shapeId: shapes.finalizeRecursive(widened, inner.fields, inner.indexValue, inner.declaredOrder, inner.memberOrder),
+        shapeId: shapes.finalizeRecursive(widened, inner.fields, inner.indexValue, inner.declaredOrder, inner.memberOrder, inner.literalKeys),
       };
     }
-    return { kind: "record", shapeId: shapes.intern(inner.fields, false, inner.indexValue, inner.declaredOrder, inner.memberOrder) };
+    return { kind: "record", shapeId: shapes.intern(inner.fields, false, inner.indexValue, inner.declaredOrder, inner.memberOrder, inner.literalKeys) };
   } finally {
     shapes.inProgress.delete(widened);
     mapRecordStack.pop();
@@ -4441,8 +4447,18 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     const declaredOrder = esOwnKeyOrder(fields.filter((f) => accessorSlotProp(f.name) === null).map((f) => f.name));
     const hasAccessors = fields.some((f) => accessorSlotProp(f.name) !== null);
     const memberOrder = hasAccessors ? [...new Set(fields.map((f) => accessorSlotProp(f.name)?.prop ?? f.name))] : undefined;
+    // GH #235: a mapped type over literal keys (`Record<"gmail" | "drive",
+    // V>`, `Readonly<...>` of one) has no declaration order — the checker
+    // lists its keys in the key union's order, not the order any value
+    // spells them; and so does a type built from one (a rest object, a
+    // spread's result), wherever a key without a declaration of its own
+    // lands. Such a shape keeps each record's own order (record-order.ts),
+    // so a literal answers its spelling, as Node does.
+    const literalKeys = indexValue === undefined && fields.length > 1 &&
+      fields.every((f) => accessorSlotProp(f.name) === null) &&
+      props.some((p) => checker.declarationsOf(p).length === 0);
     fields.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    return { fields, ...(indexValue ? { indexValue } : {}), declaredOrder, ...(memberOrder ? { memberOrder } : {}) };
+    return { fields, ...(indexValue ? { indexValue } : {}), declaredOrder, ...(memberOrder ? { memberOrder } : {}), ...(literalKeys ? { literalKeys: true as const } : {}) };
   }
 }
 
