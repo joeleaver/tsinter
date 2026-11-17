@@ -104,6 +104,33 @@ export function dynArmGlobalDecl(L: Lowerer, decl: ts.VariableDeclaration): bool
   return (L.typeOf(init).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
 }
 
+/** S125 (paperclip's superRefine loops): a `const` for-of loop binding — the
+ * loop variable itself, or a name inside its destructuring pattern (no
+ * default, no rest) — is a contained slot: where S125 (c) refuses the
+ * element's checked copy, the next pass binds the dynamic element itself. */
+export function forOfConstBinding(id: ts.Node): boolean {
+  if (!ts.isIdentifier(id)) return false;
+  let n: ts.Node = id;
+  let p: ts.Node | undefined = id.parent;
+  if (p !== undefined && ts.isBindingElement(p)) {
+    if (p.name !== n || p.initializer !== undefined || p.dotDotDotToken !== undefined) return false;
+    while (p !== undefined && (ts.isBindingElement(p) || ts.isArrayBindingPattern(p) || ts.isObjectBindingPattern(p))) {
+      if (ts.isBindingElement(p) && (p.initializer !== undefined || p.dotDotDotToken !== undefined)) return false;
+      n = p;
+      p = p.parent;
+    }
+  }
+  if (p === undefined || !ts.isVariableDeclaration(p) || p.name !== n) return false;
+  const list = p.parent;
+  if (!ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return false;
+  return ts.isForOfStatement(list.parent) && list.parent.initializer === list;
+}
+
+/** A for-of loop binding on the dynamic arm this pass (forOfConstBinding). */
+export function dynArmForOf(L: Lowerer, id: ts.Node): boolean {
+  return L.dynArmSites.size > 0 && ts.isIdentifier(id) && L.dynArmSites.has(`forof:${dynArmKey(id)}`) && forOfConstBinding(id);
+}
+
 /** A function literal's parameter that takes the dynamic arm. */
 export function dynArmParam(L: Lowerer, param: ts.ParameterDeclaration): boolean {
   return L.dynArmSites.size > 0 && L.dynArmSites.has(`param:${dynArmKey(param)}`);
@@ -136,7 +163,7 @@ export function dynArmResultType(L: Lowerer, fn: ts.Node): IrType | null {
  * binding's statement may reference it). */
 export function collectDynArmSyms(L: Lowerer): void {
   if (L.dynArmSites.size === 0) return;
-  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^(param|dparam|ret|dret):/, "").replace(/:\d+:\d+$/, "")));
+  const files = new Set([...L.dynArmSites].map((k) => k.replace(/^(param|dparam|ret|dret|forof):/, "").replace(/:\d+:\d+$/, "")));
   for (const sf of L.program.getSourceFiles()) {
     if (sf.isDeclarationFile || !files.has(sf.fileName)) continue;
     const visit = (n: ts.Node): void => {
@@ -145,6 +172,10 @@ export function collectDynArmSyms(L: Lowerer): void {
         if (s !== undefined) L.dynArmSyms.add(s);
       } else if (ts.isParameter(n) && ts.isIdentifier(n.name) && dynArmParam(L, n)) {
         const s = L.checker.getSymbolAtLocation(n.name);
+        if (s !== undefined) L.dynArmSyms.add(s);
+      }
+      else if (ts.isIdentifier(n) && dynArmForOf(L, n)) {
+        const s = L.checker.getSymbolAtLocation(n);
         if (s !== undefined) L.dynArmSyms.add(s);
       }
       ts.forEachChild(n, visit);
