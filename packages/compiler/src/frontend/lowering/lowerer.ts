@@ -8646,6 +8646,12 @@ export class Lowerer {
     if (type.kind === "jsval") {
       return { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc };
     }
+    // GH #255: on the WasmGC lanes a number or boolean binding with no
+    // initializer (`let n!: number`, `var b: boolean`, one a closure reads
+    // before the write) starts as its slot's undefined, as in Node — not
+    // the zero value 0 / false. (Every ref-typed slot starts null, which
+    // is already its undefined; S119.)
+    if (this.undefSlots && (type.kind === "f64" || type.kind === "bool")) return { kind: "slotUndef", type, loc };
     return this.wrappedUndefined(type, loc);
   }
 

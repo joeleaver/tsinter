@@ -10077,7 +10077,9 @@ Node), `pop()` of an empty array, a
 missing key of a `Record<string, T>` or index signature, a write past an
 array's end (the gap), a `T | undefined = undefined` default the checker
 narrows to `T` (GH #77), a `T`-typed field read before its first assignment
-(`x!: number`), `Array.from({ length })`'s unassigned slots, and a lying
+(`x!: number`), a `let` or `var` binding read before its first assignment
+(`let n!: number`, or one a closure reads first; GH #255 — a number or
+boolean binding used to start at 0 / false), `Array.from({ length })`'s unassigned slots, and a lying
 `undefined!` / `undefined as any as T`. On the WasmGC lanes each slot kind
 has one `undefined`: an f64 holds one signaling NaN (bits
 `0xFFF4756E64656600` — arithmetic quiets it, so `undefined + 1` is an
@@ -10581,6 +10583,14 @@ corpus cycle programs 2900–2907 (Node-exact, including uncaught TDZ
 errors); the wasm-differential "module forms" rows pin the fence text and
 exit status for a `var` and an enum read early, and that the same
 programs read late run as Node.
+
+**Amendment (GH #255, wasm and wasm-native):** a number or boolean `var`
+holds its slot's undefined from instantiation (S119), so code of a cycle
+that reads one before its module ran reads Node's `undefined` (`${v}` is
+`undefined`, `K * 2` is `NaN`) instead of stopping. Other `var` types,
+enums and JSON defaults keep the fence. **Tested by:** module forms rows
+MF-04 and MF-10 (the number `var` against Node, an enum and a string `var`
+pinning the fence).
 
 <!-- S125 is reserved for the GH #109 branch. -->
 
