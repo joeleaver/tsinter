@@ -261,7 +261,10 @@ export interface GenericInstance {
       if (param.initializer) return { type: t, mode: "omittable", bodyType: t };
       return { type: t, mode: param.questionToken ? "omittable" : "required" };
     }
-    if (ts.isIdentifier(param.name) && L.dynParamOverrides.has(param)) {
+    if (L.dynParamOverrides.has(param) && (ts.isIdentifier(param.name) || (!param.initializer && !param.dotDotDotToken && !param.questionToken))) {
+      // (an ARRAY pattern too — `([, value]) =>` over a dynamic array's
+      // elements: the slot holds the dynamic element, the prologue
+      // destructures it through the dynamic iteration pack)
       return { type: DYN, mode: param.questionToken ? "omittable" : "required" };
     }
     if (!ts.isIdentifier(param.name)) {
