@@ -7085,7 +7085,7 @@ const SKIP_RULE_SITES: { file: string; anchor: string }[] = [
   },
   {
     file: "packages/compiler/src/frontend/lowering/lower-stmts.ts",
-    anchor: "Fixed and hybrid shapes cannot lose keys mid-walk",
+    anchor: "Shapes whose every key is always present cannot lose one",
   },
 ];
 

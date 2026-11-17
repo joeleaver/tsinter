@@ -10,7 +10,7 @@ import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, importCallHandleType, neverResidueTsBinding, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
-import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
+import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeysOf, lowerObjModelForInReceiver } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
@@ -20,7 +20,7 @@ import { isProvenanceSourceFile } from "../provenance-registry.js";
 import { ambientUndefVarRootOf, lowerImportEquals, nsUndefRead, nsWritableTarget, trapDeclRootOf } from "./lower-namespaces.js";
 import { expandoWritableTarget, lowerExpandoAssignStmt } from "./lower-expando.js";
 import { ForOfIterProjection, lowerForOfArrayIter, lowerForOfMap, lowerForOfSearchParams, lowerForOfSet, objectIterOverIndexShape, strCharsCall } from "./lower-containers.js";
-import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingRestFnInfoOf, bindingRestFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishExprUnitOf, nullishGenericBindingUnitOf, recordKeysArrayCall } from "./lower-calls.js";
+import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingRestFnInfoOf, bindingRestFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishExprUnitOf, nullishGenericBindingUnitOf, recordForInLiveHelper, recordKeysArrayCall } from "./lower-calls.js";
 import { isMixinFnBinding, mixinResultBindingClassOf } from "./lower-mixins.js";
 import type { ClassInfo, ClassIteratorInfo } from "./lower-classes.js";
 import { genericIfaceBindingKeepsClass } from "./lower-classes.js";
@@ -28,7 +28,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, createRequireSpecOf } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
-import { boundTargetParts, lowerAnyIncDec } from "./lower-exprs.js";
+import { boundTargetParts, lowerAnyIncDec, protoMissCall } from "./lower-exprs.js";
 import { lowerArrayLengthWrite } from "./lower-stdlib-members.js";
 import { lowerProcessExitCodeWrite } from "./lower-builtins.js";
 import { orderedRecordWrite, abstractPropertyDeclOf, asDynOperand, droppableStatic, emptyArrayOf, ensureConcatString, undefElse, undefToObjectGuard, holeFencedArray, mayHoldSlotUndef, undefPlusGuard, undefinedAsAbsent, undefinedAsText, aliasTypeofNarrows, builtinTokenUseOk, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
@@ -8606,8 +8606,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    *   skipped at runtime (Node's missing-key behavior: an unset optional
    *   never entered the object). The key list
    *   snapshots at loop entry, which IS Node's for-in contract for keys
-   *   ADDED during the walk (never visited); fixed shapes cannot lose keys
-   *   mid-loop (no delete), so the snapshot is exact.
+   *   ADDED during the walk (never visited); an optional field's key can
+   *   be deleted mid-loop, so such shapes re-check each key before its
+   *   visit (GH #247, recordForInLiveHelper) — Node's HasProperty.
    * - INDEX-SIGNATURE shapes: the same Object.keys hybrid/pure walk
    *   (declared fields first, then the overflow in JS own-key order —
    *   objectIterOverIndexShape's "keys" arm, same intern key). Adds during
@@ -8643,11 +8644,41 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     }
     // Units U3 + U4: for-in over a dynamic value walks own and inherited
     // enumerable keys (objmodel.ts forInKeys).
+    // GH #247: the receiver binds once, and each visit re-checks the key
+    // is still `in` it (Node's HasProperty, prototype chain included): a
+    // key deleted before its turn is skipped. A string receiver's index
+    // keys cannot disappear (and `in` on a string throws), so it skips
+    // the test.
     {
-      const omKeys = lowerObjModelForInKeys(L, stmt.expression);
-      if (omKeys !== null) {
-        const keys: IrExpr = { kind: "dynCheck", value: { kind: "dynFromJsval", value: omKeys, type: DYN, loc }, type: arrayOf(STRING), loc } as IrExpr;
-        return lowerForInOverKeys(L, stmt, keys, labels);
+      const omRecv = lowerObjModelForInReceiver(L, stmt.expression);
+      if (omRecv !== null) {
+        const recv = L.declareHiddenLocal("%inobj", JSVAL);
+        const recvDyn = (): IrExpr => ({ kind: "dynFromJsval", value: { kind: "varRef", localId: recv.id, type: JSVAL, loc }, type: DYN, loc } as IrExpr);
+        const keys: IrExpr = {
+          kind: "dynCheck",
+          value: { kind: "dynFromJsval", value: lowerObjModelForInKeysOf({ kind: "varRef", localId: recv.id, type: JSVAL, loc }, loc), type: DYN, loc },
+          type: arrayOf(STRING),
+          loc,
+        } as IrExpr;
+        const guard = (kRef: IrExpr): IrExpr => ({
+          kind: "logical",
+          op: "||",
+          left: { kind: "dynTest", test: "string", value: recvDyn(), type: BOOL, loc },
+          right: {
+            kind: "logical",
+            op: "||",
+            left: { kind: "libCall", fn: "dyn.hasKey", args: [recvDyn(), kRef], type: BOOL, loc },
+            // an inherited Object.prototype name `in` reads as absent
+            // (SEMANTICS.md S015): Node would visit it — stop by name
+            right: protoMissCall(L, kRef, loc),
+            type: BOOL,
+            loc,
+          },
+          type: BOOL,
+          loc,
+        } as IrExpr);
+        const loop = lowerForInOverKeys(L, stmt, keys, labels, guard);
+        return { kind: "block", body: [{ kind: "varDecl", localId: recv.id, init: omRecv, loc }, loop], loc };
       }
     }
     const recvT = L.mapTypeOf(L.typeOf(stmt.expression));
@@ -8698,15 +8729,28 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             loc,
           };
         }
-        // Fixed and hybrid shapes cannot lose keys mid-walk (no delete;
-        // an undefined-arm write agrees with the snapshot under Node's
-        // missing-key behavior), so the snapshot alone is exact.
-        const keys = undefElse(L, receiver, loc, emptyArrayOf(loc), (read) =>
+        const keysOf = (r: IrExpr): IrExpr => undefElse(L, r, loc, emptyArrayOf(loc), (read) =>
           rShape.indexValue
             ? objectIterOverIndexShape(L, stmt.expression, "keys", read.type as IrType & { kind: "record" }, rShape, read, keysT, loc)
             : recordKeysArrayCall(L, read, read.type as IrType & { kind: "record" }, rShape, loc),
         );
-        return lowerForInOverKeys(L, stmt, keys, labels);
+        // GH #247: a shape with an optional (or undefined-armed) field can
+        // lose that key mid-walk (`delete r.f`, also through an alias or a
+        // call): bind the receiver once and re-check each visit's key, as
+        // Node's HasProperty does — a key deleted before its turn is
+        // skipped, one deleted and re-added is visited. Keys added during
+        // the walk stay unvisited (the snapshot).
+        const live = recordForInLiveHelper(L, receiver.type.shapeId, loc);
+        if (live !== null) {
+          const recv = L.declareHiddenLocal("%inrec", receiver.type);
+          const recvRef = (): IrExpr => ({ kind: "varRef", localId: recv.id, type: receiver.type, loc });
+          const guard = (kRef: IrExpr): IrExpr => ({ kind: "call", callee: live, args: [recvRef(), kRef], type: BOOL, loc });
+          const loop = lowerForInOverKeys(L, stmt, keysOf(recvRef()), labels, guard);
+          return { kind: "block", body: [{ kind: "varDecl", localId: recv.id, init: receiver, loc }, loop], loc };
+        }
+        // Shapes whose every key is always present cannot lose one, so
+        // the snapshot alone is exact.
+        return lowerForInOverKeys(L, stmt, keysOf(receiver), labels);
       }
       L.unsupported(
         "SC1052",

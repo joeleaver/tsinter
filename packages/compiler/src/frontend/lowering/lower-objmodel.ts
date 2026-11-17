@@ -365,9 +365,15 @@ export function lowerObjModelNew(L: Lowerer, expr: ts.NewExpression): IrExpr | n
 
 /** The keys a for-in over a dynamic value visits (a fresh dynamic array),
  * or null when the operand is not dynamic. */
-export function lowerObjModelForInKeys(L: Lowerer, operand: ts.Expression): IrExpr | null {
+/** The receiver of a for-in over a dynamic value (a jsval), or null. */
+export function lowerObjModelForInReceiver(L: Lowerer, operand: ts.Expression): IrExpr | null {
   if (!omActive(L) || !isDynNode(L, operand)) return null;
-  return lib("om.forInKeys", [js(L, operand)], locOf(operand));
+  return js(L, operand);
+}
+
+/** The keys a for-in over the (jsval) receiver `recv` visits. */
+export function lowerObjModelForInKeysOf(recv: IrExpr, loc: SrcLoc): IrExpr {
+  return lib("om.forInKeys", [recv], loc);
 }
 
 /* ── SEMANTICS.md S132 ─────────────────────────────────────────────── */
