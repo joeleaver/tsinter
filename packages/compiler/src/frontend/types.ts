@@ -618,6 +618,9 @@ export interface TypeMapperCtx {
   /** docs/design/vue-object-model.md D1: program interfaces some `as` cast
    * targets (collected before lowering, lower-objmodel.ts). */
   castCallableIfaces?: Set<ts.Symbol>;
+  /** SEMANTICS.md S133 (l): does the program's own source construct,
+   * extend or implement the class this declaration declares? */
+  programBuiltClassDecl?: (decl: ts.Node) => boolean;
   /** LowerOptions.hostFetch: the backend's host supplies fetch, so the
    * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
    * without --dynamic (the module serves them — SEMANTICS.md S098). */
@@ -1498,7 +1501,20 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     ]);
     let handle: IrType | null = null;
     let refined = true;
+    // S133 (l): a declared class over a dynamic implementation refined by
+    // plain members (drizzle's `PgTableWithColumns<T> = PgTable<T> & { [K
+    // in keyof T['columns']]: … }`, Object.assign'd in its JavaScript) is
+    // the implementation's dynamic value; the refinement's members read
+    // dynamically.
+    let dynPart = false;
     for (const part of widened.getTypes()) {
+      // (Classes only: a declared INTERFACE refined by members keeps the
+      // record mapping S133's declared-values amendment gives picocolors'
+      // `Colors & { createColors }`.)
+      if (ctx.sharedDynamic === true && declaredClassOverDynamic(part, ctx)) {
+        dynPart = true;
+        continue;
+      }
       const mapped = mapType(part, ctx);
       if (mapped && HANDLE_KINDS.has(mapped.kind)) {
         if (handle !== null && handle.kind !== mapped.kind) {
@@ -1520,6 +1536,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       }
     }
     if (refined && handle !== null) return handle;
+    if (refined && dynPart && handle === null) return JSVAL;
     // MIXIN instance intersections (`Tagged.C & Derived` — values built
     // through a mixin result): the chain structure names the unique
     // pinned instantiation; ambiguity stays unmapped (the hook's rules).
@@ -1543,6 +1560,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     const ds = widened.getSymbol();
     if (ds !== undefined && declaredDynamicSymbol(ds, widened, checker, ctx)) return ctx.sharedDynamic === true ? JSVAL : DYN;
   }
+  if (declaredClassOverDynamic(widened, ctx)) return JSVAL;
   const widenedSym = widened.getSymbol();
   const classDecl = widenedSym ? checker.valueDeclarationOf(widenedSym) : undefined;
   if (
@@ -3679,6 +3697,64 @@ export function declaredInterfaceOverDynamic(widened: ts.Type, ctx: TypeMapperCt
     if (pd !== undefined && (pd.kind === ts.SyntaxKind.MethodSignature || ts.isMethodDeclaration(pd))) return true;
     return checker.getCallSignatures(checker.getNonNullableType(checker.getTypeOfSymbol(p))).length > 0;
   });
+}
+
+/** Does a declared class extend `Error` (or a subclass of it), through
+ * its heritage clauses? */
+function declaredErrorClass(sym: ts.Symbol, checker: ts.TypeChecker, seen: Set<ts.Symbol>): boolean {
+  if (seen.has(sym)) return false;
+  seen.add(sym);
+  for (const d of checker.rawDeclarationsOf(sym)) {
+    if (!ts.isClassDeclaration(d)) continue;
+    const ext = d.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0];
+    if (ext === undefined) continue;
+    const e = ext.expression;
+    if (ts.isIdentifier(e) && /^(Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError)$/.test(e.text)) return true;
+    let base: ts.Symbol | undefined;
+    try {
+      base = checker.getSymbolAtLocation(e);
+      if (base !== undefined && (base.flags & ts.SymbolFlags.Alias) !== 0) base = checker.getAliasedSymbol(base);
+    } catch {
+      base = undefined;
+    }
+    if (base !== undefined && declaredErrorClass(base, checker, seen)) return true;
+  }
+  return false;
+}
+
+/** S133 (k) or (l): a declared type whose values are the implementation's
+ * own dynamic values. */
+export function declaredOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
+  return declaredInterfaceOverDynamic(widened, ctx) || declaredClassOverDynamic(widened, ctx);
+}
+
+/** SEMANTICS.md S133 (l), "a declared class the program only types
+ * against": on the one-world lanes, a class (its instance type) that only a
+ * viewed package's shipped declarations declare, which the program's own
+ * sources never construct, extend or implement, is the implementation's own
+ * dynamic value, as (k) makes a declared interface. drizzle's `PgColumn`:
+ * pgTable(...) builds its columns in drizzle's JavaScript (builders and
+ * Object.assign), and the program only ever holds them. Identity is kept,
+ * members dispatch dynamically, and results cross into the declared member
+ * types at the use. A class the program constructs, extends or implements
+ * keeps its S115 view. */
+export function declaredClassOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
+  if (ctx.sharedDynamic !== true || ctx.programBuiltClassDecl === undefined) return false;
+  const sym = widened.getSymbol();
+  if (sym === undefined || (sym.flags & ts.SymbolFlags.Class) === 0) return false;
+  const checker = ctx.checker;
+  // The instance type only: the class value (`typeof PgColumn`) keeps its
+  // own paths.
+  if (checker.getConstructSignatures(widened).length > 0) return false;
+  const decls = checker.rawDeclarationsOf(sym);
+  if (decls.length === 0) return false;
+  if (!decls.every((d) => isDtsMirrorPath(d.getSourceFile().fileName))) return false;
+  if (!decls.some((d) => ts.isClassDeclaration(d))) return false;
+  // A declared ERROR class (`class DeclError extends Error`) keeps its
+  // existing mapping: thrown by the package, caught and narrowed by
+  // `instanceof` in the program.
+  if (declaredErrorClass(sym, checker, new Set())) return false;
+  return !decls.some((d) => ctx.programBuiltClassDecl!(d));
 }
 
 function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {

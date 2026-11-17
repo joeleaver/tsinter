@@ -9601,8 +9601,10 @@ leaving into typed storage follows (d)). So:
   the expando); (iii) reading `constructor` or `__proto__` through the
   view, and for an EventEmitter subclass the emitter's members (`on`,
   `emit`, ...), ends the program by name; (iv) a method read through the
-  view is a fresh function per read (Node: the one prototype function, so
-  `o.m === o.m` differs) that runs on its call's own `this` — the view
+  view is one function per (declaring class, method), shared across all
+  reads and all instances, as Node's one prototype function (`o.m === o.m`
+  and `o.m === p.m` hold; amended 2026-11-17). It takes its receiver from
+  the call's own `this` — the view
   for `o.m(x)`, another instance's view for `o.m.call(other, x)` — and a
   call whose `this` is no instance of the class (a detached `const f =
   o.m; f(x)`, where Node runs the method with `this` undefined) stops by
@@ -11725,6 +11727,53 @@ member of a runtime-keyed object literal, which stops where the literal is
 built.
 **Tested by:** `packages/compiler/test/wasm-commander-typed-chain.test.ts`
 (CMDT-01..11).
+
+**Amendment (l) — a declared class the program only types against
+(2026-11-16, Joe-approved design).** On the WasmGC lanes, a class that only
+a viewed package's declarations declare, which the program's own sources
+(outside node_modules) never construct, extend or implement, is the
+implementation's own dynamic value on the program side, as in (k). drizzle
+is the case: `pgTable(...)` builds its columns in drizzle's JavaScript
+(builders and Object.assign), and the program types them as `PgColumn<…>`,
+a declared abstract class it only ever holds (`.references(() =>
+companies.id)`, `eq(companies.id, x)`). So:
+- identity is kept and nothing is copied: a column passed through a typed
+  parameter, returned from a `() => PgColumn` callback, stored in a
+  `PgColumn[]` or compared with `===` is the implementation's object;
+- member reads and method calls dispatch dynamically, and their results
+  cross into the declared member types at the use, by S133's crossing. A
+  declared primitive checks its kind and stops by name when the
+  implementation produces another. A declared class or interface result
+  stays dynamic.
+A class the program constructs, extends or implements keeps its S115 view,
+and so does every class of the program's own. `x instanceof C` against
+such a class is refused by name at compile time, not guessed. The class
+value itself (`typeof C`, its statics) keeps its existing paths and fences.
+The method-as-value path is exactly one shape: a `this.<m>` that is the
+whole initializer of a field of a class in a compiled package's
+JavaScript (drizzle's ColumnBuilder `$default = this.$defaultFn`). That
+field holds the method's function read through the instance's view (S115
+(iv)): one function per (declaring class, method), so `b.$default ===
+b.$defaultFn` and `b.$default === o.$default` hold as in Node, and its
+`this` is the call's own (a detached or foreign `this` stops by name).
+Every other method read as a value, in the program or a package, keeps
+the "bound method references" refusal.
+A JavaScript field declared `undefined` and assigned nowhere in its
+class (drizzle's Column `enumValues = void 0`) holds the dynamic value.
+A declared class that extends `Error` (directly or through its chain)
+stays out of this rule: thrown by the package, it is caught and narrowed
+by `instanceof` in the program, as before.
+An intersection of such a class with plain members (drizzle's
+`PgTableWithColumns<T> = PgTable<T> & { …columns }`) is the dynamic value
+too (a declared interface so refined keeps its record mapping). In a
+compiled class instance's default (dynamic-caller) instance of a method,
+an unannotated defaulted JavaScript parameter (`references(ref,
+config = {})`) is a dynamic slot that takes its default when undefined.
+What is trusted is the declarations' claim, as everywhere in S133. A false
+claim about a member surfaces at the first crossing that checks it, which
+may be the implementation's own write while it builds the value.
+**Tested by:** `packages/compiler/test/npm-declared-class-dynamic.test.ts`
+(DC-01..11).
 
 **Amendment (m) — a viewed package's declarations that import another
 opted-in package (2026-11-16).** A view's declaration files may import
