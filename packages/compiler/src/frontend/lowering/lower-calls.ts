@@ -25,7 +25,7 @@ import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerTypedArrayFrom
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { codePointAtOn, lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
-import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
+import { OBJECT_PROTO_NAMES, forInArrayKey, holeFencedArray, protoMissCall } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -8563,10 +8563,32 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
    * (a key is own exactly when Object.keys would list it — the two share
    * the guard), everything else true, no match false. */
   function recordHasOwnHelper(L: Lowerer, shapeId: string, loc: SrcLoc): string {
-    const key = `obj.hasOwn:${shapeId}`;
+    return recordKeyPresenceHelper(L, shapeId, "hasOwn", loc);
+  }
+
+  /** GH #247: for-in's per-visit presence re-check over a record shape —
+   * Node skips a key deleted before the walk reaches it (HasProperty just
+   * before each visit). `%obj.forInLive.<n>(r, k)` answers like
+   * Object.hasOwn for the declared fields whose key can be absent, and true
+   * for every other key (a required field; a hybrid's added key, which no
+   * lowered delete removes). An absent optional field named like an
+   * Object.prototype member stops by name: Node would find the inherited
+   * member and visit it (SEMANTICS.md S015). Null when no field's key can
+   * be absent (the snapshot alone is exact). */
+  export function recordForInLiveHelper(L: Lowerer, shapeId: string, loc: SrcLoc): string | null {
+    const shape = L.shapes.get(shapeId);
+    if (!shape) return null;
+    const mayBeAbsent = shape.fields.some((f) =>
+      f.internal !== true && (f.optional === true || (f.type.kind === "union" && L.armTag(f.type.unionId, UNDEFINED_T) >= 0)));
+    if (!mayBeAbsent) return null;
+    return recordKeyPresenceHelper(L, shapeId, "forIn", loc);
+  }
+
+  function recordKeyPresenceHelper(L: Lowerer, shapeId: string, mode: "hasOwn" | "forIn", loc: SrcLoc): string {
+    const key = mode === "hasOwn" ? `obj.hasOwn:${shapeId}` : `obj.forInLive:${shapeId}`;
     const existing = L.arrHofHelpers.get(key);
     if (existing) return existing;
-    const helper = `%obj.hasOwn.${L.arrHofHelpers.size}`;
+    const helper = mode === "hasOwn" ? `%obj.hasOwn.${L.arrHofHelpers.size}` : `%obj.forInLive.${L.arrHofHelpers.size}`;
     L.arrHofHelpers.set(key, helper);
     const shape = L.shapes.get(shapeId)!;
     const recT: IrType = { kind: "record", shapeId };
@@ -8574,8 +8596,9 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const kRef: IrExpr = { kind: "varRef", localId: "k.0", type: STRING, loc };
     const body: IrStmt[] = [];
     for (const f of shape.fields) {
+      if (mode === "forIn" && f.internal === true) continue;
       const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
-      const answer: IrExpr =
+      const answer0: IrExpr =
         utag >= 0 && f.type.kind === "union"
           ? L.markPresence(
               {
@@ -8591,16 +8614,26 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
               f.name,
             )
           : plainFieldPresent(L, { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc }, loc) ?? { kind: "boolLit", value: true, type: BOOL, loc };
+      // for-in: a key that is always present needs no test (the miss
+      // answer below is true)
+      if (mode === "forIn" && answer0.kind === "boolLit" && answer0.value && f.optional !== true) continue;
+      // GH #132: off the fast path the record's own order answers.
+      const answer = f.optional === true ? orderedPresence(L, rRef, shapeId, f.name, answer0, loc) : answer0;
       body.push({
         kind: "if",
         cond: { kind: "strEq", negated: false, left: kRef, right: { kind: "strLit", value: f.name, type: STRING, loc }, type: BOOL, loc },
-        // GH #132: off the fast path the record's own order answers.
-        then: [{ kind: "return", value: f.optional === true ? orderedPresence(L, rRef, shapeId, f.name, answer, loc) : answer, loc }],
+        then: [{
+          kind: "return",
+          value: mode === "forIn" && OBJECT_PROTO_NAMES.has(f.name)
+            ? { kind: "logical", op: "||", left: answer, right: protoMissCall(L, kRef, loc), type: BOOL, loc }
+            : answer,
+          loc,
+        }],
         else_: null,
         loc,
       });
     }
-    body.push({ kind: "return", value: { kind: "boolLit", value: false, type: BOOL, loc }, loc });
+    body.push({ kind: "return", value: { kind: "boolLit", value: mode === "forIn", type: BOOL, loc }, loc });
     L.liftedFns.push({
       name: helper,
       params: [
