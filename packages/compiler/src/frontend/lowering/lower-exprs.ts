@@ -23,7 +23,7 @@ import { fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } f
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
+import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, jsFuncNameOf, neverResidueTsBinding, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { isTimerHandleTyped, lowerProcessVersionsProbe } from "./lower-builtins.js";
@@ -6431,6 +6431,42 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
  * member's value is itself such a literal (commander's saveStateBeforeParse).
  * (A dynamic field read the checker narrows to its `{}` type is a checked
  * copy of the dynamic value; the dynamic value is the source.) */
+/** GH #234's nested crossing: a fresh literal lifted as the island literal
+ * (viewOf's `objLit`, key/value argument pairs) names each function member
+ * box by the member's ES name (jsFuncNameOf), recursing into nested
+ * literals. A box that already carries a name keeps it. */
+function nameNestedLiteralFns(lifted: IrExpr, lit: ts.ObjectLiteralExpression): void {
+  if (lifted.kind !== "jsOp" || lifted.op !== "objLit") return;
+  const byKey = new Map<string, ts.ObjectLiteralElementLike>();
+  for (const p of lit.properties) {
+    if (ts.isSpreadAssignment(p)) continue;
+    const name = p.name;
+    if (ts.isIdentifier(name) || ts.isStringLiteral(name)) byKey.set(name.text, p);
+  }
+  const args = lifted.args;
+  for (let i = 0; i + 1 < args.length; i += 2) {
+    const keyArg = args[i]!;
+    const keyLit = keyArg.kind === "jsMarshal" ? keyArg.value : keyArg;
+    if (keyLit.kind !== "strLit") continue;
+    const prop = byKey.get(keyLit.value);
+    if (prop === undefined) continue;
+    const val = args[i + 1] as IrExpr & { fnName?: string };
+    if (ts.isPropertyAssignment(prop)) {
+      let init: ts.Expression = prop.initializer;
+      while (ts.isParenthesizedExpression(init)) init = init.expression;
+      if (ts.isObjectLiteralExpression(init)) {
+        nameNestedLiteralFns(val, init);
+        continue;
+      }
+    }
+    if ((val.kind === "jsMarshal" || val.kind === "dynFrom") && val.value.type.kind === "func" && val.fnName === undefined &&
+        (ts.isMethodDeclaration(prop) || ts.isPropertyAssignment(prop))) {
+      const fnName = jsFuncNameOf(prop);
+      if (fnName !== null) val.fnName = fnName;
+    }
+  }
+}
+
 function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
   return lit.properties.some((p) => {
     if (ts.isPropertyAssignment(p)) {
@@ -6592,6 +6628,28 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
         const k = fnProtoOfValueNode(L, valueExpr);
         if (k !== null) (v as { fnProto?: number }).fnProto = k;
       }
+      // GH #234: a record or class instance the checked-dynamic tree cannot
+      // hold directly (a literal holding a method: `{ v: { toString() {…} } }`)
+      // crosses through its JavaScript view in the one world, the way the
+      // same value crosses as a call argument. The fence-closure stand-in
+      // below would answer typeof "function" where Node has the object.
+      if (L.sharedDynamic && (v.type.kind === "record" || v.type.kind === "object")) {
+        const viewDiagsBefore = L.diags.length;
+        try {
+          const j = L.coerceToExpected(raw, JSVAL);
+          // A fresh nested literal crosses as the literal Node builds
+          // (viewOf); its function members take their ES names from the
+          // source (`{ f: () => 1, g() {}, h: function hh() {} }` names f,
+          // g and hh — SEMANTICS.md S020's GH #140 rule, nested now).
+          let lit: ts.Expression = valueExpr;
+          while (ts.isParenthesizedExpression(lit)) lit = lit.expression;
+          if (ts.isObjectLiteralExpression(lit)) nameNestedLiteralFns(j, lit);
+          if (j.type.kind === "jsval") v = { kind: "dynFromJsval", value: j, type: DYN, loc: locOf(prop) };
+        } catch (err) {
+          if (!(err instanceof PoisonError) || L.diagSink !== null) throw err;
+          L.diags.splice(viewDiagsBefore);
+        }
+      }
       if (v.type.kind !== "dyn") {
         const convDiagsBefore = L.diags.length;
         try {
@@ -6623,11 +6681,11 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
             first.loc.start,
           );
           const message = `${first.message} [${first.code} at ${first.loc.file}:${pos.line + 1}]`;
-          // A value that is no function (a RegExp, a Map): a stand-in
-          // function box would answer typeof/instanceof wrongly, so the
-          // literal stops by name where it is built.
-          const fnLike = v.type.kind === "func" || v.type.kind === "record" || v.type.kind === "object" ||
-            v.type.kind === "union" || v.type.kind === "jsval";
+          // A value that is no function (a RegExp, a Map, a record or class
+          // instance with no view, GH #234): a stand-in function box would
+          // answer typeof/instanceof wrongly, so the literal stops by name
+          // where it is built.
+          const fnLike = v.type.kind === "func" || v.type.kind === "union" || v.type.kind === "jsval";
           if (!fnLike) {
             const stopName = `%fn${L.lambdaCounter++}_dynstop`;
             L.liftedFns.push({
@@ -8827,7 +8885,10 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     const read: IrExpr = L.sharedDynamic && obj.type.kind === "jsval" && key.type.kind === "jsval"
       ? { kind: "call", callee: inheritedKeyReadHelper(L, loc), args: [obj, key], type: JSVAL, loc }
       : { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
-    if (!expr.questionDotToken) {
+    // GH #236: `e[1]` typed `never` by inference residue (an Object.entries
+    // tuple over an object with no index signature) holds whatever the
+    // object held — no eager exit to never's f64.
+    if (!expr.questionDotToken && !neverResidueTsBinding(L, expr, L.typeOf(expr))) {
       const declared = L.mapTypeOf(L.typeOf(expr));
       if (
         declared &&

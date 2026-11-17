@@ -825,6 +825,51 @@ export function neverTaintedJsType(L: Lowerer, node: ts.Node, t: ts.Type): boole
   return walk(t, 4);
 }
 
+/** GH #236: the TypeScript twin of neverTaintedJsType, for BINDINGS on the
+ * dynamic tier. `Object.entries(o)` over an `object` with no index
+ * signature (an `unknown` narrowed by `typeof o === "object"`) infers its
+ * element `[string, never]`, so the callback in
+ * `Object.entries(o).map(([k, v]) => …)` gets a pattern parameter typed
+ * `[string, never]` and a `v` typed `never`. The values are whatever the
+ * object holds, and never's f64 mapping would fence the first one that is
+ * not a number. A parameter or destructured binding whose type carries
+ * `never` inside an array or tuple, or a destructured element typed `never`
+ * itself, holds the dynamic value instead. Bare `never` on a plain binding
+ * keeps the f64 mapping (a dead read). Only where `any` maps to the
+ * dynamic value (TypeScript sources on the dynamic tier). */
+export function neverResidueTsBinding(L: Lowerer, node: ts.Node, t: ts.Type): boolean {
+  if (isJsSourceFile(node.getSourceFile()) || !L.typeCtx.dynamic) return false;
+  const p = node.parent;
+  const isPattern = ts.isArrayBindingPattern(node) || ts.isObjectBindingPattern(node);
+  const inElement = ts.isIdentifier(node) && p !== undefined && ts.isBindingElement(p) && p.name === node;
+  const isParamName = ts.isIdentifier(node) && p !== undefined && ts.isParameter(p) && p.name === node;
+  // `e[1]` over such a tuple (`Object.entries(o).map((e) => e[1])`): the
+  // element read is typed `never` and holds whatever the object held.
+  const residueRead = ts.isElementAccessExpression(node) && (t.flags & ts.TypeFlags.Never) !== 0;
+  if (!isPattern && !inElement && !isParamName && !residueRead) return false;
+  if (inElement && (t.flags & ts.TypeFlags.Never) !== 0) return true;
+  // A function literal's parameter typed `never` by its context:
+  // `Object.values(o).map((v) => typeof v)` (Object.values over such an
+  // object infers `never[]`). Folding `typeof v` to "number" would be a
+  // silent divergence; the parameter holds the dynamic argument.
+  if (isParamName && (t.flags & ts.TypeFlags.Never) !== 0 && (p as ts.ParameterDeclaration).type === undefined &&
+      (ts.isArrowFunction(p!.parent) || ts.isFunctionExpression(p!.parent))) {
+    return true;
+  }
+  const walk = (x: ts.Type, depth: number): boolean => {
+    if (depth === 0) return false;
+    if (x.isUnionType()) return x.getTypes().some((a) => walk(a, depth - 1));
+    if (L.checker.isArrayType(x) || L.checker.isTupleType(x)) {
+      return L.checker
+        .getTypeArguments(x as ts.TypeReference)
+        .some((a) => (a.flags & ts.TypeFlags.Never) !== 0 || walk(a, depth - 1));
+    }
+    return false;
+  };
+  if (residueRead) return walk(L.checker.getTypeAtLocation((node as ts.ElementAccessExpression).expression), 4);
+  return walk(t, 4);
+}
+
 /** The dyn undefined value — what an uninitialized checked-dynamic
  * binding holds (JS: declared bindings read `undefined` before any
  * assignment). A NULL dyn slot is a trap, never a value, so every dyn
@@ -4624,6 +4669,7 @@ export class Lowerer {
 
   irTypeOf(node: ts.Node): IrType {
     const t = this.typeOf(node);
+    if (neverResidueTsBinding(this, node, t)) return JSVAL;
     // A never-tainted JS type (neverTaintedJsType) maps — never rides as
     // f64 — but must not: pre-empt the mapping so the JS fallback below
     // answers instead.
