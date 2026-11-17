@@ -19,7 +19,7 @@ import type { Lowerer } from "./lowerer.js";
 import { orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
-import { fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
+import { classViewOf, fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -39,7 +39,7 @@ import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8Spread
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
-import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
+import { declaredClassOverDynamic, isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
@@ -762,6 +762,27 @@ export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     }
   }
 
+/** SEMANTICS.md S133 (l): `x instanceof C` against a declared class the
+ * program only types against (its instances are the implementation's own
+ * dynamic values) is refused by name rather than guessed. */
+function refuseDeclaredDynamicClassInstanceof(L: Lowerer, expr: ts.BinaryExpression): void {
+  if (!L.sharedDynamic) return;
+  let ctorT: ts.Type;
+  try {
+    ctorT = L.checker.getTypeAtLocation(expr.right);
+  } catch {
+    return;
+  }
+  const sig = L.checker.getConstructSignatures(ctorT)[0];
+  const inst = sig !== undefined ? L.checker.getReturnTypeOfSignature(sig) : undefined;
+  if (inst === undefined || !declaredClassOverDynamic(inst, L.typeCtx)) return;
+  L.unsupported(
+    "SC1090",
+    expr,
+    `'instanceof ${expr.right.getText()}' against a declared class the program never constructs, extends or implements (its values are the package's own dynamic objects, SEMANTICS.md S133 (l))`,
+  );
+}
+
 /** Module-TDZ guard (module-tdz.ts): whatever a guarded source read
  * lowered to — a global read the IR pass guards, or a FOLDED/ALIASED form
  * with no global read left (`late === undefined`, `void late`, `typeof
@@ -943,6 +964,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       if (nw !== null) return nw;
     }
     if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword) {
+      refuseDeclaredDynamicClassInstanceof(L, expr);
       const io = lowerObjModelInstanceof(L, expr);
       if (io !== null) return io;
     }
@@ -10885,7 +10907,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       const result = L.lowerExpr(expr.right);
       return { kind: "seqExpr", stmts: [effect], result, type: result.type, loc };
     }
-    if (op === ts.SyntaxKind.InstanceOfKeyword) return L.lowerInstanceOf(expr, loc);
+    if (op === ts.SyntaxKind.InstanceOfKeyword) {
+      refuseDeclaredDynamicClassInstanceof(L, expr);
+      return L.lowerInstanceOf(expr, loc);
+    }
     if (op === ts.SyntaxKind.InKeyword) {
       return lowerInExpression(L, expr, loc);
     }
@@ -13586,6 +13611,18 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
     return { kind: "call", callee: helper, args: [recv], type: recordT, loc };
   }
 
+/** `this.<m>` as the whole initializer of a field of a class in a compiled
+ * npm package's JavaScript (drizzle's `$default = this.$defaultFn`). */
+export function isPackageAliasFieldInit(expr: ts.PropertyAccessExpression): boolean {
+  if (expr.expression.kind !== ts.SyntaxKind.ThisKeyword) return false;
+  let top: ts.Node = expr;
+  while (ts.isParenthesizedExpression(top.parent)) top = top.parent;
+  const p = top.parent;
+  if (!ts.isPropertyDeclaration(p) || p.initializer !== top) return false;
+  const sf = expr.getSourceFile();
+  return isJsSourceFile(sf) && npmStaticPackageOfPath(sf.fileName) !== null;
+}
+
 /** Field read `obj.f` on class-instance and record receivers, through the
    * shared FieldTarget union (fieldGet / recordGet). Bound method references
    * on classes are rejected specifically; func-typed record fields are
@@ -13601,6 +13638,16 @@ function inUndefRecvThrower(L: Lowerer, loc: SrcLoc): string {
       (L.findMethodOn(L.classes.get(receiverIr.className) ?? null, expr.name.text) ||
         findGenericMethodOn(L, L.classes.get(receiverIr.className) ?? null, expr.name.text))
     ) {
+      // One world, exactly drizzle's method ALIAS field (`$default =
+      // this.$defaultFn` in a compiled package's JavaScript class): the
+      // method read through the instance's view, whose `this` is the call's
+      // own (S115 (iv), a fresh function per read). Every other method read
+      // as a value keeps the refusal.
+      if (L.sharedDynamic && !L.engine && viewableClass(L, receiverIr) !== null && isPackageAliasFieldInit(expr)) {
+        const recv = L.lowerExpr(expr.expression);
+        const view = classViewOf(L, recv, locOf(expr));
+        return { kind: "jsOp", op: "getProp", name: expr.name.text, args: [view], type: JSVAL, loc: locOf(expr) } as IrExpr;
+      }
       L.unsupported("SC1090", expr, `bound method references (call '${expr.name.text}' directly)`);
     }
     // An object-literal GENERIC method as a VALUE (`o.m` — the member is

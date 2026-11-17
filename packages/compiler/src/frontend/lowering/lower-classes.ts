@@ -10,6 +10,7 @@ import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrPar
 import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
+import { npmStaticPackageOfPath } from "../npm-static.js";
 import { nodeThrowExpr, PoisonError, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable, undefinedAsAbsent } from "./lower-exprs.js";
@@ -1680,7 +1681,22 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // undefined arm (undefFieldInitLineC — Node defines the property
           // as undefined on construction, verified), and reads/writes ride
           // the ordinary undefined-armed union machinery.
-          const type = L.irTypeOf(member.name);
+          // A JavaScript field declared `undefined` and assigned nowhere in
+          // its class (drizzle's Column: `enumValues = void 0`, which
+          // subclasses redeclare): the checker types it `undefined` alone,
+          // no static slot kind — the dynamic value holds it, as Node does.
+          const unitOnly = L.sharedDynamic && isJsSourceFile(member.getSourceFile()) && member.initializer !== undefined &&
+            (() => {
+              const t = L.checker.getTypeAtLocation(member.name);
+              return (t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) !== 0 && (t.flags & ~(ts.TypeFlags.Undefined | ts.TypeFlags.Void)) === 0;
+            })();
+          let type = unitOnly ? JSVAL : L.irTypeOf(member.name);
+          // A method ALIAS field (drizzle's ColumnBuilder: `$default =
+          // this.$defaultFn`): the method read as a value, which on the
+          // one-world lanes is the instance's method function (its `this`
+          // the call's own, as in Node) — a dynamic value the field holds.
+          if (L.sharedDynamic && member.initializer !== undefined && isThisMethodRead(L, member.initializer) &&
+            isJsSourceFile(member.getSourceFile()) && npmStaticPackageOfPath(member.getSourceFile().fileName) !== null) type = JSVAL;
           if (type.kind === "void") L.badType(member.name, L.typeOf(member.name));
           // dyn stays out of class fields (KEEP NARROW; record
           // fields and array elements are unmappable via mapType already)
@@ -4009,6 +4025,37 @@ export function lowerClassMembers(L: Lowerer, info: ClassInfo): IrFunction[] {
     }
     return out;
   }
+
+/** `this.<m>` where `m` is a method of the enclosing class (a method
+ * read as a value, not called). */
+function isThisMethodRead(L: Lowerer, e: ts.Expression): boolean {
+  let x = e;
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  if (!ts.isPropertyAccessExpression(x) || x.expression.kind !== ts.SyntaxKind.ThisKeyword) return false;
+  let cls: ts.Node | undefined = x.parent;
+  while (cls !== undefined && !ts.isClassDeclaration(cls) && !ts.isClassExpression(cls)) cls = cls.parent;
+  if (cls === undefined) return false;
+  const name = x.name.text;
+  let c: ts.ClassLikeDeclaration | undefined = cls as ts.ClassLikeDeclaration;
+  const seen = new Set<ts.Node>();
+  while (c !== undefined && !seen.has(c)) {
+    seen.add(c);
+    if (c.members.some((m) => ts.isMethodDeclaration(m) && m.name !== undefined && ts.isIdentifier(m.name) && m.name.text === name &&
+      !(ts.getModifiers(m) ?? []).some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword))) return true;
+    const ext = c.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0];
+    if (ext === undefined) return false;
+    let sym: ts.Symbol | undefined;
+    try {
+      sym = L.checker.getSymbolAtLocation(ext.expression);
+      if (sym !== undefined && (sym.flags & ts.SymbolFlags.Alias) !== 0) sym = L.checker.getAliasedSymbol(sym);
+    } catch {
+      return false;
+    }
+    const d = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
+    c = d !== undefined && (ts.isClassDeclaration(d) || ts.isClassExpression(d)) ? d : undefined;
+  }
+  return false;
+}
 
 /** Does the class around `stmt` assign `this.<name>` a dynamic value — an
  * `any`-typed one, or an object literal spreading an any/unknown/object

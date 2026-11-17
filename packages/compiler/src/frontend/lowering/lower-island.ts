@@ -9,7 +9,7 @@ import { BOOL, DYN, F64, FN_PROTO_STUB, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAN
 import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
 import { npmDeclaredOnlyDiag, requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isDtsMirrorPath } from "../npm-static.js";
-import { classLiftIn, fencedValue } from "./class-views.js";
+import { classLiftIn, fencedValue, flushUnviewableClasses } from "./class-views.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
 import { moduleNsSourceFileOf } from "./lower-namespaces.js";
@@ -271,6 +271,7 @@ import { regexCrossingChecked } from "./lower-regex.js";
       // shares as its live view, or a fresh literal builds as the dynamic
       // object Node would build (unit H, SEMANTICS.md S115 (a)).
       if (L.sharedDynamic && !L.engine && (e.type.kind === "record" || e.type.kind === "array")) return L.jsvalLiftExpr(e, e.loc);
+      flushUnviewableClasses(L, e.type);
       L.unsupported("SC1090", node, boundaryIntoIslandMsg(L.fmt(e.type)));
     }
     // U1a: a marshaled function carries its binding's spelling (S020).

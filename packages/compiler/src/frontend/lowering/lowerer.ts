@@ -16,8 +16,8 @@ import { lowerHostCall } from "./lower-host.js";
 import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import { dtsCallResult, dtsPropertyRead, getterRecordIntoDynamic } from "./lower-dts.js";
-import { isDtsMirrorPath } from "../npm-static.js";
-import { buildErrorViews, classFuncBox, classLiftIn, finishConstructorNames, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
+import { isDtsMirrorPath, npmStaticPackageOfPath } from "../npm-static.js";
+import { buildErrorViews, classFuncBox, classLiftIn, flushUnviewableClasses, finishConstructorNames, noteErrorViewEdges, fencedValue, classUnionExitHelper, classUnview, classViewOf, viewableClass } from "./class-views.js";
 import { builtinBoxPosition, collectEs5, es5TypeOf, type Es5Info } from "./lower-objmodel.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
@@ -2054,6 +2054,10 @@ export class Lowerer {
       // lowering, long after the constructor completes.
       isProgramFile: (sf) => this.fileTag.has(sf),
       dynArmResultType: (decl) => withMapperHook(() => dynArmResultType(this, decl)),
+      programBuiltClassDecl: (decl) => {
+        const n = (decl as { name?: ts.Node }).name;
+        return n !== undefined && ts.isIdentifier(n) && this.programBuiltClassNames().has(n.text);
+      },
     };
     // --dynamic: modules reachable only through dynamic import() joined
     // moduleOrder BEFORE any pass constructed — lowerToIr runs
@@ -3989,6 +3993,54 @@ export class Lowerer {
     return t;
   }
 
+  /** SEMANTICS.md S133 (l): the names of the package classes the program's
+   * own sources (outside node_modules) construct (`new C`), extend or
+   * implement — those keep their S115 views. By name, because the
+   * declarations' redirect answers a package class's implementation for its
+   * symbol (a same-named class of another package keeps its view too: the
+   * conservative side). One walk, memoized. */
+  programBuiltClassNames(): ReadonlySet<string> {
+    if (this.programBuiltClassSet !== null) return this.programBuiltClassSet;
+    const out = new Set<string>();
+    this.programBuiltClassSet = out;
+    const checker = this.checker;
+    const note = (e: ts.Expression): void => {
+      let x = e;
+      while (ts.isParenthesizedExpression(x) || ts.isAsExpression(x) || ts.isNonNullExpression(x)) x = x.expression;
+      const id = ts.isPropertyAccessExpression(x) ? x.name : x;
+      if (!ts.isIdentifier(id)) return;
+      let sym: ts.Symbol | undefined;
+      try {
+        sym = checker.getSymbolAtLocation(id);
+        if (sym !== undefined && (sym.flags & ts.SymbolFlags.Alias) !== 0) sym = checker.getAliasedSymbol(sym);
+      } catch {
+        sym = undefined;
+      }
+      if (sym === undefined) return;
+      const decls = [...checker.rawDeclarationsOf(sym), ...checker.declarationsOf(sym)];
+      if (decls.some((d) => d.getSourceFile().fileName.includes("/node_modules/") || isDtsMirrorPath(d.getSourceFile().fileName))) {
+        out.add(sym.name);
+        for (const d of decls) {
+          const n = (d as { name?: ts.Node }).name;
+          if (n !== undefined && ts.isIdentifier(n)) out.add(n.text);
+        }
+      }
+    };
+    const visit = (n: ts.Node): void => {
+      if (ts.isNewExpression(n)) note(n.expression);
+      else if (ts.isHeritageClause(n)) for (const t of n.types) note(t.expression);
+      ts.forEachChild(n, visit);
+    };
+    const files = this.moduleOrder.length > 0 ? this.moduleOrder : [this.entry];
+    for (const sf of files) {
+      // (A compiled package's own JavaScript constructs its classes: that is
+      // the implementation, not the program.)
+      if (!sf.isDeclarationFile && !sf.fileName.includes("/node_modules/") && npmStaticPackageOfPath(sf.fileName) === null) visit(sf);
+    }
+    return out;
+  }
+  private programBuiltClassSet: Set<string> | null = null;
+
   /** Does the checker type map to a JSDoc-rule union (S014's U1b amendment)? */
   private isJsMixedUnionType(t: ts.Type, node: ts.Node): boolean {
     // Unions and arrays only: a FUNCTION type answering `any` would turn a
@@ -4831,6 +4883,7 @@ export class Lowerer {
       this.unsupported("SC1090", node, boundaryOutOfIslandMsg(this.fmt(expected)));
     }
     if (expected.kind === "jsval") {
+      flushUnviewableClasses(this, actual);
       this.unsupported("SC1090", node, boundaryIntoIslandMsg(this.fmt(actual)));
     }
     // Class-value mismatches: the pointed stories — a widening whose

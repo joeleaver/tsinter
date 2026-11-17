@@ -32,7 +32,7 @@ import { isUndefExpr } from "./lower-exprs.js";
 import { emitterRooted } from "./lower-emitter.js";
 import { EMITTER_API_MEMBERS, findGenericMethodOn, type ClassInfo } from "./lower-classes.js";
 import { implicitDefaultInstance, type GenericInstance } from "./lower-calls.js";
-import { BOOL, DYN, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, DYN, ERRV_PROBE, F64, JSVAL, STRING, VOID, typeEquals, typeKey, type IrExpr, type IrFunction, type IrGlobal, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 
 const str = (value: string, loc: SrcLoc): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
 const undef = (loc: SrcLoc): IrExpr => ({ kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc });
@@ -50,6 +50,15 @@ export function viewableClass(L: Lowerer, t: IrType): ClassInfo | null {
   if (!info || info.decl === null || info.builtinError || info.builtinEmitter || info.builtinStream !== undefined) return null;
   for (let b = info.base; b !== null; b = b.base) if (b.builtinError) return null;
   return info;
+}
+
+/** A class instance (or a union carrying some) that cannot be viewed
+ * because its class never collected (a deferred, poisoned declaration):
+ * report the class's own diagnostics at this use, so the site names the
+ * real blocker rather than the generic boundary refusal. */
+export function flushUnviewableClasses(L: Lowerer, t: IrType): void {
+  const arms = t.kind === "union" ? L.unions.get(t.unionId)?.arms ?? [] : [t];
+  for (const a of arms) if (a.kind === "object" && !L.classes.has(a.className)) L.flushDeferredClass(a.className);
 }
 
 /** The instance's view: `%cview.<n>(x)`. */
@@ -515,13 +524,36 @@ function exitArg(L: Lowerer, v: IrExpr, t: IrType): IrExpr | null {
   return typeEquals(out.type, t) ? out : null;
 }
 
+/** The module global holding the one method function of (declarer,
+ * method) read through class views (S115 (iv)); undefined until the first
+ * read. */
+function methodFnGlobal(L: Lowerer, declarer: ClassInfo, method: string): { fn: IrGlobal; made: IrGlobal } {
+  const id = `%g.%mfn.${declarer.def.name}.${method.replace(/[^A-Za-z0-9_$]/g, "_")}`;
+  const get = (gid: string, type: IrType): IrGlobal => {
+    const have = L.globalsList.find((g) => g.id === gid);
+    if (have !== undefined) return have;
+    const g: IrGlobal = { id: gid, name: gid.slice(3), type, mutable: true };
+    L.globalsList.push(g);
+    return g;
+  };
+  // (a separate flag: a jsval global has no value before its first write)
+  return { fn: get(id, JSVAL), made: get(`${id}.made`, BOOL) };
+}
+
 /** The bound-method FUNC for `name` on the instance captured as `x.0`:
  * every parameter takes a dynamic value (checked into the method's own
  * parameter types), the result crosses back lifted. */
-function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: string, x: () => IrExpr, cap: { localId: string; name: string; type: IrType }, capLocal: { id: string; name: string; type: IrType; mutable: false; boxed: true }, loc: SrcLoc, receiverFromThis = true): IrExpr {
+function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: string, x: () => IrExpr, cap: { localId: string; name: string; type: IrType }, capLocal: { id: string; name: string; type: IrType; mutable: false; boxed: true }, loc: SrcLoc, receiverFromThis = true, shared = false): IrExpr {
   const found = L.findMethodOn(info, name);
   const implicit = found === null ? implicitMethodOf(L, info, name) : null;
   const fnName = `${factory}.m.${name.replace(/[^A-Za-z0-9_$]/g, "_")}`;
+  // A SHARED function (one per declaring class and method, receiver from
+  // `this`) captures nothing and is lifted once.
+  const fnT0: IrType = { kind: "func", params: [], ret: JSVAL };
+  if (shared && L.liftedFns.some((f) => f.name === fnName)) {
+    const prior = L.liftedFns.find((f) => f.name === fnName)!;
+    return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: [], type: { ...fnT0, params: prior.params.map(() => JSVAL) }, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
+  }
   const shapes = found !== null ? found.sig.params : implicit!.inst.params;
   const fixed = shapes.filter((p) => p.mode === "required" || p.mode === "omittable");
   const body: IrStmt[] = [];
@@ -596,9 +628,9 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
     name: fnName,
     params,
     returnType: JSVAL,
-    captures: [cap],
+    captures: shared ? [] : [cap],
     locals: [
-      capLocal,
+      ...(shared ? [] : [capLocal]),
       ...params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: true })),
       { id: "th.0", name: "th", type: JSVAL, mutable: true },
       { id: "r.0", name: "r", type: x().type, mutable: true },
@@ -608,7 +640,7 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
   };
   L.liftedFns.push(fn);
   const fnT: IrType = { kind: "func", params: params.map(() => JSVAL), ret: JSVAL };
-  return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: [cap.localId], type: fnT, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
+  return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: shared ? [] : [cap.localId], type: fnT, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
 }
 
 /** The interned view factory of one class. */
@@ -679,7 +711,36 @@ export function classViewFactory(L: Lowerer, className: string, loc: SrcLoc): st
       if (call === null) continue;
       value = liftOut(L, call, loc);
     } else {
-      value = boundMethodFn(L, name, info, m.name, x, cap, capLocal, loc);
+      // One function per (declaring class, method), as Node's one prototype
+      // function: built on the first read, then every read through any
+      // instance's view answers it (`o.m === o.m`, `o.m === p.m`). It takes
+      // its receiver from the call's own `this`, so it is shared safely.
+      const found = L.findMethodOn(info, m.name);
+      const implicit = found === null ? implicitMethodOf(L, info, m.name) : null;
+      const declarer = found?.declarer ?? implicit?.declarer ?? info;
+      const g = methodFnGlobal(L, declarer, m.name);
+      const gRef: IrExpr = { kind: "varRef", localId: g.fn.id, type: JSVAL, loc };
+      const dx = (): IrExpr => L.upcastTo(x(), declarer.def.name);
+      getBody.push({
+        kind: "if",
+        cond: keyIs(m.name),
+        then: [
+          {
+            kind: "if",
+            cond: { kind: "unary", op: "!", operand: { kind: "varRef", localId: g.made.id, type: BOOL, loc }, type: BOOL, loc },
+            then: [
+              { kind: "assign", localId: g.fn.id, value: boundMethodFn(L, `%mfn.${declarer.def.name}`, declarer, m.name, dx, cap, capLocal, loc, true, true), loc },
+              { kind: "assign", localId: g.made.id, value: { kind: "boolLit", value: true, type: BOOL, loc }, loc },
+            ],
+            else_: null,
+            loc,
+          },
+          { kind: "return", value: gRef, loc },
+        ],
+        else_: null,
+        loc,
+      });
+      continue;
     }
     getBody.push({ kind: "if", cond: keyIs(m.name), then: [{ kind: "return", value, loc }], else_: null, loc });
   }

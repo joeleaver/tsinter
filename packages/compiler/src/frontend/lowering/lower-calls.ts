@@ -11,7 +11,7 @@ import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
-import { declaredInterfaceOverDynamic, isGenericCallableMemberType, typeKey } from "../types.js";
+import { declaredOverDynamic, isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, THIS_BINDING, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, lexThisEntry, newFnCtx, nodeThrowExpr, jsMixedObjectUnion } from "./lowerer.js";
 import { armRooted, dynArmKey, dynArmParam, dynArmResultType, isDynArmSite, stripParens } from "./dyn-arm.js";
 import { isTypedComposite } from "./island-views.js";
@@ -2113,8 +2113,16 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
    * VALUE reference of an implicit-any function names (indirect calls
    * carry no per-site types to bind). */
   export function implicitDefaultInstance(L: Lowerer, blame: ts.Node, info: GenericFnInfo): GenericInstance {
+    // A defaulted JavaScript parameter with no annotation (`references(ref,
+    // config = {})`) takes whatever dynamic callers pass, its default when
+    // that is undefined: the dynamic slot, never its initializer's type.
     const shapes: ParamShape[] = info.decl.parameters.map((param, i) =>
-      info.implicitParams![i] ? { type: DYN, mode: "required" as const } : L.paramShape(param),
+      info.implicitParams![i]
+        ? { type: DYN, mode: "required" as const }
+        : ts.isMethodDeclaration(info.decl) && param.initializer !== undefined && param.type === undefined && ts.isIdentifier(param.name) &&
+            param.dotDotDotToken === undefined && isJsSourceFile(param.getSourceFile())
+          ? { type: DYN, mode: "omittable" as const, bodyType: DYN }
+          : L.paramShape(param),
     );
     return internImplicitInstance(L, blame, info, shapes, new Map());
   }
@@ -3982,7 +3990,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const recvDynamic =
         recvAny ||
         (recvTs0.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) !== 0 ||
-        declaredInterfaceOverDynamic(L.checker.getNonNullableType(recvTs0), L.typeCtx);
+        declaredOverDynamic(L.checker.getNonNullableType(recvTs0), L.typeCtx);
       if (L.sharedDynamic && recvDynamic && !(L.engine && recvAny)) {
         const served = lowerDynReceiverMethodCall(L, expr, expr.expression);
         if (served) return served;
@@ -5364,7 +5372,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       L.sharedDynamic &&
       !call.questionDotToken &&
       !access.questionDotToken &&
-      declaredInterfaceOverDynamic(L.checker.getNonNullableType(recvTs), L.typeCtx)
+      declaredOverDynamic(L.checker.getNonNullableType(recvTs), L.typeCtx)
     ) {
       if (call.arguments.some((a) => ts.isSpreadElement(a))) {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
