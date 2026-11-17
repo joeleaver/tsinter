@@ -393,8 +393,14 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   if (![...byName.keys()].some(isCopyHelper) && !functions.some((f) => hasDynCrossing(f.body))) return;
 
   const classPrefixes = [...L.classes.keys()].map((c) => `%${c}.`);
+  /** A program function of any module: the entry's are bare names, every
+   * other module's carry its file tag (`%m<i>.`, lowerer.ts fileTag) —
+   * the same kind of function either way. (S125: paperclip's real sites
+   * live in tagged modules, where the bare-name test made every call into
+   * another module "unknown code" whose arguments escape with writes.) */
+  const programFn = (name: string): boolean => !name.startsWith("%") || (/^%m\d+\.[^%]/.test(name) && byName.has(name));
   const transparentCallee = (name: string): boolean => {
-    if (!name.startsWith("%")) return true;
+    if (programFn(name)) return true;
     if (isCopyHelper(name) || TRANSPARENT_HELPER.test(name) || PASS_THROUGH.test(name)) return true;
     return classPrefixes.some((p) => name.startsWith(p));
   };
@@ -1893,6 +1899,25 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
   const IDENTITY = "the program compares values of these types by identity, and the copy is a different object";
   const KEYS = "the program prints, serializes, lists the keys of or tests the class of the copy, which carries only the slot's own fields and class";
   const reported = new Set<string>();
+  // (fb73ae21 review) A typed value that crosses into a dynamic slot (an
+  // `object`-typed binding, a Set<object> element, a WeakMap<object, …>
+  // key) carries its identity there: where the program compares dynamic
+  // values by identity, every type so crossed is identity-observed, so a
+  // width copy of it (S125 (b)) — a different object in the slot — is
+  // refused rather than compared unequal.
+  if (dynIdentity) {
+    // (the one-world lanes: a typed composite enters the island as its
+    // view or marshal — islandEntered)
+    for (const k of islandEntered) identity.add(k);
+    for (const d of dynSites) {
+      if (d.dir !== "in") continue;
+      for (const t of [d.t, ...refsOf(d.t).refs]) {
+        if (!isComposite(t)) continue;
+        identity.add(tkey(t));
+        if (t.kind === "union") for (const a of L.unions.get(t.unionId)?.arms ?? []) identity.add(tkey(a));
+      }
+    }
+  }
   for (const s of sites) {
     const pairs = [...(() => {
       const acc = new Map<string, { from: IrType; to: IrType }>();
@@ -1947,6 +1972,12 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           else if ((uses.includes("keys") || foldedKeys.has(tkey(p.to))) && keysDiffer(p.from, p.to)) why = KEYS;
           else if (foldedClass.has(tkey(p.to)) && printDiffer(p.from, p.to)) why = KEYS;
           else if (uses.includes("other") && !unique) why = byType();
+          // (fb73ae21 review) a copy whose type crosses into dynamic slots
+          // the program compares by identity (an `object` binding, a
+          // Set<object> element, a WeakMap<object, …> key — the crossing
+          // is a "keys" use here): a different object where JavaScript's
+          // is the same, so the copy refuses.
+          else if (!unique && uses.length > 0 && identity.has(tkey(p.to))) why = IDENTITY;
         } else if (!unique) {
           why = byType();
         } else if (reach.has(tkey(p.to)) && printDiffer(p.from, p.to)) {
@@ -2678,7 +2709,7 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         case "call":
           // A program function every return of which builds a value from
           // its own locals.
-          if ((!e.callee.startsWith("%") || /^%fn\d+$/.test(e.callee)) && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
+          if ((programFn(e.callee) || /^%fn\d+$/.test(e.callee)) && byName.has(e.callee)) return returnsOwned(e.callee, depth + 1);
           return fresh(e) && (e.type.kind !== "array" || !hasRef(e.type.elem));
         default:
           // A fresh spine (map/filter/slice, a builder, `new`) of scalars.
