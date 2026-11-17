@@ -572,6 +572,11 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
       // own uses are followed like a recordGet's).
       case "recordKeyGet":
         return key === "obj" ? "read" : "other";
+      // S125 (paperclip's zod callbacks, `new Set(ids).size === ids.length`):
+      // a Set built from an array of scalars reads its spine and keeps
+      // only the scalar elements (composite ones are exposed parts below).
+      case "setNew":
+        return key === "seed" ? "read" : "other";
       case "fieldGet":
       case "arrayGet":
       case "toBool":
@@ -636,6 +641,8 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         return [{ t: t.elem }];
       }
       if (pk === "arrIntrinsic" && key === "receiver" && parent["method"] !== "length" && parent["method"] !== "join") return [{ t: t.elem }];
+      // A Set seeded from the array stores its elements.
+      if (pk === "setNew" && key === "seed") return [{ t: t.elem }];
       return [];
     }
     if (t.kind === "record" && pk === "call" && /^%obj\.(values|entries)\./.test(parent["callee"] as string)) {
@@ -996,6 +1003,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
         break;
       case "mapNew":
       case "setNew": {
+        // A seed array of scalars is only read (its elements are copied in).
+        const seed = k === "setNew" ? (r["seed"] as IrExpr | undefined) : undefined;
+        if (seed !== undefined && seed.type.kind === "array" && !isComposite(seed.type.elem)) rest = "r";
         const ct = r["type"] as IrType;
         const kt = ct.kind === "map" ? ct.key : ct.kind === "set" ? ct.elem : undefined;
         if (kt !== undefined && isComposite(kt)) {

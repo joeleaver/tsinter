@@ -29,6 +29,16 @@ export async function action(fn, opts) {
   return opts;
 }`;
 
+
+/** zod's refine/superRefine shape (paperclip's validators): a typed
+ * callback dynamic code calls with its own array, and writes to it after
+ * (the callback's parameter takes the dynamic arm, U2a). */
+const ZDEP = `export function refine(fn, input) {
+  const ok = fn(input);
+  input.push("late");
+  return ok;
+}`;
+
 defineRows("S125 share-vs-copy", [
   {
     id: "S125-A4-01 a declared collector pushing into its array parameter, handed to dynamic code: one array; a direct call stays typed",
@@ -402,4 +412,15 @@ function f(xs: Array<{ action: string }>) { xs.forEach((x) => { const r = x as {
 const ps: P[] = [{ action: "create", slug: "a" }];
 f(ps);
 console.log(ps);`, refused: /SC1090 .*COPY where JavaScript shares the object.*S125/ },
+  {
+    id: "S125-A6-01 paperclip's zod uniqueness refinements: a Set built from the callback's array (new Set(values).size === values.length, [...new Set(ids)]) reads it once",
+    entry: "main.ts",
+    files: { "dep.mjs": ZDEP },
+    src: `import { refine } from "./dep.mjs";
+const input: string[] = JSON.parse('["a","b","a"]');
+console.log(refine((values: string[]) => new Set(values).size === values.length, input), input);
+const ids = ["x", "y", "x"];
+console.log(refine((v: string[]) => [...new Set(v)].length === 2, ids), ids);
+console.log(refine((v: string[]) => { const s = new Set(v); v.push("w"); return s.size === v.length; }, ["p"]));`,
+  },
 ]);
