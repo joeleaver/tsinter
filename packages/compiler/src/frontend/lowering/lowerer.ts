@@ -672,7 +672,10 @@ export function lowerToIr(
     if (p.ok) built = { emit, result, sites: dynArmSites, noSpec };
     if (round >= DYN_ARM_ROUNDS) break;
     if (p.ok) {
-      const soft = [...emit.dynArmSoft].filter((k) => !dynArmSites.has(k));
+      // A pass that builds may still hold refused crossings: a compiled
+      // package's JavaScript defers its S125 refusals to where they run
+      // (zod's module-load `NEVER`); those slots try the arm as well.
+      const soft = [...emit.dynArmSoft, ...emit.dynArmRetry].filter((k) => !dynArmSites.has(k));
       if (soft.length === 0) break;
       dynArmSites = new Set([...dynArmSites, ...soft]);
       continue;
