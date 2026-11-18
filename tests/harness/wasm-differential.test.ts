@@ -3727,6 +3727,7 @@ const TIER_FLOOR: string[] = [
   "2950-bigint-any-arith/main.ts",
   "2951-fs-filehandle.ts",
   "2961-regex-script-emoji-props.ts",
+  "2964-regex-any-subject.ts",
 ];
 
 interface RunResult {

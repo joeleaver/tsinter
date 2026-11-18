@@ -5929,6 +5929,15 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       // GH #104 (SEMANTICS.md S119): the subject's ToString — a slot
       // holding undefined is searched as the text "undefined".
       const args = call.arguments.map((a) => L.lowerExpr(a));
+      // GH #252: a dynamic subject (an `any` holding undefined, null, a
+      // number…) is ToString'd as Node does — the bare dyn ToString — never
+      // handed over as a string slot (whose undefined the matcher read as a
+      // null string: an unnamed trap).
+      if (args.length === 1 && (args[0]!.type.kind === "jsval" || args[0]!.type.kind === "dyn")) {
+        const a0 = args[0]!;
+        const d: IrExpr = a0.type.kind === "jsval" ? { kind: "dynFromJsval", value: a0, type: DYN, loc: a0.loc } : a0;
+        args[0] = { kind: "toString", operand: d, type: STRING, loc: a0.loc };
+      }
       if (args.length !== 1) return { kind: "regexIntrinsic", method: "test", receiver, args, type: BOOL, loc };
       return undefTextSubject(L, receiver, args[0]!, loc, (r, s) => ({ kind: "regexIntrinsic", method: "test", receiver: r, args: [s], type: BOOL, loc }));
     }

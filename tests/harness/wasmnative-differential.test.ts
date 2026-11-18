@@ -1031,6 +1031,7 @@ const CLAIM_FLOOR: string[] = [
   "2950-bigint-any-arith/main.ts",
   "2951-fs-filehandle.ts",
   "2961-regex-script-emoji-props.ts",
+  "2964-regex-any-subject.ts",
   "300-if-else.ts",
   "301-while.ts",
   "302-for.ts",
