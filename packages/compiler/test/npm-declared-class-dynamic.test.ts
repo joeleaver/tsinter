@@ -333,7 +333,7 @@ describe("S115 (iv): one method function per declaring class across view factori
         "node_modules/inh/index.js": `export class Base { constructor() { this.tag = ""; } mark() { this.tag += "m"; return this; } }\nexport class Sub extends Base { extra() { this.tag += "x"; return this; } }\nexport function base() { return new Base(); }\nexport function sub() { return new Sub(); }\n`,
         "package.json": pj({ type: "module" }),
         "tsconfig.json": pj({ compilerOptions: { strict: true, module: "nodenext", skipLibCheck: true, noEmit: true } }),
-        "main.ts": `import { base, sub } from "inh";\nconst b = base();\nconst s = sub();\nconsole.log(b.mark().tag, s.mark().extra().tag, b.mark === s.mark, s.extra === sub().extra);`,
+        "main.ts": `import { base, sub } from "inh";\nconst s = sub();\nconsole.log(s.mark().extra().tag);\nconst b = base();\nconsole.log(b.mark().tag, b.mark === s.mark, s.extra === sub().extra);`,
       },
     }, lane);
   }, 600_000);
