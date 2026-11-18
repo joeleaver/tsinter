@@ -618,6 +618,37 @@ export function login(raw: string, notify: (message: string) => void = console.e
 login("to stderr");
 login("x", (m) => console.log("got", m));`,
   },
+  {
+    id: "SB-31 new RegExp over a dynamic pattern (paperclip's question-set validator), util.isDeepStrictEqual over one static type (its config store)",
+    nodeTypes: true,
+    src: `import { isDeepStrictEqual } from "node:util";
+const value: any = JSON.parse('{"a":{"pattern":"^a+$"},"b":{"pattern":"(["},"c":{},"d":{"pattern":42}}');
+for (const k of ["a", "b", "c", "d"]) {
+  let ok = true;
+  let src = "";
+  try { const re = new RegExp(value[k].pattern); src = re.source; } catch (e) { ok = false; src = (e as Error).name; }
+  console.log(k, ok, src);
+}
+type Cfg = { server: { port: number; host: string }; tags: string[]; mode?: string };
+const a: Cfg = { server: { port: 1, host: "h" }, tags: ["x"] };
+const b: Cfg = { server: { port: 1, host: "h" }, tags: ["x"] };
+const c: Cfg = { server: { port: 1, host: "h" }, tags: ["x"], mode: "m" };
+console.log(isDeepStrictEqual(a, b), isDeepStrictEqual(a, c), isDeepStrictEqual(a, { ...b, tags: ["y"] }), isDeepStrictEqual(NaN, NaN), isDeepStrictEqual(0, -0), isDeepStrictEqual("s", "s"));`,
+  },
+  {
+    id: "SB-32 an optional-chained Stats method (paperclip's seed-source probe: entry?.isSymbolicLink())",
+    nativeOnly: true,
+    nodeTypes: true,
+    src: `import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+const d = fs.mkdtempSync(path.join(os.tmpdir(), "sb32-"));
+fs.writeFileSync(path.join(d, "f"), "x");
+fs.symlinkSync("f", path.join(d, "l"));
+function entry(p: string): fs.Stats | undefined { return fs.existsSync(p) ? fs.lstatSync(p) : undefined; }
+for (const n of ["f", "l", "nope"]) console.log(n, entry(path.join(d, n))?.isSymbolicLink(), entry(path.join(d, n))?.isFile());
+fs.rmSync(d, { recursive: true, force: true });`,
+  },
 ];
 
 function write(row: Row, backend: string): string {

@@ -12592,6 +12592,12 @@ function values a `() => number` or `(message: string) => void` slot holds
   that is not an object (Node's catchable `TypeError: Iterator value … is
   not an entry object`) stop by name, and a key or value that is not the
   map's declared type meets the checked boundary's fence (S122).
+- (e) **`new RegExp(pattern)` over a dynamic pattern** compiles Node's
+  ToString of it (undefined is the empty pattern; a bad pattern throws
+  Node's catchable SyntaxError); a pattern that is itself a RegExp, which
+  Node copies, stops by name. `util.isDeepStrictEqual(a, b)` answers what
+  `assert.deepStrictEqual` decides (two operands of one static type, the
+  same structural comparison and the same refusals).
 
-**Tested by:** SB-20..SB-30 in `packages/compiler/test/wasm-stdlib-batch.test.ts`
+**Tested by:** SB-20..SB-32 in `packages/compiler/test/wasm-stdlib-batch.test.ts`
 (wasm and wasm-native, against Node).
