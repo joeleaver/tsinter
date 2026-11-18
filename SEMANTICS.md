@@ -11773,7 +11773,7 @@ What is trusted is the declarations' claim, as everywhere in S133. A false
 claim about a member surfaces at the first crossing that checks it, which
 may be the implementation's own write while it builds the value.
 **Tested by:** `packages/compiler/test/npm-declared-class-dynamic.test.ts`
-(DC-01..11).
+(DC-01..12).
 
 **Amendment (m) — a viewed package's declarations that import another
 opted-in package (2026-11-16).** A view's declaration files may import

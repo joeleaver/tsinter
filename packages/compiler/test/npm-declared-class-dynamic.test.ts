@@ -321,3 +321,20 @@ describe("S133 (l): a package's method alias field keeps Node's identity (one fu
     }, lane);
   }, 600_000);
 });
+
+describe("S115 (iv): one method function per declaring class across view factories", () => {
+  test.for(["wasm", "wasm-native"] as const)("DC-12 an inherited method read through two classes' views on %s", async (lane) => {
+    await checkRow(scratch, {
+      id: `DC-12-${lane}`,
+      npmStatic: ["inh"],
+      files: {
+        "node_modules/inh/package.json": pj({ name: "inh", version: "1.0.0", type: "module", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } }),
+        "node_modules/inh/index.d.ts": `export declare class Base { tag: string; mark(): this; }\nexport declare class Sub extends Base { extra(): this; }\nexport declare function base(): Base;\nexport declare function sub(): Sub;\n`,
+        "node_modules/inh/index.js": `export class Base { constructor() { this.tag = ""; } mark() { this.tag += "m"; return this; } }\nexport class Sub extends Base { extra() { this.tag += "x"; return this; } }\nexport function base() { return new Base(); }\nexport function sub() { return new Sub(); }\n`,
+        "package.json": pj({ type: "module" }),
+        "tsconfig.json": pj({ compilerOptions: { strict: true, module: "nodenext", skipLibCheck: true, noEmit: true } }),
+        "main.ts": `import { base, sub } from "inh";\nconst b = base();\nconst s = sub();\nconsole.log(b.mark().tag, s.mark().extra().tag, b.mark === s.mark, s.extra === sub().extra);`,
+      },
+    }, lane);
+  }, 600_000);
+});

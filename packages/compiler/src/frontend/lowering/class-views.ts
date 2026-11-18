@@ -540,6 +540,17 @@ function methodFnGlobal(L: Lowerer, declarer: ClassInfo, method: string): { fn: 
   return { fn: get(id, JSVAL), made: get(`${id}.made`, BOOL) };
 }
 
+/** The shared method functions a Lowerer has lifted: name -> arity. */
+const sharedMethodFnsBy = new WeakMap<Lowerer, Map<string, number>>();
+function sharedMethodFns(L: Lowerer): Map<string, number> {
+  let m = sharedMethodFnsBy.get(L);
+  if (m === undefined) {
+    m = new Map();
+    sharedMethodFnsBy.set(L, m);
+  }
+  return m;
+}
+
 /** The bound-method FUNC for `name` on the instance captured as `x.0`:
  * every parameter takes a dynamic value (checked into the method's own
  * parameter types), the result crosses back lifted. */
@@ -549,10 +560,13 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
   const fnName = `${factory}.m.${name.replace(/[^A-Za-z0-9_$]/g, "_")}`;
   // A SHARED function (one per declaring class and method, receiver from
   // `this`) captures nothing and is lifted once.
-  const fnT0: IrType = { kind: "func", params: [], ret: JSVAL };
-  if (shared && L.liftedFns.some((f) => f.name === fnName)) {
-    const prior = L.liftedFns.find((f) => f.name === fnName)!;
-    return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: [], type: { ...fnT0, params: prior.params.map(() => JSVAL) }, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
+  // (Recorded per Lowerer: the lifted-function list drains into the module
+  // between view factories, so it cannot answer "already lifted".)
+  if (shared) {
+    const made = sharedMethodFns(L).get(fnName);
+    if (made !== undefined) {
+      return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: [], type: { kind: "func", params: Array.from({ length: made }, () => JSVAL), ret: JSVAL }, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
+    }
   }
   const shapes = found !== null ? found.sig.params : implicit!.inst.params;
   const fixed = shapes.filter((p) => p.mode === "required" || p.mode === "omittable");
@@ -639,6 +653,7 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
     loc,
   };
   L.liftedFns.push(fn);
+  if (shared) sharedMethodFns(L).set(fnName, params.length);
   const fnT: IrType = { kind: "func", params: params.map(() => JSVAL), ret: JSVAL };
   return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: shared ? [] : [cap.localId], type: fnT, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
 }
