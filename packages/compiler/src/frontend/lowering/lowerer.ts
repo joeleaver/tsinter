@@ -10689,7 +10689,7 @@ export class Lowerer {
     if (!expr.questionDotToken && ts.isPropertyAccessExpression(expr.expression)) {
       const inner = this.builtinMemberOf(expr.expression);
       if (inner && inner.module === "fs" && inner.member === "constants") {
-        const MODES: Record<string, number | undefined> = { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 };
+        const MODES: Record<string, number | undefined> = { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4, COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4 };
         const value = own(MODES, expr.name.text);
         if (value === undefined) {
           this.noLowering(
@@ -11013,8 +11013,8 @@ export class Lowerer {
     return lowerDateCall(this, call, access);
   }
 
-  checkTextCodecCtor(recv: ts.NewExpression, cls: string): void {
-    checkTextCodecCtor(this, recv, cls);
+  checkTextCodecCtor(recv: ts.NewExpression, cls: string): number {
+    return checkTextCodecCtor(this, recv, cls);
   }
 
   lowerTextCodecCall(call: ts.CallExpression,

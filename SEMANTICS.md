@@ -10371,6 +10371,18 @@ five contraction starters and fuzzed over 400,000 starter-and-mark strings.
 the table from the pinned inputs; `tests/diagnostics/locale-compare.ts`
 pins the refusals. Corpus 2826 and 2827 (ASCII, every lane).
 
+**Amendment (paperclip's stdlib batch 3): `{ sensitivity: "base" }`.** On the
+wasm and wasm-native lanes, an options bag that is exactly the literal
+`{ sensitivity: "base" }`, with a locales argument this entry admits
+(paperclip's app catalog: `a.name.localeCompare(b.name, "en", { sensitivity:
+"base" })`, sorted at module load), compares the same root collation at
+primary strength only — ICU's `UCOL_PRIMARY`, which Node's `"base"` maps to:
+case and accents tie (`"a"`, `"A"` and `"á"` answer 0), punctuation and
+everything else with a primary weight still counts. Every other bag still
+refuses at build time. **Tested by:** SB-20 in
+`packages/compiler/test/wasm-stdlib-batch.test.ts` (wasm and wasm-native,
+against Node).
+
 ## S121 — `process.stdin/stdout/stderr.isTTY` on a stream that is not a terminal reads `false`, where Node's stream has no such property (`undefined`) *(c and llvm lanes)*
 
 Node defines `isTTY` only on a `tty.ReadStream`/`tty.WriteStream`; a pipe
@@ -12519,3 +12531,67 @@ The bracket and optional spellings (`Error["name"]`, `Error?.length`) answer lik
 `getOwnPropertySymbols(Error)` crashed the compiler before, and so did `typeof` of an absent member of a
 JavaScript literal (`typeof o.stack`), which now answers "undefined". **Tested by:**
 `packages/compiler/test/wasm-gh245-error-ctor.test.ts` (wasm and wasm-native, against Node).
+
+## S151 — Paperclip's stdlib batch 3: Intl.DateTimeFormat is one built-in form, a WeakRef never empties and a FinalizationRegistry never calls back, and a few cold argument shapes stop by name *(wasm and wasm-native)*
+
+Paperclip's third batch of standard-library and @types/node surface (its
+SC2020 sites, measured against its five workload cases by Node's own block
+coverage: only module-load code runs). What lowers Node-exactly needs no
+entry — `renameSync`, `linkSync`, `symlinkSync` (a literal type ignored, as
+on every POSIX host), `readlinkSync`, `fsyncSync`, `openSync` with a mode,
+`copyFileSync` with a run-time mode (see (b)), the `fs.constants.COPYFILE_*`
+values, a plain `Stats`' `mode`,
+`uid`, `gid`, `nlink`, `ino`, `dev`, `rdev`, `blksize` and `blocks` (every
+`stat`/`lstat` then builds the full record), `URL.port` and `URL.origin`,
+`crypto.randomInt(min, max)` over integer literals, `process.version`,
+`process.stdout.columns ?? n`, `Number.isInteger` over a `number |
+undefined`, `Object.hasOwn` with a narrowed `unknown` key, a readonly
+tuple's `includes` over a cast argument, a readonly-tuple-constrained
+generic's `join`, `new TextDecoder("utf-8", { fatal: true, ignoreBOM: true
+})`, `p.catch(() => undefined)` over a `Promise<void>`, and a `Map` whose
+values are shared with dynamic code (a drizzle row with a `Date` member),
+seeded from `rows.map((r) => [r.id, r])`, `Array.from(map, mapper)` over
+the map's live entries, `JSON.stringify(value, null, c ? 2 : 0)` over a
+dynamic value, and `Date.now` / `console.error` / `console.log` read as the
+function values a `() => number` or `(message: string) => void` slot holds
+(S120's amendment covers the `"base"` collation). What parts from Node:
+
+- (a) **Intl.DateTimeFormat** has one built-in form, paperclip's routine
+  timestamp: `new Intl.DateTimeFormat("en-US", { year: "numeric", month:
+  "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true,
+  timeZone: "UTC", timeZoneName: "short" })` (the bag's members in any
+  order), whose `format(date)` writes ICU's `"April 28, 2026 at 12:17 PM
+  UTC"`, a date's time value taken as `Number(date)` takes it (undefined is
+  now) and a time value Node's TimeClip rejects throwing Node's `RangeError:
+  Invalid time value`. Any other locale or bag refuses at build time by name,
+  and so do the other members. A date before the year 1 (ICU writes those
+  with its era form) stops the program by name where `format` runs.
+  Unpicked: the other locales and options — ICU data the binary does not
+  carry.
+- (b) **fs modes.** `openSync`'s and `copyFileSync`'s mode argument is
+  checked the way Node checks it; a mode Node rejects (`ERR_OUT_OF_RANGE` /
+  `ERR_INVALID_ARG_TYPE`, a catchable error in Node) stops the program by
+  name instead, and so does `COPYFILE_FICLONE_FORCE` (Node clones or fails
+  with `ENOSYS`/`ENOTSUP`). `COPYFILE_FICLONE` copies, as libuv does when
+  the file system has no clone. Unpicked: Node's mode errors.
+- (c) **WeakRef and FinalizationRegistry.** A `WeakRef` holds its target
+  strongly, so `deref()` always answers it, and a `FinalizationRegistry`'s
+  cleanup callback is evaluated and never called: the WasmGC heap tells the
+  program nothing about collection. Both are behaviors the specification
+  allows (a host may keep any object alive, and may never call a cleanup
+  callback); Node does collect, so a long-running program may see `deref()`
+  answer `undefined` and its cleanups run there, never here. `register`
+  checks its target (an object or a function, Node's
+  `FinalizationRegistry.prototype.register: invalid target` TypeError
+  otherwise) and takes holdings written as an object literal (a fresh object
+  can never be the target, Node's other check); other holdings, a
+  non-object unregister token and `unregister` refuse at build time.
+- (d) **`new Map(pairs)` over dynamic pairs** walks Node's way (each entry's
+  `0` and `1` members, a later duplicate key overwriting in place); a seed
+  that is not an array at run time (Node walks any iterable) and an entry
+  that is not an object (Node's catchable `TypeError: Iterator value … is
+  not an entry object`) stop by name, and a key or value that is not the
+  map's declared type meets the checked boundary's fence (S122).
+
+**Tested by:** SB-20..SB-30 in `packages/compiler/test/wasm-stdlib-batch.test.ts`
+(wasm and wasm-native, against Node).

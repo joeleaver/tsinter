@@ -2,7 +2,7 @@
  * crypto, child_process spawn/spawnSync and child/stats/spawn-result
  * methods), JSON.parse/stringify, process properties/methods and
  * process.env access, and console.log detection. */
-import { isBigIntStatsType, lowerBigIntStatsProperty, lowerStatCall } from "./lower-bigint.js";
+import { isBigIntStatsType, lowerBigIntStatsProperty, lowerPlainStatsNumber, lowerStatCall } from "./lower-bigint.js";
 import { lowerFspOpenCall } from "./lower-filehandle.js";
 import { readFileSync } from "node:fs";
 import { builtinModules } from "node:module";
@@ -541,6 +541,50 @@ import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, DYN, F64, FSWATCHER_T, PROCSTRE
     return null;
   }
 
+/** `Date.now` and `console.error` / `console.log` read as function VALUES
+   * (paperclip's `now: () => number = Date.now` and `notify: (message:
+   * string) => void = console.error` defaults): one memoized lifted function
+   * per form — `Date.now` the clock read, the console methods a one-string
+   * call (the slot's own signature; other slot types keep the fence). Every
+   * read of one form is the same function, so identity compares agree with
+   * themselves. Null otherwise. */
+  function lowerBuiltinFnValue(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (expr.questionDotToken) return null;
+    const p = expr.parent;
+    if (p !== undefined && ts.isCallExpression(p) && p.expression === expr) return null;
+    const loc = locOf(expr);
+    const hl: SrcLoc = { file: "<builtin>", start: 0, end: 0 };
+    if (L.stdlibGlobalMember(expr, "Date") === "now") {
+      const name = "%date.now.value";
+      if (!L.liftedFns.some((f) => f.name === name)) {
+        L.liftedFns.push({ name, params: [], returnType: F64, locals: [], body: [{ kind: "return", value: { kind: "libCall", fn: "date.now", args: [], type: F64, loc: hl }, loc: hl }], loc: hl });
+      }
+      return { kind: "closure", fnName: name, captures: [], type: funcOf([], F64), loc };
+    }
+    const member = L.stdlibGlobalMember(expr, "console");
+    if (member === "error" || member === "log") {
+      const ctx = L.checker.getContextualType(expr);
+      const want = ctx ? L.mapTypeOf(ctx) : null;
+      if (want?.kind !== "func" || want.params.length !== 1 || want.params[0]!.kind !== "string" || want.ret.kind !== "void" || want.rest === true) return null;
+      const name = `%console.${member}.value`;
+      if (!L.liftedFns.some((f) => f.name === name)) {
+        L.liftedFns.push({
+          name,
+          params: [{ localId: "m.0", name: "message", type: STRING }],
+          returnType: VOID,
+          locals: [{ id: "m.0", name: "message", type: STRING, mutable: false }],
+          body: [
+            { kind: "exprStmt", expr: { kind: "intrinsic", name: member === "log" ? "console.log" : "console.error", args: [{ kind: "varRef", localId: "m.0", type: STRING, loc: hl }], type: VOID, loc: hl }, loc: hl },
+            { kind: "return", value: null, loc: hl },
+          ],
+          loc: hl,
+        });
+      }
+      return { kind: "closure", fnName: name, captures: [], type: funcOf([STRING], VOID), loc };
+    }
+    return null;
+  }
+
 /** The memoized () => number lifted wrapper behind
    * performance.now.bind(performance): a plain function value over the
    * same perf.now libCall. */
@@ -827,6 +871,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     readFileSync: ["path"], writeFileSync: ["path"], appendFileSync: ["path"], mkdirSync: ["path"], rmSync: ["path"], rmdirSync: ["path"],
     readdirSync: ["path"], statSync: ["path"], lstatSync: ["path"], unlinkSync: ["path"], accessSync: ["path"],
     chmodSync: ["path"], chownSync: ["path"], openSync: ["path"], copyFileSync: ["src", "dest"], mkdtempSync: ["prefix"],
+    renameSync: ["oldPath", "newPath"], linkSync: ["existingPath", "newPath"], symlinkSync: ["target", "path"], readlinkSync: ["path"],
   };
   /** The members whose path parameter also takes a file descriptor: a
    * dynamic number there is the fd form, not Node's type error. */
@@ -1436,6 +1481,79 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     {
       const fh = lowerFspOpenCall(L, expr, bi.module, bi.member);
       if (fh !== null) return fh;
+    }
+    // symlinkSync(target, path, type): the type ("dir" | "file" |
+    // "junction", a literal) matters on Windows only; Node validates it,
+    // then ignores it here. Any other third argument refuses by name.
+    if (bi.module === "fs" && bi.member === "symlinkSync" && expr.arguments.length === 3) {
+      const t = expr.arguments[2]!;
+      if (!ts.isStringLiteral(t) || !["dir", "file", "junction"].includes(t.text)) {
+        L.noLowering("symlinkSync with a type other than a 'dir' | 'file' | 'junction' literal", t);
+      }
+      const target = checkedStrParam(L, expr.arguments[0]!, "target", FS_PATH_TEXT, true);
+      const path = checkedStrParam(L, expr.arguments[1]!, "path", FS_PATH_TEXT, true);
+      return deferArgChecks(L, [target, path], loc, (args) => ({ kind: "libCall", fn: "fs.symlinkSync", args, type: VOID, loc }));
+    }
+    // openSync(path, flags, mode) with a mode (paperclip's 0o600 temp
+    // files), and copyFileSync(src, dest, mode) with a run-time mode
+    // (paperclip's durableCopyFile(…, flags = 0) passing COPYFILE_EXCL):
+    // WasmGC lanes. A mode Node would reject (not an integer, out of its
+    // range) and COPYFILE_FICLONE_FORCE stop by name (lifted helpers:
+    // statement bodies).
+    if (L.sharedDynamic && bi.module === "fs" && (bi.member === "openSync" || bi.member === "copyFileSync") && expr.arguments.length === 3 &&
+        !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+      const [a0, a1, a2] = expr.arguments as unknown as [ts.Expression, ts.Expression, ts.Expression];
+      const open = bi.member === "openSync";
+      if (open && !ts.isStringLiteral(a1)) L.noLowering("openSync with a flags argument other than a string literal", a1);
+      const first = checkedStrParam(L, a0, open ? "path" : "src", FS_PATH_TEXT, true);
+      const second: IrExpr = open ? { kind: "strLit", value: (a1 as ts.StringLiteral).text, type: STRING, loc } : checkedStrParam(L, a1, "dest", FS_PATH_TEXT, true);
+      const mode = L.lowerExprExpecting(a2, F64);
+      if (mode.type.kind !== "f64") L.noLowering(`${bi.member} with a '${L.fmt(mode.type)}' mode`, a2);
+      const line = ts.getLineAndCharacterOfPosition(expr.getSourceFile(), expr.getStart()).line + 1;
+      const flagsLit = open ? (a1 as ts.StringLiteral).text : "";
+      const name = open ? `%fs.openSyncMode.${JSON.stringify(flagsLit)}` : "%fs.copyFileMode";
+      if (!L.liftedFns.some((f) => f.name === name)) {
+        const hl: SrcLoc = { file: "<builtin>", start: 0, end: 0 };
+        const n = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc: hl });
+        const r = (id: string, t: IrType): IrExpr => ({ kind: "varRef", localId: id, type: t, loc: hl });
+        const m = r("m.0", F64);
+        const max = open ? 0o37777777777 : 7;
+        const bad: IrExpr = {
+          kind: "logical", op: "||",
+          left: { kind: "unary", op: "!", operand: { kind: "bin", op: "===", left: m, right: { kind: "libCall", fn: "math.trunc", args: [m], type: F64, loc: hl }, type: BOOL, loc: hl }, type: BOOL, loc: hl },
+          right: { kind: "logical", op: "||", left: { kind: "bin", op: "<", left: m, right: n(0), type: BOOL, loc: hl }, right: { kind: "bin", op: ">", left: m, right: n(max), type: BOOL, loc: hl }, type: BOOL, loc: hl },
+          type: BOOL, loc: hl,
+        };
+        const fence = (what: string): IrStmt => ({ kind: "runtimeFence", code: "SC2020", message: `${what} is not supported yet (SEMANTICS.md S151) [SC2020 at fs.${bi.member}]`, loc: hl });
+        const body: IrStmt[] = [{ kind: "if", cond: bad, then: [fence(`fs.${bi.member} with a mode Node rejects (its ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE)`)], else_: null, loc: hl }];
+        if (open) {
+          body.push({ kind: "return", value: { kind: "libCall", fn: "fs.openSyncMode", args: [r("a.0", STRING), { kind: "strLit", value: flagsLit, type: STRING, loc: hl }, m], type: F64, loc: hl }, loc: hl });
+        } else {
+          const bit = (b: number): IrExpr => ({ kind: "bin", op: "!==", left: { kind: "bin", op: "&", left: m, right: n(b), type: F64, loc: hl }, right: n(0), type: BOOL, loc: hl });
+          body.push({ kind: "if", cond: bit(4), then: [fence("fs.copyFileSync with COPYFILE_FICLONE_FORCE (a copy-on-write clone, or a failure)")], else_: null, loc: hl });
+          body.push({
+            kind: "if",
+            cond: bit(1),
+            then: [{ kind: "exprStmt", expr: { kind: "libCall", fn: "fs.copyFileExclSync", args: [r("a.0", STRING), r("b.0", STRING)], type: VOID, loc: hl }, loc: hl }],
+            else_: [{ kind: "exprStmt", expr: { kind: "libCall", fn: "fs.copyFileSync", args: [r("a.0", STRING), r("b.0", STRING)], type: VOID, loc: hl }, loc: hl }],
+            loc: hl,
+          });
+        }
+        const params = open
+          ? [{ localId: "a.0", name: "a", type: STRING }, { localId: "m.0", name: "m", type: F64 }]
+          : [{ localId: "a.0", name: "a", type: STRING }, { localId: "b.0", name: "b", type: STRING }, { localId: "m.0", name: "m", type: F64 }];
+        L.liftedFns.push({
+          name,
+          params,
+          returnType: open ? F64 : VOID,
+          locals: params.map((p) => ({ id: p.localId, name: p.name, type: p.type, mutable: false })),
+          body,
+          loc: hl,
+        });
+      }
+      void line;
+      const callArgs = open ? [first, mode] : [first, second, mode];
+      return deferArgChecks(L, callArgs, loc, (args) => ({ kind: "call", callee: name, args, type: open ? F64 : VOID, loc }));
     }
     // accessSync(p, mode?): an omitted mode is Node's F_OK (0). The mode
     // is an ordinary number — fs.constants.* reads bake to literals.
@@ -3835,6 +3953,30 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       return { kind: "libCall", fn: "json.parse", args: [text], type: DYN, loc };
     }
     if (member === "stringify") {
+      // `JSON.stringify(value, null, cond ? 2 : 0)` over a dynamic value
+      // (paperclip's `--json` result writer): the value, then the space's
+      // condition (Node's argument order), then the serializer with the
+      // arm's indent.
+      const condSpace = stringifyCondSpace(L, call);
+      if (condSpace !== null) {
+        const v0 = L.lowerExpr(call.arguments[0]!);
+        const v = L.sharedDynamic ? asDynOperand(v0) : v0;
+        if (v.type.kind === "dyn" && L.undefSlots) {
+          return bindOnce(L, v, loc, (read) => {
+            const ser = (indent: string): IrExpr =>
+              indent !== "" ? Object.assign({ kind: "jsonStringify", value: read, type: STRING, loc } as IrExpr, { indent }) : { kind: "jsonStringify", value: read, type: STRING, loc };
+            return {
+              kind: "ternary",
+              cond: { kind: "logical", op: "||", left: { kind: "dynTest", test: "undefined", value: read, type: BOOL, loc }, right: { kind: "dynTest", test: "function", value: read, type: BOOL, loc }, type: BOOL, loc },
+              then: { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: L.lowerCondition(condSpace.cond), loc }], result: { kind: "slotUndef", type: STRING, loc }, type: STRING, loc },
+              else_: { kind: "ternary", cond: L.lowerCondition(condSpace.cond), then: ser(condSpace.whenTrue), else_: ser(condSpace.whenFalse), type: STRING, loc },
+              type: STRING,
+              loc,
+            };
+          });
+        }
+        L.noLowering("JSON.stringify with replacer/space parameters", call, "the conditional space lowers over a dynamic value");
+      }
       const indent = stringifySpaceIndent(L, call);
       const argNode = call.arguments[0]!;
       const value0 = L.lowerExpr(argNode);
@@ -3962,6 +4104,29 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
    * replacer/space spellings compile — the replacer must be `null` (or
    * `undefined`), the space a numeric/string literal or `null`/`undefined`;
    * everything else keeps the existing fence. */
+  /** A `null` replacer and a space `c ? <literal> : <literal>` (each arm a
+   * numeric or string literal): the condition and the two arms' indents
+   * (Node's space rules), or null. */
+  function stringifyCondSpace(L: Lowerer, call: ts.CallExpression): { cond: ts.Expression; whenTrue: string; whenFalse: string } | null {
+    if (call.arguments.length !== 3 || call.arguments.some((a) => ts.isSpreadElement(a))) return null;
+    const unwrap = (e: ts.Expression): ts.Expression => (ts.isParenthesizedExpression(e) ? unwrap(e.expression) : e);
+    const replacer = unwrap(call.arguments[1]!);
+    if (replacer.kind !== ts.SyntaxKind.NullKeyword) return null;
+    const space = unwrap(call.arguments[2]!);
+    if (!ts.isConditionalExpression(space)) return null;
+    const arm = (e0: ts.Expression): string | null => {
+      const e = unwrap(e0);
+      if (ts.isNumericLiteral(e)) return " ".repeat(Math.min(10, Math.max(0, Math.trunc(Number(e.text.replace(/_/g, ""))))));
+      if (ts.isStringLiteral(e)) return e.text.slice(0, 10);
+      return null;
+    };
+    const t = arm(space.whenTrue);
+    const f = arm(space.whenFalse);
+    if (t === null || f === null) return null;
+    void L;
+    return { cond: space.condition, whenTrue: t, whenFalse: f };
+  }
+
   function stringifySpaceIndent(L: Lowerer, call: ts.CallExpression): string {
     const fence = (): never =>
       L.noLowering(
@@ -4170,6 +4335,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     bi: { module: string; member: string },
     loc: SrcLoc,): IrExpr | null {
     if (bi.module !== "crypto") return null;
+    if (bi.member === "randomInt") return lowerRandomIntCall(L, expr, loc);
     const LISTS: Record<string, readonly string[] | undefined> = {
       getCiphers: CRYPTO_CIPHERS,
       getHashes: CRYPTO_HASHES,
@@ -4189,6 +4355,75 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       type: arrayOf(STRING),
       loc,
     };
+  }
+
+/** `crypto.randomInt(min, max)` with integer-literal bounds (paperclip's
+   * worktree color): Node's own sampling — six CSPRNG bytes read big-endian,
+   * redrawn while at or past the largest multiple of the range below
+   * 2^48 - 1, then min + x % range. Bounds Node rejects, and the one-
+   * argument and callback forms, refuse by name. */
+  function lowerRandomIntCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrExpr {
+    const lit = (e: ts.Expression | undefined): number | null => {
+      if (e === undefined) return null;
+      if (ts.isNumericLiteral(e)) return Number(e.text);
+      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(e.operand)) return -Number(e.operand.text);
+      return null;
+    };
+    const min = lit(expr.arguments[0]);
+    const max = lit(expr.arguments[1]);
+    const RAND_MAX = 0xffff_ffff_ffff;
+    if (
+      expr.arguments.length !== 2 || min === null || max === null ||
+      !Number.isSafeInteger(min) || !Number.isSafeInteger(max) || max <= min || max - min > RAND_MAX
+    ) {
+      L.noLowering("crypto.randomInt other than (min, max) integer literals Node accepts", expr);
+    }
+    const range = max! - min!;
+    const randLimit = RAND_MAX - (RAND_MAX % range);
+    const name = `%crypto.randomInt.${min}.${max}`;
+    if (!L.liftedFns.some((f) => f.name === name)) {
+      const n = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
+      const x: IrExpr = { kind: "varRef", localId: "x.0", type: F64, loc };
+      L.liftedFns.push({
+        name,
+        params: [],
+        returnType: F64,
+        locals: [{ id: "x.0", name: "x", type: F64, mutable: true }],
+        body: [
+          { kind: "varDecl", localId: "x.0", init: n(0), loc },
+          {
+            kind: "while",
+            cond: { kind: "boolLit", value: true, type: BOOL, loc },
+            body: [
+              {
+                kind: "assign",
+                localId: "x.0",
+                value: {
+                  kind: "bytesIntrinsic",
+                  method: "readNumVar",
+                  receiver: { kind: "libCall", fn: "crypto.randomBytes", args: [n(6)], type: BYTES_U8, loc },
+                  args: [{ kind: "strLit", value: "ube", type: STRING, loc }, n(0), n(6)],
+                  type: F64,
+                  loc,
+                },
+                loc,
+              },
+              {
+                kind: "if",
+                cond: { kind: "bin", op: "<", left: x, right: n(randLimit), type: BOOL, loc },
+                then: [{ kind: "return", value: { kind: "bin", op: "+", left: n(min!), right: { kind: "bin", op: "%", left: x, right: n(range), type: F64, loc }, type: F64, loc }, loc }],
+                else_: null,
+                loc,
+              },
+            ],
+            loc,
+          },
+          { kind: "return", value: n(0), loc },
+        ],
+        loc,
+      });
+    }
+    return { kind: "call", callee: name, args: [], type: F64, loc };
   }
 
 /** Method calls on URL-typed receivers: `u.toString()` is Node's href
@@ -4848,6 +5083,10 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
    * Node's shape). Null for everything else, so the ordinary chain (and
    * its fences) keeps going. */
   export function lowerBuiltinExtraProperty(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+    {
+      const v = lowerBuiltinFnValue(L, expr);
+      if (v !== null) return v;
+    }
     if (expr.questionDotToken && !L.chainHandled.has(expr)) return null;
     // decoder.encoding on a StringDecoder-typed receiver: the record's
     // hidden canonical-name field (construction folded the aliases —
@@ -4887,7 +5126,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     }
     if (kind === "child") return null; // pid/exitCode/killed live in lowerIntrinsicProperty
     if (kind === "stats") {
-      const full = lowerBigIntStatsProperty(L, expr);
+      const full = lowerBigIntStatsProperty(L, expr) ?? lowerPlainStatsNumber(L, expr);
       if (full !== null) return full;
     }
     if (kind === "stats" && name === "mtimeMs") {
@@ -5399,7 +5638,7 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     if (!ts.isIdentifier(expr.expression)) return null;
     const bi = L.builtinImportOf(expr.expression);
     if (!bi || bi.module !== "fs" || bi.member !== "constants") return null;
-    const MODES: Record<string, number | undefined> = { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 };
+    const MODES: Record<string, number | undefined> = { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4, COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4 };
     const loc = locOf(expr);
     // The open(2) flags (fs/promises open's numeric form): Node's own
     // values per OS — [linux, darwin, win32 (-1: undefined there)].
@@ -5479,7 +5718,15 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
     // JS files skip the annotation fence: there is no annotation to fix —
     // the read IS Node's `number | undefined` and lowers to exactly that
     // (commander's `isTTY ? columns : undefined` help-width probes).
-    if ((!declared || typeKey(declared) !== typeKey(want)) && !isJsSourceFile(expr.getSourceFile())) {
+    // `process.stdout.columns ?? 100` (and `|| 100`): the default covers
+    // the undefined Node answers off a TTY, so the read is exactly Node's
+    // `number | undefined` whatever the annotation says (paperclip's
+    // terminal-width probe).
+    let up: ts.Node = expr;
+    while (ts.isParenthesizedExpression(up.parent)) up = up.parent;
+    const defaulted = ts.isBinaryExpression(up.parent) && up.parent.left === up &&
+      (up.parent.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || up.parent.operatorToken.kind === ts.SyntaxKind.BarBarToken);
+    if ((!declared || typeKey(declared) !== typeKey(want)) && !isJsSourceFile(expr.getSourceFile()) && !defaulted) {
       L.noLowering(
         `process.${stream}.columns as a plain number`,
         expr,
@@ -5555,6 +5802,18 @@ function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
       // the string names the compat target, not a linked library.
       const fn = expr.name.text === "node" ? "process.versionsNode" : "process.versionsOpenssl";
       return { kind: "libCall", fn, args: [], type: STRING, loc: locOf(expr) };
+    }
+    // process.version: Node's "v" + process.versions.node — the same
+    // compat target (paperclip's supported-Node message).
+    if (expr.name.text === "version" && !expr.questionDotToken && L.stdlibGlobalMember(expr, "process") === "version") {
+      const loc = locOf(expr);
+      return {
+        kind: "strConcat",
+        left: { kind: "strLit", value: "v", type: STRING, loc },
+        right: { kind: "libCall", fn: "process.versionsNode", args: [], type: STRING, loc },
+        type: STRING,
+        loc,
+      };
     }
     // The capability-probe members that honestly DON'T EXIST in a
     // compiled binary — each reads undefined (their declared types carry
@@ -6885,7 +7144,14 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       // One world without the engine (U1a, the Number(x) precedent): an
       // island-typed value is the checked-dynamic value, so the dyn arm
       // below answers it.
-      const arg = L.sharedDynamic && !L.engine ? asDynOperand(arg0) : arg0;
+      let arg = L.sharedDynamic && !L.engine ? asDynOperand(arg0) : arg0;
+      // A union with a number arm (paperclip's `Number.isInteger(entry.idx)`
+      // over `number | undefined`): the value boxed is the dyn arm's
+      // question — is it a number, and then the predicate.
+      if (arg.type.kind === "union" && L.sharedDynamic && !L.engine && canConvertToDyn(arg.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))) {
+        const boxed = L.coerceToExpected(arg, DYN);
+        if (boxed.type.kind === "dyn") arg = boxed;
+      }
       // An ISLAND ('any'-typed) argument evaluates the predicate in the
       // engine — the statics never coerce, so the engine's answer over the
       // real value is JS-exact where a static fence would refuse the
@@ -7167,12 +7433,26 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
    * decoder may spell the default label; anything else (other labels,
    * { fatal }/{ ignoreBOM } options) changes behavior the runtime doesn't
    * implement. The encoder takes none. */
-  export function checkTextCodecCtor(L: Lowerer, recv: ts.NewExpression, cls: string): void {
+  /* The decoder's options code (the record's %opts): 0 the defaults, 3 a
+   * literal `{ fatal: true, ignoreBOM: true }` (paperclip's strict zip-entry
+   * decoder) — every other bag refuses by name. */
+  export function checkTextCodecCtor(L: Lowerer, recv: ts.NewExpression, cls: string): number {
     const ctorArgs = recv.arguments ?? [];
     if (cls === "TextDecoder") {
       const labelT = ctorArgs.length >= 1 ? L.typeOf(ctorArgs[0]!) : null;
       const utf8Label =
         labelT !== null && labelT.isStringLiteralType() && (labelT.value === "utf-8" || labelT.value === "utf8");
+      const bag = ctorArgs[1];
+      if (ctorArgs.length === 2 && utf8Label && L.sharedDynamic && ts.isObjectLiteralExpression(bag!)) {
+        const flags = new Map<string, boolean>();
+        for (const p of bag.properties) {
+          if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) break;
+          const v = p.initializer.kind === ts.SyntaxKind.TrueKeyword ? true : p.initializer.kind === ts.SyntaxKind.FalseKeyword ? false : null;
+          if (v === null || (p.name.text !== "fatal" && p.name.text !== "ignoreBOM") || flags.has(p.name.text)) break;
+          flags.set(p.name.text, v);
+        }
+        if (flags.size === bag.properties.length && flags.get("fatal") === true && flags.get("ignoreBOM") === true) return 3;
+      }
       if (ctorArgs.length > 1 || (ctorArgs.length === 1 && !utf8Label)) {
         L.noLowering(
           "new TextDecoder beyond the default utf-8",
@@ -7183,6 +7463,50 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
     } else if (ctorArgs.length > 0) {
       L.noLowering("new TextEncoder with arguments", recv);
     }
+    return 0;
+  }
+
+  /** `decode(bytes)` under `{ fatal: true, ignoreBOM: true }`: the bytes'
+   * utf-8 text with a leading BOM kept; input that is not well-formed
+   * utf-8 (its text does not encode back to the same bytes — the
+   * replacement decode changes every ill-formed subpart) throws Node's
+   * TypeError ERR_ENCODING_INVALID_ENCODED_DATA. */
+  function strictUtf8Decode(L: Lowerer, bytes: IrExpr, loc: SrcLoc): IrExpr {
+    const b = L.declareHiddenLocal("%tdBytes", BYTES_U8);
+    const s = L.declareHiddenLocal("%tdText", STRING);
+    const bRef: IrExpr = { kind: "varRef", localId: b.id, type: BYTES_U8, loc };
+    const sRef: IrExpr = { kind: "varRef", localId: s.id, type: STRING, loc };
+    const utf8: IrExpr = { kind: "strLit", value: "utf8", type: STRING, loc };
+    return {
+      kind: "seqExpr",
+      stmts: [
+        { kind: "varDecl", localId: b.id, init: bytes, loc },
+        { kind: "varDecl", localId: s.id, init: { kind: "bytesIntrinsic", method: "toString", receiver: bRef, args: [utf8], type: STRING, loc }, loc },
+        {
+          kind: "if",
+          cond: {
+            kind: "unary",
+            op: "!",
+            operand: {
+              kind: "bytesIntrinsic",
+              method: "equals",
+              receiver: { kind: "libCall", fn: "buffer.fromStr", args: [sRef, utf8], type: BYTES_U8, loc },
+              args: [bRef],
+              type: BOOL,
+              loc,
+            },
+            type: BOOL,
+            loc,
+          },
+          then: [{ kind: "exprStmt", expr: nodeThrowExpr(1, "ERR_ENCODING_INVALID_ENCODED_DATA", "The encoded data was not valid for encoding utf-8", VOID, loc), loc }],
+          else_: null,
+          loc,
+        },
+      ],
+      result: sRef,
+      type: STRING,
+      loc,
+    };
   }
 
   /** The stdlib TextEncoder/TextDecoder class a value's checker type
@@ -7222,7 +7546,8 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
       return null;
     }
     const loc = locOf(call);
-    if (ts.isNewExpression(recv)) checkTextCodecCtor(L, recv, cls);
+    let ctorOpts = 0;
+    if (ts.isNewExpression(recv)) ctorOpts = checkTextCodecCtor(L, recv, cls);
     else receiverEffect = L.lowerExpr(recv);
     const withReceiver = (e: IrExpr): IrExpr =>
       receiverEffect === null || droppableStatic(receiverEffect)
@@ -7250,6 +7575,40 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
           argNode,
           "Uint8Array/Buffer input decodes (ArrayBuffer values have no representation)",
         );
+      }
+      if (ctorOpts === 3) return strictUtf8Decode(L, arg, loc);
+      if (receiverEffect !== null && receiverEffect.type.kind === "record" &&
+          L.shapes.get(receiverEffect.type.shapeId)?.fields.some((f) => f.name === "%opts")) {
+        // A decoder VALUE: its options decide, read after the receiver and
+        // the argument evaluate (Node's order).
+        const recT = receiverEffect.type;
+        const d = L.declareHiddenLocal("%tdDec", recT);
+        const a = L.declareHiddenLocal("%tdArg", BYTES_U8);
+        const aRef: IrExpr = { kind: "varRef", localId: a.id, type: BYTES_U8, loc };
+        return {
+          kind: "seqExpr",
+          stmts: [
+            { kind: "varDecl", localId: d.id, init: receiverEffect, loc },
+            { kind: "varDecl", localId: a.id, init: arg, loc },
+          ],
+          result: {
+            kind: "ternary",
+            cond: {
+              kind: "bin",
+              op: "===",
+              left: { kind: "recordGet", obj: { kind: "varRef", localId: d.id, type: recT, loc }, shapeId: recT.shapeId, field: "%opts", type: F64, loc },
+              right: { kind: "numLit", value: 3, type: F64, loc },
+              type: BOOL,
+              loc,
+            },
+            then: strictUtf8Decode(L, aRef, loc),
+            else_: { kind: "libCall", fn: "text.decode", args: [aRef], type: STRING, loc },
+            type: STRING,
+            loc,
+          },
+          type: STRING,
+          loc,
+        };
       }
       return withReceiver({ kind: "libCall", fn: "text.decode", args: [arg], type: STRING, loc });
     }

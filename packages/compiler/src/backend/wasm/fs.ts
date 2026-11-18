@@ -173,6 +173,8 @@ export const CODES: readonly (readonly [name: string, text: string])[] = [
   ["EROFS", "read-only file system"],
   ["ELOOP", "too many symbolic links encountered"],
   ["ENAMETOOLONG", "name too long"],
+  // 15, appended for renameSync/linkSync (paperclip's stdlib batch 3)
+  ["EXDEV", "cross-device link not permitted"],
 ];
 
 /** EISDIR's own index (1-based) in `CODES` — op 1's read-stage override
@@ -1655,10 +1657,63 @@ export class FsBuilder {
    * slot is "content": both are paths, and failure renders the two-path
    * message above, never `emitThrowFromStatus`. */
   copyFileSyncHelper(): number {
-    return this.cached("copyFileSync", [this.strRef(), this.strRef()], [], (idx) => {
+    return this.buildTwoPathOp("copyFileSync", 15, "copyfile", "src", "dest");
+  }
+
+  /** renameSync (op 31), linkSync (op 32) and symlinkSync (op 33, the
+   * target first): copyFileSync's two-path staging and message, each with
+   * its own syscall (paperclip's stdlib batch 3). Node validates both
+   * paths before the call (its argument names), as here. */
+  renameSyncHelper(): number {
+    return this.buildTwoPathOp("renameSync", 31, "rename", "oldPath", "newPath");
+  }
+  linkSyncHelper(): number {
+    return this.buildTwoPathOp("linkSync", 32, "link", "existingPath", "newPath");
+  }
+  symlinkSyncHelper(): number {
+    return this.buildTwoPathOp("symlinkSync", 33, "symlink", "target", "path");
+  }
+  /** copyFileSync(src, dest, COPYFILE_EXCL): op 15 with x = 1 (the
+   * destination opened O_EXCL — EEXIST when it exists, libuv's check). */
+  copyFileExclSyncHelper(): number {
+    return this.buildTwoPathOp("copyFileExclSync", 15, "copyfile", "src", "dest", 1);
+  }
+  /** `%w.fs.readlinkSync(path) -> str` (op 34): the link's target text. */
+  readlinkSyncHelper(): number {
+    return this.buildReadLengthOp("readlinkSync", 34, "readlink", {}, false);
+  }
+  /** `%w.fs.fsyncSync(fd) -> void` (op 28, y = 0): shape "no". */
+  fsyncSyncHelper(): number {
+    return this.cached("fsyncSync", [I32], [], (idx) => {
       const c = new Code();
-      this.emitNulGuard(c, 0, "src", () => {});
-      this.emitNulGuard(c, 1, "dest", () => {});
+      const FD = 0;
+      const STATUS = 1;
+      const MATCHED = 2;
+      const N = 3;
+      c.i32Const(28);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.localGet(FD);
+      c.i32Const(0);
+      c.call(this.deps.fsCallFunc(28));
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, FD, MATCHED, N, "fsync", "no", {});
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+    });
+  }
+
+  private buildTwoPathOp(name: string, op: number, syscall: string, argA: string, argB: string, x = 0): number {
+    return this.cached(name, [this.strRef(), this.strRef()], [], (idx) => {
+      const c = new Code();
+      this.emitNulGuard(c, 0, argA, () => {});
+      this.emitNulGuard(c, 1, argB, () => {});
       const SRC = 0;
       const DST = 1;
       const A_LEN = 2;
@@ -1702,20 +1757,20 @@ export class FsBuilder {
       c.localGet(B_BASE);
       c.call(this.stageStrUtf16AtHelper());
       c.drop();
-      c.i32Const(15);
+      c.i32Const(op);
       c.localGet(A_BASE);
       c.localGet(A_LEN);
       c.localGet(B_BASE);
       c.localGet(B_LEN);
+      c.i32Const(x);
       c.i32Const(0);
-      c.i32Const(0);
-      c.call(this.deps.fsCallFunc(15));
+      c.call(this.deps.fsCallFunc(op));
       c.localSet(STATUS);
       c.localGet(STATUS);
       c.i32Const(0);
       c.i32LtS();
       c.ifVoid();
-      this.emitThrowFromStatusTwoPath(c, STATUS, SRC, DST, MATCHED, N, "copyfile");
+      this.emitThrowFromStatusTwoPath(c, STATUS, SRC, DST, MATCHED, N, syscall);
       c.end();
 
       this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32, I32], c.bytes());
@@ -1737,17 +1792,18 @@ export class FsBuilder {
    * never takes one, matching Node's own default. On success, STATUS
    * (>=0) IS the fd, returned as f64 directly — no retry loop (open never
    * "retries for more room", it either gets an fd or an errno). */
-  openSyncHelper(): number {
-    return this.cached("openSync", [this.strRef(), I32], [{ kind: "f64" }], (idx) => {
+  openSyncHelper(withMode = false): number {
+    return this.cached(withMode ? "openSyncMode" : "openSync", withMode ? [this.strRef(), I32, I32] : [this.strRef(), I32], [{ kind: "f64" }], (idx) => {
       const c = new Code();
       this.emitNulGuard(c, 0, "path", (c2) => c2.f64Const(-1));
       const PATH = 0;
       const FLAGS = 1;
-      const A_LEN = 2;
-      const A_BASE = 3;
-      const STATUS = 4;
-      const MATCHED = 5;
-      const N = 6;
+      const o = withMode ? 1 : 0; // openSyncMode's third param: the mode
+      const A_LEN = 2 + o;
+      const A_BASE = 3 + o;
+      const STATUS = 4 + o;
+      const MATCHED = 5 + o;
+      const N = 6 + o;
 
       c.localGet(PATH);
       c.arrayLen();
@@ -1770,7 +1826,8 @@ export class FsBuilder {
       c.i32Const(0); // bPtr unused
       c.i32Const(0); // bLen unused
       c.localGet(FLAGS); // x: flags
-      c.i32Const(0o666); // y: mode (this tier's own fixed default)
+      if (withMode) c.localGet(2); // y: the program's mode
+      else c.i32Const(0o666); // y: mode (Node's default)
       c.call(this.deps.fsCallFunc(21));
       c.localSet(STATUS);
       c.localGet(STATUS);

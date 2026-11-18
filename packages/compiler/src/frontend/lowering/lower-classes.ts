@@ -6,6 +6,8 @@
 import * as ts from "../ts7/adapter.js";
 import { declaredMemberTypeOf } from "../dts-bridge.js";
 import type { Lowerer } from "./lowerer.js";
+import { isIntlDtfNew, lowerIntlDtfNew } from "./lower-intl-dtf.js";
+import { lowerWeakRefNew } from "./lower-weakref.js";
 import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, UNDEFINED_T, URL_T, VOID, arrayOf, isSupportedMapKey, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, blockBodyOf, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
@@ -5330,6 +5332,8 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       const agent = lowerHttpAgentNew(L, expr);
       if (agent) return agent;
     }
+    // new Intl.DateTimeFormat(...) — the built-in form (lower-intl-dtf.ts)
+    if (isIntlDtfNew(L, expr)) return lowerIntlDtfNew(L, expr);
     if (ts.isIdentifier(expr.expression)) {
       // `import C = N.C; new C()` — the alias's own source-order guards
       // (a no-op for every non-import= binding).
@@ -5514,13 +5518,23 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       // `.encoding` property answers. The composed forms
       // (`new TextEncoder().encode(s)`) never build it (lowerTextCodecCall
       // claims those before the receiver lowers).
+      // new WeakRef(target) / new FinalizationRegistry(cleanup) (lower-weakref.ts)
+      {
+        const wr = lowerWeakRefNew(L, expr, symbol ?? undefined);
+        if (wr !== null) return wr;
+      }
       if (symbol && (symbol.name === "TextDecoder" || symbol.name === "TextEncoder") && L.isStdlibSymbol(symbol)) {
-        L.checkTextCodecCtor(expr, symbol.name);
+        const opts = L.checkTextCodecCtor(expr, symbol.name);
         const codecT = L.mapTypeOf(L.typeOf(expr));
         if (codecT?.kind !== "record") L.badType(expr, L.typeOf(expr));
+        // The options bag is a literal of literals (checkTextCodecCtor):
+        // nothing in it evaluates observably.
         return {
           kind: "recordLit",
-          fields: [{ name: "%enc", value: { kind: "strLit", value: "utf-8", type: STRING, loc } }],
+          fields: [
+            { name: "%enc", value: { kind: "strLit", value: "utf-8", type: STRING, loc } },
+            ...(symbol.name === "TextDecoder" ? [{ name: "%opts", value: { kind: "numLit", value: opts, type: F64, loc } as IrExpr }] : []),
+          ],
           type: codecT,
           loc,
         };

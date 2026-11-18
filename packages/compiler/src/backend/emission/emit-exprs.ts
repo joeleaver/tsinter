@@ -718,6 +718,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           // (SEMANTICS.md S120; scr_string.c)
           case "localeCompare":
             return E.newTemp(e.type, `scr_str_locale_compare(${r.name}, ${args[0]!.name})`);
+          case "localeCompareBase":
+            throw new Error("c emitter bug: localeCompareBase is a WasmGC-lane intrinsic (the frontend refuses it here)");
           case "cpAt":
             return E.newTemp(e.type, `scr_str_cp_at(${r.name}, ${args[0]!.name})`);
           default: {
@@ -2992,6 +2994,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_url_host(${arg(0)})`);
           case "url.username":
           case "url.password":
+          case "url.port":
+          case "url.origin":
             throw new Error(`${fn} is lowered for the WasmGC lanes only (use --backend wasm)`);
           case "url.hostname":
             return finish(`scr_url_hostname(${arg(0)})`);
@@ -6388,6 +6392,14 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "fh.sync":
           case "fh.chmod":
           case "fh.truncate":
+          case "stats.num":
+          case "fs.renameSync":
+          case "fs.linkSync":
+          case "fs.symlinkSync":
+          case "fs.readlinkSync":
+          case "fs.fsyncSync":
+          case "fs.openSyncMode":
+          case "fs.copyFileExclSync":
           case "big.lit":
           case "big.add":
           case "big.sub":

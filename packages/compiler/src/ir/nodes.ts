@@ -497,8 +497,13 @@ export function isPrimitiveMapKey(t: IrType): boolean {
  * Record/object/union values can point back at the map holding them, which
  * is exactly why ref-valued maps are cycle-capable (see the backend's
  * cycle analysis and docs/memory.md). Shared frontend/validator. */
-export function isSupportedMapValue(t: IrType): boolean {
+export function isSupportedMapValue(t: IrType, dynOk = false): boolean {
   switch (t.kind) {
+    // The dynamic value (WasmGC lanes, `dynOk`): Map<string, Row> where Row
+    // is a record the program shares with dynamic code (a drizzle row with
+    // a Date member) — the index-signature overflow's own value kind.
+    case "dyn":
+      return dynOk;
     case "f64":
     case "string":
     case "bool":
@@ -1757,6 +1762,10 @@ export type IrStrIntrinsicMethod =
   // -1/0/1 by ICU's root collation (SEMANTICS.md S120) — args[0] the other
   // string.
   | "localeCompare"
+  // a.localeCompare(b, <root-collation locale>, { sensitivity: "base" }):
+  // the same collation at primary strength only (case and accents
+  // ignored) — WasmGC lanes only (the frontend refuses it elsewhere).
+  | "localeCompareBase"
   // The string iterator's step: the full code-POINT character at a UTF-16
   // index (astral chars come back whole where charAt truncates) — for-of
   // over strings desugars onto it, advancing by the result's length.
@@ -2442,6 +2451,10 @@ export type IrLibFn =
   | "url.hostname"
   | "url.username"
   | "url.password"
+  /** url.port ("" or the digits) and url.origin (WHATWG's, "null" for
+   * opaque origins): WasmGC lanes (url-whatwg.ts). */
+  | "url.port"
+  | "url.origin"
   | "url.pathname"
   | "url.href"
   | "url.fileURLToPathUrl"
@@ -2627,6 +2640,10 @@ export type IrLibFn =
   | "fh.truncate"
   | "stats.big"
   | "stats.isKind"
+  /** A plain Stats numeric field (mode, uid, nlink, ...) off the full
+   * record, as a number (stats.big's f64 twin; lower-bigint.ts
+   * lowerPlainStatsNumber). */
+  | "stats.num"
   | "stats.isFile"
   | "stats.isDirectory"
   | "stats.size"
@@ -4668,6 +4685,22 @@ export type IrLibFn =
   | "fs.chmodSync"
   | "fs.chownSync"
   | "fs.copyFileSync"
+  /** Paperclip's stdlib batch 3 (WasmGC lanes): renameSync/linkSync/
+   * symlinkSync(target, path[, type]) — Node's two-path messages
+   * ("ENOENT: …, rename 'a' -> 'b'"); readlinkSync(path) → the target
+   * text; fsyncSync(fd) (an fd shape, no path in the message). All throw
+   * Node's catchable fs errors. */
+  | "fs.renameSync"
+  | "fs.linkSync"
+  | "fs.symlinkSync"
+  | "fs.readlinkSync"
+  | "fs.fsyncSync"
+  /** openSync(path, flags, mode) — the mode a number (Node's
+   * parseFileMode over an integer: the creation mode, umask applying);
+   * copyFileExclSync is copyFileSync(src, dest, fs.constants.COPYFILE_EXCL)
+   * — EEXIST when the destination exists. */
+  | "fs.openSyncMode"
+  | "fs.copyFileExclSync"
   | "fs.lstatSync"
   /** fs.openSync(path, flags) → the raw fd as f64, and fs.closeSync(fd)
    * — the pair behind spawn's fd-stdio form. flags is Node's string
@@ -7181,7 +7214,7 @@ export function moduleUsesSymbol(mod: IrModule): boolean {
 
 /** The full stat record's keys: WasmGC-only like BigInt, refused on the
  * legacy lanes with it (SC3003). */
-const LEGACY_REFUSED_FNS: ReadonlySet<string> = new Set(["fs.statBig", "fs.fstatBig", "fsp.statBig", "stats.big", "stats.isKind", "error.syscall", "error.errno", "fsp.open", "fsp.openNum", "fh.fd", "fh.close", "fh.stat", "fh.read", "fh.write", "fh.writeStr", "fh.writeFile", "fh.readFile", "fh.readFileStr", "fh.sync", "fh.chmod", "fh.truncate"]);
+const LEGACY_REFUSED_FNS: ReadonlySet<string> = new Set(["fs.statBig", "fs.fstatBig", "fsp.statBig", "stats.big", "stats.isKind", "error.syscall", "error.errno", "fsp.open", "fsp.openNum", "fh.fd", "fh.close", "fh.stat", "fh.read", "fh.write", "fh.writeStr", "fh.writeFile", "fh.readFile", "fh.readFileStr", "fh.sync", "fh.chmod", "fh.truncate", "fs.renameSync", "fs.linkSync", "fs.symlinkSync", "fs.readlinkSync", "fs.fsyncSync", "fs.openSyncMode", "fs.copyFileExclSync", "stats.num"]);
 
 /** The source location of the first bigint-carrying node (a bigint-kind
  * type or a big.* libCall) — the legacy C/LLVM lanes' SC3003 refusal
@@ -8196,6 +8229,13 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "fs.chmodSync",
   "fs.chownSync",
   "fs.copyFileSync",
+  "fs.renameSync",
+  "fs.linkSync",
+  "fs.symlinkSync",
+  "fs.readlinkSync",
+  "fs.fsyncSync",
+  "fs.openSyncMode",
+  "fs.copyFileExclSync",
   "fs.lstatSync",
   "fs.writeFileModeSync",
   "fs.writeFileExclModeSync",

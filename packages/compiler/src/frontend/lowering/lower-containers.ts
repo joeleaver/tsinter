@@ -8,7 +8,7 @@ import { ARRAYBUFFER_T, BIGINT_T, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem,
 import { orderFromKeys, orderedFieldStmts, orderedShape, ownKeysHelper } from "./record-order.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { lowerArrayFromIterable, optionalNumber } from "./lower-stdlib-members.js";
-import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
+import { afterArgs, evaluateArgsFirst, bindOnce, undefTextSubject, undefElse, undefFnArgGuard, undefCallSpreadGuard, boolToNumber, droppableStatic, plainFieldPresent, undefToObjectGuard, lowerMemberRecv, undefIterGuard, holeFencedCall, isGlobalUndefined, isRequireMainFilename, isUndefExpr, mayHoldSlotUndef, undefinedAsAbsent, undefinedAsText, lowerDynObjectLiteral, probeLower, pureReemittable, asDynOperand } from "./lower-exprs.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { lowerReplaceCall } from "./lower-regex.js";
@@ -116,7 +116,18 @@ function lowerOptionalDefaultArg(
    * types, or a call form whose copy could be observed). */
   function tupleArrayElem(L: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression, method: string): IrType | null {
     const checkerT = L.typeOf(access.expression);
-    if (!L.checker.isTupleType(checkerT) || !L.checker.typeToString(checkerT).startsWith("readonly ")) return null;
+    if (!L.checker.isTupleType(checkerT) || !L.checker.typeToString(checkerT).startsWith("readonly ")) {
+      // A type parameter constrained to a READONLY array (`<T extends
+      // readonly number[]>(presets: T)`, paperclip's presetSchema) that
+      // this instantiation binds to a tuple: the checker admits no write
+      // through `T`, so the copy is as unobservable as a readonly tuple's.
+      if (!(checkerT.flags & ts.TypeFlags.TypeParameter) || L.typeParamTsResolver(checkerT) === null) return null;
+      const tpSym = checkerT.getSymbol();
+      const decl = tpSym === undefined ? undefined : L.checker.declarationsOf(tpSym).find(ts.isTypeParameterDeclaration);
+      const c = decl?.constraint;
+      if (c === undefined || !ts.isTypeOperatorNode(c) || c.operator !== ts.SyntaxKind.ReadonlyKeyword ||
+          !(ts.isArrayTypeNode(c.type) || ts.isTupleTypeNode(c.type))) return null;
+    }
     const t = L.mapTypeOf(checkerT);
     if (t?.kind !== "record") return null;
     const shape = L.shapes.get(t.shapeId);
@@ -130,7 +141,11 @@ function lowerOptionalDefaultArg(
    * numeric literal, an array literal of those. */
   function pureTupleArg(a: ts.Expression): boolean {
     let e = a;
-    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    // a type assertion is no evaluation of its own (`opts.source as T`)
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) e = e.expression;
+    // a member read off a plain binding (`opts.source`, `d.phase`): no
+    // write to a readonly tuple can come out of it
+    if (ts.isPropertyAccessExpression(e) && !e.questionDotToken) return pureTupleArg(e.expression);
     if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken) e = e.operand;
     if (ts.isArrayLiteralExpression(e)) return e.elements.every((x) => !ts.isSpreadElement(x) && pureTupleArg(x));
     return ts.isIdentifier(e) || ts.isStringLiteral(e) || ts.isNumericLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) ||
@@ -3682,6 +3697,12 @@ export function callValueUsed(call: ts.CallExpression): boolean {
 
     if (name === "get") {
       const k = L.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
+      // A dyn-valued map (values shared with dynamic code): the dyn value,
+      // undefined on a miss — the checker's `V | undefined` crosses from it
+      // where the use site names a type.
+      if (receiverIr.value.kind === "dyn") {
+        return { kind: "mapIntrinsic", method: "get", receiver, args: [k], type: DYN, loc };
+      }
       // The checker types the call `V | undefined`, which interns the
       // result union. `undefined` sorts LAST among all possible arm
       // typeKeys, so when V is itself a union its arms keep their tags in
@@ -5808,13 +5829,19 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     mapT: IrType & { kind: "map" },): IrExpr | null {
     if (ts.isSpreadElement(argNode)) return null;
     const seed = L.lowerExpr(argNode);
+    if ((seed.type.kind === "jsval" || seed.type.kind === "dyn") && L.sharedDynamic &&
+        (mapT.value.kind === "dyn" || mapT.value.kind === "f64" || mapT.value.kind === "string" || mapT.value.kind === "bool") &&
+        (mapT.key.kind === "string" || mapT.key.kind === "f64")) {
+      return lowerMapSeedDyn(L, asDynOperand(seed), mapT, locOf(argNode));
+    }
     if (seed.type.kind !== "array" || seed.type.elem.kind !== "record") return null;
     const elem = seed.type.elem;
     const shape = L.shapes.get(elem.shapeId);
     if (!shape?.tuple || shape.fields.length !== 2) return null;
     const kT = shape.fields.find((f) => f.name === "0")!.type;
     const vT = shape.fields.find((f) => f.name === "1")!.type;
-    if (!typeEquals(kT, mapT.key) || !typeEquals(vT, mapT.value)) return null;
+    // a value shared with dynamic code (jsval) enters a dyn-valued map as the same value
+    if (!typeEquals(kT, mapT.key) || !(typeEquals(vT, mapT.value) || (vT.kind === "jsval" && mapT.value.kind === "dyn"))) return null;
     const loc = locOf(argNode);
     const key = `seed:${typeKey(mapT.key)}:${typeKey(mapT.value)}:${elem.shapeId}`;
     let helper = L.mapHofHelpers.get(key);
@@ -5826,6 +5853,82 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     // GH #104 (SEMANTICS.md S119): a seed slot holding undefined is no
     // seed — `new Map(u)` is empty.
     return { kind: "call", callee: helper, args: [undefinedAsAbsent(L, seed, { kind: "arrayLit", elems: [], type: seed.type, loc })], type: mapT, loc };
+  }
+
+/** `new Map(rows.map((r) => [r.id, r]))` where the pairs are the dynamic
+   * value (paperclip's drizzle rows, shared with dynamic code): Node's walk
+   * over the array — each entry's "0" and "1" members, a later duplicate
+   * key overwriting in place — into a dyn-valued map. A seed that is not
+   * an array at run time, or an entry that is not an object, stops by
+   * name (Node walks any iterable / throws its TypeError); a key that is
+   * not the map's key type is the checked boundary's fence (S122). */
+  function lowerMapSeedDyn(L: Lowerer, seed: IrExpr, mapT: IrType & { kind: "map" }, loc: SrcLoc): IrExpr {
+    const name = `%map.seedDyn.${typeKey(mapT.key)}.${typeKey(mapT.value)}`;
+    if (!L.liftedFns.some((f) => f.name === name)) {
+      const r = (id: string, t: IrType): IrExpr => ({ kind: "varRef", localId: id, type: t, loc });
+      const num = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
+      const s = (v: string): IrExpr => ({ kind: "strLit", value: v, type: STRING, loc });
+      const fence = (what: string): IrStmt => ({ kind: "runtimeFence", code: "SC1090", message: `new Map over ${what} is not supported yet [SC1090 at a dynamic Map seed]`, loc });
+      const e = r("e.0", DYN);
+      L.liftedFns.push({
+        name,
+        params: [{ localId: "a.0", name: "a", type: DYN }],
+        returnType: mapT,
+        locals: [
+          { id: "a.0", name: "a", type: DYN, mutable: false },
+          { id: "m.0", name: "m", type: mapT, mutable: false },
+          { id: "i.0", name: "i", type: F64, mutable: true },
+          { id: "e.0", name: "e", type: DYN, mutable: false },
+        ],
+        body: [
+          { kind: "if", cond: { kind: "unary", op: "!", operand: { kind: "dynTest", test: "array", value: r("a.0", DYN), type: BOOL, loc }, type: BOOL, loc }, then: [fence("a dynamic value that is not an array (Node walks any iterable)")], else_: null, loc },
+          { kind: "varDecl", localId: "m.0", init: { kind: "mapNew", type: mapT, loc }, loc },
+          {
+            kind: "for",
+            init: { kind: "varDecl", localId: "i.0", init: num(0), loc },
+            cond: { kind: "bin", op: "<", left: r("i.0", F64), right: { kind: "libCall", fn: "dyn.arrLen", args: [r("a.0", DYN)], type: F64, loc }, type: BOOL, loc },
+            update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: r("i.0", F64), right: num(1), type: F64, loc }, loc },
+            body: [
+              { kind: "varDecl", localId: "e.0", init: { kind: "libCall", fn: "dyn.arrAt", args: [r("a.0", DYN), r("i.0", F64)], type: DYN, loc }, loc },
+              {
+                kind: "if",
+                cond: {
+                  kind: "unary",
+                  op: "!",
+                  operand: { kind: "logical", op: "||", left: { kind: "dynTest", test: "array", value: e, type: BOOL, loc }, right: { kind: "dynTest", test: "object", value: e, type: BOOL, loc }, type: BOOL, loc },
+                  type: BOOL,
+                  loc,
+                },
+                then: [fence("an entry that is not an object (Node throws its TypeError)")],
+                else_: null,
+                loc,
+              },
+              {
+                kind: "exprStmt",
+                expr: {
+                  kind: "mapIntrinsic",
+                  method: "set",
+                  receiver: r("m.0", mapT),
+                  args: [
+                    { kind: "dynCheck", value: { kind: "dynKeyGet", value: e, key: s("0"), type: DYN, loc }, type: mapT.key, loc },
+                    mapT.value.kind === "dyn"
+                      ? { kind: "dynKeyGet", value: e, key: s("1"), type: DYN, loc }
+                      : { kind: "dynCheck", value: { kind: "dynKeyGet", value: e, key: s("1"), type: DYN, loc }, type: mapT.value, loc },
+                  ],
+                  type: VOID,
+                  loc,
+                },
+                loc,
+              },
+            ],
+            loc,
+          },
+          { kind: "return", value: r("m.0", mapT), loc },
+        ],
+        loc,
+      });
+    }
+    return { kind: "call", callee: name, args: [seed], type: mapT, loc };
   }
 
 /** The seeding loop, from existing IR nodes:
@@ -5875,7 +5978,9 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
               receiver: ref("m.0", mapT),
               args: [
                 { kind: "recordGet", obj: e, shapeId: tupleT.shapeId, field: "0", type: kT, loc },
-                { kind: "recordGet", obj: e, shapeId: tupleT.shapeId, field: "1", type: vT, loc },
+                vT.kind === "jsval" && mapT.value.kind === "dyn"
+                  ? { kind: "dynFromJsval", value: { kind: "recordGet", obj: e, shapeId: tupleT.shapeId, field: "1", type: vT, loc }, type: DYN, loc }
+                  : { kind: "recordGet", obj: e, shapeId: tupleT.shapeId, field: "1", type: vT, loc },
               ],
               type: VOID,
               loc,
@@ -6282,7 +6387,19 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
         );
       }
     }
-    if (options !== undefined && !isUndefinedLiteral(options)) {
+    // `{ sensitivity: "base" }` (a literal bag with exactly that member, the
+    // locales argument given): ICU's primary strength over the same root
+    // collation (paperclip's catalog sort), on the WasmGC lanes.
+    let primary = false;
+    if (
+      options !== undefined && L.sharedDynamic && locales !== undefined && !isUndefinedLiteral(locales) &&
+      ts.isObjectLiteralExpression(options) && options.properties.length === 1
+    ) {
+      const p = options.properties[0]!;
+      primary = ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) &&
+        p.name.text === "sensitivity" && ts.isStringLiteral(p.initializer) && p.initializer.text === "base";
+    }
+    if (options !== undefined && !isUndefinedLiteral(options) && !primary) {
       L.noLowering(
         ".localeCompare with an options argument",
         options,
@@ -6295,7 +6412,7 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     // Unit U (SEMANTICS.md S119): an argument holding its slot's undefined
     // is ToString'd, as Node does ("undefined").
     if (L.undefSlots) arg = undefinedAsText(L, arg, loc);
-    if (constRead === null) return { kind: "strIntrinsic", method: "localeCompare", receiver, args: [arg], type: F64, loc };
+    if (constRead === null) return { kind: "strIntrinsic", method: primary ? "localeCompareBase" : "localeCompare", receiver, args: [arg], type: F64, loc };
     // a folded const locale: receiver, argument, then the const's own read,
     // in Node's order
     const r = L.declareHiddenLocal("%lcRecv", receiver.type);
@@ -6309,7 +6426,7 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       ],
       result: {
         kind: "strIntrinsic",
-        method: "localeCompare",
+        method: primary ? "localeCompareBase" : "localeCompare",
         receiver: { kind: "varRef", localId: r.id, type: receiver.type, loc },
         args: [{ kind: "varRef", localId: a.id, type: arg.type, loc }],
         type: F64,

@@ -7,6 +7,8 @@ import { lowerFileHandleMethodCall } from "./lower-filehandle.js";
 import * as ts from "../ts7/adapter.js";
 import { lowerObjModelStatic, usesThis } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
+import { lowerIntlDtfCall } from "./lower-intl-dtf.js";
+import { lowerWeakRefCall } from "./lower-weakref.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
@@ -25,7 +27,7 @@ import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerTypedArrayFrom
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { codePointAtOn, lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
-import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
+import { forInArrayKey, holeFencedArray, isGlobalUndefined } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -4929,6 +4931,8 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // The composed en-US Intl.NumberFormat form — before the member
         // fences (the receiver's Intl.NumberFormat type has no mapping).
         lowerIntlNumberFormatCall(L, expr, expr.expression) ??
+        lowerIntlDtfCall(L, expr, expr.expression) ??
+        lowerWeakRefCall(L, expr, expr.expression) ??
         lowerGroupByStaticCall(L, expr, expr.expression) ??
         // Iterator-helper chains rooted at arr.values() — before the
         // array method paths (the terminal names collide with array
@@ -8027,7 +8031,16 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
           "value — take `(e)` or `(e: unknown)` and narrow with instanceof)",
       );
     }
-    const resultT = L.mapTypeOf(L.typeOf(call));
+    let resultT = L.mapTypeOf(L.typeOf(call));
+    // `p.catch(() => undefined)` over a Promise<void> (paperclip's cleanup
+    // idiom): the checker's `Promise<void | undefined>` holds one value,
+    // undefined, either way — the void promise.
+    if (resultT === null && promT.kind === "promise" && promT.inner.kind === "void") {
+      const ct = L.typeOf(call);
+      const arg = ct.getSymbol()?.name === "Promise" ? L.checker.getTypeArguments(ct as ts.TypeReference)[0] : undefined;
+      const parts = arg === undefined ? [] : arg.isUnionType() ? arg.getTypes() : [arg];
+      if (parts.length > 0 && parts.every((p) => (p.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) !== 0)) resultT = promT;
+    }
     if (resultT?.kind !== "promise") {
       L.noLowering(
         "catch with this handler's result type",
@@ -8071,7 +8084,10 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         if (ts.isBlock(hb)) {
           catchBody = L.lowerStmts(hb.statements);
         } else if (R.kind === "void") {
-          catchBody = [{ kind: "exprStmt", expr: L.lowerExpr(hb), loc: locOf(hb) }];
+          // `() => undefined` over a void promise: nothing to evaluate
+          catchBody = ts.isIdentifier(hb) && hb.text === "undefined" && isGlobalUndefined(L, hb)
+            ? []
+            : [{ kind: "exprStmt", expr: L.lowerExpr(hb), loc: locOf(hb) }];
         } else {
           // Bare-expression handler: `(e) => v` (promise results flatten
           // through the async-return path, like any `return v`).
@@ -11178,7 +11194,7 @@ export function lowerHasOwnCall(L: Lowerer, call: ts.CallExpression, recvNode: t
     if (probed?.type.kind === "dyn" || (L.sharedDynamic && probed?.type.kind === "jsval")) {
       const loc = locOf(call);
       const receiver = asDynOperand(L.lowerExpr(recvNode));
-      let key = L.lowerExpr(keyNode);
+      let key = asDynOperand(L.lowerExpr(keyNode));
       if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {
         key = { kind: "toString", operand: key, type: STRING, loc: locOf(keyNode) };
       }
@@ -11191,7 +11207,7 @@ export function lowerHasOwnCall(L: Lowerer, call: ts.CallExpression, recvNode: t
     const loc = locOf(call);
     const receiver = undefToObjectGuard(L, L.lowerExpr(recvNode), locOf(call));
     if (receiver.type.kind !== "record") return null; // probe/lower drift: keep the fence
-    let key = L.lowerExpr(keyNode);
+    let key = L.sharedDynamic ? asDynOperand(L.lowerExpr(keyNode)) : L.lowerExpr(keyNode);
     // Number/boolean/dyn keys stringify — ToPropertyKey, the keyed-write
     // path's rule; symbol and composite keys keep the fence.
     if (key.type.kind === "f64" || key.type.kind === "bool" || key.type.kind === "dyn") {

@@ -625,8 +625,8 @@ int32_t host_umask(int32_t isRead, int32_t mask) {
 /* ── fsCall ───────────────────────────────────────────────────────────── */
 /* the module's own errno enumeration (fs.ts), else the 256-based carrier */
 int32_t wn_fs_err(int e) {
-  static const int order[] = {ENOENT, EEXIST, EACCES, ENOTDIR, EISDIR, ENOTEMPTY, EPERM, EBADF, EMFILE, ENOSPC, EINVAL, EROFS, ELOOP, ENAMETOOLONG};
-  for (int i = 0; i < 14; i++)
+  static const int order[] = {ENOENT, EEXIST, EACCES, ENOTDIR, EISDIR, ENOTEMPTY, EPERM, EBADF, EMFILE, ENOSPC, EINVAL, EROFS, ELOOP, ENAMETOOLONG, EXDEV};
+  for (int i = 0; i < 15; i++)
     if (order[i] == e) return -(i + 1);
   return -(256 + e);
 }
@@ -1332,7 +1332,8 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       /* libuv's uv__fs_copyfile: open without truncating, and when the
        * destination IS the source, do nothing (truncating first would
        * empty the file) */
-      int out = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC, st.st_mode & 07777);
+      /* x = 1: COPYFILE_EXCL (the destination must not exist) */
+      int out = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC | (x & 1 ? O_EXCL : 0), st.st_mode & 07777);
       if (out < 0) {
         rc = wn_fs_err(errno);
         close(in);
@@ -1365,6 +1366,38 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       close(in);
       close(out);
       free(dst);
+      break;
+    }
+    case 31:
+    case 32:
+    case 33: {
+      /* rename(A, B), link(A, B), symlink(target A, path B) */
+      char *dst = path_arg(B, BL, "an fs path");
+      int r = op == 31 ? rename(path, dst) : op == 32 ? link(path, dst) : symlink(path, dst);
+      if (r != 0) rc = wn_fs_err(errno);
+      free(dst);
+      break;
+    }
+    case 34: {
+      /* readlink(A): the target's text into slot B, read-shaped */
+      size_t cap = 256;
+      for (;;) {
+        char *b = malloc(cap);
+        if (!b) abort();
+        ssize_t n = readlink(path, b, cap);
+        if (n < 0) {
+          rc = wn_fs_err(errno);
+          free(b);
+          break;
+        }
+        if ((size_t)n < cap) {
+          rc = put_content((const uint8_t *)b, (size_t)n, 0, B, BL);
+          free(b);
+          break;
+        }
+        free(b);
+        cap *= 2;
+      }
       break;
     }
     case 16:

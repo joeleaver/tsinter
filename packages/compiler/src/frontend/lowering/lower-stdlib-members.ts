@@ -780,6 +780,7 @@ export function lowerArrayFromIterable(L: Lowerer, call: ts.CallExpression): IrE
   let srcNode: ts.Expression = args[0]!;
   while (ts.isParenthesizedExpression(srcNode)) srcNode = srcNode.expression;
   const srcT = L.mapTypeOf(L.typeOf(srcNode));
+  if (srcT?.kind === "map") return arrayFromMapMapped(L, call, srcNode, srcT, resT, loc);
   const freshSet = ts.isNewExpression(srcNode) && srcT?.kind === "set";
   if (srcT?.kind !== "string" && srcT?.kind !== "array" && !freshSet) return null;
   const r = iterableArray(L, srcNode, null, loc, NOT_ITERABLE);
@@ -791,6 +792,90 @@ export function lowerArrayFromIterable(L: Lowerer, call: ts.CallExpression): IrE
   if (!typeEquals(arrayOf(f.type.ret), resT)) return null;
   const helper = fromMapHelper(L, r.arr.type, f.type, loc);
   return { kind: "call", callee: helper, args: [r.arr, f], type: resT, loc };
+}
+
+/** `Array.from(map, (entry, i) => …)` (paperclip's env-file writer): Node's
+ * walk of the map's LIVE entry iterator — each entry a fresh `[key, value]`
+ * array, the mapper called on it as the walk reaches it (an entry the
+ * mapper deletes ahead is skipped, one it adds is visited: the forEach
+ * desugar's iteration primitives), the results pushed in order. The
+ * mapper's first parameter takes the `[K, V]` tuple. Null otherwise. */
+function arrayFromMapMapped(L: Lowerer, call: ts.CallExpression, srcNode: ts.Expression,
+  mapT: IrType & { kind: "map" }, resT: IrType & { kind: "array" }, loc: SrcLoc): IrExpr | null {
+  // Node's order: the source, then the mapper
+  const m = L.lowerExpr(srcNode);
+  if (m.type.kind !== "map") return null;
+  const f = L.lowerExpr(call.arguments[1]!);
+  if (f.type.kind !== "func" || f.type.params.length > 2 || f.type.rest === true) return null;
+  const entT = f.type.params[0];
+  if (entT !== undefined) {
+    const sh = entT.kind === "record" ? L.shapes.get(entT.shapeId) : undefined;
+    if (!sh?.tuple || sh.fields.length !== 2 ||
+        !typeEquals(sh.fields.find((x) => x.name === "0")!.type, mapT.key) ||
+        !typeEquals(sh.fields.find((x) => x.name === "1")!.type, mapT.value)) return null;
+  }
+  if (f.type.params.length === 2 && f.type.params[1]!.kind !== "f64") return null;
+  if (!typeEquals(arrayOf(f.type.ret), resT)) return null;
+  const fnT = f.type;
+  const name = `%arr.fromMap.${typeKey(mapT)}.${typeKey(fnT)}`;
+  if (!L.liftedFns.some((x) => x.name === name)) {
+    const r = (id: string, t: IrType): IrExpr => ({ kind: "varRef", localId: id, type: t, loc });
+    const num = (v: number): IrExpr => ({ kind: "numLit", value: v, type: F64, loc });
+    const iter = (method: "iterCount" | "iterLive" | "iterKey" | "iterValue" | "iterEnter" | "iterExit", a: IrExpr[], type: IrType): IrExpr =>
+      ({ kind: "mapIntrinsic", method, receiver: r("m.0", mapT), args: a, type, loc });
+    const callArgs: IrExpr[] = [];
+    if (entT !== undefined && entT.kind === "record") {
+      callArgs.push({
+        kind: "recordLit",
+        fields: [
+          { name: "0", value: iter("iterKey", [r("i.0", F64)], mapT.key) },
+          { name: "1", value: iter("iterValue", [r("i.0", F64)], mapT.value) },
+        ],
+        type: entT,
+        loc,
+      });
+    }
+    if (fnT.params.length === 2) callArgs.push(r("n.0", F64));
+    const visit: IrStmt[] = [
+      { kind: "exprStmt", expr: { kind: "arrIntrinsic", method: "push", receiver: r("out.0", resT), args: [{ kind: "callValue", callee: r("f.0", fnT), args: callArgs, type: fnT.ret, loc }], type: F64, loc }, loc },
+      { kind: "assign", localId: "n.0", value: { kind: "bin", op: "+", left: r("n.0", F64), right: num(1), type: F64, loc }, loc },
+    ];
+    L.liftedFns.push({
+      name,
+      params: [{ localId: "m.0", name: "m", type: mapT }, { localId: "f.0", name: "f", type: fnT }],
+      returnType: resT,
+      locals: [
+        { id: "m.0", name: "m", type: mapT, mutable: true },
+        { id: "f.0", name: "f", type: fnT, mutable: true },
+        { id: "i.0", name: "i", type: F64, mutable: true },
+        { id: "n.0", name: "n", type: F64, mutable: true },
+        { id: "out.0", name: "out", type: resT, mutable: false },
+      ],
+      body: [
+        { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: resT, loc }, loc },
+        { kind: "varDecl", localId: "n.0", init: num(0), loc },
+        { kind: "exprStmt", expr: iter("iterEnter", [], VOID), loc },
+        {
+          kind: "tryCatch",
+          tryBody: [{
+            kind: "for",
+            init: { kind: "varDecl", localId: "i.0", init: num(0), loc },
+            cond: { kind: "bin", op: "<", left: r("i.0", F64), right: iter("iterCount", [], F64), type: BOOL, loc },
+            update: { kind: "assign", localId: "i.0", value: { kind: "bin", op: "+", left: r("i.0", F64), right: num(1), type: F64, loc }, loc },
+            body: [{ kind: "if", cond: iter("iterLive", [r("i.0", F64)], BOOL), then: visit, else_: null, loc }],
+            loc,
+          }],
+          catchBody: null,
+          catchLocalId: null,
+          finallyBody: [{ kind: "exprStmt", expr: iter("iterExit", [], VOID), loc }],
+          loc,
+        },
+        { kind: "return", value: r("out.0", resT), loc },
+      ],
+      loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [m, f], type: resT, loc };
 }
 
 /* ── Object statics ──────────────────────────────────────────────────── */
