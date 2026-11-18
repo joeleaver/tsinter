@@ -5299,6 +5299,14 @@ export class Lowerer {
     if (expected.kind === "dyn" && expr.type.kind === "symbol" && this.sharedDynamic && !this.engine) {
       return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc } as IrExpr;
     }
+    // A typed RegExp into a checked-dynamic slot (zod's `z.string().regex(re)`
+    // argument on its dynamic receiver): the same shared box its crossing
+    // into `any` takes (SEMANTICS.md S043's unit F1 amendment) — identity
+    // and lastIndex shared from both sides; dyn and jsval are one value on
+    // these lanes.
+    if (expected.kind === "dyn" && expr.type.kind === "regex" && this.sharedDynamic && !this.engine) {
+      return { kind: "dynFromJsval", value: { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc }, type: DYN, loc: expr.loc } as IrExpr;
+    }
     // A record of functions and trailing getters (an npm package's JS
     // literal, @clack/prompts' spinner result) into a dynamic slot: the
     // dynamic object Node's literal is, getters live (lower-dts.ts).

@@ -25,7 +25,7 @@ import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerTypedArrayFrom
 import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { codePointAtOn, lowerArrayCopyWithin, lowerArrayFill, lowerArrayMemberExtra, lowerNumberToStringRadix, lowerStringFromCodePoint, lowerStringMemberExtra, recordHasOwnIndexHelper } from "./lower-stdlib-members.js";
 import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from "./record-order.js";
-import { OBJECT_PROTO_NAMES, forInArrayKey, holeFencedArray, protoMissCall } from "./lower-exprs.js";
+import { OBJECT_PROTO_NAMES, forInArrayKey, holeFencedArray, lowerDynObjectLiteral, protoMissCall } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -5316,6 +5316,33 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
  * the dyn array and validated-extracts the survivors into the element type
  * the checker committed the result to. Null when the receiver isn't a dyn
  * value or the method isn't claimable (the method-call fence stays). */
+/** An argument of a call through a dynamic value. A FRESH object literal
+ * (zod's `.datetime({ offset: true })` options) is built as the dynamic
+ * object itself: nothing else holds it, so no copy is involved; its member
+ * values cross one by one. */
+function dynCallArg(L: Lowerer, a: ts.Expression): IrExpr {
+  if (L.sharedDynamic && !L.engine && ts.isObjectLiteralExpression(a) && freshDynLiteral(L, a)) {
+    return lowerDynObjectLiteral(L, a);
+  }
+  return L.lowerExprExpecting(a, DYN);
+}
+
+/** Only a literal whose member values are scalars, RegExps (the shared box)
+ * or nested fresh literals of the same kind takes the member-by-member
+ * build: a typed object or array member (`{ inner }`) must keep the one
+ * shared value the ordinary crossing gives it, so a later write through
+ * the package's reference reaches the program's. */
+function freshDynLiteral(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
+  return lit.properties.every((p) => {
+    if (!(ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) || ts.isComputedPropertyName(p.name)) return false;
+    let v: ts.Expression = ts.isPropertyAssignment(p) ? p.initializer : p.name;
+    while (ts.isParenthesizedExpression(v)) v = v.expression;
+    if (ts.isObjectLiteralExpression(v)) return freshDynLiteral(L, v);
+    const k = L.mapTypeOf(L.typeOf(v))?.kind;
+    return k === "f64" || k === "string" || k === "bool" || k === "undefinedT" || k === "nullT" || k === "regex" || k === "bigint";
+  });
+}
+
   function lowerDynReceiverMethodCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (L.chainBlocked(call, access)) return null;
@@ -5385,7 +5412,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (call.arguments.some((a) => ts.isSpreadElement(a))) {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
       }
-      const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+      const args = call.arguments.map((a) => dynCallArg(L, a));
       // The result crosses into the declared return type at the use: a
       // declared primitive (`error.format(): string`) checks its kind.
       return L.maybeNarrow({ kind: "dynInvoke", recv, method: access.name.text, calleeName: access.getText(), args, type: DYN, loc: locOf(call) }, call);
@@ -5408,7 +5435,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       !call.arguments.some(ts.isSpreadElement) && !call.questionDotToken && !access.questionDotToken
     ) {
       const loc = locOf(call);
-      const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+      const args = call.arguments.map((a) => dynCallArg(L, a));
       return { kind: "call", callee: dynLocaleCompareHelper(L, access.getText(), args.length, loc), args: [recv, ...args], type: DYN, loc };
     }
     // String methods claim only names NO other dyn-representable kind's
@@ -5486,7 +5513,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (call.arguments.some((a) => ts.isSpreadElement(a))) {
         L.unsupported("SC1090", call, "spread arguments in calls through 'unknown' values");
       }
-      const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+      const args = call.arguments.map((a) => dynCallArg(L, a));
       return {
         kind: "dynInvoke",
         recv,
@@ -5523,7 +5550,10 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       type: DYN,
       loc: locOf(access),
     };
-    const args = call.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+    // A FRESH object literal argument (zod's `.datetime({ offset: true })`
+    // options) is built as the dynamic object itself: nothing else holds
+    // it, so no copy is involved (its member values cross one by one).
+    const args = call.arguments.map((a) => dynCallArg(L, a));
     // One world, a TypeScript call site (U1b): `c.who()` over a dynamic
     // value is a METHOD call — the receiver-kind dispatch whose OBJ arm
     // reads the own member and calls it with `this` bound, as Node does
