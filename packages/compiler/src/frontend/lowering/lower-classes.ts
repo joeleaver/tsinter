@@ -3931,8 +3931,91 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
         ? { kind: "downcast" as const, value: receiver, type: { kind: "object" as const, className: declarer.def.name }, loc }
         : upcastTo(L, receiver, declarer.def.name);
     const args = L.completeArgs(call.arguments, instance.params, loc, call);
-    return { kind: "call", callee: instance.name, args: [thisArg, ...args], type: instance.returnType, loc };
+    const built: IrExpr = { kind: "call", callee: instance.name, args: [thisArg, ...args], type: instance.returnType, loc };
+    return thisReturnNarrow(L, declarer, name, receiver, built);
   }
+
+/** A JavaScript method every return of which is `return this` (a builder
+ * method: drizzle's `default(value) { …; return this; }`) yields the
+ * receiver itself. Called on a receiver whose static class is a subclass of
+ * the declarer, its result is that subclass: Node returns the very object,
+ * so the narrowing is exact. Anything else is left as built. */
+export function thisReturnNarrow(L: Lowerer, declarer: ClassInfo, method: string, receiver: IrExpr, result: IrExpr): IrExpr {
+  if (receiver.type.kind !== "object" || result.type.kind !== "object") return result;
+  if (receiver.type.className === result.type.className) return result;
+  if (!isSubclassOf(L, receiver.type.className, result.type.className)) return result;
+  const decl = declarer.decl;
+  if (decl === null || !isJsSourceFile(decl.getSourceFile())) return result;
+  const m = decl.members.find((x): x is ts.MethodDeclaration =>
+    ts.isMethodDeclaration(x) && x.name !== undefined && ts.isIdentifier(x.name) && x.name.text === method && x.body !== undefined);
+  if (m === undefined || m.body === undefined || !returnsOnlyThis(m.body)) return result;
+  // Only when no class at or below the receiver's static class overrides
+  // the method: an override may return anything (drizzle-shaped `Weird
+  // extends DateBase { default(v) { return new Builder(...) } }`), and the
+  // call's runtime receiver may be such a class. A class this lowering never
+  // registered (a deferred declaration) leaves the set open: no narrowing.
+  const recvClass = receiver.type.className;
+  for (const c of L.classes.values()) {
+    if (c === declarer) continue;
+    if (c.def.name !== recvClass && !isSubclassOf(L, c.def.name, recvClass)) continue;
+    if (L.findMethodOn(c, method)?.declarer === c || findGenericMethodOn(L, c, method)?.declarer === c) return result;
+  }
+  for (const [name, sym] of L.deferredClassByName) {
+    if (L.classes.has(name)) continue;
+    const d = L.checker.valueDeclarationOf(sym);
+    if (d === undefined || !(ts.isClassDeclaration(d) || ts.isClassExpression(d))) return result;
+    const declaresIt = d.members.some((x) => {
+      const nm = (x as unknown as { name?: ts.Node }).name;
+      return nm !== undefined && ts.isIdentifier(nm) && nm.text === method;
+    });
+    if (declaresIt && deferredExtends(L, d, recvClass)) return result;
+  }
+  return { kind: "downcast", value: result, type: receiver.type, loc: result.loc };
+}
+
+/** Does the class declaration `d` extend (through its heritage) the class
+ * the IR names `target`? Unresolvable heritage answers true (open). */
+function deferredExtends(L: Lowerer, d: ts.ClassLikeDeclaration, target: string): boolean {
+  const seen = new Set<ts.Node>();
+  let c: ts.ClassLikeDeclaration | undefined = d;
+  while (c !== undefined && !seen.has(c)) {
+    seen.add(c);
+    if (L.classNamer(c) === target) return true;
+    const ext = c.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0];
+    if (ext === undefined) return false;
+    let sym: ts.Symbol | undefined;
+    try {
+      sym = L.checker.getSymbolAtLocation(ext.expression);
+      if (sym !== undefined && (sym.flags & ts.SymbolFlags.Alias) !== 0) sym = L.checker.getAliasedSymbol(sym);
+    } catch {
+      return true;
+    }
+    const nd = sym !== undefined ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (nd === undefined) return true;
+    c = ts.isClassDeclaration(nd) || ts.isClassExpression(nd) ? nd : undefined;
+    if (c === undefined) return true;
+  }
+  return false;
+}
+
+function returnsOnlyThis(body: ts.Block): boolean {
+  const last = body.statements[body.statements.length - 1];
+  if (last === undefined || !ts.isReturnStatement(last)) return false;
+  let ok = true;
+  const visit = (n: ts.Node): void => {
+    if (!ok) return;
+    if (ts.isFunctionLike(n)) return; // a nested function's returns are its own
+    if (ts.isReturnStatement(n)) {
+      let e = n.expression;
+      while (e !== undefined && ts.isParenthesizedExpression(e)) e = e.expression;
+      if (e === undefined || e.kind !== ts.SyntaxKind.ThisKeyword) ok = false;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  };
+  for (const st of body.statements) visit(st);
+  return ok;
+}
 
 /** Wraps a derived-class expression in an upcast when the target base
    * class differs (a no-op reinterpret at runtime; keeps IR types exact). */
