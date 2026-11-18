@@ -7,7 +7,7 @@ for (const key in w) {
   console.log(key);
 }
 for (let i = 0, j = n; i < j; i = i + 1) {
-  console.log(i);
+  setTimeout(() => console.log(i + j), 0);
 }
 debugger;
 enum Color {
