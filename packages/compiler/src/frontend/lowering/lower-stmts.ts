@@ -9,7 +9,7 @@ import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js"
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, importCallHandleType, neverResidueTsBinding, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { dynArmForOf, lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
+import { dynArmForOf, dynArmKey, lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
 import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeys } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
@@ -911,6 +911,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // of slipping an empty return past the validator.
       let value: IrExpr | null = null;
       if (stmt.expression) {
+        noteNeverReturn(L, stmt);
         return L.lowerReturnStmt(stmt.expression, locOf(stmt));
       } else if (L.ctx.returnType.kind === "union") {
         value = L.wrappedUndefined(L.ctx.returnType, locOf(stmt));
@@ -9312,3 +9313,24 @@ export function lowerForStatement(L: Lowerer, stmt: ts.ForStatement): IrStmt {
       L.scopes.pop();
     }
   }
+
+/** S125 (paperclip's `return z.NEVER` transforms): a plain function that
+ * returns a value its types call `never` — a package's sentinel read off a
+ * binding (zod's `NEVER`, the dynamic object itself) — hands that object to
+ * its caller in Node, whatever result type the other returns give the
+ * function. Its result takes the dynamic arm in the next pass (a `ret:`
+ * site, dyn-arm.ts), so the sentinel crosses back unchanged where the
+ * typed result would have checked it and stopped. */
+function noteNeverReturn(L: Lowerer, stmt: ts.ReturnStatement): void {
+  if (!L.sharedDynamic || L.engine || stmt.expression === undefined) return;
+  let e: ts.Expression = stmt.expression;
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  if (!ts.isIdentifier(e) && !ts.isPropertyAccessExpression(e)) return;
+  if ((L.checker.getTypeAtLocation(e).flags & ts.TypeFlags.Never) === 0) return;
+  let fn: ts.Node | undefined = stmt.parent;
+  while (fn !== undefined && !ts.isFunctionLike(fn)) fn = fn.parent;
+  if (fn === undefined || !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn))) return;
+  if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined || (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return;
+  if (L.ctx.returnType.kind === "dyn" || L.ctx.returnType.kind === "jsval") return;
+  L.dynArmSoft.add(`ret:${dynArmKey(fn)}`);
+}

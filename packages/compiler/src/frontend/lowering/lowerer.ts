@@ -672,7 +672,10 @@ export function lowerToIr(
     if (p.ok) built = { emit, result, sites: dynArmSites, noSpec };
     if (round >= DYN_ARM_ROUNDS) break;
     if (p.ok) {
-      const soft = [...emit.dynArmSoft].filter((k) => !dynArmSites.has(k));
+      // A pass that builds may still hold refused crossings: a compiled
+      // package's JavaScript defers its S125 refusals to where they run
+      // (zod's module-load `NEVER`); those slots try the arm as well.
+      const soft = [...emit.dynArmSoft, ...emit.dynArmRetry].filter((k) => !dynArmSites.has(k));
       if (soft.length === 0) break;
       dynArmSites = new Set([...dynArmSites, ...soft]);
       continue;
@@ -823,6 +826,25 @@ export function neverTaintedJsType(L: Lowerer, node: ts.Node, t: ts.Type): boole
     return false;
   };
   return walk(t, 4);
+}
+
+/** S128 (zod's `export declare const NEVER: never`): a read of a binding
+ * that declarations type `never` while an implementation gives it a value
+ * (a compiled package's sentinel object) holds that value — the dynamic
+ * object itself — not never's f64 dead-read slot: comparing it, printing it
+ * or handing it on reads Node's object. */
+export function neverDeclaredRead(L: Lowerer, node: ts.Node, t: ts.Type): boolean {
+  if ((t.flags & ts.TypeFlags.Never) === 0 || !L.sharedDynamic || L.engine) return false;
+  const name = ts.isIdentifier(node) ? node : ts.isPropertyAccessExpression(node) ? node.name : null;
+  if (name === null) return false;
+  let sym = L.checker.getSymbolAtLocation(name);
+  if (sym === undefined) return false;
+  if ((sym.flags & ts.SymbolFlags.Alias) !== 0) sym = L.checker.getAliasedSymbol(sym);
+  // (the binding the read resolves to is the implementation's — a compiled
+  // package's JavaScript `const` with a value — while the checker spells
+  // the declarations' `never`)
+  return [...L.checker.rawDeclarationsOf(sym), ...L.checker.declarationsOf(sym)].some((d) =>
+    ts.isVariableDeclaration(d) && d.initializer !== undefined && isJsSourceFile(d.getSourceFile()));
 }
 
 /** GH #236: the TypeScript twin of neverTaintedJsType, for BINDINGS on the
@@ -3843,6 +3865,12 @@ export class Lowerer {
     // answers a dynamic array of symbols (dyn.ownSymbols) — its reads take
     // the dynamic paths, whatever `symbol[]` the checker spelled.
     if (this.sharedDynamic && !this.engine) {
+      // S128 (zod's `export declare const NEVER: never`): a read of a binding
+      // the declarations type `never` is the implementation's dynamic value.
+      if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) {
+        const t0 = this.checker.getTypeAtLocation(node);
+        if ((t0.flags & ts.TypeFlags.Never) !== 0 && neverDeclaredRead(this, node, t0)) return this.checker.getAnyType();
+      }
       const ownSymbolsCall = (n: ts.Node | undefined): boolean =>
         n !== undefined && ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
         n.expression.name.text === "getOwnPropertySymbols" && ts.isIdentifier(n.expression.expression) &&
