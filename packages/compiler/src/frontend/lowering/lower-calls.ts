@@ -28,7 +28,7 @@ import { declaredFields, orderedFieldStmts, orderedPresence, orderedShape } from
 import { forInArrayKey, holeFencedArray } from "./lower-exprs.js";
 import { orderedRecordWrite, afterArgs, evaluateArgsFirst, checkAfterArgs, undefFenceGuard, isUndefExpr, undefCallSpreadGuard, undefFnParamGuard, plainFieldPresent, boolCanon, boolToNumber, droppableStatic, mayHoldSlotUndef, undefIterGuard, toNumberCanon, undefRecvGuard, undefToObjectGuard, undefinedAsText, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, probeLowerDyn, probeLowerHeld, holdProbe, releaseHeldProbe, templateRawTextOf, asDynOperand } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
-import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
+import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, thisReturnNarrow, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
 import { lowerConsoleInspectArg, lowerFormatCall, lowerRuntimeFormat, type RuntimeFormatArg } from "./lower-inspect.js";
 import { STREAM_API_MEMBERS, lowerStreamMethodCall, lowerStreamModuleCall, lowerStreamStaticCall, streamSidesOf } from "./lower-stream.js";
@@ -10909,13 +10909,13 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
         loc: locOf(call),
       });
     }
-    return reconcileOverloadReturn(L, call, {
+    return thisReturnNarrow(L, found.declarer, method, receiver, reconcileOverloadReturn(L, call, {
       kind: "call",
       callee: `%${found.declarer.def.name}.${method}`,
       args: [L.upcastTo(receiver, found.declarer.def.name), ...args],
       type: found.sig.ret,
       loc: locOf(call),
-    });
+    }));
   }
 
 /** V8's CallPrinter rendering of a spread source, as its nullish spread-call

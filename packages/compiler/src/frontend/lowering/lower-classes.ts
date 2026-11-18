@@ -3931,8 +3931,45 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
         ? { kind: "downcast" as const, value: receiver, type: { kind: "object" as const, className: declarer.def.name }, loc }
         : upcastTo(L, receiver, declarer.def.name);
     const args = L.completeArgs(call.arguments, instance.params, loc, call);
-    return { kind: "call", callee: instance.name, args: [thisArg, ...args], type: instance.returnType, loc };
+    const built: IrExpr = { kind: "call", callee: instance.name, args: [thisArg, ...args], type: instance.returnType, loc };
+    return thisReturnNarrow(L, declarer, name, receiver, built);
   }
+
+/** A JavaScript method every return of which is `return this` (a builder
+ * method: drizzle's `default(value) { …; return this; }`) yields the
+ * receiver itself. Called on a receiver whose static class is a subclass of
+ * the declarer, its result is that subclass: Node returns the very object,
+ * so the narrowing is exact. Anything else is left as built. */
+export function thisReturnNarrow(L: Lowerer, declarer: ClassInfo, method: string, receiver: IrExpr, result: IrExpr): IrExpr {
+  if (receiver.type.kind !== "object" || result.type.kind !== "object") return result;
+  if (receiver.type.className === result.type.className) return result;
+  if (!isSubclassOf(L, receiver.type.className, result.type.className)) return result;
+  const decl = declarer.decl;
+  if (decl === null || !isJsSourceFile(decl.getSourceFile())) return result;
+  const m = decl.members.find((x): x is ts.MethodDeclaration =>
+    ts.isMethodDeclaration(x) && x.name !== undefined && ts.isIdentifier(x.name) && x.name.text === method && x.body !== undefined);
+  if (m === undefined || m.body === undefined || !returnsOnlyThis(m.body)) return result;
+  return { kind: "downcast", value: result, type: receiver.type, loc: result.loc };
+}
+
+function returnsOnlyThis(body: ts.Block): boolean {
+  const last = body.statements[body.statements.length - 1];
+  if (last === undefined || !ts.isReturnStatement(last)) return false;
+  let ok = true;
+  const visit = (n: ts.Node): void => {
+    if (!ok) return;
+    if (ts.isFunctionLike(n)) return; // a nested function's returns are its own
+    if (ts.isReturnStatement(n)) {
+      let e = n.expression;
+      while (e !== undefined && ts.isParenthesizedExpression(e)) e = e.expression;
+      if (e === undefined || e.kind !== ts.SyntaxKind.ThisKeyword) ok = false;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  };
+  for (const st of body.statements) visit(st);
+  return ok;
+}
 
 /** Wraps a derived-class expression in an upcast when the target base
    * class differs (a no-op reinterpret at runtime; keeps IR types exact). */
