@@ -1616,7 +1616,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             }
             const handleT =
               L.dynamic && ts.isIdentifier(decl.name) && nameNode === decl.name
-                ? ((specT !== null ? JSVAL : dynArmGlobalDecl(L, decl) ? (isJsSourceFile(sf) ? DYN : JSVAL) : null) ??
+                ? ((specT !== null ? JSVAL : dynArmGlobalDecl(L, decl) || jsFrozenGlobal(sf, decl) ? (isJsSourceFile(sf) ? DYN : JSVAL) : null) ??
                   importCallHandleType(decl.initializer) ??
                   // An unchecked-overload call result stores the handle,
                   // exactly the local rule (uncheckedOverloadHandleCall).
@@ -2266,3 +2266,18 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
       loc,
     };
   }
+
+/** A JavaScript module-scope binding initialized by `Object.freeze(…)` (or
+ * seal / preventExtensions) — zod's `export const NEVER =
+ * Object.freeze({ status: "aborted" })`, a sentinel compared by identity:
+ * its global holds the dynamic object from the first pass (the object
+ * itself, frozen, one identity), as the dynamic arm would after S125 (c)
+ * refused its checked copy. TypeScript reads see that object. */
+function jsFrozenGlobal(sf: ts.SourceFile, decl: ts.VariableDeclaration): boolean {
+  if (!isJsSourceFile(sf) || !ts.isIdentifier(decl.name) || decl.initializer === undefined) return false;
+  let init: ts.Expression = decl.initializer;
+  while (ts.isParenthesizedExpression(init)) init = init.expression;
+  return ts.isCallExpression(init) && ts.isPropertyAccessExpression(init.expression) &&
+    ts.isIdentifier(init.expression.expression) && init.expression.expression.text === "Object" &&
+    ["freeze", "seal", "preventExtensions"].includes(init.expression.name.text) && init.arguments.length === 1;
+}

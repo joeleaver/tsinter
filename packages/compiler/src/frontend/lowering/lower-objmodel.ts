@@ -32,6 +32,20 @@ function strip(e: ts.Expression): ts.Expression {
 export function isDynNode(L: Lowerer, node: ts.Expression): boolean {
   const t = L.typeOf(node);
   if ((t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return true;
+  // A binding that holds the dynamic value whatever its checker type (the
+  // dynamic arm, U2a; a JavaScript module global the arm keeps dynamic —
+  // zod's frozen `NEVER`): the object-model statics answer on the object.
+  let id: ts.Expression = node;
+  while (ts.isParenthesizedExpression(id)) id = id.expression;
+  if (ts.isIdentifier(id)) {
+    const sym = L.checker.getSymbolAtLocation(id);
+    if (sym !== undefined) {
+      const target = (sym.flags & ts.SymbolFlags.Alias) !== 0 ? L.checker.getAliasedSymbol(sym) : sym;
+      if (L.dynArmSyms.has(sym) || L.dynArmSyms.has(target)) return true;
+      const g = L.globalsBySymbol.get(target) ?? L.globalsBySymbol.get(sym);
+      if (g !== undefined && (g.type.kind === "dyn" || g.type.kind === "jsval")) return true;
+    }
+  }
   let m;
   try {
     m = L.mapTypeOf(t);

@@ -11028,7 +11028,28 @@ not build:
   console.log(xs)` prints `[ { a: 1 } ]` where Node prints every key):
   the parse is a value nothing else holds, so the copy keeps S009's
   tolerance rather than this observer rule.
+
+**Amendment (frozen sentinels in JavaScript, 2026-11-17).** A JavaScript
+module-scope binding initialized by `Object.freeze(…)`, `Object.seal(…)` or
+`Object.preventExtensions(…)` (zod 4.6.7's `export const NEVER =
+Object.freeze({ status: "aborted" })`, a sentinel compared by identity)
+holds the dynamic object itself from the first pass: one object, frozen as
+in Node, so `r === NEVER` across modules, `Object.isFrozen(NEVER)` and a
+write to it (ignored in sloppy code, a TypeError in a module) all answer as
+Node. Object-model statics (`isFrozen`, `freeze`, …) answer on any binding
+that holds the dynamic value, whatever its checker type. A refused copy in a
+compiled package's JavaScript, which stops only where it runs, also takes
+the dynamic arm in the next pass, as a refused copy that fails the build
+does. A read of such a sentinel that declarations type `never` (zod's
+`export declare const NEVER: never`), from TypeScript or from JavaScript
+importing it through them, is the implementation's dynamic object (S128):
+compared by identity, held in `unknown`, printed or serialized as Node does.
+A plain function that returns it (paperclip's `return z.NEVER` in a
+transform callback, whose other returns are typed) has its result on the
+dynamic arm (a `ret:` site), so the sentinel reaches its caller unchanged
+and zod's identity test sees its own object.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
+both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
 both lanes).
 
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
