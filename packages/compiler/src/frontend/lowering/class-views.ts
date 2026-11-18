@@ -560,8 +560,9 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
   const fnName = `${factory}.m.${name.replace(/[^A-Za-z0-9_$]/g, "_")}`;
   // A SHARED function (one per declaring class and method, receiver from
   // `this`) captures nothing and is lifted once.
-  // (Recorded per Lowerer: the lifted-function list drains into the module
-  // between view factories, so it cannot answer "already lifted".)
+  // (Recorded per Lowerer, before the body lowers: the lifted-function list
+  // drains into the module between view factories, and a view factory built
+  // while this body lowers reads the same method.)
   if (shared) {
     const made = sharedMethodFns(L).get(fnName);
     if (made !== undefined) {
@@ -572,6 +573,9 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
   const fixed = shapes.filter((p) => p.mode === "required" || p.mode === "omittable");
   const body: IrStmt[] = [];
   const params = fixed.map((_, i) => ({ localId: `a.${i}`, name: `a${i}`, type: JSVAL as IrType }));
+  // Recorded before the body lowers: lifting a result can build another
+  // class's view, which reads this same method and must reuse the name.
+  if (shared) sharedMethodFns(L).set(fnName, params.length);
   if (fixed.length !== shapes.length) {
     body.push(fence(`calling the method '${name}' (its rest parameter) through a class instance shared with dynamic code is not supported yet`, loc));
     body.push({ kind: "return", value: undef(loc), loc });
@@ -653,7 +657,6 @@ function boundMethodFn(L: Lowerer, factory: string, info: ClassInfo, name: strin
     loc,
   };
   L.liftedFns.push(fn);
-  if (shared) sharedMethodFns(L).set(fnName, params.length);
   const fnT: IrType = { kind: "func", params: params.map(() => JSVAL), ret: JSVAL };
   return { kind: "jsMarshal", value: { kind: "closure", fnName, captures: shared ? [] : [cap.localId], type: fnT, loc }, fnName: name, type: JSVAL, loc } as IrExpr;
 }
