@@ -7676,6 +7676,19 @@ array on the second PLAIN evaluation would show an UNMUTATED array, contradictin
 fact recorded in the rows-file battery's own reach table rather than invented as a dedicated mutant for
 this entry.
 
+**Amendment — implicit-any JavaScript tags (2026-11-17, WasmGC lanes).** A tagged template whose tag is
+an implicit-any JavaScript function (drizzle's `sql(strings, ...params)`, members merged onto it
+afterwards) compiles as that function's per-call-site implicit instance, called with the site's
+interned strings array and the substitutions at their own types. The array keeps this entry's per-site
+identity: the same object on every evaluation of a site, a distinct one per site. When the tag's body
+reads its strings parameter's `.raw` or asks `Object.isFrozen`/`isSealed`/`isExtensible` of it (or of
+its `.raw`), the instance is per SITE: `.raw` is the site's interned raw spans (escapes uncooked, `\u`
+sequences kept verbatim), and the integrity answers are Node's (frozen). A write to the strings array
+in the tag's own body (an element or `length` assignment, a mutating method) refuses by name; a write
+through an alias elsewhere is this entry's divergence as above. A template span with an invalid escape
+(Node cooks it to `undefined`) refuses by name, as before.
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..05).
+
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 
 A JS function that reads its own `arguments` binding with no declared parameters ahead of it (the sloppy-

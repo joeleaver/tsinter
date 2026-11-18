@@ -206,6 +206,10 @@ export interface GenericInstance {
    * checker type, consulted by the Lowerer's typeOf while this instance's
    * body lowers (the implicit twin of `bindings`). */
   implicitArgTypes?: Map<ts.Symbol, ts.Type>;
+  /** An implicit TAG instance whose body reads its strings array's `.raw`
+   * (or asks whether it is frozen): one instance per template SITE, which
+   * answers those reads from that site's raw spans. */
+  tplSite?: { key: string; raw: string[]; strings: ts.Symbol };
   /** Implicit instances only: eager-lowering lifecycle. "lowering" while
    * the body builds (a re-demand is same-key recursion: the caller uses
    * the PINNED fallback returnType and returnPinned locks it); "done" once
@@ -1535,6 +1539,8 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     // mapType to substitute); see the implicit-monomorphization section.
     L.implicitParamTypes =
       info.implicitParams !== undefined ? (inst.implicitArgTypes ?? new Map()) : null;
+    const prevTagSite = L.tagSite;
+    L.tagSite = inst.tplSite ?? null;
     L.instantiationContext = `instantiating '${info.baseName}' with ${inst.typeArgsText}`;
     // Coverage counts a generic source body once: re-instantiations of the
     // method AND re-instantiations of the declaring generic class re-visit
@@ -1670,6 +1676,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       L.typeParamBindings = prevBindings;
       L.typeParamTsBindings = prevTsBindings;
       L.implicitParamTypes = prevImplicit;
+      L.tagSite = prevTagSite;
       L.instantiationContext = prevContext;
       L.suppressStats = prevSuppress;
     }
@@ -2112,6 +2119,140 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     return internImplicitInstance(L, call, info, shapes, argTypes);
   }
 
+/** The per-call-site instance of an implicit-any JavaScript TAG function:
+   * its first parameter bound to TemplateStringsArray (the site's interned
+   * strings array), the rest to the substitutions' own types — the
+   * implicitCallInstance rules over the tag's argument list. */
+  export function implicitTagInstance(L: Lowerer, expr: ts.TaggedTemplateExpression, info: GenericFnInfo, values: readonly ts.Expression[], site: { key: string; raw: string[] }): GenericInstance {
+    const shapes: ParamShape[] = [];
+    const argTypes = new Map<ts.Symbol, ts.Type>();
+    info.decl.parameters.forEach((param, i) => {
+      const sym = info.implicitParams![i];
+      if (!sym) {
+        shapes.push(L.paramShape(param));
+        return;
+      }
+      let bound: IrType = DYN;
+      const t = i === 0 ? templateStringsArrayType(L) : (() => {
+        const arg = values[i - 1];
+        return arg === undefined ? undefined : L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
+      })();
+      if (t !== undefined) {
+        const mapped = L.mapTypeOf(t);
+        if (bindableImplicitIr(mapped)) {
+          bound = mapped;
+          argTypes.set(sym, t);
+        }
+      }
+      shapes.push({ type: bound, mode: "required" });
+    });
+    // Per SITE only when the body observes what is per site beyond the
+    // cooked spans: `.raw`, or whether the array is frozen.
+    const p0 = info.decl.parameters[0];
+    const s0 = p0 !== undefined && ts.isIdentifier(p0.name) ? L.checker.getSymbolAtLocation(p0.name) : undefined;
+    const perSite = s0 !== undefined && info.decl.body !== undefined && tagBodyObservesSite(L, info.decl.body, s0);
+    return internImplicitInstance(L, expr, info, shapes, argTypes, perSite ? { ...site, strings: s0! } : undefined);
+  }
+
+  function tagBodyObservesSite(L: Lowerer, body: ts.Node, sym: ts.Symbol): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isIdentifier(n) && L.checker.getSymbolAtLocation(n) === sym) {
+        const p = n.parent;
+        if ((ts.isPropertyAccessExpression(p) && p.expression === n && p.name.text === "raw") ||
+          (ts.isCallExpression(p) && p.arguments.includes(n))) found = true;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return found;
+  }
+
+  /** Inside a per-site tag instance: is `e` the strings parameter itself
+   * ("strings"), its `.raw` ("raw"), or neither? */
+  export function tagStringsRefOf(L: Lowerer, e: ts.Expression): "strings" | "raw" | null {
+    const site = L.tagSite;
+    if (site === null) return null;
+    let x = e;
+    while (ts.isParenthesizedExpression(x)) x = x.expression;
+    if (ts.isIdentifier(x)) return L.checker.getSymbolAtLocation(x) === site.strings ? "strings" : null;
+    if (ts.isPropertyAccessExpression(x) && x.name.text === "raw" && ts.isIdentifier(x.expression) &&
+      L.checker.getSymbolAtLocation(x.expression) === site.strings) return "raw";
+    return null;
+  }
+
+  /** TemplateStringsArray's `raw` member type. */
+  export function tagRawType(L: Lowerer): ts.Type | undefined {
+    const tsa = templateStringsArrayType(L);
+    if (tsa === undefined) return undefined;
+    const raw = L.checker.getPropertiesOfType(tsa).find((p) => p.name === "raw");
+    return raw === undefined ? undefined : L.checker.getTypeOfSymbol(raw);
+  }
+
+  /** The standard library's TemplateStringsArray type (memoized). */
+  const tsaTypes = new WeakMap<Lowerer, ts.Type | null>();
+  function templateStringsArrayType(L: Lowerer): ts.Type | undefined {
+    let t = tsaTypes.get(L);
+    if (t === undefined) {
+      t = null;
+      for (const sf of L.program.getSourceFiles()) {
+        if (!sf.isDeclarationFile || !/lib\.es5\.d\.ts$/.test(sf.fileName)) continue;
+        for (const st of sf.statements) {
+          if (ts.isInterfaceDeclaration(st) && st.name.text === "TemplateStringsArray") {
+            t = L.checker.getTypeAtLocation(st.name);
+            break;
+          }
+        }
+        if (t !== null) break;
+      }
+      tsaTypes.set(L, t);
+    }
+    return t ?? undefined;
+  }
+
+  /** A tag's strings parameter is frozen in Node (a write throws in module
+   * code): a write to it in the tag's own body — an element or `length`
+   * assignment, a mutating method — refuses by name. (A write through an
+   * alias elsewhere is S080's registered divergence.) */
+  function fenceTagStringsEscape(L: Lowerer, info: GenericFnInfo, blame: ts.Node): void {
+    const p0 = info.decl.parameters[0];
+    if (p0 === undefined || !ts.isIdentifier(p0.name) || info.decl.body === undefined) return;
+    const sym = L.checker.getSymbolAtLocation(p0.name);
+    if (sym === undefined) return;
+    let bad: ts.Node | null = null;
+    const visit = (n: ts.Node): void => {
+      if (bad !== null) return;
+      if (ts.isIdentifier(n) && n !== p0.name && L.checker.getSymbolAtLocation(n) === sym) {
+        let use: ts.Node = n;
+        while (ts.isParenthesizedExpression(use.parent)) use = use.parent;
+        const par = use.parent;
+        const MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin"]);
+        const writes =
+          (ts.isElementAccessExpression(par) && par.expression === use && isWriteTarget(par)) ||
+          (ts.isPropertyAccessExpression(par) && par.expression === use &&
+            (isWriteTarget(par) || (MUTATORS.has(par.name.text) && ts.isCallExpression(par.parent) && par.parent.expression === par)));
+        if (writes) bad = n;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(info.decl.body);
+    if (bad !== null) {
+      L.unsupported("SC1090", bad, "writing a tag function's strings array (Node's array is frozen, and the write throws in module code)");
+    }
+    void blame;
+  }
+
+  function isWriteTarget(n: ts.Node): boolean {
+    const p = n.parent;
+    if (ts.isBinaryExpression(p) && p.left === n && p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && p.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return true;
+    if ((ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) &&
+      (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken)) return true;
+    return ts.isDeleteExpression(p);
+  }
+
 /** The all-dyn DEFAULT instance — today's compiled body exactly: what a
    * VALUE reference of an implicit-any function names (indirect calls
    * carry no per-site types to bind). */
@@ -2133,8 +2274,9 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
   function internImplicitInstance(L: Lowerer, blame: ts.Node,
     info: GenericFnInfo,
     shapes: ParamShape[],
-    argTypes: Map<ts.Symbol, ts.Type>,): GenericInstance {
-    const key = shapes.map((s) => typeKey(s.type)).join(",");
+    argTypes: Map<ts.Symbol, ts.Type>,
+    tplSite?: GenericInstance["tplSite"],): GenericInstance {
+    const key = shapes.map((s) => typeKey(s.type)).join(",") + (tplSite !== undefined ? `|tpl:${tplSite.key}` : "");
     let inst = info.instances.get(key);
     if (inst?.implicitState === "failed") {
       // The instance's body did not compile (its own diagnostic is
@@ -2167,6 +2309,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       bindings: new Map(),
       typeArgsText: `(${rendered.length > 80 ? rendered.slice(0, 77) + "..." : rendered})`,
       implicitArgTypes: argTypes,
+      ...(tplSite !== undefined ? { tplSite } : {}),
       implicitState: "lowering",
       ...(declared === null ? { implicitInferReturn: true as const } : {}),
     };
@@ -6556,8 +6699,20 @@ const inliningPredicates = new Set<ts.Symbol>();
     if (ts.isIdentifier(expr.tag) && !L.isSelfReference(expr.tag)) {
       if (L.isTopLevelFnSymbol(expr.tag) && !L.peekLocal(expr.tag)) {
         fenceEarlyAliasUse(L, expr.tag, expr);
-        if (L.genericFnOf(expr.tag)) {
-          L.unsupported("SC1090", expr, "tagged templates with generic tag functions");
+        {
+          const g = L.genericFnOf(expr.tag);
+          // An implicit-any JAVASCRIPT tag (drizzle's `sql(strings,
+          // ...params)`): the per-call-site implicit instance, its strings
+          // parameter bound to the site's TemplateStringsArray and each
+          // substitution to its own type, called like any implicit-any
+          // function. TypeScript generic tags keep the fence.
+          if (g !== null && g.implicitParams !== undefined && isJsSourceFile(g.decl.getSourceFile())) {
+            fenceTagStringsEscape(L, g, expr);
+            const instance = implicitTagInstance(L, expr, g, values, { key: `${loc.file}:${expr.template.getStart()}`, raw: pieces.map((p) => templateRawTextOf(p)) });
+            const args = completeArgs(L, values, instance.params, loc, expr, [strings]);
+            return { kind: "call", callee: instance.name, args, type: instance.returnType, loc };
+          }
+          if (g) L.unsupported("SC1090", expr, "tagged templates with generic tag functions");
         }
         const sig = L.fnSigOf(expr.tag);
         if (sig) {

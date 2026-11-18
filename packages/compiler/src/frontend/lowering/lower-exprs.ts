@@ -35,7 +35,7 @@ import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUn
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
 import { assignsThisMemberConditionally, classInstanceMemberNames, findGenericMethodOn, lowerStaticFieldRead, type ClassInfo } from "./lower-classes.js";
-import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver, staticKindTest } from "./lower-calls.js";
+import { bindingNeverReassigned, tagStringsRefOf, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver, staticKindTest } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
@@ -2635,6 +2635,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // Optional chaining `a?.b`: the guard lowers here (a tag test around
       // the plain property lowering below); the handled marker keeps this
       // re-entrant dispatch from looping.
+      // A per-site tag instance's `strings.raw` (lower-calls.ts
+      // implicitTagInstance): the site's interned raw spans — one array
+      // per site, as Node's.
+      if (!expr.questionDotToken && tagStringsRefOf(L, expr) === "raw" && L.tagSite !== null) {
+        return { kind: "templateStrings", key: `${L.tagSite.key}#raw`, cooked: L.tagSite.raw, type: arrayOf(STRING), loc: locOf(expr) };
+      }
       if (expr.questionDotToken && !L.chainHandled.has(expr)) {
         // (`process.versions?.electron`: versions is never nullish, and the
         // probe reads undefined — no guard to build.)

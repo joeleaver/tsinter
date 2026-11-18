@@ -10,7 +10,7 @@ import { PoisonError, boxFactsOf, fnProtoOfValueNode, nodeThrowExpr, type Lowere
 import { BOOL, DYN, F64, JSVAL, STRING, typeEquals, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 import { locOf } from "../program.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { lowerHasOwnCall } from "./lower-calls.js";
+import { lowerHasOwnCall, tagStringsRefOf } from "./lower-calls.js";
 import { isJsSourceFileName } from "../shared.js";
 import { stdlibGlobalNameOf } from "./surfaces.js";
 import { declaredDynamicSymbol } from "../types.js";
@@ -174,6 +174,10 @@ export function lowerObjModelStatic(L: Lowerer, call: ts.CallExpression, member:
     case "isFrozen":
     case "isSealed":
     case "isExtensible": {
+      // A tag's strings array and its `.raw` are frozen in Node.
+      if (args.length >= 1 && tagStringsRefOf(L, args[0]!) !== null) {
+        return { kind: "boolLit", value: member !== "isExtensible", type: BOOL, loc };
+      }
       if (!dyn0) return null;
       const level = member === "isFrozen" ? 2 : member === "isSealed" ? 1 : 0;
       return lib("om.isIntegrity", [js(L, args[0]!), { kind: "numLit", value: level, type: F64, loc }], loc, BOOL);

@@ -125,7 +125,7 @@ import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, 
 import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
 import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
-import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
+import { lowerRecordFieldCall, lowerObjectMethodCall, tagRawType, tagStringsRefOf, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, moduleNsSourceFileOf, nsPathPrefix } from "./lower-namespaces.js";
 
 /** Entry function name. '%' cannot appear in a TS identifier, so a user
@@ -1339,6 +1339,10 @@ export class Lowerer {
    * typeParamBindings — the checker has no `T` to substitute, so the
    * binding rides the node-type accessor instead of mapType. */
   implicitParamTypes: Map<ts.Symbol, ts.Type> | null = null;
+  /** The template site a per-site implicit tag instance is lowering for
+   * (lower-calls.ts implicitTagInstance): its strings parameter's `.raw`
+   * and frozen-ness answer from it. */
+  tagSite: { key: string; raw: string[]; strings: ts.Symbol } | null = null;
   /** IMPLICIT-ANY instances lowered EAGERLY at first demand (their return
    * types are inferred from the body — the call site needs them settled),
    * collected here for run()'s function list (the liftedFns discipline). */
@@ -3832,6 +3836,13 @@ export class Lowerer {
   }
 
   typeOf(node: ts.Node): ts.Type {
+    // A per-site tag instance's `strings.raw`: TemplateStringsArray's own
+    // `raw` member type (the strings parameter is implicit-any to the
+    // checker; its binding answers the identifier, this the member).
+    if (this.tagSite !== null && ts.isPropertyAccessExpression(node) && tagStringsRefOf(this, node) === "raw") {
+      const rawT = tagRawType(this);
+      if (rawT !== undefined) return rawT;
+    }
     // Units U3 + U4: Error / Object / globalThis taken as values are
     // dynamic values.
     if (ts.isIdentifier(node) && (node.text === "Error" || node.text === "Object" || node.text === "globalThis" || node.text === "global" || this.stdlibGlobalAliases.size > 0) && builtinBoxPosition(this, node) !== null) {
