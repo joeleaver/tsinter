@@ -5845,6 +5845,11 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
         const receiver = L.lowerExpr(expr.expression);
         return { kind: "libCall", fn: name === "username" ? "url.username" : "url.password", args: [receiver], type: STRING, loc: locOf(expr) };
       }
+      // port and origin (paperclip's stdlib batch 3; WasmGC lanes)
+      if ((name === "port" || name === "origin") && L.sharedDynamic) {
+        const receiver = L.lowerExpr(expr.expression);
+        return { kind: "libCall", fn: name === "port" ? "url.port" : "url.origin", args: [receiver], type: STRING, loc: locOf(expr) };
+      }
       if (name === "protocol" || name === "pathname" || name === "href" || name === "host" || name === "hostname" || name === "search" || name === "hash") {
         const receiver = L.lowerExpr(expr.expression);
         const fn =

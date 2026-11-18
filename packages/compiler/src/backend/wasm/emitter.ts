@@ -1450,6 +1450,14 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fsp.openNum" ||
         node.startsWith("fh.") ||
         node === "fs.realpathSync" ||
+        // paperclip's stdlib batch 3
+        node === "fs.renameSync" ||
+        node === "fs.linkSync" ||
+        node === "fs.symlinkSync" ||
+        node === "fs.readlinkSync" ||
+        node === "fs.fsyncSync" ||
+        node === "fs.openSyncMode" ||
+        node === "fs.copyFileExclSync" ||
         // The ten fsp promise twins (design §6.5): SYNCHRONOUS syscall +
         // an already-settled promise, so they mint fsCall exactly like
         // their sync siblings — no new import kind, no async machinery.
@@ -30481,10 +30489,35 @@ class Assembler {
           this.releaseScratch(this.strRef, PATH);
           return;
         }
-        if (e.fn === "fs.copyFileSync") {
+        if (e.fn === "fs.copyFileSync" || e.fn === "fs.copyFileExclSync" || e.fn === "fs.renameSync" || e.fn === "fs.linkSync" || e.fn === "fs.symlinkSync") {
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
-          code.call(this.fs.copyFileSyncHelper());
+          code.call(
+            e.fn === "fs.copyFileSync" ? this.fs.copyFileSyncHelper()
+              : e.fn === "fs.copyFileExclSync" ? this.fs.copyFileExclSyncHelper()
+              : e.fn === "fs.renameSync" ? this.fs.renameSyncHelper()
+                : e.fn === "fs.linkSync" ? this.fs.linkSyncHelper()
+                  : this.fs.symlinkSyncHelper(),
+          );
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readlinkSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.readlinkSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.fsyncSync") {
+          // Node's getValidatedFd: an integer in [0, 2^31 - 1]
+          const fdl = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(fdl);
+          this.emitNetInt32Check(code, () => code.localGet(fdl), "fd", 0);
+          code.localGet(fdl);
+          this.releaseScratch(F64, fdl);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.fsyncSyncHelper());
           this.emitPendingCheck();
           return;
         }
@@ -30545,7 +30578,7 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
-        if (e.fn === "fs.openSync") {
+        if (e.fn === "fs.openSync" || e.fn === "fs.openSyncMode") {
           // args[1] (flags) MUST be a compile-time STRING LITERAL — Node's
           // own flag strings map to a SMALL FIXED ENUM this tier's host
           // contract shares with 3D's adapter (never raw POSIX bits, which
@@ -30584,7 +30617,11 @@ class Assembler {
             return;
           }
           code.i32Const(flagCode);
-          code.call(this.fs.openSyncHelper());
+          if (e.fn === "fs.openSyncMode") {
+            this.walkExpr(e.args[2]!);
+            code.call(this.toInt32Helper());
+          }
+          code.call(this.fs.openSyncHelper(e.fn === "fs.openSyncMode"));
           this.emitPendingCheck();
           return;
         }
@@ -31358,6 +31395,16 @@ class Assembler {
           code.call(this.big.fromBits(true));
           return;
         }
+        if (e.fn === "stats.num") {
+          const f = e.args[1];
+          const slot = f?.kind === "strLit" ? STAT_RAW.indexOf(f.value) : -1;
+          if (slot < 0) throw new Error("emitter bug: stats.num field");
+          this.walkExpr(e.args[0]!);
+          code.i32Const(slot);
+          code.call(this.fs.statsRawHelper());
+          code.f64ConvertI64S();
+          return;
+        }
         if (e.fn === "stats.isKind") {
           const f = e.args[1];
           const want = f?.kind === "strLit" ? ({ block: 0o060000n, char: 0o020000n, fifo: 0o010000n, socket: 0o140000n } as Record<string, bigint>)[f.value] : undefined;
@@ -31974,6 +32021,12 @@ class Assembler {
             // ICU's root collation (collation.ts, SEMANTICS.md S120)
             this.walkExpr(e.args[0]!);
             code.call(this.collation.compare());
+            code.f64ConvertI32S();
+            return;
+          case "localeCompareBase":
+            // the same collation at primary strength ({ sensitivity: "base" })
+            this.walkExpr(e.args[0]!);
+            code.call(this.collation.compare(true));
             code.f64ConvertI32S();
             return;
           case "toLowerCase":
@@ -40768,6 +40821,22 @@ class Assembler {
         //      instead, and this reuse would very likely break.
         //   unions.ts's own "two unions' arms never intern one type"
         //   comment predates this finding and is corrected alongside it.
+        // A dyn-valued map (a value shared with dynamic code): the miss is
+        // the dyn undefined itself.
+        if (rt.value.kind === "dyn" && e.type.kind === "dyn") {
+          this.walkExpr(e.receiver);
+          this.walkExpr(e.args[0]!);
+          code.call(this.maps.get(info));
+          const val = this.acquireScratch(info.valVal);
+          code.localSet(val);
+          this.openIfResult(info.valVal);
+          code.localGet(val);
+          code.else_();
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.close();
+          this.releaseScratch(info.valVal, val);
+          return;
+        }
         if (e.type.kind !== "union") throw new Error("map get result is not a union");
         const undefTag = this.undefinedArmTag(e.type.unionId);
         if (undefTag < 0) throw new Error("map get union lacks its undefined arm");
@@ -44098,6 +44167,10 @@ class Assembler {
         return simple(() => W().usernameFn(), false);
       case "url.password":
         return simple(() => W().passwordFn(), false);
+      case "url.port":
+        return simple(() => W().portFn(), false);
+      case "url.origin":
+        return simple(() => W().originFn(), false);
       case "url.pathname":
         return simple(() => W().pathnameFn(), false);
       case "url.search":

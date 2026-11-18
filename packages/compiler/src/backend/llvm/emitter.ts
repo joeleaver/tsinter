@@ -9087,6 +9087,8 @@ class LlEmitter {
       // (SEMANTICS.md S120; scr_string.c)
       case "localeCompare":
         return call("scr_str_locale_compare", "double (ptr, ptr)", `ptr ${r.name}, ptr ${args[0]!.name}`, "double", false);
+      case "localeCompareBase":
+        throw new Error("llvm emitter bug: localeCompareBase is a WasmGC-lane intrinsic (the frontend refuses it here)");
       case "cpAt":
         // The code point AT an index as a one-code-point string (+1) —
         // the string-for-of desugar's read.

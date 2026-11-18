@@ -437,6 +437,187 @@ console.log("before");
 console.log(protos());`,
     extra: { "p.js": `export function protos() { return typeof Error.prototype; }` },
   },
+  // ── batch 3 (paperclip's third SC2020 batch) ──────────────────────────
+  {
+    id: "SB-20 a module-level sort by localeCompare(b, 'en', { sensitivity: 'base' }) (paperclip's app catalog): primary strength — case and accents tie, punctuation counts",
+    src: `const entries = new Map<string, { name: string; slug: string }>();
+for (const [name, slug] of [["beta", "b"], ["Alpha", "a"], ["alpha", "c"], ["Émile", "e"], ["emile", "d"], ["Zed", "z"], ["a-b", "ab"], ["ab", "ab2"], ["Ab", "ab3"], ["Ærø", "ae"], ["aero", "ae2"], ["日本", "jp"], ["ß", "ss"], ["ss", "ss2"]] as const) entries.set(slug, { name, slug });
+export const SORTED = [...entries.values()].sort((a, b) =>
+  a.name.localeCompare(b.name, "en", { sensitivity: "base" }) || a.slug.localeCompare(b.slug));
+console.log(SORTED.map((e) => e.slug).join(","));
+console.log(["a", "A", "á", "b", "", "a b", "ab"].map((x) => ["a", "A", "á", "b", "", "a b", "ab"].map((y) => x.localeCompare(y, "en-US", { sensitivity: "base" })).join(" ")).join(" | "));`,
+  },
+  {
+    id: "SB-21 readonly-tuple-constrained generic join (paperclip's presetSchema<T extends readonly number[]>) and a readonly tuple's includes over a cast argument",
+    src: `const DAILY = [3, 7, 14] as const;
+const WEEKLY = [1, 2, 4] as const;
+function presetMessage<T extends readonly number[]>(presets: T, label: string) {
+  return \`\${label} must be one of: \${presets.join(", ")}\`;
+}
+console.log(presetMessage(DAILY, "dailyDays"), "|", presetMessage(WEEKLY, "weeklyWeeks"));
+const SOURCES = ["timer", "assignment", "on_demand", "automation"] as const;
+type Source = (typeof SOURCES)[number];
+const opts: { source: string } = { source: "timer" };
+const pick = (o: { source: string }) => (SOURCES.includes(o.source as Source) ? (o.source as Source) : "on_demand");
+console.log(pick(opts), pick({ source: "nope" }), SOURCES.includes(opts.source as Source));`,
+  },
+  {
+    id: "SB-22 new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }) at module level (paperclip's zip-entry decoder): the BOM kept, ill-formed input throws Node's TypeError",
+    src: `const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const loose = new TextDecoder();
+function dec(d: typeof strict, b: Uint8Array): string {
+  try { return JSON.stringify(d.decode(b)); } catch (e) { const err = e as NodeJS.ErrnoException; return \`\${err.name} \${err.code} \${err.message}\`; }
+}
+const cases = [new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69]), new Uint8Array([0x68, 0xff, 0x69]), new Uint8Array([0xe2, 0x82]), new Uint8Array([0xed, 0xa0, 0x80]), new Uint8Array([0xf0, 0x9f, 0x98, 0x80]), new Uint8Array([])];
+for (const c of cases) console.log(dec(strict, c), "/", dec(loose, c));
+console.log(strict.encoding, new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(new Uint8Array([0xef, 0xbb, 0xbf])).length);`,
+    nodeTypes: true,
+  },
+  {
+    id: "SB-23 URL port and origin (paperclip's hostPortKey, trusted-origins default, github URL check)",
+    nodeTypes: true,
+    src: `for (const s of ["https://github.com/a/b", "http://h:8080/x", "https://h:443/", "postgres://u:p@db:5433/x", "file:///tmp/x", "blob:https://a.com:9/x", "blob:file:///x", "data:text/plain,hi", "ws://h:80", "wss://H:444", "ftp://f:21/"]) {
+  const u = new URL(s);
+  console.log(JSON.stringify(u.port), u.origin, \`\${u.hostname}:\${u.port || "5432"}\`);
+}`,
+  },
+  {
+    id: "SB-24 renameSync, linkSync, symlinkSync (with a type), readlinkSync and fsyncSync (paperclip's install store and config writes): Node's results and two-path errors",
+    nativeOnly: true,
+    nodeTypes: true,
+    src: `import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+const d = fs.mkdtempSync(path.join(os.tmpdir(), "sb24-"));
+const show = (err: NodeJS.ErrnoException) => { console.log(err.code, err.message.split(d).join("<D>")); };
+fs.writeFileSync(path.join(d, "a"), "A");
+fs.renameSync(path.join(d, "a"), path.join(d, "b"));
+console.log(fs.existsSync(path.join(d, "a")), fs.readFileSync(path.join(d, "b"), "utf8"));
+try { fs.renameSync(path.join(d, "a"), path.join(d, "c")); } catch (e) { show(e as NodeJS.ErrnoException); }
+fs.linkSync(path.join(d, "b"), path.join(d, "h"));
+try { fs.linkSync(path.join(d, "b"), path.join(d, "h")); } catch (e) { show(e as NodeJS.ErrnoException); }
+console.log(fs.statSync(path.join(d, "h")).nlink, fs.lstatSync(path.join(d, "b")).nlink);
+fs.symlinkSync("b", path.join(d, "s"));
+fs.mkdirSync(path.join(d, "dir"));
+fs.symlinkSync("dir", path.join(d, "sd"), "dir");
+console.log(fs.readlinkSync(path.join(d, "s")), fs.readlinkSync(path.join(d, "sd")), fs.lstatSync(path.join(d, "s")).isSymbolicLink());
+try { fs.symlinkSync("x", path.join(d, "s")); } catch (e) { show(e as NodeJS.ErrnoException); }
+try { fs.readlinkSync(path.join(d, "b")); } catch (e) { show(e as NodeJS.ErrnoException); }
+try { fs.readlinkSync(path.join(d, "missing")); } catch (e) { show(e as NodeJS.ErrnoException); }
+const fd = fs.openSync(path.join(d, "f"), "w");
+fs.fsyncSync(fd);
+fs.closeSync(fd);
+try { fs.fsyncSync(fd); } catch (e) { show(e as NodeJS.ErrnoException); }
+try { fs.renameSync(path.join(d, "b"), path.join(d, "dir")); } catch (e) { show(e as NodeJS.ErrnoException); }
+fs.rmSync(d, { recursive: true, force: true });
+console.log("done");`,
+  },
+  {
+    id: "SB-25 a plain Stats' mode, uid and nlink (paperclip's ownership and permission checks)",
+    nativeOnly: true,
+    nodeTypes: true,
+    src: `import * as fs from "node:fs";
+import { statSync, chmodSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+const d = fs.mkdtempSync(path.join(os.tmpdir(), "sb25-"));
+const f = path.join(d, "f");
+fs.writeFileSync(f, "x", { mode: 0o640 });
+chmodSync(f, 0o640);
+const st = fs.lstatSync(f);
+console.log((st.mode & 0o777).toString(8), (st.mode & 0o022) !== 0, st.uid === process.getuid?.(), st.nlink, st.isFile(), st.size);
+chmodSync(f, statSync(f).mode & 0o700);
+console.log((fs.statSync(f).mode & 0o777).toString(8));
+fs.rmSync(d, { recursive: true, force: true });`,
+  },
+  {
+    id: "SB-26 paperclip's module-level Intl.DateTimeFormat (en-US, UTC, long month, h:mm a z): format over time values; TimeClip's RangeError",
+    src: `const HUMAN = new Intl.DateTimeFormat("en-US", { year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZone: "UTC", timeZoneName: "short" });
+export function fmt(ms: number): string { return HUMAN.format(ms); }
+console.log([0, 1777378620000, 951782400000, 1e12, -1e10, 253402300799999, 43200000, 3600000 * 13 + 60000 * 5, -62135596800000, 8.64e15].map(fmt).join(" | "));
+for (const bad of [NaN, 8.64e15 + 1, Infinity]) { try { fmt(bad); } catch (e) { console.log((e as Error).name, (e as Error).message); } }`,
+  },
+  {
+    id: "SB-27 WeakRef and FinalizationRegistry at module level (paperclip's client registry): deref answers the target, register checks and keeps nothing observable",
+    src: `type Client = { name: string };
+const byKey = new Map<string, Set<WeakRef<Client>>>();
+const fin = new FinalizationRegistry<{ key: string; ref: WeakRef<Client> }>(({ key, ref }) => {
+  const refs = byKey.get(key);
+  if (!refs) return;
+  refs.delete(ref);
+});
+export function reg(key: string, c: Client): void {
+  const ref = new WeakRef(c);
+  let refs = byKey.get(key);
+  if (!refs) { refs = new Set(); byKey.set(key, refs); }
+  refs.add(ref);
+  fin.register(c, { key, ref }, ref);
+}
+const a = { name: "a" };
+reg("h:1", a);
+reg("h:1", { name: "b" });
+const set = byKey.get("h:1");
+if (set) for (const r of set) console.log(r.deref()?.name, r.deref() === a);
+const o = {};
+const w = new WeakRef(o);
+console.log(w.deref() === o, typeof fin);`,
+  },
+  {
+    id: "SB-28 new Map(rows.map((r) => [r.id, r])) over rows shared with dynamic code (paperclip's drizzle rows with a Date member): get, has, size, keys, explicit value types",
+    src: `interface Row { id: string; name: string; parentId: string | null; createdAt: Date; n: number }
+function depthOf(rows: Row[]): string[] {
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const byKey = new Map(rows.map((r) => [\`\${r.id}:\${r.n}\`, r]));
+  const numbers = new Map<string, number>(rows.map((r) => [r.id, r.n]));
+  const depth = new Map<string, number>();
+  const d = (r: Row): number => {
+    const known = depth.get(r.id);
+    if (known !== undefined) return known;
+    if (!r.parentId) { depth.set(r.id, 0); return 0; }
+    const parent = byId.get(r.parentId);
+    if (!parent) { depth.set(r.id, 0); return 0; }
+    const v = d(parent) + 1;
+    depth.set(r.id, v);
+    return v;
+  };
+  return [...rows].sort((x, y) => d(x) - d(y)).map((r) => \`\${r.name}:\${d(r)}:\${byId.has(r.id)}:\${byId.get(r.id)?.name ?? "-"}:\${numbers.get(r.id)}:\${byKey.size}\`).concat([...byKey.keys()].join("|"), String(byId.get("zz")));
+}
+const rows = JSON.parse('[{"id":"c","name":"C","parentId":"b","createdAt":"x","n":3},{"id":"a","name":"A","parentId":null,"createdAt":"x","n":1},{"id":"b","name":"B","parentId":"a","createdAt":"x","n":2},{"id":"a","name":"A2","parentId":null,"createdAt":"x","n":4}]') as Row[];
+console.log(depthOf(rows).join(","));`,
+  },
+  {
+    id: "SB-29 small batch-3 shapes: Object.hasOwn with a narrowed unknown key, Number.isInteger over number | undefined, process.stdout.columns ?? n, crypto.randomInt, process.version's shape, p.catch(() => undefined)",
+    nodeTypes: true,
+    src: `import { randomInt } from "node:crypto";
+export const METHODS = { github: ["repo", "issues"], linear: ["issues"] } as const;
+export function isId(value: unknown): value is keyof typeof METHODS { return typeof value === "string" && Object.hasOwn(METHODS, value); }
+console.log(isId("github"), isId("toString"), isId(3), isId("linear"));
+const entries: { idx?: number; tag: string }[] = [{ idx: 2, tag: "a" }, { tag: "b" }, { idx: 1.5, tag: "c" }];
+console.log(entries.map((e, i) => (Number.isInteger(e.idx) ? Number(e.idx) : i)).join(","));
+console.log(Math.max(60, process.stdout.columns ?? 100));
+const xs = Array.from({ length: 500 }, () => randomInt(0, 360));
+console.log(xs.every((x) => Number.isInteger(x) && x >= 0 && x < 360), new Set(xs).size > 100);
+console.log(/^v\\d+\\.\\d+\\.\\d+$/.test(process.version), process.version === \`v\${process.versions.node}\`);
+async function stop(): Promise<void> { throw new Error("no"); }
+async function main() { await stop().catch(() => undefined); console.log("caught"); }
+await main();`,
+  },
+  {
+    id: "SB-30 Array.from(map, ([k, v], i) => ...) walks the live entries (paperclip's env-file writer); JSON.stringify(v, null, c ? 2 : 0); Date.now and console.error as default function values",
+    src: `const missing = new Map<string, string>([["A", "1"], ["B", "2"]]);
+console.log(JSON.stringify(Array.from(missing, ([key, value]) => ({ contents: \`\${key}=\${value}\`, ending: "\\n" }))));
+const m2 = new Map<string, number>([["a", 1], ["b", 2], ["c", 3]]);
+console.log(Array.from(m2, ([k, v], i) => { if (k === "a") { m2.delete("b"); m2.set("d", 4); } return \`\${i}:\${k}=\${v}\`; }).join(","));
+function writeResult(value: unknown, options: { json?: boolean }) { process.stdout.write(\`\${JSON.stringify(value, null, options.json ? 2 : 0)}\\n\`); }
+writeResult({ a: [1, { b: 2 }] }, { json: true });
+writeResult({ a: [1] }, {});
+writeResult(undefined, { json: true });
+export function capture(now: () => number = Date.now): boolean { return now() > 1e12; }
+console.log(capture(), capture(() => 5));
+export function login(raw: string, notify: (message: string) => void = console.error) { notify(raw); }
+login("to stderr");
+login("x", (m) => console.log("got", m));`,
+  },
 ];
 
 function write(row: Row, backend: string): string {

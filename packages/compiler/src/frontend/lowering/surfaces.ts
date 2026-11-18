@@ -637,6 +637,14 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     // realpath(3) — Node's realpathSync (failures spell syscall "lstat",
     // Node's own message shape).
     realpathSync: { fn: "fs.realpathSync", params: [STRING], result: STRING },
+    // Paperclip's stdlib batch 3 (WasmGC lanes; the legacy lanes refuse
+    // them, SC3003): the two-path ops, readlink and fsync. symlinkSync's
+    // third (type) argument is special-cased (lowerBuiltinModuleCall).
+    renameSync: { fn: "fs.renameSync", params: [STRING, STRING], result: VOID },
+    linkSync: { fn: "fs.linkSync", params: [STRING, STRING], result: VOID },
+    symlinkSync: { fn: "fs.symlinkSync", params: [STRING, STRING], result: VOID },
+    readlinkSync: { fn: "fs.readlinkSync", params: [STRING], result: STRING },
+    fsyncSync: { fn: "fs.fsyncSync", params: [F64], result: VOID },
     // The fd pair behind spawn's fd-stdio form (the daemon-log idiom:
     // openSync(logPath, "a") → spawn stdio ["ignore", fd, fd] →
     // closeSync). openSync takes Node's string flags ("r", "w", "a", the

@@ -1847,6 +1847,57 @@ export class UrlEngine {
     });
   }
 
+  /** url.port: the port's digits, "" when absent (a default port is
+   * stored absent, as WHATWG's parser drops it). */
+  portFn(): number {
+    return this.fn("port", [this.urlRef()], [this.sRef], (f, $) => {
+      const O = f.local(this.obRef);
+      const p = $.get(this.urlType(), U_PORT, $.l(0));
+      $.if($.lt(p, $.i(0)), () => $.ret($.anew(this.S, $.i(0))));
+      $.put(O, this.obNew($));
+      $.run(this.itoaFn(), $.l(O), p);
+      $.do(this.obStr($, $.l(O)));
+    });
+  }
+
+  /** url.origin (ada's url_aggregator::get_origin): a special non-file
+   * URL's scheme "://" host[:port]; a blob: URL's is its path's, parsed
+   * as a URL, when that is http or https; "null" otherwise. */
+  originFn(): number {
+    return this.fn("origin", [this.urlRef()], [this.sRef], (f, $) => {
+      const O = f.local(this.obRef);
+      const IN = f.local(this.urlRef());
+      const g = (i: number): X => $.get(this.urlType(), i, $.l(0));
+      const nul = (): void => {
+        $.put(O, this.obNew($));
+        this.pushLit($, $.l(O), "null");
+        $.ret(this.obStr($, $.l(O)));
+      };
+      const t = g(U_TYPE);
+      $.if($.both($.ne(t, $.i(T_NOT_SPECIAL)), $.ne(t, $.i(T_FILE))), () => {
+        $.put(O, this.obNew($));
+        $.run(this.obAppendStrFn(), $.l(O), g(U_SCHEME));
+        this.pushLit($, $.l(O), "://");
+        $.run(this.obAppendStrFn(), $.l(O), $.call(this.hostFn(), $.l(0)));
+        $.ret(this.obStr($, $.l(O)));
+      });
+      const sch = g(U_SCHEME);
+      const isBlob = $.andThen(
+        $.eq($.alen(sch), $.i(4)),
+        $.andThen(
+          $.eq($.agetU(this.S, sch, $.i(0)), $.i(98)),
+          $.andThen($.eq($.agetU(this.S, sch, $.i(1)), $.i(108)), $.both($.eq($.agetU(this.S, sch, $.i(2)), $.i(111)), $.eq($.agetU(this.S, sch, $.i(3)), $.i(98)))),
+        ),
+      );
+      $.if($.not(isBlob), () => nul());
+      $.put(IN, $.call(this.parseOrNullFn(), g(U_PATH)));
+      $.if($.isNull($.l(IN)), () => nul());
+      const it = $.get(this.urlType(), U_TYPE, $.l(IN));
+      $.if($.both($.ne(it, $.i(T_HTTP)), $.ne(it, $.i(T_HTTPS))), () => nul());
+      $.do($.call(this.originFn(), $.l(IN)));
+    });
+  }
+
   pathnameFn(): number {
     return this.fn("pathname", [this.urlRef()], [this.sRef], (_f, $) => {
       $.do($.get(this.urlType(), U_PATH, $.l(0)));

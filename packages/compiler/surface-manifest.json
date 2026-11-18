@@ -909,6 +909,18 @@
       "status": "static"
     },
     {
+      "id": "node-builtin.fs.fsyncSync",
+      "kind": "node-builtin",
+      "name": "fs.fsyncSync",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.linkSync",
+      "kind": "node-builtin",
+      "name": "fs.linkSync",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.lstatSync",
       "kind": "node-builtin",
       "name": "fs.lstatSync",
@@ -1042,9 +1054,21 @@
       "status": "static"
     },
     {
+      "id": "node-builtin.fs.readlinkSync",
+      "kind": "node-builtin",
+      "name": "fs.readlinkSync",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.realpathSync",
       "kind": "node-builtin",
       "name": "fs.realpathSync",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.renameSync",
+      "kind": "node-builtin",
+      "name": "fs.renameSync",
       "status": "static"
     },
     {
@@ -1063,6 +1087,12 @@
       "id": "node-builtin.fs.statSync",
       "kind": "node-builtin",
       "name": "fs.statSync",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.fs.symlinkSync",
+      "kind": "node-builtin",
+      "name": "fs.symlinkSync",
       "status": "static"
     },
     {

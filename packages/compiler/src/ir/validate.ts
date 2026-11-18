@@ -51,6 +51,7 @@ export const STR_INTRINSIC_SIGS: Record<
   isWellFormed: { argTypes: [], minArgs: 0, result: BOOL },
   toWellFormed: { argTypes: [], minArgs: 0, result: STRING },
   localeCompare: { argTypes: [STRING], minArgs: 1, result: F64 },
+  localeCompareBase: { argTypes: [STRING], minArgs: 1, result: F64 },
   cpAt: { argTypes: [F64], minArgs: 1, result: STRING },
 };
 
@@ -319,6 +320,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "fh.truncate": { argTypes: [FILEHANDLE_T, F64], result: { kind: "promise", inner: VOID } },
   "stats.big": { argTypes: [STATS_T, STRING], result: BIGINT_T },
   "stats.isKind": { argTypes: [STATS_T, STRING], result: BOOL },
+  "stats.num": { argTypes: [STATS_T, STRING], result: F64 },
   "big.lit": { argTypes: [STRING], result: BIGINT_T },
   "big.add": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
   "big.sub": { argTypes: [BIGINT_T, BIGINT_T], result: BIGINT_T },
@@ -364,6 +366,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "url.hostname": { argTypes: [URL_T], result: STRING },
   "url.username": { argTypes: [URL_T], result: STRING },
   "url.password": { argTypes: [URL_T], result: STRING },
+  "url.port": { argTypes: [URL_T], result: STRING },
+  "url.origin": { argTypes: [URL_T], result: STRING },
   "url.pathname": { argTypes: [URL_T], result: STRING },
   "url.href": { argTypes: [URL_T], result: STRING },
   "url.fileURLToPathUrl": { argTypes: [URL_T], result: STRING },
@@ -431,6 +435,13 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "fs.chmodSync": { argTypes: [STRING, F64], result: VOID },
   "fs.chownSync": { argTypes: [STRING, F64, F64], result: VOID },
   "fs.copyFileSync": { argTypes: [STRING, STRING], result: VOID },
+  "fs.renameSync": { argTypes: [STRING, STRING], result: VOID },
+  "fs.linkSync": { argTypes: [STRING, STRING], result: VOID },
+  "fs.symlinkSync": { argTypes: [STRING, STRING], result: VOID },
+  "fs.readlinkSync": { argTypes: [STRING], result: STRING },
+  "fs.fsyncSync": { argTypes: [F64], result: VOID },
+  "fs.openSyncMode": { argTypes: [STRING, STRING, F64], result: F64 },
+  "fs.copyFileExclSync": { argTypes: [STRING, STRING], result: VOID },
   "fs.writeFileModeSync": { argTypes: [STRING, STRING, F64], result: VOID },
   "fs.writeFileExclModeSync": { argTypes: [STRING, STRING, F64], result: VOID },
   "fs.mkdirModeSync": { argTypes: [STRING, F64], result: VOID },
@@ -2681,7 +2692,7 @@ function validateFunction(
         if (!isSupportedMapKey(e.type.key)) {
           err(`mapNew key kind ${e.type.key.kind} (frontend must fence)`, e.loc);
         }
-        if (!isSupportedMapValue(e.type.value)) {
+        if (!isSupportedMapValue(e.type.value, seqIfOk)) {
           err(`mapNew value kind ${e.type.value.kind} (frontend must fence)`, e.loc);
         }
         // Seed entries lower pairwise, K/V-typed exactly like set() args.
@@ -2712,6 +2723,11 @@ function validateFunction(
           }
           checkExpr(e.args[0]!);
           expectType(e.args[0]!, key, "mapIntrinsic get key");
+          // a dyn-valued map answers the dyn value (a miss: the dyn undefined)
+          if (value.kind === "dyn") {
+            if (e.type.kind !== "dyn") err("mapIntrinsic get over a dyn-valued map must return dyn", e.loc);
+            break;
+          }
           const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
           const rest = def ? def.arms.filter((a) => a.kind !== "undefinedT") : [];
           // When V is itself a union its own undefined arm (if any) folds

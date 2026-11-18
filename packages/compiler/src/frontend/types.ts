@@ -1806,6 +1806,36 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       ]),
     };
   }
+  // WeakRef<T> and FinalizationRegistry<T> (paperclip's client registry,
+  // SEMANTICS.md S151): a WeakRef is a one-field record holding its
+  // target STRONGLY (deref() always answers it: the WasmGC heap reports no
+  // collection to the program, which the spec allows), a registry a
+  // one-field record whose cleanup callbacks are never called (the
+  // spec's own "may never be called").
+  if (
+    (psym?.name === "WeakRef" || psym?.name === "FinalizationRegistry") &&
+    checker.declarationsOf(psym).some((d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()))
+  ) {
+    const args = checker.getTypeArguments(widened as ts.TypeReference);
+    if (args.length !== 1) return null;
+    if (psym.name === "FinalizationRegistry") {
+      return { kind: "record", shapeId: ctx.shapes.intern([{ name: "%finreg", type: F64, internal: true }]) };
+    }
+    let inner = mapType(args[0]!, ctx);
+    // an `object`-typed target is the shared dynamic value: the field holds it as dyn
+    if (inner?.kind === "jsval") inner = DYN;
+    if (inner === null || (inner.kind !== "dyn" && !isSupportedSetElem(inner))) return null;
+    return { kind: "record", shapeId: ctx.shapes.intern([{ name: "%weakref", type: inner, internal: true }]) };
+  }
+  // Intl.DateTimeFormat: a one-field record naming the formatter's
+  // (locale, options) form. Construction admits only the forms with a
+  // built-in formatting (lower-intl-dtf.ts); `format` is the one member.
+  if (
+    psym?.name === "DateTimeFormat" &&
+    checker.declarationsOf(psym).some((d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()))
+  ) {
+    return { kind: "record", shapeId: ctx.shapes.intern([{ name: "%dtf", type: STRING, internal: true }]) };
+  }
   // TextEncoder / TextDecoder (the WHATWG utf-8 codecs @types/node
   // declares): a one-field record holding the encoding name ("utf-8", the
   // `.encoding` property). Construction admits only the default utf-8
@@ -1819,9 +1849,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         ctx.isStdlibFile(d.getSourceFile()),
     )
   ) {
+    // A decoder also carries its options (%opts: 0 the defaults, 3 for
+    // `{ fatal: true, ignoreBOM: true }` — the one other combination
+    // construction admits, checkTextCodecCtor).
     return {
       kind: "record",
-      shapeId: ctx.shapes.intern([{ name: "%enc", type: STRING, internal: true }]),
+      shapeId: ctx.shapes.intern(
+        psym.name === "TextDecoder"
+          ? [{ name: "%enc", type: STRING, internal: true }, { name: "%opts", type: F64, internal: true }]
+          : [{ name: "%enc", type: STRING, internal: true }],
+      ),
     };
   }
   // Promise.allSettled's elements (lib.es2020.promise): PromiseFulfilledResult<T>
@@ -1964,8 +2001,12 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (weakMap && ((args[0]!.flags & ts.TypeFlags.Any) !== 0 || checker.typeToString(args[0]!) === "WeakKey")) return null;
     const key = mapType(args[0]!, ctx);
     if (!key || !isSupportedMapKey(key)) return null;
-    const value = mapType(args[1]!, ctx);
-    if (!value || !isSupportedMapValue(value)) return null;
+    let value = mapType(args[1]!, ctx);
+    // A value shared with dynamic code (the one-world jsval, WasmGC lanes):
+    // the slot holds it as the dyn value — the same representation.
+    const oneWorld = ctx.sharedDynamic === true && ctx.engine !== true;
+    if (value?.kind === "jsval" && oneWorld) value = DYN;
+    if (!value || !isSupportedMapValue(value, oneWorld)) return null;
     // WeakMap (docs/design/object-keys.md): the same storage, a strong
     // table — nothing observes the difference but the printer.
     return weakMap ? { kind: "map", key, value, weak: true } : mapOf(key, value);

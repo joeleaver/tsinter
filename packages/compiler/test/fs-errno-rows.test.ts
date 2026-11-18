@@ -263,7 +263,8 @@ describe("fs.ts's OWN table (OP_TABLE/CODES) cross-checked against the committed
   // readFileSync inputs. They are therefore NOT listed here — they belong
   // in the ORDINARY reachable set the test below checks, like any other
   // code the generator hits.
-  const CODES_NOT_REACHED_BY_GENERATOR: ReadonlySet<string> = new Set(["EPERM", "EMFILE", "ENOSPC", "EINVAL", "EROFS"]);
+  // EXDEV (15, appended for renameSync/linkSync) needs two file systems.
+  const CODES_NOT_REACHED_BY_GENERATOR: ReadonlySet<string> = new Set(["EPERM", "EMFILE", "ENOSPC", "EINVAL", "EROFS", "EXDEV"]);
 
   test("every ORDINARY-INPUT-REACHABLE code in fs.ts's table matches a row's own code exactly (no transposition, no typo)", () => {
     const rowCodes = new Set(committed.rows.map((r) => r.code).filter((c) => c !== "ERR_FS_EISDIR"));

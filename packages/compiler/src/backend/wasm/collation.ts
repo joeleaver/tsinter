@@ -959,8 +959,8 @@ export class CollationBuilder {
    * decomposes, combines, expands or takes part in a contraction or prefix
    * rule — the generator checks), straight off the UTF-16: -1, 0 or 1, or 2
    * when either string holds anything else. */
-  private asciiCompare(): number {
-    return this.fn("asciiCompare", [this.ref(this.strType), this.ref(this.strType)], [I32], (f, $) => {
+  private asciiCompare(levels = 3): number {
+    return this.fn(levels === 3 ? "asciiCompare" : `asciiCompare${levels}`, [this.ref(this.strType), this.ref(this.strType)], [I32], (f, $) => {
       const T = this.I32A;
       const S = this.strType;
       const [A0, B0] = [0, 1];
@@ -986,7 +986,7 @@ export class CollationBuilder {
           $.sel(I32, $.eq($.l(LV), $.i(1)), $.shrU($.aget(T, $.g(this.g.asciiST), ch), $.i(5)), $.and($.aget(T, $.g(this.g.asciiST), ch), $.i(31))),
         );
       };
-      $.for(LV, $.i(0), $.i(3), () => {
+      $.for(LV, $.i(0), $.i(levels), () => {
         $.put(I, $.i(0));
         $.put(J, $.i(0));
         $.put(OR, $.i(1)); // the level is still undecided
@@ -1010,20 +1010,22 @@ export class CollationBuilder {
     });
   }
 
-  /** %w.coll.compare — (a, b) → -1 | 0 | 1, flat strings. */
-  compare(): number {
-    return this.fn("compare", [this.ref(this.strType), this.ref(this.strType)], [I32], (f, $) => {
+  /** %w.coll.compare — (a, b) → -1 | 0 | 1, flat strings. `primary`: the
+   * comparison at primary strength only (`{ sensitivity: "base" }`, ICU's
+   * UCOL_PRIMARY: case and accents ignored, punctuation still counted). */
+  compare(primary = false): number {
+    return this.fn(primary ? "comparePrimary" : "compare", [this.ref(this.strType), this.ref(this.strType)], [I32], (f, $) => {
       const T = this.I32A;
       const XA = f.local(this.ref(T));
       const YA = f.local(this.ref(T));
       const R = f.local(I32);
       $.run(this.init());
-      $.put(R, $.call(this.asciiCompare(), $.l(0), $.l(1)));
+      $.put(R, $.call(this.asciiCompare(primary ? 1 : 3), $.l(0), $.l(1)));
       $.if($.ne($.l(R), $.i(2)), () => $.ret($.l(R)));
       $.put(XA, $.call(this.ces(), $.l(0), $.i(0)));
       $.put(YA, $.call(this.ces(), $.l(1), $.i(1)));
       $.put(R, $.call(this.level(), $.l(XA), $.l(YA), $.i(0)));
-      $.if($.not($.l(R)), () => {
+      if (!primary) $.if($.not($.l(R)), () => {
         $.put(R, $.call(this.level(), $.l(XA), $.l(YA), $.i(1)));
         $.if($.not($.l(R)), () => $.put(R, $.call(this.level(), $.l(XA), $.l(YA), $.i(2))));
       });

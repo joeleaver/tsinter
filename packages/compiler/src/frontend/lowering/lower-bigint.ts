@@ -348,6 +348,46 @@ export function lowerBigIntMethodCall(L: Lowerer, call: ts.CallExpression, acces
 
 const STAT_BIG_FIELDS = new Set(["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs"]);
 
+/** The plain Stats fields only the full record (op 24) carries. */
+const STAT_NUM_FIELDS = new Set(["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "blksize", "blocks"]);
+
+const statNumbersRead = new WeakMap<object, boolean>();
+/** True when some program source reads one of STAT_NUM_FIELDS off a plain
+ * Stats receiver: then every stat/lstat builds the full record, so the
+ * reads (stats.num) always find it. Computed once per Lowerer. */
+export function programReadsStatNumbers(L: Lowerer): boolean {
+  let hit = statNumbersRead.get(L);
+  if (hit !== undefined) return hit;
+  hit = false;
+  const re = /\.\s*(dev|ino|mode|nlink|uid|gid|rdev|blksize|blocks)\b/;
+  for (const sf of L.program.getSourceFiles()) {
+    if (hit) break;
+    if (sf.isDeclarationFile || !re.test(sf.text)) continue;
+    ts.walkPreorder(sf, (n) => {
+      if (hit) return "stop";
+      if (ts.isPropertyAccessExpression(n) && STAT_NUM_FIELDS.has(n.name.text)) {
+        const arms = statsArms(L, n.expression);
+        if (arms.plain && !arms.big) hit = true;
+      }
+      return undefined;
+    });
+  }
+  statNumbersRead.set(L, hit);
+  return hit;
+}
+
+/** A plain Stats' numeric field (`st.mode & 0o777`, `st.nlink > 1`): the
+ * full record's slot as a number (programReadsStatNumbers made every
+ * stat/lstat build one). Null for any other member or receiver. */
+export function lowerPlainStatsNumber(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+  if (!L.sharedDynamic || !STAT_NUM_FIELDS.has(expr.name.text)) return null;
+  const arms = statsArms(L, expr.expression);
+  if (!arms.plain || arms.big) return null;
+  const loc = locOf(expr);
+  const receiver = L.lowerExpr(expr.expression);
+  return { kind: "libCall", fn: "stats.num", args: [receiver, { kind: "strLit", value: expr.name.text, type: STRING, loc }], type: F64, loc };
+}
+
 /** Is `node`'s checker type @types/node's BigIntStats? */
 export function isBigIntStatsType(L: Lowerer, node: ts.Expression): boolean {
   const arms = statsArms(L, node);
@@ -431,8 +471,10 @@ export function lowerStatCall(L: Lowerer, call: ts.CallExpression, module: strin
   if (args.some((a) => ts.isSpreadElement(a)) || args.length < 1 || args.length > 2) {
     return L.noLowering(`${member} with ${args.length} arguments`, call);
   }
-  // the one-argument forms ops 7/8 already serve stay as they are
-  if (args.length === 1 && member !== "fstatSync" && member !== "lstat") return null;
+  // the one-argument forms ops 7/8 already serve stay as they are — unless
+  // the program reads a plain Stats' numeric fields (mode, uid, nlink…),
+  // which only the full record carries (WasmGC lanes)
+  if (args.length === 1 && member !== "fstatSync" && member !== "lstat" && !(L.sharedDynamic && programReadsStatNumbers(L))) return null;
   const loc = locOf(call);
   if (args.length === 2) {
     const optNode = args[1]!;
