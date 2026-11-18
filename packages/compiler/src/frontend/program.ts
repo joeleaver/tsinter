@@ -400,7 +400,12 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // just resolved) — without maxNodeModuleJsDepth, node_modules JS types as
   // an implicit-any module (TS7016) and nothing infers. Only flagged
   // compiles pay this; flagless builds keep the exact historical options.
-  if (npmStaticActive()) options.maxNodeModuleJsDepth = 4;
+  // The depth must reach every module an opted-in package's own import
+  // graph evaluates: drizzle's pg-core/columns/date.common.js sits five
+  // relative imports below the package entry, and a shallower limit left it
+  // out of the program (its classes then "not declared") while Node loads
+  // it. Non-opted packages' JS still serves as the any-surface stub.
+  if (npmStaticActive()) options.maxNodeModuleJsDepth = 32;
   // --provenance-sources: the registered entries become tsconfig "paths"
   // so tsgo's OWN resolution of the bare specifiers lands on the same
   // source files the preflight resolver answers — the checker types the
