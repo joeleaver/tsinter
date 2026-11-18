@@ -5508,7 +5508,38 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
         }
         const strArg = (a: ts.Expression | undefined, what: string): IrExpr => {
           if (!a) return { kind: "strLit", value: "", type: STRING, loc };
-          const v = L.lowerExpr(a);
+          const v0 = L.lowerExpr(a);
+          // A dynamic argument (paperclip's `new RegExp(value.textValidation
+          // .pattern)` over a parsed record): Node's ToString of it, undefined
+          // the absent argument; a RegExp to copy stops by name (S151).
+          if (L.sharedDynamic && !L.engine && (v0.type.kind === "jsval" || v0.type.kind === "dyn")) {
+            const dv = v0.type.kind === "dyn" ? v0 : ({ kind: "dynFromJsval", value: v0, type: DYN, loc } as IrExpr);
+            const tmp = L.declareHiddenLocal("%rxArg", DYN);
+            const ref = (): IrExpr => ({ kind: "varRef", localId: tmp.id, type: DYN, loc });
+            return {
+              kind: "seqExpr",
+              stmts: [{ kind: "varDecl", localId: tmp.id, init: dv, loc }],
+              result: {
+                kind: "ternary",
+                cond: { kind: "dynTest", test: "regex", value: ref(), type: BOOL, loc },
+                then: fencedValue(L, { kind: "strLit", value: "", type: STRING, loc }, "SC2020",
+                  `new RegExp copying a RegExp held in a dynamic value is not supported yet (SEMANTICS.md S151) [SC2020 at ${loc.file}:${ts.getLineAndCharacterOfPosition(expr.getSourceFile(), expr.getStart()).line + 1}]`, loc),
+                else_: {
+                  kind: "ternary",
+                  cond: { kind: "dynTest", test: "undefined", value: ref(), type: BOOL, loc },
+                  then: { kind: "strLit", value: "", type: STRING, loc },
+                  else_: { kind: "libCall", fn: "dyn.toStringCoerce", args: [ref()], type: STRING, loc },
+                  type: STRING,
+                  loc,
+                },
+                type: STRING,
+                loc,
+              },
+              type: STRING,
+              loc,
+            };
+          }
+          const v = v0;
           if (v.type.kind !== "string") {
             L.noLowering(
               `new RegExp with a '${L.fmt(v.type)}' ${what}`,

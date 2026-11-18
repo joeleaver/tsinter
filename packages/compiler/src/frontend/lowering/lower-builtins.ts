@@ -4939,7 +4939,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
    * receivers. */
   export function lowerStatsMethodCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
-    if (call.questionDotToken || access.questionDotToken) return null;
+    if (L.chainBlocked(access, call)) return null;
     if (L.mapTypeOf(L.typeOf(access.expression))?.kind !== "stats") return null;
     if (!L.isStdlibMember(access)) return null;
     const name = access.name.text;

@@ -1608,3 +1608,28 @@ function deepEqHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
   });
   return name;
 }
+
+/** `util.isDeepStrictEqual(a, b)` (paperclip's config store): the verdict
+ * assert.deepStrictEqual computes — the same per-type structural
+ * comparison under Node's strict rules (Object.is for numbers), over two
+ * operands of ONE static type; anything the comparison cannot carry
+ * faithfully refuses by name, as assert's own fence does. */
+export function lowerIsDeepStrictEqualCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrExpr {
+  if (expr.arguments.length !== 2 || expr.arguments.some((x) => ts.isSpreadElement(x))) {
+    L.noLowering(`util.isDeepStrictEqual with ${expr.arguments.length} arguments`, expr);
+  }
+  const a = L.lowerExpr(expr.arguments[0]!);
+  const b = L.lowerExpr(expr.arguments[1]!);
+  if (!typeEquals(a.type, b.type)) {
+    L.noLowering(
+      `util.isDeepStrictEqual of '${L.fmt(a.type)}' and '${L.fmt(b.type)}' values`,
+      expr,
+      "deep equality lowers when both sides have the SAME static type",
+    );
+  }
+  const unsupported = isUnitType(a.type) || a.type.kind === "dyn" || a.type.kind === "jsval"
+    ? "dynamic and unit values have no static deep comparison here"
+    : deepUnsupportedReason(L, a.type, new Set());
+  if (unsupported !== null) L.noLowering(`util.isDeepStrictEqual of '${L.fmt(a.type)}' values`, expr, unsupported);
+  return { kind: "call", callee: deepEqHelper(L, a.type, loc), args: [a, b], type: BOOL, loc };
+}

@@ -34,6 +34,7 @@
  * record/class property order follows declaration order (SEMANTICS.md
  * 36's existing stance). */
 import * as ts from "../ts7/adapter.js";
+import { lowerIsDeepStrictEqualCall } from "./lower-assert.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
 import { BOOL, BYTES_U8, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
@@ -2339,6 +2340,8 @@ export function lowerUtilModuleCall(
       return lowerGetCallSitesCall(L, expr, loc);
     case "styleText":
       return lowerStyleTextCall(L, expr, loc);
+    case "isDeepStrictEqual":
+      return lowerIsDeepStrictEqualCall(L, expr, loc);
     default:
       return null;
   }
