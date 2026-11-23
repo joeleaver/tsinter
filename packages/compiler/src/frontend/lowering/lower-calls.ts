@@ -5,7 +5,7 @@
 import { returnWidens } from "./big-widen.js";
 import { lowerFileHandleMethodCall } from "./lower-filehandle.js";
 import * as ts from "../ts7/adapter.js";
-import { lowerObjModelStatic, usesThis } from "./lower-objmodel.js";
+import { isDynNode, lowerObjModelStatic, usesThis } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
@@ -2035,8 +2035,21 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     let any = false;
     const out = decl.parameters.map((param): ts.Symbol | null => {
       if (!ts.isIdentifier(param.name)) return null;
-      if (param.dotDotDotToken || param.questionToken || param.initializer) return null;
+      if (param.dotDotDotToken || param.questionToken) return null;
       if (param.name.text === "this") return null;
+      // S125 (fast-string-truncated-width's `truncationOptions = {}`): a
+      // JavaScript parameter defaulted to an empty object literal is typed
+      // `{}` by inference, which no caller's options fit without a copy; in
+      // a function that already instantiates per call site, it binds the
+      // argument's own record type too (the caller's object, Node's
+      // sharing; a key the record lacks reads undefined, S128), and an
+      // omitted argument keeps the default.
+      if (param.initializer) {
+        if (param.type !== undefined || !isJsSourceFile(param.getSourceFile()) || !emptyObjectDefault(param.initializer)) return null;
+        const sym = L.checker.getSymbolAtLocation(param.name);
+        if (!sym || paramWrittenInBody(L, decl.body!, sym, param.name.text)) return null;
+        return sym;
+      }
       const t = L.typeOf(param.name);
       if ((t.flags & ts.TypeFlags.Any) === 0) return null;
       const sym = L.checker.getSymbolAtLocation(param.name);
@@ -2046,6 +2059,29 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       return sym;
     });
     return any ? out : null;
+  }
+
+  /** `= {}` (parentheses aside). */
+  function emptyObjectDefault(e: ts.Expression): boolean {
+    let x = e;
+    while (ts.isParenthesizedExpression(x)) x = x.expression;
+    return ts.isObjectLiteralExpression(x) && x.properties.length === 0;
+  }
+
+  /** An identifier argument naming a local the current function holds as
+   * the dynamic value (a forwarded defaulted parameter on its dynamic
+   * slot — fast-string-width's `options` into the measuring function). */
+  function dynLocalArg(L: Lowerer, arg: ts.Expression): boolean {
+    let a = arg;
+    while (ts.isParenthesizedExpression(a)) a = a.expression;
+    if (!ts.isIdentifier(a)) return false;
+    const local = L.resolveWritable(a);
+    return local !== null && (local.type.kind === "dyn" || local.type.kind === "jsval");
+  }
+
+  /** An implicit slot that is a defaulted parameter (emptyObjectDefault). */
+  function defaultedImplicit(param: ts.ParameterDeclaration): boolean {
+    return param.initializer !== undefined;
   }
 
 /** The checker-fallback return type an implicit instance PROMISES before
@@ -2093,8 +2129,45 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         shapes.push(L.paramShape(param));
         return;
       }
-      let bound: IrType = DYN;
       const arg = call.arguments[i];
+      if (defaultedImplicit(param)) {
+        // Only an argument whose own type maps to a record binds; an omitted
+        // or possibly-undefined one keeps the declared shape (its default).
+        let mapped: IrType | null = null;
+        let t: ts.Type | undefined;
+        if (arg && !ts.isSpreadElement(arg)) {
+          // An object literal lowers against its contextual type (a viewed
+          // package's declared options type, S133): the slot takes that
+          // record, so the literal is built into it, not copied.
+          let a: ts.Expression = arg;
+          while (ts.isParenthesizedExpression(a)) a = a.expression;
+          const ctx = ts.isObjectLiteralExpression(a) ? L.checker.getContextualType(a) : undefined;
+          t = ctx !== undefined ? L.checker.getNonNullableType(ctx) : L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
+          try {
+            mapped = L.mapTypeOf(t);
+          } catch (e) {
+            if (!(e instanceof PoisonError)) throw e;
+          }
+        }
+        if (arg === undefined) {
+          // Omitted: the default `{}` is a fresh object of the body's own —
+          // the dynamic slot holds it, so the body may add keys to it as
+          // Node does (`opts.seen = 1`).
+          shapes.push({ type: DYN, mode: "omittable", bodyType: DYN });
+        } else if (!ts.isSpreadElement(arg) && (isDynNode(L, arg) || dynLocalArg(L, arg))) {
+          // A dynamic argument (a JavaScript module's object literal on the
+          // checked-dynamic tree — fast-string-truncated-width's own
+          // NO_TRUNCATION): the slot holds that object itself.
+          shapes.push({ type: DYN, mode: "omittable", bodyType: DYN });
+        } else if (mapped !== null && mapped.kind === "record" && t !== undefined) {
+          argTypes.set(sym, t);
+          shapes.push({ type: mapped, mode: "required" });
+        } else {
+          shapes.push(L.paramShape(param));
+        }
+        return;
+      }
+      let bound: IrType = DYN;
       if (arg && !ts.isSpreadElement(arg)) {
         // The argument's own checker type, literal-widened ('add' binds
         // string) — typeOf consults the ACTIVE instance's bindings, so a
@@ -2121,7 +2194,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
     // that is undefined: the dynamic slot, never its initializer's type.
     const shapes: ParamShape[] = info.decl.parameters.map((param, i) =>
       info.implicitParams![i]
-        ? { type: DYN, mode: "required" as const }
+        ? defaultedImplicit(param) ? { type: DYN, mode: "omittable" as const, bodyType: DYN } : { type: DYN, mode: "required" as const }
         : ts.isMethodDeclaration(info.decl) && param.initializer !== undefined && param.type === undefined && ts.isIdentifier(param.name) &&
             param.dotDotDotToken === undefined && isJsSourceFile(param.getSourceFile())
           ? { type: DYN, mode: "omittable" as const, bodyType: DYN }
