@@ -9259,6 +9259,131 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     return null;
   }
 
+const stripParensTs = (e: ts.Expression): ts.Expression => { let c = e; while (ts.isParenthesizedExpression(c)) c = c.expression; return c; };
+/** pc-json: a cast that COPIES a JSON document held as the dynamic value
+ * (`doc as T`, `[a0, a1] as T[]`, a member chain off one) into typed
+ * storage keeps only the keys T declares. The documents are data known at
+ * build time, so the copy is checked here: every key of every object the
+ * copy takes must be declared by its type (an index signature takes any
+ * key; a union, the arm that declares them). Answers where and why it
+ * would drop a key (or cannot tell), else null — also when the operand is
+ * no document. Key ORDER follows the type (S041's checked-conversion rule). */
+export function jsonDocCopyDrops(L: Lowerer, value: ts.Expression, target: IrType): { node: ts.Node; why: string } | null {
+  if (L.dynJsonImportSyms.size === 0) return null;
+  const operand = stripParensTs(value);
+  if (!L.dynJsonRooted(operand)) return null;
+  const NO = Symbol("unresolved");
+  const docOf = (e: ts.Expression): unknown => {
+    const n = stripParensTs(e);
+    if (ts.isIdentifier(n)) {
+      const a = L.checker.getSymbolAtLocation(n);
+      if (a === undefined || (a.flags & ts.SymbolFlags.Alias) === 0) return NO;
+      const d = L.dynJsonDocs.get(L.checker.getAliasedSymbol(a));
+      return d === undefined ? NO : d;
+    }
+    if (ts.isNonNullExpression(n)) return docOf(n.expression);
+    if (ts.isPropertyAccessExpression(n) || (ts.isElementAccessExpression(n) && (ts.isStringLiteral(n.argumentExpression) || ts.isNumericLiteral(n.argumentExpression)))) {
+      const base = docOf(n.expression);
+      if (base === NO || typeof base !== "object" || base === null) return NO;
+      const key = ts.isPropertyAccessExpression(n) ? n.name.text : (n.argumentExpression as ts.StringLiteral | ts.NumericLiteral).text;
+      return Object.prototype.hasOwnProperty.call(base, key) ? (base as Record<string, unknown>)[key] : NO;
+    }
+    return NO;
+  };
+  // The first undeclared key's path (or a target this check cannot model),
+  // or null when the copy keeps every key. A value of the wrong KIND for its
+  // target is null here: the checked copy itself ends the program by name
+  // there (S009's `expected <T> at <path>, got <kind>`).
+  const undeclared = (v: unknown, t: IrType, path: string): string | null => {
+    if (v === null || typeof v !== "object") return null;
+    const isArr = Array.isArray(v);
+    // Can a target of this kind hold an object (or array) value at all?
+    const holds = (k: IrType): boolean => {
+      if (k.kind === "jsval" || k.kind === "dyn") return true;
+      if (k.kind === "array") return isArr;
+      if (k.kind === "record") {
+        const sh = L.shapes.get(k.shapeId);
+        return sh !== undefined && (sh.tuple === true) === isArr;
+      }
+      if (k.kind === "union") return (L.unions.get(k.unionId)?.arms ?? []).some(holds);
+      // Unit and primitive kinds cannot; anything else (a class, a map, ...)
+      // might, and is checked as "cannot tell" below.
+      return !["f64", "string", "bool", "nullT", "undefinedT", "void", "bigint", "symbol"].includes(k.kind);
+    };
+    switch (t.kind) {
+      case "jsval":
+      case "dyn":
+        return null; // shared as the dynamic value itself
+      case "array": {
+        if (!isArr) return null;
+        const arr = v as unknown[];
+        for (let i = 0; i < arr.length; i++) {
+          const r = undeclared(arr[i], t.elem, `${path}[${i}]`);
+          if (r !== null) return r;
+        }
+        return null;
+      }
+      case "union": {
+        const arms = (L.unions.get(t.unionId)?.arms ?? []).filter(holds);
+        if (arms.length === 0) return null;
+        let first: string | null = null;
+        for (const arm of arms) {
+          const r = undeclared(v, arm, path);
+          if (r === null) return null;
+          first ??= r;
+        }
+        return first;
+      }
+      case "record": {
+        const shape = L.shapes.get(t.shapeId);
+        if (shape === undefined) return `${path} (a type this check cannot read)`;
+        if ((shape.tuple === true) !== isArr) return null;
+        const visible = shape.fields.filter((f) => f.internal !== true);
+        if (isArr) {
+          const arr = v as unknown[];
+          for (let i = 0; i < arr.length; i++) {
+            const ft = visible[i]?.type;
+            if (ft === undefined) return `${path}[${i}]`;
+            const r = undeclared(arr[i], ft, `${path}[${i}]`);
+            if (r !== null) return r;
+          }
+          return null;
+        }
+        const fields = new Map(visible.map((f) => [f.name, f.type] as const));
+        for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+          const ft = fields.get(k) ?? shape.indexValue;
+          if (ft === undefined) return `${path}.${k}`;
+          const r = undeclared(val, ft, `${path}.${k}`);
+          if (r !== null) return r;
+        }
+        return null;
+      }
+      default:
+        return holds(t) ? `${path} (a '${L.fmt(t)}' target this check cannot read)` : null;
+    }
+  };
+  const check = (e: ts.Expression, t: IrType): { node: ts.Node; why: string } | null => {
+    const doc = docOf(e);
+    const where = e.getText().slice(0, 60);
+    if (doc === NO) {
+      return { node: e, why: `a typed copy of a JSON document's value ('${where}') whose keys the build cannot check against '${L.fmt(t)}' (cast the whole document, or read it as 'any')` };
+    }
+    const r = undeclared(doc, t, "$");
+    if (r === null) return null;
+    return { node: e, why: `a typed copy of the JSON document '${where}' into '${L.fmt(t)}', which does not declare its key ${r} (the copy would drop it where JavaScript keeps it; declare the key, or read the document as 'any')` };
+  };
+  if (ts.isArrayLiteralExpression(operand)) {
+    if (target.kind !== "array") return { node: operand, why: "a JSON document copied by a cast to a non-array type" };
+    for (const el of operand.elements) {
+      if (ts.isSpreadElement(el) || ts.isOmittedExpression(el)) return { node: el, why: "a spread or hole among JSON documents copied by a cast" };
+      const r = check(el, target.elem);
+      if (r !== null) return r;
+    }
+    return null;
+  }
+  return check(operand, target);
+}
+
   /** Can every value a dynamic key can reach (declared fields + the
    * overflow) surface as the read's result type? dyn results need
    * dyn-convertible fields (JSON-safe, with the undefined arm allowed at

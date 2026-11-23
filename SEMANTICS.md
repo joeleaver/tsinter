@@ -3738,7 +3738,25 @@ is then Node's.
 - two different SHAPES' records are unaffected by each other, but a record built by a CHECKED CONVERSION
   from a dynamic value (`JSON.parse(s) as T`, a JavaScript value entering a typed slot, the `structuredClone`
   round trip) takes the declared order whatever the source's key order (`JSON.parse('{"b":1,"a":2}') as {
-  a?: number; b: number }` answers `[ 'a', 'b' ]`, Node `[ 'b', 'a' ]`);
+  a?: number; b: number }` answers `[ 'a', 'b' ]`, Node `[ 'b', 'a' ]`). A JSON module's default import
+  whose document has no static representation (an array of differently-keyed objects, which TypeScript
+  types as a union of records), or which the program only ever casts (`a0 as T`, `[a0, a1] as T[]`), at
+  least once to another type, meets the rules for dynamic values on the wasm and wasm-native lanes: the
+  binding is the dynamic value `JSON.parse` makes of the document's text. That value holds every key in
+  the document's order, every importer shares it, and the lowering reads it as `any` (as it reads a
+  re-export of it, and an array literal of only such bindings). So `doc as T` or `[a0, a1] as T[]`, used
+  in place or bound to a `const`, is that value itself (S128) wherever the build keeps such a cast on the
+  dynamic arm. Where a cast instead copies documents into typed storage (paperclip's `[a0, …] as
+  AppDefinition[]`, whose uses need typed records), the copy keeps the type's declared fields in declared
+  order: this is the checked-conversion rule above, so paperclip's definitions answer their keys in
+  `AppDefinition`'s order, where Node answers each document's own order. The documents are known at build
+  time, so the build checks every such copy: a document holding a key its type does not declare is never
+  copied. The cast takes the dynamic arm where its slot can hold the value, and otherwise the build refuses
+  by name (SC1090). Where that arm cannot compile, the exact-fit copy stops by name at run time (S128 (a2),
+  SC1100). Later copies of a value held on the arm follow S128 the same way (a document that does not fit
+  exactly stops by name). Tested by `packages/compiler/test/wasm-top10-paperclip-json-docs.test.ts` (pc-json).
+  Other lanes keep the SC2011 refusal. A document the program also uses in some other way keeps its static
+  record, as before;
 - index-signature records: GH #227 (S031's amendment) retires S031's declared-then-overflow order on these
   lanes — a hybrid's keys answer in Node's order, a late declared optional key included (`{ xx?: number;
   b: number; [k: string]: number | undefined }` with `o.xx = 4` after `{ b: 2 }` answers `b, xx`), and a

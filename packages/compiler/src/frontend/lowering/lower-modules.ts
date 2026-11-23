@@ -13,7 +13,7 @@ import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsJsFile, isJsSourceFile, isRequireStatement, locOf, makeCycleAdmission, orderedImportsOf, resolveImport, resolveNpmImport } from "../program.js";
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
-import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
+import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { INSTANTIATION_WRITES } from "./module-tdz.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
@@ -557,6 +557,68 @@ export interface FileParts {
     visit(sf);
   }
 
+  /** How every module references JSON default-import bindings, per
+   * document (its aliased symbol): the cast targets (`d as T` gives T, an
+   * element of a cast array literal `[d, other] as T[]` gives T's element
+   * type, parentheses aside; null where the target maps to no type or the
+   * array literal's cast is not to an array), and whether any reference is
+   * NOT such a cast operand. One walk per Lowerer: every importer shares the
+   * document's one global, so the answer covers them all. */
+  interface JsonRefs { casts: (IrType | null)[]; other: boolean }
+  const jsonRefsMemo = new WeakMap<Lowerer, Map<ts.Symbol, JsonRefs>>();
+  function jsonRefs(L: Lowerer, parts: FileParts[]): Map<ts.Symbol, JsonRefs> {
+    const memo = jsonRefsMemo.get(L);
+    if (memo !== undefined) return memo;
+    const out = new Map<ts.Symbol, JsonRefs>();
+    jsonRefsMemo.set(L, out);
+    const names = new Set<string>();
+    for (const fp of parts) {
+      for (const st of fp.sf.statements) {
+        if (!ts.isImportDeclaration(st) || st.importClause?.name === undefined || !ts.isStringLiteral(st.moduleSpecifier)) continue;
+        if (st.moduleSpecifier.text.endsWith(".json")) names.add(st.importClause.name.text);
+      }
+    }
+    if (names.size === 0) return out;
+    const visit = (n: ts.Node): void => {
+      if (ts.isIdentifier(n)) {
+        if (!names.has(n.text) || ts.isImportClause(n.parent)) return;
+        const a = L.checker.getSymbolAtLocation(n);
+        if (a === undefined || (a.flags & ts.SymbolFlags.Alias) === 0) return;
+        const doc = L.checker.getAliasedSymbol(a);
+        let refs = out.get(doc);
+        if (refs === undefined) out.set(doc, (refs = { casts: [], other: false }));
+        let up: ts.Node = n.parent;
+        while (ts.isParenthesizedExpression(up)) up = up.parent;
+        let elem = false;
+        if (ts.isArrayLiteralExpression(up)) {
+          elem = true;
+          up = up.parent;
+          while (ts.isParenthesizedExpression(up)) up = up.parent;
+        }
+        if (!ts.isAsExpression(up) && !ts.isTypeAssertion(up)) {
+          refs.other = true;
+          return;
+        }
+        const target = L.mapTypeOf(L.checker.getTypeFromTypeNode(up.type));
+        refs.casts.push(target === null ? null : elem ? (target.kind === "array" ? target.elem : null) : target);
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    for (const fp of parts) visit(fp.sf);
+    return out;
+  }
+
+  /** A bakeable JSON document every reference of which is a cast operand
+   * (`d as T`, `[d, …] as T[]`), at least one to a type other than its own
+   * static type `own`: baked, each such cast would copy the record where
+   * Node shares the one object (an S125 refusal). A document the program
+   * also uses otherwise keeps its static record, as before. */
+  function jsonOnlyCastElsewhere(L: Lowerer, parts: FileParts[], doc: ts.Symbol, own: IrType): boolean {
+    const refs = jsonRefs(L, parts).get(doc);
+    return refs !== undefined && !refs.other && refs.casts.some((want) => want === null || !typeEquals(want, own));
+  }
+
 /** JSON module default imports (`import pkg from "../package.json"`):
    * the document is DATA known at build time, so the binding bakes into a
    * record global — the checker's structural type for the module (thanks
@@ -601,9 +663,35 @@ export interface FileParts {
         if (!jsonSf || !jsonSf.fileName.endsWith(".json")) continue;
         try {
           const tsType = L.typeOf(clause.name);
-          const mapped = L.mapTypeOf(tsType);
-          if (!mapped || !L.comptimeBakeable(mapped)) {
+          const staticType = L.mapTypeOf(tsType);
+          // A document with no static representation (an array of
+          // differently-keyed objects types as a union of records; a null
+          // field; ...) is, on the WasmGC lanes' one dynamic world, the
+          // dynamic value JSON.parse makes of its text — what Node's JSON
+          // module evaluates to: every key, in the document's order, one
+          // object shared by every importer (the run-once loader below).
+          // Its uses follow the dynamic value's rules (S128, S041).
+          // A bakeable document the program only ever casts, at least once
+          // to ANOTHER type (`a0 as T`, or an element of `[a0, a1] as T[]` —
+          // paperclip's generated app-definition list mixes single-shape
+          // documents with the rest), would be a typed copy of the baked
+          // record where Node shares the one object: it is the dynamic
+          // value too.
+          const unbakeable = !staticType || !L.comptimeBakeable(staticType);
+          const asDynamic = L.sharedDynamic && !L.engine && (unbakeable || jsonOnlyCastElsewhere(L, parts, target, staticType!));
+          if (!asDynamic && unbakeable) {
             L.badType(clause.name, tsType);
+          }
+          const mapped: IrType = asDynamic ? JSVAL : staticType!;
+          // The binding IS that dynamic value, whatever structural type the
+          // checker spelled for the document: like a `const` typed `any`,
+          // every expression rooted at it answers `any` to the lowering
+          // (Lowerer.typeOf), so `doc as T` takes the dynamic value's rules
+          // (S128: a contained slot is the value itself, every key kept)
+          // and never a typed width copy of the checker's document type.
+          if (asDynamic) {
+            L.dynJsonImportSyms.add(nameSym);
+            L.dynJsonTargets.add(target);
           }
           // tsgo tolerates JSON shapes strict JSON.parse rejects (a leading
           // `//` comment — importAttributes11), so no SC0001 guarantees a
@@ -620,9 +708,14 @@ export interface FileParts {
             ));
             throw new PoisonError();
           }
+          if (asDynamic) L.dynJsonDocs.set(target, parsed);
           let loader = L.jsonLoaderOf.get(target);
           if (loader === undefined) {
-            const value = L.comptimeValueToIr(parsed, mapped, "$", clause.name);
+            // (Held as the island type, `jsval` — what a binding typed `any`
+            // holds on these lanes; dyn and jsval are one representation.)
+            const value: IrExpr = asDynamic
+              ? { kind: "jsMarshal", value: { kind: "libCall", fn: "json.parse", args: [{ kind: "strLit", value: jsonSf.text, type: STRING, loc: locOf(stmt) }], type: DYN, loc: locOf(stmt) }, type: JSVAL, loc: locOf(stmt) }
+              : L.comptimeValueToIr(parsed, mapped, "$", clause.name);
             const n = L.globalsList.length;
             let g = L.globalsBySymbol.get(target);
             if (!g) {

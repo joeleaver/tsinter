@@ -123,7 +123,7 @@ import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
-import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf, jsonDocCopyDrops } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, moduleNsSourceFileOf, nsPathPrefix } from "./lower-namespaces.js";
@@ -1821,6 +1821,43 @@ export class Lowerer {
   readonly dynArmExitNodes = new WeakMap<object, string>();
   /** Bindings and parameters holding the dynamic arm. */
   readonly dynArmSyms = new Set<ts.Symbol>();
+  /** pc-json (lower-modules.ts collectJsonImports): JSON default-import
+   * bindings (their import ALIAS symbols) holding the dynamic value of a
+   * document with no static representation. Like a `const` typed `any`,
+   * every expression rooted at one answers `any` (typeOf), whatever
+   * structural type the checker spelled for the document. */
+  readonly dynJsonImportSyms = new Set<ts.Symbol>();
+  /** Their documents (the aliased symbols): a binding re-exported under
+   * another name (`export { doc as D }`, `export default doc`, `export {
+   * default as D } from "./d.json"`) is an alias resolving to one. */
+  readonly dynJsonTargets = new Set<ts.Symbol>();
+  /** Their parsed documents, by document symbol: the build-time check that
+   * a cast copying one keeps every key (lower-exprs.ts jsonDocCopyFence). */
+  readonly dynJsonDocs = new Map<ts.Symbol, unknown>();
+  /** Is `node` the binding itself or a member/element read or call off it
+   * — or an array literal of nothing else (`[a0, a1]`, the element list of
+   * paperclip's `[a0, …] as AppDefinition[]`: one dynamic array of the
+   * shared documents, so the cast takes the dynamic value's rules as a
+   * whole instead of copying each document into the element type)? */
+  dynJsonRooted(node: ts.Node): boolean {
+    if (ts.isArrayLiteralExpression(node)) {
+      return node.elements.length > 0 && node.elements.every((el) => !ts.isSpreadElement(el) && !ts.isOmittedExpression(el) && this.dynJsonRooted(el));
+    }
+    let n: ts.Node = node;
+    for (;;) {
+      if (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) n = n.expression;
+      else if (ts.isCallExpression(n)) n = n.expression;
+      else break;
+    }
+    if (!ts.isIdentifier(n)) return false;
+    const p = n.parent;
+    if (p !== undefined && ts.isPropertyAccessExpression(p) && p.name === n) return false;
+    if (p !== undefined && (ts.isImportClause(p) || ts.isPropertyAssignment(p) && p.name === n)) return false;
+    const s = p !== undefined && ts.isShorthandPropertyAssignment(p) ? this.checker.getShorthandAssignmentValueSymbol(p) : this.checker.getSymbolAtLocation(n);
+    if (s === undefined) return false;
+    if (this.dynJsonImportSyms.has(s)) return true;
+    return (s.flags & ts.SymbolFlags.Alias) !== 0 && this.dynJsonTargets.has(this.checker.getAliasedSymbol(s));
+  }
   /** JavaScript `let` locals widened to the union their assignments hold
    * (lower-stmts.ts jsLetAssignedUnion), by local id. */
   readonly jsWidenedLets = new Set<string>();
@@ -1884,6 +1921,20 @@ export class Lowerer {
     const key = forOf ? `forof:${dynArmKey(n)}` : retFn !== null ? `ret:${dynArmKey(retFn)}` : dynArmKey(n);
     const armable = contained || retFn !== null || forOf;
     if (armable) this.dynArmExitNodes.set(exit, key);
+    // pc-json: a copy of a JSON document held as the dynamic value (the
+    // documents are known at build time) that would drop a key the document
+    // holds takes the dynamic arm in the next pass where the slot can hold
+    // it — the arm keeps the document itself, and a failed arm falls back to
+    // the exact-fit copy below, which stops by name — and refuses by name
+    // anywhere else. A copy that drops nothing keeps the type's key order
+    // (S041's checked-conversion rule).
+    if (this.dynJsonImportSyms.size > 0 && exit.kind === "dynCheck" && ts.isExpression(n)) {
+      const dropped = jsonDocCopyDrops(this, ts.isAsExpression(n) || ts.isTypeAssertion(n) ? n.expression : n, exit.type);
+      if (dropped !== null) {
+        if (!armable) this.unsupported("SC1090", dropped.node, dropped.why);
+        if (!this.exactSites.has(key)) this.dynArmSoft.add(key);
+      }
+    }
     // Never a silent width copy where U2 is in play: a copy taken FROM a
     // dynamic-arm value, or one at a slot whose arm did not build (the
     // fallback pass's exactSites), copies only a value of exactly its
@@ -4102,6 +4153,7 @@ export class Lowerer {
       const t = es5TypeOf(this, this.es5, node);
       if (t !== null) return t;
     }
+    if (this.dynJsonImportSyms.size > 0 && this.dynJsonRooted(node)) return this.checker.getAnyType();
     // Unit U2a (dyn-arm.ts): an expression rooted at a dynamic-arm value
     // is that dynamic value, whatever type the checker spelled — `any`.
     if (this.dynArmActive) {
