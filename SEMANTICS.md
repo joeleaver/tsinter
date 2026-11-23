@@ -11819,9 +11819,11 @@ functions whose lengths differ, or functions the compiler cannot name, and
 the callback has optional or defaulted parameters, reading its `length`
 stops by name. A rest-parameter callback value stays refused by name.
 `x instanceof RegExp` over a dynamic value is tested at run time. A RegExp
-that cannot enter dynamic code stops by name where it would, including a
-member of a runtime-keyed object literal, which stops where the literal is
-built.
+that cannot enter dynamic code stops by name where it would. (pc-zregex: a
+typed RegExp entering a checked-dynamic slot now takes the one shared box its
+crossing into `any` takes, so a member of a runtime-keyed object literal no
+longer stops where the literal is built: it is the same RegExp, and
+`instanceof RegExp` over it answers Node's — CMDT-11.)
 **Tested by:** `packages/compiler/test/wasm-commander-typed-chain.test.ts`
 (CMDT-01..11).
 

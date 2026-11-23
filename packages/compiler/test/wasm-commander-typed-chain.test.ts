@@ -3,7 +3,7 @@
  * parseDshArgs share — and the commander stops met on that path. Rows run
  * under Node and on both WasmGC lanes and must match byte for byte. */
 import { describe, test } from "vitest";
-import { checkFenced, checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";
+import { checkRow, type Row, scratchDir } from "./top10-paperclip-rows.js";
 
 const scratch = scratchDir("cmdr-typed-chain");
 
@@ -254,6 +254,19 @@ console.log(applyConst(cb));
 `,
     },
   },
+  {
+    id: "CMDT-11 a record holding a RegExp that becomes a dynamic field shares the one RegExp (instanceof answers Node's)",
+    files: {
+      "main.cjs": `class C {
+  constructor() { this.cfg = { re: /k/ }; }
+  conf(c) { this.cfg = { ...this.cfg, ...c }; return this; }
+}
+console.log("before");
+const c = new C();
+c.conf(JSON.parse('{"a":1}'));
+console.log(c.cfg.re instanceof RegExp, c.cfg.a);`,
+    },
+  },
 ];
 
 describe("commander typed chain (wasm lane vs Node)", () => {
@@ -265,24 +278,5 @@ describe("commander typed chain (wasm lane vs Node)", () => {
 describe("commander typed chain (wasm-native lane vs Node)", () => {
   test.for(ROWS.map((r) => [r.id, r] as const))("%s", async ([, row]) => {
     await checkRow(scratch, row, "wasm-native");
-  }, 600_000);
-});
-
-describe("commander typed chain: stops by name (wasm-native lane)", () => {
-  test("CMDT-11 a record holding a RegExp that becomes a dynamic field stops by name where it is built (never a wrong instanceof)", async () => {
-    const row: Row = {
-    id: "CMDT-11 a record holding a RegExp that becomes a dynamic field stops by name where it is built (never a wrong instanceof)",
-    files: {
-      "main.cjs": `class C {
-  constructor() { this.cfg = { re: /k/ }; }
-  conf(c) { this.cfg = { ...this.cfg, ...c }; return this; }
-}
-console.log("before");
-const c = new C();
-c.conf(JSON.parse('{"a":1}'));
-console.log(c.cfg.re instanceof RegExp, c.cfg.a);`,
-    },
-  };
-    await checkFenced(scratch, row, "wasm-native", "before\n", "holding 'RegExp' values in a runtime-keyed (computed-key) object literal");
   }, 600_000);
 });
