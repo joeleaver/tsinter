@@ -4467,6 +4467,8 @@ class LlEmitter {
         this.B.line(`${fresh} = call ptr @scr_regex_fresh(ptr @${re.sym})`);
         return this.own({ name: fresh, type: e.type });
       }
+      case "tplStringsDyn":
+        throw new Error("llvm emitter bug: tplStringsDyn reaches only the WasmGC lanes (the frontend lowers it under sharedDynamic)");
       case "templateStrings": {
         // One immortal static string array per template SITE (the key);
         // the +1 retain is a no-op on immortals. Cooked strings intern

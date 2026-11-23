@@ -5950,6 +5950,13 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       value = { kind: "bin", op: compound, left: read, right: rhs, type: F64, loc };
     } else if (target.type.kind === "bigint" && rhs.type.kind === "bigint" && bigArith(compound, read, rhs, loc) !== null) {
       value = bigArith(compound, read, rhs, loc)!;
+    } else if (compound === "+" && target.type.kind === "dyn" && rhs.type.kind === "string" && isJsSourceFile(expr.getSourceFile())) {
+      // A JS any-origin target `+=` a string: the binary operator's
+      // string-context rule — String(target) (`+`'s default hint), then
+      // the concatenation, back into the dyn slot (drizzle's sql tag:
+      // `let text = strings[0]; text += "$" + n + strings[i + 1]`).
+      const concat: IrExpr = { kind: "strConcat", left: { kind: "toString", operand: read, hint: "default", type: STRING, loc }, right: rhs, type: STRING, loc };
+      value = { kind: "dynFrom", value: concat, type: DYN, loc };
     } else if (
       (target.type.kind === "dyn" || rhs.type.kind === "dyn") &&
       (target.type.kind === "dyn" || target.type.kind === "f64") &&

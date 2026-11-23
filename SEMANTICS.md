@@ -7741,6 +7741,33 @@ array on the second PLAIN evaluation would show an UNMUTATED array, contradictin
 fact recorded in the rows-file battery's own reach table rather than invented as a dedicated mutant for
 this entry.
 
+**Amendment — implicit-any JavaScript tags (2026-11-23, WasmGC lanes).** A tagged template whose tag
+is an implicit-any JavaScript function (drizzle's `sql(strings, ...params)`, members merged onto it
+afterwards) calls that function's implicit instance with the substitutions at their own types and,
+for the strings argument, the site's interned DYNAMIC array. It is one object per site on every
+evaluation and distinct between sites. It is frozen and carries a frozen, non-enumerable `raw` array
+of the raw spans (escapes uncooked, `\u` sequences verbatim, CR and CRLF line breaks normalised to LF
+as Node does). The tag's body is dynamic code over Node's object, so every read, alias, store, call
+and comparison answers as Node does from the dynamic object model. That covers reads past the end
+(`undefined`), forwarding, returning, identity caches in a Map or WeakMap, callbacks, and calling the
+tag directly with a plain array. Writes throw Node's strict-mode TypeErrors, and sloppy code ignores
+them: an element, `length` or `raw` is read-only, any other key cannot be added, and `push` and
+`pop` throw. `Object.isFrozen`/`isSealed` answer true and `isExtensible` false, `Object.freeze` returns
+the array, and `"raw" in s` and `Object.hasOwn(s, "raw")` hold on the strings array and not on its
+`raw`. The remaining object-model surface of the two arrays stops by name at run time:
+- the other mutating Array methods (`sort`, `splice`, `shift`, `unshift`, `reverse`, `fill`,
+  `copyWithin`);
+- `Object.getOwnPropertyNames`, `Reflect.ownKeys` and `Object.getOwnPropertyDescriptor(s)` (the
+  non-writable indices and the hidden `raw` are not tabled);
+- `Object.defineProperty(ies)`, `delete` and `Object.setPrototypeOf`.
+
+Operators keep the JavaScript dynamic-operand rules: an element in `s[1] + 1` is checked to a number
+and stops by name on a string, where Node concatenates, and a `switch` over an element stops by name; with a string on either side, `+` and `+=`
+concatenate as Node does. An island tag call's strings array (unit A2) is the same kind of box: it now takes the same write
+and integrity answers, as Node does (its `raw` stays the plain array it was). A template span with an
+invalid escape (Node cooks it to `undefined`) refuses by name, as before.
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20).
+
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 
 A JS function that reads its own `arguments` binding with no declared parameters ahead of it (the sloppy-

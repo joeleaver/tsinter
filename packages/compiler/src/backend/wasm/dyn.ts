@@ -8024,6 +8024,53 @@ export class DynBuilder {
     });
   }
 
+  /** S080: a strict-mode write `d[k] = v` (locals 0 and 1 of a void
+   * helper) into a tag call's FROZEN strings array or its frozen raw (a
+   * `$dynTpl` box) throws Node's TypeError and returns: an existing
+   * element, `length` or the strings array's `raw` is read-only, any other
+   * key cannot be added. */
+  private tplWriteGuard(c: Code): void {
+    if (!this.tplLive) return;
+    const concat = this.deps.concat();
+    c.localGet(0);
+    c.refTest(this.tplT());
+    c.ifVoid();
+    this.deps.throwTypeError(c, (x) => {
+      this.pushIsLength(x, (y) => y.localGet(1));
+      x.localGet(1);
+      x.call(this.canonIdx());
+      this.arrLen(x, (y) => this.arrPayload(y, (z) => z.localGet(0)));
+      x.i32LtU();
+      x.i32Or();
+      x.localGet(1);
+      this.deps.lit(x, "raw");
+      x.call(this.deps.strEq());
+      x.localGet(0);
+      x.refCast(this.tplT());
+      x.structGet(this.tplT(), 3);
+      x.globalGet(this.undefinedGlobal());
+      x.refEq();
+      x.i32Eqz();
+      x.i32And();
+      x.i32Or();
+      x.ifResult(this.deps.strRef());
+      this.deps.lit(x, "Cannot assign to read only property '");
+      x.localGet(1);
+      x.call(concat);
+      this.deps.lit(x, "' of object '[object Array]'");
+      x.call(concat);
+      x.else_();
+      this.deps.lit(x, "Cannot add property ");
+      x.localGet(1);
+      x.call(concat);
+      this.deps.lit(x, ", object is not extensible");
+      x.call(concat);
+      x.end();
+    });
+    c.return_();
+    c.end();
+  }
+
   /** Is `k` exactly "length"? */
   private pushIsLength(c: Code, pushKey: (c: Code) => void): void {
     pushKey(c);
@@ -8862,6 +8909,7 @@ export class DynBuilder {
     return this.cached("islandSetIdx", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
       const c = new Code();
       const I = 3;
+      this.tplWriteGuard(c);
       c.localGet(0);
       c.structGet(this.dynT(), DYN_KIND);
       c.i32Const(DK.ARR);
@@ -8909,6 +8957,7 @@ export class DynBuilder {
       this.symFence(c, K, "assigning a member of");
       this.typedArm(c, 0, K, () => this.typedFence(c, "assigning a member of", () => {})); // Unit I
       this.urlWriteFence(c, 0, K, () => {}); // Unit I
+      this.tplWriteGuard(c);
       const SETM = 8;
       this.errProtoGuard(c, (x) => x.localGet(0), "assigning a member of");
       this.arm(c, K, [DK.OBJ], () => {
@@ -9400,7 +9449,9 @@ export class DynBuilder {
         }
       });
       if (this.tplLive) {
-        // Unit A2: a tag call's strings array owns `raw` (non-enumerable).
+        // Unit A2: a tag call's strings array owns `raw` (non-enumerable);
+        // its raw array (S080: a `$dynTpl` box holding the undefined
+        // immortal) does not.
         c.localGet(0);
         c.refTest(this.tplT());
         c.ifVoid();
@@ -9408,7 +9459,12 @@ export class DynBuilder {
         this.deps.lit(c, "raw");
         c.call(this.deps.strEq());
         c.ifVoid();
-        c.i32Const(1);
+        c.localGet(0);
+        c.refCast(this.tplT());
+        c.structGet(this.tplT(), 3);
+        c.globalGet(this.undefinedGlobal());
+        c.refEq();
+        c.i32Eqz();
         c.return_();
         c.end();
         c.end();
@@ -9603,6 +9659,15 @@ export class DynBuilder {
       this.bigFence(c, K, "assigning a member of");
       this.symFence(c, K, "assigning a member of");
       this.arm(c, K, [DK.STR, DK.NUM, DK.BOOL], () => {});
+      if (this.tplLive) {
+        // S080: sloppy code's write into a frozen tag strings array is
+        // ignored, as in Node.
+        c.localGet(0);
+        c.refTest(this.tplT());
+        c.ifVoid();
+        c.return_();
+        c.end();
+      }
       if (this.objModelLive) {
         // Units U3 + U4: the write's rejections are silent (om.set reads
         // and clears the flag on entry).
@@ -14298,6 +14363,53 @@ export class DynBuilder {
         this.typedArm(c, 0, K, () => this.typedFence(c, `calling '${method}' on`, (x) => x.refNull(dynT))); // Unit I
         this.arrLen(c, (x) => x.localGet(1));
         c.localSet(ARGC);
+        if (this.tplLive && DynBuilder.VIEW_MUTATORS.has(method)) {
+          // S080: a mutating Array method on a tag call's FROZEN strings
+          // array (or its frozen raw): push and pop throw Node's TypeError,
+          // the others stop by name.
+          c.localGet(0);
+          c.refTest(this.tplT());
+          c.ifVoid();
+          const lenStr = (x: Code, delta: number): void => {
+            this.boxNum(x, (y) => {
+              this.arrLen(y, (z) => this.arrPayload(z, (w) => w.localGet(0)));
+              y.f64ConvertI32S();
+              if (delta !== 0) {
+                y.f64Const(delta);
+                y.f64Add();
+              }
+            });
+            x.call(this.toStr());
+          };
+          if (method === "push") {
+            this.deps.throwTypeError(c, (x) => {
+              x.localGet(ARGC);
+              x.i32Eqz();
+              x.ifResult(this.deps.strRef());
+              this.deps.lit(x, "Cannot assign to read only property 'length' of object '[object Array]'");
+              x.else_();
+              this.deps.lit(x, "Cannot add property ");
+              lenStr(x, 0);
+              x.call(concat);
+              this.deps.lit(x, ", object is not extensible");
+              x.call(concat);
+              x.end();
+            });
+          } else if (method === "pop") {
+            this.deps.throwTypeError(c, (x) => {
+              this.deps.lit(x, "Cannot delete property '");
+              lenStr(x, -1);
+              x.call(concat);
+              this.deps.lit(x, "' of [object Array]");
+              x.call(concat);
+            });
+          } else {
+            this.deps.fence(c, (x) => this.deps.lit(x, `'Array.prototype.${method}' on a tagged template's frozen strings array is not supported yet`));
+          }
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+        }
 
         // Nullish receivers: Node's property-read message. The emitter
         // has already run this test at the member get, before it built a

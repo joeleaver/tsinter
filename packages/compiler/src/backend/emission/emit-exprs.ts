@@ -749,6 +749,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // the immortal stands for the fresh object itself.
         return E.newTemp(e.type, E.regexLitDirect ? `scr_regex_retain(&${sym})` : `scr_regex_fresh(&${sym})`);
       }
+      case "tplStringsDyn":
+        throw new Error("emitter bug: tplStringsDyn reaches only the WasmGC lanes (the frontend lowers it under sharedDynamic)");
       case "templateStrings": {
         // One immortal static string array per template SITE (the key);
         // the +1 retain is a no-op on immortals but keeps the owned-temps
