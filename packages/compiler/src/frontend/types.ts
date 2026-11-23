@@ -2000,7 +2000,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // A value shared with dynamic code (the one-world jsval, WasmGC lanes):
     // the slot holds it as the dyn value — the same representation.
     const oneWorld = ctx.sharedDynamic === true && ctx.engine !== true;
-    if (value?.kind === "jsval" && oneWorld) value = DYN;
+    // (Not an `any`/`unknown` value type: an untyped Map keeps the
+    // dynamic Map object, GH #183.)
+    if (value?.kind === "jsval" && oneWorld && (args[1]!.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) value = DYN;
     if (!value || !isSupportedMapValue(value, oneWorld)) return null;
     // WeakMap (docs/design/object-keys.md): the same storage, a strong
     // table — nothing observes the difference but the printer.

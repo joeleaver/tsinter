@@ -898,6 +898,9 @@ export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly I
     rmSync: ["fs.rmOptsSync", "fs.rmRetrySync"],
     // The { withFileTypes: true } Dirent form.
     readdirSync: ["fs.readdirTypesSync"],
+    // The mode-argument forms (paperclip's stdlib batch 3).
+    openSync: ["fs.openSyncMode"],
+    copyFileSync: ["fs.copyFileExclSync"],
     // The JS-source validation-ladder variant (lowerFsLadderCall): the
     // real mkdtemp runs when the options leave utf8 semantics.
     mkdtempSync: ["fs.mkdtempSyncChk"],
