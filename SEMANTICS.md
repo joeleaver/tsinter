@@ -10635,7 +10635,7 @@ that reads one before its module ran reads Node's `undefined` (`${v}` is
 `undefined`, `K * 2` is `NaN`) instead of stopping. Other `var` types,
 enums and JSON defaults keep the fence. **Tested by:** module forms rows
 MF-04 and MF-10 (the number `var` against Node, an enum and a string `var`
-pinning the fence).
+pinning the fence) and MF-11 (a boolean `var`, against Node).
 
 <!-- S125 is reserved for the GH #109 branch. -->
 

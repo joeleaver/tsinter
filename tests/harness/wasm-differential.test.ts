@@ -10704,6 +10704,16 @@ describe("module forms rows", () => {
     }
   }, 120000);
 
+  test("MF-11 S124 (GH #255 amendment): a boolean `var` read by cycle code before its module ran is Node's undefined (falsy); read after, Node's value", async () => {
+    expect(
+      await sameAsNode({
+        "main.ts": 'import { f } from "./a.ts";\nconsole.log("main", f);\n',
+        "a.ts": 'import "./b.ts";\nexport var f = true;\nconsole.log("a", f);\n',
+        "b.ts": 'import { f } from "./a.ts";\nconsole.log("b", `${f}`, f ? 1 : 0);\nexport {};\n',
+      }),
+    ).toEqual({ stdout: "b undefined 0\na true\nmain true\n", exitCode: 0 });
+  }, 120000);
+
   test("MF-08 a relative import no file answers (in JavaScript, where the checker does not stop it) compiles to Node's ERR_MODULE_NOT_FOUND startup crash, before any module evaluates", async () => {
     expect(
       await sameAsNode({
