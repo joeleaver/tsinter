@@ -7292,7 +7292,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         // the lowering keeps dynamic, so the receiver's lowering decides)
         const recvT = L.mapTypeOf(L.typeOf(src.expression.expression));
         const typedRecv = recvT !== null && ["map", "set", "array", "searchParams", "bytes", "record", "object", "string"].includes(recvT.kind);
-        const probe = typedRecv ? null : probeLower(L, src.expression.expression);
+        // (an implicit-any JavaScript function's rest parameter is `any[]`
+        // to the checker but lowers dynamic: drizzle's sql tag walks
+        // `for (const [i, p] of params.entries())`, so an array-typed
+        // receiver is probed too — a typed array lowers as an array)
+        const probe = typedRecv && recvT.kind !== "array" ? null : probeLower(L, src.expression.expression);
         if (probe !== null && (probe.type.kind === "jsval" || probe.type.kind === "dyn")) {
           const recv = L.lowerExpr(src.expression.expression);
           if (recv.type.kind === "jsval" || recv.type.kind === "dyn") return lowerForOfDyn(L, stmt, asDynOperand(recv), labels, true);
