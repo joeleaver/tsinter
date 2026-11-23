@@ -489,6 +489,29 @@ const o = JSON.parse('{"a":1}');
 try { for (const [k] of o.entries()) console.log(k); } catch (e) { console.log(e.constructor.name, e.message); }`,
   },
   {
+    id: "S125-A7-04 for-of over .entries() of an implicit-any function's rest parameter (drizzle's sql tag: `any[]` to the checker, dynamic in the lowering) walks [index, element] live; an untyped Map or an array behind one binding",
+    entry: "main.mjs",
+    src: `function walk(head, ...params) {
+  let out = "";
+  for (const [i, p] of params.entries()) {
+    if (i === 0 && params.length < 4) params.push("late");
+    out += "|" + i + ":" + String(p);
+  }
+  return out;
+}
+console.log("a", walk("a"));
+console.log("b", walk("b", 1, "two", { k: 3 }.k));
+console.log("c", walk("c", null, undefined));
+const pick = (v) => v;
+for (const flag of [true, false]) {
+  const m = pick(new Map());
+  m.set(1, 2);
+  m.set(3, 4);
+  const x = flag ? m : JSON.parse("[5,6]");
+  for (const [k, v] of x.entries()) console.log(flag, k, v);
+}`,
+  },
+  {
     id: "S125-A6-01 paperclip's zod uniqueness refinements: a Set built from the callback's array (new Set(values).size === values.length, [...new Set(ids)]) reads it once",
     entry: "main.ts",
     files: { "dep.mjs": ZDEP },
