@@ -10996,8 +10996,23 @@ A plain function that returns it (paperclip's `return z.NEVER` in a
 transform callback, whose other returns are typed) has its result on the
 dynamic arm (a `ret:` site), so the sentinel reaches its caller unchanged
 and zod's identity test sees its own object.
+
+**Amendment (an options object into a JavaScript `= {}` parameter, 2026-11-23).**
+A JavaScript function that already instantiates per call site (an untyped
+parameter beside it) binds a parameter defaulted to an empty object literal
+(fast-string-truncated-width's `truncationOptions = {}`, `widthOptions = {}`;
+fast-string-width's `options = {}`) per call site too: an argument whose type
+is a record binds that record (an object literal its contextual type — a
+viewed package's declared options type), so the body reads and writes the
+caller's object itself, as in Node, and a key the record lacks reads
+undefined (its `??` default applies, S128); a dynamic argument (a JavaScript
+module's own options literal, a forwarded parameter on its dynamic slot)
+binds the dynamic slot; an omitted one takes the default on the dynamic slot,
+a fresh object the body may add keys to. Any other argument keeps the `{}`
+slot and S125's judgement of its copy.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
+both lanes); `packages/compiler/test/wasm-s125-fstw-options.test.ts` (S125-O-*,
 both lanes).
 
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
