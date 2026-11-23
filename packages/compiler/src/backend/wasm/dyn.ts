@@ -4868,6 +4868,76 @@ export class DynBuilder {
     return this.assignRaw(true);
   }
 
+  /** Object.assign onto a FUNCTION (postgres.js's `Object.assign(sql, {
+   * unsafe, end, … })`): the source's own enumerable entries in order, each
+   * written through keySet into the function's own property table. */
+  assignOntoFunc(): number {
+    return this.cached("assignOntoFunc", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const PAIRS = 2;
+      const N = 3;
+      const I = 4;
+      const P = 5;
+      const c = new Code();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      c.localGet(1);
+      c.i32Const(this.symLive ? 10 : 2); // entries, symbol keys too (CopyDataProperties)
+      c.call(this.objWalkUser());
+      c.localTee(P);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      this.arrPayload(c, (x) => x.localGet(P));
+      c.localTee(PAIRS);
+      c.structGet(this.deps.arrVec().struct, VEC_LEN);
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(PAIRS), (x) => x.localGet(I));
+      c.localSet(P);
+      c.localGet(0);
+      this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(0));
+      c.structGet(dynT, DYN_REF);
+      emitFlatCast(c, this.deps.strType());
+      this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(1));
+      c.call(this.keySet());
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(0);
+      this.mb.setBody(idx, [this.arrRef(), I32, I32, this.dynRef()], c.bytes());
+    });
+  }
+
   /** Object.assign onto a view: member by member through keySet (the
    * accessors' checks), the source's own enumerable entries in order. */
   assign(): number {
@@ -11091,10 +11161,41 @@ export class DynBuilder {
       };
       handleSide(0, "onto");
       handleSide(1, "from");
+      // A FUNCTION target writes into its own property table; any other
+      // non-object target (an array, a boxed primitive) is not modeled —
+      // returning it untouched would silently copy nothing.
+      if (!except) {
+        c.localGet(K);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(0);
+        c.localGet(1);
+        c.call(this.assignOntoFunc());
+        c.return_();
+        c.end();
+      }
       c.localGet(K);
       c.i32Const(DK.OBJ);
       c.i32Ne();
       c.ifVoid();
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.i32Or();
+      c.localGet(K);
+      c.i32Const(DK.BOOL);
+      c.i32Eq();
+      c.i32Or();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.fence(c, (x) => this.deps.lit(x, "Object.assign onto a dynamic value that is neither a plain object nor a function (an array, a typed value) is not supported yet"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
       c.localGet(0);
       c.return_();
       c.end();

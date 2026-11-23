@@ -2792,6 +2792,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (hybrid) return hybrid;
   }
   const callSigs = checker.getCallSignatures(widened);
+  // S133 (k), callable amendment: a viewed package's declared CALLABLE
+  // interface with members (postgres.js's `Sql<T>`: a generic call
+  // signature — it is also a template tag — plus generic and plain
+  // methods) is the implementation's dynamic value, as a non-callable one.
+  if (callSigs.length > 0 && declaredInterfaceOverDynamic(widened, ctx)) return JSVAL;
   if (callSigs.length === 1) {
     const sig = callSigs[0]!;
     if (sig.getTypeParameters().length) return null;

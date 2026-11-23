@@ -693,6 +693,14 @@ export function collectEs5(L: Lowerer, files: readonly ts.SourceFile[]): Es5Info
         if (m === "setPrototypeOf") markDyn(n.arguments[1]);
         if (m === "defineProperties" || m === "create") markDyn(n.arguments[1]);
         if (m === "defineProperty") markDyn(n.arguments[2]);
+      } else if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && ts.isIdentifier(n.expression.expression) &&
+                 n.expression.expression.text === "Object" && n.expression.name.text === "assign" && n.arguments.length > 0) {
+        // `Object.assign(sql, { unsafe, end, … })` onto a FUNCTION (postgres.js
+        // builds its client this way): a function given properties, a
+        // dynamic FUNC like an expando target. (Record targets keep their
+        // own Object.assign lowering.)
+        const f = fnSymbol(symOf(n.arguments[0]!));
+        if (f !== undefined) info.ctors.add(f);
       } else if (ts.isDeleteExpression(n)) {
         const t = strip(n.expression);
         if (ts.isPropertyAccessExpression(t) || ts.isElementAccessExpression(t)) markDyn(t.expression);

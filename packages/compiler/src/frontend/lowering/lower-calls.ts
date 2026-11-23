@@ -2173,7 +2173,20 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         // string) — typeOf consults the ACTIVE instance's bindings, so a
         // bound param forwarded into another implicit call transitively
         // instantiates it (this._initCommandGroup(command)).
-        const t = L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
+        let t = L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
+        // A fresh object literal argument takes its CONTEXTUAL type's shape
+        // when it lowers (a declared `options?: Options` of the .d.ts the
+        // call resolved to — postgres's `postgres(url, { max: 1 })`): the
+        // parameter binds that declared type, so the value crosses as it
+        // is rather than as a copy into the literal's narrower shape.
+        let a: ts.Expression = arg;
+        while (ts.isParenthesizedExpression(a)) a = a.expression;
+        if (ts.isObjectLiteralExpression(a)) {
+          const ctx0 = L.checker.getContextualType(a);
+          const ctx = ctx0 === undefined ? undefined : L.checker.getNonNullableType(ctx0);
+          const ctxMapped = ctx !== undefined && (ctx.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 ? L.mapTypeOf(ctx) : null;
+          if (ctx !== undefined && bindableImplicitIr(ctxMapped) && ctxMapped.kind === "record") t = ctx;
+        }
         const mapped = L.mapTypeOf(t);
         // A TemplateStringsArray argument (a tag function called directly,
         // `t(["q"] as unknown as TemplateStringsArray, 1)`) keeps the
@@ -9254,7 +9267,14 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // `Object.assign(fn, { props })` whose RESULT type maps to the hybrid
     // (function-with-properties) record: the chalk-shape CONSTRUCTOR.
     if (member === "assign") {
-      const hybrid = lowerObjectAssignHybrid(L, call);
+      // A JavaScript function the program gives properties (an ES5 dynamic
+      // FUNC — postgres.js's `Object.assign(sql, { unsafe, end, … })`):
+      // the dynamic assign below, never the typed hybrid record.
+      let t0: ts.Expression | undefined = call.arguments[0];
+      while (t0 !== undefined && ts.isParenthesizedExpression(t0)) t0 = t0.expression;
+      const t0Sym = t0 !== undefined && ts.isIdentifier(t0) ? L.checker.getSymbolAtLocation(t0) : undefined;
+      const dynFuncTarget = t0Sym !== undefined && L.es5 !== null && L.es5.ctors.has(t0Sym);
+      const hybrid = dynFuncTarget ? null : lowerObjectAssignHybrid(L, call);
       if (hybrid) return hybrid;
       // `Object.assign({}, lit)` — an EMPTY fresh-literal target and one
       // object-literal source: the result is a fresh object carrying
@@ -9295,10 +9315,20 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         // CHECKED-DYNAMIC target and source (the JS file-scope
         // object-literal identity story): the runtime dyn copy — own
         // members of the source land on the target, which returns.
-        if (tProbe?.type.kind === "dyn" || (L.sharedDynamic && tProbe?.type.kind === "jsval")) {
+        if (tProbe?.type.kind === "dyn" || (L.sharedDynamic && tProbe?.type.kind === "jsval") || (dynFuncTarget && L.sharedDynamic && tProbe?.type.kind === "func")) {
           const loc = locOf(call);
-          const target = asDynOperand(L.lowerExpr(call.arguments[0]!));
-          const source = assignSourceDyn(L, asDynOperand(L.lowerExpr(call.arguments[1]!)), call.arguments[1]!);
+          // (A function target boxes into its dynamic FUNC: its property
+          // table is keyed by the closure, so every later box of the same
+          // function — `return sql` — carries what the assign wrote.)
+          const target = tProbe?.type.kind === "func"
+            ? L.coerceInto(call.arguments[0]!, L.lowerExpr(call.arguments[0]!), DYN)
+            : asDynOperand(L.lowerExpr(call.arguments[0]!));
+          // (A function target's object-literal source — `{ unsafe, end }`,
+          // its members functions — is built as the dynamic object itself.)
+          const srcNode = source0(call.arguments[1]!);
+          const source = tProbe?.type.kind === "func" && ts.isObjectLiteralExpression(srcNode)
+            ? L.lowerExprExpecting(srcNode, DYN)
+            : assignSourceDyn(L, asDynOperand(L.lowerExpr(call.arguments[1]!)), call.arguments[1]!);
           if (target.type.kind === "dyn" && source.type.kind === "dyn") {
             return { kind: "libCall", fn: "dyn.assign", args: [target, source], type: DYN, loc };
           }
@@ -11352,6 +11382,12 @@ function islandMethodSpreadCall(
  * SEMANTICS.md S115): the walk then copies its own members as JS does —
  * nested composites by reference — where the checked-dynamic conversion
  * would deep-copy them. */
+function source0(e: ts.Expression): ts.Expression {
+  let x = e;
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  return x;
+}
+
 function assignSourceDyn(L: Lowerer, src: IrExpr, node: ts.Node): IrExpr {
   // (--dynamic: the source's view, as main built it; the one dynamic world
   // without the flag keeps main's checked-dynamic source conversion.)
