@@ -3312,7 +3312,9 @@ export function widthCopyPass(L: Lowerer, functions: IrFunction[]): void {
           // (A copy no binding, field or unknown code ever holds is read where it
           // is made, before the original can change.)
           else if (origWrittenWhileHeld(s, sole ? refs.filter((r) => tkey(r) !== tkey(s.t)) : refs, dead)) why = ORIG_WRITTEN;
-          else if (!destRO && dynIdentityOps.some((o) => o === null || alias.same(o.e, o.fn, s.node, s.where))) why = DYN_SAME;
+          // (GH #250: an identity test is no read-only use — `last === x`
+          // over two crossings of one record compares two copies.)
+          else if (dynIdentityOps.some((o) => o === null || alias.same(o.e, o.fn, s.node, s.where))) why = DYN_SAME;
         }
       } else {
         feature = `a dynamic ('unknown', 'any' or 'object') value checked into '${L.fmt(s.t)}'`;
