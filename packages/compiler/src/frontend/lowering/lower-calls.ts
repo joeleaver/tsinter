@@ -2178,7 +2178,13 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         // instantiates it (this._initCommandGroup(command)).
         const t = L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
         const mapped = L.mapTypeOf(t);
-        if (bindableImplicitIr(mapped)) {
+        // A TemplateStringsArray argument (a tag function called directly,
+        // `t(["q"] as unknown as TemplateStringsArray, 1)`) keeps the
+        // dynamic slot, as a tagged call's strings array does (S080): the
+        // tag's body reads it as Node's array (out of range: undefined),
+        // never through a static string[] whose element type hides it.
+        const tsa = (t.getAliasSymbol() ?? t.getSymbol())?.name === "TemplateStringsArray";
+        if (bindableImplicitIr(mapped) && !tsa) {
           bound = mapped;
           argTypes.set(sym, t);
         }
@@ -2186,6 +2192,35 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       shapes.push({ type: bound, mode: "required" });
     });
     return internImplicitInstance(L, call, info, shapes, argTypes);
+  }
+
+/** The instance a TAGGED-TEMPLATE call of an implicit-any JavaScript tag
+   * names: its strings parameter keeps the dynamic slot (the site's
+   * tplStringsDyn value), every other implicit parameter binds the matching
+   * substitution's widened checker type — implicitCallInstance's rules over
+   * the tag's argument list. */
+  export function implicitTagInstance(L: Lowerer, expr: ts.TaggedTemplateExpression, info: GenericFnInfo, values: readonly ts.Expression[]): GenericInstance {
+    const shapes: ParamShape[] = [];
+    const argTypes = new Map<ts.Symbol, ts.Type>();
+    info.decl.parameters.forEach((param, i) => {
+      const sym = info.implicitParams![i];
+      if (!sym) {
+        shapes.push(L.paramShape(param));
+        return;
+      }
+      let bound: IrType = DYN;
+      const arg = i === 0 ? undefined : values[i - 1];
+      if (arg !== undefined) {
+        const t = L.checker.getBaseTypeOfLiteralType(L.typeOf(arg));
+        const mapped = L.mapTypeOf(t);
+        if (bindableImplicitIr(mapped)) {
+          bound = mapped;
+          argTypes.set(sym, t);
+        }
+      }
+      shapes.push({ type: bound, mode: "required" });
+    });
+    return internImplicitInstance(L, expr, info, shapes, argTypes);
   }
 
 /** The all-dyn DEFAULT instance — today's compiled body exactly: what a
@@ -6665,8 +6700,30 @@ const inliningPredicates = new Set<ts.Symbol>();
     if (ts.isIdentifier(expr.tag) && !L.isSelfReference(expr.tag)) {
       if (L.isTopLevelFnSymbol(expr.tag) && !L.peekLocal(expr.tag)) {
         fenceEarlyAliasUse(L, expr.tag, expr);
-        if (L.genericFnOf(expr.tag)) {
-          L.unsupported("SC1090", expr, "tagged templates with generic tag functions");
+        {
+          const g = L.genericFnOf(expr.tag);
+          // An implicit-any JAVASCRIPT tag (drizzle's `sql(strings,
+          // ...params)`): its strings parameter takes the site's strings
+          // array as a DYNAMIC value — a frozen array carrying its frozen
+          // `.raw`, interned per site (the tplStringsDyn node) — so every
+          // read, alias, store and integrity question in the tag's body is
+          // the dynamic object model's answer, as in Node (SEMANTICS.md
+          // S080); each substitution binds its own type, as in a call.
+          // TypeScript generic tags keep the fence.
+          if (g !== null && g.implicitParams !== undefined && isJsSourceFile(g.decl.getSourceFile()) && L.sharedDynamic && !L.engine) {
+            const instance = implicitTagInstance(L, expr, g, values);
+            const site: IrExpr = {
+              kind: "tplStringsDyn",
+              key: `${loc.file}:${expr.template.getStart()}`,
+              cooked: pieces.map((p) => p.text),
+              raw: pieces.map((p) => templateRawTextOf(p).replace(/\r\n?/g, "\n")),
+              type: DYN,
+              loc,
+            };
+            const args = completeArgs(L, values, instance.params, loc, expr, [site]);
+            return { kind: "call", callee: instance.name, args, type: instance.returnType, loc };
+          }
+          if (g) L.unsupported("SC1090", expr, "tagged templates with generic tag functions");
         }
         const sig = L.fnSigOf(expr.tag);
         if (sig) {

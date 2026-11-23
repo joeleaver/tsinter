@@ -2375,6 +2375,12 @@ function validateFunction(
         }
         break;
       }
+      case "tplStringsDyn": {
+        if (e.type.kind !== "dyn") err("tplStringsDyn must be dyn-typed", e.loc);
+        if (e.key === "") err("tplStringsDyn key must be non-empty", e.loc);
+        if (e.raw.length !== e.cooked.length) err("tplStringsDyn raw/cooked length mismatch", e.loc);
+        break;
+      }
       case "templateStrings": {
         if (e.type.kind !== "array" || e.type.elem.kind !== "string") {
           err("templateStrings must be string[]-typed", e.loc);

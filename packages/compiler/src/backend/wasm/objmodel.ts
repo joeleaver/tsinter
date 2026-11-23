@@ -1841,6 +1841,7 @@ export class ObjModel {
   /** %w.om.defineProperty(target, key box, desc) → target (null pending). */
   defineProperty(): number {
     return this.fn("defineProperty", [this.d.dynRef(), this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [this.strRef()], (c) => {
+        this.tplFence(c, "Object.defineProperty", (x) => x.globalGet(this.d.undefinedGlobal()));
       const KS = 3;
       c.localGet(1);
       c.call(this.d.toPropertyKey());
@@ -1891,6 +1892,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.dynRef(), I32, this.d.dynRef(), this.d.dynRef(), this.d.arrRef()],
       (c) => {
+        this.tplFence(c, "Object.defineProperties", (x) => x.globalGet(this.d.undefinedGlobal()));
         const KEYS = 2;
         const I = 3;
         const KB = 4;
@@ -2013,6 +2015,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [I32, this.d.entryRef(), I32, this.d.objRef(), this.k.fnPropsRef(), I32],
       (c) => {
+        this.tplFence(c, "Object.getOwnPropertyDescriptor", (x) => x.globalGet(this.d.undefinedGlobal()));
         const K = 2;
         const E = 3;
         const F = 4;
@@ -2239,6 +2242,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [I32, this.d.objRef(), this.d.objRef(), I32, I32, this.d.entryRef(), I32, this.k.fnPropsRef(), this.d.dynRef(), this.d.arrRef()],
       (c) => {
+        this.tplFence(c, "Object.getOwnPropertyNames (or Reflect.ownKeys)", (x) => x.globalGet(this.d.undefinedGlobal()));
       this.d.globalReflectGuard(c, (x) => x.localGet(0));
         const K = 1;
         const O = 2;
@@ -2411,6 +2415,7 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.dynRef(), this.d.objRef(), I32, this.d.dynRef(), this.d.dynRef()],
       (c) => {
+        this.tplFence(c, "Object.getOwnPropertyDescriptors", (x) => x.globalGet(this.d.undefinedGlobal()));
       this.d.globalReflectGuard(c, (x) => x.localGet(0));
         const NAMES = 1;
         const OUT = 2;
@@ -2487,6 +2492,7 @@ export class ObjModel {
       [I32],
       [I32, this.d.objRef(), I32, this.k.fnPropsRef(), I32],
       (c) => {
+        this.tplFence(c, "'delete'", (x) => x.i32Const(0));
       this.d.errMirrorGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "'delete' of a member");
       this.d.errStackGuard(c, (x) => x.localGet(0), (x) => x.localGet(1), "'delete' of");
         const K = 2;
@@ -2700,6 +2706,7 @@ export class ObjModel {
     const dynT = this.d.dynT();
     const L = this.d.objLinkedT();
     return this.fn("setProto", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), I32], (c) => {
+        this.tplFence(c, "Object.setPrototypeOf", (x) => x.globalGet(this.d.undefinedGlobal()));
       this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.setPrototypeOf");
       // GH #238 (review): an object linked to an error prototype is an
       // error-like object in Node (instanceof, name, toString through the
@@ -3015,6 +3022,20 @@ export class ObjModel {
     );
   }
 
+  /** S080: a tag call's frozen strings array (or its frozen raw — a
+   * `$dynTpl` box) in parameter 0 stops by name: its own-property table
+   * (non-writable indices, the non-enumerable `raw`) is not modeled. */
+  private tplFence(c: Code, what: string, pushResult: (x: Code) => void): void {
+    if (!this.d.tplLive) return;
+    c.localGet(0);
+    c.refTest(this.d.tplT());
+    c.ifVoid();
+    this.k.deps.fence(c, (x) => this.lit(x, `${what} on a tagged template's frozen strings array is not supported yet`));
+    pushResult(c);
+    c.return_();
+    c.end();
+  }
+
   /* ── integrity levels ───────────────────────────────────────────────── */
 
   /** %w.om.integrity(o, level) → o: 0 preventExtensions, 1 seal, 2 freeze. */
@@ -3030,6 +3051,15 @@ export class ObjModel {
       [this.d.dynRef()],
       [this.d.objRef(), I32, this.d.entryRef(), I32, I32],
       (c) => {
+        // S080: a tag call's strings array (and its raw) is already frozen.
+        if (this.d.tplLive) {
+          c.localGet(0);
+          c.refTest(this.d.tplT());
+          c.ifVoid();
+          c.localGet(0);
+          c.return_();
+          c.end();
+        }
       this.d.globalReflectGuard(c, (x) => x.localGet(0));
       this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.freeze, seal or preventExtensions");
         const O = 2;
@@ -3136,6 +3166,18 @@ export class ObjModel {
     const entries = this.d.entriesArrayType();
     const entryT = this.d.entryT();
     return this.fn("isIntegrity", [this.d.dynRef(), I32], [I32], [this.d.objRef(), I32, this.d.entryRef()], (c) => {
+        // S080: a tag call's strings array (and its raw) is frozen: sealed
+        // and frozen, never extensible (level 0 asks extensibility).
+        if (this.d.tplLive) {
+          c.localGet(0);
+          c.refTest(this.d.tplT());
+          c.ifVoid();
+          c.localGet(1);
+          c.i32Const(0);
+          c.i32Ne();
+          c.return_();
+          c.end();
+        }
       this.d.globalReflectGuard(c, (x) => x.localGet(0));
       const O = 2;
       const I = 3;

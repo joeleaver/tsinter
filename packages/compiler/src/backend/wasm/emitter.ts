@@ -3814,7 +3814,7 @@ class Assembler {
           (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
       );
     this.accessorsLive = this.objModelLive || this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
-    this.tplLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "tplStrings");
+    this.tplLive = this.irNodeReachable(mod, (rec) => (rec["kind"] === "jsOp" && rec["op"] === "tplStrings") || rec["kind"] === "tplStringsDyn");
     {
       const unionHasUrl = (id: string): boolean => (mod.unions ?? []).some((u) => u.id === id && u.arms.some((arm) => arm.kind === "url"));
       const unionHasTyped = (id: string): boolean =>
@@ -32609,11 +32609,17 @@ class Assembler {
         // there when it is in range, and no other spelling ever is.
         const arrIdx = /^(0|[1-9][0-9]*)$/.test(e.key) ? Number(e.key) : null;
         if (e.key === "raw" && this.tplLive) {
-          // Unit A2: a tag call's strings array owns `raw`.
+          // Unit A2: a tag call's strings array owns `raw` (S080: its raw
+          // array, a `$dynTpl` box holding the undefined immortal, does not).
           code.localGet(d);
           code.refTest(this.dyn.tplT());
           this.openIfResult(I32);
-          code.i32Const(1);
+          code.localGet(d);
+          code.refCast(this.dyn.tplT());
+          code.structGet(this.dyn.tplT(), 3);
+          code.globalGet(this.dyn.undefinedGlobal());
+          code.refEq();
+          code.i32Eqz();
           code.else_();
           pushFuncArm();
           this.close();
@@ -34821,6 +34827,54 @@ class Assembler {
        * read-only, matching Node's own array exactly UNTIL a write is
        * attempted, which Node's real is frozen array rejects and this
        * tier's plain mutable vec accepts (S080's two measured shapes). */
+      case "tplStringsDyn": {
+        // S080: a tagged template's strings object for an implicit-any
+        // JavaScript tag — one immortal DYNAMIC array per site, a `$dynTpl`
+        // box (frozen; its `raw` companion), whose `raw` array is itself a
+        // `$dynTpl` box holding the undefined immortal (frozen, no `raw`).
+        let g = this.templateInternGlobals.get(`dyn:${e.key}`);
+        if (g === undefined) {
+          g = this.mb.addGlobal(this.dyn.dynRef(), true, (w) => {
+            w.u8(0xd0); // ref.null $dyn
+            w.sleb(this.dyn.dynT());
+          });
+          this.templateInternGlobals.set(`dyn:${e.key}`, g);
+        }
+        code.globalGet(g);
+        code.refIsNull();
+        this.openIf();
+        const cooked = this.acquireScratch(this.dyn.arrRef());
+        const raw = this.acquireScratch(this.dyn.arrRef());
+        code.f64Const(0);
+        code.call(this.vecs.newLen(this.dynVecInfo()));
+        code.localSet(cooked);
+        code.f64Const(0);
+        code.call(this.vecs.newLen(this.dynVecInfo()));
+        code.localSet(raw);
+        e.cooked.forEach((s, i) => {
+          code.localGet(cooked);
+          this.dyn.boxStr(code, () => this.pushStrLit(s));
+          code.call(this.dyn.arrPush());
+          code.localGet(raw);
+          this.dyn.boxStr(code, () => this.pushStrLit(e.raw[i]!));
+          code.call(this.dyn.arrPush());
+        });
+        code.i32Const(DK.ARR);
+        code.f64Const(0);
+        code.localGet(cooked);
+        code.i32Const(DK.ARR);
+        code.f64Const(0);
+        code.localGet(raw);
+        code.globalGet(this.dyn.undefinedGlobal());
+        code.structNew(this.dyn.tplT());
+        code.structNew(this.dyn.tplT());
+        code.globalSet(g);
+        this.releaseScratch(this.dyn.arrRef(), raw);
+        this.releaseScratch(this.dyn.arrRef(), cooked);
+        this.close();
+        code.globalGet(g);
+        return;
+      }
       case "templateStrings": {
         const stringVecKey = arrayOf(STRING) as IrType & { kind: "array" };
         const vecInfo = this.vecInfoFor(stringVecKey, e.loc);

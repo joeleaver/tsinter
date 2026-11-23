@@ -1380,6 +1380,7 @@ class FnAnalyzer {
       case "unitLit":
       case "regexLit":
       case "templateStrings":
+      case "tplStringsDyn":
       case "classRef":
       case "selfRef":
       case "chainRecv":

@@ -5063,6 +5063,11 @@ export type IrExpr =
    * spelling) and `.raw` does not exist on it (reads fence by name;
    * String.raw itself lowers separately, splicing raw text directly). */
   | { kind: "templateStrings"; key: string; cooked: string[]; type: IrType; loc: SrcLoc }
+  /** A tagged template's strings object handed to an implicit-any
+   * JavaScript tag (WasmGC lanes): the per-SITE interned DYNAMIC array —
+   * frozen, carrying its frozen `raw` array of the raw spans — so the tag's
+   * dynamic body sees Node's object (SEMANTICS.md S080). DYN-typed. */
+  | { kind: "tplStringsDyn"; key: string; cooked: string[]; raw: string[]; type: IrType; loc: SrcLoc }
   /** A regex operation (see IrRegexIntrinsicMethod for the surface and the
    * receiver/arg conventions). The receiver and args are BORROWED;
    * string/array results are owned (+1). `replaceAll`, `matchAll` and
