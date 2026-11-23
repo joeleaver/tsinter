@@ -122,7 +122,7 @@ const ROWS: Row[] = [
 
 /** Forms that stay compile refusals, each by name. */
 const REFUSALS: { id: string; src: string; message: RegExp }[] = [
-  { id: "weakref", src: "class K {}\nconst wr = new WeakRef(new K());\nconsole.log(typeof wr);", message: /'new WeakRef' is part of the standard library types but has no scriptc lowering yet/ },
+  { id: "finreg-unregister", src: "const f = new FinalizationRegistry<{ k: number }>(() => {});\nconst t = {};\nconsole.log(f.unregister(t));", message: /unregister/ },
   { id: "array-from-set-mapper", src: "const s = new Set([1, 2]);\nconsole.log(Array.from(s, (x) => x * 2));", message: /'Array\.from with this argument shape'/ },
   { id: "array-from-generator", src: "function* g() { yield 1; }\nconsole.log(Array.from(g()));", message: /'Array\.from with this argument shape'/ },
   { id: "concat-spread", src: "const parts = [\"x\"];\nconsole.log(\"\".concat(...parts));", message: /'string\.concat'/ },

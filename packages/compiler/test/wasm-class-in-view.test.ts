@@ -65,10 +65,10 @@ const u = b as any;
 console.log(u.label, u.one.name, u.many.length, u.many[1].n, u.one instanceof Item);`,
   },
   {
-    id: "CVIEW-03 an array of instances of a class that does not compile here (a WeakRef field), cast to any: the class's own diagnostics and a named refusal at the crossing, never an internal error",
+    id: "CVIEW-03 an array of instances of a class that does not compile here (an Intl.Collator field), cast to any: the class's own diagnostics and a named refusal at the crossing, never an internal error",
     src: `class V {
   tag = "x";
-  ref?: WeakRef<object>;
+  ref?: Intl.Collator;
 }
 function mark(xs: V[]): void {
   (xs as any)._isVList = true;
