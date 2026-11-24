@@ -43,6 +43,7 @@ import { dtsCallResult } from "./lower-dts.js";
 import { classViewOf, fencedValue, liftClassReceiver, viewableClass } from "./class-views.js";
 import { lowerVoidTernaryStatement } from "./lower-stmts.js";
 import { onlyStubTouches } from "./stub-builtins.js";
+import { typedErrorAsDyn } from "./typed-error-dyn.js";
 
 /** How a parameter participates in CALL-SITE COMPLETION (the frontend
  * completes every call to the one full signature, so the IR and backends
@@ -9609,6 +9610,12 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         let v = asDynOperand(L.lowerExpr(argNode));
         if (v.type.kind !== "dyn") v = { kind: "dynFrom", value: v, type: DYN, loc: locOf(call) };
         return { kind: "libCall", fn, args: [v], type: DYN, loc: locOf(call) };
+      }      // A typed error lists its encoding's user view, Node's own
+      // enumerable keys (GH #193, typed-error-dyn.ts).
+      const errDyn = typedErrorAsDyn(L, argNode);
+      if (errDyn !== null) {
+        const fn = member === "keys" ? "dyn.objKeys" : member === "values" ? "dyn.objValues" : "dyn.objEntries";
+        return { kind: "libCall", fn, args: [errDyn], type: DYN, loc: locOf(call) };
       }
     }
     let argIr = L.mapTypeOf(L.typeOf(argNode));

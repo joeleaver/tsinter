@@ -38,6 +38,7 @@ import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier, stubBuiltinModuleOf } from "../shared.js";
 import { probeNodeRequireRefusal } from "../npm.js";
 import { lowerExecCompanionDecl, lowerRegexLastIndexIncDec, lowerRegexLastIndexWrite } from "./lower-regex.js";
+import { lowerTypedErrorExpandoWrite } from "./typed-error-dyn.js";
 
 /** `const X = /* @__PURE__ *\/ makeX()` at a module's top level: every
  * declarator initialized by a call (or `new`) carrying the bundler PURE
@@ -5657,6 +5658,12 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           if (target) {
             const value = L.lowerExprExpecting(expr.right, target.fieldType);
             return L.fieldSetStmt(target, value, locOf(expr), expr.left);
+          }
+          // `e.code = v` on a typed error: an own property of its
+          // encoding, as in Node (GH #193, typed-error-dyn.ts).
+          {
+            const viaErr = lowerTypedErrorExpandoWrite(L, expr.left, expr.right, locOf(expr));
+            if (viaErr) return viaErr;
           }
           // A write to an ABSTRACT property through an abstract-typed
           // receiver: the read fence's write twin (the declaration is

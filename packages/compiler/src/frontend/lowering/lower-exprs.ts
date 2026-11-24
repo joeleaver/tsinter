@@ -45,6 +45,7 @@ import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerB
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
 import { dtsAwaitedResult } from "./lower-dts.js";
 import { fenceNodeClassKeyWalk } from "./node-class-fence.js";
+import { isTypedErrorNode, typedErrorAsDyn } from "./typed-error-dyn.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
  * class ACCESSOR property (reads become getter calls, writes setter calls;
@@ -6658,6 +6659,9 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
       return ts.isObjectLiteralExpression(init) && jsLiteralBuildsDynamic(L, init);
     }
     if (!ts.isSpreadAssignment(p)) return false;
+    // A typed error spreads its own enumerable keys, which its type does
+    // not describe: the dynamic object (GH #193, typed-error-dyn.ts).
+    if (isTypedErrorNode(L, p.expression)) return true;
     // A source whose type declares fields keeps the field-by-field record
     // copy (corpus 2300's `{ ...conf, proto }` over a file-scope literal);
     // one whose type declares none (`{}`, `object`, `any`: commander's
@@ -6695,7 +6699,7 @@ function jsLiteralBuildsDynamic(L: Lowerer, lit: ts.ObjectLiteralExpression): bo
     const objRef = (): IrExpr => ({ kind: "varRef", localId: objLocal!.id, type: DYN, loc });
     for (const prop of expr.properties) {
       if (ts.isSpreadAssignment(prop) && L.sharedDynamic) {
-        const raw = L.lowerExpr(prop.expression);
+        const raw = typedErrorAsDyn(L, prop.expression) ?? L.lowerExpr(prop.expression);
         // A checked copy of a dynamic value (a dynamic field read narrowed to
         // the checker's type): spread the dynamic value itself.
         const unwrapped = raw.kind === "dynCheck" && raw.value.type.kind === "dyn" ? raw.value : raw;

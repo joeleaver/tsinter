@@ -12,6 +12,7 @@ import { locOf } from "../program.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { lowerHasOwnCall } from "./lower-calls.js";
 import { isJsSourceFileName } from "../shared.js";
+import { typedErrorAsJsval } from "./typed-error-dyn.js";
 import { stdlibGlobalNameOf } from "./surfaces.js";
 import { declaredDynamicSymbol } from "../types.js";
 
@@ -381,8 +382,11 @@ export function lowerObjModelNew(L: Lowerer, expr: ts.NewExpression): IrExpr | n
  * or null when the operand is not dynamic. */
 /** The receiver of a for-in over a dynamic value (a jsval), or null. */
 export function lowerObjModelForInReceiver(L: Lowerer, operand: ts.Expression): IrExpr | null {
-  if (!omActive(L) || !isDynNode(L, operand)) return null;
-  return js(L, operand);
+  if (!omActive(L)) return null;
+  if (isDynNode(L, operand)) return js(L, operand);
+  // a typed error walks its encoding's keys, as Node walks the error's
+  // own enumerable ones (GH #193, typed-error-dyn.ts)
+  return typedErrorAsJsval(L, operand);
 }
 
 /** The keys a for-in over the (jsval) receiver `recv` visits. */

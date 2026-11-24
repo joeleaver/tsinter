@@ -7792,7 +7792,14 @@ it was empty ... is not supported yet`): Node lists it when the error was built 
 (`new Error()`, `new Error(undefined)`) and hides it when it was built with `""`, and the error's
 message slot holds `""` for both. The same answers hold for the other listings of an error held in a
 dynamic value (`Object.keys`/`values`/`entries`, a plain-target `Object.assign`, spread, an object
-rest, for-in; S138's GH #193 paragraph). A stamped `code` (a Node internal or system error's) is
+rest, for-in; S138's GH #193 paragraph), and for an error held in a typed slot (a JavaScript
+tag's `const e = new Error("m")`, which the checker types as `Error`; a TypeScript `Error` binding):
+a property its type gives no slot (`e.code = "E"`, a written `stack` or `cause`) is written onto the
+error's dynamic encoding, and `Object.keys`/`values`/`entries`, for-in and a JavaScript literal's
+spread of it walk that encoding, so a JavaScript-built error answers as one held as `any`. A
+JavaScript literal spreading a typed error into a binding the checker types as a record (`const o =
+{ ...e }`) stops by name (S125's copy fence, or the record-shape fence when the binding is later
+reassigned). A stamped `code` (a Node internal or system error's) is
 still hidden from these listings, where Node lists it. A `Map` source stops by name (`Object.assign` from a typed `Map` has no lowering), and so
 does `Object.assign` with more than one source onto either array (`Object.assign onto a
 non-plain-object target is not supported yet`), where Node throws on the first key the sources hold
@@ -12193,7 +12200,11 @@ crossing), is listed where it was first written, as in Node. A `message`
 written while the error's message is empty stops such a listing by name
 (S080: the slot cannot tell an absent message, which Node would then list,
 from a present empty one); one written over a non-empty message stays
-hidden, as in Node. `delete` or `Object.defineProperty` of `name` or
+hidden, as in Node. An error held in a typed slot answers the same: a
+property its type gives no slot (`e.code = v` in JavaScript, a written
+`stack` or `cause`) lands on its dynamic encoding, and `Object.keys`/
+`values`/`entries`, for-in and a JavaScript literal's spread of it walk
+the encoding (S080). `delete` or `Object.defineProperty` of `name` or
 `message` on an error held in a dynamic value stops by name (the slots keep
 no absent or redefined state), as of `stack` before. A stamped `code` (Node
 lists it) is still hidden, and `JSON.stringify` of an error whose class is

@@ -6987,6 +6987,10 @@ export class Lowerer {
         (dst.kind === "func" && canAdaptDynFuncTo(dst, (id) => this.shapes.get(id), (id) => this.unions.get(id), this.sharedDynamic))
       );
     }
+    // Derived-into-base widening, coerceToExpected's `upcast` (a pointer
+    // reinterpret): a `() => TypeError` function invoked through a
+    // `() => Error` slot converts its result, as JS hands it over.
+    if (src.kind === "object" && dst.kind === "object" && this.isSubclassOf(src.className, dst.className)) return true;
     if (dst.kind === "union") {
       if (src.kind === "union") return this.unionRetagMappable(src.unionId, dst.unionId);
       if (src.kind === "void") return this.armTag(dst.unionId, UNDEFINED_T) >= 0;
