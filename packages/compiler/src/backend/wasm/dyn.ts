@@ -7684,9 +7684,10 @@ export class DynBuilder {
       const c = new Code();
       const B = 2;
       const V = 3;
+      const T = 4;
       c.localGet(0);
       c.structGet(this.deps.errT(), this.deps.errBox());
-      c.refCastNull(this.dynT());
+      this.errOwn.boxOrNull(c, T);
       c.localTee(B);
       c.refIsNull();
       c.ifVoid();
@@ -7705,7 +7706,7 @@ export class DynBuilder {
       c.localGet(1);
       c.localGet(V);
       c.call(this.objPut());
-      this.mb.setBody(idx, [this.dynRef(), this.dynRef()], c.bytes());
+      this.mb.setBody(idx, [this.dynRef(), this.dynRef(), { kind: "ref", nullable: true, typeIndex: EQ_HEAP }], c.bytes());
     });
   }
 
@@ -7728,9 +7729,10 @@ export class DynBuilder {
     return this.cached("errStackReset", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [], (idx) => {
       const c = new Code();
       const B = 1;
+      const T = 2;
       c.localGet(0);
       c.structGet(this.deps.errT(), this.deps.errBox());
-      c.refCastNull(this.dynT());
+      this.errOwn.boxOrNull(c, T);
       c.localTee(B);
       c.refIsNull();
       c.ifVoid();
@@ -7747,7 +7749,7 @@ export class DynBuilder {
       this.deps.lit(c, "stack");
       c.globalGet(this.undefinedGlobal());
       c.call(this.objPut());
-      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+      this.mb.setBody(idx, [this.dynRef(), { kind: "ref", nullable: true, typeIndex: EQ_HEAP }], c.bytes());
     });
   }
 
@@ -7907,11 +7909,12 @@ export class DynBuilder {
   errBoxOf(): number {
     return this.cached("errBoxOf", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [this.dynRef()], (idx) => {
       // GH #146: the error's own slot (fromError).
+      // A pending sentinel (err-own.ts) is no encoding.
       const c = new Code();
       c.localGet(0);
       c.structGet(this.deps.errT(), this.deps.errBox());
-      c.refCastNull(this.dynT());
-      this.mb.setBody(idx, [], c.bytes());
+      this.errOwn.boxOrNull(c, 1);
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }], c.bytes());
     });
   }
 
@@ -12548,11 +12551,12 @@ export class DynBuilder {
         // GH #146: this error's box if it has one already — its own slot,
         // constant time (the list scan this replaces made a loop of fresh
         // crossings quadratic).
+        // GH #193: anything else in the slot is null or the pending
+        // markers sentinel (err-own.ts), placed once this build is done.
         c.localGet(0);
         c.structGet(errT, this.deps.errBox());
         c.localTee(B);
-        c.refIsNull();
-        c.i32Eqz();
+        c.refTest(this.dynT());
         c.ifVoid();
         c.localGet(B);
         c.refCast(this.dynT());
@@ -12700,6 +12704,8 @@ export class DynBuilder {
             c.call(this.objPut());
           });
         }
+        // GH #193: markers written before this crossing, in their places.
+        this.errOwn.placePending(c, B, O);
         c.localGet(D);
         this.mb.setBody(
           idx,

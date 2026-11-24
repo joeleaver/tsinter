@@ -5047,10 +5047,11 @@ export class JsonBuilder {
    * name and message as ordinary members (S021); in a module that can
    * build that encoding (the emitter asks after every function is walked
    * — dyn.ts fromError was built), putDyn's object arm is rebuilt to skip
-   * those keys and `stack` of an error-encoded object. The residue (an
-   * assigned `name` is hidden too; a user object carrying the marker
-   * loses those keys) is S021's and S025's amendments. Every other module
-   * keeps putDyn byte-identical. */
+   * those keys and `stack` of an error-encoded object; a `name` a program
+   * made own (GH #193's marker) serializes in its place, and a `message`
+   * written over "" stops by name (err-own.ts jsonEntry). The residue (a
+   * user object carrying the marker loses those keys) is S021's and
+   * S025's amendments. Every other module keeps putDyn byte-identical. */
   hideErrorMembers(): void {
     const idx = this.fns.get("putDyn");
     if (idx === undefined) return;
@@ -5518,6 +5519,14 @@ export class JsonBuilder {
         }
         c.i32Eqz();
         c.ifVoid();
+        if (hideErr) {
+          // GH #193: an own `name` a program wrote serializes in its
+          // place; a `message` written over "" stops by name (err-own.ts).
+          c.localGet(ISERR);
+          c.ifVoid();
+          dyn.errOwn.jsonEntry(c, P, OP);
+          c.end();
+        }
         c.localGet(FIRST);
         c.i32Eqz();
         c.ifVoid();

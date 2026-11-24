@@ -436,11 +436,16 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     },
   });
 
+  // The emitter's errT layout up to its encoding slot (emitter.ts ERR_BOX):
+  // vt, name, message, %code, then the mutable eqref holding the error's
+  // `%error` encoding once it crosses (GH #146) — fromError and err-own.ts
+  // read and write it.
   const errT = mb.structType([
     { storage: I32, mutable: false },
     { storage: strRef, mutable: true },
     { storage: strRef, mutable: true },
     { storage: strRef, mutable: false },
+    { storage: { kind: "ref", nullable: true, typeIndex: -0x13 }, mutable: true },
   ]);
   const excKindG = mb.addGlobal(I32, true, (w) => {
     w.u8(0x41);
@@ -517,6 +522,7 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     errName: () => 1,
     errMessage: () => 2,
     errCode: () => 3,
+    errBox: () => 4,
     throwError: (c, _cn, _n, pushMessage) => {
       pushMessage(c);
       c.drop();

@@ -9610,7 +9610,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         let v = asDynOperand(L.lowerExpr(argNode));
         if (v.type.kind !== "dyn") v = { kind: "dynFrom", value: v, type: DYN, loc: locOf(call) };
         return { kind: "libCall", fn, args: [v], type: DYN, loc: locOf(call) };
-      }      // A typed error lists its encoding's user view, Node's own
+      }
+      // A typed error lists its encoding's user view, Node's own
       // enumerable keys (GH #193, typed-error-dyn.ts).
       const errDyn = typedErrorAsDyn(L, argNode);
       if (errDyn !== null) {

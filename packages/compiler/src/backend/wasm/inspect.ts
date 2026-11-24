@@ -3657,6 +3657,37 @@ export class InspectBuilder {
         c.end();
         c.localSet(HC);
       }
+      // GH #193: a typed error a program gave own members through its
+      // encoding (a written `code`, `stack`, `cause` or expando —
+      // errExtraGlobal says some error has one) renders as that encoding
+      // does: its written code shown, the rest stopped by name. A
+      // DOMException keeps its own rendering (dynError's arm for it comes
+      // back here).
+      const delegate = !raw && this.deps.errDyn !== undefined;
+      const BX = dx !== undefined ? 12 : 10;
+      if (delegate) {
+        const dyn = this.deps.dyn();
+        c.globalGet(dyn.errExtraGlobal());
+        if (dx !== undefined) {
+          c.localGet(D);
+          c.i32Eqz();
+          c.i32And();
+        }
+        c.ifVoid();
+        c.localGet(E);
+        c.call(dyn.errBoxOf());
+        c.localTee(BX);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(BX);
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.call(this.dynError());
+        c.return_();
+        c.end();
+        c.end();
+      }
       // Beyond the depth budget an error with extra properties collapses to
       // `[Name]`; one WITHOUT them still prints its full base, because the
       // bracket form IS its stack rather than a property dump (measured
@@ -3866,9 +3897,12 @@ export class InspectBuilder {
       c.call(this.end());
       this.mb.setBody(
         idx,
-        dx !== undefined
-          ? [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), I32, I32, this.deps.strRef()]
-          : [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), this.deps.strRef()],
+        [
+          ...(dx !== undefined
+            ? [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), I32, I32, this.deps.strRef()]
+            : [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), this.deps.strRef()]),
+          ...(delegate ? [this.deps.dyn().dynRef()] : []),
+        ],
         c.bytes(),
       );
     });

@@ -23,17 +23,47 @@
  *    place; only the stamped one (and a DOMException's derived one, a
  *    prototype getter in Node) stays hidden (codeHidden).
  *
- * The markers are built into the encoding early when the error has not
- * crossed yet, as GH #191's own-name marker always was. An instance the
- * crossing would stop on (S138 errStopTest), or whose class sets its own
- * name (errNameTest: its listings stop by name), needs none. */
+ * An error that has not crossed yet keeps no encoding for a marker: the
+ * write leaves a PENDING sentinel in the error's encoding slot instead (a
+ * shared immutable struct per marker set, never an allocation per error),
+ * and the first crossing (dyn.ts fromError) places the pending markers
+ * last, which is where a marker built then would have stood: nothing else
+ * is in the encoding until it exists. An error whose class the encoding
+ * mirrors (GH #191) still builds at the write, since its view's keys are
+ * placed when the encoding is built. An instance the crossing would stop
+ * on (S138 errStopTest), or whose class sets its own name (errNameTest:
+ * its listings stop by name), needs none.
+ *
+ * JSON.stringify of an encoding walks its entries itself (json.ts
+ * putDyn): jsonEntry turns the own-name marker into the `name` member in
+ * its place and stops by name at the message marker. */
 import type { DynBuilder } from "./dyn.js";
-import { ENTRY_KEY } from "./dyn.js";
+import { DYN_REF, ENTRY_KEY } from "./dyn.js";
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
+import { I32, type ValType } from "./module.js";
 import { ERR_MSG_UNSURE, ERR_OWN_NAME, ERRV_PROBE } from "../../ir/nodes.js";
+
+/** The pending-marker bits a sentinel carries (ErrOwnKeys.pendingT). */
+const PEND_NAME = 1;
+const PEND_MSG = 2;
+
+/** An eqref local: the error's encoding slot as read (EQ_HEAP is the
+ * abstract `eq` heap type's code). */
+const EQ_HEAP = -0x13;
+const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
+
+/** The stop for a `message` written over "" (ERR_MSG_UNSURE), named for
+ * the walk that reached it. */
+function msgUnsureText(what: string): string {
+  return `${what} of an error held in a dynamic value whose 'message' was written while it was empty (whether Node lists it depends on whether the error was constructed with a message, which this build does not record) is not supported yet (SEMANTICS.md S080)`;
+}
 
 export class ErrOwnKeys {
   constructor(private readonly d: DynBuilder) {}
+
+  private pendingType: number | null = null;
+  private readonly pendingGlobals = new Map<number, number>();
 
   private get k() {
     return this.d.omKit();
@@ -66,10 +96,57 @@ export class ErrOwnKeys {
     c.f64Ne();
   }
 
+  /** The pending sentinel's type: `{ bits: i32 }`, the markers the
+   * error's first crossing places (PEND_NAME, PEND_MSG). Never a dyn
+   * value, so the slot's readers tell it from an encoding by type. */
+  pendingT(): number {
+    this.pendingType ??= this.k.mb.openStructType("err:pending", [{ storage: I32, mutable: false }]);
+    return this.pendingType;
+  }
+
+  private pendingRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pendingT() };
+  }
+
+  /** %w.dyn.errPending(bits) → the one shared sentinel for marker set
+   * `bits` (1..3), built on its first use. */
+  private pendingOf(): number {
+    return this.k.cached("errPending", [I32], [this.pendingRef()], (idx) => {
+      const T = this.pendingT();
+      const c = new Code();
+      for (const bits of [PEND_NAME, PEND_MSG, PEND_NAME | PEND_MSG]) {
+        let g = this.pendingGlobals.get(bits);
+        if (g === undefined) {
+          g = this.k.mb.addGlobal(this.pendingRef(), true, (w) => {
+            w.u8(0xd0);
+            w.sleb(T);
+          });
+          this.pendingGlobals.set(bits, g);
+        }
+        c.localGet(0);
+        c.i32Const(bits);
+        c.i32Eq();
+        c.ifVoid();
+        c.globalGet(g);
+        c.refIsNull();
+        c.ifVoid();
+        c.i32Const(bits);
+        c.structNew(T);
+        c.globalSet(g);
+        c.end();
+        c.globalGet(g);
+        c.return_();
+        c.end();
+      }
+      c.unreachable();
+      this.k.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   /** Puts marker `key` (the value `true`) into the error's encoding,
    * building the encoding if the error has not crossed yet. An existing
    * marker keeps its place, as an own property does in Node. */
-  private mark(c: Code, key: string): void {
+  private markNow(c: Code, key: string): void {
     const d = this.d;
     d.objPayload(c, (x) => {
       x.localGet(0);
@@ -78,6 +155,89 @@ export class ErrOwnKeys {
     this.k.deps.lit(c, key);
     c.globalGet(d.boolGlobal(true));
     c.call(d.objPut());
+  }
+
+  /** Records marker `key` (pending bit `bit`) for the error in local 0,
+   * `B` an eqref scratch local: into its encoding when it has one (or its
+   * class is mirrored, GH #191), else as a pending bit its first crossing
+   * places (dyn.ts fromError, placePending) — no encoding is built for
+   * an error that may never cross. */
+  private mark(c: Code, key: string, bit: number, B: number): void {
+    const deps = this.k.deps;
+    const lazy = (): void => {
+      c.localGet(0);
+      c.structGet(deps.errT(), deps.errBox());
+      c.localTee(B);
+      c.refTest(this.d.dynT());
+      c.ifVoid();
+      this.markNow(c, key);
+      c.else_();
+      c.localGet(0);
+      c.localGet(B);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(B);
+      c.refCast(this.pendingT());
+      c.structGet(this.pendingT(), 0);
+      c.end();
+      c.i32Const(bit);
+      c.i32Or();
+      c.call(this.pendingOf());
+      c.structSet(deps.errT(), deps.errBox());
+      c.end();
+    };
+    if (deps.errView === undefined) {
+      lazy();
+      return;
+    }
+    this.viewKindNe(c, ERRV_PROBE, 9);
+    c.ifVoid();
+    lazy();
+    c.else_();
+    this.markNow(c, key);
+    c.end();
+  }
+
+  /** In dyn.ts fromError, once the encoding (OBJ in local `O`) is built
+   * and published: the markers pending in the slot's old value (local
+   * `B`, an eqref), in their places — after everything the build put,
+   * which is where a write before the crossing would have put them. */
+  placePending(c: Code, B: number, O: number): void {
+    const T = this.pendingT();
+    c.localGet(B);
+    c.refTest(T);
+    c.ifVoid();
+    for (const [bit, key] of [[PEND_NAME, ERR_OWN_NAME], [PEND_MSG, ERR_MSG_UNSURE]] as const) {
+      c.localGet(B);
+      c.refCast(T);
+      c.structGet(T, 0);
+      c.i32Const(bit);
+      c.i32And();
+      c.ifVoid();
+      c.localGet(O);
+      this.k.deps.lit(c, key);
+      c.globalGet(this.d.boolGlobal(true));
+      c.call(this.d.objPut());
+      c.end();
+    }
+    c.end();
+  }
+
+  /** Pushes the error's encoding (ref null dyn) from its slot value on
+   * the stack (an eqref; `T` an eqref scratch local), or null for none
+   * yet — a pending sentinel is not an encoding. */
+  boxOrNull(c: Code, T: number): void {
+    const D = this.d.dynT();
+    c.localTee(T);
+    c.refTestNull(D);
+    c.ifResult({ kind: "ref", nullable: true, typeIndex: D });
+    c.localGet(T);
+    c.refCastNull(D);
+    c.else_();
+    c.refNull(D);
+    c.end();
   }
 
   /** %w.dyn.errNameOwned(err): after a write of `name` from outside the
@@ -98,7 +258,7 @@ export class ErrOwnKeys {
         c.ifVoid();
         c.return_();
         c.end();
-        this.mark(c, ERR_OWN_NAME);
+        this.markNow(c, ERR_OWN_NAME);
         c.return_();
         c.end();
       }
@@ -109,8 +269,8 @@ export class ErrOwnKeys {
         c.return_();
         c.end();
       }
-      this.mark(c, ERR_OWN_NAME);
-      this.k.mb.setBody(idx, [], c.bytes());
+      this.mark(c, ERR_OWN_NAME, PEND_NAME, 1);
+      this.k.mb.setBody(idx, [EQ_REF], c.bytes());
     });
   }
 
@@ -142,17 +302,51 @@ export class ErrOwnKeys {
       c.localTee(S);
       c.refIsNull();
       c.ifVoid();
-      this.mark(c, ERR_MSG_UNSURE);
+      this.mark(c, ERR_MSG_UNSURE, PEND_MSG, 2);
       c.return_();
       c.end();
       c.localGet(S);
       c.arrayLen();
       c.i32Eqz();
       c.ifVoid();
-      this.mark(c, ERR_MSG_UNSURE);
+      this.mark(c, ERR_MSG_UNSURE, PEND_MSG, 2);
       c.end();
-      this.k.mb.setBody(idx, [deps.strRef()], c.bytes());
+      this.k.mb.setBody(idx, [deps.strRef(), EQ_REF], c.bytes());
     });
+  }
+
+  /** JSON.stringify's member walk over the encoding (OBJ in local `OP`)
+   * of an error, at the entry pair in vec local `P` (json.ts putDyn): the
+   * own-name marker becomes the pair ("name", the slot's value) in its
+   * place — Node serializes an own enumerable `name` — and the message
+   * marker stops by name, as a listing does. Any other pair is left as
+   * it is. The pair is the walk's own fresh copy (objWalk's entries). */
+  jsonEntry(c: Code, P: number, OP: number): void {
+    const d = this.d;
+    const deps = this.k.deps;
+    const key = (x: Code): void => {
+      d.arrAt(x, (y) => y.localGet(P), (y) => y.i32Const(0));
+      x.structGet(d.dynT(), DYN_REF);
+      emitFlatCast(x, deps.strType());
+    };
+    key(c);
+    deps.lit(c, ERR_MSG_UNSURE);
+    c.call(deps.strEq());
+    c.ifVoid();
+    deps.fence(c, (x) => deps.lit(x, msgUnsureText("JSON.stringify")));
+    c.end();
+    key(c);
+    deps.lit(c, ERR_OWN_NAME);
+    c.call(deps.strEq());
+    c.ifVoid();
+    d.arrSet(c, (x) => x.localGet(P), (x) => x.i32Const(0), (x) => d.boxStr(x, (y) => deps.lit(y, "name")));
+    d.arrSet(c, (x) => x.localGet(P), (x) => x.i32Const(1), (x) =>
+      d.boxStr(x, (y) => {
+        y.localGet(OP);
+        y.call(d.errLinkOf());
+        y.structGet(deps.errT(), deps.errName());
+      }));
+    c.end();
   }
 
   /** Pushes i32: is the error in local `err` (non-null) one whose `code`
@@ -199,8 +393,7 @@ export class ErrOwnKeys {
     deps.lit(c, ERR_MSG_UNSURE);
     c.call(deps.strEq());
     c.ifVoid();
-    deps.fence(c, (x) =>
-      deps.lit(x, "a key listing, spread or Object.assign of an error held in a dynamic value whose 'message' was written while it was empty (whether Node lists it depends on whether the error was constructed with a message, which this build does not record) is not supported yet (SEMANTICS.md S080)"));
+    deps.fence(c, (x) => deps.lit(x, msgUnsureText("a key listing, spread or Object.assign")));
     c.end();
   }
 }

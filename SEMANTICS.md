@@ -7797,6 +7797,19 @@ tag's `const e = new Error("m")`, which the checker types as `Error`; a TypeScri
 a property its type gives no slot (`e.code = "E"`, a written `stack` or `cause`) is written onto the
 error's dynamic encoding, and `Object.keys`/`values`/`entries`, for-in and a JavaScript literal's
 spread of it walk that encoding, so a JavaScript-built error answers as one held as `any`. A
+`name` or `message` written before the error first crosses into a dynamic value builds no encoding:
+the write leaves a pending mark on the error, and the encoding built at the crossing places the
+written `name` (or the empty-message stop) where it was first written, so the answers above are the
+same either way. `JSON.stringify` of an error held in a dynamic value serializes a written `name` in
+its listed place and a written `code` or expando as Node does, and stops by name (`JSON.stringify of
+an error held in a dynamic value whose 'message' was written while it was empty ... is not supported
+yet`) on such a `message`. `console.log`/`util.inspect` of a typed error whose encoding holds
+members (S027's stackless form: a written `code` shows as `[Error: m] { code: 'C' }`) prints them as
+for the error held as `any`; one with a written `stack`, `cause` or other expando **stops by name**
+(`inspecting an error held in a dynamic value with its own 'stack'` / `with own properties beyond
+name, message and code ... is not supported yet`), where Node prints the stack. A typed read of a
+written `stack` or `cause` (`t.stack`) still refuses at compile time (GH #135); read through `any`
+it answers as Node. A
 JavaScript literal spreading a typed error into a binding the checker types as a record (`const o =
 { ...e }`) stops by name (S125's copy fence, or the record-shape fence when the binding is later
 reassigned). A stamped `code` (a Node internal or system error's) is
@@ -7823,7 +7836,7 @@ and stops by name on a string, where Node concatenates, and a `switch` over an e
 concatenate as Node does. An island tag call's strings array (unit A2) is the same kind of box: it now takes the same write
 and integrity answers, as Node does (its `raw` stays the plain array it was). A template span with an
 invalid escape (Node cooks it to `undefined`) refuses by name, as before.
-**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source; TAG-35 Error sources against Node, TAG-36 the named stop of a multi-source `Object.assign`); `packages/compiler/test/npm-tag-implicit-errors.test.ts` (TAG-38 Error sources a TypeScript program wrote `name`, `code`, `message` or `stack` onto, typed or held as `any`, and their plain-target listings, against Node on both lanes; TAG-39/40 the named stop of a `message` written over an empty one).
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source; TAG-35 Error sources against Node, TAG-36 the named stop of a multi-source `Object.assign`); `packages/compiler/test/npm-tag-implicit-errors.test.ts` (TAG-38 Error sources a TypeScript program wrote `name`, `code`, `message` or `stack` onto, typed or held as `any`, and their plain-target listings, against Node on both lanes; TAG-39/40 the named stop of a `message` written over an empty one; TAG-41..51 typed errors' listings, function-slot identity, members read back, key order, caught errors, subclass fields, `delete`/`defineProperty`, inspection, JSON, `structuredClone` and the pending marks against Node; TAG-60..66 the named run-time stops of inspection, JSON and listings; TAG-70..75 the compile-time refusals of typed `stack`/`cause` reads, S125 array aliasing, typed spread and rest).
 
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 
@@ -12207,8 +12220,10 @@ property its type gives no slot (`e.code = v` in JavaScript, a written
 the encoding (S080). `delete` or `Object.defineProperty` of `name` or
 `message` on an error held in a dynamic value stops by name (the slots keep
 no absent or redefined state), as of `stack` before. A stamped `code` (Node
-lists it) is still hidden, and `JSON.stringify` of an error whose class is
-not mirrored still drops a written `name` (S021's Unit B amendment).
+lists it) is still hidden. `JSON.stringify` of an error held in a dynamic
+value serializes a written `name` in its listed place, as in Node (it
+dropped it before, S021's Unit B amendment), and stops by name on a
+`message` written while the message was empty, as the listings do (S080).
 
 A typed `"code" in e` on an Error-rooted receiver answers through the
 classes declaring `code` (rea step 8); while any Error subclass assigns
@@ -12222,7 +12237,7 @@ silently missing member.
 loss was reachable on main through any `unknown`/`any` crossing.
 **Tested by:** `packages/compiler/test/wasm-top10-rea-error-subclass-dyn.test.ts`,
 `wasm-top10-rea-error-code-in.test.ts`, and the re-pinned rows of
-`wasm-gh144-error-subclass-write.test.ts`
+`wasm-gh144-error-subclass-write.test.ts`, and the GH #193 JSON rows TAG-44/48/50 of `npm-tag-implicit-errors.test.ts`
 (wasm and wasm-native, against Node).
 
 **GH #191 amendment (2026-11-12): the own members cross.** An instance of a
