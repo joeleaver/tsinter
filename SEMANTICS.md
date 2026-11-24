@@ -12707,7 +12707,11 @@ function values a `() => number` or `(message: string) => void` slot holds
   UTC"`, a date's time value taken as Node's ToNumber takes it (undefined is
   now, a BigInt throws Node's `TypeError: Cannot convert a BigInt value to a
   number`) and a time value Node's TimeClip rejects throwing Node's `RangeError:
-  Invalid time value`. Any other locale or bag refuses at build time by name,
+  Invalid time value`. Open (GH #269): an object whose `valueOf` returns a
+  BigInt throws `RangeError: Invalid time value`, and one whose `toString`
+  does throws `TypeError: Cannot convert object to primitive value`, where
+  Node throws the BigInt TypeError: the shared ToPrimitive does not yet treat
+  a BigInt result as one. Any other locale or bag refuses at build time by name,
   and so do the other members. A date before the year 1 (ICU writes those
   with its era form) stops the program by name where `format` runs.
   Unpicked: the other locales and options — ICU data the binary does not
