@@ -3132,7 +3132,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
       ret: sig.ret,
       ...(sig.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
     };
-    L.requireExactArityValue(blame, blame, sig.params, funcType);
+    L.admitFunctionValue(blame, blame, sig.params, funcType);
     return { kind: "closure", fnName, captures: [], type: funcType, loc };
   }
 

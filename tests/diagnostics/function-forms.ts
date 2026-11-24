@@ -32,7 +32,8 @@ const restRef = rest;
 function unionDefault(x: string | null = "hi"): void {
   console.log(x === null);
 }
-// Nested function declarations are values (const name = lambda) — fenced.
+// Nested function declarations with defaulted parameters are values typed
+// by their completed signature now (fn-value-arity.ts); kept as context.
 function outer(): number {
   function inner(n = 2): number {
     return n;

@@ -36,8 +36,8 @@
  * The pass never rewrites a well-typed argument: typeEquals matches are
  * untouched, so byte-stability holds for every program that lowered
  * cleanly before. The validator stays the backstop for anything else. */
-import type { Lowerer } from "./lowerer.js";
-import { PoisonError } from "./lowerer.js";
+import { PoisonError, type Lowerer } from "./lowerer.js";
+import { padOmittedArgs } from "./fn-value-arity.js";
 import { canAdaptDynFuncTo, canMarshalTypedFuncIntoIsland, DYN, IrExpr, IrType, JSVAL, SrcLoc, STRING, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { LIB_FN_SIGS, REGEX_INTRINSIC_SIGS, STR_INTRINSIC_SIGS } from "../../ir/validate.js";
 import { unionMismatchDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -181,7 +181,7 @@ export function enforceLibBoundary(L: Lowerer, node: unknown): void {
     }
     if (e.callee.type.kind !== "func") return; // validator's ICE otherwise
     const params = e.callee.type.params;
-    if (e.args.length !== params.length) {
+    if (e.args.length !== params.length && !padOmittedArgs(L, e.callee.type, e.args, e.loc)) {
       fence(
         L,
         "SC1090",

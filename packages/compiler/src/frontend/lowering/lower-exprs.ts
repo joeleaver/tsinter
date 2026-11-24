@@ -2025,7 +2025,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           // rest array — a boxed call packs the surplus into it (U1b).
           ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
-        L.requireExactArityValue(expr, expr, sig.params, funcType);
+        L.admitFunctionValue(expr, expr, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
       }
       {
@@ -8620,7 +8620,7 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
           // rest array — a boxed call packs the surplus into it (U1b).
           ...(sig.params.some((p) => p.mode === "islandRest") ? { restAbi: "jsval" as const } : {}),
         };
-        L.requireExactArityValue(prop, propName, sig.params, funcType);
+        L.admitFunctionValue(prop, propName, sig.params, funcType);
         return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
       }
       if (L.genericFnsBySymbol.has(resolved)) {

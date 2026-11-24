@@ -11,7 +11,7 @@ import { lowerIntlDtfCall } from "./lower-intl-dtf.js";
 import { lowerWeakRefCall } from "./lower-weakref.js";
 import { fenceNodeClassKeyWalk } from "./node-class-fence.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { declaredOverDynamic } from "../declared-dynamic.js";
@@ -664,149 +664,6 @@ export interface GenericInstance {
     }
     return wrapped;
   }
-
-/** DECISION (docs/ir.md): function VALUES keep exact-arity semantics — a
-   * func-typed IrType spells one completed signature, so a function whose
-   * declaration has optional/default/rest parameters can become a value only
-   * where the target type spells that exact signature with required
-   * parameters (`x?: T` / `x: T = e` params appear as literal `T | undefined`
-   * unions; a rest signature is never spellable without `...`, which func
-   * types reject). Direct calls get the full feature. */
-  export function requireExactArityValue(L: Lowerer, blame: ts.Node,
-    contextual: ts.Expression | null,
-    shapes: readonly ParamShape[],
-    funcType: IrType,): void {
-    // dynRest params ride the boxed thunk (JS arity — no completed-ABI
-    // spelling exists or is needed); they don't gate the value form.
-    // Dynamic-tier omittable params (`{} = a` with `a: any` — jsval/dyn
-    // slots) don't either: their ABI slot IS the declared param type (no
-    // synthesized union), so every func-type spelling of the signature
-    // already matches and short calls through the value complete with the
-    // tier's undefined (omittedArgFor).
-    if (
-      shapes.every(
-        (s) =>
-          s.mode === "required" ||
-          s.mode === "dynRest" ||
-          s.mode === "islandRest" ||
-          (s.mode === "omittable" && (s.type.kind === "dyn" || s.type.kind === "jsval")),
-      )
-    ) {
-      return;
-    }
-    if (shapes.some((s) => s.mode === "rest")) {
-      L.unsupported("SC1090", blame, "functions with rest parameters as values (call them directly)");
-    }
-    // The type the value FLOWS under must spell the completed ABI: the
-    // contextual (target) type when one exists, otherwise the expression's
-    // OWN inferred type — the unannotated-const case (`const f = (x = 5) =>
-    // ...`), where every later read types the value by that inference and
-    // optional/defaulted params spell their `T | undefined` slots (mapType's
-    // completed-signature contract), so omitted trailing args complete with
-    // the undefined arm like any direct call.
-    const target = contextual ? L.checker.getContextualType(contextual) : undefined;
-    // A JS binding whose own type has no static mapping (picocolors'
-    // `let createColors = (enabled = isColorSupported) => ({ red: … })`,
-    // whose result holds implicit-any closures) types every later read by
-    // the JS checked-dynamic fallback — the same per-piece answer judges
-    // the value here.
-    const ownType = (e: ts.Expression): IrType | null => {
-      const t = L.typeOf(e);
-      const m = L.mapTypeOf(t);
-      if (m !== null && jsMixedObjectUnion(L, e, m)) return DYN;
-      if (m !== null) return m;
-      return isJsSourceFile(e.getSourceFile()) ? dynFallbackType(L, e, t) : null;
-    };
-    const mapped = target
-      ? L.mapTypeOf(target)
-      : contextual
-        ? ownType(contextual)
-        : null;
-    if (mapped && typeEquals(mapped, funcType)) return;
-    // A union-typed slot (`runner || defaultRunner` under a
-    // `CommandRunner | undefined` context): the value can only inhabit
-    // the union's one func arm — judge by it.
-    let mappedFn: IrType | null =
-      mapped?.kind === "union"
-        ? (() => {
-            const arms = L.unions.get(mapped.unionId)?.arms.filter((a) => a.kind === "func") ?? [];
-            return arms.length === 1 ? arms[0]! : null;
-          })()
-        : mapped;
-    // A contextual type that maps to something non-functional (`picked ||
-    // defaultRunner` — tsc's contextual answer for the rhs is not the
-    // slot): judge by the expression's OWN completed type; the slot's
-    // coercion still enforces (or adapts) the flow it lands in.
-    if (mappedFn?.kind !== "func" && contextual) {
-      mappedFn = L.mapTypeOf(L.typeOf(contextual));
-    }
-    if (mappedFn && typeEquals(mappedFn, funcType)) return;
-    // A target signature that agrees on the completed parameters and
-    // differs only by RETURNING the structural spawnSync-result record
-    // (the CommandRunner shape): the slot coercion bridges with the
-    // interned runner-value adapter, so the value passes here.
-    if (
-      mappedFn?.kind === "func" &&
-      funcType.kind === "func" &&
-      L.spawnResFnAdapterPlan(funcType, mappedFn) !== null
-    ) {
-      return;
-    }
-    // An 'any'-typed slot is the ISLAND boundary: the host-function
-    // trampoline already implements JS call semantics over the completed
-    // signature — a missing engine argument arrives as undefined and takes
-    // the omittable param's undefined arm (which is what triggers the
-    // default), surplus arguments drop. So a function with optional/
-    // defaulted params may flow into a package API whenever the completed
-    // signature can cross at all (jsvalIn re-checks and speaks otherwise) —
-    // commander's `.option(flags, desc, collector, [])` pattern.
-    if (mapped?.kind === "jsval" &&
-      canMarshalTypedFuncIntoIsland(funcType, (id) => L.shapes.get(id), (id) => L.unions.get(id))
-    ) {
-      return;
-    }
-    // The same boundary through a package's SHIPPED DECLARATIONS
-    // (SEMANTICS.md S133): an argument of a call that resolves to an
-    // npm-static package's .d.ts lands in the package's JavaScript, which
-    // takes the value with its OWN completed signature (the per-call-site
-    // instance, or the checked-dynamic box) and calls it with JS argument
-    // semantics — commander's `.option(flags, desc, collect)` with
-    // `collect = (value, previous = []) => ...` under the declared
-    // `(value: string, previous: T) => T`.
-    if (contextual !== null && intoNpmStaticDeclaration(L, contextual) &&
-      canBoxFuncIntoDyn(funcType, (id) => L.shapes.get(id), (id) => L.unions.get(id))
-    ) {
-      return;
-    }
-    L.unsupported(
-      "SC1090",
-      blame,
-      "functions with optional or defaulted parameters as values, except where the " +
-        "target type spells the completed signature with required parameters " +
-        "(a '(x?: T) => R' function flows into a '(x: T | undefined) => R' slot, " +
-        "and a package/'any' slot takes any signature that can cross the island " +
-        "boundary; otherwise call the function directly)",
-    );
-  }
-
-/** Is `arg` an argument of a call whose resolved signature is declared in
- * an npm-static package's shipped declarations (its JavaScript runs the
- * call)? */
-function intoNpmStaticDeclaration(L: Lowerer, arg: ts.Expression): boolean {
-  let e: ts.Node = arg;
-  while (ts.isParenthesizedExpression(e.parent)) e = e.parent;
-  const call = e.parent;
-  if (!ts.isCallExpression(call) || !call.arguments.includes(e as ts.Expression)) return false;
-  try {
-    const sig = L.checker.getResolvedSignature(call);
-    const decl = sig ? L.checker.signatureDeclaration(sig) : undefined;
-    if (decl === undefined) return false;
-    const sf = decl.getSourceFile();
-    return sf.isDeclarationFile && npmStaticPackageOfPath(sf.fileName) !== null;
-  } catch {
-    return false;
-  }
-}
 
 /** The BODY-facing return type of a (possibly async) function: an async
    * body's `return v` fulfills its promise with v, so the body returns the
@@ -1797,7 +1654,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
         ret: inst.returnType,
         ...(inst.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
       };
-      L.requireExactArityValue(ref, ref, inst.params, funcType);
+      L.admitFunctionValue(ref, ref, inst.params, funcType);
       L.noteEdge(inst.name);
       return { kind: "closure", fnName: inst.name, captures: [], type: funcType, loc };
     }
@@ -1826,7 +1683,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       if (sigs.length === 1) target = sigs[0]!;
       else if (sigs.length === 0 && pinT.isUnionType()) {
         // A `Fn | undefined`-flavored slot: the value can only inhabit the
-        // one callable arm — judge by it (the requireExactArityValue union
+        // one callable arm — judge by it (the admitFunctionValue union
         // rule).
         const callable = pinT.getTypes().map((t) => L.checker.getCallSignatures(t)).filter((s) => s.length === 1);
         if (callable.length === 1) target = callable[0]![0]!;
@@ -1850,7 +1707,7 @@ export function genericFnOf(L: Lowerer, ident: ts.Identifier): GenericFnInfo | n
       ret: inst.returnType,
       ...(inst.params.some((p) => p.mode === "dynRest") ? { rest: true as const } : {}),
     };
-    L.requireExactArityValue(ref, ref, inst.params, funcType);
+    L.admitFunctionValue(ref, ref, inst.params, funcType);
     L.noteEdge(inst.name);
     return { kind: "closure", fnName: inst.name, captures: [], type: funcType, loc };
   }
@@ -7150,7 +7007,7 @@ const inliningPredicates = new Set<ts.Symbol>();
    * node. The func type's params are the ABI types, so a lambda with
    * optional/default params has the same IR type as one spelling the
    * `T | undefined` unions with required params — exactly the exact-arity
-   * value rule (requireExactArityValue decides who may become a value). */
+   * value rule (admitFunctionValue, fn-value-arity.ts, decides who may become a value). */
   export function lambdaSignature(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration,): { shapes: ParamShape[]; funcType: IrType & { kind: "func" } } {
     if (!node.body) L.unsupported("SC1090", node, "function overload signatures");
     if (
@@ -7413,12 +7270,12 @@ function arrowReadsThis(fn: ts.ArrowFunction): boolean {
 function lowerLambdaInner(L: Lowerer, node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration, opts?: { selfBinding?: boolean }): IrExpr {
     const loc = locOf(node);
     const { shapes, funcType } = L.lambdaSignature(node);
-    // A lambda IS a value: the exact-arity rule applies at birth. The
-    // contextual (target) type decides — `(x?: number) => void` may flow
-    // into a slot annotated `(x: number | undefined) => void` (same ABI
-    // signature), anything else is fenced. Nested function declarations and
-    // object-literal shorthand methods aren't expressions — always fenced.
-    L.requireExactArityValue(
+    // A lambda IS a value: the value rule (fn-value-arity.ts) applies at
+    // birth. The contextual (target) type decides — `(x?: number) => void`
+    // flows into a `(x: number | undefined) => void` slot or one passing
+    // fewer arguments. Nested function declarations and object-literal
+    // methods aren't expressions: their completed signature types them.
+    L.admitFunctionValue(
       node,
       ts.isArrowFunction(node) || ts.isFunctionExpression(node) ? node : null,
       shapes,
@@ -10503,7 +10360,7 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
 /** A REST-PARAMETER arrow that only ever gets CALLED — paperclip's
    * `const one = (...scopes: string[]) => [scopes.map(auth)]`
    * (google-workspace-connectors.ts). A function value with a rest
-   * convention has no compiled spelling (requireExactArityValue), but this
+   * convention has no compiled spelling (admitFunctionValue, fn-value-arity.ts), but this
    * binding never becomes a value. It is a module-scope `const` in a
    * TypeScript file, not exported, and every reference to it in its file is
    * the callee of a plain call `one(…)`. So it lowers like a function

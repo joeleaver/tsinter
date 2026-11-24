@@ -106,7 +106,7 @@ import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMs
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
 import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
-import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, dynboxClosure, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, requireExactArityValue, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
+import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, dynboxClosure, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
 import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
@@ -125,6 +125,7 @@ import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, 
 import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
 import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf, jsonDocCopyDrops } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
+import { absentArg, admitFunctionValue, cleanFuncAdaptable, surplusParamsAbsent } from "./fn-value-arity.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, moduleNsSourceFileOf, nsPathPrefix } from "./lower-namespaces.js";
 import { fenceNodeClassCrossing, nodeClassCrossingLabel } from "./node-class-fence.js";
@@ -7002,22 +7003,9 @@ export class Lowerer {
     return false;
   }
 
-  /** True when a `src` function value enters a `dst` slot through
-   * funcCoerceAdapter with NO stranded (trap-only) piece: no rest packs,
-   * no surplus source params, every slot parameter converts into the
-   * wrapped function's own type, and the result converts back (a void
-   * slot drops it; a void result answers the exact JS undefined for
-   * dyn/jsval slots). The width family's func gate — widthLiftPlan
-   * bridges only signatures whose every call succeeds by construction. */
+  /** fn-value-arity.ts's cleanFuncAdaptable: the width family's func gate. */
   cleanFuncAdaptable(src: IrType & { kind: "func" }, dst: IrType & { kind: "func" }): boolean {
-    if (src.rest === true || dst.rest === true) return false;
-    if (src.params.length > dst.params.length) return false;
-    for (let i = 0; i < src.params.length; i++) {
-      if (!this.coercibleValue(dst.params[i]!, src.params[i]!)) return false;
-    }
-    if (dst.ret.kind === "void") return src.ret.kind !== "jsval";
-    if (this.coercibleValue(src.ret, dst.ret)) return true;
-    return src.ret.kind === "void" && (dst.ret.kind === "dyn" || dst.ret.kind === "jsval");
+    return cleanFuncAdaptable(this, src, dst);
   }
 
   /** Interned `%fn.adapt.<n>(f)` — the GENERAL function-value adapter: a
@@ -7025,7 +7013,9 @@ export class Lowerer {
    * only by coercibleValue conversions. The slot's callers pass toT's
    * parameters: the wrapper takes them, converts the first
    * fromT.params.length into the wrapped function's own types (surplus
-   * slot parameters are DROPPED — JS's extra-argument rule), calls it,
+   * slot parameters are DROPPED — JS's extra-argument rule — and surplus
+   * omittable FUNCTION parameters get undefined, JS's missing-argument
+   * rule, fn-value-arity.ts), calls it,
    * and converts the result back (a void slot drops the result; a void
    * result wraps as the slot union's undefined arm). Rest signatures on
    * either side decline (the pack shapes don't line up mechanically).
@@ -7064,7 +7054,7 @@ export class Lowerer {
       return this.restFuncAdapter(fromT, toT, loc);
     }
     if (fromT.rest === true || toT.rest === true) return null;
-    if (fromT.params.length > toT.params.length) return null;
+    if (!surplusParamsAbsent(this, fromT, toT)) return null;
     // Piece dispositions beyond coercibleValue, all CHECKER-APPROVED
     // function compatibilities (bivariant method params under the suite's
     // non-strict settings, `() => never` throwers displayed as void by
@@ -7079,7 +7069,7 @@ export class Lowerer {
     //   value — the call runs (a `never` thrower never comes back, so the
     //   trap is unreachable there), then the stranded TypeError.
     let strandParams = false;
-    for (let i = 0; i < fromT.params.length; i++) {
+    for (let i = 0; i < fromT.params.length && i < toT.params.length; i++) {
       if (!this.coercibleValue(toT.params[i]!, fromT.params[i]!)) strandParams = true;
     }
     let voidRet: "dyn" | "jsval" | "strand" | null = null;
@@ -7122,6 +7112,7 @@ export class Lowerer {
       ];
     } else {
       const args = fromT.params.map((pt, i) => {
+        if (i >= toT.params.length) return absentArg(this, pt, loc); // JS: a missing argument is undefined
         const aRef: IrExpr = { kind: "varRef", localId: `a.${i}`, type: toT.params[i]!, loc };
         const converted = this.coerceToExpected(aRef, pt);
         if (!typeEquals(converted.type, pt)) throw new Error("lowerer bug: probed fn-adapter param stopped coercing");
@@ -8976,11 +8967,11 @@ export class Lowerer {
     return undefinedArgFor(this, type, loc, blame);
   }
 
-  requireExactArityValue(blame: ts.Node,
+  admitFunctionValue(blame: ts.Node,
     contextual: ts.Expression | null,
     shapes: readonly ParamShape[],
     funcType: IrType,): void {
-    return requireExactArityValue(this, blame, contextual, shapes, funcType);
+    return admitFunctionValue(this, blame, contextual, shapes, funcType);
   }
 
   bodyReturnType(isAsync: boolean, declared: IrType): IrType {
