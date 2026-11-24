@@ -16,7 +16,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { nodeThrowExpr } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { BOOL, DYN, F64, STRING, arrayOf, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, JSVAL, STRING, arrayOf, type IrExpr, type IrStmt, type IrType, type SrcLoc } from "../../ir/nodes.js";
 
 const PAPERCLIP_FORM = "en-US:MMMMdyhmmaz:UTC";
 const PAPERCLIP_OPTIONS: Readonly<Record<string, string | boolean>> = {
@@ -100,7 +100,7 @@ export function lowerIntlDtfCall(L: Lowerer, call: ts.CallExpression, access: ts
         kind: "ternary",
         cond: { kind: "dynTest", test: "undefined", value: ref, type: BOOL, loc },
         then: now,
-        else_: { kind: "libCall", fn: "dyn.toNumber", args: [ref], type: F64, loc },
+        else_: dynToNumber(L, ref, call.arguments[0]!, loc),
         type: F64,
         loc,
       };
@@ -109,6 +109,16 @@ export function lowerIntlDtfCall(L: Lowerer, call: ts.CallExpression, access: ts
     }
   }
   return { kind: "seqExpr", stmts, result: { kind: "call", callee: dtfHelper(L), args: [ms], type: STRING, loc }, type: STRING, loc };
+}
+
+/** ECMA-262 ToNumber of the dyn `ref`, as unary `+` computes it (the
+ * shared %w.dyn.toNumber: an object's own valueOf/toString runs, a BigInt
+ * is V8's "Cannot convert a BigInt value to a number" TypeError). The
+ * `dyn.toNumber` libCall is Number()'s conversion, which takes a BigInt to
+ * its nearest double instead. */
+function dynToNumber(L: Lowerer, ref: IrExpr, node: ts.Expression, loc: SrcLoc): IrExpr {
+  const plus: IrExpr = { kind: "jsOp", op: "plus", args: [L.jsvalIn(ref, node)], type: JSVAL, loc };
+  return { kind: "dynCheck", value: { kind: "dynFromJsval", value: plus, type: DYN, loc }, type: F64, loc };
 }
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];

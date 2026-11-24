@@ -7,6 +7,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { typeReachesItself } from "./lower-inspect.js";
 import { recordFieldOwnTest } from "./lower-calls.js";
+import { holeFenceStmt } from "./lower-exprs.js";
 import { BOOL, F64, IrExpr, IrStmt, IrType, SrcLoc, VOID, accessorSlotProp, isOpaqueBuiltinShape, isUnitType, typeEquals, typeKey } from "../../ir/nodes.js";
 
 /* ── deep equality (deepStrictEqual / notDeepStrictEqual) ──────────────── */
@@ -137,6 +138,11 @@ export function deepEqHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
       const at = (arr: IrExpr, i: IrExpr): IrExpr => ({ kind: "arrayGet", arr, index: i, type: t.elem, loc });
       locals.push({ id: "i.0", name: "i", type: F64, mutable: true });
       body = [
+        // Strict mode compares own keys, so a HOLE is not an undefined
+        // element (`[, 1]` vs `[undefined, 1]` is false). This tier stores a
+        // hole as the element's undefined: once the program has made a hole,
+        // an array holding undefined stops at S119's named fence.
+        ...(L.undefSlots ? [holeFenceStmt(a(), "a strict deep comparison", loc), holeFenceStmt(b(), "a strict deep comparison", loc)] : []),
         bailIf(neq(len(a()), len(b()))),
         {
           kind: "for",

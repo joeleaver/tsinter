@@ -12704,8 +12704,9 @@ function values a `() => number` or `(message: string) => void` slot holds
   "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true,
   timeZone: "UTC", timeZoneName: "short" })` (the bag's members in any
   order), whose `format(date)` writes ICU's `"April 28, 2026 at 12:17 PM
-  UTC"`, a date's time value taken as `Number(date)` takes it (undefined is
-  now) and a time value Node's TimeClip rejects throwing Node's `RangeError:
+  UTC"`, a date's time value taken as Node's ToNumber takes it (undefined is
+  now, a BigInt throws Node's `TypeError: Cannot convert a BigInt value to a
+  number`) and a time value Node's TimeClip rejects throwing Node's `RangeError:
   Invalid time value`. Any other locale or bag refuses at build time by name,
   and so do the other members. A date before the year 1 (ICU writes those
   with its era form) stops the program by name where `format` runs.
@@ -12726,7 +12727,7 @@ function values a `() => number` or `(message: string) => void` slot holds
   answer `undefined` and its cleanups run there, never here. `new WeakRef`
   and `register` check their target as Node's CanBeHeldWeakly does: an
   object, a function or a symbol not registered with `Symbol.for` is held,
-  anything else (a registered symbol included) throws Node's `WeakRef:
+  anything else (`null` and a registered symbol included) throws Node's `WeakRef:
   invalid target` / `FinalizationRegistry.prototype.register: invalid
   target` TypeError. `register` evaluates all its arguments first, then
   checks, as Node does, and takes holdings written as an object literal (a
@@ -12739,7 +12740,10 @@ function values a `() => number` or `(message: string) => void` slot holds
   refuses at build time by name — JSON text, `console.log`/`util.inspect`/
   `util.format`, `String()` and template text, `Object.keys`/`values`/
   `entries`, `for-in`, `Object.hasOwn`, the `in` operator, `Object.assign`,
-  spread and `structuredClone`.
+  spread and `structuredClone` — and so does a crossing of one into any
+  other record or class type (`w as unknown as Record<string, unknown>`, a
+  plain or index-signature record parameter, a field of such a type), whose
+  copy would be program data with keys, printing and `String()` of its own.
 - (d) **`new Map(pairs)` over dynamic pairs** walks Node's way (each entry's
   `0` and `1` members, a later duplicate key overwriting in place); a seed
   that is not an array at run time (Node walks any iterable) and an entry
@@ -12755,8 +12759,13 @@ function values a `() => number` or `(message: string) => void` slot holds
   as Node's strict mode does, as `Object.hasOwn` answers them: an own key
   holding `undefined` is not a missing key (`{ a: undefined }` and `{}`
   differ). A required undefined-armed field of a shape a checked conversion
-  builds reads as S091 (c) has every key surface read it.
+  builds reads as S091 (c) has every key surface read it. An array's index
+  is an own key too, so a hole is not an `undefined` element (`[, 1]` and
+  `[undefined, 1]` differ); this tier stores a hole as the element's
+  `undefined` (S119), so once the program has made a hole, a strict deep
+  comparison of an array holding `undefined` stops the program at S119's
+  named fence, as S119 (b)'s other hole observers do.
 
 **Tested by:** SB-20..SB-32 in `packages/compiler/test/wasm-stdlib-batch.test.ts`
-and SB-33..SB-41 in `packages/compiler/test/wasm-stdlib-batch-builtins.test.ts`
+and SB-33..SB-48 in `packages/compiler/test/wasm-stdlib-batch-builtins.test.ts`
 (wasm and wasm-native, against Node).

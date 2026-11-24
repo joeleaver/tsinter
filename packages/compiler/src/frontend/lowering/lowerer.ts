@@ -127,6 +127,7 @@ import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSlice
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, moduleNsSourceFileOf, nsPathPrefix } from "./lower-namespaces.js";
+import { fenceNodeClassCrossing, nodeClassCrossingLabel } from "./node-class-fence.js";
 
 /** Entry function name. '%' cannot appear in a TS identifier, so a user
  * function can never collide with it (mangling is injective per prefix). */
@@ -5896,6 +5897,9 @@ export class Lowerer {
    * deeper keeps the exactness fences. Null when the pair isn't
    * width-coercible. */
   widthCoerce(expr: IrExpr, expected: IrType): IrExpr | null {
+    // A built-in class instance's record never reshapes into another type
+    // (node-class-fence.ts): its copy would show the hidden slot.
+    fenceNodeClassCrossing(this, expr.type, expected, expr.loc);
     if (expected.kind === "record" && expr.type.kind === "record") {
       // Index-signature pairs reshape through the overflow CAPTURE helper
       // (the `Object.fromEntries(e) as ModelPricing` pattern — declared
@@ -6226,7 +6230,7 @@ export class Lowerer {
     // completion rule below is the one extra fence). Index-signature
     // TARGETS keep the overflow CAPTURE helper (widthCoerce's other arm):
     // a fresh hybrid needs keyed writes, not a field-list literal.
-    if (!from || !to || to.indexValue) return null;
+    if (!from || !to || to.indexValue || nodeClassCrossingLabel(this, fromId, { kind: "record", shapeId: toId }) !== null) return null;
     // Tuple↔record pairs never relate; tuple↔tuple only arity-exact.
     if (!!from.tuple !== !!to.tuple) return null;
     if (from.tuple && from.fields.length !== to.fields.length) return null;
@@ -6286,6 +6290,8 @@ export class Lowerer {
     const from = this.shapes.get(fromId);
     const to = this.shapes.get(toId);
     if (!from || !to) return null;
+    const nodeClass = nodeClassCrossingLabel(this, fromId, { kind: "record", shapeId: toId });
+    if (nodeClass !== null) return `a ${nodeClass} instance keeps its state in internal slots and has no own keys; it never reshapes into another record`;
     if (to.indexValue) {
       // The overflow CAPTURE's gates (lowerRecordOvfCaptureHelper).
       if (from.tuple || to.tuple) return "a tuple cannot reshape into an index-signature record";

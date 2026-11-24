@@ -85,8 +85,18 @@ function canBeHeldWeakly(L: Lowerer, v: IrExpr, loc: SrcLoc): IrExpr {
     type: BOOL,
     loc,
   };
+  // dynTest "object" follows typeof, so it is true for null: CanBeHeldWeakly
+  // rejects null (Node's "invalid target"), so the object arm excludes it.
+  const object: IrExpr = {
+    kind: "logical",
+    op: "&&",
+    left: { kind: "dynTest", test: "object", value: v, type: BOOL, loc },
+    right: { kind: "dynTest", test: "null", negated: true, value: v, type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
   return or(
-    or({ kind: "dynTest", test: "object", value: v, type: BOOL, loc }, { kind: "dynTest", test: "function", value: v, type: BOOL, loc }),
+    or(object, { kind: "dynTest", test: "function", value: v, type: BOOL, loc }),
     { kind: "logical", op: "&&", left: isSymbol, right: unregistered({ kind: "dynCheck", value: v, type: SYMBOL_T, loc }), type: BOOL, loc },
   );
 }
