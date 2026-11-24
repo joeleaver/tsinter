@@ -11091,6 +11091,70 @@ export class DynBuilder {
       };
       handleSide(0, "onto");
       handleSide(1, "from");
+      if (this.tplLive && !except) {
+        // S080: onto a tag call's FROZEN strings array (or its raw): a
+        // source with no own enumerable key copies nothing (a nullish one
+        // is skipped); otherwise its first key is read (one [[Get]], a
+        // getter runs once) and that key's [[Set]] throws Node's TypeError
+        // (an element read-only, any other key not extensible), the keyed
+        // write's own guard.
+        c.localGet(0);
+        c.refTest(this.tplT());
+        c.ifVoid();
+        c.localGet(1);
+        c.structGet(dynT, DYN_KIND);
+        c.localTee(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(K);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(0);
+        c.return_();
+        c.end();
+        this.typedArm(c, 1, K, () => this.typedFence(c, "copying the members of", (x) => x.refNull(dynT)));
+        c.localGet(1);
+        c.i32Const(0); // KEYS
+        c.call(this.objWalk());
+        c.localTee(PAIRS);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)));
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(0);
+        c.return_();
+        c.end();
+        this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)), (x) => x.i32Const(0));
+        c.localSet(P);
+        const key = (x: Code): void => {
+          x.localGet(P);
+          x.structGet(dynT, DYN_REF);
+          emitFlatCast(x, this.deps.strType());
+        };
+        c.localGet(1);
+        key(c);
+        c.i32Const(0);
+        c.call(this.keyGet());
+        c.localSet(PAIRS);
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(0);
+        key(c);
+        c.localGet(PAIRS);
+        c.call(this.keySet());
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+      }
       c.localGet(K);
       c.i32Const(DK.OBJ);
       c.i32Ne();
@@ -14625,6 +14689,17 @@ export class DynBuilder {
               x.i32Or();
               x.i32And();
               x.i32Or();
+              if (this.tplLive) {
+                // S080 / unit A2: a tag call's strings array owns `raw`,
+                // non-enumerable.
+                x.localGet(0);
+                x.refTest(this.tplT());
+                x.localGet(S);
+                this.deps.lit(x, "raw");
+                x.call(this.deps.strEq());
+                x.i32And();
+                x.i32Or();
+              }
               x.i32Eqz();
               x.i32And();
             }

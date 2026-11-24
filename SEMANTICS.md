@@ -7770,9 +7770,19 @@ and comparison answers as Node does from the dynamic object model. That covers r
 (`undefined`), forwarding, returning, identity caches in a Map or WeakMap, callbacks, and calling the
 tag directly with a plain array. Writes throw Node's strict-mode TypeErrors, and sloppy code ignores
 them: an element, `length` or `raw` is read-only, any other key cannot be added, and `push` and
-`pop` throw. `Object.isFrozen`/`isSealed` answer true and `isExtensible` false, `Object.freeze` returns
-the array, and `"raw" in s` and `Object.hasOwn(s, "raw")` hold on the strings array and not on its
-`raw`. The remaining object-model surface of the two arrays stops by name at run time:
+`pop` throw. The same guard covers every write path: TypeScript code holding the array as `any` (or
+`any[]`, or in a typed binding that took S125's dynamic arm, which shares the object) and writing an
+element by a number, a variable or a string index, past the end or `length` (a compound `+=` or
+`++` on an `any` element still refuses at compile time, as everywhere), and `Object.assign` onto
+either array, which throws on the first key it copies as Node's [[Set]] does (a
+source with no own enumerable key, or a nullish one, copies nothing). A strings array a tag returns
+into a typed `string[]` slot is S125 (c)'s crossing: a `const`/`let` binding written through takes
+the dynamic arm and holds the frozen array itself (the write throws, the element is unchanged), and a
+field or element written through is the copy S125 (c) refuses by name. `Object.isFrozen`/`isSealed`
+answer true and `isExtensible` false, `Object.freeze` returns the array, and `"raw" in s` and
+`Object.hasOwn(s, "raw")` hold on the strings array and not on its `raw`; `raw` is non-enumerable
+(`propertyIsEnumerable("raw")` is false; for-in, `Object.keys` and `Object.assign` from the array see
+only its elements). The remaining object-model surface of the two arrays stops by name at run time:
 - the other mutating Array methods (`sort`, `splice`, `shift`, `unshift`, `reverse`, `fill`,
   `copyWithin`);
 - `Object.getOwnPropertyNames`, `Reflect.ownKeys` and `Object.getOwnPropertyDescriptor(s)` (the
@@ -7784,7 +7794,7 @@ and stops by name on a string, where Node concatenates, and a `switch` over an e
 concatenate as Node does. An island tag call's strings array (unit A2) is the same kind of box: it now takes the same write
 and integrity answers, as Node does (its `raw` stays the plain array it was). A template span with an
 invalid escape (Node cooks it to `undefined`) refuses by name, as before.
-**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20).
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy).
 
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 

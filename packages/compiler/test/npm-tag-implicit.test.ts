@@ -53,6 +53,9 @@ export declare function cached(strings: TemplateStringsArray, ...params: unknown
 export declare function weakCached(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 export declare function writes(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 export declare function parse(txt: string): unknown;
+export declare function assigns(strings: TemplateStringsArray, ...params: unknown[]): unknown;
+export declare function enumer(strings: TemplateStringsArray, ...params: unknown[]): unknown;
+export declare function same(strings: TemplateStringsArray, ...params: unknown[]): string[];
 `;
 
 const TG_JS = String.raw`
@@ -213,6 +216,29 @@ export function writes(strings) {
   out.push(String([Object.freeze(strings) === strings, "raw" in strings, "raw" in strings.raw, Object.hasOwn(strings, "raw"), Object.hasOwn(strings.raw, "raw"), strings.raw.raw, Array.isArray(strings), strings[0]]));
   return out.join("\n");
 }
+// review: Object.assign onto the frozen arrays, and their enumerability
+function kv(k, v) { const o = {}; o[k] = v; return o; }
+export function assigns(strings) {
+  const out = [];
+  let calls = 0;
+  const tries = [
+    () => Object.assign(strings, { get g1() { calls++; return 1; }, get g2() { calls++; return 2; } }),
+    () => Object.assign(strings, kv(0, "x")), () => Object.assign(strings, { foo: 1 }), () => Object.assign(strings.raw, kv(0, "x")),
+    () => Object.assign(strings, "q"), () => Object.assign(strings, {}) === strings, () => Object.assign(strings, null) === strings,
+    () => Object.assign(strings, []) === strings, () => JSON.stringify(Object.assign({}, strings)), () => JSON.stringify(Object.assign({}, strings.raw)),
+  ];
+  for (const f of tries) {
+    try { out.push(String(f())); } catch (e) { out.push(e.constructor.name + ": " + e.message); }
+  }
+  return out.join("\n") + "\n" + strings[0] + strings.raw[0] + Object.keys(strings) + " getters run: " + calls;
+}
+export function enumer(strings) {
+  let o = "";
+  for (const k in strings) o += k + "+";
+  return String([strings.propertyIsEnumerable("raw"), strings.propertyIsEnumerable("0"), strings.propertyIsEnumerable("length"), strings.raw.propertyIsEnumerable("raw"),
+    strings.raw.propertyIsEnumerable(0), strings.hasOwnProperty("raw"), Object.keys(strings).join("+"), o]);
+}
+export function same(strings) { return strings; }
 export { sql };
 `;
 
@@ -349,6 +375,64 @@ const ROWS: Row[] = [
       `console.log(writes\`a\${1}b\`);`,
     ].join("\n") },
   },
+  {
+    id: "TAG-21 TypeScript's writes through a returned strings array held as any (number, variable and string indexes, past the end, raw's element, a loop, an any[] binding, length) throw Node's TypeErrors",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { ret } from "tg";`,
+      `const a = ret\`a\${1}b\` as any;`,
+      `const b: any[] = ret\`c\${2}d\` as any;`,
+      `const tries: (() => void)[] = [`,
+      `  () => { a[0] = "y"; }, () => { a[1] = "y"; }, () => { a.raw[0] = "y"; }, () => { a[5] = "y"; }, () => { a.raw[3] = "y"; },`,
+      `  () => { const i = 1; a[i] = "z"; }, () => { a["0"] = "w"; },`,
+      `  () => { for (let i = 0; i < 2; i++) a[i] = "l"; }, () => { b[0] = 1; }, () => { b.length = 0; },`,
+      `];`,
+      `for (const f of tries) {`,
+      `  try { f(); console.log("ok"); } catch (e) { console.log((e as Error).name + ": " + (e as Error).message); }`,
+      `}`,
+      `console.log(a[0], a[1], a.raw[0], a.length, b[0], b.length);`,
+    ].join("\n") },
+  },
+  {
+    id: "TAG-22 Object.assign onto the frozen arrays (an element key, a new key, raw's element, a string source, a source of getters read once) throws Node's TypeErrors; empty and nullish sources copy nothing; the arrays as sources copy their elements, not raw",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { assigns, ret } from "tg";`,
+      `console.log(assigns\`a\${1}b\`);`,
+      `const a = ret\`e\${1}f\` as any;`,
+      `try { Object.assign(a, { z: 1 }); console.log("ok"); } catch (e) { console.log((e as Error).message); }`,
+      `console.log(a[1]);`,
+    ].join("\n") },
+  },
+  {
+    id: "TAG-23 raw is the strings array's own non-enumerable member (propertyIsEnumerable, for-in, Object.keys); the island tag of unit A2 answers the same",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { enumer } from "tg";`,
+      `console.log(enumer\`a\${1}b\`);`,
+      `const isl: any = (s: any, ...v: unknown[]): string => String([s.propertyIsEnumerable("raw"), s.propertyIsEnumerable("0"), s.raw.propertyIsEnumerable("raw")]);`,
+      `console.log(isl\`x\${1}y\`);`,
+    ].join("\n") },
+  },
+  {
+    id: "TAG-24 a strings array returned into a typed string[] slot and only read (join, length, an element)",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { same } from "tg";`,
+      `const r = same\`a\${1}b\`;`,
+      `console.log(r.join("|"), r.length, r[1]);`,
+    ].join("\n") },
+  },
+  {
+    id: "TAG-25 a strings array returned into a typed string[] slot (the binding takes S125's dynamic arm, sharing the frozen array) and written: Node's TypeError, the element unchanged",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { same } from "tg";`,
+      `const r = same\`a\${1}b\`;`,
+      `try { r[0] = "x"; } catch (e) { console.log((e as Error).message); }`,
+      `console.log(r[0]);`,
+    ].join("\n") },
+  },
 ];
 
 describe("implicit-any JavaScript tags (wasm lane vs Node)", () => {
@@ -378,6 +462,22 @@ describe("implicit-any JavaScript tags: an invalid escape (cooked undefined) ref
     const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["tg"] });
     expect(res.ok).toBe(false);
     expect(res.diagnostics.map((d) => d.message).join("\n")).toMatch(/invalid escape sequences/);
+  }, 600_000);
+});
+
+describe("implicit-any JavaScript tags: a strings array checked into a typed field or element and written through it refuses by name (S125 (c))", () => {
+  test("TAG-26 a typed record field and an array element holding a returned strings array, written", async () => {
+    const dir = writeProject({ ...TG, "main.ts": [
+      `import { same } from "tg";`,
+      `const h: { r: string[] } = { r: same\`c\${1}d\` };`,
+      `try { h.r[0] = "x"; } catch (e) { console.log((e as Error).message); }`,
+      `const xs: string[][] = [same\`e\${1}f\`];`,
+      `try { xs[0]![0] = "x"; } catch (e) { console.log((e as Error).message); }`,
+      `console.log(h.r[0], xs[0]![0]);`,
+    ].join("\n") }, "tag26");
+    const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["tg"] });
+    expect(res.ok).toBe(false);
+    expect(res.diagnostics.map((d) => d.message).join("\n")).toMatch(/checked into 'string\[\]': it would be a COPY where JavaScript shares the object, and the program writes to values of the copy's type/);
   }, 600_000);
 });
 

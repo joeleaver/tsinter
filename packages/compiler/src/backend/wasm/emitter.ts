@@ -43307,6 +43307,16 @@ class Assembler {
       code.i32Eqz();
       code.i32And();
     }
+    if (value !== null && this.tplLive) {
+      // S080: a tag call's FROZEN strings array (or its raw, a `$dynTpl`
+      // box) is never written in place: the keyed route's write guard
+      // throws Node's TypeError (strict code — a sloppy write never takes
+      // this path).
+      code.localGet(r);
+      code.refTest(this.dyn.tplT());
+      code.i32Eqz();
+      code.i32And();
+    }
     if (value === null) this.openIfResult(dynRef);
     else this.openIf();
     code.localGet(f);
