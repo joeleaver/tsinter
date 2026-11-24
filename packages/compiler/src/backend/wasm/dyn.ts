@@ -135,6 +135,7 @@ import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { ERR_OWN_NAME, ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "../../ir/nodes.js";
 import { ObjModel } from "./objmodel.js";
+import { TplFrozen } from "./tpl-frozen.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
 import { RE_F_DYN_BOX, RE_F_LAST_INDEX } from "./regex-value.js";
@@ -662,6 +663,14 @@ export class DynBuilder {
   get om(): ObjModel {
     this.omInst ??= new ObjModel(this);
     return this.omInst;
+  }
+
+  private tplInst: TplFrozen | null = null;
+
+  /** S080: the frozen strings arrays' write surface, where live. */
+  get tpl(): TplFrozen {
+    this.tplInst ??= new TplFrozen(this);
+    return this.tplInst;
   }
 
   /** The builder internals objmodel.ts emits with. */
@@ -8025,50 +8034,10 @@ export class DynBuilder {
   }
 
   /** S080: a strict-mode write `d[k] = v` (locals 0 and 1 of a void
-   * helper) into a tag call's FROZEN strings array or its frozen raw (a
-   * `$dynTpl` box) throws Node's TypeError and returns: an existing
-   * element, `length` or the strings array's `raw` is read-only, any other
-   * key cannot be added. */
+   * helper) into a tag call's FROZEN strings array or its frozen raw
+   * throws Node's TypeError and returns (tpl-frozen.ts). */
   private tplWriteGuard(c: Code): void {
-    if (!this.tplLive) return;
-    const concat = this.deps.concat();
-    c.localGet(0);
-    c.refTest(this.tplT());
-    c.ifVoid();
-    this.deps.throwTypeError(c, (x) => {
-      this.pushIsLength(x, (y) => y.localGet(1));
-      x.localGet(1);
-      x.call(this.canonIdx());
-      this.arrLen(x, (y) => this.arrPayload(y, (z) => z.localGet(0)));
-      x.i32LtU();
-      x.i32Or();
-      x.localGet(1);
-      this.deps.lit(x, "raw");
-      x.call(this.deps.strEq());
-      x.localGet(0);
-      x.refCast(this.tplT());
-      x.structGet(this.tplT(), 3);
-      x.globalGet(this.undefinedGlobal());
-      x.refEq();
-      x.i32Eqz();
-      x.i32And();
-      x.i32Or();
-      x.ifResult(this.deps.strRef());
-      this.deps.lit(x, "Cannot assign to read only property '");
-      x.localGet(1);
-      x.call(concat);
-      this.deps.lit(x, "' of object '[object Array]'");
-      x.call(concat);
-      x.else_();
-      this.deps.lit(x, "Cannot add property ");
-      x.localGet(1);
-      x.call(concat);
-      this.deps.lit(x, ", object is not extensible");
-      x.call(concat);
-      x.end();
-    });
-    c.return_();
-    c.end();
+    if (this.tplLive) this.tpl.writeGuard(c);
   }
 
   /** Is `k` exactly "length"? */
@@ -11092,66 +11061,15 @@ export class DynBuilder {
       handleSide(0, "onto");
       handleSide(1, "from");
       if (this.tplLive && !except) {
-        // S080: onto a tag call's FROZEN strings array (or its raw): a
-        // source with no own enumerable key copies nothing (a nullish one
-        // is skipped); otherwise its first key is read (one [[Get]], a
-        // getter runs once) and that key's [[Set]] throws Node's TypeError
-        // (an element read-only, any other key not extensible), the keyed
-        // write's own guard.
+        // S080: onto a tag call's FROZEN strings array (or its raw): the
+        // source's first own enumerable key, a symbol key included, fails
+        // its [[Set]] (tpl-frozen.ts).
         c.localGet(0);
         c.refTest(this.tplT());
         c.ifVoid();
-        c.localGet(1);
-        c.structGet(dynT, DYN_KIND);
-        c.localTee(K);
-        c.i32Const(DK.UNDEF);
-        c.i32Eq();
-        c.localGet(K);
-        c.i32Const(DK.NULL);
-        c.i32Eq();
-        c.i32Or();
-        c.ifVoid();
         c.localGet(0);
-        c.return_();
-        c.end();
-        this.typedArm(c, 1, K, () => this.typedFence(c, "copying the members of", (x) => x.refNull(dynT)));
         c.localGet(1);
-        c.i32Const(0); // KEYS
-        c.call(this.objWalk());
-        c.localTee(PAIRS);
-        c.refIsNull();
-        c.ifVoid();
-        c.refNull(dynT);
-        c.return_();
-        c.end();
-        this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)));
-        c.i32Eqz();
-        c.ifVoid();
-        c.localGet(0);
-        c.return_();
-        c.end();
-        this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)), (x) => x.i32Const(0));
-        c.localSet(P);
-        const key = (x: Code): void => {
-          x.localGet(P);
-          x.structGet(dynT, DYN_REF);
-          emitFlatCast(x, this.deps.strType());
-        };
-        c.localGet(1);
-        key(c);
-        c.i32Const(0);
-        c.call(this.keyGet());
-        c.localSet(PAIRS);
-        c.globalGet(this.deps.excKind());
-        c.ifVoid();
-        c.refNull(dynT);
-        c.return_();
-        c.end();
-        c.localGet(0);
-        key(c);
-        c.localGet(PAIRS);
-        c.call(this.keySet());
-        c.refNull(dynT);
+        c.call(this.tpl.assignOnto());
         c.return_();
         c.end();
       }

@@ -56,6 +56,8 @@ export declare function parse(txt: string): unknown;
 export declare function assigns(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 export declare function enumer(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 export declare function same(strings: TemplateStringsArray, ...params: unknown[]): string[];
+export declare function frozenMore(strings: TemplateStringsArray, ...params: unknown[]): unknown;
+export declare function symCopy(): string;
 `;
 
 const TG_JS = String.raw`
@@ -239,6 +241,31 @@ export function enumer(strings) {
     strings.raw.propertyIsEnumerable(0), strings.hasOwnProperty("raw"), Object.keys(strings).join("+"), o]);
 }
 export function same(strings) { return strings; }
+// review 2: symbol-keyed and other sources, length/pop/for-in writes, the arrays' own listings
+function symSrc(desc, more) { const o = {}; if (more) o.a = 1; o[Symbol(desc)] = 1; return o; }
+export function frozenMore(strings) {
+  const out = [];
+  for (const a of [strings, strings.raw]) {
+    const tries = [
+      () => Object.assign(a, symSrc("s")), () => Object.assign(a, symSrc("t", true)),
+      () => { a.length = 5; }, () => a.pop(), () => { for (const k in { 0: 1, q: 2 }) a[k] = "w"; },
+      () => Object.assign(a, 5) === a, () => Object.assign(a, true) === a, () => Object.assign(a, "xy"), () => Object.assign(a, "") === a,
+      () => Object.assign(a, { length: 0 }), () => Object.assign(a, { raw: [] }),
+      () => JSON.stringify(a), () => JSON.stringify([...a]), () => Object.keys(a).join("+"), () => { a[Symbol("w")] = 1; },
+    ];
+    for (const f of tries) {
+      try { out.push(String(f())); } catch (e) { out.push(e.constructor.name + ": " + e.message); }
+    }
+  }
+  return out.join("\n") + "\n" + strings.join() + "|" + strings.raw.join() + "|" + strings.length + "|" + strings.raw.length;
+}
+export function symCopy() {
+  const s = Symbol("k");
+  const src = { a: 1 };
+  src[s] = 2;
+  const t = Object.assign({}, src);
+  return [Object.keys(t).join(), Object.getOwnPropertySymbols(t).length, t[s], Object.getOwnPropertySymbols(t)[0] === s].join("|");
+}
 export { sql };
 `;
 
@@ -433,6 +460,36 @@ const ROWS: Row[] = [
       `console.log(r[0]);`,
     ].join("\n") },
   },
+  {
+    id: "TAG-27 Object.assign onto the frozen arrays from a symbol-keyed source (Node's TypeError names the symbol), a source whose string key comes before its symbol, number, boolean, string, empty-string, {length} and {raw} sources; length, pop and for-in writes; JSON, spread, Object.keys and a symbol-keyed write",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { frozenMore } from "tg";`,
+      `console.log(frozenMore\`a\${1}b\`);`,
+    ].join("\n") },
+  },
+  {
+    id: "TAG-28 Object.assign onto a plain object copies a source's own enumerable symbol-keyed member",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": `import { symCopy } from "tg";\nconsole.log(symCopy());` },
+  },
+  {
+    id: "TAG-29 TypeScript writes a returned strings array (and its raw) through an any parameter, sets its length, pops it and Object.assigns a symbol-keyed source onto it: Node's TypeErrors",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { ret } from "tg";`,
+      `const a = ret\`a\${1}b\` as any;`,
+      `const w = (x: any): void => { x[0] = "p"; };`,
+      `const wk = (x: any): void => { x.q = "p"; };`,
+      `const so: any = {};`,
+      `so[Symbol("s")] = 1;`,
+      `const tries: (() => unknown)[] = [() => w(a), () => w(a.raw), () => wk(a), () => wk(a.raw), () => { a.length = 5; }, () => a.pop(), () => Object.assign(a, so), () => Object.assign(a.raw, so)];`,
+      `for (const f of tries) {`,
+      `  try { f(); console.log("ok"); } catch (e) { console.log((e as Error).name + ": " + (e as Error).message); }`,
+      `}`,
+      `console.log(a.join(), a.raw.join(), a.length, JSON.stringify(a), JSON.stringify([...a]), Object.keys(a).join());`,
+    ].join("\n") },
+  },
 ];
 
 describe("implicit-any JavaScript tags (wasm lane vs Node)", () => {
@@ -489,6 +546,7 @@ describe("implicit-any JavaScript tags: the frozen arrays' unmodeled object-mode
     ["TAG-18 Object.defineProperty", "Object.defineProperty(strings, \"k\", { value: 1 }); return \"no\";", /Object\.defineProperty on a tagged template's frozen strings array is not supported yet/],
     ["TAG-20 a switch over an element (a switch on a JavaScript dynamic value)", "switch (strings[5]) { case undefined: return \"u\"; default: return \"x\"; }", /switch statements on 'unknown' values/],
     ["TAG-19 arithmetic over an element (a JavaScript dynamic operand of `+ 1` is checked to a number)", "return String(strings[1] + 1);", /expected number/],
+    ["TAG-34 Object.assign from a Map onto the array (a typed Map source has no Object.assign lowering)", "return String(Object.assign(strings, new Map([[\"k\", 1]])) === strings);", /'Object\.assign' is part of the standard library types but has no scriptc lowering yet/],
   ] as const)("%s", async ([, body, re]) => {
     const dir = writeProject({
       ...TG,
@@ -496,6 +554,30 @@ describe("implicit-any JavaScript tags: the frozen arrays' unmodeled object-mode
       "node_modules/tg/index.d.ts": `${TG_DTS}\nexport declare function bad(strings: TemplateStringsArray, ...v: unknown[]): unknown;\n`,
       "main.ts": `import { bad } from "tg";\nconsole.log("before");\nconsole.log(bad\`y\${1}z\`);`,
     }, "tagx");
+    const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["tg"] });
+    if (!res.ok) throw new Error(`refused at compile time: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+    const got = await nativeRun(res.binaryPath!, []);
+    expect(got.stdout, got.stderr).toBe("before\n");
+    expect(got.exitCode).not.toBe(0);
+    expect(got.stderr).toMatch(re);
+  }, 600_000);
+});
+
+describe("implicit-any JavaScript tags: the frozen arrays' other mutating methods called from TypeScript stop by name at run time", () => {
+  test.for([
+    ["TAG-30 copyWithin on the array held as any", "a.copyWithin(0, 1)", /'Array\.prototype\.copyWithin' on a tagged template's frozen strings array is not supported yet/],
+    ["TAG-31 splice on its raw", "a.raw.splice(0, 1)", /'Array\.prototype\.splice' on a tagged template's frozen strings array is not supported yet/],
+    ["TAG-32 shift through a typed string[] binding", "r.shift()", /'Array\.prototype\.shift' on a tagged template's frozen strings array is not supported yet/],
+    ["TAG-33 unshift on the array held as any", "a.unshift(\"x\")", /'Array\.prototype\.unshift' on a tagged template's frozen strings array is not supported yet/],
+  ] as const)("%s", async ([, expr, re]) => {
+    const dir = writeProject({ ...TG, "main.ts": [
+      `import { ret, same } from "tg";`,
+      `const a = ret\`a\${1}b\` as any;`,
+      `const r = same\`c\${1}d\`;`,
+      `console.log("before");`,
+      `try { console.log(String(${expr})); } catch (e) { console.log((e as Error).message); }`,
+      `console.log(a.join(), r.join());`,
+    ].join("\n") }, "tagts");
     const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["tg"] });
     if (!res.ok) throw new Error(`refused at compile time: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
     const got = await nativeRun(res.binaryPath!, []);
