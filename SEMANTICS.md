@@ -7807,7 +7807,10 @@ yet`) on such a `message`. `console.log`/`util.inspect` of a typed error whose e
 members (S027's stackless form: a written `code` shows as `[Error: m] { code: 'C' }`) prints them as
 for the error held as `any`; one with a written `stack`, `cause` or other expando **stops by name**
 (`inspecting an error held in a dynamic value with its own 'stack'` / `with own properties beyond
-name, message and code ... is not supported yet`), where Node prints the stack. A typed read of a
+name, message and code ... is not supported yet`), where Node prints the stack. Open (GH #272): a
+typed DOMException is not routed through that path, so an expando written on one is silently
+missing from its print (`[DOMException [AbortError]: dm]` where Node adds `{ x: 1 }`); held as
+`any` it stops by name. A typed read of a
 written `stack` or `cause` (`t.stack`) still refuses at compile time (GH #135); read through `any`
 it answers as Node. A
 JavaScript literal spreading a typed error into a binding the checker types as a record (`const o =
