@@ -1,4 +1,5 @@
 import { isDtsMirrorPath } from "./npm-static.js";
+import { declaredClassOverDynamic, declaredInterfaceOverDynamic, declaredPickOverDynamic } from "./declared-dynamic.js";
 import * as ts from "./ts7/adapter.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
 import { ARRAYBUFFER_T, arrayOf, BIGINT_T, BOOL, bytesOf, canConvertToDyn, canMarshalIntoIsland, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
@@ -2835,6 +2836,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (hybrid) return hybrid;
   }
   const callSigs = checker.getCallSignatures(widened);
+  // SEMANTICS.md S133 (k), callable: a viewed package's declared CALLABLE
+  // interface with function members (postgres's `Sql<T>`, a JS function
+  // carrying properties) is the implementation's dynamic value, as a
+  // non-callable one is below; its calls and tagged templates call it.
+  if (callSigs.length > 0 && declaredInterfaceOverDynamic(widened, ctx)) return JSVAL;
   if (callSigs.length === 1) {
     const sig = callSigs[0]!;
     if (sig.getTypeParameters().length) return null;
@@ -2963,7 +2969,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (childShaped && core >= 2) return CHILD_T;
   }
   if (flags & (ts.TypeFlags.Object | ts.TypeFlags.Intersection) && callSigs.length === 0) {
-    if (declaredInterfaceOverDynamic(widened, ctx)) return JSVAL;
+    if (declaredInterfaceOverDynamic(widened, ctx) || declaredPickOverDynamic(widened, ctx)) return JSVAL;
     const viaAlias = mapGenericUtilityAlias(widened, ctx);
     if (viaAlias) return viaAlias;
     const record = mapRecordType(widened, ctx);
@@ -3713,97 +3719,6 @@ interface RecordShapeParts {
   declaredOrder?: string[];
   memberOrder?: string[];
   literalKeys?: true;
-}
-
-/** SEMANTICS.md S133 (k), "a declared interface over a dynamic
- * implementation": on the one-world lanes, an interface (or object type
- * alias) a viewed package's shipped declarations declare, with a member
- * that is a function (a method, or a function-typed property), is the
- * implementation's own dynamic value — zod's ZodString, ZodObject<Shape>,
- * whose instances are built per-instance by `$constructor` and carry
- * overloaded and generic methods no record shape holds. Identity is kept
- * and nothing is copied: member reads and calls dispatch dynamically, and
- * their results cross into the declared member types at the use. Data-only
- * interfaces keep their record mapping (a checked conversion), declared
- * classes their S115 views, and the program's own types are untouched. */
-export function declaredInterfaceOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
-  if (ctx.sharedDynamic !== true) return false;
-  const sym = widened.getSymbol() ?? widened.getAliasSymbol();
-  if (sym === undefined) return false;
-  const checker = ctx.checker;
-  // The RAW declarations: the declared-surface redirect would answer a merged
-  // `const` export's JS implementation for the symbol (dts-bridge.ts).
-  const decls = checker.rawDeclarationsOf(sym);
-  if (decls.length === 0) return false;
-  // Every declaration comes from the view's mirror, and the TYPE side is an
-  // interface or object type (zod merges `interface ZodString` with a
-  // `const ZodString` value of the same name; a class is never this case).
-  if (!decls.every((d) => isDtsMirrorPath(d.getSourceFile().fileName))) return false;
-  if (decls.some((d) => ts.isClassDeclaration(d))) return false;
-  if (!decls.some((d) => ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d) || ts.isTypeLiteralNode(d))) return false;
-  return checker.getPropertiesOfType(widened).some((p) => {
-    const pd = checker.declarationsOf(p)[0];
-    if (pd !== undefined && (pd.kind === ts.SyntaxKind.MethodSignature || ts.isMethodDeclaration(pd))) return true;
-    return checker.getCallSignatures(checker.getNonNullableType(checker.getTypeOfSymbol(p))).length > 0;
-  });
-}
-
-/** Does a declared class extend `Error` (or a subclass of it), through
- * its heritage clauses? */
-function declaredErrorClass(sym: ts.Symbol, checker: ts.TypeChecker, seen: Set<ts.Symbol>): boolean {
-  if (seen.has(sym)) return false;
-  seen.add(sym);
-  for (const d of checker.rawDeclarationsOf(sym)) {
-    if (!ts.isClassDeclaration(d)) continue;
-    const ext = d.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0];
-    if (ext === undefined) continue;
-    const e = ext.expression;
-    if (ts.isIdentifier(e) && /^(Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError)$/.test(e.text)) return true;
-    let base: ts.Symbol | undefined;
-    try {
-      base = checker.getSymbolAtLocation(e);
-      if (base !== undefined && (base.flags & ts.SymbolFlags.Alias) !== 0) base = checker.getAliasedSymbol(base);
-    } catch {
-      base = undefined;
-    }
-    if (base !== undefined && declaredErrorClass(base, checker, seen)) return true;
-  }
-  return false;
-}
-
-/** S133 (k) or (l): a declared type whose values are the implementation's
- * own dynamic values. */
-export function declaredOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
-  return declaredInterfaceOverDynamic(widened, ctx) || declaredClassOverDynamic(widened, ctx);
-}
-
-/** SEMANTICS.md S133 (l), "a declared class the program only types
- * against": on the one-world lanes, a class (its instance type) that only a
- * viewed package's shipped declarations declare, which the program's own
- * sources never construct, extend or implement, is the implementation's own
- * dynamic value, as (k) makes a declared interface. drizzle's `PgColumn`:
- * pgTable(...) builds its columns in drizzle's JavaScript (builders and
- * Object.assign), and the program only ever holds them. Identity is kept,
- * members dispatch dynamically, and results cross into the declared member
- * types at the use. A class the program constructs, extends or implements
- * keeps its S115 view. */
-export function declaredClassOverDynamic(widened: ts.Type, ctx: TypeMapperCtx): boolean {
-  if (ctx.sharedDynamic !== true || ctx.programBuiltClassDecl === undefined) return false;
-  const sym = widened.getSymbol();
-  if (sym === undefined || (sym.flags & ts.SymbolFlags.Class) === 0) return false;
-  const checker = ctx.checker;
-  // The instance type only: the class value (`typeof PgColumn`) keeps its
-  // own paths.
-  if (checker.getConstructSignatures(widened).length > 0) return false;
-  const decls = checker.rawDeclarationsOf(sym);
-  if (decls.length === 0) return false;
-  if (!decls.every((d) => isDtsMirrorPath(d.getSourceFile().fileName))) return false;
-  if (!decls.some((d) => ts.isClassDeclaration(d))) return false;
-  // A declared ERROR class (`class DeclError extends Error`) keeps its
-  // existing mapping: thrown by the package, caught and narrowed by
-  // `instanceof` in the program.
-  if (declaredErrorClass(sym, checker, new Set())) return false;
-  return !decls.some((d) => ctx.programBuiltClassDecl!(d));
 }
 
 function mapRecordType(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {

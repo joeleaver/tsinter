@@ -97,6 +97,206 @@ const DECL = (kindType = "string"): Record<string, string> => ({
   "tsconfig.json": pj({ compilerOptions: { strict: true, module: "nodenext", skipLibCheck: true, noEmit: true } }),
 });
 
+// A postgres.js-shaped package (paperclip's `postgres@3.4.9` surface): the
+// client is a JS function carrying properties, declared as a CALLABLE
+// interface (a generic call signature, also a template tag) with a generic
+// `unsafe<T>` whose type argument appears only in its result, plain
+// methods, and a reserved connection whose interface extends the client's.
+const PG_DTS = (unsafeResult: string): string => `export type Row = Record<string, unknown>;
+export interface PendingQuery<T> extends Promise<T> {}
+export interface Sql<TTypes extends Record<string, unknown> = {}> {
+  <T extends readonly unknown[] = Row[]>(template: TemplateStringsArray, ...parameters: unknown[]): PendingQuery<T>;
+  unsafe<T extends any[] = Row[]>(query: string, parameters?: unknown[]): PendingQuery<${unsafeResult}>;
+  reserve(): Promise<ReservedSql<TTypes>>;
+  end(options?: { timeout?: number }): Promise<void>;
+}
+export interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
+  release(): void;
+}
+declare function postgres(url: string): Sql<{}>;
+export default postgres;
+`;
+
+// (The client's members are defined with Object.defineProperties; real
+// postgres.js uses Object.assign onto the function, a package-side form
+// this file does not cover.)
+const PG_JS = `function client(url) {
+  let calls = 0;
+  function sql(strings, ...params) {
+    let text = strings[0];
+    for (let i = 0; i < params.length; i++) text += "$" + (i + 1) + strings[i + 1];
+    calls++;
+    return Promise.resolve([{ text, params }]);
+  }
+  function unsafe(query, parameters) {
+    calls++;
+    if (query === "LIE") return Promise.resolve("not rows");
+    return Promise.resolve(query.startsWith("SELECT") ? [{ n: calls, q: query, p: parameters ?? [] }] : []);
+  }
+  async function end(o) {
+    console.log("end", url, o ? o.timeout : "none", calls);
+  }
+  function release() {
+    console.log("released", url);
+  }
+  Object.defineProperties(sql, {
+    unsafe: { value: unsafe, enumerable: true },
+    end: { value: end, enumerable: true },
+    release: { value: release, enumerable: true },
+  });
+  return sql;
+}
+export default function postgres(url) {
+  const sql = client(url);
+  async function reserve() {
+    return client(url + "#reserved");
+  }
+  Object.defineProperty(sql, "reserve", { value: reserve, enumerable: true });
+  return sql;
+}
+`;
+
+const PG =(unsafeResult = "T"): Record<string, string> => ({
+  "node_modules/pg/package.json": pj({ name: "pg", version: "1.0.0", type: "module", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } }),
+  "node_modules/pg/index.d.ts": PG_DTS(unsafeResult),
+  "node_modules/pg/index.js": PG_JS,
+  "package.json": pj({ type: "module" }),
+  "tsconfig.json": pj({ compilerOptions: { strict: true, module: "nodenext", target: "es2022", skipLibCheck: true, noEmit: true } }),
+});
+
+const PG_ROWS: Row[] = [
+  {
+    id: "DD-07 a declared callable interface (postgres's Sql<{}>): a tagged-template call, unsafe<T> with typed field reads, unsafe() with its default type argument, end()",
+    npmStatic: ["pg"],
+    files: {
+      ...PG(),
+      "main.ts": [
+        `import postgres from "pg";`,
+        `const sql = postgres("u1");`,
+        `async function run(s: typeof sql): Promise<void> {`,
+        `  const id = 7;`,
+        `  const tagged = await s\`select * from t where id = \${id}\`;`,
+        `  console.log(JSON.stringify(tagged));`,
+        `  const rows = await s.unsafe<{ n: number; q: string }[]>("SELECT n", [1, "a"]);`,
+        `  console.log(rows.length, rows[0]!.n + 1, rows[0]!.q.toUpperCase());`,
+        `  await s.unsafe("BEGIN");`,
+        `  const none = await s.unsafe<never[]>("COMMIT");`,
+        `  console.log(none.length);`,
+        `}`,
+        `await run(sql);`,
+        `await sql.end({ timeout: 0 });`,
+        `await sql.end();`,
+      ].join("\n"),
+    },
+  },
+  {
+    id: "DD-08 Sql<{}> as a declared type: a parameter, a class field, an array element and a Map<string, Set<WeakRef<Sql<{}>>>> registry, with identity kept",
+    npmStatic: ["pg"],
+    files: {
+      ...PG(),
+      "main.ts": [
+        `import postgres, { type Sql } from "pg";`,
+        `async function first(s: Sql<{}>, q: string): Promise<number> {`,
+        `  const r = await s.unsafe<{ n: number }[]>(q);`,
+        `  return r[0]!.n;`,
+        `}`,
+        `class Holder {`,
+        `  readonly sql: Sql<{}>;`,
+        `  readonly name: string;`,
+        `  constructor(sql: Sql<{}>, name: string) {`,
+        `    this.sql = sql;`,
+        `    this.name = name;`,
+        `  }`,
+        `  async count(): Promise<number> { return first(this.sql, "SELECT " + this.name); }`,
+        `}`,
+        `const sql = postgres("u2");`,
+        `const h = new Holder(sql, "h");`,
+        `console.log(await h.count(), h.sql === sql, await first(sql, "SELECT x"));`,
+        `const all: Sql<{}>[] = [sql, postgres("u3")];`,
+        `console.log(all.length, all[0] === sql, all[1] === sql);`,
+        `const registry = new Map<string, Set<WeakRef<Sql<{}>>>>();`,
+        `function register(key: string, s: Sql<{}>): void {`,
+        `  let set = registry.get(key);`,
+        `  if (set === undefined) { set = new Set(); registry.set(key, set); }`,
+        `  set.add(new WeakRef(s));`,
+        `}`,
+        `register("a", sql);`,
+        `register("a", all[1]!);`,
+        `for (const ref of registry.get("a")!) {`,
+        `  const s = ref.deref();`,
+        `  console.log(s === sql, s === undefined);`,
+        `}`,
+        `await h.sql.end();`,
+      ].join("\n"),
+    },
+  },
+  {
+    id: "DD-09 paperclip's SqlExecutor = Pick<ReturnType<typeof postgres>, \"unsafe\">, and an Omit: calls through the alias parameter, identity across it, and a tagged-template call on the same value",
+    npmStatic: ["pg"],
+    files: {
+      ...PG(),
+      "main.ts": [
+        `import postgres from "pg";`,
+        `type SqlExecutor = Pick<ReturnType<typeof postgres>, "unsafe">;`,
+        `type NoEnd = Omit<ReturnType<typeof postgres>, "end" | "reserve">;`,
+        `const sql = postgres("u4");`,
+        `async function migrate(ex: SqlExecutor): Promise<number> {`,
+        `  await ex.unsafe("BEGIN");`,
+        `  const rows = await ex.unsafe<{ n: number }[]>("SELECT n");`,
+        `  await ex.unsafe("COMMIT");`,
+        `  return rows[0]!.n * 10;`,
+        `}`,
+        `function same(ex: SqlExecutor): boolean {`,
+        `  return ex === sql;`,
+        `}`,
+        `console.log(await migrate(sql), same(sql), same(postgres("u5")));`,
+        `async function viaHeld(): Promise<void> {`,
+        `  const held: SqlExecutor = sql;`,
+        `  const d = await held.unsafe<{ n: number; q: string }[]>("SELECT d");`,
+        `  console.log(d[0]!.q, held === sql);`,
+        `}`,
+        `await viaHeld();`,
+        `async function viaOmit(s: NoEnd): Promise<string> {`,
+        `  const u = await s.unsafe<{ q: string }[]>("SELECT o");`,
+        `  return u[0]!.q + " " + (s === sql);`,
+        `}`,
+        `console.log(await viaOmit(sql));`,
+        `async function tag(s: typeof sql): Promise<string> {`,
+        `  const t = await s\`insert \${"x"}\`;`,
+        `  return JSON.stringify(t);`,
+        `}`,
+        `console.log(await tag(sql));`,
+        `await sql.end();`,
+      ].join("\n"),
+    },
+  },
+  {
+    id: "DD-10 reserve() then release() (postgres's ReservedSql<{}>, an interface extending the callable Sql<{}>)",
+    npmStatic: ["pg"],
+    files: {
+      ...PG(),
+      "main.ts": [
+        `import postgres, { type ReservedSql, type Sql } from "pg";`,
+        `const pool: Sql<{}> = postgres("u6");`,
+        `async function withReserved(p: Sql<{}>): Promise<number> {`,
+        `  const conn: ReservedSql<{}> = await p.reserve();`,
+        `  try {`,
+        `    await conn.unsafe("BEGIN");`,
+        `    const r = await conn.unsafe<{ n: number }[]>("SELECT r");`,
+        `    const t = await conn\`select \${2}\`;`,
+        `    console.log(JSON.stringify(t), conn === p);`,
+        `    return r[0]!.n;`,
+        `  } finally {`,
+        `    conn.release();`,
+        `  }`,
+        `}`,
+        `console.log(await withReserved(pool));`,
+        `await pool.end({ timeout: 5 });`,
+      ].join("\n"),
+    },
+  },
+];
+
 const ROWS: Row[] = [
   {
     id: "DD-01 calls, chains, a typed parameter, the self-referential member and a throw through a declared interface",
@@ -178,13 +378,13 @@ const ROWS: Row[] = [
 ];
 
 describe("S133 (k): a declared interface over a dynamic implementation (wasm lane vs Node)", () => {
-  test.for(ROWS.map((r) => [r.id, r] as const))("%s", async ([, row]) => {
+  test.for([...ROWS, ...PG_ROWS].map((r) => [r.id, r] as const))("%s", async ([, row]) => {
     await checkRow(scratch, row, "wasm");
   }, 600_000);
 });
 
 describe("S133 (k): a declared interface over a dynamic implementation (wasm-native lane vs Node)", () => {
-  test.for(ROWS.map((r) => [r.id, r] as const))("%s", async ([, row]) => {
+  test.for([...ROWS, ...PG_ROWS].map((r) => [r.id, r] as const))("%s", async ([, row]) => {
     await checkRow(scratch, row, "wasm-native");
   }, 600_000);
 });
@@ -209,6 +409,34 @@ describe("S133 (k): a declared primitive the implementation does not produce sto
     expect(got.stdout).not.toContain("before\nNaN");
     expect(got.exitCode).not.toBe(0);
     expect(got.stderr).toMatch(/number|string/);
+  }, 600_000);
+});
+
+describe("S133 (k): a declared callable interface whose method result the implementation does not produce stops by name", () => {
+  test("DD-11 `unsafe<{ n: number }[]>` declared to settle to rows, implemented as a string", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dd11-"));
+    const files: Record<string, string> = {
+      ...PG(),
+      "main.ts": [
+        `import postgres from "pg";`,
+        `const sql = postgres("u7");`,
+        `console.log("before");`,
+        `const rows = await sql.unsafe<{ n: number }[]>("LIE");`,
+        `console.log("after", rows.length);`,
+      ].join("\n"),
+    };
+    for (const [name, src] of Object.entries(files)) {
+      mkdirSync(join(dir, name, ".."), { recursive: true });
+      writeFileSync(join(dir, name), src);
+    }
+    const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["pg"] });
+    if (!res.ok) throw new Error(`DD-11 refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+    const got = await nativeRun(res.binaryPath!, []);
+    // Node prints `after 8` (the string's length); the declaration's claim
+    // is false for this value, so the program ends at the crossing.
+    expect(got.stdout, got.stderr).toBe("before\n");
+    expect(got.exitCode).not.toBe(0);
+    expect(got.stderr).toMatch(/array|string/);
   }, 600_000);
 });
 

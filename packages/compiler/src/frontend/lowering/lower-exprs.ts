@@ -39,7 +39,8 @@ import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8Spread
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
-import { declaredClassOverDynamic, isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
+import { declaredClassOverDynamic } from "../declared-dynamic.js";
+import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";

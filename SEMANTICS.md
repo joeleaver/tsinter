@@ -11983,6 +11983,36 @@ only where a crossing checks it.
 **Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
 (DD-01..06).
 
+**Amendment (k), callable and Pick/Omit (2026-11-24, unit GM-1 of
+`docs/design/generic-method-receiver.md`).** Callable declared interfaces,
+and Pick/Omit of (k)/(l) types, are the dynamic value.
+- A (k) interface may have call signatures. postgres.js's `Sql<T>` is the
+  case: the client is a JavaScript function carrying properties, declared
+  with a generic call signature (it is also a template tag), a generic
+  `unsafe<T>()` whose type argument appears only in its result, and plain
+  methods (`reserve()`, `end()`; `ReservedSql<T>` extends it with
+  `release()`). Calling the value, as a function or as a tag, calls the
+  implementation's function. Its members dispatch as (k)'s do, and a type
+  argument only selects the declared result type that the result crosses
+  into at the use. An interface with call signatures and no function
+  member keeps its function mapping.
+- The standard library's `Pick<T, K>`, and so `Omit<T, K>` (a Pick of the
+  remaining keys), under any alias the program gives it, is the dynamic
+  value when every property it keeps is a member a (k) or (l) type
+  declares. paperclip's `SqlExecutor = Pick<ReturnType<typeof postgres>,
+  "unsafe">` is the case: a parameter of that type receives the client
+  itself, so `===` across it holds and nothing is copied. A Pick of the
+  program's own types, or one keeping a member another type declares,
+  keeps its record mapping.
+Everything else is (k) as written: identity is kept, dispatch is dynamic,
+and a result the implementation produces against its declaration (`unsafe`
+settling to a string where rows are declared) ends the program by name at
+the crossing. A declared type argument that is a record array with an
+index signature (postgres's default `Row[]`) held in a typed binding is a
+copy, which S125 judges as for every dynamic value.
+**Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
+(DD-07..10 against Node on both lanes; DD-11, the named stop).
+
 **Amendment — a dynamic result under a declared class (2026-11-16).** On
 the WasmGC lanes, when the implementation hands back a dynamic value where
 the declarations name a program-compiled class (commander's `this`-returning
