@@ -7777,8 +7777,15 @@ element by a number, a variable or a string index, past the end or `length` (a c
 either array, which throws on the first key it copies as Node's [[Set]] does: the source's string
 keys come first, then its symbol keys, so a source holding only symbol keys throws naming the first
 one (`Cannot add property Symbol(s), object is not extensible`). A source with no own enumerable key
-(a number, a boolean, the empty string, `{}`), or a nullish one, copies nothing; a `Map` source
-stops by name (`Object.assign` from a typed `Map` has no lowering). A strings array a tag returns
+(a number, a boolean, the empty string, `{}`), or a nullish one, copies nothing. An Error source
+(a built-in error, a subclass instance, a caught runtime error) is walked as the keys Node lists, so
+its non-enumerable `message` and `stack` and its inherited `name` copy nothing and the target comes
+back, while an own enumerable field (an expando, a subclass's field, a subclass's own `name`) throws
+naming it (`new AggregateError` and an Error's `cause` option still refuse by name at compile
+time). A `Map` source stops by name (`Object.assign` from a typed `Map` has no lowering), and so
+does `Object.assign` with more than one source onto either array (`Object.assign onto a
+non-plain-object target is not supported yet`), where Node throws on the first key the sources hold
+(and returns the array when they hold none). A strings array a tag returns
 into a typed `string[]` slot is S125 (c)'s crossing: a `const`/`let` binding written through takes
 the dynamic arm and holds the frozen array itself (the write throws, the element is unchanged), and a
 field or element written through is the copy S125 (c) refuses by name. `Object.isFrozen`/`isSealed`
@@ -7798,7 +7805,7 @@ and stops by name on a string, where Node concatenates, and a `switch` over an e
 concatenate as Node does. An island tag call's strings array (unit A2) is the same kind of box: it now takes the same write
 and integrity answers, as Node does (its `raw` stays the plain array it was). A template span with an
 invalid escape (Node cooks it to `undefined`) refuses by name, as before.
-**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source).
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source; TAG-35 Error sources against Node, TAG-36 the named stop of a multi-source `Object.assign`).
 
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 

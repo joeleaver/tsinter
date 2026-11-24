@@ -58,6 +58,7 @@ export declare function enumer(strings: TemplateStringsArray, ...params: unknown
 export declare function same(strings: TemplateStringsArray, ...params: unknown[]): string[];
 export declare function frozenMore(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 export declare function symCopy(): string;
+export declare function errSrc(strings: TemplateStringsArray, ...params: unknown[]): unknown;
 `;
 
 const TG_JS = String.raw`
@@ -265,6 +266,32 @@ export function symCopy() {
   src[s] = 2;
   const t = Object.assign({}, src);
   return [Object.keys(t).join(), Object.getOwnPropertySymbols(t).length, t[s], Object.getOwnPropertySymbols(t)[0] === s].join("|");
+}
+class MyErr extends Error {}
+function expando() { try { throw new Error("m"); } catch (e) { e.u = 2; return e; } }
+class FieldErr extends Error { constructor() { super("m"); this.f = 1; } }
+class NamedErr extends Error { constructor() { super("m"); this.name = "NamedErr"; } }
+export function errSrc(strings) {
+  const out = [];
+  for (const a of [strings, strings.raw]) {
+    const withField = expando();
+    let caught;
+    try { JSON.parse("{"); } catch (e) { caught = e; }
+    const tries = [
+      () => Object.assign(a, new Error("m")) === a,
+      () => Object.assign(a, new TypeError("m")) === a,
+      () => Object.assign(a, new RangeError("m")) === a,
+      () => Object.assign(a, new MyErr("m")) === a,
+      () => Object.assign(a, caught) === a,
+      () => Object.assign(a, withField),
+      () => Object.assign(a, new FieldErr()),
+      () => Object.assign(a, new NamedErr()),
+    ];
+    for (const f of tries) {
+      try { out.push(String(f())); } catch (e) { out.push(e.constructor.name + ": " + e.message); }
+    }
+  }
+  return out.join("\n") + "\n" + strings.join() + "|" + strings.raw.join() + "|" + strings.length;
 }
 export { sql };
 `;
@@ -490,6 +517,14 @@ const ROWS: Row[] = [
       `console.log(a.join(), a.raw.join(), a.length, JSON.stringify(a), JSON.stringify([...a]), Object.keys(a).join());`,
     ].join("\n") },
   },
+  {
+    id: "TAG-35 Object.assign onto the frozen arrays from an Error source (Error, TypeError, a RangeError, a subclass, a caught SyntaxError) copies nothing; one with an own enumerable field (an expando, a subclass's field, a subclass's own name) throws Node's TypeError naming it",
+    npmStatic: ["tg"],
+    files: { ...TG, "main.ts": [
+      `import { errSrc } from "tg";`,
+      `console.log(errSrc\`a\${1}b\`);`,
+    ].join("\n") },
+  },
 ];
 
 describe("implicit-any JavaScript tags (wasm lane vs Node)", () => {
@@ -547,6 +582,7 @@ describe("implicit-any JavaScript tags: the frozen arrays' unmodeled object-mode
     ["TAG-20 a switch over an element (a switch on a JavaScript dynamic value)", "switch (strings[5]) { case undefined: return \"u\"; default: return \"x\"; }", /switch statements on 'unknown' values/],
     ["TAG-19 arithmetic over an element (a JavaScript dynamic operand of `+ 1` is checked to a number)", "return String(strings[1] + 1);", /expected number/],
     ["TAG-34 Object.assign from a Map onto the array (a typed Map source has no Object.assign lowering)", "return String(Object.assign(strings, new Map([[\"k\", 1]])) === strings);", /'Object\.assign' is part of the standard library types but has no scriptc lowering yet/],
+    ["TAG-36 Object.assign onto the array from two sources", "return String(Object.assign(strings, {}, {}) === strings);", /Object\.assign onto a non-plain-object target is not supported yet/],
   ] as const)("%s", async ([, body, re]) => {
     const dir = writeProject({
       ...TG,

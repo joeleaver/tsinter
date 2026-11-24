@@ -116,7 +116,8 @@ export class TplFrozen {
    * (the target comes back); otherwise the source's FIRST own enumerable
    * key in OrdinaryOwnPropertyKeys order (the string keys, then the
    * symbol keys) is read — one [[Get]], a getter runs once — and that
-   * key's [[Set]] throws. */
+   * key's [[Set]] throws. An error's encoding is listed as its user view
+   * (errUserView), so only its own enumerable fields count. */
   assignOnto(): number {
     const dynRef = this.d.dynRef();
     return this.k.cached("tpl.assignOnto", [dynRef, dynRef], [dynRef], (idx) => {
@@ -141,6 +142,21 @@ export class TplFrozen {
       c.return_();
       c.end();
       d.typedArm(c, 1, K, () => d.typedFence(c, "copying the members of", (x) => x.refNull(dynT)));
+      // GH #193: an error's encoding is walked as its user view, as the
+      // plain-target copy walks it (dyn.ts assignRaw) — its `%error`
+      // marker and its name/message/code/stack entries are not keys Node
+      // lists, so an Error source with no own enumerable key copies
+      // nothing and one with an expando fails on that expando.
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      d.boxObj(c, (x) => {
+        d.objPayload(x, (y) => y.localGet(1));
+        x.call(d.errUserView());
+      });
+      c.localSet(1);
+      c.end();
       c.localGet(1);
       c.i32Const(d.symLive ? 8 : 0); // KEYS, with the symbol keys after the string keys
       c.call(d.objWalk());
