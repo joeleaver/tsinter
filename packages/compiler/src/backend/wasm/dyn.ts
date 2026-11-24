@@ -133,9 +133,10 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
-import { ERR_OWN_NAME, ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "../../ir/nodes.js";
+import { ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "../../ir/nodes.js";
 import { ObjModel } from "./objmodel.js";
 import { TplFrozen } from "./tpl-frozen.js";
+import { ErrOwnKeys } from "./err-own.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
 import { RE_F_DYN_BOX, RE_F_LAST_INDEX } from "./regex-value.js";
@@ -439,6 +440,10 @@ export interface DynDeps {
    * that sets an own `name`? JSON, key listings and Object.assign of its
    * encoding stop (Node lists the own name; the encoding hides it). */
   errNameTest?: (c: Code, pushErr: (c: Code) => void) => void;
+  /** GH #193: pushes i32, is the error `pushErr` leaves a DOMException
+   * (its `code` entry is the derived legacy number, a prototype getter in
+   * Node, never listed)? Absent: the module mints none. */
+  errIsDomex?: (c: Code, pushErr: (c: Code) => void) => void;
   /** GH #191: calls one of the frontend's error-mirror helpers over a user
    * Error subclass's instance (class-views.ts buildErrorViews): `kind
    * (err, key) -> f64`, `get(err, key) -> dyn`, `set(err, key, v) -> f64`,
@@ -671,6 +676,15 @@ export class DynBuilder {
   get tpl(): TplFrozen {
     this.tplInst ??= new TplFrozen(this);
     return this.tplInst;
+  }
+
+  private errOwnInst: ErrOwnKeys | null = null;
+
+  /** GH #193: which of an error's name/message/code a program made own
+   * and enumerable (err-own.ts). */
+  get errOwn(): ErrOwnKeys {
+    this.errOwnInst ??= new ErrOwnKeys(this);
+    return this.errOwnInst;
   }
 
   /** The builder internals objmodel.ts emits with. */
@@ -7506,12 +7520,17 @@ export class DynBuilder {
         c.i32Const(0);
         c.return_();
         c.end();
+        if (key === "message") {
+          // GH #193: whether the write makes an own enumerable message.
+          c.localGet(0);
+          c.call(this.errMessageWriting());
+        }
         c.localGet(0);
         c.localGet(2);
         c.structGet(dynT, DYN_REF);
         emitFlatCast(c, this.deps.strType());
         c.structSet(errT, slot);
-        if (key === "name" && this.deps.errView !== undefined) {
+        if (key === "name") {
           c.localGet(0);
           c.call(this.errNameOwned());
         }
@@ -7691,41 +7710,15 @@ export class DynBuilder {
   }
 
   /** %w.dyn.errNameOwned(err): after a write of `name` from outside the
-   * class (typed or dynamic) to a mirrored error whose class does not own
-   * `name`: the property is own from now on in Node, listed in the place
-   * this write gives it — a marker entry (ERR_OWN_NAME) in its encoding,
-   * which is built now if the error has not crossed yet (GH #191). */
+   * class (typed or dynamic): err-own.ts nameWritten (GH #191, GH #193). */
   errNameOwned(): number {
-    return this.cached("errNameOwned", [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }], [], (idx) => {
-      const c = new Code();
-      const view = this.deps.errView!;
-      view(c, "kind", (x) => {
-        x.localGet(0);
-        this.deps.lit(x, ERRV_PROBE);
-      });
-      c.f64Const(9);
-      c.f64Ne();
-      c.ifVoid();
-      c.return_();
-      c.end();
-      view(c, "kind", (x) => {
-        x.localGet(0);
-        this.deps.lit(x, "name");
-      });
-      c.f64Const(0);
-      c.f64Ne();
-      c.ifVoid();
-      c.return_();
-      c.end();
-      this.objPayload(c, (x) => {
-        x.localGet(0);
-        x.call(this.fromError());
-      });
-      this.deps.lit(c, ERR_OWN_NAME);
-      c.globalGet(this.boolGlobal(true));
-      c.call(this.objPut());
-      this.mb.setBody(idx, [], c.bytes());
-    });
+    return this.errOwn.nameWritten();
+  }
+
+  /** %w.dyn.errMessageWriting(err): before a write of `message` (typed or
+   * dynamic): err-own.ts messageWriting (GH #193). */
+  errMessageWriting(): number {
+    return this.errOwn.messageWriting();
   }
 
   /** %w.dyn.errStackReset(err): `Error.captureStackTrace` over a typed
@@ -7781,11 +7774,20 @@ export class DynBuilder {
     });
   }
 
-  /** `delete` or defineProperty of `stack` on any error's encoding stops
-   * by name: Node's own `stack` is non-enumerable (listings hide it here),
-   * but deleting it or redefining it can make an own enumerable `stack`
-   * the listings would then miss. */
+  /** `delete` or defineProperty of `stack`, `name` or `message` on any
+   * error's encoding stops by name: Node's own `stack` is non-enumerable
+   * (listings hide it here), but deleting it or redefining it can make an
+   * own enumerable `stack` the listings would then miss; `name` and
+   * `message` live in the error's typed slots, which keep no absent or
+   * redefined state, and their listing follows the writes (err-own.ts). */
   errStackGuard(c: Code, pushDyn: (c: Code) => void, pushKey: (c: Code) => void, what: string): void {
+    for (const key of ["stack", "name", "message"]) this.errSlotKeyGuard(c, pushDyn, pushKey, what, key);
+  }
+
+  private errSlotKeyGuard(c: Code, pushDyn: (c: Code) => void, pushKey: (c: Code) => void, what: string, key: string): void {
+    const why = key === "stack"
+      ? "its listing keeps Node's non-enumerable stack hidden"
+      : "the error keeps it in a typed slot, which has no absent or redefined state";
     pushDyn(c);
     c.structGet(this.dynT(), DYN_KIND);
     c.i32Const(DK.OBJ);
@@ -7796,12 +7798,12 @@ export class DynBuilder {
     c.refIsNull();
     c.i32Eqz();
     pushKey(c);
-    this.deps.lit(c, "stack");
+    this.deps.lit(c, key);
     c.call(this.deps.strEq());
     c.i32And();
     c.ifVoid();
     this.deps.fence(c, (x) =>
-      this.deps.lit(x, `${what} 'stack' of an error held in a dynamic value is not supported yet (its listing keeps Node's non-enumerable stack hidden)`));
+      this.deps.lit(x, `${what} '${key}' of an error held in a dynamic value is not supported yet (${why})`));
     c.end();
     c.end();
   }
@@ -10310,10 +10312,11 @@ export class DynBuilder {
   }
 
   /** The reserved keys this build makes by name (objmodel.ts
-   * SYM_KEY_PREFIX + a well-known symbol's name; nodes.ts ERR_OWN_NAME). */
+   * SYM_KEY_PREFIX + a well-known symbol's name; nodes.ts ERR_OWN_NAME,
+   * ERR_MSG_UNSURE). */
   private static readonly INTERNAL_RESERVED_KEYS = [
     "asyncIterator", "hasInstance", "isConcatSpreadable", "iterator", "match", "matchAll", "replace",
-    "search", "species", "split", "toPrimitive", "toStringTag", "unscopables", "ownName",
+    "search", "species", "split", "toPrimitive", "toStringTag", "unscopables", "ownName", "ownMessage",
   ].map((n) => "\uD800@@" + n);
 
   keyGuard(): number {
@@ -10396,11 +10399,13 @@ export class DynBuilder {
    *    already fail the differential on one. */
   /** %w.dyn.errUserView(obj) → obj itself, or for an error's dynamic
    * encoding a copy without its `%error` marker and the error's `name`,
-   * `message` and stamped `code` entries (GH #193): Node does not list them
-   * (the marker does not exist; the rest are non-enumerable or on the
-   * prototype), so a program's key listing or Object.assign walks the copy
-   * and an expando the program wrote still shows. The runtime's own walks
-   * (inspection, JSON) hide them their own way. */
+   * `message`, `stack` and stamped `code` entries (GH #193): Node does not
+   * list them (the marker does not exist; the rest are non-enumerable or on
+   * the prototype), so a program's key listing or Object.assign walks the
+   * copy and an expando the program wrote still shows — a `code` it wrote
+   * included. A `name` the program made own is listed where it was first
+   * written, and a `message` written over "" stops by name (err-own.ts).
+   * The runtime's own walks (inspection, JSON) hide them their own way. */
   errUserView(): number {
     return this.cached("errUserView", [this.objRef()], [this.objRef()], (idx) => {
       const objT = this.objT();
@@ -10460,21 +10465,9 @@ export class DynBuilder {
         this.deps.lit(c, "%error");
         c.call(this.deps.strEq());
         c.brIf(0);
-        // an own `name` a write from outside the class made (errNameOwned)
-        c.localGet(E);
-        c.structGet(entryT, ENTRY_KEY);
-        this.deps.lit(c, ERR_OWN_NAME);
-        c.call(this.deps.strEq());
-        c.ifVoid();
-        c.localGet(CP);
-        this.deps.lit(c, "name");
-        this.boxStr(c, (x) => {
-          x.localGet(ERR);
-          x.structGet(this.deps.errT(), this.deps.errName());
-        });
-        c.call(this.objPut());
-        c.br(1);
-        c.end();
+        // an own `name` a write from outside the class made, a `message`
+        // written over "" (err-own.ts)
+        this.errOwn.markerArm(c, E, ERR, CP, 0);
         view(c, "kind", (x) => {
           x.localGet(ERR);
           x.localGet(E);
@@ -10492,14 +10485,7 @@ export class DynBuilder {
         c.f64Const(1);
         c.f64Ne();
         c.ifVoid();
-        c.i32Const(0);
-        for (const key of ["name", "message", "code", "stack"]) {
-          c.localGet(E);
-          c.structGet(entryT, ENTRY_KEY);
-          this.deps.lit(c, key);
-          c.call(this.deps.strEq());
-          c.i32Or();
-        }
+        this.errHiddenEntry(c, E, ERR);
         c.brIf(1);
         c.end();
         c.localGet(CP);
@@ -10539,16 +10525,10 @@ export class DynBuilder {
       c.localGet(I);
       c.arrayGet(entries);
       c.localSet(E);
-      c.i32Const(0);
-      for (const key of ["%error", "name", "message", "code", "stack"]) {
-        c.localGet(E);
-        c.structGet(entryT, ENTRY_KEY);
-        this.deps.lit(c, key);
-        c.call(this.deps.strEq());
-        c.i32Or();
-      }
-      c.i32Eqz();
-      c.ifVoid();
+      c.block();
+      this.errOwn.markerArm(c, E, ERR, CP, 0);
+      this.errHiddenEntry(c, E, ERR);
+      c.brIf(0);
       c.localGet(CP);
       c.localGet(E);
       c.structGet(entryT, ENTRY_KEY);
@@ -10566,6 +10546,31 @@ export class DynBuilder {
       c.localGet(CP);
       this.mb.setBody(idx, [this.objRef(), I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: this.deps.errT() }, F64], c.bytes());
     });
+  }
+
+  /** Pushes i32: is entry local `E` of the encoding of the error in local
+   * `ERR` one the user view hides — the marker, the error's `name`,
+   * `message` and `stack`, and a `code` the runtime placed (GH #193)? */
+  private errHiddenEntry(c: Code, E: number, ERR: number): void {
+    const entryT = this.entryT();
+    c.i32Const(0);
+    for (const key of ["%error", "name", "message", "stack"]) {
+      c.localGet(E);
+      c.structGet(entryT, ENTRY_KEY);
+      this.deps.lit(c, key);
+      c.call(this.deps.strEq());
+      c.i32Or();
+    }
+    c.localGet(E);
+    c.structGet(entryT, ENTRY_KEY);
+    this.deps.lit(c, "code");
+    c.call(this.deps.strEq());
+    c.ifResult(I32);
+    this.errOwn.codeHidden(c, ERR);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.i32Or();
   }
 
   /** S138: when the error in local `err` (non-null) is an instance of a

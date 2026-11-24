@@ -6465,10 +6465,33 @@ class Assembler {
    * its vt's preorder position equal to %DOMException's? The class has
    * no subclasses (the frontend fences `extends DOMException`), so an
    * equality is the whole interval. */
+  /** `err.name = v` (slot 1) or `err.message = v` (slot 2) on the error
+   * in local `o`, the string in local `v`: the slot write, with the
+   * listing's record of what the write makes own (GH #191, GH #193: dyn.ts
+   * errNameOwned after a `name`, errMessageWriting before a `message`). */
+  private emitErrSlotWrite(c: Code, o: number, v: number, slot: number): void {
+    if (slot === 2) {
+      c.localGet(o);
+      c.call(this.dyn.errMessageWriting());
+    }
+    c.localGet(o);
+    c.localGet(v);
+    c.structSet(this.exc().errT, slot);
+    if (slot === 1) {
+      c.localGet(o);
+      c.call(this.dyn.errNameOwned());
+    }
+  }
+
   private emitIsDomexInto(c: Code, slot: number): void {
+    this.emitIsDomexOf(c, (x) => x.localGet(slot));
+  }
+
+  /** Pushes i32: is the (non-null) error `pushErr` leaves a DOMException? */
+  private emitIsDomexOf(c: Code, pushErr: (c: Code) => void): void {
     const meta = this.classes.meta("%DOMException");
     if (meta === undefined) throw new Error("wasm emitter bug: %DOMException has no class metadata");
-    c.localGet(slot);
+    pushErr(c);
     c.structGet(this.exc().errT, 0);
     c.structGet(this.classes.ci(), CI_PRE);
     c.i32Const(meta.pre);
@@ -12560,6 +12583,7 @@ class Assembler {
       errStopTest: (c, pushErr) => this.emitErrStopTest(c, pushErr),
       ...(this.mod.errViews !== undefined ? { errView: (c: Code, op: "kind" | "get" | "set" | "keys", pushArgs: (c: Code) => void) => this.errViewCall(c, op, pushArgs) } : {}),
       ...(this.errNamePres().length > 0 ? { errNameTest: (c: Code, pushErr: (c: Code) => void) => this.emitErrStopTest(c, pushErr, true) } : {}),
+      ...(this.domexLive ? { errIsDomex: (c: Code, pushErr: (c: Code) => void) => this.emitIsDomexOf(c, pushErr) } : {}),
       ...(this.errProtoNames().size > 0 ? { errProtoDeclares: () => this.errProtoDeclares() } : {}),
       ...(this.classes.meta("%Error") !== undefined ? { errExactKind: () => this.errExactKind() } : {}),
       ...(this.undefSlots ? { holesMade: () => this.holesMadeGlobal() } : {}),
@@ -23636,51 +23660,55 @@ class Assembler {
             this.emitFenceFatal(code, (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`), null);
             code.call(this.reportUncaughtHelper());
             this.close();
-            code.localGet(o);
-            code.localGet(v);
-            code.structSet(this.exc().errT, slot);
+            this.emitErrSlotWrite(code, o, v, slot);
             this.releaseScratch(this.strRef, v);
             this.releaseScratch(errRef, o);
             return;
           }
-          // GH #191: `name` written from outside a mirrored error's class
-          // becomes own (dyn.ts errNameOwned).
-          const ownName = slot === 1 && this.mod.errViews !== undefined;
           const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-          const nv = ownName ? this.acquireScratch(errRef) : -1;
+          const o = this.acquireScratch(errRef);
+          const v = this.acquireScratch(this.strRef);
           this.walkExpr(s.obj);
-          if (nv >= 0) code.localTee(nv);
+          code.localSet(o);
           this.walkExpr(s.value);
-          code.structSet(this.exc().errT, slot);
-          if (nv >= 0) {
-            code.localGet(nv);
-            code.call(this.dyn.errNameOwned());
-            this.releaseScratch(errRef, nv);
-          }
+          code.localSet(v);
+          this.emitErrSlotWrite(code, o, v, slot);
+          this.releaseScratch(this.strRef, v);
+          this.releaseScratch(errRef, o);
           return;
         }
         const field = this.classField(s.className, s.field, s.loc);
         if (field === null) return;
-        // GH #191: a field of an error whose encoding mirrors it — the
-        // encoding's entry follows the write (errFieldSync).
-        const mirror = this.errMirrorField(s.className, s.field) || (s.field === "name" && this.mod.errViews !== undefined && this.classes.errorRooted(s.className))
-          ? this.acquireScratch(this.classes.ref(field.info))
-          : -1;
-        this.walkExpr(s.obj);
-        if (mirror >= 0) code.localTee(mirror);
         // A class field holds a string VALUE (`this.buf += x` stays a node)
         // — except an error-rooted class's `name` and `message`, which are
         // errT's own flat-string slots (GH #144: a node there was an
         // invalid module).
         const errSlot = this.classes.errorRooted(s.className) && (s.field === "name" || s.field === "message");
+        // GH #191: a field of an error whose encoding mirrors it — the
+        // encoding's entry follows the write (errFieldSync). GH #193: a
+        // `name` or `message` slot write records what it makes own
+        // (errNameOwned after, errMessageWriting before).
+        const mirrorField = this.errMirrorField(s.className, s.field);
+        const mirror = mirrorField || errSlot ? this.acquireScratch(this.classes.ref(field.info)) : -1;
+        this.walkExpr(s.obj);
+        if (mirror >= 0) code.localTee(mirror);
         if (this.nodesLive && !errSlot) this.walkValue(s.value);
         else this.walkExpr(s.value);
+        if (errSlot && s.field === "message") {
+          const v = this.acquireScratch(this.strRef);
+          code.localSet(v);
+          code.localGet(mirror);
+          code.call(this.dyn.errMessageWriting());
+          code.localGet(v);
+          this.releaseScratch(this.strRef, v);
+        }
         code.structSet(field.info.struct, field.index);
         if (mirror >= 0) {
-          code.localGet(mirror);
-          if (s.field === "name") {
+          if (errSlot && s.field === "name") {
+            code.localGet(mirror);
             code.call(this.dyn.errNameOwned());
-          } else {
+          } else if (mirrorField) {
+            code.localGet(mirror);
             this.pushStrLit(s.field);
             code.call(this.dyn.errFieldSync());
           }

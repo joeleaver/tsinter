@@ -114,7 +114,7 @@
  * the whole exposure. (scr_inspect.c:142-143 attributes the difference to
  * NFC alone; fixing the C is not this increment's business.) */
 import { Code } from "./code.js";
-import { ERR_OWN_NAME } from "../../ir/nodes.js";
+import { ERR_MSG_UNSURE, ERR_OWN_NAME } from "../../ir/nodes.js";
 import { emitFlatCast } from "./strings.js";
 import {
   BYTES_PAYLOAD_IS_BUFFER,
@@ -3503,8 +3503,10 @@ export class InspectBuilder {
       keyIs("%error");
       keyIs("message");
       c.i32Or();
-      // GH #191: the own-name marker (dyn.ts errNameOwned)
+      // GH #191, GH #193: the own-name and message markers (err-own.ts)
       keyIs(ERR_OWN_NAME);
+      c.i32Or();
+      keyIs(ERR_MSG_UNSURE);
       c.i32Or();
       c.ifVoid();
       c.else_();

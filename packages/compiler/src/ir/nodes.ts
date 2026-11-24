@@ -4840,10 +4840,17 @@ export type IrLibFn =
  * shows. */
 export const ERRV_PROBE = "\uD800%errv";
 
-/** GH #191: the encoding entry marking where a mirrored error's `name`
- * became own through a write from outside its class (dyn.ts errNameOwned);
- * the symbol-key prefix keeps it out of every walker but the listing's. */
+/** GH #191: the encoding entry marking where an error's `name` became own
+ * through a write from outside its class (err-own.ts nameWritten); the
+ * symbol-key prefix keeps it out of every walker but the listing's. */
 export const ERR_OWN_NAME = "\uD800@@ownName";
+
+/** S080 (GH #193): the encoding entry marking where an error's `message`
+ * was written while its slot held "" — an absent message (the write makes
+ * an own ENUMERABLE property in Node) or a present empty one (it stays
+ * non-enumerable); the slot cannot tell them apart, so a listing stops by
+ * name there (err-own.ts messageWriting). */
+export const ERR_MSG_UNSURE = "\uD800@@ownMessage";
 
 export type IrNumBinOp =
   | "+" | "-" | "*" | "/" | "%" | "**"

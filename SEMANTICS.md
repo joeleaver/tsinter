@@ -7782,7 +7782,18 @@ one (`Cannot add property Symbol(s), object is not extensible`). A source with n
 its non-enumerable `message` and `stack` and its inherited `name` copy nothing and the target comes
 back, while an own enumerable field (an expando, a subclass's field, a subclass's own `name`) throws
 naming it (`new AggregateError` and an Error's `cause` option still refuse by name at compile
-time). A `Map` source stops by name (`Object.assign` from a typed `Map` has no lowering), and so
+time). What the program writes onto an error counts as in Node (GH #193): a `name` written from
+outside a class that owns it, typed or dynamic, and a `code` it writes are own enumerable keys in
+write order, so the copy throws naming the first of them; a `message` rewritten on an error whose
+message is non-empty, and any written `stack`, stay non-enumerable and copy nothing. A `message`
+written while the error's message is empty **stops by name** when the error is listed (`a key
+listing, spread or Object.assign of an error held in a dynamic value whose 'message' was written while
+it was empty ... is not supported yet`): Node lists it when the error was built without a message
+(`new Error()`, `new Error(undefined)`) and hides it when it was built with `""`, and the error's
+message slot holds `""` for both. The same answers hold for the other listings of an error held in a
+dynamic value (`Object.keys`/`values`/`entries`, a plain-target `Object.assign`, spread, an object
+rest, for-in; S138's GH #193 paragraph). A stamped `code` (a Node internal or system error's) is
+still hidden from these listings, where Node lists it. A `Map` source stops by name (`Object.assign` from a typed `Map` has no lowering), and so
 does `Object.assign` with more than one source onto either array (`Object.assign onto a
 non-plain-object target is not supported yet`), where Node throws on the first key the sources hold
 (and returns the array when they hold none). A strings array a tag returns
@@ -7805,7 +7816,7 @@ and stops by name on a string, where Node concatenates, and a `switch` over an e
 concatenate as Node does. An island tag call's strings array (unit A2) is the same kind of box: it now takes the same write
 and integrity answers, as Node does (its `raw` stays the plain array it was). A template span with an
 invalid escape (Node cooks it to `undefined`) refuses by name, as before.
-**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source; TAG-35 Error sources against Node, TAG-36 the named stop of a multi-source `Object.assign`).
+**Tested by:** `packages/compiler/test/npm-tag-implicit.test.ts` (TAG-01..20; TAG-21..25 the writes, `Object.assign`, enumerability and typed-slot rows against Node, TAG-26 the refused field and element copy; TAG-27..29 symbol-keyed and scalar sources, `length`/`pop`/for-in writes, writes through an `any` parameter and the arrays' JSON, spread and keys against Node, TAG-30..34 the named stops of `copyWithin`/`splice`/`shift`/`unshift` from TypeScript and of a `Map` source; TAG-35 Error sources against Node, TAG-36 the named stop of a multi-source `Object.assign`); `packages/compiler/test/npm-tag-implicit-errors.test.ts` (TAG-38 Error sources a TypeScript program wrote `name`, `code`, `message` or `stack` onto, typed or held as `any`, and their plain-target listings, against Node on both lanes; TAG-39/40 the named stop of a `message` written over an empty one).
 
 ## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
 
@@ -12174,8 +12185,19 @@ Error subclasses that declare nothing of their own, the builtin error
 classes and Node's own errors are unaffected. Separately (GH #193), a
 program's key listing (`Object.keys`/`values`/`entries`, an object rest)
 or `Object.assign` of any error held in a dynamic value no longer shows
-the encoding's `%error` marker or its `name`/`message`/`code` entries; an
-expando the program wrote still shows.
+the encoding's `%error` marker or its `name`/`message`/`stack` entries or a
+stamped `code`; an expando the program wrote still shows, a `code` it wrote
+included. A `name` written from outside a class that owns it, onto any
+error (the builtin classes included, typed or dynamic, before or after the
+crossing), is listed where it was first written, as in Node. A `message`
+written while the error's message is empty stops such a listing by name
+(S080: the slot cannot tell an absent message, which Node would then list,
+from a present empty one); one written over a non-empty message stays
+hidden, as in Node. `delete` or `Object.defineProperty` of `name` or
+`message` on an error held in a dynamic value stops by name (the slots keep
+no absent or redefined state), as of `stack` before. A stamped `code` (Node
+lists it) is still hidden, and `JSON.stringify` of an error whose class is
+not mirrored still drops a written `name` (S021's Unit B amendment).
 
 A typed `"code" in e` on an Error-rooted receiver answers through the
 classes declaring `code` (rea step 8); while any Error subclass assigns
