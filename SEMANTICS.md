@@ -12723,12 +12723,23 @@ function values a `() => number` or `(message: string) => void` slot holds
   program nothing about collection. Both are behaviors the specification
   allows (a host may keep any object alive, and may never call a cleanup
   callback); Node does collect, so a long-running program may see `deref()`
-  answer `undefined` and its cleanups run there, never here. `register`
-  checks its target (an object or a function, Node's
-  `FinalizationRegistry.prototype.register: invalid target` TypeError
-  otherwise) and takes holdings written as an object literal (a fresh object
-  can never be the target, Node's other check); other holdings, a
-  non-object unregister token and `unregister` refuse at build time.
+  answer `undefined` and its cleanups run there, never here. `new WeakRef`
+  and `register` check their target as Node's CanBeHeldWeakly does: an
+  object, a function or a symbol not registered with `Symbol.for` is held,
+  anything else (a registered symbol included) throws Node's `WeakRef:
+  invalid target` / `FinalizationRegistry.prototype.register: invalid
+  target` TypeError. `register` evaluates all its arguments first, then
+  checks, as Node does, and takes holdings written as an object literal (a
+  fresh object can never be the target, Node's other check); other holdings,
+  a non-object unregister token and `unregister` refuse at build time. The
+  three built-ins (a DateTimeFormat too) keep their state in a hidden slot of
+  a compiled record, where Node's objects have internal slots and no own
+  keys: `util.isDeepStrictEqual` and `assert.deepStrictEqual` answer two of
+  one class equal, as Node does, and every surface that would show the slot
+  refuses at build time by name — JSON text, `console.log`/`util.inspect`/
+  `util.format`, `String()` and template text, `Object.keys`/`values`/
+  `entries`, `for-in`, `Object.hasOwn`, the `in` operator, `Object.assign`,
+  spread and `structuredClone`.
 - (d) **`new Map(pairs)` over dynamic pairs** walks Node's way (each entry's
   `0` and `1` members, a later duplicate key overwriting in place); a seed
   that is not an array at run time (Node walks any iterable) and an entry
@@ -12740,7 +12751,12 @@ function values a `() => number` or `(message: string) => void` slot holds
   Node's catchable SyntaxError); a pattern that is itself a RegExp, which
   Node copies, stops by name. `util.isDeepStrictEqual(a, b)` answers what
   `assert.deepStrictEqual` decides (two operands of one static type, the
-  same structural comparison and the same refusals).
+  same structural comparison and the same refusals). Both compare own keys
+  as Node's strict mode does, as `Object.hasOwn` answers them: an own key
+  holding `undefined` is not a missing key (`{ a: undefined }` and `{}`
+  differ). A required undefined-armed field of a shape a checked conversion
+  builds reads as S091 (c) has every key surface read it.
 
 **Tested by:** SB-20..SB-32 in `packages/compiler/test/wasm-stdlib-batch.test.ts`
+and SB-33..SB-41 in `packages/compiler/test/wasm-stdlib-batch-builtins.test.ts`
 (wasm and wasm-native, against Node).

@@ -1315,14 +1315,47 @@ export function isInternalField(shape: IrRecordShape, fieldName: string): boolea
   return shape.fields.some((f) => f.name === fieldName && f.internal === true);
 }
 
-/** True when `shape` is the record a NODE CLASS instance maps to (its
- * hidden `%enc` slot: StringDecoder, TextEncoder, TextDecoder), not program
- * data. Node's generic surfaces see the instance, not the record: JSON
- * text, inspection and String() would print the hidden slot where Node
- * prints the class's own form ("{}", "TextDecoder { ... }", "[object
- * TextEncoder]"), so those consumers refuse such shapes by name. */
+/** The hidden slot naming each built-in class whose instances map to a
+ * record (types.ts), and the class name a fence prints for it. */
+const NODE_CLASS_SLOTS: ReadonlyMap<string, string> = new Map([
+  ["%enc", "StringDecoder/TextEncoder/TextDecoder"],
+  ["%dtf", "Intl.DateTimeFormat"],
+  ["%weakref", "WeakRef"],
+  ["%finreg", "FinalizationRegistry"],
+]);
+
+/** The class name when `shape` is the record a built-in CLASS instance
+ * maps to (its hidden internal slot: `%enc` for StringDecoder, TextEncoder
+ * and TextDecoder, `%dtf` for Intl.DateTimeFormat, `%weakref` for WeakRef,
+ * `%finreg` for FinalizationRegistry), null for program data. */
+export function nodeClassLabel(shape: IrRecordShape): string | null {
+  for (const f of shape.fields) {
+    if (f.internal !== true) continue;
+    const label = NODE_CLASS_SLOTS.get(f.name);
+    if (label !== undefined) return label;
+  }
+  return null;
+}
+
+/** True when `shape` is the record of a built-in whose state Node keeps
+ * entirely in internal slots (Intl.DateTimeFormat, WeakRef,
+ * FinalizationRegistry): no own property of any kind, so Node's deep
+ * comparison sees two instances of the class as equal. (Node's text codecs
+ * keep their state in own symbol-keyed properties, which it compares.) */
+export function isOpaqueBuiltinShape(shape: IrRecordShape): boolean {
+  return shape.fields.some((f) => f.internal === true && (f.name === "%dtf" || f.name === "%weakref" || f.name === "%finreg"));
+}
+
+/** True when `shape` is a built-in class instance's record
+ * (nodeClassLabel), not program data. Node's generic surfaces see the
+ * instance, not the record: its state lives in internal slots, so it has
+ * no own keys, and JSON text, inspection and String() print the class's
+ * own form ("{}", "TextDecoder { ... }", "WeakRef {}", "[object
+ * TextEncoder]"). Those consumers, and every key walk (Object.keys and
+ * friends, for-in, hasOwn, `in`, Object.assign, structuredClone), refuse
+ * such shapes by name rather than show the hidden slot. */
 export function isNodeClassShape(shape: IrRecordShape): boolean {
-  return shape.fields.some((f) => f.name === "%enc" && f.internal === true);
+  return nodeClassLabel(shape) !== null;
 }
 
 /** `field` with only its identity flags kept ({name, type, optional?,

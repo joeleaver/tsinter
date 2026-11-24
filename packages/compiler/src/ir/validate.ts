@@ -4930,11 +4930,14 @@ function validateFunction(
         // Runtime HANDLE targets unwrap the checked-dynamic tree's handle kind by tag (a
         // retained reference, no copy — DYN_HANDLE_KINDS).
         const handleOk = DYN_HANDLE_KINDS.has(e.type.kind);
+        // The WasmGC lanes box a symbol by reference (DK.SYMBOL, dynFrom's
+        // wasmSymbol arm): the extractor answers the same symbol.
+        const symbolOk = undefSlots && e.type.kind === "symbol";
         // Data with `unknown` leaves (canDynCheckTo's records/tuples/arrays
         // holding dyn): the leaves pass through as dynamic values.
         const dynLeafOk = (e.type.kind === "record" || e.type.kind === "array" || e.type.kind === "union") &&
           canDynCheckTo(e.type, (id) => records.get(id), (id) => unions.get(id));
-        if (!jsonOk(e.type) && !undefArmedOk && !bytesOk && !errorOk && !funcOk && !handleOk && !dynLeafOk) {
+        if (!jsonOk(e.type) && !undefArmedOk && !bytesOk && !errorOk && !funcOk && !handleOk && !symbolOk && !dynLeafOk) {
           err(`dynCheck against non-JSON-representable type ${e.type.kind}`, e.loc);
         }
         break;

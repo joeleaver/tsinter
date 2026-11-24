@@ -34,10 +34,10 @@
  * record/class property order follows declaration order (SEMANTICS.md
  * 36's existing stance). */
 import * as ts from "../ts7/adapter.js";
-import { lowerIsDeepStrictEqualCall } from "./lower-assert.js";
+import { lowerIsDeepStrictEqualCall } from "./lower-assert-deep.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, BYTES_U8, DYN, F64, JSVAL, isNodeClassShape, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, BYTES_U8, DYN, F64, JSVAL, nodeClassLabel, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
 import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
@@ -152,8 +152,9 @@ function inspectSupport(L: Lowerer, t: IrType, visiting: Set<string>, out: { rec
       visiting.add(t.shapeId);
       const shape = L.shapes.get(t.shapeId);
       if (!shape) return "this record shape has no inspect lowering";
-      if (isNodeClassShape(shape)) {
-        return "StringDecoder/TextEncoder/TextDecoder instances have no inspect lowering (Node prints the class's own form)";
+      const nodeClass = nodeClassLabel(shape);
+      if (nodeClass !== null) {
+        return `${nodeClass} instances have no inspect lowering (Node prints the class's own form)`;
       }
       // Accessor-carrying shapes: Node prints the accessor names as
       // `x: [Getter]` / `[Setter]` / `[Getter/Setter]` in insertion order

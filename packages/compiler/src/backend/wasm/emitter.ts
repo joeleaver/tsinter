@@ -32320,6 +32320,8 @@ class Assembler {
             t.kind === "func" ||
             t.kind === "bytes" ||
             t.kind === "bigint" ||
+            // a symbol unwraps by reference (DK.SYMBOL's payload)
+            t.kind === "symbol" ||
             // The %Error extraction after an `instanceof Error` narrow
             // (INC-27 U5); no other class reaches here from the frontend
             // (TypeError/RangeError narrows are board #189's front-end

@@ -92,7 +92,8 @@ export function lowerIntlDtfCall(L: Lowerer, call: ts.CallExpression, access: ts
     if (a.type.kind === "f64") ms = a;
     else if (a.type.kind === "dyn" || a.type.kind === "jsval") {
       const d = L.declareHiddenLocal("%dtfArg", DYN);
-      const dv: IrExpr = a.type.kind === "dyn" ? a : { kind: "dynFrom", value: a, type: DYN, loc };
+      // a jsval (a Date, an `any`) crosses by reference: the same value
+      const dv: IrExpr = a.type.kind === "dyn" ? a : { kind: "dynFromJsval", value: a, type: DYN, loc };
       stmts.push({ kind: "varDecl", localId: d.id, init: dv, loc });
       const ref: IrExpr = { kind: "varRef", localId: d.id, type: DYN, loc };
       ms = {

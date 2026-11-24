@@ -18,7 +18,7 @@ import { realpathSync } from "node:fs";
 import type { Lowerer } from "./lowerer.js";
 import { orderNoteKeyedWrite, orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
-import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, isNodeClassShape, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, nodeClassLabel, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { classViewOf, fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
@@ -44,6 +44,7 @@ import { lowerYield } from "./lower-generators.js";
 import { bigArith, bigLitOf, lowerBigIntStatsProperty, refuseStatsRecast, lowerBigBinary, lowerBigIncDec, lowerBigIntLiteral, lowerBigUnary, lowerBigUnaryPlus } from "./lower-bigint.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
 import { dtsAwaitedResult } from "./lower-dts.js";
+import { fenceNodeClassKeyWalk } from "./node-class-fence.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
  * class ACCESSOR property (reads become getter calls, writes setter calls;
@@ -9938,8 +9939,9 @@ function ensureStringOf(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
       // prints its elements like an array (not lowered — fenced) — every
       // other record is Object.prototype.toString's constant.
       const shape = L.shapes.get(e.type.shapeId);
-      if (shape && isNodeClassShape(shape)) {
-        L.unsupported("SC1090", node, "string conversions of StringDecoder/TextEncoder/TextDecoder instances (Node prints '[object <class>]')");
+      const nodeClass = shape ? nodeClassLabel(shape) : null;
+      if (nodeClass !== null) {
+        L.unsupported("SC1090", node, `string conversions of ${nodeClass} instances (Node prints '[object <class>]')`);
       }
       if (shape && !shape.tuple && !shape.fields.some((f) => f.name === "toString")) {
         return { kind: "toString", operand: e, type: STRING, loc: e.loc };
@@ -12876,6 +12878,7 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     if (ts.isPrivateIdentifier(expr.left)) {
       return lowerPrivateIn(L, expr, expr.left, loc);
     }
+    fenceNodeClassKeyWalk(L, L.mapTypeOf(L.typeOf(expr.right)), expr.right, "the 'in' operator");
     // Compile-time-known STRING keys fold — literals, and the same
     // const/enum-literal and template folding computed property keys get
     // (foldedStringKeyOf); runtime-valued keys keep the fence.

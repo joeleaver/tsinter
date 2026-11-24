@@ -1,7 +1,9 @@
 /* WeakRef and FinalizationRegistry (paperclip's stdlib batch 3,
  * SEMANTICS.md S151): a WeakRef holds its target strongly and deref()
  * answers it; a registry evaluates its cleanup callback and every
- * register() argument, checks the target as Node does, and never calls
+ * register() argument, then checks the target as Node does (Node's
+ * CanBeHeldWeakly: an object, a function or a symbol not registered with
+ * Symbol.for), and never calls
  * the callback (the WasmGC heap reports no collection to the program —
  * the spec's "may never be called"). types.ts maps both to one-field
  * records. unregister and the other members keep the SC2020 fence. */
@@ -9,7 +11,7 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { dynUndefinedExpr, nodeThrowExpr } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { BOOL, DYN, F64, type IrExpr, type IrStmt } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, STRING, SYMBOL_T, UNDEFINED_T, typeKey, type IrExpr, type IrStmt, type SrcLoc } from "../../ir/nodes.js";
 
 function recordField(L: Lowerer, t: ReturnType<Lowerer["mapTypeOf"]>, field: string) {
   if (t?.kind !== "record") return null;
@@ -46,34 +48,54 @@ export function lowerWeakRefNew(L: Lowerer, expr: ts.NewExpression, symbol: ts.S
   const target = L.coerceToExpected(L.lowerExpr(args[0]!), slot.field.type);
   const stmts: IrStmt[] = [];
   let value = target;
-  if (target.type.kind === "dyn") {
-    // Node's CanBeHeldWeakly: an object, a function or an unregistered symbol
-    const d = L.declareHiddenLocal("%wrTarget", DYN);
+  if (target.type.kind === "dyn" || target.type.kind === "symbol") {
+    const d = L.declareHiddenLocal("%wrTarget", target.type);
     stmts.push({ kind: "varDecl", localId: d.id, init: target, loc });
-    value = { kind: "varRef", localId: d.id, type: DYN, loc };
-    stmts.push(weakTargetCheck(value, "WeakRef: invalid target", loc));
+    value = { kind: "varRef", localId: d.id, type: target.type, loc };
+    stmts.push(weakTargetCheck(L, value, "WeakRef: invalid target", loc));
   }
   const lit: IrExpr = { kind: "recordLit", fields: [{ name: "%weakref", value }], type: slot.rec, loc };
   return stmts.length === 0 ? lit : { kind: "seqExpr", stmts, result: lit, type: slot.rec, loc };
 }
 
-function weakTargetCheck(v: IrExpr, message: string, loc: IrExpr["loc"]): IrStmt {
-  return {
-    kind: "if",
-    cond: {
-      kind: "unary",
-      op: "!",
-      operand: {
-        kind: "logical",
-        op: "||",
-        left: { kind: "dynTest", test: "object", value: v, type: BOOL, loc },
-        right: { kind: "dynTest", test: "function", value: v, type: BOOL, loc },
-        type: BOOL,
-        loc,
-      },
+/** Node's CanBeHeldWeakly over `v` (a dyn or a symbol read): an object, a
+ * function, or a symbol not registered with `Symbol.for`. */
+function canBeHeldWeakly(L: Lowerer, v: IrExpr, loc: SrcLoc): IrExpr {
+  const or = (left: IrExpr, right: IrExpr): IrExpr => ({ kind: "logical", op: "||", left, right, type: BOOL, loc });
+  const unregistered = (sym: IrExpr): IrExpr => {
+    // Symbol.keyFor's `string | undefined` (canonical arm order)
+    const unionId = L.unions.intern([STRING, UNDEFINED_T].sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1)));
+    const keyT = { kind: "union" as const, unionId };
+    return {
+      kind: "unionIsTag",
+      unionId,
+      tag: L.armTag(unionId, UNDEFINED_T),
+      negated: false,
+      value: { kind: "libCall", fn: "sym.keyFor", args: [sym], type: keyT, loc },
       type: BOOL,
       loc,
-    },
+    };
+  };
+  if (v.type.kind === "symbol") return unregistered(v);
+  const isSymbol: IrExpr = {
+    kind: "strEq",
+    negated: false,
+    left: { kind: "libCall", fn: "dyn.typeof", args: [v], type: STRING, loc },
+    right: { kind: "strLit", value: "symbol", type: STRING, loc },
+    type: BOOL,
+    loc,
+  };
+  return or(
+    or({ kind: "dynTest", test: "object", value: v, type: BOOL, loc }, { kind: "dynTest", test: "function", value: v, type: BOOL, loc }),
+    { kind: "logical", op: "&&", left: isSymbol, right: unregistered({ kind: "dynCheck", value: v, type: SYMBOL_T, loc }), type: BOOL, loc },
+  );
+}
+
+/** `if (!CanBeHeldWeakly(v)) throw new TypeError(message)` */
+function weakTargetCheck(L: Lowerer, v: IrExpr, message: string, loc: SrcLoc): IrStmt {
+  return {
+    kind: "if",
+    cond: { kind: "unary", op: "!", operand: canBeHeldWeakly(L, v, loc), type: BOOL, loc },
     then: [{ kind: "exprStmt", expr: nodeThrowExpr(1, "", message, F64, loc), loc }],
     else_: null,
     loc,
@@ -110,11 +132,14 @@ export function lowerWeakRefCall(L: Lowerer, call: ts.CallExpression, access: ts
     return L.noLowering("FinalizationRegistry.register with holdings other than an object literal", args[1]!);
   }
   const stmts: IrStmt[] = [{ kind: "exprStmt", expr: L.lowerExpr(access.expression), loc }];
-  const target = L.lowerExpr(args[0]!);
-  if (target.type.kind === "dyn") {
-    const d = L.declareHiddenLocal("%frTarget", DYN);
+  // Node evaluates every argument, then checks the target.
+  let target = L.lowerExpr(args[0]!);
+  if (target.type.kind === "jsval") target = { kind: "dynFromJsval", value: target, type: DYN, loc };
+  let check: IrStmt | null = null;
+  if (target.type.kind === "dyn" || target.type.kind === "symbol") {
+    const d = L.declareHiddenLocal("%frTarget", target.type);
     stmts.push({ kind: "varDecl", localId: d.id, init: target, loc });
-    stmts.push(weakTargetCheck({ kind: "varRef", localId: d.id, type: DYN, loc }, "FinalizationRegistry.prototype.register: invalid target", loc));
+    check = weakTargetCheck(L, { kind: "varRef", localId: d.id, type: target.type, loc }, "FinalizationRegistry.prototype.register: invalid target", loc);
   } else if (target.type.kind !== "record" && target.type.kind !== "object" && target.type.kind !== "func" && target.type.kind !== "array" && target.type.kind !== "map" && target.type.kind !== "set") {
     return L.noLowering(`FinalizationRegistry.register of a '${L.fmt(target.type)}' target`, args[0]!);
   } else {
@@ -128,6 +153,7 @@ export function lowerWeakRefCall(L: Lowerer, call: ts.CallExpression, access: ts
     }
     stmts.push({ kind: "exprStmt", expr: tok, loc });
   }
+  if (check !== null) stmts.push(check);
   // register answers undefined: the dyn undefined (a statement drops it)
   return { kind: "seqExpr", stmts, result: dynUndefinedExpr(loc), type: DYN, loc };
 }

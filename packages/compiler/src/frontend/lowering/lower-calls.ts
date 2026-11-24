@@ -9,6 +9,7 @@ import { isDynNode, lowerObjModelStatic, usesThis } from "./lower-objmodel.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerIntlDtfCall } from "./lower-intl-dtf.js";
 import { lowerWeakRefCall } from "./lower-weakref.js";
+import { fenceNodeClassKeyWalk } from "./node-class-fence.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, keyedReadRecv, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
@@ -3848,6 +3849,7 @@ function lowerCallInner(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const toDynArg = (a: ts.Expression | undefined): IrExpr => {
         if (!a) return dynUndefinedExpr(loc);
         const v = L.lowerExpr(a);
+        fenceNodeClassKeyWalk(L, v.type, a, "structuredClone");
         const conv = L.coerceToExpected(v, DYN);
         if (conv.type.kind !== "dyn") {
           L.noLowering(
@@ -8703,6 +8705,28 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     return recordKeyPresenceHelper(L, shapeId, "forIn", loc);
   }
 
+  /** Is field `f` an own key of the record `rRef` (of shape `shapeId`) on
+   * the fast path? An undefined-armed field answers by its tag (the S091
+   * key rule, L.markPresence), a plain field through the S119 (i) flags,
+   * any other field true. */
+  function recordFieldFastPresence(L: Lowerer, rRef: IrExpr, shapeId: string, f: { name: string; type: IrType }, loc: SrcLoc): IrExpr {
+    const read: IrExpr = { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc };
+    const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
+    if (utag >= 0 && f.type.kind === "union") {
+      return L.markPresence({ kind: "unionIsTag", unionId: f.type.unionId, tag: utag, negated: true, value: read, type: BOOL, loc }, shapeId, f.name);
+    }
+    return plainFieldPresent(L, read, loc) ?? { kind: "boolLit", value: true, type: BOOL, loc };
+  }
+
+  /** Object.hasOwn(r, "<f>") for a declared field `f` of a plain record
+   * shape (what Object.keys lists, off the fast path included): null when
+   * the key is always present. The strict deep comparison's key check. */
+  export function recordFieldOwnTest(L: Lowerer, rRef: IrExpr, shapeId: string, f: { name: string; type: IrType; optional?: boolean }, loc: SrcLoc): IrExpr | null {
+    const fast = recordFieldFastPresence(L, rRef, shapeId, f, loc);
+    if (f.optional !== true && fast.kind === "boolLit" && fast.value) return null;
+    return f.optional === true ? orderedPresence(L, rRef, shapeId, f.name, fast, loc) : fast;
+  }
+
   function recordKeyPresenceHelper(L: Lowerer, shapeId: string, mode: "hasOwn" | "forIn", loc: SrcLoc): string {
     const key = mode === "hasOwn" ? `obj.hasOwn:${shapeId}` : `obj.forInLive:${shapeId}`;
     const existing = L.arrHofHelpers.get(key);
@@ -8716,23 +8740,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     const body: IrStmt[] = [];
     for (const f of shape.fields) {
       if (mode === "forIn" && f.internal === true) continue;
-      const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
-      const answer0: IrExpr =
-        utag >= 0 && f.type.kind === "union"
-          ? L.markPresence(
-              {
-                kind: "unionIsTag",
-                unionId: f.type.unionId,
-                tag: utag,
-                negated: true,
-                value: { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc },
-                type: BOOL,
-                loc,
-              },
-              shapeId,
-              f.name,
-            )
-          : plainFieldPresent(L, { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc }, loc) ?? { kind: "boolLit", value: true, type: BOOL, loc };
+      const answer0 = recordFieldFastPresence(L, rRef, shapeId, f, loc);
       // for-in: a key that is always present needs no test (the miss
       // answer below is true)
       if (mode === "forIn" && answer0.kind === "boolLit" && answer0.value && f.optional !== true) continue;
@@ -9262,6 +9270,8 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
             return { kind: "libCall", fn: "dyn.assign", args: [target, source], type: DYN, loc };
           }
         }
+        fenceNodeClassKeyWalk(L, tProbe?.type, call.arguments[0]!, "Object.assign");
+        fenceNodeClassKeyWalk(L, sProbe?.type, call.arguments[1]!, "Object.assign");
         if (tProbe?.type.kind === "record" && sProbe?.type.kind === "record") {
           const tShape = L.shapes.get(tProbe.type.shapeId);
           const sShape = L.shapes.get(sProbe.type.shapeId);
@@ -9555,6 +9565,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     if (argIr?.kind !== "record") return null; // Maps, classes, arrays → the SC2020 fence
     const shape = L.shapes.get(argIr.shapeId);
     if (!shape || shape.tuple) return null; // tuple → the fence
+    fenceNodeClassKeyWalk(L, argIr, argNode, `Object.${member}`);
     // Accessor-carrying shapes: Node's answer includes the accessor NAMES
     // (own enumerable properties) and — for values/entries — the getter
     // RESULTS, invoked in key order. The static field walk models neither
@@ -11339,6 +11350,7 @@ export function lowerHasOwnCall(L: Lowerer, call: ts.CallExpression, recvNode: t
       return { kind: "libCall", fn: "dyn.hasOwn", args: [receiver, key], type: BOOL, loc };
     }
     if (probed?.type.kind !== "record") return null;
+    fenceNodeClassKeyWalk(L, probed.type, recvNode, "Object.hasOwn");
     const shape = L.shapes.get(probed.type.shapeId);
     if (!shape || shape.tuple || (!shape.indexValue && shapeHasAccessorSlots(shape))) return null;
     const loc = locOf(call);

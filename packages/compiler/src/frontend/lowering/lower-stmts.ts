@@ -28,6 +28,7 @@ import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, createRequireSpecOf } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
+import { fenceNodeClassKeyWalk } from "./node-class-fence.js";
 import { boundTargetParts, lowerAnyIncDec, protoMissCall } from "./lower-exprs.js";
 import { lowerArrayLengthWrite } from "./lower-stdlib-members.js";
 import { lowerProcessExitCodeWrite } from "./lower-builtins.js";
@@ -8762,6 +8763,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         if (receiver.type.kind !== "record") L.badType(stmt.expression, L.typeOf(stmt.expression));
         const rShape = L.shapes.get(receiver.type.shapeId);
         if (!rShape) throw new Error(`lowerer bug: unknown shape ${receiver.type.shapeId}`);
+        fenceNodeClassKeyWalk(L, receiver.type, stmt.expression, "for-in");
         // Accessor-carrying shapes: Node's for-in visits the accessor
         // NAMES (own enumerable properties) — the static key walk omits
         // them (accessor slots live outside declaredOrder), so the loop
