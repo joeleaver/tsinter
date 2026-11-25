@@ -43,15 +43,15 @@ blocks `heartbeat-run.ts:192` (G1).
 
 ## 2. How S125 decides today
 
-- **Out-of-function copies (S125 b).** `width-copies.ts:1546-1580` (`fresh`,
-  `deepFresh`) and `width-copies.ts:1965-2032` (`allFresh`, `byType`, the emission at
-  2032).
-- **Dynamic crossings (S125 c).** `judgeDynSites`, `width-copies.ts:2589`. Its reason
-  strings are at 2591-2602 (`DYN_WRITE_FROM`, `DYN_SAME` at 2599, `COPY_WRITTEN`). The
-  in-crossing judgement is at 3296-3317 (DYN_SAME from `dynIdentityOps` and
-  `alias.same`), the out-crossing judgement at 3318-3363, the refused-arm retry at
-  3416-3423, and the emission at 3425. The DYN_SAME judgement uses the
-  context-insensitive unification at `width-copies.ts:2540-2584`, so one helper used as a
+- **Out-of-function copies (S125 b).** `fresh` and `deepFresh` in
+  `width-copy-fresh.ts`; `allFresh`, `byType` and the emission in `judgeWidthSites`
+  (`judge-width-sites.ts`). (Line numbers in the first draft of this note cited the
+  single `width-copies.ts` that S125-J split by responsibility.)
+- **Dynamic crossings (S125 c).** `judgeDynSites` in `judge-dyn-sites.ts`, with its
+  reason strings (`DYN_WRITE_FROM`, `DYN_SAME`, `COPY_WRITTEN`), the in-crossing
+  judgement (DYN_SAME from `dynIdentityOps` and `alias.same`), the out-crossing
+  judgement, the refused-arm retry and the emission. The DYN_SAME judgement uses the
+  context-insensitive unification in `dyn-alias-classes.ts`, so one helper used as a
   value merges every argument it is ever handed into one class.
 - **Containment.** `Lowerer.noteDynArmExit`, `lowerer.ts:1881-1924`. Contained means a
   cast, an armable binding *initializer*, or a direct identifier-callee argument

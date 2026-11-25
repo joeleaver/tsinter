@@ -11184,9 +11184,57 @@ module's own options literal, a forwarded parameter on its dynamic slot)
 binds the dynamic slot; an omitted one takes the default on the dynamic slot,
 a fresh object the body may add keys to. Any other argument keeps the `{}`
 slot and S125's judgement of its copy.
+**Amendment (J) — three more copies nothing can observe, and the arm that
+was tried (2026-11-24, unit S125-J of docs/design/s125-copy-family.md).**
+(b) and (c)'s list of copies that are not observable gains two:
+- **A read-only tuple into a read-only array.** An `as const` tuple of
+  scalars copied into a `readonly T[]` (or `ReadonlyArray<T>`) slot
+  (paperclip's `parseEnumFromEnv<DeploymentMode>(raw, DEPLOYMENT_MODES)`):
+  TypeScript types both the tuple and the slot read-only; the tuple is a
+  literal, or a binding assigned once from one and never captured; every
+  use of that binding and of the slot's binding only reads the array (an
+  element or `length` read, a loop, a truth or nullish test, printing,
+  `new Set(xs)`, `join`, `slice`, `includes`, `indexOf` and the other
+  non-mutating methods, another width copy, or a direct call of a program
+  function whose parameter's own uses pass the same test); and nothing
+  compares either side's type by identity. Neither array is ever written
+  then, so the copy reads exactly what the original would, whatever other
+  `string[]` values the program writes. A cast alias (`MODES as unknown as
+  string[]`) is its own copy, judged on its own, so a write through it
+  still refuses; so does a mutable tuple written while the copy is held,
+  and `===` on the array type.
+- **A fresh literal nested in a call-argument literal.** A literal made
+  only of literals and scalar values (an `as const` retag, a string
+  binding, a union retag of such a value) is fresh all the way down, also
+  when it sits inside another literal passed to a call, and also when the
+  call's parameter is a package's declared type the literal was lowered
+  at (zod's `z.iso.datetime({ offset: true })` against `DateTimeParams`,
+  clack's `select({ options: [{ value: "a" as const, label }] })`). Only
+  its keys could tell its copy apart, and they are judged from the literal
+  itself rather than from the declared shape: by S091 an optional field the
+  literal leaves undefined (unspelled, or a static `undefined`) is not an
+  own key on either side, a required one always is, a field whose
+  presence would differ between the two sides is a difference unless the
+  literal's value there is statically never undefined, and the keys both
+  sides own must come in the same order. When GH #132 notes the literal's
+  spelled key order (`%ord.<n>`, for a spelling or an undefinedness off the
+  fast path), every order the note may store must be the target's order
+  too, and a note whose order vector is not a constant counts as a
+  difference. A literal the program also holds
+  through a binding is not fresh, so one the package keeps and the program
+  later writes through its alias still refuses.
+
+And a refusal at a site where an instance or a dynamic arm was tried names
+why it did not lower: the SC1090 text gains "(the dynamic arm was tried here
+and did not lower: <first diagnostic of that attempt>)", or "(the instance
+that shares the object (S125 (a)) was tried here and did not lower: …)",
+with the blocking diagnostic's code, its message and its file and line. The
+first failure at each site is kept across the dynamic-arm rounds, so the
+note survives the round that falls back to the copy.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
 both lanes); `packages/compiler/test/wasm-s125-fstw-options.test.ts` (S125-O-*,
+both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*,
 both lanes).
 
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*

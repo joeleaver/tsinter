@@ -106,7 +106,9 @@ import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMs
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
 import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
-import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, dynboxClosure, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
+import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
+import { dynboxClosure } from "./width-instances.js";
+import type { ArmFailures } from "./arm-failures.js";
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
 import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
@@ -519,6 +521,9 @@ export interface LowererMode {
   noSpec?: ReadonlySet<string>;
   /** Unit U2: the slots whose arm did not build — exact-fit copies only. */
   exactSites?: ReadonlySet<string>;
+  /** Unit S125-J, M0: the failed share attempts by site, one map for every
+   * arm round of a build (arm-failures.ts). */
+  armFailures?: ArmFailures;
 }
 
 /** Build lowering runs in two passes over the same ts.Program:
@@ -634,6 +639,7 @@ export function lowerToIr(
   // falls back to the last pass that built, with that slot's copy taking only
   // exactly-fitting values (exactSites): never a silent width copy where
   // the arm was meant (SEMANTICS.md S128 (a3)).
+  const armFailures: ArmFailures = new Map();
   const pass = (dynArmSites: ReadonlySet<string>, noSpec: ReadonlySet<string>, exactSites: ReadonlySet<string>): { emit: Lowerer; result: LowerResult; ok: boolean } => {
     const l = new Lowerer(program, entry, moduleOrder, dynamic, {
       reachable,
@@ -647,6 +653,7 @@ export function lowerToIr(
       dynArmSites,
       noSpec,
       exactSites,
+      armFailures,
     });
     for (const d of dynamicCycleDiags) l.pushDiag(d);
     for (const d of ffiValidation.diagnostics) l.pushDiag(d);
@@ -733,6 +740,7 @@ export function lowerToIr(
     dynArmSites,
     noSpec,
     exactSites,
+    armFailures,
   });
   const rem = remainder.run();
   return { ...result, unreached: { diagnostics: rem.diagnostics, stats: rem.stats } };
@@ -1988,6 +1996,8 @@ export class Lowerer {
    * dynamic arm did not build, which therefore copy only exactly-fitting
    * values (exactGuard). */
   readonly exactSites: ReadonlySet<string>;
+  /** M0 (arm-failures.ts): the failed share attempts by site. */
+  readonly armFailures: ArmFailures;
   /** `exit` (a dynCheck), preceded by U2's exact-fit test: a value that does
    * not have exactly the target's shape ends the program by name instead
    * of becoming a width-tolerant copy. The test is an interned pass-through
@@ -2301,6 +2311,7 @@ export class Lowerer {
     this.dynArmSites = mode.dynArmSites ?? new Set();
     this.noSpec = mode.noSpec ?? new Set();
     this.exactSites = mode.exactSites ?? new Set();
+    this.armFailures = mode.armFailures ?? new Map();
     this.checker = program.getTypeChecker();
     this.typeCtx = {
       checker: this.checker,
