@@ -6031,9 +6031,13 @@ export class Lowerer {
       const candidates: { tag: number; arm: IrType }[] = [];
       def.arms.forEach((arm, i) => {
         if (isUnitType(arm)) return;
+        // (A tuple is an array in JavaScript: `[...] as const` into a
+        // `readonly T[] | undefined` slot rebuilds into the array arm —
+        // widthLiftPlan's tupleArr lift — as it does into a bare array.)
         const sameFamily =
           (src.kind === "record" && arm.kind === "record") ||
           (src.kind === "array" && arm.kind === "array") ||
+          (src.kind === "record" && arm.kind === "array") ||
           (src.kind === "object" && arm.kind === "record") ||
           (src.kind === "record" && arm.kind === "object");
         if (sameFamily && this.widthLiftPlan(src, arm) !== null) candidates.push({ tag: i, arm });
@@ -7558,7 +7562,7 @@ export class Lowerer {
       // Zero width-lift candidates proves no honest mapping was missed.
       const candidates = def.arms.filter(
         (arm) =>
-          ((src.kind === "record" && arm.kind === "record") || (src.kind === "array" && arm.kind === "array")) &&
+          ((src.kind === "record" && (arm.kind === "record" || arm.kind === "array")) || (src.kind === "array" && arm.kind === "array")) &&
           this.widthLiftPlan(src, arm) !== null,
       );
       if (candidates.length !== 0) return null;

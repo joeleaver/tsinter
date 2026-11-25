@@ -10,7 +10,12 @@
  *       package's declared parameter type, judged by its own keys (S091:
  *       an optional field left undefined is not an own key);
  *   M0: an instance or dynamic arm that was tried at the site and did not
- *       lower names its first diagnostic. */
+ *       lower names its first diagnostic.
+ *
+ * And (review of 59e69bd5) a write through a cast alias of the copy — the
+ * slot's binding, a parameter, a returned alias, the tuple itself — while
+ * the original's length is still read refuses by name instead of growing
+ * the copy alone; a tuple into an optional array slot converts. */
 import { defineRows } from "./u3u4-rows.js";
 
 const PJ = (n: string): string => `{"name":"${n}","version":"1.0.0","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"}}}`;
@@ -140,4 +145,76 @@ const p = new P();
 console.log(bump(p), p.n);`,
     refused: /the instance that shares the object \(S125 \(a\)\) was tried here and did not lower: SC1090 JSON\.stringify/,
   },
+]);
+
+/** The program under every cast-alias row: an `as const` tuple, and a
+ * `string[]` written elsewhere (the by-type answer alone would refuse). */
+const CM = `const MODES = ["a", "b"] as const;
+type Mode = (typeof MODES)[number];
+const names: string[] = ["x"];
+names.push("y");
+`;
+const COPY = /SC1090 .*COPY.*S125/;
+
+defineRows("S125-J cast-alias writes", [
+  { id: "S125-J-09 a write through a cast of the read-only slot's binding refuses (Node: 3 3)", entry: "main.ts", refused: COPY,
+    src: `const MODES = ["a", "b"] as const; const ro: readonly string[] = MODES; (ro as string[]).push("z"); console.log(ro.length, MODES.length);` },
+  { id: "S125-J-10 a generic callee writing its parameter through `as T[]` refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function g<T extends string>(xs: readonly T[]): number { (xs as T[]).push("z" as T); return xs.length; }
+console.log(g<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-11 a rest parameter written through a cast refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function g<T extends string>(...rest: (readonly T[])[]): number { (rest[0] as T[]).push("z" as T); return rest[0]!.length; }
+console.log(g<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-12 a constructor parameter property written through a cast refuses", entry: "main.ts", refused: COPY,
+    src: CM + `class C<T extends string> { constructor(readonly xs: readonly T[]) {} }
+const c = new C<Mode>(MODES);
+(c.xs as string[]).push("z");
+console.log(c.xs.length, MODES.length);` },
+  { id: "S125-J-13 a method writing its parameter through a cast refuses", entry: "main.ts", refused: COPY,
+    src: CM + `class K { run<T extends string>(xs: readonly T[]): number { (xs as T[]).push("z" as T); return xs.length; } }
+console.log(new K().run<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-14 an async function writing its parameter through a cast refuses", entry: "main.ts", refused: COPY,
+    src: CM + `async function g<T extends string>(xs: readonly T[]): Promise<number> { await 0; (xs as T[]).push("z" as T); return xs.length; }
+void g<Mode>(MODES).then((n) => console.log(n, MODES.length));` },
+  { id: "S125-J-15 a callback writing what it is handed through a cast refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function g<T extends string>(xs: readonly T[], cb: (x: readonly T[]) => void): number { cb(xs); return xs.length; }
+console.log(g<Mode>(MODES, (x) => { (x as string[]).push("z"); }), MODES.length);` },
+  { id: "S125-J-16 a function called through a const alias, and an arrow const, writing through a cast refuse", entry: "main.ts", refused: COPY,
+    src: CM + `function w(xs: readonly string[]): number { (xs as string[]).push("z"); return xs.length; }
+const g = w;
+const a = (xs: readonly string[]): number => { (xs as string[]).reverse(); return xs.length; };
+console.log(g(MODES), a(MODES), MODES.length);` },
+  { id: "S125-J-17 a write seven calls deep refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function f7<T extends string>(xs: readonly T[]): number { (xs as T[]).push("z" as T); return xs.length; }
+function f6<T extends string>(xs: readonly T[]): number { return f7(xs); }
+function f5<T extends string>(xs: readonly T[]): number { return f6(xs); }
+function f4<T extends string>(xs: readonly T[]): number { return f5(xs); }
+function f3<T extends string>(xs: readonly T[]): number { return f4(xs); }
+function f2<T extends string>(xs: readonly T[]): number { return f3(xs); }
+function f1<T extends string>(xs: readonly T[]): number { return f2(xs); }
+console.log(f1<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-18 `satisfies` and then a cast, written, refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function g<T extends string>(xs: readonly T[]): number { ((xs satisfies readonly T[]) as T[]).push("z" as T); return xs.length; }
+console.log(g<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-19 an optional parameter written through `xs! as T[]` refuses", entry: "main.ts", refused: COPY,
+    src: CM + `function g<T extends string>(xs: readonly T[] | undefined): number { (xs! as T[]).push("z" as T); return xs!.length; }
+console.log(g<Mode>(MODES), MODES.length);` },
+  { id: "S125-J-20 a returned alias written through a cast refuses (Node: 3 3)", entry: "main.ts", refused: COPY,
+    src: CM + `function keep<T extends string>(xs: readonly T[]): readonly T[] { return xs; }
+const k = keep<Mode>(MODES);
+(k as Mode[]).push("a");
+(keep<Mode>(MODES) as Mode[]).push("b");
+console.log(k.length, MODES.length);` },
+  { id: "S125-J-21 the tuple itself written through `as unknown as string[]`, with no binding, refuses by name", entry: "main.ts", refused: COPY,
+    src: `const MODES = ["a", "b"] as const; (MODES as unknown as string[]).push("z"); console.log(MODES.length);` },
+  { id: "S125-J-23 a union of tuples cast to `string[]` and written refuses by name (no one array rebuilds both)", entry: "main.ts", refused: /SC1090 an array member on a .* value cast to 'string\[\]'/,
+    src: `const MODES = ["a", "b"] as const;
+const OTHER = ["c"] as const;
+const pick = process.argv.length > 0 ? MODES : OTHER;
+(pick as unknown as string[]).push("z");
+console.log(pick.length, MODES.length);` },
+  { id: "S125-J-22 a tuple into an optional read-only array parameter converts and reads as Node does", entry: "main.ts",
+    src: CM + `function g<T extends string>(xs: readonly T[] | undefined): number { return xs === undefined ? -1 : xs.length + xs.indexOf("b" as T); }
+function h(xs?: readonly string[]): string { return xs?.join("+") ?? "none"; }
+console.log(g<Mode>(MODES), g<Mode>(undefined), h(MODES), h(), MODES.length, names);` },
 ]);

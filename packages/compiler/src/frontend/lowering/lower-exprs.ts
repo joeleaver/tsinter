@@ -4451,9 +4451,35 @@ export function lowerMemberRecv(L: Lowerer, access: ts.PropertyAccessExpression)
     const recv = tupleAsArray(L, L.lowerExpr(access.expression), locOf(access), want?.kind === "array" ? want.elem : undefined);
     return access.questionDotToken ? recv : undefRecvGuardFor(L, access, recv);
   }
-  const receiver = L.lowerExpr(access.expression);
+  const receiver = tupleUnderArrayType(L, access.expression, L.lowerExpr(access.expression));
   if (access.questionDotToken) return receiver;
   return undefRecvGuardFor(L, access, receiver);
+}
+
+/** A TUPLE value the checker types as an array (`(MODES as unknown as
+ * string[]).push(…)` — a cast converts nothing, so the value is still the
+ * tuple): the member works on the tuple REBUILT as that array, the
+ * tuple-into-array width copy every other array slot makes. It is judged
+ * like them (S125 (b)): a write through it refuses by name where the
+ * original is still observed, since the copy would grow alone. (The
+ * read-only members a fresh copy cannot betray take tupleAsArray's
+ * unjudged copy above — tupleArrayRecv.) */
+function tupleUnderArrayType(L: Lowerer, e: ts.Expression, value: IrExpr): IrExpr {
+  const t = value.type;
+  const isTuple = (x: IrType): boolean => x.kind === "record" && L.shapes.get(x.shapeId)?.tuple === true;
+  const tupleArm = t.kind === "union" && (L.unions.get(t.unionId)?.arms ?? []).some(isTuple);
+  if (!isTuple(t) && !tupleArm) return value;
+  const want = L.mapTypeOf(L.typeOf(e));
+  if (want?.kind !== "array") return value;
+  if (isTuple(t)) return L.coerceToExpected(value, want);
+  // A union that may hold a tuple (`(cond ? A : B) as unknown as
+  // string[]`): no one array rebuilds every arm, and the cast converts
+  // nothing.
+  return L.unsupported(
+    "SC1090",
+    e,
+    `an array member on a '${L.fmt(t)}' value cast to '${L.fmt(want)}' (a tuple arm is a fixed shape the cast does not convert — narrow to one tuple first, or copy it with [...x])`,
+  );
 }
 
 /** A string intrinsic whose result can be the slot's undefined. */
@@ -13934,7 +13960,11 @@ export function isPackageAliasFieldInit(expr: ts.PropertyAccessExpression): bool
             "'.length' of a computed tuple expression (the arity is a constant — bind the tuple to a const first)",
           );
         }
-        return { kind: "numLit", value: shape.fields.length, type: F64, loc: locOf(expr) };
+        // (A bare binding's read stays visible to the width pass: the
+        // arity is the original's, and a copy written through a cast
+        // alias would grow where the original does not — S125 (b).)
+        const tupleOf = ts.isIdentifier(expr.expression) ? L.lowerExpr(expr.expression) : undefined;
+        return { kind: "numLit", value: shape.fields.length, ...(tupleOf?.kind === "varRef" ? { tupleOf } : {}), type: F64, loc: locOf(expr) };
       }
     }
     return null;

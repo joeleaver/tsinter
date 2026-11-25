@@ -9,6 +9,7 @@
  * The record outlives a pass: lowerToIr hands every arm round one map, so
  * a failure seen in an earlier round still names itself in the round whose
  * diagnostics are reported. The first failure at a site wins. */
+import { dirname, relative } from "node:path";
 import * as ts from "../ts7/adapter.js";
 import type { SrcLoc } from "../../ir/nodes.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
@@ -18,10 +19,18 @@ import type { Lowerer } from "./lowerer.js";
  * instance typed by the argument's own type. */
 export type ArmTry = "arm" | "share";
 
+/** Why an attempt did not lower: the first diagnostic's code and
+ * message, and where it was reported — kept apart so the note can name
+ * that place relative to the refused site, the same on every machine. */
+export interface FailureText {
+  text: string;
+  at?: { file: string; line: number };
+}
+
 export interface ArmFailure {
   kind: ArmTry;
-  /** The first diagnostic of the failed lowering, rendered. */
-  text: string;
+  /** The first diagnostic of the failed lowering. */
+  why: FailureText;
 }
 
 /** Site → first failure, shared across the arm rounds of one build. */
@@ -33,19 +42,19 @@ const siteKey = (loc: SrcLoc): string => `${loc.file}:${loc.start}:${loc.end}`;
 const MAX_MESSAGE = 240;
 
 /** A diagnostic as the attribution names it: code, message, and where. */
-export function describeDiag(L: Lowerer, d: ScrDiagnostic): string {
+export function describeDiag(L: Lowerer, d: ScrDiagnostic): FailureText {
   const msg = d.message.length > MAX_MESSAGE ? `${d.message.slice(0, MAX_MESSAGE - 1)}…` : d.message;
   const sf = L.program.getSourceFile(d.loc.file);
-  const line = sf !== undefined ? `:${ts.getLineAndCharacterOfPosition(sf, d.loc.start).line + 1}` : "";
-  return `${d.code} ${msg} [${d.loc.file}${line}]`;
+  const text = `${d.code} ${msg}`;
+  return sf !== undefined ? { text, at: { file: d.loc.file, line: ts.getLineAndCharacterOfPosition(sf, d.loc.start).line + 1 } } : { text };
 }
 
 /** Records that the attempt `kind` made for the value at each of `locs`
  * (the argument, and the argument without its parentheses) failed. */
-export function noteArmFailure(L: Lowerer, locs: SrcLoc[], kind: ArmTry, text: string): void {
+export function noteArmFailure(L: Lowerer, locs: SrcLoc[], kind: ArmTry, why: FailureText): void {
   for (const loc of locs) {
     const k = siteKey(loc);
-    if (!L.armFailures.has(k)) L.armFailures.set(k, { kind, text });
+    if (!L.armFailures.has(k)) L.armFailures.set(k, { kind, why });
   }
 }
 
@@ -55,5 +64,16 @@ export function armFailureNote(L: Lowerer, loc: SrcLoc): string {
   const f = L.armFailures.get(siteKey(loc));
   if (f === undefined) return "";
   const what = f.kind === "arm" ? "the dynamic arm" : "the instance that shares the object (S125 (a))";
-  return ` (${what} was tried here and did not lower: ${f.text})`;
+  return ` (${what} was tried here and did not lower: ${f.why.text}${where(loc, f.why)})`;
+}
+
+/** Where the failure was reported, from the refused site: its line when
+ * it is in the site's own file, otherwise the file relative to the
+ * site's directory (never an absolute path, which would name the
+ * machine the build ran on). */
+function where(site: SrcLoc, why: FailureText): string {
+  if (why.at === undefined) return "";
+  if (why.at.file === site.file) return ` [line ${why.at.line}]`;
+  const rel = relative(dirname(site.file), why.at.file).split("\\").join("/");
+  return ` [${rel}:${why.at.line}]`;
 }

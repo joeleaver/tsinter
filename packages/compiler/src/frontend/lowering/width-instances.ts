@@ -13,14 +13,14 @@ import { typeKey } from "../types.js";
 import type { Lowerer } from "./lowerer.js";
 import { PoisonError } from "./lowerer.js";
 import { armRooted, dynArmKey, isDynArmSite, stripParens } from "./dyn-arm.js";
-import { type ArmTry, describeDiag, noteArmFailure } from "./arm-failures.js";
+import { type ArmTry, describeDiag, type FailureText, noteArmFailure } from "./arm-failures.js";
 import {
   FnSig, GenericFnInfo, GenericInstance, ParamShape, arrayParamUsesBindable, bodyReadsArguments, carriesFields, castsParam,
   implicitDeclaredReturn, instanceBoundExceeded, instanceParent, isThisParameter, paramWrittenInBody,
 } from "./lower-calls.js";
 
 /** M0: why a failed instance failed, for the later sites that reuse it. */
-const failures = new WeakMap<GenericInstance, string>();
+const failures = new WeakMap<GenericInstance, FailureText>();
 
 /** GH #109 (SEMANTICS.md S125): a direct call of a plain TypeScript
  * function passing a CLASS INSTANCE or a WIDER RECORD where a parameter
@@ -120,8 +120,8 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
     L.widthSpecInfos.set(decl, info);
   }
   for (const b of bindings.keys()) L.widthBoundParams.add(b);
-  const inst = widthInstance(L, info, shapes, bindings, undefined, (text) => {
-    for (const t of tried) noteArmFailure(L, [locOf(t.arg), locOf(stripParens(t.arg))], t.kind, text);
+  const inst = widthInstance(L, info, shapes, bindings, undefined, (why) => {
+    for (const t of tried) noteArmFailure(L, [locOf(t.arg), locOf(stripParens(t.arg))], t.kind, why);
   });
   if (inst === null) return null;
   const args = L.completeArgs(expr.arguments, inst.params, loc, expr);
@@ -173,7 +173,7 @@ export function dynboxClosure(L: Lowerer, e: IrExpr): IrExpr {
     L.widthSpecInfos.set(decl, info);
   }
   for (const b of bindings.keys()) L.widthBoundParams.add(b);
-  const inst = widthInstance(L, info, shapes, bindings, retArm, (text) => noteArmFailure(L, [e.loc], "arm", text));
+  const inst = widthInstance(L, info, shapes, bindings, retArm, (why) => noteArmFailure(L, [e.loc], "arm", why));
   if (inst === null) return e;
   L.dynboxDecls.set(inst.name, hit);
   return { kind: "closure", fnName: inst.name, captures: [], type: { kind: "func", params: inst.params.map((p) => p.type), ret: inst.returnType }, loc: e.loc };
@@ -185,7 +185,7 @@ export function dynboxClosure(L: Lowerer, e: IrExpr): IrExpr {
  * support — `JSON.stringify` of an instance, say): the call then keeps its
  * ordinary path, whose copy widthCopyPass judges. Nothing the failed
  * attempt reported survives it. */
-function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], argTypes: Map<ts.Symbol, ts.Type>, retOverride: IrType | undefined, onFail: (text: string) => void): GenericInstance | null {
+function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], argTypes: Map<ts.Symbol, ts.Type>, retOverride: IrType | undefined, onFail: (why: FailureText) => void): GenericInstance | null {
   const key = shapes.map((s) => typeKey(s.type)).join(",") + (retOverride !== undefined ? `|ret=${typeKey(retOverride)}` : "");
   const existing = info.instances.get(key);
   if (existing) {
@@ -199,7 +199,7 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
   }
   const bound = instanceBoundExceeded(info, "width");
   if (bound !== null) {
-    onFail(bound);
+    onFail({ text: bound });
     return null;
   }
   const rendered = shapes.map((s) => L.fmt(s.type)).join(", ");
@@ -235,7 +235,7 @@ function widthInstance(L: Lowerer, info: GenericFnInfo, shapes: ParamShape[], ar
   }
   if (fn === null || captured.length > 0) {
     inst.implicitState = "failed";
-    const why = captured.length > 0 ? describeDiag(L, captured[0]!) : "its body did not lower over the bound types";
+    const why = captured.length > 0 ? describeDiag(L, captured[0]!) : { text: "its body did not lower over the bound types" };
     failures.set(inst, why);
     onFail(why);
     // A function lifted out of the failed body (a lambda) that calls the

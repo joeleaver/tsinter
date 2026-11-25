@@ -11199,10 +11199,33 @@ was tried (2026-11-24, unit S125-J of docs/design/s125-copy-family.md).**
   function whose parameter's own uses pass the same test); and nothing
   compares either side's type by identity. Neither array is ever written
   then, so the copy reads exactly what the original would, whatever other
-  `string[]` values the program writes. A cast alias (`MODES as unknown as
-  string[]`) is its own copy, judged on its own, so a write through it
-  still refuses; so does a mutable tuple written while the copy is held,
-  and `===` on the array type.
+  `string[]` values the program writes. A mutable tuple written while the
+  copy is held still refuses, and so does `===` on the array type.
+
+  A cast to a mutable array type (`as string[]`, `as T[]`, `xs! as T[]`,
+  `(xs satisfies …) as T[]`) converts nothing, so a write through one is a
+  write to whatever value it casts, and every copy it can reach is judged
+  for it like any other write (by type, wherever a binding's uses are not
+  all known). Review of 59e69bd5 found that judgement blind to one
+  observer, in (b) generally and not only here: the tuple's `.length`,
+  which lowers to its arity constant, recorded no use of the tuple, so a
+  tuple whose only other use was its length looked held by the copy
+  alone, and a write through a cast of the copy — the slot's binding
+  (`(ro as string[]).push(…)`), a parameter of a generic, rest, method,
+  async, callback, aliased or seven-deep callee, a constructor's
+  parameter property, a returned alias — grew the copy where Node grows
+  the one shared array (`3 2` for Node's `3 3`). The folded `.length` of a
+  tuple binding now counts as a read of it, so each of those refuses by
+  name. The tuple itself cast to an array (`(MODES as unknown as
+  string[]).push(…)`, no binding in between) is rebuilt as that array
+  where the member is applied — the tuple-into-array copy every array slot
+  makes, judged like them — instead of handing a tuple to the array
+  method (an internal compiler error); a union of tuples cast that way
+  refuses by name, since no one array rebuilds every arm. And a tuple
+  passed to an array slot that also admits undefined (`xs?: readonly
+  T[]`, `readonly T[] | undefined`) rebuilds into the array arm, as into a
+  bare array slot, where it used to end the program at run time ("not
+  representable in the target union").
 - **A fresh literal nested in a call-argument literal.** A literal made
   only of literals and scalar values (an `as const` retag, a string
   binding, a union retag of such a value) is fresh all the way down, also
@@ -11228,7 +11251,9 @@ And a refusal at a site where an instance or a dynamic arm was tried names
 why it did not lower: the SC1090 text gains "(the dynamic arm was tried here
 and did not lower: <first diagnostic of that attempt>)", or "(the instance
 that shares the object (S125 (a)) was tried here and did not lower: …)",
-with the blocking diagnostic's code, its message and its file and line. The
+with the blocking diagnostic's code, its message and where it was reported
+(its line when in the refused site's own file, otherwise its file relative
+to the site's directory and its line — never an absolute path). The
 first failure at each site is kept across the dynamic-arm rounds, so the
 note survives the round that falls back to the copy.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,

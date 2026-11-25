@@ -4866,7 +4866,19 @@ export type IrExpr =
    * spelling, never on the already-rounded value. Round-tripping literals
    * and non-integer spellings carry nothing, so the IR is byte-identical
    * for every program that held its numbers. */
-  | { kind: "numLit"; value: number; spelling?: string; type: IrType; loc: SrcLoc }
+  | {
+      kind: "numLit";
+      value: number;
+      spelling?: string;
+      /** A folded tuple `t.length` (the arity constant): the tuple binding
+       * it was read from. Nothing evaluates it; it keeps the read visible
+       * to the analyses that ask who still observes a value (S125: a copy
+       * written through a cast alias is observable while the original's
+       * length is read). */
+      tupleOf?: IrExpr;
+      type: IrType;
+      loc: SrcLoc;
+    }
   | { kind: "strLit"; value: string; type: IrType; loc: SrcLoc }
   | { kind: "boolLit"; value: boolean; type: IrType; loc: SrcLoc }
   /** An `undefined` or `null` literal; `type` is the matching unit kind.

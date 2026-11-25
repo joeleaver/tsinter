@@ -136,6 +136,9 @@ export function useOf(cx: WidthCx, parent: Record<string, unknown>, key: string)
       return "read";
     case "recordGet":
       return key === "obj" && !parent["spreadCopy"] ? "read" : "other";
+    // A folded tuple `t.length` (lower-exprs.ts): the arity read.
+    case "numLit":
+      return key === "tupleOf" ? "read" : "other";
     // An index-signature read: a key observation, and — when the value
     // it answers is composite — a part of the record read out (whose
     // own uses are followed like a recordGet's).
@@ -315,7 +318,7 @@ export function typedOwnUseAt(cx: WidthCx, i: number, t: IrType): { ok: boolean;
     return { ok: !hasRef(cx, anc["type"] as IrType) };
   }
   if ((ak === "recordSet" || ak === "fieldSet" || ak === "recordKeySet") && key === "obj") return { ok: true, stored: [anc["value"] as IrExpr] };
-  if ((ak === "fieldIncDec" && key === "obj") || ak === "toBool" || ak === "isUndef") return { ok: true };
+  if ((ak === "fieldIncDec" && key === "obj") || ak === "toBool" || ak === "isUndef" || (ak === "numLit" && key === "tupleOf")) return { ok: true };
   if (ak === "arraySet" && key === "arr") return { ok: true, stored: [anc["value"] as IrExpr] };
   if (ak === "arrIntrinsic" && key === "receiver") {
     const m = anc["method"] as string;
