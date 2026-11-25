@@ -1066,7 +1066,7 @@ function collectWidenedArrays(L: Lowerer, jsFiles: readonly ts.SourceFile[], inf
       if (vals.length === 0 || !vals.every((v) => freshNodes(v, nodes))) continue;
       info.syms.add(s);
       // Element and member reads, calls and operators over it take the
-      // dynamic arm (dyn-arm.ts armRooted): the value is asked at run time.
+      // dynamic arm (dyn-arm-rooted.ts armRooted): the value is asked at run time.
       L.dynArmSyms.add(s);
       for (const x of nodes) info.lits.add(x);
       widened.add(s);

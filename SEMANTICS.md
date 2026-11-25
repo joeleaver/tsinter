@@ -11268,16 +11268,69 @@ with the blocking diagnostic's code, its message and where it was reported
 to the site's directory and its line — never an absolute path). The
 first failure at each site is kept across the dynamic-arm rounds, so the
 note survives the round that falls back to the copy.
+
+**Amendment (K) — the dynamic arm's reach (2026-11-25, unit S125-K of
+docs/design/s125-copy-family.md, M3).** U2's contained slots (S128 (a))
+gain five, each taken only where (c) refused the copy and falling back to
+that refusal, by name, when the arm does not build. No new representation:
+the slot holds the dynamic value as a `const` binding on the arm does.
+- **A `let` assigned only by `=` statements.** A function's own `let` (not
+  a loop's) whose every write, in the function or a closure, is a plain
+  `x = value` statement (paperclip's `let config: Config | null = null;
+  try { config = readConfig(path); } catch …`). Where one of those
+  assignments' copies is refused, the binding holds the dynamic value from
+  its declaration on: no initializer is `undefined`, and any other value
+  assigned to it crosses as itself (a typed object as its live view,
+  S115's unit H), so each assignment stores the very object and `===`,
+  writes from either side, printing, JSON and key order are Node's. A
+  `let` also written by a compound assignment (`??=`, `+=`), `++`/`--`, a
+  destructuring assignment or as a loop's target, and a module-scope
+  `let`, keep the copy and its refusal.
+- **An operand of `?:`, `??`, `||` or `&&` in a contained slot.** Where an
+  operand's copy is refused and every other value operand is fresh (a
+  literal made only of literals, `null`, `undefined`) or already dynamic
+  (`any`/`unknown`, a statically compiled package's result, a value on the
+  arm) — `&&`'s left operand, its value only when falsy, needs no test —
+  the outermost such expression is the dynamic value itself when its own
+  value lands in a contained slot (a binding, a direct call's argument, a
+  plain function's result, a deferred `let`'s assignment). That slot then
+  takes the arm through its own copy. A cast of a checked-dynamic
+  (`unknown`) value is such a slot itself (paperclip's
+  `Array.isArray(payload.x) ? (payload.x as string[]) : []`): its copy was
+  judged at its operand and now arms the cast. An operand beside a typed
+  object (`flag ? pkg() : fallback`) keeps the copy and its refusal: the
+  typed object would be a view, not itself.
+- **A name of a `const` destructuring pattern.** A name in a function's
+  `const` array or object pattern, with no default and no rest at any
+  level (drizzle's `const [counts] = await db.select()`), holds the dynamic
+  element itself, as a `const` for-of binding's does.
+- **A module global initialized by a package's call.** A module-scope
+  `const` whose initializer is a call (or an awaited call) of a function
+  or method a statically compiled package declares (zod's
+  `export const def = schema.parse(raw)`): the package's result is its own
+  value in every lowering pass, so the global holds it; reads and writes
+  from its module and every importer reach the one object.
+- **A defaulted parameter of a plain function.** A defaulted parameter
+  (`options: Opts = {}`) of a plain function declaration takes a dynamic
+  argument as a required one does (S125 (a)'s per-call-site instance with
+  the parameter typed `any`), and picks its default on the dynamic
+  `undefined` — the default is then the dynamic value too. A call without
+  the argument keeps the typed function.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
 both lanes); `packages/compiler/test/wasm-s125-fstw-options.test.ts` (S125-O-*,
-both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*,
-both lanes).
+both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*
+and S125-K-*, both lanes); `packages/compiler/test/wasm-any-array-shared.test.ts`
+(H-EXIT-13, a deferred `let` assigned a parameter's dynamic value, which
+refused before (K)); `packages/compiler/test/npm-declared-dynamic.test.ts`
+(DD-12, a module global holding a package's result).
 
 ## S128 — A dynamic value in a contained typed slot is the dynamic value itself, checked only where a value must enter typed storage; a fresh value of exactly the slot's shape is a typed copy *(wasm and wasm-native)*
 
 Docs: `docs/design/dynamic-values.md` §4.3 (unit U2; Joe's rulings J1,
-J2 (a) and J4). Implementation: `frontend/lowering/dyn-arm.ts`.
+J2 (a) and J4). Implementation: `frontend/lowering/dyn-arm.ts` (the slots), `dyn-arm-rooted.ts`
+(what is on the arm), `dyn-arm-exits.ts` (where an exit's slot is, the
+exact-fit guard) and `dyn-arm-spec.ts` (U2b).
 
 **(a) The dynamic arm (U2a).** TypeScript lets a dynamic value (`any`,
 `unknown`, `object`, a JavaScript inference residue) into a typed
@@ -11318,6 +11371,11 @@ whatever its shape. On these lanes the CONTAINED slots do the same:
   `for (const … of d.entries())` over a dynamic receiver walks an array's
   `[index, element]` pairs (Array.prototype.entries); a receiver that is
   not an array at run time stops by name before the loop;
+- *(amended 2026-11-25, S125's amendment (K))* a `let` assigned only by
+  plain `=` statements, an operand of `?:`/`??`/`||`/`&&` whose slot is
+  contained, a name of a `const` destructuring pattern, a module global
+  initialized by a package's call, and a defaulted parameter of a plain
+  function;
 - and, inside them, an unannotated callback parameter of a method called
   on such a value (`xs.map((x) => typeof x)` hands `x` whatever the array
   holds).
@@ -12092,11 +12150,14 @@ and Pick/Omit of (k)/(l) types, are the dynamic value.
 Everything else is (k) as written: identity is kept, dispatch is dynamic,
 and a result the implementation produces against its declaration (`unsafe`
 settling to a string where rows are declared) ends the program by name at
-the crossing. A declared type argument that is a record array with an
+the crossing into typed storage (a method's typed parameter); a module
+global holding the result keeps the package's own value and never crosses
+(S125 amendment (K)), so it reads as Node does. A declared type argument that is a record array with an
 index signature (postgres's default `Row[]`) held in a typed binding is a
 copy, which S125 judges as for every dynamic value.
 **Tested by:** `packages/compiler/test/npm-declared-dynamic.test.ts`
-(DD-07..10 against Node on both lanes; DD-11, the named stop).
+(DD-07..10 against Node on both lanes; DD-11, the named stop; DD-12, the
+module global, against Node).
 
 **Amendment — a dynamic result under a declared class (2026-11-16).** On
 the WasmGC lanes, when the implementation hands back a dynamic value where

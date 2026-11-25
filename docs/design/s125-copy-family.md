@@ -53,7 +53,7 @@ blocks `heartbeat-run.ts:192` (G1).
   judgement, the refused-arm retry and the emission. The DYN_SAME judgement uses the
   context-insensitive unification in `dyn-alias-classes.ts`, so one helper used as a
   value merges every argument it is ever handed into one class.
-- **Containment.** `Lowerer.noteDynArmExit`, `lowerer.ts:1881-1924`. Contained means a
+- **Containment.** `noteDynArmExit` (`lowerer.ts:1881-1924` when written; since S125-K in `dyn-arm-exits.ts`, which also holds the (K) slots). Contained means a
   cast, an armable binding *initializer*, or a direct identifier-callee argument
   (1893-1898). The `ret:` slot covers only non-generic, non-async, non-generator
   functions (1905-1917).

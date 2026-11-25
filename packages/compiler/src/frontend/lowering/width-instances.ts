@@ -12,7 +12,8 @@ import { isJsSourceFile, locOf } from "../program.js";
 import { typeKey } from "../types.js";
 import type { Lowerer } from "./lowerer.js";
 import { PoisonError } from "./lowerer.js";
-import { armRooted, dynArmKey, isDynArmSite, stripParens } from "./dyn-arm.js";
+import { dynArmKey, isDynArmSite, stripParens } from "./dyn-arm.js";
+import { armRooted } from "./dyn-arm-rooted.js";
 import { type ArmTry, describeDiag, type FailureText, noteArmFailure } from "./arm-failures.js";
 import {
   FnSig, GenericFnInfo, GenericInstance, ParamShape, arrayParamUsesBindable, bodyReadsArguments, carriesFields, castsParam,
@@ -62,12 +63,18 @@ export function widthSpecializedCall(L: Lowerer, expr: ts.CallExpression, sig: F
     // Unit U2a (dyn-arm.ts): a dynamic-arm argument into a typed composite
     // parameter — the instance's parameter holds the dynamic value itself
     // (S125 (a)'s vehicle, the argument's own type being `any`).
-    if (arg && L.dynArmActive && shape.mode === "required" && L.copiesOnCrossing(shape.type) && (armRooted(L, arg) || isDynArmSite(L, stripParens(arg))) &&
-        ts.isIdentifier(param.name) && !param.dotDotDotToken && !param.questionToken && !param.initializer && !isThisParameter(param)) {
+    // (K) A defaulted parameter binds the same way and picks its default
+    // on the dynamic undefined (declareParams' omittable prologue), the
+    // default then being the dynamic value too.
+    const defaulted = param.initializer !== undefined && shape.mode === "omittable";
+    if (arg && L.dynArmActive && (shape.mode === "required" || defaulted) && L.copiesOnCrossing(defaulted ? shape.bodyType ?? shape.type : shape.type) &&
+        (armRooted(L, arg) || isDynArmSite(L, stripParens(arg))) &&
+        ts.isIdentifier(param.name) && !param.dotDotDotToken && !param.questionToken && (defaulted || !param.initializer) && !isThisParameter(param)) {
       const psym = L.checker.getSymbolAtLocation(param.name);
       if (psym) {
         bindings.set(psym, L.checker.getAnyType());
-        shapes[i] = { type: js ? DYN : JSVAL, mode: "required" };
+        const t = js ? DYN : JSVAL;
+        shapes[i] = defaulted ? { type: t, mode: "omittable", bodyType: t } : { type: t, mode: "required" };
         tried.push({ arg, kind: "arm" });
       }
       return;

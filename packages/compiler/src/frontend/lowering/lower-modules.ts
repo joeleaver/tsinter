@@ -16,7 +16,8 @@ import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, u
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType, typeEquals } from "../../ir/nodes.js";
 import { INSTANTIATION_WRITES } from "./module-tdz-guards.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
+import { dynArmDecl, dynArmGlobalDecl } from "./dyn-arm.js";
+import { registerSpecGlobal, specGlobalTarget } from "./dyn-arm-spec.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
 import { scopeEntryFences, duplicateFnSyntaxErrors, bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingRestFnInfoOf, bindingRestFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
@@ -1696,7 +1697,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             // production — whatever the checker's namespace type mapped to
             // (lowerVarDecl's rule at module scope; the init body assigns
             // it).
-            // Unit U2b (dyn-arm.ts): a module-scope fresh cast takes two
+            // Unit U2b (dyn-arm-spec.ts): a module-scope fresh cast takes two
             // arms — this global holds the dynamic value.
             const specT = ts.isIdentifier(decl.name) && nameNode === decl.name ? specGlobalTarget(L, decl) : null;
             // A site whose global keeps typed storage this pass (dyn-arm.ts

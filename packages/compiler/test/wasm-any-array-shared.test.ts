@@ -304,7 +304,6 @@ const EXIT_ROWS: [string, string][] = [
   ["H-EXIT-06 a15-ctor-param", "// @dynamic\nconst o: any = { list: [\"a\"] };\nclass R { constructor(xs: string[]) { xs.push(\"z\"); } }\nnew R(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-07 a16-method", "// @dynamic\nconst o: any = { list: [\"a\"] };\nclass S { add(xs: string[]) { xs.push(\"z\"); } }\nnew S().add(o.list);\nconsole.log(o.list.length);"],
   ["H-EXIT-08 a17-callback", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction apply(f: (x: string[]) => void, v: any) { f(v); }\napply((x: string[]) => { x.push(\"z\"); }, o.list);\nconsole.log(o.list.length);"],
-  ["H-EXIT-13 a31-param-reassign-alias", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction f(xs: string[]) { let y: string[] = []; y = xs; y.push(\"q\"); }\nf(o.list);\nconsole.log(o.list.length);"],
 ];
 
 for (const [name, src] of EXIT_ROWS) {
@@ -349,6 +348,10 @@ for (const [name, src, want] of ARM_ROWS) {
     expect(await armRow(name.split(" ")[0]!, src)).toBe(want);
   });
 }
+
+test("H-EXIT-13 a31-param-reassign-alias — unit S125-K (SEMANTICS.md S125 amendment (K)): a deferred `let` assigned the parameter's dynamic value holds it, so the push is Node's", async () => {
+  expect(await armRow("H-EXIT-13", "// @dynamic\nconst o: any = { list: [\"a\"] };\nfunction f(xs: string[]) { let y: string[] = []; y = xs; y.push(\"q\"); }\nf(o.list);\nconsole.log(o.list.length);")).toBe("2\n");
+});
 
 test("H-EXIT-20 a typed-composite callback parameter dynamic code passes data into — unit U2a: the parameter holds the caller's value itself (the dynamic arm), matching Node", async () => {
   expect(await armRow("H-EXIT-20", "// @dynamic\nconst cb: any = (xs: number[]) => xs.length;\nconsole.log(cb([1, 2]));")).toBe("2\n");

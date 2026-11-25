@@ -9,7 +9,8 @@ import { orderNoteCopy, orderNoteDelete, orderedShape } from "./record-order.js"
 import { lowerForOfGenerator, lowerYieldStarStatement } from "./lower-generators.js";
 import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrGlobal, IrJsOp, IrLocal, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, isUnitType, shapeFieldCopy, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/nodes.js";
 import { PoisonError, boundIdentifiersOf, dynFallbackType, jsMixedObjectUnion, dynUndefinedExpr, importCallHandleType, neverResidueTsBinding, neverTaintedJsType, stmtUsesIsland, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { dynArmForOf, dynArmKey, lowerSpecDecl, lowerSpecSplit } from "./dyn-arm.js";
+import { bindArmName, dynArmKey } from "./dyn-arm.js";
+import { lowerSpecDecl, lowerSpecSplit } from "./dyn-arm-spec.js";
 import { isDynClassDecl, isGlobalBox, lowerDynClass, lowerObjModelDelete, lowerObjModelForInKeysOf, lowerObjModelForInReceiver } from "./lower-objmodel.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { declaredSymbolsOf, onlyStubTouches } from "./stub-builtins.js";
@@ -139,7 +140,7 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
       for (let i = 0; i < stmts.length; i++) {
         const stmt = stmts[i]!;
         entry.index = i;
-        // Unit U2b (dyn-arm.ts): the first statement naming a speculative
+        // Unit U2b (dyn-arm-spec.ts): the first statement naming a speculative
         // binding lowers the statements that read it on both arms.
         if (L.specBindings.size > 0) {
           const split = lowerSpecSplit(L, stmts, i);
@@ -544,6 +545,16 @@ export function paramPatternGuards(L: Lowerer, pattern: ts.ObjectBindingPattern,
       n = n.parent;
     }
     return ts.isVariableDeclaration(n) ? n : null;
+  }
+
+/** Is a binding name declared by `var` (its hosting VariableDeclaration's
+   * list carries no `let`/`const`)? The host, not the name: a name inside
+   * a pattern is no declaration, so its own combined flags never see the
+   * list's — every `const`/`let` pattern name would answer `var`, one
+   * function-scoped slot that every closure made in a loop shares. */
+  function hostIsVar(name: ts.Identifier): boolean {
+    const host = hostVariableDeclarationOf(name);
+    return host !== null && isVarDeclared(host);
   }
 
 /** `for (var x of ...)` loop variables: the ONE function-scoped binding
@@ -3274,13 +3285,18 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         out.push({ kind: "assign", localId: g.id, value: L.coerceInto(name, value, g.type), loc: bindLoc });
         return;
       }
-      if (symbol && hostVariableDeclarationOf(name) !== null && isVarDeclared(name)) {
+      if (symbol && hostIsVar(name)) {
         const hoisted = hoistVarBinding(L, symbol, name);
         out.push({ kind: "assign", localId: hoisted.id, value: L.coerceInto(name, value, hoisted.type), loc: bindLoc });
         return;
       }
-      const local = L.declareLocal(name, name.text, value.type, isLet);
-      out.push({ kind: "varDecl", localId: local.id, init: value, loc: bindLoc });
+      // A block-scoped name on the dynamic arm (bindArmName) is the handle;
+      // any other holds its declared type as the hoisted slot above does: a
+      // handle under a record type would reach typed reads.
+      if (bindArmName(L, name, value, isLet, out)) return;
+      const type = varBindingType(L, name) ?? L.badType(name, L.typeOf(name));
+      const local = L.declareLocal(name, name.text, type, isLet);
+      out.push({ kind: "varDecl", localId: local.id, init: L.coerceInto(name, value, type), loc: bindLoc });
     });
     return true;
   }
@@ -3303,16 +3319,9 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     out: IrStmt[],): void {
     const loc = value.loc;
     if (ts.isIdentifier(name)) {
-      // S125: a for-of loop binding on the dynamic arm holds the dynamic
-      // element itself, shared as in Node (dyn-arm.ts forOfConstBinding).
-      if (dynArmForOf(L, name) && (value.type.kind === "jsval" || value.type.kind === "dyn")) {
-        const js = isJsSourceFile(name.getSourceFile());
-        const t: IrType = js ? DYN : JSVAL;
-        const v: IrExpr = js ? asDynOperand(value) : value.type.kind === "dyn" ? { kind: "jsMarshal", value, type: JSVAL, loc } : value;
-        const local = L.declareLocal(name, name.text, t, isLet);
-        out.push({ kind: "varDecl", localId: local.id, init: v, loc });
-        return;
-      }
+      // S125 / (K): a for-of loop binding or a `const` pattern's name on
+      // the dynamic arm holds the dynamic element itself.
+      if (bindArmName(L, name, value, isLet, out)) return;
       const symbol = L.checker.getSymbolAtLocation(name);
       const g = symbol ? L.globalsBySymbol.get(symbol) : undefined;
       if (g) {
@@ -3325,7 +3334,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       // VariableDeclaration hosts only: parameter patterns (also routed
       // here by declareParams) carry no block-scope flag either, but their
       // bindings are the parameters' own.
-      if (symbol && hostVariableDeclarationOf(name) !== null && isVarDeclared(name)) {
+      if (symbol && hostIsVar(name)) {
         const hoisted = hoistVarBinding(L, symbol, name);
         out.push({ kind: "assign", localId: hoisted.id, value: L.coerceInto(name, value, hoisted.type), loc });
         return;

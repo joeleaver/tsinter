@@ -16,7 +16,7 @@ import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 
 import type { Lowerer } from "./lowerer.js";
-import { orderNoteKeyedWrite, orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
+import { orderNoteKeyedWrite, orderNoteLiteral, orderNoteSpread, orderNoteWrite, orderedPresence, orderedShape, forgetSpreadSnapshots, spreadSnapshotEntry, spreadSnapshots, type SpreadPart } from "./record-order.js";
 import type { ModuleTdz } from "./module-tdz.js";
 import { ARRAYBUFFER_T, BOOL, CAUGHT, FN_PROTO_STUB, DYN, DYN_HANDLE_KINDS, accessorSlotProp, isInternalField, nodeClassLabel, shapeFieldCopy, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { classViewOf, fencedValue, liftClassReceiver, lowerConstructorName, viewableClass } from "./class-views.js";
@@ -24,7 +24,9 @@ import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReaso
 import { ARRAY_METHODS, builtinFenceHintOf, builtinModuleConstExprOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncNameOf, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, jsFuncNameOf, neverResidueTsBinding, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
-import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
+import { isDynArmSite } from "./dyn-arm.js";
+import { armCast, armRetCast } from "./dyn-arm-rooted.js";
+import { noteDynArmExit } from "./dyn-arm-exits.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { tupleCastToArray, tupleUnderArrayType } from "./tuple-array-casts.js";
 import { lowerTupleLength } from "./tuple-length.js";
@@ -1957,7 +1959,7 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // every non-import= binding — see lower-namespaces.ts).
       fenceEarlyAliasUse(L, expr, expr);
       const g = L.globalOf(expr);
-      // Unit U2b (dyn-arm.ts): a module-scope speculative binding read
+      // Unit U2b (dyn-arm-spec.ts): a module-scope speculative binding read
       // where no split fixed its arm — the next pass binds it eagerly.
       if (g && L.specBindings.size > 0) {
         const sym = L.resolveValueSymbol(expr);
@@ -2574,7 +2576,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       return L.lowerCall(expr);
     }
     if (ts.isArrayLiteralExpression(expr)) return L.lowerArrayLiteral(expr);
-    if (ts.isObjectLiteralExpression(expr)) return withLiteralOrder(L, expr, L.lowerObjectLiteral(expr));
+    if (ts.isObjectLiteralExpression(expr)) {
+      forgetSpreadSnapshots(L, expr);
+      return withLiteralOrder(L, expr, L.lowerObjectLiteral(expr));
+    }
     if (ts.isElementAccessExpression(expr)) return L.lowerElementAccess(expr);
     if (ts.isConditionalExpression(expr)) return lowerTernary(L, expr);
 
@@ -10138,6 +10143,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // (functions, bytes, handles, undefined-armed unions) take that
       // exit over the same value (jsval and dyn are one representation).
       if (!L.boundarySafe(target) && L.sharedDynamic) {
+        // (K) a cast S125 (c) refused (its exit judged at the operand,
+        // dyn-arm-exits.ts) is the dynamic value itself, as below.
+        if (L.copiesOnCrossing(target) && isDynArmSite(L, expr)) return inner;
         return lowerDynCastTo(L, expr, asDynOperand(inner), target);
       }
       // A scalar target takes the checked-dynamic cast too (its failure
@@ -10171,7 +10179,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
         if (!exitIsFresh(L, expr.expression, target)) {
           // S115 (d)'s U1a amendment: a judged copy, wherever it lands —
           // or, where S125 (c) refuses it, the dynamic arm (U2a).
-          if (L.sharedDynamic) return L.noteDynArmExit(judgedExit(inner, target, locOf(expr)), expr);
+          if (L.sharedDynamic) return noteDynArmExit(L, judgedExit(inner, target, locOf(expr)), expr);
           L.pushDiag(s115Diag(locOf(expr), exitRefusal(L, target)));
           throw new PoisonError();
         }
@@ -14629,7 +14637,7 @@ function withLiteralOrder(L: Lowerer, expr: ts.ObjectLiteralExpression, lowered:
     if (ts.isSpreadAssignment(p)) {
       // The source's own keys, as the spread itself snapshotted them at its
       // own position (lowerObjectLiteral's spread arm).
-      const found = spreadSnapshots.get(p);
+      const found = spreadSnapshots(L).get(p);
       if (found === undefined) return lowered;
       parts.push({ spread: found.snap, shapeId: found.shapeId, snap: true });
       continue;

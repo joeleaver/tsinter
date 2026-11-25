@@ -32,6 +32,7 @@
  * Scope: plain declared records (no tuples, no index signatures — S031 keeps
  * those) on the WasmGC lanes (`undefSlots`), the backend's `recordOrderSlot`
  * rule. */
+import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import {
   BOOL, DYN, F64, STRING, VOID, arrayOf, isArrayIndexKey, isUnitType, recordOrderFields,
@@ -546,8 +547,20 @@ export function orderNoteSpread(L: Lowerer, lit: IrExpr, shapeId: string, parts:
  * AST node → the hidden local holding it), read by the literal's order note
  * (lower-exprs.ts withLiteralOrder): Node reads a spread source's own keys
  * where the spread stands, so a later property that deletes, adds or clears
- * one of them must not change the result. */
-export const spreadSnapshots = new WeakMap<object, { snap: IrExpr; shapeId: string }>();
+ * one of them must not change the result. A snapshot names its own pass's
+ * hidden local and shape, so each pass (one Lowerer) keeps its own map, and
+ * a literal forgets its spreads' entries before it lowers (forgetSpreadSnapshots):
+ * a function lowered again in the same pass (a width instance) must not read
+ * the other instance's local. */
+const snapshotsByPass = new WeakMap<Lowerer, WeakMap<object, { snap: IrExpr; shapeId: string }>>();
+export function spreadSnapshots(L: Lowerer): WeakMap<object, { snap: IrExpr; shapeId: string }> {
+  let m = snapshotsByPass.get(L);
+  if (m === undefined) snapshotsByPass.set(L, (m = new WeakMap()));
+  return m;
+}
+export function forgetSpreadSnapshots(L: Lowerer, lit: ts.ObjectLiteralExpression): void {
+  for (const p of lit.properties) if (ts.isSpreadAssignment(p)) spreadSnapshots(L).delete(p);
+}
 
 /** `%ord.<n>(o) -> number[]`: a copy of `o`'s own keys as an order vector —
  * its stored order, or the fast path's materialized (any record shape). */
@@ -580,7 +593,7 @@ export function spreadSnapshotEntry(L: Lowerer, node: object, src: IrExpr, srcSh
   const t = L.declareHiddenLocal("%ordsnap", NUMS);
   t.mutable = true; // assigned by the dropped entry, in place
   const snap: IrExpr = { kind: "call", callee: snapshotHelper(L, srcShape, loc), args: [src], type: NUMS, loc };
-  spreadSnapshots.set(node, { snap: ref(t.id, NUMS, loc), shapeId: srcShapeId });
+  spreadSnapshots(L).set(node, { snap: ref(t.id, NUMS, loc), shapeId: srcShapeId });
   return { name: `%ordsnap.${t.id}`, value: { kind: "assignExpr", localId: t.id, value: snap, type: NUMS, loc } as IrExpr, drop: true };
 }
 

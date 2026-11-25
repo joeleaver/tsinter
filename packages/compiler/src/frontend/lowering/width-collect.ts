@@ -41,7 +41,7 @@ function visit(cx: WidthCx, n: unknown, mode: Mode, parent: Record<string, unkno
     }
     // Unit U2b: a module-scope speculative binding's own re-pointing (its
     // dynamic global taking the view of its exactly-fitting typed copy,
-    // dyn-arm.ts lowerSpecDecl) is the dynamic value itself, in exactly
+    // dyn-arm-spec.ts lowerSpecDecl) is the dynamic value itself, in exactly
     // its type's shape: no printer reaching it can see a key it lacks.
     // Every other crossing of the copy is an escape like any other. (A
     // view factory's own body answers to its call sites: each records

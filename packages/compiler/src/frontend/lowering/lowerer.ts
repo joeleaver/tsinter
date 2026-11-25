@@ -100,7 +100,10 @@ import {
 import { exitIsConsumedCopy, exitIsFresh, judgedExit, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, carriesAccessors, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { widthCopyPass } from "./width-copies.js";
 import { bigWidenTypeOf, programHoldsBigint } from "./big-widen.js";
-import { armableBinding, armInitDecl, armPatternSyms, armRooted, collectDynArmSyms, dynArmDecl, forOfConstBinding, dynArmKey, dynArmResultType, dynArmTypeOf, type SpecBinding } from "./dyn-arm.js";
+import { collectDynArmSyms, dynArmDecl, dynArmLet, dynArmKey, dynArmResultType } from "./dyn-arm.js";
+import { armInitDecl, armPatternSyms, armRooted, dynArmTypeOf } from "./dyn-arm-rooted.js";
+import { type SpecBinding } from "./dyn-arm-spec.js";
+import { exitFromArm, noteDynArmExit } from "./dyn-arm-exits.js";
 import { validateModule } from "../../ir/validate.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinModuleConstExprOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
@@ -127,7 +130,7 @@ import { insertModuleTdzChecks } from "./module-tdz-guards.js";
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
-import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf, jsonDocCopyDrops } from "./lower-exprs.js";
+import { asDynOperand, bindOnce, captureAssignValue, takeHeldProbe, isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { absentArg, admitFunctionValue, cleanFuncAdaptable, surplusParamsAbsent } from "./fn-value-arity.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall, withInstanceDepth } from "./lower-calls.js";
@@ -1873,6 +1876,8 @@ export class Lowerer {
   /** JavaScript `let` locals widened to the union their assignments hold
    * (lower-stmts.ts jsLetAssignedUnion), by local id. */
   readonly jsWidenedLets = new Set<string>();
+  /** (K) dyn-arm.ts deferredLetBinding's answers, per declaration. */
+  readonly deferredLets = new Map<ts.VariableDeclaration, boolean>();
   /** Function name → the source parameters of the function literal it
    * was lowered from (the width-copy pass names a refused parameter). */
   readonly dynArmFnParams = new Map<string, readonly ts.ParameterDeclaration[]>();
@@ -1886,158 +1891,12 @@ export class Lowerer {
     const b = this.implicitParamTypes.get(s);
     return b !== undefined && (b.flags & ts.TypeFlags.Any) !== 0;
   }
-  /** Records a judged exit at a contained slot (a cast, or a `const`/`let`
-   * initializer) so that, if S125 (c) refuses it, the next pass lowers it
-   * on the dynamic arm. Answers the exit unchanged. */
-  noteDynArmExit(exit: IrExpr, node: ts.Node): IrExpr {
-    let n: ts.Node = node;
-    while (ts.isParenthesizedExpression(n)) n = n.expression;
-    let up: ts.Node = n.parent;
-    while (up !== undefined && ts.isParenthesizedExpression(up)) up = up.parent;
-    // A declaration's own exit may be lowered against its name (a module
-    // global's assignment): the binding's key is its initializer's.
-    if (up !== undefined && ts.isVariableDeclaration(up) && up.name === n && up.initializer !== undefined) {
-      n = up.initializer;
-      while (ts.isParenthesizedExpression(n)) n = n.expression;
-    }
-    const contained =
-      ts.isAsExpression(n) || ts.isTypeAssertion(n) ||
-      (up !== undefined && ts.isVariableDeclaration(up) && up.initializer !== undefined && ts.isIdentifier(up.name) &&
-        armableBinding(up)) ||
-      // An argument of a direct call: the callee's per-call-site instance
-      // takes the parameter on the arm (widthSpecializedCall).
-      (up !== undefined && ts.isCallExpression(up) && ts.isIdentifier(up.expression) && up.arguments.some((a) => a === n || a === node));
-    // S125 A1 (a plain function's result): an exit at a `return` of a plain
-    // function (a declaration or a function literal; not generic, async or
-    // a generator), or at an arrow's expression body — the function's
-    // RESULT takes the dynamic arm in the next pass (a `ret:` site, as a
-    // boxed literal's result does), so every caller receives the shared
-    // value and checks only where it must enter typed storage.
-    const retFn = ((): ts.FunctionLikeDeclaration | null => {
-      let fn: ts.Node | undefined;
-      if (up !== undefined && ts.isReturnStatement(up)) {
-        fn = up.parent;
-        while (fn !== undefined && !ts.isFunctionDeclaration(fn) && !ts.isFunctionExpression(fn) && !ts.isArrowFunction(fn) && !ts.isMethodDeclaration(fn) &&
-          !ts.isConstructorDeclaration(fn) && !ts.isAccessor(fn) && !ts.isClassStaticBlockDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
-      } else if (up !== undefined && ts.isArrowFunction(up) && up.body === n) {
-        fn = up;
-      }
-      if (fn === undefined || !(ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn))) return null;
-      if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined || (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
-      return fn;
-    })();
-    // (Review: the result's exit keeps the exact-fit guard below — a copy
-    // taken from an arm value, or at a `ret:` slot whose arm did not build.)
-    // S125: a `const` for-of loop binding (dyn-arm.ts forOfConstBinding).
-    const forOf = forOfConstBinding(n);
-    const key = forOf ? `forof:${dynArmKey(n)}` : retFn !== null ? `ret:${dynArmKey(retFn)}` : dynArmKey(n);
-    const armable = contained || retFn !== null || forOf;
-    if (armable) this.dynArmExitNodes.set(exit, key);
-    // pc-json: a copy of a JSON document held as the dynamic value (the
-    // documents are known at build time) that would drop a key the document
-    // holds takes the dynamic arm in the next pass where the slot can hold
-    // it — the arm keeps the document itself, and a failed arm falls back to
-    // the exact-fit copy below, which stops by name — and refuses by name
-    // anywhere else. A copy that drops nothing keeps the type's key order
-    // (S041's checked-conversion rule).
-    if (this.dynJsonImportSyms.size > 0 && exit.kind === "dynCheck" && ts.isExpression(n)) {
-      const dropped = jsonDocCopyDrops(this, ts.isAsExpression(n) || ts.isTypeAssertion(n) ? n.expression : n, exit.type);
-      if (dropped !== null) {
-        if (!armable) this.unsupported("SC1090", dropped.node, dropped.why);
-        if (!this.exactSites.has(key)) this.dynArmSoft.add(key);
-      }
-    }
-    // Never a silent width copy where U2 is in play: a copy taken FROM a
-    // dynamic-arm value, or one at a slot whose arm did not build (the
-    // fallback pass's exactSites), copies only a value of exactly its
-    // type's shape, and stops by name otherwise (SEMANTICS.md S128 (a2)).
-    if (exit.kind === "dynCheck") {
-      // (Review: an object literal or spread returned from a plain function
-      // is a NEW object: a key its type does not declare is GH #148's to
-      // judge (a printed copy refuses by name; spreadsIn reads through this
-      // guard), so its guard skips undeclared keys; the declared ones keep
-      // the exact test, a missing one its S119 mark.)
-      const freshRet = retFn !== null && ts.isObjectLiteralExpression(n);
-      const fromArm = this.exitFromArm(node);
-      if ((fromArm || (armable && this.exactSites.has(key))) && this.copiesOnCrossing(exit.type) && this.boundaryExitSafe(exit.type)) {
-        return this.exactGuard(exit, fromArm
-          ? "a dynamic value held in a typed slot (SEMANTICS.md S128) copied into typed storage it does not fit exactly (a key the type does not declare, keys out of the type's order, an absent required key that is not a plain number, string or boolean, an optional key holding undefined, or a mistyped value): the copy would differ from the object"
-          : "a dynamic value that does not have exactly its typed slot's shape, in a slot whose uses this build cannot compile on the dynamic arm yet (SEMANTICS.md S128 (a3))", freshRet && exit.type.kind === "record");
-      }
-    }
-    return exit;
-  }
-  /** Unit U2: is the value an exit at `node` copies a dynamic-arm value
-   * (the exit's own expression, a declaration's initializer, a literal
-   * member's value, a spread's source, or — for a destructured binding —
-   * the declaration's initializer)? */
-  exitFromArm(node: ts.Node): boolean {
-    if (!this.dynArmActive) return false;
-    let n: ts.Node = node;
-    while (ts.isParenthesizedExpression(n)) n = n.expression;
-    let up: ts.Node = n.parent;
-    while (up !== undefined && ts.isParenthesizedExpression(up)) up = up.parent;
-    if (up !== undefined && ts.isVariableDeclaration(up) && up.name === n && up.initializer !== undefined) {
-      n = up.initializer;
-      while (ts.isParenthesizedExpression(n)) n = n.expression;
-    } else if (up !== undefined && ts.isBindingElement(up) && up.name === n) {
-      // A destructured binding's exit is lowered against its own name: the
-      // value is read off the declaration's initializer.
-      let d: ts.Node = up;
-      while (ts.isBindingElement(d) || ts.isObjectBindingPattern(d) || ts.isArrayBindingPattern(d)) d = d.parent;
-      if (!ts.isVariableDeclaration(d) || d.initializer === undefined) return false;
-      n = d.initializer;
-    }
-    if (ts.isAsExpression(n) || ts.isTypeAssertion(n)) n = n.expression;
-    if (ts.isShorthandPropertyAssignment(n)) n = n.name;
-    else if (ts.isPropertyAssignment(n)) n = n.initializer;
-    else if (ts.isSpreadElement(n) || ts.isSpreadAssignment(n)) n = n.expression;
-    return ts.isExpression(n) && armRooted(this, n);
-  }
   /** Unit U2: the slots (exit keys, and `spec:` keys of U2b bindings) the
    * dynamic arm did not build, which therefore copy only exactly-fitting
-   * values (exactGuard). */
+   * values (dyn-arm-exits.ts exactGuard). */
   readonly exactSites: ReadonlySet<string>;
   /** M0 (arm-failures.ts): the failed share attempts by site. */
   readonly armFailures: ArmFailures;
-  /** `exit` (a dynCheck), preceded by U2's exact-fit test: a value that does
-   * not have exactly the target's shape ends the program by name instead
-   * of becoming a width-tolerant copy. The test is an interned pass-through
-   * helper around the checked value (`%u2.exact.N`), so S125 (c)'s judgement
-   * sees the same crossing as before. */
-  exactGuard(exit: IrExpr & { kind: "dynCheck" }, why: string, width = false): IrExpr {
-    const loc = exit.loc;
-    const vt = exit.value.type;
-    const key = `u2exact:${typeKey(vt)}:${typeKey(exit.type)}:${why}${width ? ":width" : ""}`;
-    let name = this.retagHelpers.get(key);
-    if (name === undefined) {
-      name = `%u2.exact.${this.retagHelpers.size}`;
-      this.retagHelpers.set(key, name);
-      const x: IrExpr = { kind: "varRef", localId: "x.0", type: vt, loc };
-      const asJs: IrExpr = vt.kind === "jsval" ? x : { kind: "jsMarshal", value: x, type: JSVAL, loc };
-      this.liftedFns.push({
-        name,
-        params: [{ localId: "x.0", name: "x", type: vt }],
-        returnType: vt,
-        locals: [{ id: "x.0", name: "x", type: vt, mutable: false }],
-        body: [
-          {
-            kind: "if",
-            cond: { kind: "unary", op: "!", operand: { kind: "jsFits", value: asJs, target: exit.type, type: BOOL, lenient: true, ...(width ? { width: true as const } : {}), loc }, type: BOOL, loc },
-            then: [{ kind: "runtimeFence", code: "SC1100", message: why, loc }],
-            else_: null,
-            loc,
-          },
-          { kind: "return", value: x, loc },
-        ],
-        loc,
-      });
-    }
-    const result: IrExpr = { ...exit, value: { kind: "call", callee: name, args: [exit.value], type: vt, loc } };
-    const k = this.dynArmExitNodes.get(exit);
-    if (k !== undefined) this.dynArmExitNodes.set(result, k);
-    return result;
-  }
   /** GH #187 (big-widen.ts): the program can hold a bigint, so arithmetic
    * over `any` answers `any`; its memo tables. */
   private bigWidenGate: boolean | null = null;
@@ -2060,7 +1919,7 @@ export class Lowerer {
   get dynArmActive(): boolean {
     return this.dynArmSites.size > 0 || this.dynArmSyms.size > 0;
   }
-  /** Unit U2b (dyn-arm.ts): the speculative bindings declared so far, the
+  /** Unit U2b (dyn-arm-spec.ts): the speculative bindings declared so far, the
    * ones whose arm the current lowering fixed, how deep, every key this
    * pass speculated, the keys a failed speculation asks the next pass to
    * bind eagerly, and the keys this pass binds eagerly. */
@@ -2068,7 +1927,7 @@ export class Lowerer {
   /** Locals that joined the arm from an arm initializer, by the statement
    * list they live in (removed from dynArmSyms when it is lowered). */
   readonly armTransient = new Map<ts.Symbol, readonly ts.Statement[]>();
-  /** Unit U2b: each function lowering's remaining split budget (dyn-arm.ts). */
+  /** Unit U2b: each function lowering's remaining split budget (dyn-arm-spec.ts). */
   readonly specBudget = new WeakMap<object, number>();
   readonly specFixed = new Set<ts.Symbol>();
   specDepth = 0;
@@ -3812,10 +3671,10 @@ export class Lowerer {
         loc: check.loc,
       };
     }
-    if (ts.isExpression(node) && !(this.sharedDynamic && this.exitFromArm(node)) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
+    if (ts.isExpression(node) && !(this.sharedDynamic && exitFromArm(this, node)) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
     // S115 (d)'s WasmGC amendment: the dynCheck IS the judged copy (at a
     // contained slot, the dynamic arm where S125 (c) refuses it — U2a).
-    if (this.sharedDynamic) return this.noteDynArmExit(check, node);
+    if (this.sharedDynamic) return noteDynArmExit(this, check, node);
     this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
   }
 
@@ -8508,12 +8367,12 @@ export class Lowerer {
     if (e !== expr && this.dynamic && e.kind === "jsExit" && expr.type.kind === "jsval" && this.copiesOnCrossing(e.type)) {
       if (ts.isExpression(node) && exitIsOwnView(this, node, e.type)) {
         e = { kind: "jsUnview", value: e.value, typeKey: typeKey(e.type), what: unviewWhat(this, e.type), type: e.type, loc: e.loc };
-      } else if (ts.isExpression(node) && !(this.sharedDynamic && this.exitFromArm(node)) &&
+      } else if (ts.isExpression(node) && !(this.sharedDynamic && exitFromArm(this, node)) &&
           (exitIsFresh(this, node, e.type) || exitIsConsumedCopy(this, node, e.type))) e.fresh = true;
       // S115 (d)'s U1a amendment: a local, parameter, return, field or
       // element takes a judged copy (S125 (c) refuses the observable ones;
       // a copy it cannot follow is judged by its type).
-      else if (this.sharedDynamic) e = this.noteDynArmExit(judgedExit(e.value, e.type, e.loc), node);
+      else if (this.sharedDynamic) e = noteDynArmExit(this, judgedExit(e.value, e.type, e.loc), node);
       else this.refuse115(node, exitRefusal(this, e.type));
     }
     // `unknown` crosses exactly like `any` (S115): a typed composite enters
@@ -9637,7 +9496,7 @@ export class Lowerer {
     }
     if (!symbol) return null;
     // Unit U2b: a speculative binding read where no split fixed its arm —
-    // the next pass binds it eagerly (dyn-arm.ts).
+    // the next pass binds it eagerly (dyn-arm-spec.ts).
     const spec = this.specBindings.get(symbol);
     if (spec !== undefined && !this.specFixed.has(symbol)) this.specRetry.add(spec.key);
     const direct = this.resolveKey(symbol, ident);
@@ -10091,6 +9950,20 @@ export class Lowerer {
     if (dynArmDecl(this, decl) || (this.armTransient.size > 0 && this.armTransient.has(this.checker.getSymbolAtLocation(decl.name)!))) {
       const symbol = this.checker.getSymbolAtLocation(decl.name);
       if (symbol !== undefined && !this.globalsBySymbol.has(symbol) && this.dynArmSyms.has(symbol)) {
+        // (K) A deferred `let` (dyn-arm.ts deferredLetBinding) holds the
+        // dynamic value from its declaration on: no initializer is
+        // undefined, any other value crosses as itself (a typed one as its
+        // live view, S115's unit H).
+        if (dynArmLet(this, decl)) {
+          const id = decl.name as ts.Identifier;
+          const js = isJsSourceFile(decl.getSourceFile());
+          const loc = locOf(decl);
+          const init: IrExpr = decl.initializer === undefined
+            ? { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }
+            : this.coerceInto(decl.initializer, this.lowerExpr(decl.initializer), JSVAL);
+          const local = this.declareLocal(id, id.text, js ? DYN : JSVAL, isLet);
+          return { kind: "varDecl", localId: local.id, init: js ? asDynOperand(init) : init, loc };
+        }
         const init0 = this.lowerExpr(decl.initializer!);
         // A JavaScript source keeps its dynamic bindings in checked-dynamic
         // storage (S014's U1b amendment): the same \$dyn value, whose uses

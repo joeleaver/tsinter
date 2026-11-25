@@ -413,8 +413,36 @@ describe("S133 (k): a declared primitive the implementation does not produce sto
 });
 
 describe("S133 (k): a declared callable interface whose method result the implementation does not produce stops by name", () => {
-  test("DD-11 `unsafe<{ n: number }[]>` declared to settle to rows, implemented as a string", async () => {
+  test("DD-11 `unsafe<{ n: number }[]>` declared to settle to rows, implemented as a string, passed to a typed method parameter", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dd11-"));
+    const files: Record<string, string> = {
+      ...PG(),
+      "main.ts": [
+        `import postgres from "pg";`,
+        `const sql = postgres("u7");`,
+        `console.log("before");`,
+        `class C { count(r: { n: number }[]): number { return r.length; } }`,
+        `console.log("after", new C().count(await sql.unsafe<{ n: number }[]>("LIE")));`,
+      ].join("\n"),
+    };
+    for (const [name, src] of Object.entries(files)) {
+      mkdirSync(join(dir, name, ".."), { recursive: true });
+      writeFileSync(join(dir, name), src);
+    }
+    const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["pg"] });
+    if (!res.ok) throw new Error(`DD-11 refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+    const got = await nativeRun(res.binaryPath!, []);
+    // Node prints `after 8` (the string's length); the declaration's claim
+    // is false for this value, so the program ends where it crosses into the
+    // method's typed parameter. (DD-12: a module global holding the result
+    // keeps the package's own value and never crosses.)
+    expect(got.stdout, got.stderr).toBe("before\n");
+    expect(got.exitCode).not.toBe(0);
+    expect(got.stderr).toMatch(/array|string/);
+  }, 600_000);
+
+  test("DD-12 the same result held by a module global is the package's own value (SEMANTICS.md S125 amendment (K)), matching Node", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dd12-"));
     const files: Record<string, string> = {
       ...PG(),
       "main.ts": [
@@ -430,13 +458,11 @@ describe("S133 (k): a declared callable interface whose method result the implem
       writeFileSync(join(dir, name), src);
     }
     const res = await compile(join(dir, "main.ts"), { outPath: join(dir, "program"), outDir: dir, backend: "wasm-native", npmStatic: ["pg"] });
-    if (!res.ok) throw new Error(`DD-11 refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
+    if (!res.ok) throw new Error(`DD-12 refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
     const got = await nativeRun(res.binaryPath!, []);
-    // Node prints `after 8` (the string's length); the declaration's claim
-    // is false for this value, so the program ends at the crossing.
-    expect(got.stdout, got.stderr).toBe("before\n");
-    expect(got.exitCode).not.toBe(0);
-    expect(got.stderr).toMatch(/array|string/);
+    // Node prints the string's length: the global holds the string itself.
+    expect(got.stdout, got.stderr).toBe("before\nafter 8\n");
+    expect(got.exitCode).toBe(0);
   }, 600_000);
 });
 
