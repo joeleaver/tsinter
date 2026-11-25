@@ -27,6 +27,7 @@ import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncN
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { tupleCastToArray, tupleUnderArrayType } from "./tuple-array-casts.js";
+import { lowerTupleLength } from "./tuple-length.js";
 import { isTimerHandleTyped, lowerProcessVersionsProbe } from "./lower-builtins.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, stubBuiltinModuleOf, unsupportedModuleFeatureOf } from "../shared.js";
@@ -6561,8 +6562,12 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
     if (expr.kind === ts.SyntaxKind.TrueKeyword || expr.kind === ts.SyntaxKind.FalseKeyword ||
         expr.kind === ts.SyntaxKind.NullKeyword) return true;
     if (ts.isPropertyAccessExpression(expr)) {
+      // A member of an `any`/`unknown` receiver (a Proxy, an accessor the
+      // checker cannot see) or one with no symbol proves nothing: a cast
+      // to a literal type (`p.k as "a"`) would otherwise fold its read away.
+      if ((L.typeOf(expr.expression).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return false;
       const sym = L.checker.getSymbolAtLocation(expr.name);
-      if (sym && sym.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return false;
+      if (!sym || sym.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return false;
       return pureKeyExpr(L, expr.expression);
     }
     if (ts.isPrefixUnaryExpression(expr) &&
@@ -13922,32 +13927,11 @@ export function isPackageAliasFieldInit(expr: ts.PropertyAccessExpression): bool
         );
       }
     }
-    // `t.length` on a tuple: the arity CONSTANT (tuples are fixed-shape —
-    // the checker types it as the literal arity too). Folding discards the
-    // receiver's evaluation, so only side-effect-free receivers fold;
-    // anything else (a call result) binds to a const first.
+    // `t.length` on a tuple: the arity CONSTANT, the receiver evaluated
+    // whenever its evaluation could be observed (tuple-length.ts).
     if (receiverIr?.kind === "record" && expr.name.text === "length") {
       const shape = L.shapes.get(receiverIr.shapeId);
-      if (shape?.tuple) {
-        let root: ts.Expression = expr.expression;
-        while (ts.isPropertyAccessExpression(root)) root = root.expression;
-        if (!ts.isIdentifier(root) && root.kind !== ts.SyntaxKind.ThisKeyword) {
-          L.unsupported(
-            "SC1090",
-            expr,
-            "'.length' of a computed tuple expression (the arity is a constant — bind the tuple to a const first)",
-          );
-        }
-        // The read stays visible to the width pass, whatever form the
-        // receiver takes (a binding, `this.t`, `ns.T`, `C.T`, `o.t`): the
-        // arity is the original's, and a copy written through a cast
-        // alias would grow where the original does not — S125 (b). The
-        // receiver is lowered once, here, and only for that: nothing
-        // evaluates `tupleOf`; the IR walkers that see it (liveness,
-        // capture lists, TDZ marking) count a read JavaScript makes too.
-        const tupleOf = L.lowerExpr(expr.expression);
-        return { kind: "numLit", value: shape.fields.length, tupleOf, type: F64, loc: locOf(expr) };
-      }
+      if (shape?.tuple) return lowerTupleLength(L, expr, shape.fields.length);
     }
     return null;
   }

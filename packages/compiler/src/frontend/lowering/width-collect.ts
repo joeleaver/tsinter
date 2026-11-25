@@ -218,7 +218,7 @@ function visit(cx: WidthCx, n: unknown, mode: Mode, parent: Record<string, unkno
     case "arraySet":
       noteWrite(cx, tkey((r["arr"] as IrExpr).type));
       break;
-    // A folded tuple `t.length` reads its tuple's arity (lower-exprs.ts):
+    // A folded tuple `t.length` reads its tuple's arity (tuple-length.ts):
     // a read in place, like an array's `xs.length`.
     case "numLit":
       kids = ["tupleOf"];

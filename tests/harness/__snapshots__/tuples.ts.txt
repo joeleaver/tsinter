@@ -37,32 +37,25 @@ tuples.ts:25:33 - error SC1090: spread elements in tuple literals (positions mus
      |                                 ^~~~~~~
   26 | 
 
-tuples.ts:31:13 - error SC1090: '.length' of a computed tuple expression (the arity is a constant — bind the tuple to a const first) is not supported yet
+tuples.ts:29:13 - error SC1090: '.join()' on arrays of this element type (number, string, and boolean arrays join — unions of those with undefined/null arms too, the units printing empty like JS) is not supported yet
 
-  30 | }
-  31 | console.log(mk().length);
-     |             ^~~~~~~~~~~
+  28 | const recs: { id: number }[] = [{ id: 1 }];
+  29 | console.log(recs.join(","));
+     |             ^~~~~~~~~~~~~~
+  30 | const tuples: [string, string][] = [["k", "v"]];
+
+tuples.ts:31:13 - error SC1090: '.join()' on arrays of this element type (number, string, and boolean arrays join — unions of those with undefined/null arms too, the units printing empty like JS) is not supported yet
+
+  30 | const tuples: [string, string][] = [["k", "v"]];
+  31 | console.log(tuples.join(";"));
+     |             ^~~~~~~~~~~~~~~~
   32 | 
 
-tuples.ts:35:13 - error SC1090: '.join()' on arrays of this element type (number, string, and boolean arrays join — unions of those with undefined/null arms too, the units printing empty like JS) is not supported yet
+tuples.ts:35:7 - error SC2009: values of type 'Map<string, number>[]' cannot be compiled: the array shape is supported, but 'Map<string, number>' elements have no array representation yet
 
-  34 | const recs: { id: number }[] = [{ id: 1 }];
-  35 | console.log(recs.join(","));
-     |             ^~~~~~~~~~~~~~
-  36 | const tuples: [string, string][] = [["k", "v"]];
-
-tuples.ts:37:13 - error SC1090: '.join()' on arrays of this element type (number, string, and boolean arrays join — unions of those with undefined/null arms too, the units printing empty like JS) is not supported yet
-
-  36 | const tuples: [string, string][] = [["k", "v"]];
-  37 | console.log(tuples.join(";"));
-     |             ^~~~~~~~~~~~~~~~
-  38 | 
-
-tuples.ts:41:7 - error SC2009: values of type 'Map<string, number>[]' cannot be compiled: the array shape is supported, but 'Map<string, number>' elements have no array representation yet
-
-  40 | // element kind).
-  41 | const maps: Map<string, number>[] = [];
+  34 | // element kind).
+  35 | const maps: Map<string, number>[] = [];
      |       ^~~~
-  42 | 
+  36 | 
 
   hint: the outer shape is supported — the named component is the blocker; restate it inside the compilable set (number, string, boolean, arrays, Maps, Sets, RegExp, functions, classes, records, unions of those, and 'unknown')

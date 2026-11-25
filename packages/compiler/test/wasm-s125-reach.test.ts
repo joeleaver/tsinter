@@ -288,3 +288,72 @@ const p = new P();
 console.log(bump(p), p.n);`,
     refused: /the instance that shares the object \(S125 \(a\)\) was tried here and did not lower: SC1090 JSON\.stringify.* \[util\/bump\.ts:2\]\)/ },
 ]);
+
+/** GH #274: a tuple's `.length` is its arity constant, but the receiver
+ * is evaluated whenever that could be observed (tuple-length.ts): a getter
+ * anywhere on the chain runs, once, in source order; a chain of plain data
+ * reads still folds (S125-J's `tupleOf` read). */
+defineRows("S125-J tuple length receivers", [
+  { id: "S125-J-34 `.length` off a class getter runs the getter", entry: "main.ts",
+    src: `class C { get t() { console.log("get"); return ["a", "b"] as const; } }
+console.log(new C().t.length);
+const c = new C();
+console.log(c.t.length, c.t.length);` },
+  { id: "S125-J-35 `.length` off an inherited getter and an overriding one runs the receiver's getter", entry: "main.ts",
+    src: `class B { get t(): readonly [number, number] { console.log("B.get"); return [1, 2]; } }
+class D extends B {}
+class E extends B { override get t(): readonly [number, number] { console.log("E.get"); return [3, 4]; } }
+console.log(new D().t.length);
+const bs: B[] = [new B(), new E()];
+for (const b of bs) console.log(b.t.length);` },
+  { id: "S125-J-36 `.length` off a static getter refuses by name (static accessors have no lowering; Node: `static get`, 3)", entry: "main.ts",
+    refused: /SC1090 the static member 't' of class 'S' \(static accessors/,
+    src: `class S { static get t() { console.log("static get"); return ["x", "y", "z"] as const; } }
+console.log(S.t.length);` },
+  { id: "S125-J-37 `.length` off an object-literal getter runs it", entry: "main.ts",
+    src: `let n = 0;
+const o = { get t() { n++; console.log("lit get", n); return [1, 2] as const; } };
+console.log(o.t.length);
+console.log(o.t.length, n);` },
+  { id: "S125-J-38 a getter in the middle of a chain (`a.g.t.length`) runs once", entry: "main.ts",
+    src: `const a = { get g() { console.log("g"); return { t: ["p", "q"] as const }; } };
+console.log(a.g.t.length);
+class G { get g() { console.log("G.g"); return { t: [1, 2, 3] as const }; } }
+const h = { inner: new G() };
+console.log(h.inner.g.t.length);` },
+  { id: "S125-J-39 plain data chains still fold and match Node", entry: "main.ts",
+    src: `const T = ["a", "b"] as const;
+namespace NS { export const U = [1, 2] as const; }
+class H { t = [1, 2, 3] as const; static S = ["z"] as const; n = { t: [1] as const }; len(): number { return this.t.length + this.n.t.length; } }
+const h = new H();
+const o = { t: [1, 2] as const, in: { t: [1, 2, 3, 4] as const } };
+console.log(T.length, NS.U.length, h.t.length, H.S.length, h.n.t.length, o.t.length, o.in.t.length, h.len(), (o).in!.t.length);` },
+  { id: "S125-J-40 the receiver's side effect keeps its place in a larger expression", entry: "main.ts",
+    src: `let n = 0;
+class C { get t() { n++; console.log("get", n); return ["a", "b"] as const; } }
+const c = new C();
+function f(x: string): number { console.log("f", x); return 1; }
+console.log(f("a") + c.t.length * 10 + f("b"), n);
+function mk(): [string, number] { console.log("mk"); return ["z", 9]; }
+console.log(mk().length + mk().length);
+const ok = f("c") > 0 && c.t.length === 2;
+console.log(ok, n);` },
+  { id: "S125-J-41 `.length` of a module binding read before its declaration throws Node's ReferenceError", entry: "main.ts",
+    src: `function peek(): string { try { return String(T.length); } catch (e) { return (e as Error).name + ": " + (e as Error).message; } }
+console.log(peek());
+const T = ["a", "b"] as const;
+console.log(peek());` },
+  { id: "S125-J-42 a getter satisfying an interface's data property refuses by name where it enters the record slot", entry: "main.ts",
+    refused: /SC1090 a get\/set accessor satisfying the data property 't'/,
+    src: `interface HasT { readonly t: readonly [string, string]; }
+const viaLit: HasT = { get t() { console.log("iface lit get"); return ["a", "b"] as const; } };
+console.log(viaLit.t.length);
+class K implements HasT { get t() { console.log("K get"); return ["c", "d"] as const; } }
+const k: HasT = new K();
+console.log(k.t.length);` },
+  { id: "S125-J-43 a computed key cast to a literal type off an `any` receiver refuses by name instead of folding the read away (Node: `k read`, 1)", entry: "main.ts",
+    refused: /SC1090 computed property keys/,
+    src: `const p: any = { get k() { console.log("k read"); return "a"; } };
+const o = { [p.k as "a"]: 1 };
+console.log(o.a);` },
+]);

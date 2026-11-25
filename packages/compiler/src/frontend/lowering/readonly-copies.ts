@@ -97,9 +97,12 @@ function useLeavesIt(cx: WidthCx, u: UseSite, seen: Set<string>, depth: number):
     case "recordOrder":
     case "fieldGet":
       return u.key === "obj";
-    // A folded tuple `t.length` (lower-exprs.ts) reads the arity.
+    // A folded tuple `t.length` (tuple-length.ts) reads the arity.
     case "numLit":
       return u.key === "tupleOf";
+    // A value evaluated for effect and discarded (tuple-length.ts).
+    case "exprStmt":
+      return true;
     case "arrayGet":
       return u.key === "arr";
     case "forOf":

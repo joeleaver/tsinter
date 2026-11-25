@@ -24,12 +24,6 @@ for (const part of pair) {
 // Spread has no fixed positions inside a tuple literal.
 const copy: [string, number] = [...pair];
 
-// The arity constant folds only off side-effect-free receivers.
-function mk(): [string, number] {
-  return ["z", 9];
-}
-console.log(mk().length);
-
 // join on ref-element arrays: JS would recursively toString — dishonest.
 const recs: { id: number }[] = [{ id: 1 }];
 console.log(recs.join(","));

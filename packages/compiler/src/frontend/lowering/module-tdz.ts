@@ -1205,6 +1205,12 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
       created.add(n);
       return n;
     };
+    /** Whether `n` (already rewritten) holds a node this pass created. */
+    const holdsCheck = (n: object): boolean =>
+      created.has(n) ||
+      Object.entries(n).some(([k, v]) =>
+        k !== "type" && k !== "loc" && v !== null && typeof v === "object" &&
+        (Array.isArray(v) ? v.some((x) => x !== null && typeof x === "object" && holdsCheck(x as object)) : holdsCheck(v as object)));
     /** The replacement for one IR node in its parent slot (or itself). */
     const rewrite = (node: Record<string, unknown>): Record<string, unknown> => {
       const done = memo.get(node);
@@ -1222,6 +1228,15 @@ export function insertModuleTdzChecks(tdz: ModuleTdz, functions: IrFunction[], g
         return mark({ kind: "seqExpr", stmts: [tdz.checkStmt(b, loc!, tdz.nameAt(b, loc!))], result: node, type: node["type"], loc });
       }
       walkChildren(node);
+      // A folded tuple `t.length` (tuple-length.ts) keeps its receiver as
+      // `tupleOf`, which nothing evaluates. A receiver that now holds a
+      // TDZ check may throw, as JavaScript's read of it does, so it is
+      // evaluated for effect before the constant.
+      if (kind === "numLit" && node["tupleOf"] !== undefined && holdsCheck(node["tupleOf"] as object)) {
+        const recv = node["tupleOf"] as IrExpr;
+        delete node["tupleOf"];
+        return mark({ kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: recv, loc: recv.loc }], result: node, type: node["type"], loc });
+      }
       if (kind === "incDec") {
         const b = guarded(node["localId"] as string, loc);
         if (b === null) return node;
