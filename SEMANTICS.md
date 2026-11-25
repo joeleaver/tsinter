@@ -11215,13 +11215,25 @@ was tried (2026-11-24, unit S125-J of docs/design/s125-copy-family.md).**
   async, callback, aliased or seven-deep callee, a constructor's
   parameter property, a returned alias — grew the copy where Node grows
   the one shared array (`3 2` for Node's `3 3`). The folded `.length` of a
-  tuple binding now counts as a read of it, so each of those refuses by
-  name. The tuple itself cast to an array (`(MODES as unknown as
-  string[]).push(…)`, no binding in between) is rebuilt as that array
-  where the member is applied — the tuple-into-array copy every array slot
-  makes, judged like them — instead of handing a tuple to the array
-  method (an internal compiler error); a union of tuples cast that way
-  refuses by name, since no one array rebuilds every arm. And a tuple
+  tuple now counts as a read of whatever it was read through — a binding,
+  `this.t`, a namespace member (`NS.T`), a module namespace import
+  (`ns.T`), a static field (`C.T`), an object's property (`o.t`) — so each
+  of those refuses by name (review of 97207d74 found the first fix
+  recorded only the bare binding). The fold is the only place a tuple's
+  arity becomes a constant: destructuring, spread, `.at()`, loops and
+  element reads all read the tuple itself. A tuple cast to an array type
+  (`MODES as readonly string[]`, `t as unknown as number[]`) is rebuilt as
+  that array at the cast — the tuple-into-array copy every array slot
+  makes, judged like them — instead of reaching array code as a tuple (an
+  internal compiler error, for `.length`, `[i]`, `[i] = v`, `.sort()`,
+  `.push(…)` alike). So a write through the cast (`(MODES as unknown as
+  string[]).sort()`, `(t as unknown as number[])[0] = 9`, `…[0]++`)
+  refuses by name while the tuple is still observed. Two reads straight
+  off the cast use a copy dropped on the spot, which nothing can tell from
+  the tuple, and match Node: `.length` and an element read, and the
+  read-only methods already proven unobservable on such a receiver
+  (`(S as readonly string[]).includes(s)`). A union of tuples cast that
+  way refuses by name, since no one array rebuilds every arm. And a tuple
   passed to an array slot that also admits undefined (`xs?: readonly
   T[]`, `readonly T[] | undefined`) rebuilds into the array arm, as into a
   bare array slot, where it used to end the program at run time ("not

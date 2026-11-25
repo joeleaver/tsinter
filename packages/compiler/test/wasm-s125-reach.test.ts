@@ -143,7 +143,7 @@ console.log(JSON.stringify(kept));`,
 function bump(o: { n: number }): string { o.n++; return JSON.stringify(o); }
 const p = new P();
 console.log(bump(p), p.n);`,
-    refused: /the instance that shares the object \(S125 \(a\)\) was tried here and did not lower: SC1090 JSON\.stringify/,
+    refused: /the instance that shares the object \(S125 \(a\)\) was tried here and did not lower: SC1090 JSON\.stringify.* \[line 2\]\)/,
   },
 ]);
 
@@ -207,7 +207,7 @@ const k = keep<Mode>(MODES);
 console.log(k.length, MODES.length);` },
   { id: "S125-J-21 the tuple itself written through `as unknown as string[]`, with no binding, refuses by name", entry: "main.ts", refused: COPY,
     src: `const MODES = ["a", "b"] as const; (MODES as unknown as string[]).push("z"); console.log(MODES.length);` },
-  { id: "S125-J-23 a union of tuples cast to `string[]` and written refuses by name (no one array rebuilds both)", entry: "main.ts", refused: /SC1090 an array member on a .* value cast to 'string\[\]'/,
+  { id: "S125-J-23 a union of tuples cast to `string[]` and written refuses by name (no one array rebuilds both)", entry: "main.ts", refused: /SC1090 a '.*' value cast to 'string\[\]' \(a tuple arm is a fixed shape/,
     src: `const MODES = ["a", "b"] as const;
 const OTHER = ["c"] as const;
 const pick = process.argv.length > 0 ? MODES : OTHER;
@@ -217,4 +217,74 @@ console.log(pick.length, MODES.length);` },
     src: CM + `function g<T extends string>(xs: readonly T[] | undefined): number { return xs === undefined ? -1 : xs.length + xs.indexOf("b" as T); }
 function h(xs?: readonly string[]): string { return xs?.join("+") ?? "none"; }
 console.log(g<Mode>(MODES), g<Mode>(undefined), h(MODES), h(), MODES.length, names);` },
+]);
+
+/** (Review of 97207d74) A tuple's folded `.length` read through any
+ * receiver form the fold admits — a namespace member, a module namespace
+ * import, a static field, an object property, `this` — still observes the
+ * original, so a write through a cast alias of its copy refuses (Node: 3). */
+defineRows("S125-J folded length receivers", [
+  { id: "S125-J-24 a namespace member's length after a write through a cast alias refuses", entry: "main.ts", refused: COPY,
+    src: `namespace NS { export const T = ["a", "b"] as const; }
+const ro: readonly string[] = NS.T;
+(ro as string[]).push("z");
+console.log(NS.T.length);` },
+  { id: "S125-J-25 a module namespace import's length (`ns.T.length`) after a write through a cast alias refuses", entry: "main.ts", refused: COPY,
+    files: { "modes.ts": `export const T = ["a", "b"] as const;` },
+    src: `import * as ns from "./modes.ts";
+const ro: readonly string[] = ns.T;
+(ro as string[]).push("z");
+console.log(ns.T.length);` },
+  { id: "S125-J-26 a static class field's length after a write through a cast alias refuses", entry: "main.ts", refused: COPY,
+    src: `class C { static readonly T = ["a", "b"] as const; }
+const ro: readonly string[] = C.T;
+(ro as string[]).push("z");
+console.log(C.T.length);` },
+  { id: "S125-J-27 an object property's length after a write through a cast alias refuses", entry: "main.ts", refused: COPY,
+    src: `const h = { t: ["a", "b"] as const };
+const ro: readonly string[] = h.t;
+(ro as string[]).push("z");
+console.log(h.t.length);` },
+  { id: "S125-J-28 `this.t.length` after a write through a cast alias refuses", entry: "main.ts", refused: COPY,
+    src: `class H { t = ["a", "b"] as const; run(): number { const ro: readonly string[] = this.t; (ro as string[]).push("z"); return this.t.length; } }
+console.log(new H().run());` },
+]);
+
+/** (Review of 97207d74) A tuple cast to an array type outside a method
+ * call: a read straight off the cast reads a copy dropped on the spot
+ * (Node's output); a write through it is the judged width copy and refuses
+ * while the tuple is still observed. */
+defineRows("S125-J tuple casts", [
+  { id: "S125-J-29 `.length`, an element and a read-only method read straight off a tuple cast to an array match Node", entry: "main.ts",
+    src: CM + `const t: [number, number] = [1, 2];
+const i = process.argv.length > 99 ? 0 : 1;
+console.log((MODES as readonly string[]).length, (MODES as unknown as string[])[1], (t as unknown as number[])[i], (t as unknown as number[])[5]);
+console.log((MODES as readonly string[]).includes("b"), MODES.length, t, names);` },
+  { id: "S125-J-30 `.sort()` through `as unknown as string[]` refuses (the copy would be sorted alone)", entry: "main.ts", refused: COPY,
+    src: `const T = ["b", "a"] as const;
+(T as unknown as string[]).sort();
+console.log(T[0], T.length);` },
+  { id: "S125-J-31 an element written through `as unknown as number[]` refuses (Node: 9)", entry: "main.ts", refused: COPY,
+    src: `const t: [number, number] = [1, 2];
+(t as unknown as number[])[0] = 9;
+console.log(t[0]);` },
+  { id: "S125-J-32 an element incremented through a cast refuses by name (Node: 2; `++` of an element is refused for every array)", entry: "main.ts", refused: /SC1090 increment\/decrement of non-variables/,
+    src: `const t: [number, number] = [1, 2];
+(t as unknown as number[])[0]++;
+console.log(t[0]);` },
+]);
+
+/** (Review of 97207d74) M0's note names where the blocking diagnostic was
+ * reported relative to the refused site: another file by its path from the
+ * site's directory (S125-J-08 has the same-file `[line N]`). */
+defineRows("S125-J arm-failure place", [
+  { id: "S125-J-33 (M0) a blocking diagnostic in another module is placed by its relative path", entry: "main.ts",
+    files: { "util/bump.ts": `export function bump(o: { n: number }): string {
+  o.n++; return JSON.stringify(o);
+}` },
+    src: `import { bump } from "./util/bump.ts";
+class P { n = 1; m = 2; }
+const p = new P();
+console.log(bump(p), p.n);`,
+    refused: /the instance that shares the object \(S125 \(a\)\) was tried here and did not lower: SC1090 JSON\.stringify.* \[util\/bump\.ts:2\]\)/ },
 ]);

@@ -26,6 +26,7 @@ import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDy
 import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncNameOf, esFuncNameOf, evaluatedOnce, fnDefinitionOf, fnProtoOfValueNode, jsFuncNameOf, neverResidueTsBinding, neverTaintedJsType, nodeThrowExpr, own, jsMixedObjectUnion } from "./lowerer.js";
 import { armCast, armRetCast, isDynArmSite } from "./dyn-arm.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
+import { tupleCastToArray, tupleUnderArrayType } from "./tuple-array-casts.js";
 import { isTimerHandleTyped, lowerProcessVersionsProbe } from "./lower-builtins.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { isJsSourceFileName, stubBuiltinModuleOf, unsupportedModuleFeatureOf } from "../shared.js";
@@ -4454,32 +4455,6 @@ export function lowerMemberRecv(L: Lowerer, access: ts.PropertyAccessExpression)
   const receiver = tupleUnderArrayType(L, access.expression, L.lowerExpr(access.expression));
   if (access.questionDotToken) return receiver;
   return undefRecvGuardFor(L, access, receiver);
-}
-
-/** A TUPLE value the checker types as an array (`(MODES as unknown as
- * string[]).push(…)` — a cast converts nothing, so the value is still the
- * tuple): the member works on the tuple REBUILT as that array, the
- * tuple-into-array width copy every other array slot makes. It is judged
- * like them (S125 (b)): a write through it refuses by name where the
- * original is still observed, since the copy would grow alone. (The
- * read-only members a fresh copy cannot betray take tupleAsArray's
- * unjudged copy above — tupleArrayRecv.) */
-function tupleUnderArrayType(L: Lowerer, e: ts.Expression, value: IrExpr): IrExpr {
-  const t = value.type;
-  const isTuple = (x: IrType): boolean => x.kind === "record" && L.shapes.get(x.shapeId)?.tuple === true;
-  const tupleArm = t.kind === "union" && (L.unions.get(t.unionId)?.arms ?? []).some(isTuple);
-  if (!isTuple(t) && !tupleArm) return value;
-  const want = L.mapTypeOf(L.typeOf(e));
-  if (want?.kind !== "array") return value;
-  if (isTuple(t)) return L.coerceToExpected(value, want);
-  // A union that may hold a tuple (`(cond ? A : B) as unknown as
-  // string[]`): no one array rebuilds every arm, and the cast converts
-  // nothing.
-  return L.unsupported(
-    "SC1090",
-    e,
-    `an array member on a '${L.fmt(t)}' value cast to '${L.fmt(want)}' (a tuple arm is a fixed shape the cast does not convert — narrow to one tuple first, or copy it with [...x])`,
-  );
 }
 
 /** A string intrinsic whose result can be the slot's undefined. */
@@ -10136,7 +10111,10 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           }
         }
       }
-      return inner; // erasure, unchanged
+      // A tuple carried into an array type is rebuilt as that array
+      // (tuple-array-casts.ts): the array code downstream cannot take the
+      // fixed-shape record.
+      return tupleCastToArray(L, expr, inner, L.mapTypeOf(targetTs0)) ?? inner; // otherwise erasure, unchanged
     }
     if (inner.type.kind === "jsval") {
       // The island exit. `as any` on an island value is erasure; a static
@@ -13960,11 +13938,15 @@ export function isPackageAliasFieldInit(expr: ts.PropertyAccessExpression): bool
             "'.length' of a computed tuple expression (the arity is a constant — bind the tuple to a const first)",
           );
         }
-        // (A bare binding's read stays visible to the width pass: the
+        // The read stays visible to the width pass, whatever form the
+        // receiver takes (a binding, `this.t`, `ns.T`, `C.T`, `o.t`): the
         // arity is the original's, and a copy written through a cast
-        // alias would grow where the original does not — S125 (b).)
-        const tupleOf = ts.isIdentifier(expr.expression) ? L.lowerExpr(expr.expression) : undefined;
-        return { kind: "numLit", value: shape.fields.length, ...(tupleOf?.kind === "varRef" ? { tupleOf } : {}), type: F64, loc: locOf(expr) };
+        // alias would grow where the original does not — S125 (b). The
+        // receiver is lowered once, here, and only for that: nothing
+        // evaluates `tupleOf`; the IR walkers that see it (liveness,
+        // capture lists, TDZ marking) count a read JavaScript makes too.
+        const tupleOf = L.lowerExpr(expr.expression);
+        return { kind: "numLit", value: shape.fields.length, tupleOf, type: F64, loc: locOf(expr) };
       }
     }
     return null;
