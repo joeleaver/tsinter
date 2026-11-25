@@ -31,7 +31,7 @@
  * for effect, before the constant: a discarded expression statement the
  * width pass counts as a read too (width-uses.ts). A folded receiver that
  * later gains a TDZ check (a module binding read before its declaration)
- * is evaluated after all, by module-tdz.ts, so Node's ReferenceError
+ * is evaluated after all, by module-tdz-guards.ts, so Node's ReferenceError
  * throws. GH #274. */
 import * as ts from "../ts7/adapter.js";
 import { F64, type IrExpr } from "../../ir/nodes.js";
@@ -68,7 +68,7 @@ export function plainDataChain(L: Lowerer, e: ts.Expression): boolean {
  * zone: a const captured by a function lowered before its declaration
  * (predeclareForwardCapture, lower-stmts.ts) is a TDZ box whose every read
  * checks it, and that check runs only where the read is evaluated. A
- * module binding's TDZ check is placed after lowering, by module-tdz.ts,
+ * module binding's TDZ check is placed after lowering, by module-tdz-guards.ts,
  * which evaluates a folded receiver that gained one. */
 function tdzLocal(L: Lowerer, ident: ts.Identifier): boolean {
   if (L.peekLocal(ident)?.tdz === true) return true;

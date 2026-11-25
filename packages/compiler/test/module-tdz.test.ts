@@ -17,7 +17,7 @@ import type { IrModule } from "../src/ir/nodes.js";
 import { deserializeModule } from "../src/ir/serialize.js";
 import { runWasm } from "./wasm-host.js";
 
-// The coverage invariant (module-tdz.ts assertTdzCoverage): every guarded
+// The coverage invariant (module-tdz-guards.ts assertTdzCoverage): every guarded
 // source access in a lowered unit carries a check, or the build throws.
 process.env["SCRIPTC_TDZ_ASSERT"] = "1";
 
