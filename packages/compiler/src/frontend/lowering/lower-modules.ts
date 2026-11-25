@@ -14,7 +14,7 @@ import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, 
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType, typeEquals } from "../../ir/nodes.js";
-import { INSTANTIATION_WRITES } from "./module-tdz.js";
+import { INSTANTIATION_WRITES } from "./module-tdz-guards.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, lexThisEntry, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { dynArmDecl, dynArmGlobalDecl, registerSpecGlobal, specGlobalTarget } from "./dyn-arm.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";

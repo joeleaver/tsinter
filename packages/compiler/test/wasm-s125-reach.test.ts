@@ -343,6 +343,37 @@ console.log(ok, n);` },
 console.log(peek());
 const T = ["a", "b"] as const;
 console.log(peek());` },
+  { id: "S125-J-44 `.length` of a function-scope const read by an arrow before its declaration throws Node's ReferenceError", entry: "main.ts",
+    src: `function f(): void {
+  const g = (): string => { try { return String(T.length); } catch (e) { return (e as Error).name + ": " + (e as Error).message; } };
+  console.log(g());
+  const T = ["a", "b"] as const;
+  console.log(g());
+}
+f();` },
+  { id: "S125-J-45 `.length` of a block-scope const read before its declaration throws", entry: "main.ts",
+    src: `{
+  const g = (): string => { try { return String(T.length); } catch (e) { return (e as Error).name + ": " + (e as Error).message; } };
+  console.log(g());
+  const T = [1, 2, 3] as const;
+  console.log(g());
+}` },
+  { id: "S125-J-46 `.length` read by a nested function declaration before the const's declaration throws", entry: "main.ts",
+    src: `function f(): void {
+  function g(): string { try { return String(T.length); } catch (e) { return (e as Error).name + ": " + (e as Error).message; } }
+  console.log(g());
+  const T = [1] as const;
+  console.log(g());
+}
+f();` },
+  { id: "S125-J-47 a chain rooted at a local still in its TDZ (`o.t.length` before `const o`) throws", entry: "main.ts",
+    src: `function f(): void {
+  const g = (): string => { try { return String(o.t.length); } catch (e) { return (e as Error).name + ": " + (e as Error).message; } };
+  console.log(g());
+  const o = { t: [1, 2, 3] as const };
+  console.log(g());
+}
+f();` },
   { id: "S125-J-42 a getter satisfying an interface's data property refuses by name where it enters the record slot", entry: "main.ts",
     refused: /SC1090 a get\/set accessor satisfying the data property 't'/,
     src: `interface HasT { readonly t: readonly [string, string]; }

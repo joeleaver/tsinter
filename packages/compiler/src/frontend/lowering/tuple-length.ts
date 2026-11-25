@@ -10,7 +10,9 @@
  * evaluation only when every link is PROVEN a plain data read, twice
  * over:
  *
- *   - by the checker: the root is a binding or `this`, and every member
+ *   - by the checker: the root is `this` or a binding past its temporal
+ *     dead zone (a read that may throw Node's ReferenceError is a side
+ *     effect too: tdzLocal), and every member
  *     of the chain resolves to a property declared with storage in this
  *     program's source (a class field, a constructor parameter property,
  *     an object-literal property, a namespace or module binding) on a
@@ -56,9 +58,22 @@ export function lowerTupleLength(L: Lowerer, expr: ts.PropertyAccessExpression, 
 /** Whether the checker proves evaluating `e` reads plain data only. */
 export function plainDataChain(L: Lowerer, e: ts.Expression): boolean {
   if (ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) return plainDataChain(L, e.expression);
-  if (ts.isIdentifier(e) || e.kind === ts.SyntaxKind.ThisKeyword) return true;
+  if (ts.isIdentifier(e)) return !tdzLocal(L, e);
+  if (e.kind === ts.SyntaxKind.ThisKeyword) return true;
   if (!ts.isPropertyAccessExpression(e) || e.questionDotToken) return false;
   return plainDataLink(L, e) && plainDataChain(L, e.expression);
+}
+
+/** Whether `ident` reads a local that may still be in its temporal dead
+ * zone: a const captured by a function lowered before its declaration
+ * (predeclareForwardCapture, lower-stmts.ts) is a TDZ box whose every read
+ * checks it, and that check runs only where the read is evaluated. A
+ * module binding's TDZ check is placed after lowering, by module-tdz.ts,
+ * which evaluates a folded receiver that gained one. */
+function tdzLocal(L: Lowerer, ident: ts.Identifier): boolean {
+  if (L.peekLocal(ident)?.tdz === true) return true;
+  const sym = L.checker.getSymbolAtLocation(ident);
+  return sym !== undefined && L.tdzPredeclared.has(sym);
 }
 
 /** Whether the checker proves the member read `link` is a plain data

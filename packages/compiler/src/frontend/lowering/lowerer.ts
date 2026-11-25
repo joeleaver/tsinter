@@ -121,7 +121,9 @@ import { lowerNodeTestModuleCall, lowerTestDirectCall, lowerTestMethodCall, lowe
 import { lowerAssertModuleCall, lowerAssertDirectCall } from "./lower-assert.js";
 import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
-import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
+import { ModuleTdz } from "./module-tdz.js";
+import { analyzeModuleTdz } from "./module-tdz-analysis.js";
+import { insertModuleTdzChecks } from "./module-tdz-guards.js";
 import { markStubDiag, stubDiagFor, type StubIndex } from "./stub-builtins.js";
 import { paramPatternGuards, lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { hybridWritePass, orderNoteCopy, orderedFieldStmts, orderedShape } from "./record-order.js";
