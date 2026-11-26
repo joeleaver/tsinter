@@ -8,6 +8,7 @@ import type { Lowerer } from "./lowerer.js";
 import type { IrType } from "../../ir/nodes.js";
 import { PoisonError } from "./lowerer.js";
 import { dynArmResult, isDynArmSite, stripParens } from "./dyn-arm.js";
+import { armBag } from "./dyn-arm-bag.js";
 
 /** A cast of a value already on the dynamic arm to a typed composite: in
  * Node a cast is no conversion, so the result stays the dynamic value. */
@@ -93,12 +94,16 @@ export function dynArmTypeOf(L: Lowerer, node: ts.Node): ts.Type | null {
   return armRooted(L, node) ? L.checker.getAnyType() : null;
 }
 
+function isAsyncDecl(d: ts.FunctionDeclaration): boolean {
+  return (ts.getModifiers(d) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+}
+
 const hasRetSites = new WeakMap<ReadonlySet<string>, boolean>();
 
 /** S125 A1: a direct call of a function whose RESULT is on the dynamic arm
  * (a declaration, or a binding of a function literal, with a `ret:` site):
  * the call answers the dynamic value itself. */
-function armResultCall(L: Lowerer, call: ts.CallExpression): boolean {
+function armResultCall(L: Lowerer, call: ts.CallExpression, awaited = false): boolean {
   if (L.dynArmSites.size === 0) return false;
   let has = hasRetSites.get(L.dynArmSites);
   if (has === undefined) {
@@ -113,8 +118,10 @@ function armResultCall(L: Lowerer, call: ts.CallExpression): boolean {
   const sym = L.resolveValueSymbol(callee);
   if (sym === null) return false;
   for (const d of L.checker.declarationsOf(sym)) {
-    if (ts.isFunctionDeclaration(d) && dynArmResult(L, d)) return true;
-    if (ts.isVariableDeclaration(d) && d.initializer !== undefined) {
+    // (L) an async function's call is its promise; `await` of it is the
+    // dynamic value (armRooted's AwaitExpression case).
+    if (ts.isFunctionDeclaration(d) && dynArmResult(L, d)) return isAsyncDecl(d) === awaited;
+    if (!awaited && ts.isVariableDeclaration(d) && d.initializer !== undefined) {
       const init = stripParens(d.initializer);
       if ((ts.isArrowFunction(init) || ts.isFunctionExpression(init)) && dynArmResult(L, init)) return true;
     }
@@ -156,6 +163,11 @@ export function armRooted(L: Lowerer, node: ts.Node): boolean {
   if (ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)) return armRooted(L, node.expression);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return armRooted(L, node.expression);
   if (ts.isCallExpression(node)) return armRooted(L, stripParens(node.expression)) || armResultCall(L, node);
+  // (L) `await f(…)` of an async function on the result arm (dyn-arm-async.ts).
+  if (ts.isAwaitExpression(node)) {
+    const call = stripParens(node.expression);
+    return ts.isCallExpression(call) && armResultCall(L, call, true);
+  }
   // (K) a conditional or logical expression whose operand's exit was
   // refused (dyn-arm-exits.ts armChainTop) is the dynamic value itself.
   if (ts.isConditionalExpression(node)) return isDynArmSite(L, node) || armRooted(L, node.whenTrue) || armRooted(L, node.whenFalse);
@@ -163,6 +175,8 @@ export function armRooted(L: Lowerer, node: ts.Node): boolean {
   // to TypeScript, so it builds the dynamic object (its keys in the
   // spread's own order), never a typed record read field by field.
   if (ts.isObjectLiteralExpression(node)) {
+    // (L) an options bag on the arm is the dynamic object (dyn-arm-bag.ts).
+    if (armBag(L, node)) return true;
     return node.properties.some((p) => ts.isSpreadAssignment(p) && armRooted(L, p.expression) && armStored(L, p.expression));
   }
   if (ts.isBinaryExpression(node)) {

@@ -27,19 +27,25 @@
  *     expression is itself in one of the slots above: the key of that
  *     outermost expression, which the next pass lowers as a dynamic value
  *     (dyn-arm-rooted.ts armRooted) — its slot then takes the arm through
- *     its own exit.
- * Fields and elements never take the arm (decision J4).
+ *     its own exit;
+ *   - (L) a field of an object literal passed directly to a plain
+ *     function, the literal's own key: the next pass builds the whole
+ *     literal as the dynamic object (dyn-arm-bag.ts).
+ * Fields and elements never take the arm themselves (decision J4).
  *
  * And the exact-fit guard (S128 (a2)/(a3)): a copy taken FROM a value on
  * the arm, or at a slot whose arm did not build, copies only a value of
  * exactly its type's shape and stops by name otherwise. */
 import * as ts from "../ts7/adapter.js";
-import { BOOL, JSVAL, type IrExpr } from "../../ir/nodes.js";
+import { BOOL, JSVAL, type IrExpr, type SrcLoc } from "../../ir/nodes.js";
 import { typeKey } from "../types.js";
 import type { Lowerer } from "./lowerer.js";
 import { jsonDocCopyDrops } from "./lower-exprs.js";
 import { armableBinding, constPatternBinding, deferredLetBinding, dynArmKey, forOfConstBinding, isDynArmSite, packageCallResult } from "./dyn-arm.js";
 import { armRooted } from "./dyn-arm-rooted.js";
+import { bagLiteralOf } from "./dyn-arm-bag.js";
+import { asyncArmBlocker, asyncDecl, asyncResultArmable } from "./dyn-arm-async.js";
+import { noteArmFailure } from "./arm-failures.js";
 
 /** The parent of `n`, past parentheses and non-null assertions (neither
  * changes the value), with the child it was reached from. */
@@ -139,10 +145,10 @@ function armChainTop(L: Lowerer, n: ts.Node): ts.Node {
   }
 }
 
-/** The plain function (a declaration or function literal; not generic,
- * async or a generator) whose result `n` is: the value of one of its
+/** The plain function (a declaration or function literal; not generic or
+ * a generator, and async only as dyn-arm-async.ts admits) whose result `n` is: the value of one of its
  * `return`s, or an arrow's expression body. */
-function plainResultOf(n: ts.Node, up: ts.Node | undefined): ts.FunctionLikeDeclaration | null {
+function plainResultOf(L: Lowerer, n: ts.Node, up: ts.Node | undefined): ts.FunctionLikeDeclaration | null {
   let fn: ts.Node | undefined;
   if (up !== undefined && ts.isReturnStatement(up)) {
     fn = up.parent;
@@ -152,8 +158,25 @@ function plainResultOf(n: ts.Node, up: ts.Node | undefined): ts.FunctionLikeDecl
     fn = up;
   }
   if (fn === undefined || !(ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn))) return null;
-  if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined || (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
+  if (fn.typeParameters !== undefined || fn.asteriskToken !== undefined) return null;
+  // (L) an async function declaration whose every call is awaited in place
+  // (dyn-arm-async.ts); other async functions keep their typed promise.
+  if ((ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) && !asyncResultArmable(L, fn)) return null;
   return fn;
+}
+
+/** M0 for (L): the async function declaration whose result `n` is (a
+ * `return`'s value) when a use of it keeps its result off the arm — the
+ * refusal then says which use. */
+function noteAsyncBlocker(L: Lowerer, n: ts.Node, at: SrcLoc[]): void {
+  let up = parentPastParens(n);
+  while (up !== undefined && (ts.isAsExpression(up) || ts.isTypeAssertion(up) || ts.isNonNullExpression(up) || ts.isParenthesizedExpression(up))) up = up.parent;
+  if (up === undefined || !ts.isReturnStatement(up)) return;
+  let fn: ts.Node | undefined = up.parent;
+  while (fn !== undefined && !ts.isFunctionLike(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+  if (fn === undefined || !asyncDecl(fn)) return;
+  const why = asyncArmBlocker(L, fn);
+  if (why !== null) noteArmFailure(L, at, "async", why);
 }
 
 /** (K) The `let` a plain `x = value` statement assigns `value` to, when
@@ -225,7 +248,7 @@ function directSlot(L: Lowerer, n: ts.Node, up: ts.Node | undefined, node: ts.No
   // checks only where it must enter typed storage. (The result's exit
   // keeps the exact-fit guard — a copy taken from an arm value, or at a
   // `ret:` slot whose arm did not build.)
-  const retFn = plainResultOf(n, up);
+  const retFn = plainResultOf(L, n, up);
   if (retFn !== null) return { key: `ret:${dynArmKey(retFn)}`, retFn };
   // (K) A cast already on the arm whose value a deferred `let` is assigned
   // (`cfg = u as T`): its exit now lands in the `let`.
@@ -244,6 +267,11 @@ function directSlot(L: Lowerer, n: ts.Node, up: ts.Node | undefined, node: ts.No
   // (K) a deferred `let`, assigned by a plain `=` statement.
   const letDecl = deferredLetAssigned(L, n);
   if (letDecl !== null) return { key: `let:${dynArmKey(letDecl.name)}`, retFn: null };
+  // (L) a field of an options-bag literal passed directly to a plain
+  // function: the slot is the literal itself, which the next pass builds as
+  // the dynamic object (dyn-arm-bag.ts).
+  const bag = bagLiteralOf(L, n);
+  if (bag !== null) return { key: dynArmKey(bag), retFn: null };
   return null;
 }
 
@@ -261,6 +289,7 @@ export function noteDynArmExit(L: Lowerer, exit: IrExpr, node: ts.Node): IrExpr 
   const armable = slot !== null;
   const retFn = slot?.retFn ?? null;
   if (armable) L.dynArmExitNodes.set(exit, key);
+  if (retFn === null) noteAsyncBlocker(L, n, [exit.loc]);
   // pc-json: a copy of a JSON document held as the dynamic value (the
   // documents are known at build time) that would drop a key the document
   // holds takes the dynamic arm in the next pass where the slot can hold

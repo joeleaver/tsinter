@@ -27,6 +27,7 @@ import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncN
 import { isDynArmSite } from "./dyn-arm.js";
 import { armCast, armRetCast } from "./dyn-arm-rooted.js";
 import { noteDynArmExit } from "./dyn-arm-exits.js";
+import { armBag } from "./dyn-arm-bag.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { tupleCastToArray, tupleUnderArrayType } from "./tuple-array-casts.js";
 import { lowerTupleLength } from "./tuple-length.js";
@@ -1203,6 +1204,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // (One with a runtime computed key — a symbol key — builds through
         // the runtime-keyed dynamic literal below instead: the island
         // literal has no computed-key form.)
+        // S125-L (M4): an options bag on the dynamic arm is the dynamic
+        // object Node builds (dyn-arm-bag.ts).
+        if (ts.isObjectLiteralExpression(expr) && L.sharedDynamic && armBag(L, expr)) return true;
         if (L.es5 !== null && L.es5.lits.has(expr)) {
           return !(ts.isObjectLiteralExpression(expr) && L.sharedDynamic && !L.engine && expr.properties.some((p) => {
             const n = ts.isSpreadAssignment(p) ? undefined : p.name;
@@ -10194,8 +10198,10 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
     // `as any` / `as unknown` on the one-world lanes (jsval targets): the
     // same value under the island type — erasure (design §4.1, probe c1).
     if (target.kind === "jsval") return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
-    // Unit U2a (dyn-arm.ts): a cast S125 (c) refused is the dynamic value.
-    if (L.copiesOnCrossing(target) && isDynArmSite(L, expr)) return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
+    // Unit U2a (dyn-arm.ts): a cast S125 (c) refused is the dynamic value;
+    // so is one a function on the result arm returns (S125 A1, (L): its
+    // exit was judged at the operand and keyed on the function).
+    if (L.copiesOnCrossing(target) && (isDynArmSite(L, expr) || armRetCast(L, expr))) return { kind: "jsMarshal", value: inner, type: JSVAL, loc: locOf(expr) };
     return lowerDynCastTo(L, expr, inner, target);
   }
 

@@ -16,8 +16,10 @@ import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import type { Lowerer } from "./lowerer.js";
 
 /** What was tried at the site: the dynamic arm (U2a, A4) or S125 (a)'s
- * instance typed by the argument's own type. */
-export type ArmTry = "arm" | "share";
+ * instance typed by the argument's own type — or (L) the async result arm,
+ * which a use of the function other than `await f(…)` keeps from being
+ * taken (dyn-arm-async.ts). */
+export type ArmTry = "arm" | "share" | "async";
 
 /** Why an attempt did not lower: the first diagnostic's code and
  * message, and where it was reported — kept apart so the note can name
@@ -63,6 +65,7 @@ export function noteArmFailure(L: Lowerer, locs: SrcLoc[], kind: ArmTry, why: Fa
 export function armFailureNote(L: Lowerer, loc: SrcLoc): string {
   const f = L.armFailures.get(siteKey(loc));
   if (f === undefined) return "";
+  if (f.kind === "async") return ` (the async function's result arm (S125 (L)) was not taken: ${f.why.text}${where(loc, f.why)})`;
   const what = f.kind === "arm" ? "the dynamic arm" : "the instance that shares the object (S125 (a))";
   return ` (${what} was tried here and did not lower: ${f.why.text}${where(loc, f.why)})`;
 }

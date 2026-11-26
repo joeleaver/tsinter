@@ -11326,11 +11326,63 @@ the slot holds the dynamic value as a `const` binding on the arm does.
   the parameter typed `any`), and picks its default on the dynamic
   `undefined` — the default is then the dynamic value too. A call without
   the argument keeps the typed function.
+**Amendment (L) — options bags and async results (2026-11-26, unit S125-L
+of docs/design/s125-copy-family.md, M4 and M5; Joe's decisions of that
+day: Q2 accepted, J4 kept).** Two more slots share a dynamic value where
+(c) refused its copy, each falling back to that refusal, by name, when
+the arm does not build. Typed record fields and array elements still
+never hold a dynamic value (J4): a value stored into one keeps its
+refusal.
+- **An options bag passed directly to a plain function.** An object
+  literal that is a direct argument of a direct call of a plain function
+  declaration (`seed({ sourceConfig, targetConfig, n: 1 })`), one of
+  whose field values' copies is refused, is built as the dynamic object
+  Node builds, and the callee's per-call-site instance (S125 (a)) binds
+  that parameter on the arm, so the callee reads and writes the very
+  object the caller built. A dynamic field value enters as itself; a
+  typed field value enters as its live view (S115's unit H), so a write
+  through the bag reaches the caller's value and the caller sees it. The
+  values evaluate left to right, the keys are the literal's own in its
+  order, and an `undefined`-valued key is an own key (`in`, `Object.keys`,
+  printing): S091's rule for a typed record, which drops an optional key
+  holding `undefined`, does not apply, as the bag is not a typed record.
+  `JSON.stringify` of the bag is Node's. Left typed, the field's copy
+  keeping its refusal: a literal with a spread, a computed key, a method,
+  an accessor or a `__proto__` key; a literal any of whose field values is
+  or holds a class instance (decision Q1: it would cross by copy); a
+  literal anywhere else (nested in another literal, a method's or an
+  imported generic's argument, returned or stored: J4); and a callee whose
+  instance cannot bind the parameter (generic, declared in a declaration
+  file, reading `arguments`, or a rest, optional or destructured parameter
+  at the literal's position). A bag the callee stores into a binding of
+  its own type keeps that store's refusal.
+- **An async plain function's result.** An async function declaration
+  (not generic, not a generator) whose `return` copy is refused takes
+  U2's result arm as a sync one does (`ret:`): its result is a promise of
+  the dynamic value, settling with the very object the body returned
+  (`return value as Json` with `value` from `JSON.parse` or a package),
+  and `await f(…)` is that value at each caller, so a binding of it, a
+  deferred `let` assigned it, or a direct call's argument holds the
+  object itself. A rejection reaches the caller's `catch` as in Node. The
+  arm is taken only when every reference to the function, in every module
+  (through an import's alias too), is a direct call awaited in place,
+  so the promise means one thing wherever it is seen. Any other use —
+  `f().then(…)`, `Promise.all([f(), …])`, `return f()`, `const p = f()`,
+  the function passed or stored as a value — keeps the typed promise, and
+  the `return`'s refusal names that use: `(the async function's result
+  arm (S125 (L)) was not taken: 'f' is used other than as \`await f(…)\`
+  [file:line])`. An awaited result pushed into an array or stored into a
+  record field keeps its copy's refusal (J4).
+- **A cast of an `unknown` value as a plain function's result.** A
+  `return value as T` whose operand is `unknown` (no conversion, only a
+  checked copy) now takes the result arm as `return value` of an `any`
+  does; before (L) its copy refused although the arm could hold it.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
 both lanes); `packages/compiler/test/wasm-s125-fstw-options.test.ts` (S125-O-*,
 both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*,
 both lanes); `packages/compiler/test/wasm-s125-k-reach.test.ts` (S125-K-*,
+both lanes); `packages/compiler/test/wasm-s125-l-reach.test.ts` (S125-L-*,
 both lanes); `packages/compiler/test/wasm-any-array-shared.test.ts`
 (H-EXIT-13, a deferred `let` assigned a parameter's dynamic value, which
 refused before (K)); `packages/compiler/test/npm-declared-dynamic.test.ts`
@@ -11387,6 +11439,10 @@ whatever its shape. On these lanes the CONTAINED slots do the same:
   contained, a name of a `const` destructuring pattern, a module global
   initialized by a package's call, and a defaulted parameter of a plain
   function;
+- *(amended 2026-11-26, S125's amendment (L))* an object literal passed
+  directly to a plain function, built as a dynamic object whose typed
+  field values are live views, and the result of an async plain function
+  every reference to which is `await f(…)`;
 - and, inside them, an unannotated callback parameter of a method called
   on such a value (`xs.map((x) => typeof x)` hands `x` whatever the array
   holds).

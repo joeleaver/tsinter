@@ -166,7 +166,7 @@ lowerable from S125 work alone, as the cascade analysis shows.
 
 ## 5. Rows and SEMANTICS amendments
 
-New rows go in `packages/compiler/test/wasm-s125-reach.test.ts` (S125-K's in `wasm-s125-k-reach.test.ts`) (with `u3u4-rows.ts`),
+New rows go in `packages/compiler/test/wasm-s125-reach.test.ts` (S125-K's in `wasm-s125-k-reach.test.ts`, S125-L's in `wasm-s125-l-reach.test.ts`) (with `u3u4-rows.ts`),
 each run against Node on wasm and wasm-native:
 
 - **S125-J-01..04.** `parseEnum(v, MODES)` with an `as const` tuple runs, while
@@ -203,6 +203,21 @@ SEMANTICS.md S125 amendments, written before each merge:
   on the arm. Fields and elements stay under J4.
 
 ## 6. Open questions for Joe
+
+**Decisions (Joe, 2026-11-26), recorded with unit S125-L:**
+
+- **Q1 (J4): kept.** Typed record fields and array elements never hold dynamic values; a
+  value stored into one keeps its refusal by name. That includes a class-instance field in
+  an options bag: its value would cross into the bag by copy, so the bag stays typed and
+  the field's copy keeps its refusal (row S125-L-06).
+- **Q2: accepted.** An options-bag literal passed directly to a plain function becomes an
+  island literal (a dynamic object) when one of its fields would otherwise copy an arm
+  value (M4, SEMANTICS.md S125 amendment (L)).
+- **Q3: per responsibility.** Each unit moves out of `lowerer.ts` and `lower-calls.ts` only
+  the responsibility it touches; S125-L's new code lives in `dyn-arm-bag.ts` (M4) and
+  `dyn-arm-async.ts` (M5).
+
+The questions as they were put:
 
 1. **J4: should typed record fields and array elements be able to hold dynamic values?**
    If yes, about 7 more paperclip sites run (plus G5's stored results). The cost is that

@@ -938,8 +938,9 @@ export function collectSignatureInner(L: Lowerer, decl: ts.FunctionDeclaration):
       L.badType(nameBlame, L.typeOf(nameBlame));
     }
     // S125 A1: a plain function whose result copy was refused at a `return`
-    // returns on the dynamic arm in this pass (dyn-arm.ts `ret:` sites).
-    if (!isAsync && !isGenerator && returnType.kind !== "void") {
+    // returns on the dynamic arm in this pass (dyn-arm.ts `ret:` sites);
+    // (L) an async one returns `Promise<jsval>` (dyn-arm-async.ts).
+    if (!isGenerator && returnType.kind !== "void") {
       const armRet = dynArmResultType(L, decl);
       if (armRet !== null) returnType = armRet;
     }

@@ -49,6 +49,7 @@ import { DYN, JSVAL, type IrExpr, type IrStmt, type IrType } from "../../ir/node
 import { asDynOperand } from "./lower-exprs.js";
 import { isJsSourceFile } from "../program.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
+import { asyncResultArmable } from "./dyn-arm-async.js";
 
 
 /** The key of a source node across lowering passes (one ts.Program). */
@@ -298,7 +299,8 @@ export function dynArmResult(L: Lowerer, fn: ts.Node): boolean {
 }
 
 /** The result type of a function literal on the result arm (a plain,
- * non-async, non-generator function): the dynamic value — `dyn` in a
+ * non-generator function; (L) an async one only as dyn-arm-async.ts
+ * admits it, its result the promise of the dynamic value): the dynamic value — `dyn` in a
  * JavaScript source (S014's U1b storage rule), `jsval` otherwise. Null when
  * the literal's result is not on the arm. The type mapper asks this for
  * every function type whose signature the literal declares, so a binding,
@@ -306,8 +308,14 @@ export function dynArmResult(L: Lowerer, fn: ts.Node): boolean {
 export function dynArmResultType(L: Lowerer, fn: ts.Node): IrType | null {
   if (!dynArmResult(L, fn)) return null;
   if (!(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn))) return null;
-  if (fn.asteriskToken !== undefined || fn.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true) return null;
-  return isJsSourceFile(fn.getSourceFile()) ? DYN : JSVAL;
+  if (fn.asteriskToken !== undefined) return null;
+  const value: IrType = isJsSourceFile(fn.getSourceFile()) ? DYN : JSVAL;
+  // (L) an async function declaration every reference to which awaits its
+  // call: the promise of the dynamic value (dyn-arm-async.ts).
+  if (fn.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true) {
+    return asyncResultArmable(L, fn) ? { kind: "promise", inner: value } : null;
+  }
+  return value;
 }
 
 /** Registers every binding and parameter this pass's sites put on the
