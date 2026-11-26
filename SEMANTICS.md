@@ -11284,14 +11284,18 @@ the slot holds the dynamic value as a `const` binding on the arm does.
   S115's unit H), so each assignment stores the very object and `===`,
   writes from either side, printing, JSON and key order are Node's. A
   `let` also written by a compound assignment (`??=`, `+=`), `++`/`--`, a
-  destructuring assignment or as a loop's target, a module-scope `let`,
-  and a `let` given a value that holds a class instance (its initializer
-  or any write: the instance would cross as its class view, whose members
-  the program's reachability, found before the arm rounds, never saw) keep
-  the typed slot and its refusal (SC2002, or S125's copy refusal). No other
-  (K) form takes a typed class instance: a conditional's other operands
-  are fresh literals or dynamic, and a defaulted parameter's class default
-  keeps SC2002.
+  destructuring assignment or as a loop's target, and a module-scope
+  `let` keep the typed slot and its refusal (SC2002, or S125's copy
+  refusal). A class instance assigned to an armed `let` (through
+  `as unknown as`, an `unknown` binding or a package's result) crosses as
+  its class view, whose methods and getters run on the instance itself;
+  the program's reachability, found before the arm rounds with no arm
+  taken, is extended with the members a pass's views reference, and that
+  pass lowers again. Printing such an instance stops at S115's named
+  fence, as for any class instance held as a dynamic value. A class
+  instance meeting the typed slot directly (`let c: Cfg = new G()`, a
+  conditional's class arm, a defaulted parameter's class default) never
+  arms and keeps main's refusal (SC2002, or S125's copy refusal).
 - **An operand of `?:`, `??`, `||` or `&&` in a contained slot.** Where an
   operand's copy is refused and every other value operand is fresh (a
   literal made only of literals, `null`, `undefined`) or already dynamic
@@ -11325,8 +11329,9 @@ the slot holds the dynamic value as a `const` binding on the arm does.
 **Tested by:** `packages/compiler/test/wasm-s125-share.test.ts` (S125-*,
 both lanes); `packages/compiler/test/wasm-s125-frozen.test.ts` (S125-Z-*,
 both lanes); `packages/compiler/test/wasm-s125-fstw-options.test.ts` (S125-O-*,
-both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*
-and S125-K-*, both lanes); `packages/compiler/test/wasm-any-array-shared.test.ts`
+both lanes); `packages/compiler/test/wasm-s125-reach.test.ts` (S125-J-*,
+both lanes); `packages/compiler/test/wasm-s125-k-reach.test.ts` (S125-K-*,
+both lanes); `packages/compiler/test/wasm-any-array-shared.test.ts`
 (H-EXIT-13, a deferred `let` assigned a parameter's dynamic value, which
 refused before (K)); `packages/compiler/test/npm-declared-dynamic.test.ts`
 (DD-12, a module global holding a package's result).

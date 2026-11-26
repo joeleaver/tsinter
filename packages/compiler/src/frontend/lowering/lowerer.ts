@@ -111,6 +111,7 @@ import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorCla
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
 import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
 import { dynboxClosure } from "./width-instances.js";
+import { runArmRounds, type ArmPassFn } from "./arm-rounds.js";
 import type { ArmFailures } from "./arm-failures.js";
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
 import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
@@ -544,7 +545,9 @@ export interface LowererMode {
  *    generic instances, lifted lambdas), skipping bodies the discovery
  *    pass did not mark. Keeping the emit order (and lambda/instance
  *    numbering) identical to the pre-reachability compiler means a fully
- *    reachable program emits byte-identical C.
+ *    reachable program emits byte-identical C. An emit pass that
+ *    references a body discovery did not mark (an arm round's class view,
+ *    lowered only there) re-runs discovery seeded with it and lowers again.
  *
  * `coverage: true` adds a third pass — the REMAINDER — that lowers only
  * the bodies discovery did NOT mark (plus deferred collection diagnostics
@@ -570,10 +573,6 @@ function isProducerInit(e: ts.Expression): boolean {
   while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isTypeAssertion(cur) || ts.isNonNullExpression(cur)) cur = cur.expression;
   return ts.isAwaitExpression(cur) || ts.isCallExpression(cur);
 }
-
-/** How many further passes U2a's dynamic arm may take (each adds the
- * crossings the previous one's S125 (c) judgement refused). */
-const DYN_ARM_ROUNDS = 6;
 
 export function lowerToIr(
   program: ts.Program,
@@ -625,112 +624,54 @@ export function lowerToIr(
   // as ordinary TypeScript. FFI-free builds reuse the validation lowerer
   // (validation is an immediate no-op there), retaining the historical
   // two-pass construction cost.
-  const discovery = ffiImports.length === 0
-    ? validation
-    : new Lowerer(program, entry, moduleOrder, dynamic, {
+  const discovery = (): Lowerer => new Lowerer(program, entry, moduleOrder, dynamic, {
+    targetPlatform,
+    hostFetch,
+    undefSlots,
+    sharedDynamic,
+    ffiImports,
+    ...(ffiImports.length === 0 ? {} : { ffiBindingSymbols: ffiValidation.symbolsByName }),
+  });
+  const reachRoots = [...(options.libRoots ?? [])];
+  let reachable = (ffiImports.length === 0 ? validation : discovery()).discover(reachRoots);
+  const armFailures: ArmFailures = new Map();
+  const pass: ArmPassFn = (dynArmSites, noSpec, exactSites) => {
+    for (;;) {
+      const l = new Lowerer(program, entry, moduleOrder, dynamic, {
+        reachable,
         targetPlatform,
         hostFetch,
         undefSlots,
         sharedDynamic,
+        startupCrash,
         ffiImports,
         ffiBindingSymbols: ffiValidation.symbolsByName,
+        dynArmSites,
+        noSpec,
+        exactSites,
+        armFailures,
       });
-  const reachable = discovery.discover(options.libRoots);
-  // Unit U2a (dyn-arm.ts): a dynamic value entering a contained typed slot
-  // takes the dynamic arm in a further pass — every crossing S125 (c)
-  // refused (until no new one appears), and the judged copies it accepted.
-  // Unit U2b: a pass whose speculative bindings fail to lower retries with
-  // them bound by an exact-fit copy (noSpec). A slot whose arm did not build
-  // falls back to the last pass that built, with that slot's copy taking only
-  // exactly-fitting values (exactSites): never a silent width copy where
-  // the arm was meant (SEMANTICS.md S128 (a3)).
-  const armFailures: ArmFailures = new Map();
-  const pass = (dynArmSites: ReadonlySet<string>, noSpec: ReadonlySet<string>, exactSites: ReadonlySet<string>): { emit: Lowerer; result: LowerResult; ok: boolean } => {
-    const l = new Lowerer(program, entry, moduleOrder, dynamic, {
-      reachable,
-      targetPlatform,
-      hostFetch,
-      undefSlots,
-      sharedDynamic,
-      startupCrash,
-      ffiImports,
-      ffiBindingSymbols: ffiValidation.symbolsByName,
-      dynArmSites,
-      noSpec,
-      exactSites,
-      armFailures,
-    });
-    for (const d of dynamicCycleDiags) l.pushDiag(d);
-    for (const d of ffiValidation.diagnostics) l.pushDiag(d);
-    const r = l.run();
-    // A pass that took either arm must also validate: an IR mismatch it
-    // made falls back like a refusal.
-    const took = dynArmSites.size > 0 || l.specKeys.size > 0 || noSpec.size > 0 || exactSites.size > 0;
-    const ok = r.module !== null && (!took || validateModule(r.module).length === 0);
-    return { emit: l, result: r, ok };
-  };
-  let dynArmSites: Set<string> = new Set();
-  let noSpec: Set<string> = new Set();
-  let exactSites: Set<string> = new Set();
-  let emit: Lowerer;
-  let result: LowerResult;
-  let built: { emit: Lowerer; result: LowerResult; sites: Set<string>; noSpec: Set<string> } | null = null;
-  const seenSpec = new Set<string>();
-  let round0Spec = false;
-  for (let round = 0; ; round++) {
-    const p = pass(dynArmSites, noSpec, exactSites);
-    emit = p.emit;
-    result = p.result;
-    for (const k of emit.specKeys) seenSpec.add(k);
-    if (round === 0) round0Spec = emit.specKeys.size > 0;
-    if (p.ok) built = { emit, result, sites: dynArmSites, noSpec };
-    if (round >= DYN_ARM_ROUNDS) break;
-    if (p.ok) {
-      // A pass that builds may still hold refused crossings: a compiled
-      // package's JavaScript defers its S125 refusals to where they run
-      // (zod's module-load `NEVER`); those slots try the arm as well.
-      const soft = [...emit.dynArmSoft, ...emit.dynArmRetry].filter((k) => !dynArmSites.has(k));
-      if (soft.length === 0) break;
-      dynArmSites = new Set([...dynArmSites, ...soft]);
-      continue;
-    }
-    // A failed pass also tries its accepted copies on the arm: the typed
-    // copy may be what the failing construct needed (`t.length = 0`).
-    const fresh = [...emit.dynArmRetry, ...emit.dynArmSoft].filter((k) => !dynArmSites.has(k));
-    if (fresh.length > 0) {
-      dynArmSites = new Set([...dynArmSites, ...fresh]);
-      continue;
-    }
-    const spec = (emit.specRetry.size > 0 ? [...emit.specRetry] : [...emit.specKeys]).filter((k) => !noSpec.has(k));
-    if (spec.length > 0) {
-      noSpec = new Set([...noSpec, ...spec]);
-      continue;
-    }
-    break;
-  }
-  // Nothing built: the arms may have been what failed (a site found under
-  // speculation that the eager copy never needed) — no arm, every
-  // speculative binding an exact-fit copy.
-  if (built === null && round0Spec) {
-    const allSpec = new Set([...noSpec, ...seenSpec]);
-    const p = pass(new Set(), allSpec, new Set());
-    if (p.ok) built = { emit: p.emit, result: p.result, sites: new Set(), noSpec: allSpec };
-  }
-  // A later pass's arms failed: the slots they tried and the pass that built
-  // left as copies take only exactly-fitting values.
-  if (built !== null && built.result !== result) {
-    const failed = new Set([...dynArmSites].filter((k) => !built!.sites.has(k)));
-    if (failed.size > 0) {
-      const p = pass(built.sites, built.noSpec, failed);
-      if (p.ok) {
-        built = { emit: p.emit, result: p.result, sites: built.sites, noSpec: built.noSpec };
-        exactSites = failed;
+      for (const d of dynamicCycleDiags) l.pushDiag(d);
+      for (const d of ffiValidation.diagnostics) l.pushDiag(d);
+      const r = l.run();
+      // The pass referenced a body discovery never reached: discovery
+      // lowers with no arm, so a class instance stored into an armed slot
+      // reaches its members only through the slot's class view (S125
+      // amendment (K)). Those bodies join the reachable set, from a fresh
+      // discovery seeded with them, and the pass lowers again.
+      if (l.missedEdges.size > 0) {
+        reachRoots.push(...l.missedEdges);
+        reachable = discovery().discover(reachRoots);
+        continue;
       }
+      // A pass that took either arm must also validate: an IR mismatch it
+      // made falls back like a refusal.
+      const took = dynArmSites.size > 0 || l.specKeys.size > 0 || noSpec.size > 0 || exactSites.size > 0;
+      const ok = r.module !== null && (!took || validateModule(r.module).length === 0);
+      return { emit: l, result: r, ok };
     }
-    ({ emit, result } = built);
-    dynArmSites = built.sites;
-    noSpec = built.noSpec;
-  }
+  };
+  const { emit, result, dynArmSites, noSpec, exactSites } = runArmRounds(pass);
   if (options.coverage !== true) return result;
   const remainder = new Lowerer(program, entry, moduleOrder, dynamic, {
     reachable,
@@ -2012,6 +1953,9 @@ export class Lowerer {
    * a reference to a lowerable body reports its name here — recorded even
    * when the enclosing statement later poisons. */
   onEdge: ((name: string) => void) | null = null;
+  /** Emit-pass edges to bodies outside `reachable` (see noteEdge):
+   * lowerToIr extends reachability with them and lowers the pass again. */
+  readonly missedEdges = new Set<string>();
 
   // Stack of function contexts (bottom = the function being declared at
   // top level, top = the innermost nested function currently lowering).
@@ -3561,9 +3505,17 @@ export class Lowerer {
   }
 
   /** Discovery hook (see discover): fires when lowering resolves a
-   * reference to a lowerable body. Inert in the emit pass. */
+   * reference to a lowerable body. In the emit pass it records a body the
+   * discovery pass did not reach (missedEdges). */
   noteEdge(name: string): void {
     if (this.onEdge) this.onEdge(name);
+    else if (this.recordsMissedEdges() && !this.reachable!.has(name)) this.missedEdges.add(name);
+  }
+
+  /** An emit pass over a reachable set (not discovery, not the coverage
+   * remainder, whose bodies are by definition outside it). */
+  private recordsMissedEdges(): boolean {
+    return this.reachable !== null && !this.remainder;
   }
 
   /** Discovery hook for virtual dispatch: a virtualCall on `info`'s static
@@ -3572,7 +3524,7 @@ export class Lowerer {
    * this call site; a virtualCall through their own static classes marks
    * them). */
   noteVirtualEdge(info: ClassInfo, method: string): void {
-    if (!this.onEdge) return;
+    if (!this.onEdge && !this.recordsMissedEdges()) return;
     const above = this.findMethodOn(info, method);
     if (above) this.noteEdge(`%${above.declarer.def.name}.${method}`);
     const below = (c: ClassInfo): void => {

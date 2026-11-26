@@ -166,7 +166,7 @@ lowerable from S125 work alone, as the cascade analysis shows.
 
 ## 5. Rows and SEMANTICS amendments
 
-New rows go in `packages/compiler/test/wasm-s125-reach.test.ts` (with `u3u4-rows.ts`),
+New rows go in `packages/compiler/test/wasm-s125-reach.test.ts` (S125-K's in `wasm-s125-k-reach.test.ts`) (with `u3u4-rows.ts`),
 each run against Node on wasm and wasm-native:
 
 - **S125-J-01..04.** `parseEnum(v, MODES)` with an `as const` tuple runs, while

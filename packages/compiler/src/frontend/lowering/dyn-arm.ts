@@ -167,11 +167,7 @@ export function forOfConstBinding(id: ts.Node): boolean {
  * declaration, `let:`): where S125 (c) refuses one, the next pass gives the
  * binding the dynamic value's storage, and every assignment stores its
  * value as it is (an assignment statement's result is unused, so nothing
- * else observes the stored form). A `let` given a value that holds a class
- * instance (its initializer or any write) stays typed: the instance would
- * cross as its class view, whose members reachability (computed before the
- * arm rounds) never saw, so the typed slot's own rules (SC2002, S125's
- * copy refusal) judge it as before (K). */
+ * else observes the stored form). */
 export function deferredLetBinding(L: Lowerer, decl: ts.VariableDeclaration): boolean {
   if (!ts.isIdentifier(decl.name)) return false;
   const list = decl.parent;
@@ -187,31 +183,12 @@ export function deferredLetBinding(L: Lowerer, decl: ts.VariableDeclaration): bo
       if (!ok) return;
       if (ts.isIdentifier(n) && n !== decl.name && L.checker.getSymbolAtLocation(n) === sym) {
         if (!plainReadOrStatementWrite(n)) ok = false;
-        else if (ts.isBinaryExpression(n.parent) && n.parent.left === n && holdsClassInstance(L, n.parent.right)) ok = false;
       } else ts.forEachChild(n, visit);
     };
-    if (decl.initializer !== undefined && holdsClassInstance(L, decl.initializer)) ok = false;
     visit(decl.getSourceFile());
   }
   L.deferredLets.set(decl, ok);
   return ok;
-}
-
-/** Does `value`'s static type hold a class instance anywhere (itself, a
- * union arm, a field or an element)? */
-function holdsClassInstance(L: Lowerer, value: ts.Expression): boolean {
-  const seen = new Set<string>();
-  const holds = (t: IrType | null): boolean => {
-    if (t === null) return false;
-    if (t.kind === "object") return true;
-    if (t.kind === "array") return holds(t.elem);
-    if (t.kind === "union") return (L.unions.get(t.unionId)?.arms ?? []).some(holds);
-    if (t.kind !== "record" || seen.has(t.shapeId)) return false;
-    seen.add(t.shapeId);
-    const shape = L.shapes.get(t.shapeId);
-    return shape !== undefined && (shape.fields.some((f) => holds(f.type)) || (shape.indexValue !== undefined && holds(shape.indexValue)));
-  };
-  return holds(L.mapTypeOf(L.typeOf(value)));
 }
 
 /** A statement inside a function body (not at module scope). */
