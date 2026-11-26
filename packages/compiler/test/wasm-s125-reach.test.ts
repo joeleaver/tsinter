@@ -629,5 +629,46 @@ console.log(raw.list.length);` },
 const raw: any = JSON.parse('{"z":4,"b":true,"n":["x"],"a":false}');
 const out = canon(raw);
 console.log(JSON.stringify(out), Object.keys(out).join(","), raw.n.length);
-console.log(JSON.stringify(canon({ n: [], z: 1 })));` },
+console.log(JSON.stringify(canon({ n: [], z: 1 })));` },  // A class instance never takes the arm (its view's members are found
+  // before the arm rounds): each form keeps main's refusal by name.
+  { id: "S125-K-16 a deferred `let` assigned a class instance with methods on one path keeps its typed slot, refused by name", entry: "main.ts",
+    npmStatic: ["zk"], files: ZK, refused: /SC1090 a dynamic \('unknown', 'any' or 'object'\) value checked into '\{ a: number\[\]; name: string \}': it would be a COPY/,
+    src: `import { parseCfg, type Cfg } from "zk";
+class M { a: number[] = []; name = "m"; bump(): void { this.a.push(9); } }\nclass G { a: number[] = []; get name(): string { return "g"; } }\nfunction run(f: boolean): void {
+  let c: Cfg;
+  const m = new M();
+  if (f) c = parseCfg(JSON.parse('{"a":[1],"name":"n"}')); else c = m;
+  c.a.push(2);
+  console.log(m.a.length, c.a.length);
+}
+run(false); run(true);` },
+  { id: "S125-K-17 a deferred `let` initialized with a class instance with a getter keeps its typed slot, refused by name", entry: "main.ts",
+    npmStatic: ["zk"], files: ZK, refused: /SC2002 record shapes must match exactly or width-coerce: expected '\{ a: number\[\]; name: string \}', got 'G'/,
+    src: `import { parseCfg, type Cfg } from "zk";
+class M { a: number[] = []; name = "m"; bump(): void { this.a.push(9); } }\nclass G { a: number[] = []; get name(): string { return "g"; } }\nfunction run(f: boolean): void {
+  const g = new G();
+  let c: Cfg = g;
+  if (f) c = parseCfg(JSON.parse('{"a":[1],"name":"n"}'));
+  c.a.push(2);
+  console.log(g.a.length, c.name);
+}
+run(false); run(true);` },
+  { id: "S125-K-18 a `?:` with a class instance arm keeps its copy, refused by name", entry: "main.ts",
+    npmStatic: ["zk"], files: ZK, refused: /SC1090 a dynamic \('unknown', 'any' or 'object'\) value checked into '\{ a: number\[\]; name: string \}': it would be a COPY/,
+    src: `import { parseCfg, type Cfg } from "zk";
+class M { a: number[] = []; name = "m"; bump(): void { this.a.push(9); } }\nclass G { a: number[] = []; get name(): string { return "g"; } }\nfunction run(f: boolean): void {
+  const c: Cfg = f ? parseCfg(JSON.parse('{"a":[1],"name":"n"}')) : new M();
+  c.a.push(2);
+  console.log(c.a.length);
+}
+run(false); run(true);` },
+  { id: "S125-K-19 a defaulted parameter whose default is a class instance keeps its typed slot, refused by name", entry: "main.ts",
+    npmStatic: ["zk"], files: ZK, refused: /SC2002 record shapes must match exactly or width-coerce: expected '\{ a: number\[\]; name: string \}', got 'G'/,
+    src: `import { parseCfg, type Cfg } from "zk";
+class M { a: number[] = []; name = "m"; bump(): void { this.a.push(9); } }\nclass G { a: number[] = []; get name(): string { return "g"; } }\nfunction use(c: Cfg = new G()): void {
+  c.a.push(2);
+  console.log(c.a.length, c.name);
+}
+use(parseCfg(JSON.parse('{"a":[1],"name":"n"}')));
+use();` },
 ]);

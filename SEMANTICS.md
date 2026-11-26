@@ -11284,8 +11284,14 @@ the slot holds the dynamic value as a `const` binding on the arm does.
   S115's unit H), so each assignment stores the very object and `===`,
   writes from either side, printing, JSON and key order are Node's. A
   `let` also written by a compound assignment (`??=`, `+=`), `++`/`--`, a
-  destructuring assignment or as a loop's target, and a module-scope
-  `let`, keep the copy and its refusal.
+  destructuring assignment or as a loop's target, a module-scope `let`,
+  and a `let` given a value that holds a class instance (its initializer
+  or any write: the instance would cross as its class view, whose members
+  the program's reachability, found before the arm rounds, never saw) keep
+  the typed slot and its refusal (SC2002, or S125's copy refusal). No other
+  (K) form takes a typed class instance: a conditional's other operands
+  are fresh literals or dynamic, and a defaulted parameter's class default
+  keeps SC2002.
 - **An operand of `?:`, `??`, `||` or `&&` in a contained slot.** Where an
   operand's copy is refused and every other value operand is fresh (a
   literal made only of literals, `null`, `undefined`) or already dynamic
