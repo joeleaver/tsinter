@@ -100,6 +100,20 @@ function isAsyncDecl(d: ts.FunctionDeclaration): boolean {
 
 const hasRetSites = new WeakMap<ReadonlySet<string>, boolean>();
 
+/** The symbol a call's callee names: an identifier, through an import's
+ * alias ((K): the result arm is the function's own, whichever module calls
+ * it), or a member of a module namespace (`M.f` through `import * as M`,
+ * (L)), so every caller agrees with the function on its result. */
+function calleeFunctionSymbol(L: Lowerer, callee: ts.Expression): ts.Symbol | null {
+  if (ts.isIdentifier(callee)) return L.resolveValueSymbol(callee);
+  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.expression)) return null;
+  const alias = (s: ts.Symbol | undefined): ts.Symbol | undefined =>
+    s !== undefined && s.flags & ts.SymbolFlags.Alias ? L.checker.getAliasedSymbol(s) : s;
+  const recv = alias(L.checker.getSymbolAtLocation(callee.expression));
+  if (recv === undefined || !L.checker.declarationsOf(recv).some((d) => ts.isSourceFile(d))) return null;
+  return alias(L.checker.getSymbolAtLocation(callee.name)) ?? null;
+}
+
 /** S125 A1: a direct call of a function whose RESULT is on the dynamic arm
  * (a declaration, or a binding of a function literal, with a `ret:` site):
  * the call answers the dynamic value itself. */
@@ -111,11 +125,7 @@ function armResultCall(L: Lowerer, call: ts.CallExpression, awaited = false): bo
     hasRetSites.set(L.dynArmSites, has);
   }
   if (!has) return false;
-  const callee = stripParens(call.expression);
-  if (!ts.isIdentifier(callee)) return false;
-  // (K) through an import's alias: the result arm is the function's own,
-  // whichever module calls it.
-  const sym = L.resolveValueSymbol(callee);
+  const sym = calleeFunctionSymbol(L, stripParens(call.expression));
   if (sym === null) return false;
   for (const d of L.checker.declarationsOf(sym)) {
     // (L) an async function's call is its promise; `await` of it is the

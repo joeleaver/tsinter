@@ -17,6 +17,10 @@
  *     the literal's own, as in Node (S091's typed-record rule, which drops
  *     an optional key holding undefined, does not apply to a dynamic
  *     object), and its values evaluate left to right.
+ *   - an object or array literal nested in it (a field's value, an
+ *     element, at any depth) is fresh, so it is built as an island literal
+ *     too and keeps every key Node keeps (bagPart); one whose own form does
+ *     not fit leaves the whole bag typed.
  * The key is the literal's own (`dynArmKey(literal)`): the same key a
  * judged copy of the literal at its argument slot uses, so when the
  * callee's instance does not lower, that copy and its refusal come back by
@@ -73,7 +77,8 @@ function holdsClassInstance(L: Lowerer, t: IrType | null, seen = new Set<string>
 
 /** The literal's own form fits the island literal: only `name: value` and
  * shorthand entries under identifier or string keys, no value a class
- * instance. */
+ * instance, and every literal nested in it (a field's value, an element,
+ * at any depth: nestedForm) fitting too. */
 function bagForm(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
   for (const p of lit.properties) {
     if (ts.isShorthandPropertyAssignment(p)) {
@@ -82,15 +87,32 @@ function bagForm(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
       if (!(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) return false;
       if (p.name.text === "__proto__") return false;
     } else return false;
-    const value: ts.Node = ts.isShorthandPropertyAssignment(p) ? p.name : p.initializer;
-    try {
-      if (holdsClassInstance(L, L.mapTypeOf(L.typeOf(value)))) return false;
-    } catch (e) {
-      if (e instanceof PoisonError) return false;
-      throw e;
-    }
+    if (!valueFits(L, ts.isShorthandPropertyAssignment(p) ? p.name : p.initializer)) return false;
   }
   return true;
+}
+
+/** A value of the bag (or of a literal nested in it) fits: a nested object
+ * or array literal fits as a whole (it is built as an island literal too,
+ * keeping every key and element Node keeps: bagPart), any other value
+ * holds no class instance. */
+function valueFits(L: Lowerer, value: ts.Node): boolean {
+  const lit = stripParens(value);
+  if (ts.isObjectLiteralExpression(lit)) return bagForm(L, lit);
+  if (ts.isArrayLiteralExpression(lit)) {
+    return lit.elements.every((el) => !ts.isSpreadElement(el) && !ts.isOmittedExpression(el) && valueFits(L, el));
+  }
+  try {
+    return !holdsClassInstance(L, L.mapTypeOf(L.typeOf(value)));
+  } catch (e) {
+    if (e instanceof PoisonError) return false;
+    throw e;
+  }
+}
+
+function stripParens(n: ts.Node): ts.Node {
+  while (ts.isParenthesizedExpression(n)) n = n.expression;
+  return n;
 }
 
 /** The literal is a direct argument of a direct call of a plain function
@@ -124,4 +146,25 @@ export function bagLiteralOf(L: Lowerer, n: ts.Node): ts.ObjectLiteralExpression
  * (built as the island literal, its argument bound on the arm)? */
 export function armBag(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
   return isDynArmSite(L, lit) && bagCallSlot(L, lit) && bagForm(L, lit);
+}
+
+/** M4: is this object or array literal nested in an options bag on the
+ * dynamic arm (a field's value or an element, at any depth)? It is fresh —
+ * nothing but the bag holds it — so it is built as an island literal too:
+ * a typed view of it would answer the typed record's keys (S091), not the
+ * literal's own (`d: { e: undefined }` keeps `e`, as in Node). */
+export function bagPart(L: Lowerer, lit: ts.ObjectLiteralExpression | ts.ArrayLiteralExpression): boolean {
+  let child: ts.Node = lit;
+  let up = lit.parent;
+  while (up !== undefined && ts.isParenthesizedExpression(up)) {
+    child = up;
+    up = up.parent;
+  }
+  if (up === undefined) return false;
+  let holder: ts.Node | undefined;
+  if (ts.isPropertyAssignment(up) && up.initializer === child) holder = up.parent;
+  else if (ts.isArrayLiteralExpression(up)) holder = up;
+  if (holder === undefined) return false;
+  if (ts.isArrayLiteralExpression(holder)) return bagPart(L, holder);
+  return ts.isObjectLiteralExpression(holder) && (armBag(L, holder) || bagPart(L, holder));
 }

@@ -942,6 +942,11 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         }
       } else if (L.ctx.returnType.kind === "dyn") {
         value = dynUndefinedExpr(locOf(stmt));
+      } else if (L.ctx.returnType.kind === "jsval") {
+        // A dynamic result (an `any` one, or a function on the dynamic
+        // arm's result, S125 A1 / (L)) holds JS's undefined itself, as the
+        // implicit completion does (appendImplicitUndefinedReturn).
+        value = { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc: locOf(stmt) };
       } else if (L.ctx.returnType.kind !== "void") {
         L.unsupported(
           "SC1090",

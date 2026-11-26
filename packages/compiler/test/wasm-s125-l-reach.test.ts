@@ -149,6 +149,21 @@ function run(): void {
   console.log(config, kept);
 }
 run();` },
+  { id: 'S125-L-21 a literal nested in the bag keeps an `undefined`-valued key: `in`, Object.keys and printing match Node', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    src: `import { parseCfg, type Cfg } from "zk";
+const rc = (s: string): Cfg => parseCfg(JSON.parse(s));
+type O = { src: Cfg; d: { e: undefined | number } };
+function take(o: O): void { console.log(o, "e" in o.d, Object.keys(o.d)); }
+take({ src: rc('{"name":"s","a":[]}'), d: { e: undefined } });` },
+  { id: 'S125-L-22 literals nested in the bag at depth (an array of literals, a literal in a literal): the callee writes into them, keys and JSON match Node', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    src: `import { parseCfg, type Cfg } from "zk";
+type O = { src: Cfg; xs: { e?: number; f: string | undefined }[]; m: { k: { z: undefined } } };
+function take(o: O): void { o.xs.push({ f: "p" }); o.m.k.z = undefined; console.log(o, Object.keys(o.xs[0]!), JSON.stringify(o)); }
+function run(): void {
+  const src = parseCfg(JSON.parse('{"name":"s","a":[]}'));
+  take({ src, xs: [{ e: undefined, f: undefined }, { f: "x" }], m: { k: { z: undefined } } });
+}
+run();` },
 ]);
 
 defineRows("S125-L (M5): async results on the dynamic arm", [
@@ -327,6 +342,49 @@ async function main(): Promise<void> {
   d.w = 1;
   const e = await deps.load('{"q":1}');
   console.log(d, e, e === seen);
+}
+main();` },
+  { id: 'S125-L-17 the async function called through a module namespace inside `Promise.all` keeps its result typed (the reference is judged by symbol, not spelling)', entry: "main.ts", files: { "lib.ts": `import * as M from "./main.ts";
+export async function both(): Promise<number> { const r = await Promise.all([M.sj('{"q":1}'), M.sj('{"r":2}')]); return r.length; }` },
+    src: `type Json = Record<string, unknown>;
+export async function sj(t: string): Promise<Json> { await null; const v: unknown = JSON.parse(t); return v as Json; }
+import { both } from "./lib.ts";
+async function main(): Promise<void> { const d = await sj('{"a":1}'); d.w = 1; console.log(d, await both()); }
+main();` },
+  { id: 'S125-L-18 the async function called through a renaming import inside `Promise.all` keeps its result typed', entry: "main.ts", files: { "lib.ts": `import { sj as other } from "./main.ts";
+export async function both(): Promise<number> { const r = await Promise.all([other('{"q":1}'), other('{"r":2}')]); return r.length; }` },
+    src: `type Json = Record<string, unknown>;
+export async function sj(t: string): Promise<Json> { await null; const v: unknown = JSON.parse(t); return v as Json; }
+import { both } from "./lib.ts";
+async function main(): Promise<void> { const d = await sj('{"a":1}'); d.w = 1; console.log(d, await both()); }
+main();` },
+  { id: 'S125-L-19 `await M.f(…)` through `import * as M` is on the arm, as a direct `await f(…)` is: writes from both modules reach the object', entry: "main.ts", files: { "lib.ts": `import * as M from "./main.ts";
+export async function one(x: Record<string, unknown>): Promise<string> { const e = await M.sj('{"q":[1]}'); e.x = x.w; return JSON.stringify(e); }` },
+    src: `type Json = Record<string, unknown>;
+export async function sj(t: string): Promise<Json> { await null; const v: unknown = JSON.parse(t); return v as Json; }
+import { one } from "./lib.ts";
+async function main(): Promise<void> { const d = await sj('{"a":1}'); d.w = 1; const e = await one(d); console.log(d, e); }
+main();` },
+  { id: 'S125-L-20 a renaming export and a default export of the async function, each awaited where imported, are on the arm', entry: "main.ts", files: { "lib.ts": `type Json = Record<string, unknown>;
+async function sj(t: string): Promise<Json> { await null; const v: unknown = JSON.parse(t); return v as Json; }
+export { sj as load };
+export default sj;` },
+    src: `import { load } from "./lib.ts";
+import pick from "./lib.ts";
+async function main(): Promise<void> { const d = await load('{"a":1}'); d.w = 2; const e = await pick('{"b":2}'); e.z = d; console.log(d, e); }
+main();` },
+  { id: 'S125-L-23 an async function on the arm with a bare `return;` and a fall-through completion resolves with undefined on those paths', entry: "main.ts",
+    src: `type Json = Record<string, unknown>;
+let seen: unknown = null;
+async function sj(t: string): Promise<Json | undefined> {
+  await null;
+  if (t === "") return;
+  if (t !== "-") { const v: unknown = JSON.parse(t); seen = v; return v as Json; }
+}
+async function main(): Promise<void> {
+  const d = await sj('{"a":1}');
+  if (d) d.w = 1;
+  console.log(d, d === seen, seen, await sj(""), await sj("-"));
 }
 main();` },
 ]);

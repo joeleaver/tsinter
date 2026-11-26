@@ -11346,7 +11346,12 @@ refusal.
   order, and an `undefined`-valued key is an own key (`in`, `Object.keys`,
   printing): S091's rule for a typed record, which drops an optional key
   holding `undefined`, does not apply, as the bag is not a typed record.
-  `JSON.stringify` of the bag is Node's. Left typed, the field's copy
+  `JSON.stringify` of the bag is Node's. An object or array literal
+  nested in the bag (a field's value or an element, at any depth) is
+  fresh, so it is built as a dynamic object or array too and keeps every
+  key and element Node keeps (`d: { e: undefined }` keeps `e`); a bag
+  holding a nested literal whose own form does not fit stays typed.
+  Left typed, the field's copy
   keeping its refusal: a literal with a spread, a computed key, a method,
   an accessor or a `__proto__` key; a literal any of whose field values is
   or holds a class instance (decision Q1: it would cross by copy); a
@@ -11355,7 +11360,9 @@ refusal.
   instance cannot bind the parameter (generic, declared in a declaration
   file, reading `arguments`, or a rest, optional or destructured parameter
   at the literal's position). A bag the callee stores into a binding of
-  its own type keeps that store's refusal.
+  its own type keeps that store's refusal by name, or, where the store
+  takes S128's exact-fit copy, stops at run time with S128 (a2)'s named
+  fence (SC1100) when the bag does not have exactly the type's shape.
 - **An async plain function's result.** An async function declaration
   (not generic, not a generator) whose `return` copy is refused takes
   U2's result arm as a sync one does (`ret:`): its result is a promise of
@@ -11364,9 +11371,16 @@ refusal.
   and `await f(…)` is that value at each caller, so a binding of it, a
   deferred `let` assigned it, or a direct call's argument holds the
   object itself. A rejection reaches the caller's `catch` as in Node. The
-  arm is taken only when every reference to the function, in every module
-  (through an import's alias too), is a direct call awaited in place,
-  so the promise means one thing wherever it is seen. Any other use —
+  arm is taken only when every reference to the function, in every module,
+  is a direct call awaited in place, so the promise means one thing
+  wherever it is seen. References are judged by the symbol they resolve
+  to, not by spelling: a renaming import or export (`import { f as g }`,
+  `export { f as h }`), a default import and a member of a module
+  namespace (`await M.f(…)` through `import * as M`) are each a reference,
+  and a module namespace used as a value (`const N = M`, `import(…)`,
+  `require(…)`) or a member read by a string key (`M["f"]`) blocks every
+  async function of that module. A bare `return;` or a fall-through
+  completion resolves the promise with `undefined`, as in Node. Any other use —
   `f().then(…)`, `Promise.all([f(), …])`, `return f()`, `const p = f()`,
   the function passed or stored as a value — keeps the typed promise, and
   the `return`'s refusal names that use: `(the async function's result

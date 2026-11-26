@@ -27,7 +27,7 @@ import { PoisonError, THIS_BINDING, boxFactsOf, dynUndefinedExpr, esDefinedFuncN
 import { isDynArmSite } from "./dyn-arm.js";
 import { armCast, armRetCast } from "./dyn-arm-rooted.js";
 import { noteDynArmExit } from "./dyn-arm-exits.js";
-import { armBag } from "./dyn-arm-bag.js";
+import { armBag, bagPart } from "./dyn-arm-bag.js";
 import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRead, strCharsCall, tupleAsArray } from "./lower-containers.js";
 import { tupleCastToArray, tupleUnderArrayType } from "./tuple-array-casts.js";
 import { lowerTupleLength } from "./tuple-length.js";
@@ -1205,8 +1205,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
         // the runtime-keyed dynamic literal below instead: the island
         // literal has no computed-key form.)
         // S125-L (M4): an options bag on the dynamic arm is the dynamic
-        // object Node builds (dyn-arm-bag.ts).
-        if (ts.isObjectLiteralExpression(expr) && L.sharedDynamic && armBag(L, expr)) return true;
+        // object Node builds, and so is every literal nested in it
+        // (dyn-arm-bag.ts).
+        if (L.sharedDynamic && ((ts.isObjectLiteralExpression(expr) && armBag(L, expr)) || bagPart(L, expr))) return true;
         if (L.es5 !== null && L.es5.lits.has(expr)) {
           return !(ts.isObjectLiteralExpression(expr) && L.sharedDynamic && !L.engine && expr.properties.some((p) => {
             const n = ts.isSpreadAssignment(p) ? undefined : p.name;

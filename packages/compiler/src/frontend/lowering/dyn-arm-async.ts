@@ -22,9 +22,10 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import type { FailureText } from "./arm-failures.js";
 
-/** Per declaration (one ts.Program, every lowering pass): the first
- * reference that is not an awaited direct call, or null when every one is. */
-const blockers = new WeakMap<ts.FunctionDeclaration, ts.Identifier | null>();
+/** Per program (every lowering pass): for each async function declaration
+ * (asyncDecl), the first reference to it that is not an awaited direct
+ * call, or null when every one is (blockerIndex). */
+const indexes = new WeakMap<object, Map<ts.FunctionDeclaration, ts.Node | null>>();
 
 function isAsync(fn: ts.FunctionDeclaration): boolean {
   return (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
@@ -45,54 +46,131 @@ export function asyncResultArmable(L: Lowerer, fn: ts.Node): fn is ts.FunctionDe
 /** M0 for (L): why an async function declaration's result cannot take the
  * arm — its first use other than `await f(…)` — or null when it can. */
 export function asyncArmBlocker(L: Lowerer, fn: ts.FunctionDeclaration): FailureText | null {
-  const id = firstBlocker(L, fn);
-  if (id === null) return null;
-  const sf = id.getSourceFile();
+  const at = firstBlocker(L, fn);
+  if (at === null) return null;
+  const sf = at.getSourceFile();
+  const name = fn.name!.text;
+  const spelled = at.getText(sf);
+  const what = spelled.length <= 40 ? spelled : `${spelled.slice(0, 40)}…`;
   return {
-    text: `'${id.text}' is used other than as \`await ${id.text}(…)\``,
-    at: { file: sf.fileName, line: ts.getLineAndCharacterOfPosition(sf, id.getStart()).line + 1 },
+    text: what === name ? `'${name}' is used other than as \`await ${name}(…)\`` : `'${name}' is used other than as \`await ${name}(…)\` (as '${what}')`,
+    at: { file: sf.fileName, line: ts.getLineAndCharacterOfPosition(sf, at.getStart()).line + 1 },
   };
 }
 
-function firstBlocker(L: Lowerer, fn: ts.FunctionDeclaration): ts.Identifier | null {
-  const memo = blockers.get(fn);
-  if (memo !== undefined) return memo;
-  const sym = L.checker.getSymbolAtLocation(fn.name!);
-  let found: ts.Identifier | null = sym === undefined ? fn.name! : null;
-  if (sym !== undefined) {
-    const name = fn.name!.text;
-    for (const sf of L.program.getSourceFiles()) {
-      if (found !== null) break;
-      if (sf.isDeclarationFile || !sf.text.includes(name)) continue;
-      const visit = (n: ts.Node): void => {
-        if (found !== null) return;
-        if (ts.isIdentifier(n) && n.text === name && n !== fn.name && refersTo(L, n, sym)) {
-          if (!awaitedCallee(n)) found = n;
-          return;
-        }
-        ts.forEachChild(n, visit);
-      };
-      visit(sf);
-    }
+function firstBlocker(L: Lowerer, fn: ts.FunctionDeclaration): ts.Node | null {
+  return blockerIndex(L).get(fn) ?? null;
+}
+
+/** One walk over every source file of the program, judging each reference
+ * by the symbol it resolves to (through every import, export and namespace
+ * alias), not by its spelling: `import { f as g }`, `export { f as h }`, a
+ * default import and `M.f` through `import * as M` all reach `f`. A
+ * reference is fine only as the callee of a direct call awaited in place
+ * (`await f(…)`, `await M.f(…)`). Anything else blocks: a call used any
+ * other way, the function as a value, `M["f"]`, and a namespace object of
+ * f's module used other than to read a member (`const N = M`,
+ * `Object.values(M)`, `import("./m")`, `require("./m")`), since its members
+ * then escape where no reference can be judged. Import and export
+ * specifiers and `export default f` are no uses themselves: the names they
+ * bind are judged where they are used. */
+function blockerIndex(L: Lowerer): Map<ts.FunctionDeclaration, ts.Node | null> {
+  let index = indexes.get(L.program);
+  if (index !== undefined) return index;
+  const out = new Map<ts.FunctionDeclaration, ts.Node | null>();
+  index = out;
+  indexes.set(L.program, out);
+  const files = L.program.getSourceFiles().filter((sf) => !sf.isDeclarationFile);
+  const byFile = new Map<ts.SourceFile, ts.FunctionDeclaration[]>();
+  // The spellings a reference to one of them can take: its own name, and
+  // every name an import or export binds (an alias may rename it).
+  const spellings = new Set<string>(["default"]);
+  for (const sf of files) {
+    const visit = (n: ts.Node): void => {
+      if (asyncDecl(n)) {
+        out.set(n, null);
+        spellings.add(n.name!.text);
+        const list = byFile.get(sf) ?? [];
+        list.push(n);
+        byFile.set(sf, list);
+      } else if (ts.isImportSpecifier(n) || ts.isExportSpecifier(n)) {
+        spellings.add(n.name.text);
+      } else if ((ts.isImportClause(n) || ts.isNamespaceImport(n) || ts.isNamespaceExport(n)) && n.name !== undefined) {
+        spellings.add(n.name.text);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
   }
-  blockers.set(fn, found);
-  return found;
+  if (out.size === 0) return out;
+  const block = (fn: ts.FunctionDeclaration, at: ts.Node): void => {
+    if (out.get(fn) === null) out.set(fn, at);
+  };
+  const target = (s: ts.Symbol | undefined): ts.Symbol | undefined =>
+    s !== undefined && s.flags & ts.SymbolFlags.Alias ? L.checker.getAliasedSymbol(s) : s;
+  const fnOf = (s: ts.Symbol | undefined): ts.FunctionDeclaration | null => {
+    for (const d of s !== undefined ? L.checker.declarationsOf(s) : []) if (ts.isFunctionDeclaration(d) && out.has(d)) return d;
+    return null;
+  };
+  const moduleOf = (s: ts.Symbol | undefined): ts.SourceFile | null => {
+    for (const d of s !== undefined ? L.checker.declarationsOf(s) : []) if (ts.isSourceFile(d)) return d;
+    return null;
+  };
+  const escapeModule = (sf: ts.SourceFile | null, at: ts.Node): void => {
+    for (const fn of sf !== null ? byFile.get(sf) ?? [] : []) block(fn, at);
+  };
+  for (const sf of files) {
+    const visit = (n: ts.Node): void => {
+      if (ts.isIdentifier(n)) {
+        judgeIdentifier(n);
+        return;
+      }
+      if (ts.isElementAccessExpression(n) && ts.isStringLiteralLike(n.argumentExpression)) {
+        const fn = fnOf(target(L.checker.getSymbolAtLocation(n.argumentExpression)));
+        if (fn !== null) block(fn, n);
+      }
+      if (ts.isCallExpression(n) && n.arguments.length >= 1 && ts.isStringLiteralLike(n.arguments[0]!) &&
+        (n.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(n.expression) && n.expression.text === "require"))) {
+        escapeModule(moduleOf(target(L.checker.getSymbolAtLocation(n.arguments[0]!))), n);
+      }
+      ts.forEachChild(n, visit);
+    };
+    const judgeIdentifier = (id: ts.Identifier): void => {
+      if (!spellings.has(id.text)) return;
+      const p = id.parent;
+      if (p === undefined) return;
+      // A declaration's own name, and the names imports and exports bind.
+      if (ts.isFunctionDeclaration(p) && p.name === id) return;
+      if (ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isNamespaceExport(p)) return;
+      if (ts.isExportAssignment(p) && p.expression === id && !p.isExportEquals) return;
+      const raw = ts.isShorthandPropertyAssignment(p) && p.name === id
+        ? L.checker.getShorthandAssignmentValueSymbol(p)
+        : L.checker.getSymbolAtLocation(id);
+      const s = target(raw);
+      const fn = fnOf(s);
+      if (fn !== null) {
+        const callee: ts.Node = ts.isPropertyAccessExpression(p) && p.name === id ? p : id;
+        if (!awaitedCallee(callee)) block(fn, id);
+        return;
+      }
+      // A namespace object of a module holding such functions: fine only as
+      // the receiver of a member read (judged at the member) or a type's
+      // qualifier.
+      const mod = moduleOf(s);
+      if (mod === null || !byFile.has(mod)) return;
+      if (ts.isPropertyAccessExpression(p) && p.expression === id) return;
+      if (ts.isQualifiedName(p) && p.left === id) return;
+      escapeModule(mod, id);
+    };
+    visit(sf);
+  }
+  return out;
 }
 
-/** Does `id` name the function `sym` (directly, or through an import's
- * alias)? An import or export specifier's own name is no use of it. */
-function refersTo(L: Lowerer, id: ts.Identifier, sym: ts.Symbol): boolean {
-  const p = id.parent;
-  if (p !== undefined && (ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p))) return false;
-  if (p !== undefined && ts.isPropertyAccessExpression(p) && p.name === id) return false;
-  if (p !== undefined && (ts.isPropertyAssignment(p) || ts.isPropertyDeclaration(p) || ts.isMethodDeclaration(p)) && p.name === id) return false;
-  const s = ts.isShorthandPropertyAssignment(p) ? L.checker.getShorthandAssignmentValueSymbol(p) : L.resolveValueSymbol(id);
-  return s === sym;
-}
-
-/** `id` is the callee of a direct call whose result is awaited in place. */
-function awaitedCallee(id: ts.Identifier): boolean {
-  let callee: ts.Node = id;
+/** `callee` (an identifier, or `M.f`) is the callee of a direct call whose
+ * result is awaited in place. */
+function awaitedCallee(callee0: ts.Node): boolean {
+  let callee: ts.Node = callee0;
   while (ts.isParenthesizedExpression(callee.parent)) callee = callee.parent;
   const call = callee.parent;
   if (call === undefined || !ts.isCallExpression(call) || call.expression !== callee) return false;
