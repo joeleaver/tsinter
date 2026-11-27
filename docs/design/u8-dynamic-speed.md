@@ -1,6 +1,6 @@
 # U8: speed of dynamic objects (shapes, inline caches, unboxed reads)
 
-Status: design only, written on main `0c18e62a` (2026-11-26). No compiler code changes.
+Status: approved by Joe on 2026-11-26 (§11), written on main `0c18e62a`. U8a is in progress.
 This is the U8 row of [dynamic-values.md](./dynamic-values.md) §6 (risk 6 in §7, J5 in
 §8). The budget is **probe b2 within 3× of probe b1 on the wasm lane**, and on
 wasm-native, which shares the runtime (it is the same wasm module translated to C by
@@ -60,8 +60,8 @@ Probes: 1,000 four-key records, built as JSON text in the program and parsed.
 above the noise. Each time is the median of 5 runs of the 5,000-round build minus the
 median of the 0-round build, which cancels out parsing, instantiation and start-up. The
 wasm lane runs under Node's V8 through `tests/bench/run-wasm.mjs`. Every lane's output
-matched Node's. The scripts are `gen.mjs` and `bench.mjs` in the session scratchpad;
-sub-unit 1 adds them to `tests/bench/programs` (§9).
+matched Node's. The scripts are `tests/bench/u8/gen.mjs` and `tests/bench/u8/bench.mjs`,
+and the probes' 5,000-round forms are in `tests/bench/programs` (§9).
 
 | probe | what | Node | wasm | wasm-native | wasm ÷ typed |
 |---|---|---|---|---|---|
@@ -358,6 +358,19 @@ people to read, not a CI gate.
 7. **Code size** (§7).
 
 ## 11. Decisions for Joe
+
+**Decided (Joe, 2026-11-26): the design is approved, with all four recommendations.**
+- **J1:** the 3× bar holds on the wasm lane. On wasm-native the time is measured and
+  reported, with a target of ≤ 8× typed native that does not block a merge.
+- **J2:** U8a (loop plumbing) and U8e (calls) are part of U8.
+- **J3:** U8f (`any`-world arithmetic) is the last sub-unit, landable alone, and may be
+  dropped if U8a–e run long.
+- **J4:** shapes are kept for the program's lifetime, capped at 65,536.
+
+The probes are in `tests/bench/programs` (`u8-*.ts`, the 5,000-round forms) and their
+generator and timing script in `tests/bench/u8/` (`gen.mjs`, `bench.mjs`).
+
+The options as they were put:
 
 **J1. The speed target on the native lane.**
 - On native, typed code is about 5× faster than on wasm. Holding dynamic code to 3×
