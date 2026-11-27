@@ -140,7 +140,9 @@ $shape { parent: ref null $shape, key: str, count: i32,
 - There is **one root for every prototype**. U8b caches only own data reads, and an
   own data entry answers whatever the prototype is, so the root does not need to
   name the prototype yet. Per-prototype roots arrive with the prototype ICs (U8d).
-- A cache site is an immutable global holding a `$ic { s0, i0 }` struct. A miss
+- A cache site is three plain mutable globals (its shape, its entry index and a
+  fill count; a site stops refilling after 16 fills, so a polymorphic site does not
+  pay a GC write barrier on every miss). A miss
   calls one shared helper that fills the site from a shaped receiver's own entry,
   and otherwise answers through `keyGet`. The kind and cast checks of §4 run as
   `kind == OBJ`, plus `ref.test $dynObj` only in modules that have views, because a
