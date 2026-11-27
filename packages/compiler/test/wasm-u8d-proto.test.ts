@@ -18,7 +18,11 @@
  * sloppy code ignores), a prototype mutated every round past the refresh
  * budget, a getter that moves the chain while it is read, a getter up the
  * chain, prototypes that are not plain objects (a class instance, a
- * null-prototype object), and freeze and preventExtensions of a prototype.
+ * null-prototype object), freeze and preventExtensions of a prototype, a
+ * hidden key added to a prototype over an absent read (then deleted and
+ * re-added), a hidden read-only key up a sloppy append's chain, appends on
+ * receivers that are themselves prototypes, and setPrototypeOf to null and
+ * back over cached chain reads.
  * Every row also runs shape-checked (u8-rows.ts): each cache hit re-proves
  * its answer against the uncached read, and every shaped payload checked
  * must descend from its prototype's root (ic-check.ts). */
@@ -212,4 +216,41 @@ for (let r = 0; r < __R__; r++) for (let t = 0; t < 30; t++) {
   out.push(JSON.stringify(o) + o.k);
 }
 console.log(out.join(" "));` },
+  { id: "U8d-B17 a hidden key added to the prototype over a cached absent read, deleted, then re-added", js: true,
+    src: `${ES5}
+${hot("p.zz", "if (t === 10) Object.defineProperty(P.prototype, 'zz', { value: 5, enumerable: false, configurable: true }); if (t === 15) delete P.prototype.zz; if (t === 20) Object.defineProperty(P.prototype, 'zz', { value: 6, enumerable: false, configurable: true });")}` },
+  { id: "U8d-B18 a hidden read-only key appearing up the chain of a sloppy-mode append cache", js: true,
+    stats: { "set-hits": "some" },
+    src: `function P(i) { this.i = i; }
+const out = [];
+for (let r = 0; r < __R__; r++) for (let t = 0; t < 30; t++) {
+  if (t === 10) Object.defineProperty(P.prototype, 'x', { value: 'ro', writable: false, enumerable: false, configurable: true });
+  if (t === 20) delete P.prototype.x;
+  const o = new P(t);
+  o.x = t;
+  out.push(JSON.stringify(o) + ':' + o.x + ':' + Object.keys(o).join('|'));
+}
+console.log(out.join(" "));` },
+  { id: "U8d-B19 append-cache hits on receivers that are themselves prototypes of other objects", js: true,
+    stats: { "set-hits": "some", "proto-bumps": "some" },
+    src: `function P(i) { this.i = i; }
+const out = [];
+for (let r = 0; r < __R__; r++) {
+  const protos = [];
+  const kids = [];
+  for (let i = 0; i < 4; i++) { const o = new P(i); protos.push(o); kids.push(Object.create(o)); }
+  for (let t = 0; t < 30; t++) {
+    if (t === 10) for (let i = 0; i < 4; i++) protos[i].y = t + i;
+    if (t === 20) for (let i = 0; i < 4; i++) protos[i].z = 'z' + i;
+    let row = "";
+    for (let i = 0; i < 4; i++) { const k = kids[i]; row += k.i + "/" + k.y + "/" + k.z + ","; }
+    out.push(row);
+  }
+}
+console.log(out.join("\\n"));` },
+  { id: "U8d-B20 setPrototypeOf to null and back, on the prototype and on an instance, over cached chain reads", js: true,
+    src: `const G = { g: 'g' };
+${ES5}
+Object.setPrototypeOf(P.prototype, G);
+${hot("p.g + '/' + p.v", "if (t === 10) Object.setPrototypeOf(P.prototype, null); if (t === 15) Object.setPrototypeOf(xs[1], null); if (t === 20) { Object.setPrototypeOf(P.prototype, G); Object.setPrototypeOf(xs[1], P.prototype); }")}` },
 ], { shapeCheck: true });

@@ -473,10 +473,14 @@ export class Shapes {
     c.end();
   }
 
-  /** objmodel.ts removeAt, before the entry at code `idx` (>= 0: the main
-   * table, <= -2 the hidden one) leaves the payload in local `obj`: removing the last-added key
-   * rolls the shape back to its parent; any other removal drops it. `sh`
-   * is a scratch local of shapeRef(). */
+  /** objmodel.ts removeAt, before the main-table entry at index `idx`
+   * (always >= 0 here) leaves the payload in local `obj`: removing the
+   * last-added key rolls the shape back to its parent; any other removal
+   * drops it. A hidden entry's removal does not come here: its object is
+   * already in dictionary mode (hiddenPush dropped it), and no chain way
+   * can stand on it (the walk proves nothing through a hidden key,
+   * proto-ic.ts), so it needs neither a shape change nor an epoch move.
+   * `sh` is a scratch local of shapeRef(). */
   emitRemove(c: Code, obj: number, idx: number, sh: number): void {
     const objT = this.d.objT();
     const field = this.d.objShapeField();

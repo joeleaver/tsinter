@@ -582,7 +582,8 @@ export class ObjModel {
       c.end();
       c.return_();
       c.end();
-      // Hidden: shift down.
+      // Hidden: shift down. No shape or epoch work (shapes.ts emitRemove
+      // says why).
       c.i32Const(-2);
       c.localGet(1);
       c.i32Sub();
