@@ -103,15 +103,26 @@ const hasRetSites = new WeakMap<ReadonlySet<string>, boolean>();
 /** The symbol a call's callee names: an identifier, through an import's
  * alias ((K): the result arm is the function's own, whichever module calls
  * it), or a member of a module namespace (`M.f` through `import * as M`,
- * (L)), so every caller agrees with the function on its result. */
+ * or `M.N.f` through `export * as N`, (L)), so every caller agrees with the function on its result. */
 function calleeFunctionSymbol(L: Lowerer, callee: ts.Expression): ts.Symbol | null {
   if (ts.isIdentifier(callee)) return L.resolveValueSymbol(callee);
-  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.expression)) return null;
-  const alias = (s: ts.Symbol | undefined): ts.Symbol | undefined =>
-    s !== undefined && s.flags & ts.SymbolFlags.Alias ? L.checker.getAliasedSymbol(s) : s;
-  const recv = alias(L.checker.getSymbolAtLocation(callee.expression));
-  if (recv === undefined || !L.checker.declarationsOf(recv).some((d) => ts.isSourceFile(d))) return null;
-  return alias(L.checker.getSymbolAtLocation(callee.name)) ?? null;
+  if (!ts.isPropertyAccessExpression(callee) || !isNamespaceRef(L, callee.expression)) return null;
+  return aliasTarget(L, L.checker.getSymbolAtLocation(callee.name)) ?? null;
+}
+
+function aliasTarget(L: Lowerer, s: ts.Symbol | undefined): ts.Symbol | undefined {
+  return s !== undefined && s.flags & ts.SymbolFlags.Alias ? L.checker.getAliasedSymbol(s) : s;
+}
+
+/** `M` (`import * as M`) or `M.N` (N re-exported with `export * as N`):
+ * an expression naming a module's namespace. */
+function isNamespaceRef(L: Lowerer, e: ts.Expression): boolean {
+  let at: ts.Node;
+  if (ts.isIdentifier(e)) at = e;
+  else if (ts.isPropertyAccessExpression(e) && isNamespaceRef(L, e.expression)) at = e.name;
+  else return false;
+  const s = aliasTarget(L, L.checker.getSymbolAtLocation(at));
+  return s !== undefined && L.checker.declarationsOf(s).some((d) => ts.isSourceFile(d));
 }
 
 /** S125 A1: a direct call of a function whose RESULT is on the dynamic arm

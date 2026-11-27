@@ -97,11 +97,15 @@ function bagForm(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
  * keeping every key and element Node keeps: bagPart), any other value
  * holds no class instance. */
 function valueFits(L: Lowerer, value: ts.Node): boolean {
-  const lit = stripParens(value);
+  const lit = pastNeutral(value);
   if (ts.isObjectLiteralExpression(lit)) return bagForm(L, lit);
   if (ts.isArrayLiteralExpression(lit)) {
     return lit.elements.every((el) => !ts.isSpreadElement(el) && !ts.isOmittedExpression(el) && valueFits(L, el));
   }
+  // A cast of a literal (`{ e: undefined } as D`, `as const`): the cast
+  // lowers its operand to the cast's type, a typed record whose keys
+  // follow S091, so the bag stays typed and keeps its refusal by name.
+  if (castsLiteral(lit)) return false;
   try {
     return !holdsClassInstance(L, L.mapTypeOf(L.typeOf(value)));
   } catch (e) {
@@ -110,9 +114,28 @@ function valueFits(L: Lowerer, value: ts.Node): boolean {
   }
 }
 
-function stripParens(n: ts.Node): ts.Node {
-  while (ts.isParenthesizedExpression(n)) n = n.expression;
+/** The wrappers that never change a literal's value or its lowering:
+ * parentheses, `satisfies` (it checks, the literal keeps its own type) and
+ * `!` (a literal is never nullish). */
+function isNeutral(n: ts.Node): n is ts.ParenthesizedExpression | ts.SatisfiesExpression | ts.NonNullExpression {
+  return ts.isParenthesizedExpression(n) || ts.isSatisfiesExpression(n) || ts.isNonNullExpression(n);
+}
+
+function pastNeutral(n: ts.Node): ts.Node {
+  while (isNeutral(n)) n = n.expression;
   return n;
+}
+
+function castsLiteral(n: ts.Node): boolean {
+  let e = n;
+  while (isNeutral(e) || ts.isAsExpression(e) || ts.isTypeAssertion(e)) {
+    if (ts.isAsExpression(e) || ts.isTypeAssertion(e)) {
+      const inner = pastNeutral(e.expression);
+      if (ts.isObjectLiteralExpression(inner) || ts.isArrayLiteralExpression(inner)) return true;
+    }
+    e = e.expression;
+  }
+  return false;
 }
 
 /** The literal is a direct argument of a direct call of a plain function
@@ -152,18 +175,19 @@ export function armBag(L: Lowerer, lit: ts.ObjectLiteralExpression): boolean {
  * dynamic arm (a field's value or an element, at any depth)? It is fresh —
  * nothing but the bag holds it — so it is built as an island literal too:
  * a typed view of it would answer the typed record's keys (S091), not the
- * literal's own (`d: { e: undefined }` keeps `e`, as in Node). */
+ * literal's own (`d: { e: undefined }` keeps `e`, as in Node). Parentheses,
+ * `satisfies` and `!` around it are looked through (isNeutral). */
 export function bagPart(L: Lowerer, lit: ts.ObjectLiteralExpression | ts.ArrayLiteralExpression): boolean {
   let child: ts.Node = lit;
   let up = lit.parent;
-  while (up !== undefined && ts.isParenthesizedExpression(up)) {
+  while (up !== undefined && isNeutral(up)) {
     child = up;
     up = up.parent;
   }
   if (up === undefined) return false;
   let holder: ts.Node | undefined;
   if (ts.isPropertyAssignment(up) && up.initializer === child) holder = up.parent;
-  else if (ts.isArrayLiteralExpression(up)) holder = up;
+  else if (ts.isArrayLiteralExpression(up) && up.elements.includes(child as ts.Expression)) holder = up;
   if (holder === undefined) return false;
   if (ts.isArrayLiteralExpression(holder)) return bagPart(L, holder);
   return ts.isObjectLiteralExpression(holder) && (armBag(L, holder) || bagPart(L, holder));

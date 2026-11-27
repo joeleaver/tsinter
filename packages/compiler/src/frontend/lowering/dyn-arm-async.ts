@@ -26,6 +26,9 @@ import type { FailureText } from "./arm-failures.js";
  * (asyncDecl), the first reference to it that is not an awaited direct
  * call, or null when every one is (blockerIndex). */
 const indexes = new WeakMap<object, Map<ts.FunctionDeclaration, ts.Node | null>>();
+/** Blockers that are a module namespace used as a value (or a module loaded
+ * by `import(…)` / `require(…)`), for the M0 text. */
+const namespaceEscapes = new WeakSet<ts.Node>();
 
 function isAsync(fn: ts.FunctionDeclaration): boolean {
   return (ts.getModifiers(fn) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
@@ -52,8 +55,11 @@ export function asyncArmBlocker(L: Lowerer, fn: ts.FunctionDeclaration): Failure
   const name = fn.name!.text;
   const spelled = at.getText(sf);
   const what = spelled.length <= 40 ? spelled : `${spelled.slice(0, 40)}…`;
+  const text = namespaceEscapes.has(at)
+    ? `the namespace '${what}' of its module is used as a value, so '${name}' may be reached other than as \`await ${name}(…)\``
+    : what === name ? `'${name}' is used other than as \`await ${name}(…)\`` : `'${name}' is used other than as \`await ${name}(…)\` (as '${what}')`;
   return {
-    text: what === name ? `'${name}' is used other than as \`await ${name}(…)\`` : `'${name}' is used other than as \`await ${name}(…)\` (as '${what}')`,
+    text,
     at: { file: sf.fileName, line: ts.getLineAndCharacterOfPosition(sf, at.getStart()).line + 1 },
   };
 }
@@ -117,6 +123,7 @@ function blockerIndex(L: Lowerer): Map<ts.FunctionDeclaration, ts.Node | null> {
     return null;
   };
   const escapeModule = (sf: ts.SourceFile | null, at: ts.Node): void => {
+    namespaceEscapes.add(at);
     for (const fn of sf !== null ? byFile.get(sf) ?? [] : []) block(fn, at);
   };
   for (const sf of files) {
@@ -158,9 +165,13 @@ function blockerIndex(L: Lowerer): Map<ts.FunctionDeclaration, ts.Node | null> {
       // qualifier.
       const mod = moduleOf(s);
       if (mod === null || !byFile.has(mod)) return;
-      if (ts.isPropertyAccessExpression(p) && p.expression === id) return;
-      if (ts.isQualifiedName(p) && p.left === id) return;
-      escapeModule(mod, id);
+      // `M.N` (a namespace re-exported with `export * as N`) is itself a
+      // namespace: fine as the receiver of a further member read.
+      const ref: ts.Node = (ts.isPropertyAccessExpression(p) && p.name === id) || (ts.isQualifiedName(p) && p.right === id) ? p : id;
+      const up = ref.parent;
+      if (up !== undefined && ts.isPropertyAccessExpression(up) && up.expression === ref) return;
+      if (up !== undefined && ts.isQualifiedName(up) && up.left === ref) return;
+      escapeModule(mod, ref);
     };
     visit(sf);
   }

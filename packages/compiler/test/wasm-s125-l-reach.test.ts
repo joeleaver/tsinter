@@ -164,6 +164,41 @@ function run(): void {
   take({ src, xs: [{ e: undefined, f: undefined }, { f: "x" }], m: { k: { z: undefined } } });
 }
 run();` },
+  { id: 'S125-L-24 a nested literal wrapped in `satisfies` is still the literal: its `undefined`-valued key is an own key, `in`, Object.keys and printing match Node', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    src: `import { parseCfg, type Cfg } from "zk";
+type D = { e?: number };
+type O = { src: Cfg; d: D };
+function take(o: O): void { console.log(o, "e" in o.d, Object.keys(o.d), JSON.stringify(o)); }
+function run(): void { const src = parseCfg(JSON.parse('{"name":"s","a":[]}')); take({ src, d: { e: undefined } satisfies D }); }
+run();` },
+  { id: 'S125-L-25 parentheses, a defined key beside the undefined one, and `!` around a nested literal are looked through too', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    src: `import { parseCfg, type Cfg } from "zk";
+type D = { e?: number; f?: number };
+type O = { src: Cfg; d: D; g: D; h: D };
+function take(o: O): void { console.log(o, Object.keys(o.d), Object.keys(o.g), Object.keys(o.h), JSON.stringify(o)); }
+function run(): void {
+  const src = parseCfg(JSON.parse('{"name":"s","a":[]}'));
+  take({ src, d: ({ e: undefined }) satisfies D, g: { e: undefined, f: 1 } satisfies D, h: ({ f: undefined })! });
+}
+run();` },
+  { id: 'S125-L-26 `satisfies` on an array element and on a literal nested in a nested literal: every level keeps its keys', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    src: `import { parseCfg, type Cfg } from "zk";
+type D = { e?: number; f?: number };
+type O = { src: Cfg; xs: D[]; d: { g: D } };
+function take(o: O): void { console.log(o, Object.keys(o.xs[0]!), "e" in o.d.g, JSON.stringify(o)); }
+function run(): void {
+  const src = parseCfg(JSON.parse('{"name":"s","a":[]}'));
+  take({ src, xs: [{ e: undefined } satisfies D], d: { g: { e: undefined } satisfies D } });
+}
+run();` },
+  { id: 'S125-L-27 a cast of a nested literal (`as D`) lowers it to the typed record the cast names, so the bag stays typed and stops at S128 (a2)\'s named fence', entry: "main.ts", npmStatic: ["zk"], files: ZK,
+    fence: { text: /SC1100/, stdout: "" },
+    src: `import { parseCfg, type Cfg } from "zk";
+type D = { e?: number; f?: number };
+type O = { src: Cfg; d: D };
+function take(o: O): void { console.log(o, JSON.stringify(o)); }
+function run(): void { const src = parseCfg(JSON.parse('{"name":"s","a":[]}')); take({ src, d: { e: undefined } as D }); }
+run();` },
 ]);
 
 defineRows("S125-L (M5): async results on the dynamic arm", [
@@ -372,6 +407,15 @@ export default sj;` },
     src: `import { load } from "./lib.ts";
 import pick from "./lib.ts";
 async function main(): Promise<void> { const d = await load('{"a":1}'); d.w = 2; const e = await pick('{"b":2}'); e.z = d; console.log(d, e); }
+main();` },
+  { id: 'S125-L-28 `await M.N.f(…)` through a namespace re-exported with `export * as N` is on the arm, as `await f(…)` is', entry: "main.ts", files: {
+    "a.ts": `type Json = Record<string, unknown>;
+let seen: unknown = null;
+export async function sj(t: string): Promise<Json> { await null; const v: unknown = JSON.parse(t); seen = v; return v as Json; }
+export function lastSeen(): unknown { return seen; }`,
+    "barrel.ts": `export * as N from "./a.ts";` },
+    src: `import * as M from "./barrel.ts";
+async function main(): Promise<void> { const d = await M.N.sj('{"a":1}'); d.w = 1; console.log(d, d === M.N.lastSeen(), M.N.lastSeen()); }
 main();` },
   { id: 'S125-L-23 an async function on the arm with a bare `return;` and a fall-through completion resolves with undefined on those paths', entry: "main.ts",
     src: `type Json = Record<string, unknown>;

@@ -11351,6 +11351,11 @@ refusal.
   fresh, so it is built as a dynamic object or array too and keeps every
   key and element Node keeps (`d: { e: undefined }` keeps `e`); a bag
   holding a nested literal whose own form does not fit stays typed.
+  Parentheses, `satisfies` and `!` around a nested literal change neither
+  its value nor its lowering, so they are looked through
+  (`d: { e: undefined } satisfies D` keeps `e` too). A cast of a nested
+  literal (`{ e: undefined } as D`, `<D>{…}`, `as const`) lowers it to the
+  typed record the cast names, so a bag holding one stays typed.
   Left typed, the field's copy
   keeping its refusal: a literal with a spread, a computed key, a method,
   an accessor or a `__proto__` key; a literal any of whose field values is
@@ -11376,7 +11381,8 @@ refusal.
   wherever it is seen. References are judged by the symbol they resolve
   to, not by spelling: a renaming import or export (`import { f as g }`,
   `export { f as h }`), a default import and a member of a module
-  namespace (`await M.f(…)` through `import * as M`) are each a reference,
+  namespace (`await M.f(…)` through `import * as M`, `await M.N.f(…)`
+  through a namespace re-exported with `export * as N`) are each a reference,
   and a module namespace used as a value (`const N = M`, `import(…)`,
   `require(…)`) or a member read by a string key (`M["f"]`) blocks every
   async function of that module. A bare `return;` or a fall-through
