@@ -142,7 +142,8 @@ $shape { parent: ref null $shape, key: str, count: i32,
   name the prototype yet. Per-prototype roots arrive with the prototype ICs (U8d).
 - A cache site is three plain mutable globals (its shape, its entry index and a
   fill count; a site stops refilling after 16 fills, so a polymorphic site does not
-  pay a GC write barrier on every miss). A miss
+  pay a GC write barrier on every miss; U8c replaced the count with four ways and a
+  megamorphic state, §4). A miss
   calls one shared helper that fills the site from a shaped receiver's own entry,
   and otherwise answers through `keyGet`. The kind and cast checks of §4 run as
   `kind == OBJ`, plus `ref.test $dynObj` only in modules that have views, because a
@@ -222,6 +223,52 @@ the type `(clos, recv, a0..aN-1) → dyn` for its declared arity N ≤ 4. A site
 argument count equals the arity casts the entry and calls it with boxed arguments.
 This removes the argument vector and the vector-walking validation. Any other count,
 or a placeholder FUNC, keeps `callFn`.
+
+**As built in U8c** (ic-ways.ts, ic-read.ts, ic-write.ts, lit-shape.ts,
+box-intern.ts, ic-check.ts):
+- A site is still plain mutable globals, not an `$ic` struct: per way a shape and an
+  index (a store way also its append target), plus a state `n`, the ways filled (0-4),
+  or 5 for megamorphic. The way match is inline at the site, four `ref.eq` compares in
+  one block; the first way costs what U8b's single way did. Ways fill in order and are
+  never replaced. A fifth offer makes the site megamorphic: misses then call `keyGet`
+  (or `keySet`) directly and the four ways keep hitting.
+- **Stores.** Every literal-key write gets a store site, strict and sloppy code alike
+  (the bench programs are scripts, so their writes are sloppy; a sloppy site's helpers
+  call keySet's sloppy form). An existing-key way writes `entries[i].value` in place.
+  An append way calls one shared helper that pushes the entry through dyn.ts
+  `emitEntryPush` (the append tail of `objPutBody`, factored out so the shape
+  chokepoint is still one piece of code) and moves the payload to the cached child
+  shape. The miss helper writes through keySet and offers only what that write
+  proved: the shape unchanged and the key an own entry (existing), or the shape now
+  the old shape's child for this key (append). A receiver with a non-null prototype
+  link never takes an append hit and never fills an append way; today every way of
+  linking a plain object (`om.create`, setPrototypeOf, a constructor) also drops it to
+  dictionary mode, so this guard is a second fence. The offer is cleared after
+  keySet, so a setter whose own writes fill other sites cannot fill this one. A value
+  that is an accessor cell never takes the cache.
+- **Literals.** A literal whose keys are all string literals (the IR's `dynObjLit` and
+  the TypeScript `any`-typed `jsOp objLit`) builds as before the first time; when the
+  result carries a shape whose count and length equal the literal's key count, the
+  site keeps that final shape and the shape nodes' canonical key strings. Later
+  builds make the entries array whole. A literal with a getter, a reserved key or
+  more than 64 keys never fills.
+- **Interning.** Only where a typed number becomes a stored value: a store's value and
+  a literal's field. Integers 0..1023 (bit-exact, so not -0) share a box from a
+  lazily filled table; a number literal takes a box from its own constant global. A
+  value that may be a slot's undefined (Unit U) falls back to dynFrom's helper.
+- `SCRIPTC_WASM_SHAPE_CHECK=1` now also re-checks every store hit, append and
+  literal build against the shape's promise and keyGet's answer.
+- Measured (nico, bench.mjs, loop ms, median of three interleaved cycles against U8b
+  `2829b390` in the same job): b2 wasm 111.0 (base) / 108.0, native 62.6 / 63.6;
+  poly2 wasm 205.9 -> 121.3 (**1.09x** U8b's b2, target 1.25x), native 136.2 -> 63.7;
+  poly4 wasm 260.1 -> 132.7 (**1.20x**, target 1.5x), native 172.6 -> 66.1;
+  w wasm 513.7 -> 251.4, native 386.4 -> 169.8; w1 wasm 40.2 / 44.8, native 7.2 / 7.6.
+  **w is 5.6x w1, not 3x.** What is left is the stored boxes: `p.a = r` and
+  `p.c = r + i` take values past the interning range, so each allocates a `$dyn`
+  (about 7 ns here, against about 2 ns for a store hit). With every value pre-boxed
+  the same loop runs at about 2.6x w1 on the laptop. Closing that needs unboxed
+  number slots in entries, a layout change outside this design.
+- Code size: +0.26% over 125 sampled corpus programs (13 changed, the largest +3.9%).
 
 ## 5. Prototype writes (risk 6)
 
