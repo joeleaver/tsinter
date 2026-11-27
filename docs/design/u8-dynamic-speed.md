@@ -133,6 +133,21 @@ $shape { parent: ref null $shape, key: str, count: i32,
 - **Duplicate keys** (`{"a":1,"a":2}`, a repeated literal key) replace the value in
   place, as `objPut` does today. The shape does not change.
 
+**As built in U8b** (shapes.ts, ic-read.ts):
+- `$shape` is `{ parent, key, count, kid, sib, nkids }`: the children are a linked
+  list (`kid` is the newest child, `sib` its older sibling) scanned with `strEq`,
+  which covers both the one-entry cache and the small array above.
+- There is **one root for every prototype**. U8b caches only own data reads, and an
+  own data entry answers whatever the prototype is, so the root does not need to
+  name the prototype yet. Per-prototype roots arrive with the prototype ICs (U8d).
+- A cache site is an immutable global holding a `$ic { s0, i0 }` struct. A miss
+  calls one shared helper that fills the site from a shaped receiver's own entry,
+  and otherwise answers through `keyGet`. The kind and cast checks of §4 run as
+  `kind == OBJ`, plus `ref.test $dynObj` only in modules that have views, because a
+  view is the one OBJ payload that is not a `$dynObj`.
+- `SCRIPTC_WASM_SHAPE_CHECK=1` builds every hit to re-check the shape's promise and
+  compare its answer with `keyGet`'s, trapping on any difference.
+
 ## 4. Inline caches
 
 **Placement.** Each property site whose key is a compile-time literal gets one

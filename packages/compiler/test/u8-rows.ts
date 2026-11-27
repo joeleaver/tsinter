@@ -5,12 +5,20 @@
  *   - the production build (no instrumentation) at 2 rounds is compared
  *     with Node byte for byte (stdout, stderr, exit code) on the wasm and
  *     wasm-native lanes;
- *   - when the row names `perRound`, builds with SCRIPTC_WASM_IC_STATS=1 at
- *     1 and at 2 rounds print the program's `$dyn` box count (ic-stats.ts),
- *     their stdout still matches Node's, and the difference between the two
- *     counts is the boxes one round allocates: a number asserts exactly
- *     that many (0 is the fast path), "some" asserts at least one (a row
- *     that proves a fallback ran the generic, boxing path).
+ *   - with `{ shapeCheck: true }` (defineU8Rows), the same build made
+ *     with SCRIPTC_WASM_SHAPE_CHECK=1 also matches Node: every shape-cache
+ *     hit re-verifies its answer against the uncached read and traps on a
+ *     difference (ic-read.ts), so a stale hit cannot pass as a match;
+ *   - when the row names `perRound` or `stats`, builds with
+ *     SCRIPTC_WASM_IC_STATS=1 at 1 and at 2 rounds print the program's
+ *     counters (ic-stats.ts: `$dyn` boxes, cache hits and misses, shapes
+ *     made), their stdout still matches Node's, and the difference between
+ *     the two runs' counts is what one round does. `perRound` is the boxes
+ *     one round allocates: a number asserts exactly that many (0 is the
+ *     fast path), "some" asserts at least one (a row that proves a
+ *     fallback ran the generic, boxing path). `stats` names per-round
+ *     expectations for any counter the same way, and `totals` exact
+ *     counts of the 1-round build (shapes made by a parse, say).
  *
  * The counts are deterministic, so the speed checks never time anything
  * and cannot flake. */
@@ -27,11 +35,25 @@ const run = promisify(execFile);
 
 export interface U8Row {
   id: string;
-  /** A TypeScript program; `__R__` is replaced by the round count. */
+  /** A TypeScript program (JavaScript when `js`); `__R__` is replaced by
+   * the round count. */
   src: string;
+  /** The program is JavaScript (main.js): untyped literals and containers
+   * that a TypeScript program cannot hand to dynamic code. */
+  js?: boolean;
   /** The `$dyn` boxes one round allocates (SCRIPTC_WASM_IC_STATS=1). */
-  perRound?: number | "some";
+  perRound?: Expect;
+  /** Per-round expectations for the other counters. */
+  stats?: Partial<Record<Counter, Expect>>;
+  /** Exact counts of the 1-round build. */
+  totals?: Partial<Record<Counter, number>>;
 }
+
+/** The counters an instrumented build reports (ic-stats.ts). */
+export type Counter = "dyn-allocs" | "ic-hits" | "ic-misses" | "shapes";
+
+/** Exactly this many, or at least one ("some"), or at most `max`. */
+export type Expect = number | "some" | { max: number };
 
 interface Out {
   stdout: string;
@@ -41,7 +63,7 @@ interface Out {
 
 type Lane = "wasm" | "wasm-native";
 
-const STATS_LINE = /^tsinter-stats: dyn-allocs (\d+)\n$/m;
+const STATS_LINE = /^tsinter-stats: ([a-z-]+) (\d+)\n/gm;
 
 function nodeRun(file: string): Out {
   const r = spawnSync(process.execPath, ["--experimental-transform-types", "--disable-warning=ExperimentalWarning", file], { encoding: "utf8", input: "" });
@@ -64,53 +86,78 @@ async function laneRun(lane: Lane, path: string): Promise<Out> {
   }
 }
 
-/** Builds `src` at `rounds` rounds on `lane` (instrumented when `stats`),
- * runs it, and runs the same program under Node. */
-async function build(dir: string, row: U8Row, lane: Lane, rounds: number, stats: boolean): Promise<{ got: Out; node: Out }> {
-  const sub = join(dir, `r${rounds}${stats ? "s" : ""}`);
+/** The build flavours: production, instrumented (SCRIPTC_WASM_IC_STATS)
+ * and shape-checked (SCRIPTC_WASM_SHAPE_CHECK). */
+type Flavour = "prod" | "stats" | "check";
+
+const FLAVOUR_ENV: Record<Exclude<Flavour, "prod">, string> = {
+  stats: "SCRIPTC_WASM_IC_STATS",
+  check: "SCRIPTC_WASM_SHAPE_CHECK",
+};
+
+/** Builds `src` at `rounds` rounds on `lane` as `flavour`, runs it, and
+ * runs the same program under Node. */
+async function build(dir: string, row: U8Row, lane: Lane, rounds: number, flavour: Flavour): Promise<{ got: Out; node: Out }> {
+  const sub = join(dir, `r${rounds}${flavour}`);
   mkdirSync(sub, { recursive: true });
-  const entry = join(sub, "main.ts");
+  const entry = join(sub, row.js === true ? "main.js" : "main.ts");
   writeFileSync(entry, row.src.replaceAll("__R__", String(rounds)) + "\n");
-  const prev = process.env["SCRIPTC_WASM_IC_STATS"];
-  if (stats) process.env["SCRIPTC_WASM_IC_STATS"] = "1";
-  else delete process.env["SCRIPTC_WASM_IC_STATS"];
+  const prev = Object.fromEntries(Object.values(FLAVOUR_ENV).map((k) => [k, process.env[k]]));
+  for (const [f, k] of Object.entries(FLAVOUR_ENV)) {
+    if (f === flavour) process.env[k] = "1";
+    else delete process.env[k];
+  }
   let res: Awaited<ReturnType<typeof compile>>;
   try {
     res = await compile(entry, { outPath: join(sub, lane === "wasm" ? "p.wasm" : "program"), outDir: sub, backend: lane });
   } finally {
-    if (prev === undefined) delete process.env["SCRIPTC_WASM_IC_STATS"];
-    else process.env["SCRIPTC_WASM_IC_STATS"] = prev;
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
   if (!res.ok) throw new Error(`${row.id} refused on ${lane}: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join(" | ")}`);
   return { got: await laneRun(lane, res.binaryPath!), node: nodeRun(entry) };
 }
 
-/** The box count an instrumented run printed, and its stderr without the
- * report line. */
-function statsOf(o: Out): { allocs: number; stderr: string } {
-  const m = STATS_LINE.exec(o.stderr);
-  if (m === null) throw new Error(`no stats line in stderr: ${JSON.stringify(o.stderr)}`);
-  return { allocs: Number(m[1]), stderr: o.stderr.replace(STATS_LINE, "") };
+/** The counts an instrumented run printed, and its stderr without the
+ * report lines. */
+function statsOf(o: Out): { counts: Record<string, number>; stderr: string } {
+  const counts: Record<string, number> = {};
+  for (const m of o.stderr.matchAll(STATS_LINE)) counts[m[1]!] = Number(m[2]);
+  if (counts["dyn-allocs"] === undefined) throw new Error(`no stats lines in stderr: ${JSON.stringify(o.stderr)}`);
+  return { counts, stderr: o.stderr.replace(STATS_LINE, "") };
 }
 
-export function defineU8Rows(title: string, rows: U8Row[]): void {
+function expectCount(what: string, got: number, want: Expect): void {
+  if (want === "some") expect(got, what).toBeGreaterThan(0);
+  else if (typeof want === "number") expect(got, what).toBe(want);
+  else expect(got, what).toBeLessThanOrEqual(want.max);
+}
+
+export function defineU8Rows(title: string, rows: U8Row[], opts: { shapeCheck?: boolean } = {}): void {
   const scratch = mkdtempSync(join(tmpdir(), "tsinter-u8-"));
   afterAll(() => rmSync(scratch, { recursive: true, force: true }));
   const check = async (row: U8Row, lane: Lane): Promise<void> => {
     const dir = join(scratch, `${row.id.split(" ")[0]}-${lane}`);
-    const prod = await build(dir, row, lane, 2, false);
+    const prod = await build(dir, row, lane, 2, "prod");
     expect(prod.got).toEqual(prod.node);
-    if (row.perRound === undefined) return;
-    const counts: number[] = [];
+    if (opts.shapeCheck === true) {
+      const checked = await build(dir, row, lane, 2, "check");
+      expect(checked.got, "shape-checked build").toEqual(checked.node);
+    }
+    if (row.perRound === undefined && row.stats === undefined && row.totals === undefined) return;
+    const runs: Record<string, number>[] = [];
     for (const rounds of [1, 2]) {
-      const { got, node } = await build(dir, row, lane, rounds, true);
+      const { got, node } = await build(dir, row, lane, rounds, "stats");
       const s = statsOf(got);
       expect({ ...got, stderr: s.stderr }).toEqual(node);
-      counts.push(s.allocs);
+      runs.push(s.counts);
     }
-    const delta = counts[1]! - counts[0]!;
-    if (row.perRound === "some") expect(delta).toBeGreaterThan(0);
-    else expect(delta).toBe(row.perRound);
+    const delta = (c: Counter): number => runs[1]![c]! - runs[0]![c]!;
+    if (row.perRound !== undefined) expectCount("dyn-allocs per round", delta("dyn-allocs"), row.perRound);
+    for (const [c, want] of Object.entries(row.stats ?? {}) as [Counter, Expect][]) expectCount(`${c} per round`, delta(c), want);
+    for (const [c, want] of Object.entries(row.totals ?? {}) as [Counter, number][]) expect(runs[0]![c], `${c} at 1 round`).toBe(want);
   };
   for (const lane of ["wasm", "wasm-native"] as const) {
     describe(`${title} (${lane} lane vs Node)`, () => {

@@ -188,7 +188,8 @@ import {
   type DynHandleDeps,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
-import { emitIcStatsReport, icStatsOn, setDynAllocCounter } from "./ic-stats.js";
+import { armIcStats, clearIcStats, emitIcStatsReport, icStatsOn } from "./ic-stats.js";
+import { icCacheableKey, ReadIc, type IcLocals } from "./ic-read.js";
 import { LoopNum, type NumArithOp, type NumRelOp } from "./loop-num.js";
 import { UrlBuilder } from "./url.js";
 import { UrlEngine } from "./url-whatwg.js";
@@ -2204,7 +2205,7 @@ export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, 
   } finally {
     fenceSourceTexts = null;
     setTrapHook(null);
-    setDynAllocCounter(null);
+    clearIcStats();
     setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
@@ -2225,7 +2226,7 @@ export function surveyWasmModule(mod: IrModule): string[] {
     new Assembler(inlineArrayCallbacks(lowerResumableFunctions(mod, refuse)), refuse).run();
   } finally {
     setTrapHook(null);
-    setDynAllocCounter(null);
+    clearIcStats();
     setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
@@ -3519,16 +3520,9 @@ class Assembler {
     private readonly mod: WModule,
     private readonly refuse: Refuse,
   ) {
-    // SCRIPTC_WASM_IC_STATS=1 (ic-stats.ts): the `$dyn` box counter, armed
-    // before anything can mint the box type.
-    if (icStatsOn()) {
-      setDynAllocCounter(
-        this.mb.addGlobal(I64, true, (w) => {
-          w.u8(0x42); // i64.const
-          w.sleb64(0n);
-        }),
-      );
-    }
+    // SCRIPTC_WASM_IC_STATS=1 (ic-stats.ts): the counters, armed before
+    // anything can mint the box type.
+    armIcStats(this.mb);
     // The uniform artifact contract (abi.ts): every module imports write,
     // owns a memory, and exports it — even a pure-compute program. Hosts
     // stay one shape; the cost is one page and one trivial import.
@@ -32464,6 +32458,12 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (e.key.kind === "strLit" && icCacheableKey(e.key.value)) {
+          // U8b: a literal key reads through the site's shape cache.
+          this.emitIcGet(code, e.key.value, e.optional === true, this.scratchLocals());
+          this.emitPendingCheck();
+          return;
+        }
         this.walkExpr(e.key);
         this.guardDynKeyTop(e.key);
         code.i32Const(e.optional === true ? 1 : 0);
@@ -42583,7 +42583,7 @@ class Assembler {
    * possibly-drifting copy of the fence-table list. May throw
    * (a nullish receiver, or the fence itself) — the caller owns the
    * pending check. */
-  private emitDynGetProp(code: Code, name: string, keepUndefined = false, loc?: SrcLoc): void {
+  private emitDynGetProp(code: Code, name: string, keepUndefined = false, loc?: SrcLoc, locals?: IcLocals): void {
     if (name === "constructor") {
       code.call(this.ctorGetHelper(keepUndefined, false, loc));
       return;
@@ -42600,11 +42600,39 @@ class Assembler {
       name === "arguments";
     if (needsProtoFence) {
       code.call(this.protoFenceGetPropHelper(name));
-    } else {
-      this.pushStrLitInto(code, name);
-      code.i32Const(0);
-      code.call(this.dyn.keyGet());
+      return;
     }
+    // U8b: an own-data read through the site's shape cache, where the
+    // read has locals to work in (the function being walked, or the
+    // caller's walker).
+    const ls = locals ?? (code === this.fn?.code ? this.scratchLocals() : undefined);
+    if (ls !== undefined && icCacheableKey(name)) {
+      this.emitIcGet(code, name, false, ls);
+      return;
+    }
+    this.pushStrLitInto(code, name);
+    code.i32Const(0);
+    code.call(this.dyn.keyGet());
+  }
+
+  private readIc: ReadIc | null = null;
+
+  /** U8b: the cached read `recv.key` (ic-read.ts), the receiver box on the
+   * stack; leaves keyGet's answer (the caller owns the pending check). */
+  private emitIcGet(code: Code, key: string, optional: boolean, locals: IcLocals): void {
+    this.readIc ??= new ReadIc(this.dyn, { pushStrLit: (c, v) => this.pushStrLitInto(c, v) });
+    const dynRef = this.dyn.dynRef();
+    const objRef = this.dyn.objRef();
+    const r = locals.get(dynRef);
+    const p = locals.get(objRef);
+    this.readIc.emitGet(code, key, optional, r, p);
+    locals.put?.(objRef, p);
+    locals.put?.(dynRef, r);
+  }
+
+  /** The current function's scratch pool as cache-read locals. */
+  private scratchLocals(): IcLocals {
+    return { get: (t) => this.acquireScratch(t), put: (t, i) => this.releaseScratch(t, i) };
   }
 
   private protoFenceGetPropFns = new Map<string, number>();
@@ -43028,7 +43056,7 @@ class Assembler {
         // one jsOp:getProp itself uses) — a real prototype method (e.g.
         // `const {toString} = v`) must read the real function, not
         // `keyGet`'s own-properties-only undefined.
-        this.emitDynGetProp(c, prop.key.value, this.ctorKeepsUndefined(loc), loc);
+        this.emitDynGetProp(c, prop.key.value, this.ctorKeepsUndefined(loc), loc, { get: (t) => this.wlocal(w, t) });
       } else {
         // A COMPUTED key (extra or call-shaped): ToPropertyKey reduces
         // to ToString here — this representation has no Symbol kind, so

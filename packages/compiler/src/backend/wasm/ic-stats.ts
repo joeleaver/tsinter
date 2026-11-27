@@ -4,18 +4,29 @@
  *
  * The CI speed checks count work instead of timing it, so they cannot
  * flake: a row builds a probe with the variable set, runs it, and reads
- * the counts the program prints to stderr when `_start` ends:
+ * the counts the program prints to stderr when `_start` ends, one line
+ * per counter:
  *
  *   tsinter-stats: dyn-allocs <n>
+ *   tsinter-stats: ic-hits <n>
+ *   tsinter-stats: ic-misses <n>
+ *   tsinter-stats: shapes <n>
  *
- * dyn-allocs counts every `$dyn` box the program allocated: each
- * `struct.new` of the box type (dyn.ts dynT), wherever it is emitted, first
- * adds one to an i64 global. A loop whose body allocates no box prints the
- * same count at 1 round as at 2 (wasm-u8a-loop.test.ts).
+ *   - dyn-allocs counts every `$dyn` box the program allocated: each
+ *     `struct.new` of the box type (dyn.ts dynT), wherever it is emitted,
+ *     first adds one to an i64 global. A loop whose body allocates no box
+ *     prints the same count at 1 round as at 2 (wasm-u8a-loop.test.ts).
+ *   - ic-hits / ic-misses count the property-read caches' answers
+ *     (ic-read.ts): a hit is a read the site's cache answered inline, a
+ *     miss one that went to the shared miss helper (filling the cache or
+ *     reading through keyGet).
+ *   - shapes counts the shapes made (shapes.ts next), the root excluded.
  *
- * Later U8 sub-units add their counters (IC hits and misses, shapes
- * created, argument vectors) to this report. */
+ * Every counter's global is made when the module starts (the Assembler's
+ * constructor), so a counter reads 0 in a module that never reaches it.
+ * Later U8 sub-units add their counters (argument vectors, ...) here. */
 import type { Code } from "./code.js";
+import { I64, type ModuleBuilder } from "./module.js";
 
 /** Is the stats mode on for this build? Read per build (the variable is the
  * compiler's environment, as SCRIPTC_WASM_LIT_CHECK is). */
@@ -23,30 +34,68 @@ export function icStatsOn(): boolean {
   return process.env["SCRIPTC_WASM_IC_STATS"] === "1";
 }
 
-/** The box counter: its i64 global, and the `$dyn` type index once the
- * module mints it (-1 before). Null outside the stats mode. */
-let dynAllocCounter: { global: number; typeIndex: number } | null = null;
+/** The counters, in report order. */
+const COUNTERS = ["dyn-allocs", "ic-hits", "ic-misses", "shapes"] as const;
+type Counter = (typeof COUNTERS)[number];
 
-/** Arms (a global index) or clears (null) the box counter for the module
- * being built. emitWasmModule clears it when the build ends. */
-export function setDynAllocCounter(global: number | null): void {
-  dynAllocCounter = global === null ? null : { global, typeIndex: -1 };
+/** The module being built's counter globals, and the `$dyn` type index
+ * once the module mints it (-1 before). Null outside the stats mode. */
+let stats: { globals: Record<Counter, number>; dynType: number } | null = null;
+
+/** Arms the counters for the module `mb` builds (stats mode only), before
+ * anything can mint the box type. */
+export function armIcStats(mb: ModuleBuilder): void {
+  if (!icStatsOn()) return;
+  const globals = {} as Record<Counter, number>;
+  for (const name of COUNTERS) {
+    globals[name] = mb.addGlobal(I64, true, (w) => {
+      w.u8(0x42); // i64.const
+      w.sleb64(0n);
+    });
+  }
+  stats = { globals, dynType: -1 };
+}
+
+/** Clears the counters; emitWasmModule calls it when the build ends. */
+export function clearIcStats(): void {
+  stats = null;
 }
 
 /** dyn.ts dynT: the `$dyn` box type's index, once minted. */
 export function noteDynType(typeIndex: number): void {
-  if (dynAllocCounter !== null) dynAllocCounter.typeIndex = typeIndex;
+  if (stats !== null) stats.dynType = typeIndex;
+}
+
+function bump(c: Code, name: Counter): void {
+  if (stats === null) return;
+  const g = stats.globals[name];
+  c.globalGet(g);
+  c.i64Const(1n);
+  c.i64Add();
+  c.globalSet(g);
 }
 
 /** code.ts structNew: before a `struct.new` of `typeIndex`, add one to the
  * box counter when that is the box type. The operands already on the
  * stack are untouched. */
 export function countDynAlloc(c: Code, typeIndex: number): void {
-  if (dynAllocCounter === null || typeIndex !== dynAllocCounter.typeIndex) return;
-  c.globalGet(dynAllocCounter.global);
-  c.i64Const(1n);
-  c.i64Add();
-  c.globalSet(dynAllocCounter.global);
+  if (stats === null || typeIndex !== stats.dynType) return;
+  bump(c, "dyn-allocs");
+}
+
+/** ic-read.ts: a read a site's cache answered inline. */
+export function countIcHit(c: Code): void {
+  bump(c, "ic-hits");
+}
+
+/** ic-read.ts: a read that went to the miss helper. */
+export function countIcMiss(c: Code): void {
+  bump(c, "ic-misses");
+}
+
+/** shapes.ts: a shape made. */
+export function countShape(c: Code): void {
+  bump(c, "shapes");
 }
 
 export interface IcStatsReportDeps {
@@ -61,17 +110,19 @@ export interface IcStatsReportDeps {
   f64ToStr: number;
 }
 
-/** The report line, written to stderr. Emitted at the end of `_start`. */
+/** The report lines, written to stderr. Emitted at the end of `_start`. */
 export function emitIcStatsReport(c: Code, deps: IcStatsReportDeps): void {
-  if (dynAllocCounter === null) return;
-  deps.pushStrLit(c, "tsinter-stats: dyn-allocs ");
-  c.call(deps.stage);
-  c.globalGet(dynAllocCounter.global);
-  c.f64ConvertI64U();
-  c.call(deps.f64ToStr);
-  c.call(deps.stage);
-  c.i32Const(0x0a);
-  c.call(deps.putc);
-  c.i32Const(2);
-  c.call(deps.flush);
+  if (stats === null) return;
+  for (const name of COUNTERS) {
+    deps.pushStrLit(c, `tsinter-stats: ${name} `);
+    c.call(deps.stage);
+    c.globalGet(stats.globals[name]);
+    c.f64ConvertI64U();
+    c.call(deps.f64ToStr);
+    c.call(deps.stage);
+    c.i32Const(0x0a);
+    c.call(deps.putc);
+    c.i32Const(2);
+    c.call(deps.flush);
+  }
 }

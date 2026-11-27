@@ -137,7 +137,8 @@ export class ObjModel {
       c.globalGet(g);
       c.refIsNull();
       c.ifVoid();
-      this.d.boxObj(c, (x) => this.d.pushNewObj(x, true));
+      // U8b: unshaped, as keyGet fences reads through it.
+      this.d.boxObj(c, (x) => this.d.pushNewObj(x, true, false));
       c.globalSet(g);
       c.end();
       c.globalGet(g);
@@ -267,6 +268,8 @@ export class ObjModel {
     const objT = this.d.objT();
     const L = this.d.objLinkedT();
     const entries = this.d.entriesArrayType();
+    // U8b: an attributed (or replaced) entry ends the shape's promise.
+    this.d.shapes.drop(c, (x) => x.localGet(obj));
     c.localGet(idx);
     c.i32Const(0);
     c.i32GeS();
@@ -349,6 +352,8 @@ export class ObjModel {
         x.localGet(1);
         x.structGet(this.d.entryT(), ENTRY_KEY);
       });
+      // U8b: a shaped object has no hidden key.
+      this.d.shapes.drop(c, (x) => x.localGet(0));
       c.localGet(0);
       c.structGet(L, this.d.olProto() + 2);
       c.localSet(N);
@@ -421,6 +426,8 @@ export class ObjModel {
       c.structGet(entryT, ENTRY_KEY);
       c.globalGet(this.d.undefinedGlobal());
       c.call(this.appendFn());
+      // U8b: the rotation below reorders the table against its shape.
+      this.d.shapes.drop(c, (x) => x.localGet(0));
       // entries[at+1..N] = entries[at..N-1]; entries[at] = entry
       c.localGet(0);
       c.structGet(objT, OBJ_ENTRIES);
@@ -503,15 +510,18 @@ export class ObjModel {
     const objT = this.d.objT();
     const L = this.d.objLinkedT();
     const entries = this.d.entriesArrayType();
-    return this.fn("removeAt", [this.d.objRef(), I32], [], [I32, I32, this.d.entryRef(), I32], (c) => {
+    return this.fn("removeAt", [this.d.objRef(), I32], [], [I32, I32, this.d.entryRef(), I32, this.d.shapes.shapeRef()], (c) => {
       const N = 2;
       const I = 3;
       const E = 4;
       const H = 5;
+      const SH = 6;
       c.localGet(1);
       c.i32Const(0);
       c.i32GeS();
       c.ifVoid();
+      // U8b: the last-added key rolls the shape back; any other drops it.
+      this.d.shapes.emitRemove(c, 0, 1, SH);
       c.localGet(0);
       c.structGet(objT, OBJ_LEN);
       c.localSet(N);
@@ -1186,6 +1196,9 @@ export class ObjModel {
           c.i32Const(0);
           c.i32Ne();
         };
+        // U8b: defineProperty leaves the shape (dictionary mode), whatever
+        // it defines (docs/design/u8-dynamic-speed.md §3).
+        this.d.shapes.drop(c, (x) => x.localGet(0));
         c.localGet(0);
         c.localGet(1);
         c.call(this.ownIdx());
@@ -2829,6 +2842,8 @@ export class ObjModel {
       c.end();
       c.end();
       c.structSet(L, this.d.olProto());
+      // U8b: a shape never outlives a change of its object's prototype.
+      this.d.shapes.drop(c, (x) => this.d.objPayload(x, (y) => y.localGet(0)));
       c.localGet(0);
     });
   }
@@ -3104,6 +3119,8 @@ export class ObjModel {
         c.i32Const(OF_NONEXT);
         c.i32Or();
         c.structSet(L, this.d.olProto() + 3);
+        // U8b: a shaped object is extensible.
+        this.d.shapes.drop(c, (x) => x.localGet(O));
         c.localGet(1);
         c.i32Eqz();
         c.ifVoid();

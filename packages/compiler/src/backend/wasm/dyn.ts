@@ -138,6 +138,7 @@ import { ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "
 import { ObjModel } from "./objmodel.js";
 import { TplFrozen } from "./tpl-frozen.js";
 import { ErrOwnKeys } from "./err-own.js";
+import { Shapes } from "./shapes.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
 import { RE_F_DYN_BOX, RE_F_LAST_INDEX } from "./regex-value.js";
@@ -864,21 +865,72 @@ export class DynBuilder {
    * about iteration order). */
   objT(): number {
     if (this.objType !== null) return this.objType;
-    const entries = this.mb.arrayType(this.entryRef(), true);
-    this.objEntriesType = entries;
-    this.objType = this.mb.openStructType("dyn:obj", [
-      { storage: I32, mutable: true },
-      { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
-      { storage: I32, mutable: false },
-      ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
-    ]);
+    this.objType = this.mb.openStructType("dyn:obj", this.objBaseFields());
     return this.objType;
   }
 
+  /** `$dynObj`'s fields, which every payload subtype repeats first: len,
+   * entries, the prototype code, the identity-hash slot where the module
+   * has one (OBJ_IDH), and U8b's shape (objShapeField, shapes.ts). */
+  private objBaseFields(): FieldType[] {
+    return [
+      { storage: I32, mutable: true },
+      { storage: { kind: "ref", nullable: true, typeIndex: this.entriesArrayTypeRaw() }, mutable: true },
+      { storage: I32, mutable: false },
+      ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+      { storage: this.shapes.shapeRef(), mutable: true },
+    ];
+  }
+
+  /** The entries array type, minted before `$dynObj` itself (its fields
+   * name it). */
+  private entriesArrayTypeRaw(): number {
+    this.objEntriesType ??= this.mb.arrayType(this.entryRef(), true);
+    return this.objEntriesType;
+  }
+
+  /** The number of `$dynObj` fields; a subtype's own fields follow them. */
+  private objBaseCount(): number {
+    return this.deps.idSlot === true ? 5 : 4;
+  }
+
+  /** U8b: the `shape` field of every OBJ payload (shapes.ts). */
+  objShapeField(): number {
+    return this.objBaseCount() - 1;
+  }
+
+  /** Pushes a fresh payload's `$dynObj` fields: no entries, prototype code
+   * `proto`, identity hash 0, and the root shape when `shaped` (a plain
+   * object), else null (dictionary mode: the exotic payloads). */
+  private pushObjBase(c: Code, proto: number, shaped: boolean): void {
+    c.i32Const(0);
+    c.refNull(this.entriesArrayType());
+    c.i32Const(proto);
+    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
+    this.shapes.pushInitial(c, shaped);
+  }
+
+  private shapesInst: Shapes | null = null;
+
+  /** U8b: the shapes of dynamic objects (shapes.ts). */
+  get shapes(): Shapes {
+    this.shapesInst ??= new Shapes(this);
+    return this.shapesInst;
+  }
+
+  /** The builder internals shapes.ts and ic-read.ts emit with. */
+  shapesKit() {
+    return {
+      mb: this.mb,
+      deps: this.deps,
+      cached: (name: string, params: ValType[], results: ValType[], build: (idx: number) => void): number => this.cached(name, params, results, build),
+    };
+  }
+
   /** The field index of a URL / RegExp OBJ payload's own slot (after the
-   * identity-hash slot, where the module has one). */
+   * `$dynObj` fields). */
   objPayloadSlot(): number {
-    return this.deps.idSlot === true ? 4 : 3;
+    return this.objBaseCount();
   }
 
   objRef(): ValType {
@@ -892,18 +944,17 @@ export class DynBuilder {
    * emitter.ts already pokes UnionBuilder's base struct fields directly. */
   entriesArrayType(): number {
     this.objT();
-    if (this.objEntriesType === null) throw new Error("wasm dyn builder: entries array type unresolved");
-    return this.objEntriesType;
+    return this.entriesArrayTypeRaw();
   }
 
   /** A fresh empty OBJ payload (C's `scr_dyn_new_obj` /
    * `scr_dyn_new_obj_null_proto`): len 0, no buffer yet — obj_put
    * allocates the first one, matching C's `cap ? cap * 2 : 4`. */
-  pushNewObj(c: Code, proto: boolean | number): void {
-    c.i32Const(0);
-    c.refNull(this.entriesArrayType());
-    c.i32Const(typeof proto === "number" ? proto : proto ? OBJ_PROTO_NULL : OBJ_PROTO_PLAIN);
-    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
+  pushNewObj(c: Code, proto: boolean | number, shaped = true): void {
+    const code = typeof proto === "number" ? proto : proto ? OBJ_PROTO_NULL : OBJ_PROTO_PLAIN;
+    // U8b: a plain object starts at the root shape; a container stand-in
+    // (codes 2-4) never takes one (keyGet answers it through its arms).
+    this.pushObjBase(c, code, shaped && code <= OBJ_PROTO_NULL);
     if (this.objModelLive) {
       // Units U3 + U4: every object can take attributes and a prototype.
       c.refNull(this.dynT());
@@ -1724,17 +1775,12 @@ export class DynBuilder {
   objUrlT(): number {
     if (this.objUrlType !== null) return this.objUrlType;
     const objT = this.objT();
-    const entries = this.entriesArrayType();
     const held = this.deps.url!.urlType();
     this.objUrlType = this.mb.subStructType(
       "dyn:objUrl",
       [
-        { storage: I32, mutable: true },
-        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
-        { storage: I32, mutable: false },
-        // The OBJ payload's identity-hash slot, where the module has one: a
-        // subtype repeats its supertype's fields first.
-        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        // A subtype repeats its supertype's fields first.
+        ...this.objBaseFields(),
         // Typed by what it holds: each payload subtype is its own singleton
         // recursion group, so two subtypes of one shape would canonicalize
         // to ONE type and a ref.test could not tell a URL from a RegExp.
@@ -1748,10 +1794,7 @@ export class DynBuilder {
   /** Box the URL struct ref the caller pushes as a dynamic URL. */
   boxUrl(c: Code, pushUrl: (c: Code) => void): void {
     this.boxObj(c, (x) => {
-      x.i32Const(0);
-      x.refNull(this.entriesArrayType());
-      x.i32Const(OBJ_PROTO_PLAIN);
-      if (this.deps.idSlot === true) x.i32Const(0); // OBJ_IDH
+      this.pushObjBase(x, OBJ_PROTO_PLAIN, false);
       pushUrl(x);
       x.structNew(this.objUrlT());
     });
@@ -2071,17 +2114,12 @@ export class DynBuilder {
   objRegexT(): number {
     if (this.objRegexType !== null) return this.objRegexType;
     const objT = this.objT();
-    const entries = this.entriesArrayType();
     const held = this.deps.regex!.reType();
     this.objRegexType = this.mb.subStructType(
       "dyn:objRegex",
       [
-        { storage: I32, mutable: true },
-        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
-        { storage: I32, mutable: false },
-        // The OBJ payload's identity-hash slot, where the module has one: a
-        // subtype repeats its supertype's fields first.
-        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        // A subtype repeats its supertype's fields first.
+        ...this.objBaseFields(),
         // Typed by what it holds: each payload subtype is its own singleton
         // recursion group, so two subtypes of one shape would canonicalize
         // to ONE type and a ref.test could not tell a URL from a RegExp.
@@ -2126,10 +2164,7 @@ export class DynBuilder {
       c.return_();
       c.end();
       this.boxObj(c, (x) => {
-        x.i32Const(0);
-        x.refNull(this.entriesArrayType());
-        x.i32Const(OBJ_PROTO_PLAIN);
-        if (this.deps.idSlot === true) x.i32Const(0); // OBJ_IDH
+        this.pushObjBase(x, OBJ_PROTO_PLAIN, false);
         x.localGet(0);
         x.structNew(this.objRegexT());
       });
@@ -2336,10 +2371,7 @@ export class DynBuilder {
     this.objLinkedType = this.mb.subStructType(
       "dyn:objLinked",
       [
-        { storage: I32, mutable: true },
-        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
-        { storage: I32, mutable: false },
-        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        ...this.objBaseFields(),
         { storage: this.dynRef(), mutable: this.objModelLive },
         ...(this.objModelLive
           ? [
@@ -2357,19 +2389,16 @@ export class DynBuilder {
     return this.objLinkedType;
   }
 
-  /** The linked payload's prototype field (after the identity-hash slot
-   * when the module has one); the object-model fields follow it. */
+  /** The linked payload's prototype field (after the `$dynObj` fields);
+   * the object-model fields follow it. */
   olProto(): number {
-    return this.deps.idSlot === true ? 4 : 3;
+    return this.objBaseCount();
   }
 
   /** A fresh empty linked OBJ payload whose prototype box the caller
-   * pushes. */
-  pushNewLinkedObj(c: Code, pushProto: (c: Code) => void): void {
-    c.i32Const(0);
-    c.refNull(this.entriesArrayType());
-    c.i32Const(OBJ_PROTO_PLAIN);
-    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
+   * pushes; `shaped` false for an exotic payload (an error prototype). */
+  pushNewLinkedObj(c: Code, pushProto: (c: Code) => void, shaped = true): void {
+    this.pushObjBase(c, OBJ_PROTO_PLAIN, shaped);
     pushProto(c);
     this.pushOmTail(c);
     c.structNew(this.objLinkedT());
@@ -2410,10 +2439,7 @@ export class DynBuilder {
     this.objBuiltinType = this.mb.subStructType(
       "dyn:objBuiltin",
       [
-        { storage: I32, mutable: true },
-        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
-        { storage: I32, mutable: false },
-        ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
+        ...this.objBaseFields(),
         ...(linked
           ? [
               { storage: this.dynRef(), mutable: true } as FieldType,
@@ -2431,16 +2457,13 @@ export class DynBuilder {
 
   /** The table field of `$dynObjBuiltin`. */
   private builtinTableField(): number {
-    return 3 + (this.deps.idSlot === true ? 1 : 0) + (this.objModelLive ? 4 : 0);
+    return this.objBaseCount() + (this.objModelLive ? 4 : 0);
   }
 
   /** A fresh container OBJ payload with proto code `proto` over the table
    * the caller pushes. */
   pushNewBuiltinObj(c: Code, proto: number, pushTable: (c: Code) => void): void {
-    c.i32Const(0);
-    c.refNull(this.entriesArrayType());
-    c.i32Const(proto);
-    if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
+    this.pushObjBase(c, proto, false);
     if (this.objModelLive) {
       c.refNull(this.dynT());
       this.pushOmTail(c);
@@ -2968,6 +2991,7 @@ export class DynBuilder {
         c.localGet(2);
         c.call(this.objAppend());
         c.else_();
+        this.shapes.emitReplace(c, 0, 2);
         c.localGet(3);
         c.localGet(2);
         c.structSet(this.entryT(), ENTRY_VALUE);
@@ -2994,6 +3018,7 @@ export class DynBuilder {
       const N = 4;
       const E = 5;
       const NB = 6;
+      const SH = 7;
       // the store's reserved-key check (storeKeyGuard)
       this.storeKeyGuard(c, (x) => x.localGet(1));
       c.localGet(0);
@@ -3018,6 +3043,7 @@ export class DynBuilder {
       c.call(this.deps.strEq());
       c.ifVoid();
       // Replace the VALUE; the entry keeps the key it was created with.
+      this.shapes.emitReplace(c, 0, 2);
       c.localGet(E);
       c.localGet(2);
       c.structSet(entryT, ENTRY_VALUE);
@@ -3031,6 +3057,9 @@ export class DynBuilder {
       c.end();
       c.end();
       }
+      // U8b: the shape walks to the key's child (or drops to dictionary
+      // mode), and a shaped append stores the child's canonical key.
+      this.shapes.emitAppend(c, 0, 1, 2, SH);
       // Append. Capacity is the buffer's length; C starts at 4 and
       // doubles, and a null buffer is the "no capacity yet" state.
       c.localGet(0);
@@ -3091,7 +3120,7 @@ export class DynBuilder {
       c.structSet(objT, OBJ_LEN);
       this.mb.setBody(
         idx,
-        [I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: entries }],
+        [I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: entries }, this.shapes.shapeRef()],
         c.bytes(),
       );
     });
@@ -10665,7 +10694,8 @@ export class DynBuilder {
       c.globalGet(g);
       c.refIsNull();
       c.ifVoid();
-      this.boxObj(c, (x) => this.pushNewLinkedObj(x, (y) => y.call(k === 0 ? this.om.objectProto() : this.errorProto(0))));
+      // U8b: unshaped, as keyGet fences reads through it (errProtoGuard).
+      this.boxObj(c, (x) => this.pushNewLinkedObj(x, (y) => y.call(k === 0 ? this.om.objectProto() : this.errorProto(0)), false));
       c.globalSet(g);
       c.end();
       c.globalGet(g);
