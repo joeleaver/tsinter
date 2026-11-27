@@ -3060,70 +3060,83 @@ export class DynBuilder {
       // U8b: the shape walks to the key's child (or drops to dictionary
       // mode), and a shaped append stores the child's canonical key.
       this.shapes.emitAppend(c, 0, 1, 2, SH);
-      // Append. Capacity is the buffer's length; C starts at 4 and
-      // doubles, and a null buffer is the "no capacity yet" state.
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.refIsNull();
-      c.ifResult(I32);
-      c.i32Const(1); // no buffer yet — C's `cap == 0`
-      c.else_();
-      c.localGet(N);
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.arrayLen();
-      c.i32GeU();
-      c.end();
-      c.ifVoid();
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.refIsNull();
-      c.ifResult(I32);
-      c.i32Const(4);
-      c.else_();
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.arrayLen();
-      c.i32Const(2);
-      c.i32Mul();
-      c.end();
-      c.arrayNewDefault(entries);
-      c.localSet(NB);
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.refIsNull();
-      c.i32Eqz();
-      c.ifVoid();
-      c.localGet(NB);
-      c.i32Const(0);
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.i32Const(0);
-      c.localGet(N);
-      c.arrayCopy(entries, entries);
-      c.end();
-      c.localGet(0);
-      c.localGet(NB);
-      c.structSet(objT, OBJ_ENTRIES);
-      c.end();
-      c.localGet(0);
-      c.structGet(objT, OBJ_ENTRIES);
-      c.localGet(N);
-      c.localGet(1);
-      c.localGet(2);
-      c.structNew(entryT);
-      c.arraySet(entries);
-      c.localGet(0);
-      c.localGet(N);
-      c.i32Const(1);
-      c.i32Add();
-      c.structSet(objT, OBJ_LEN);
+      this.emitEntryPush(c, 0, N, 1, 2, NB);
       this.mb.setBody(
         idx,
         [I32, I32, this.entryRef(), { kind: "ref", nullable: true, typeIndex: entries }, this.shapes.shapeRef()],
         c.bytes(),
       );
     });
+  }
+
+  /** The append of objPutBody, for a key known absent and the shape
+   * already walked: with the payload in local `obj`, its length in local
+   * `n`, the key in local `key` and the value in local `value`, grows the
+   * table when it is full (C's `cap ? cap * 2 : 4`) and stores the entry
+   * at `n`. `nb` is a scratch local of the nullable entries array. Shared
+   * with the U8c append cache (ic-write.ts), so both grow alike. */
+  emitEntryPush(c: Code, obj: number, n: number, key: number, value: number, nb: number): void {
+    const objT = this.objT();
+    const entries = this.entriesArrayType();
+    const entryT = this.entryT();
+    // Append. Capacity is the buffer's length; C starts at 4 and
+    // doubles, and a null buffer is the "no capacity yet" state.
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(1); // no buffer yet — C's `cap == 0`
+    c.else_();
+    c.localGet(n);
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.arrayLen();
+    c.i32GeU();
+    c.end();
+    c.ifVoid();
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(4);
+    c.else_();
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.arrayLen();
+    c.i32Const(2);
+    c.i32Mul();
+    c.end();
+    c.arrayNewDefault(entries);
+    c.localSet(nb);
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(nb);
+    c.i32Const(0);
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.i32Const(0);
+    c.localGet(n);
+    c.arrayCopy(entries, entries);
+    c.end();
+    c.localGet(obj);
+    c.localGet(nb);
+    c.structSet(objT, OBJ_ENTRIES);
+    c.end();
+    c.localGet(obj);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.localGet(n);
+    c.localGet(key);
+    c.localGet(value);
+    c.structNew(entryT);
+    c.arraySet(entries);
+    c.localGet(obj);
+    c.localGet(n);
+    c.i32Const(1);
+    c.i32Add();
+    c.structSet(objT, OBJ_LEN);
   }
 
   /* ── the FUNC payload ───────────────────────────────────────────────── */

@@ -50,7 +50,7 @@ export interface U8Row {
 }
 
 /** The counters an instrumented build reports (ic-stats.ts). */
-export type Counter = "dyn-allocs" | "ic-hits" | "ic-misses" | "shapes";
+export type Counter = "dyn-allocs" | "ic-hits" | "ic-misses" | "shapes" | "ic-megas" | "set-hits" | "set-misses" | "lit-hits";
 
 /** Exactly this many, or at least one ("some"), or at most `max`. */
 export type Expect = number | "some" | { max: number };

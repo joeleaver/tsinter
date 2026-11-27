@@ -11,6 +11,10 @@
  *   tsinter-stats: ic-hits <n>
  *   tsinter-stats: ic-misses <n>
  *   tsinter-stats: shapes <n>
+ *   tsinter-stats: ic-megas <n>
+ *   tsinter-stats: set-hits <n>
+ *   tsinter-stats: set-misses <n>
+ *   tsinter-stats: lit-hits <n>
  *
  *   - dyn-allocs counts every `$dyn` box the program allocated: each
  *     `struct.new` of the box type (dyn.ts dynT), wherever it is emitted,
@@ -21,6 +25,14 @@
  *     miss one that went to the shared miss helper (filling the cache or
  *     reading through keyGet).
  *   - shapes counts the shapes made (shapes.ts next), the root excluded.
+ *   - ic-megas counts the sites (read or store) that went megamorphic
+ *     (ic-ways.ts): every way taken, and a further shape offered.
+ *   - set-hits / set-misses count the store caches' writes (ic-write.ts):
+ *     a hit is a write the site's cache did itself (in place, or an
+ *     append on a cached transition), a miss one that went to the shared
+ *     miss helper or through keySet.
+ *   - lit-hits counts the object literals built on their site's cached
+ *     final shape (lit-shape.ts).
  *
  * Every counter's global is made when the module starts (the Assembler's
  * constructor), so a counter reads 0 in a module that never reaches it.
@@ -35,7 +47,7 @@ export function icStatsOn(): boolean {
 }
 
 /** The counters, in report order. */
-const COUNTERS = ["dyn-allocs", "ic-hits", "ic-misses", "shapes"] as const;
+const COUNTERS = ["dyn-allocs", "ic-hits", "ic-misses", "shapes", "ic-megas", "set-hits", "set-misses", "lit-hits"] as const;
 type Counter = (typeof COUNTERS)[number];
 
 /** The module being built's counter globals, and the `$dyn` type index
@@ -91,6 +103,26 @@ export function countIcHit(c: Code): void {
 /** ic-read.ts: a read that went to the miss helper. */
 export function countIcMiss(c: Code): void {
   bump(c, "ic-misses");
+}
+
+/** ic-ways.ts: a site gone megamorphic. */
+export function countIcMega(c: Code): void {
+  bump(c, "ic-megas");
+}
+
+/** ic-write.ts: a write a store site's cache did itself. */
+export function countSetHit(c: Code): void {
+  bump(c, "set-hits");
+}
+
+/** ic-write.ts: a write that went to the miss helper or keySet. */
+export function countSetMiss(c: Code): void {
+  bump(c, "set-misses");
+}
+
+/** lit-shape.ts: an object literal built on its cached final shape. */
+export function countLitHit(c: Code): void {
+  bump(c, "lit-hits");
 }
 
 /** shapes.ts: a shape made. */

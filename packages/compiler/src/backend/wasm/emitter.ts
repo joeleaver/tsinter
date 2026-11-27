@@ -190,6 +190,9 @@ import {
 import { InspectBuilder } from "./inspect.js";
 import { armIcStats, clearIcStats, emitIcStatsReport, icStatsOn } from "./ic-stats.js";
 import { icCacheableKey, ReadIc, type IcLocals } from "./ic-read.js";
+import { WriteIc } from "./ic-write.js";
+import { LitShape, litShapeable } from "./lit-shape.js";
+import { BoxIntern } from "./box-intern.js";
 import { LoopNum, type NumArithOp, type NumRelOp } from "./loop-num.js";
 import { UrlBuilder } from "./url.js";
 import { UrlEngine } from "./url-whatwg.js";
@@ -27237,6 +27240,13 @@ class Assembler {
             this.releaseScratch(dynRef, d);
             return;
           }
+          const k1 = e.args[1]!;
+          if (k1.kind === "strLit" && icCacheableKey(k1.value)) {
+            // U8c: a literal-key write through the store cache.
+            this.emitIcSet(k1.value, (e as { sloppy?: boolean }).sloppy === true, e.args[0]!, e.args[2]!);
+            this.emitPendingCheck();
+            return;
+          }
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
           this.guardDynKeyTop(e.args[1]!);
@@ -32870,6 +32880,11 @@ class Assembler {
           const weakSet = e.builtin === "WeakSet";
           const info = this.builtinTableInfo(weakSet);
           this.dyn.pushNewBuiltinObj(code, BUILTIN_OBJ_PROTO[e.builtin], (c) => c.call(this.maps.new_(info)));
+        } else if (this.emitLitShaped(e.fields ?? [], o)) {
+          // U8c: built through the site's final shape (lit-shape.ts).
+          this.dyn.boxObj(code, (c) => c.localGet(o));
+          this.releaseScratch(this.dyn.objRef(), o);
+          return;
         } else {
           this.dyn.pushNewObj(code, false);
         }
@@ -35325,6 +35340,12 @@ class Assembler {
           }
           case "setProp": {
             if (e.name === undefined) throw new Error("emitter bug: jsOp setProp without a name");
+            if (icCacheableKey(e.name)) {
+              // U8c: a literal-key write through the store cache.
+              this.emitIcSet(e.name, (e as { sloppy?: boolean }).sloppy === true, e.args[0]!, e.args[1]!);
+              this.emitPendingCheck();
+              return;
+            }
             this.walkExpr(e.args[0]!);
             this.pushStrLit(e.name);
             this.walkExpr(e.args[1]!);
@@ -35412,6 +35433,14 @@ class Assembler {
               }
             }
             const o = this.acquireScratch(this.dyn.objRef());
+            const litFields: { key: IrExpr; value: IrExpr }[] = [];
+            for (let i = 0; i + 1 < e.args.length; i += 2) litFields.push({ key: e.args[i]!, value: e.args[i + 1]! });
+            if (this.emitLitShaped(litFields, o)) {
+              // U8c: built through the site's final shape (lit-shape.ts).
+              this.dyn.boxObj(code, (c) => c.localGet(o));
+              this.releaseScratch(this.dyn.objRef(), o);
+              return;
+            }
             this.dyn.pushNewObj(code, false);
             code.localSet(o);
             const dynT = this.dyn.dynT();
@@ -42623,11 +42652,87 @@ class Assembler {
     this.readIc ??= new ReadIc(this.dyn, { pushStrLit: (c, v) => this.pushStrLitInto(c, v) });
     const dynRef = this.dyn.dynRef();
     const objRef = this.dyn.objRef();
+    const shRef = this.dyn.shapes.shapeRef();
     const r = locals.get(dynRef);
     const p = locals.get(objRef);
-    this.readIc.emitGet(code, key, optional, r, p);
+    const sh = locals.get(shRef);
+    this.readIc.emitGet(code, key, optional, r, p, sh);
+    locals.put?.(shRef, sh);
     locals.put?.(objRef, p);
     locals.put?.(dynRef, r);
+  }
+
+  private writeIc: WriteIc | null = null;
+  private litShape: LitShape | null = null;
+  private boxIntern: BoxIntern | null = null;
+
+  /** U8c: a value headed for a dynamic object's entry. A typed number
+   * (`jsMarshal` of an f64 that cannot be a slot's undefined) boxes
+   * through the small-integer table, a number literal to its constant box
+   * (box-intern.ts); anything else walks as usual. */
+  private walkStoredValue(e: IrExpr): void {
+    if (e.kind === "jsMarshal" && e.value.type.kind === "f64") {
+      this.boxIntern ??= new BoxIntern(this.dyn);
+      if (e.value.kind === "numLit") {
+        this.boxIntern.boxConst(this.fn.code, e.value.value);
+        return;
+      }
+      // a slot's undefined (Unit U) crosses through dynFrom's helper
+      let fallback: number | null = null;
+      if (this.undefSlots && mayBeSlotUndef(e.value as WExpr)) {
+        fallback = this.dynFromHelper(e.value.type, e.loc);
+        if (fallback === null) {
+          this.fn.code.unreachable();
+          return;
+        }
+      }
+      this.boxIntern.boxNum(this.fn.code, () => this.walkExpr(e.value), fallback);
+      return;
+    }
+    this.walkExpr(e);
+  }
+
+  /** U8c: the write `recv.key = value` (sloppy-mode code's when `sloppy`)
+   * through the site's store cache (ic-write.ts): walks the receiver, then
+   * the value, then writes; the caller owns the pending check. */
+  private emitIcSet(key: string, sloppy: boolean, recv: IrExpr, value: IrExpr): void {
+    const code = this.fn.code;
+    this.writeIc ??= new WriteIc(this.dyn, { pushStrLit: (c, v) => this.pushStrLitInto(c, v) });
+    const dynRef = this.dyn.dynRef();
+    const objRef = this.dyn.objRef();
+    const shRef = this.dyn.shapes.shapeRef();
+    const r = this.acquireScratch(dynRef);
+    const v = this.acquireScratch(dynRef);
+    this.walkExpr(recv);
+    code.localSet(r);
+    this.walkStoredValue(value);
+    code.localSet(v);
+    const p = this.acquireScratch(objRef);
+    const sh = this.acquireScratch(shRef);
+    const i = this.acquireScratch(I32);
+    this.writeIc.emitSet(code, key, sloppy, { r, v, p, sh, i });
+    this.releaseScratch(I32, i);
+    this.releaseScratch(shRef, sh);
+    this.releaseScratch(objRef, p);
+    this.releaseScratch(dynRef, v);
+    this.releaseScratch(dynRef, r);
+  }
+
+  /** U8c: a plain dynamic object literal whose keys are all string
+   * literals, built through its site's final shape (lit-shape.ts); leaves
+   * the payload in local `o`. False (nothing emitted) for any other. */
+  private emitLitShaped(fields: { key: IrExpr; value: IrExpr }[], o: number): boolean {
+    const keys: string[] = [];
+    for (const f of fields) {
+      // dynObjLit's keys are strings; jsOp objLit's are marshaled strings
+      const k = f.key.kind === "jsMarshal" ? f.key.value : f.key;
+      if (k.kind !== "strLit") return false;
+      keys.push(k.value);
+    }
+    if (!litShapeable(keys)) return false;
+    this.litShape ??= new LitShape(this.dyn, { pushStrLit: (c, v) => this.pushStrLitInto(c, v) });
+    this.litShape.emit(this.fn.code, keys, (_c, i) => this.walkStoredValue(fields[i]!.value), o, this.scratchLocals());
+    return true;
   }
 
   /** The current function's scratch pool as cache-read locals. */

@@ -215,8 +215,8 @@ const objs: any = [o, q, o, q];
 const out: string[] = [];
 for (let r = 0; r < __R__; r++) for (let i = 0; i < objs.length; i++) out.push(String(objs[i].g));
 console.log(out.join(","));` },
-  { id: "U8b-B17 a site that has filled 16 times stops refilling, reads its misses uncached and still hits its last shape",
-    stats: { "ic-misses": 19, "ic-hits": 6 }, totals: { "ic-misses": 20, "ic-hits": 5 },
+  { id: "U8b-B17 a site seeing 20 shapes fills its four ways, goes megamorphic, reads the rest uncached and keeps hitting its ways (U8c)",
+    stats: { "ic-misses": 21, "ic-hits": 4, "ic-megas": 0 }, totals: { "ic-misses": 25, "ic-hits": 0, "ic-megas": 1 },
     src: `const recs: string[] = [];
 for (let i = 0; i < 20; i++) recs.push('{"a":' + (i * 3) + ',"k' + i + '":' + i + '}');
 const xs: any = JSON.parse("[" + recs.join(",") + "]");
