@@ -133,6 +133,7 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
+import { noteDynType } from "./ic-stats.js";
 import { ERRV_PROBE, FN_PROTO_GENERATOR, FN_PROTO_SRC_TS, FN_PROTO_STUB } from "../../ir/nodes.js";
 import { ObjModel } from "./objmodel.js";
 import { TplFrozen } from "./tpl-frozen.js";
@@ -733,6 +734,7 @@ export class DynBuilder {
       { storage: F64, mutable: false },
       { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
     ]);
+    noteDynType(this.dynType);
     return this.dynType;
   }
 

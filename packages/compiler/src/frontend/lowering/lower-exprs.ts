@@ -9116,8 +9116,13 @@ function lowerObjectLiteralCore(L: Lowerer, expr: ts.ObjectLiteralExpression): I
     const key = L.jsvalIn(L.lowerExpr(expr.argumentExpression), expr.argumentExpression);
     // One world (U1a, SEMANTICS.md S015): a keyed read that misses on a key
     // naming an inherited member ends at a named fence instead of the
-    // own-only `undefined`.
-    const read: IrExpr = L.sharedDynamic && obj.type.kind === "jsval" && key.type.kind === "jsval"
+    // own-only `undefined`. That fence answers only a STRING key, so a
+    // typed number key (`xs[i]`, the `any[]` loop) is the plain keyed read:
+    // the helper would answer it the same, after boxing the number and
+    // turning it into a string (U8a, docs/design/u8-dynamic-speed.md §8);
+    // the backend reads an island array's slot straight from the f64.
+    const numKey = key.kind === "jsMarshal" && key.value.type.kind === "f64";
+    const read: IrExpr = L.sharedDynamic && obj.type.kind === "jsval" && key.type.kind === "jsval" && !numKey
       ? { kind: "call", callee: inheritedKeyReadHelper(L, loc), args: [obj, key], type: JSVAL, loc }
       : { kind: "jsOp", op: "getIdx", args: [obj, key], type: JSVAL, loc };
     // GH #236: `e[1]` typed `never` by inference residue (an Object.entries

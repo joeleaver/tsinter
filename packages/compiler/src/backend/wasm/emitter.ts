@@ -188,6 +188,8 @@ import {
   type DynHandleDeps,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
+import { emitIcStatsReport, icStatsOn, setDynAllocCounter } from "./ic-stats.js";
+import { LoopNum, type NumArithOp, type NumRelOp } from "./loop-num.js";
 import { UrlBuilder } from "./url.js";
 import { UrlEngine } from "./url-whatwg.js";
 import { QsBuilder, type QsDict } from "./querystring.js";
@@ -2202,6 +2204,7 @@ export function emitWasmModule(mod: IrModule, sourceTexts?: ReadonlyMap<string, 
   } finally {
     fenceSourceTexts = null;
     setTrapHook(null);
+    setDynAllocCounter(null);
     setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
@@ -2222,6 +2225,7 @@ export function surveyWasmModule(mod: IrModule): string[] {
     new Assembler(inlineArrayCallbacks(lowerResumableFunctions(mod, refuse)), refuse).run();
   } finally {
     setTrapHook(null);
+    setDynAllocCounter(null);
     setCanonNaNFunc(null);
     setFlatCrossing(null);
     setCharsType(null);
@@ -3515,6 +3519,16 @@ class Assembler {
     private readonly mod: WModule,
     private readonly refuse: Refuse,
   ) {
+    // SCRIPTC_WASM_IC_STATS=1 (ic-stats.ts): the `$dyn` box counter, armed
+    // before anything can mint the box type.
+    if (icStatsOn()) {
+      setDynAllocCounter(
+        this.mb.addGlobal(I64, true, (w) => {
+          w.u8(0x42); // i64.const
+          w.sleb64(0n);
+        }),
+      );
+    }
     // The uniform artifact contract (abi.ts): every module imports write,
     // owns a memory, and exports it — even a pure-compute program. Hosts
     // stay one shape; the cost is one page and one trivial import.
@@ -7692,6 +7706,10 @@ class Assembler {
       // whether or not the program arms a timer.
       if (this.eventModule) void this.timers;
       if (this.timersField === null) this.emitImplicitDrainAndCheck(c);
+      if (icStatsOn()) {
+        const h = this.ensureHelpers();
+        emitIcStatsReport(c, { pushStrLit: (x, v) => this.pushStrLitInto(x, v), ...h, f64ToStr: this.inspF64Helper() });
+      }
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
@@ -35320,7 +35338,7 @@ class Assembler {
             // in-range integral index reads its slot directly; everything
             // else takes the generic key route below.
             if (e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
-              this.emitIslandNumIndex(e.args[0]!, e.args[1]!.value, null);
+              this.loopNum.emitNumIndex(e.args[0]!, e.args[1]!.value, null);
               return;
             }
             // The index is a full jsval (validate.ts: every jsOp arg is
@@ -35338,7 +35356,7 @@ class Assembler {
           case "setIdx": {
             const sloppyWrite = (e as { sloppy?: boolean }).sloppy === true;
             if (!sloppyWrite && e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
-              this.emitIslandNumIndex(e.args[0]!, e.args[1]!.value, e.args[2]!);
+              this.loopNum.emitNumIndex(e.args[0]!, e.args[1]!.value, e.args[2]!);
               return;
             }
             this.walkExpr(e.args[0]!);
@@ -35446,6 +35464,12 @@ class Assembler {
           // this static implementation is STRONGER (§8's "objLit cannot
           // run engine getters" precedent, same shape here).
           case "add": {
+            // U8a (loop-num.ts): a typed-number or `length` operand stays
+            // unboxed when both operands are numbers.
+            if (this.loopNum.applies(e.args)) {
+              this.loopNum.emitArith("add", e.args, e.loc);
+              return;
+            }
             // Board #251: both operands evaluate, then each runs
             // ToPrimitive (an own valueOf / toString is called, its throw
             // propagates) left to right, before the string-or-number
@@ -35456,60 +35480,23 @@ class Assembler {
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
-            this.emitDynToPrimInPlace(a);
-            this.emitDynToPrimInPlace(b);
-            this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn("add")));
-            code.localGet(a);
-            code.call(this.jsIsStrLikeHelper());
-            code.localGet(b);
-            code.call(this.jsIsStrLikeHelper());
-            code.i32Or();
-            code.ifResult(this.dyn.dynRef());
-            this.dyn.boxStr(code, (c) => {
-              c.localGet(a);
-              c.call(this.dyn.toStr());
-              c.localGet(b);
-              c.call(this.dyn.toStr());
-              c.call(this.concatHelper());
-            });
-            code.else_();
-            this.dyn.boxNum(code, (c) => {
-              c.localGet(a);
-              c.call(this.jsToNumberHelper());
-              c.localGet(b);
-              c.call(this.jsToNumberHelper());
-              c.f64Add();
-            });
-            code.end();
-            this.closeBigDyn(true);
+            this.emitDynArithLocals("add", a, b);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
           }
           case "sub": case "mul": case "div": case "mod": {
+            if (this.loopNum.applies(e.args)) {
+              this.loopNum.emitArith(op, e.args, e.loc);
+              return;
+            }
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
-            // Board #251: ToPrimitive with the object protocol, left then
-            // right (an own valueOf / toString is called, its throw
-            // propagates before the right operand converts).
-            this.emitDynToPrimInPlace(a);
-            this.emitDynToPrimInPlace(b);
-            this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn(op)));
-            this.dyn.boxNum(code, (c) => {
-              c.localGet(a);
-              c.call(this.jsToNumberHelper());
-              c.localGet(b);
-              c.call(this.jsToNumberHelper());
-              if (op === "sub") c.f64Sub();
-              else if (op === "mul") c.f64Mul();
-              else if (op === "div") c.f64Div();
-              else c.call(this.fmodHelper()); // JS % is C fmod, ported already
-            });
-            this.closeBigDyn(true);
+            this.emitDynArithLocals(op, a, b);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -35567,51 +35554,19 @@ class Assembler {
           // ("local.set[0] expected type i32, found struct.new") — a
           // real, if late, backstop for the "never miscompile" rule.
           case "lt": case "le": case "gt": case "ge": {
+            // U8a (loop-num.ts): `i < xs.length` and its kin compare in
+            // f64 when both operands are numbers, with no box built.
+            if (this.loopNum.applies(e.args)) {
+              this.loopNum.emitRel(op, e.args, e.loc);
+              return;
+            }
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
-            // Board #251: ToPrimitive (number hint) on the left operand,
-            // then the right — for `>` / `>=` too (IsLessThan with
-            // LeftFirst false still converts the source-left one first).
-            this.emitDynToPrimInPlace(a);
-            this.emitDynToPrimInPlace(b);
-            this.openBigDyn(a, b, I32, () => code.call(this.bigDynCmpFn(op)));
-            // Abstract Relational Comparison (7.2.14): both operands are
-            // strings (post-ToPrimitive) → code-UNIT order (strCmpU16,
-            // S005's own comparator); otherwise numeric — IEEE f64
-            // compares already answer `false` for any NaN operand, which
-            // is JS's own "undefined → false" rule for relational ops,
-            // no separate check needed.
-            code.localGet(a);
-            code.call(this.jsIsStrLikeHelper());
-            code.localGet(b);
-            code.call(this.jsIsStrLikeHelper());
-            code.i32And();
-            code.ifResult(I32);
-            code.localGet(a);
-            code.call(this.dyn.toStr());
-            code.localGet(b);
-            code.call(this.dyn.toStr());
-            code.call(this.strCmpHelper(true));
-            code.i32Const(0);
-            if (op === "lt") code.i32LtS();
-            else if (op === "le") code.i32LeS();
-            else if (op === "gt") code.i32GtS();
-            else code.i32GeS();
-            code.else_();
-            code.localGet(a);
-            code.call(this.jsToNumberHelper());
-            code.localGet(b);
-            code.call(this.jsToNumberHelper());
-            if (op === "lt") code.f64Lt();
-            else if (op === "le") code.f64Le();
-            else if (op === "gt") code.f64Gt();
-            else code.f64Ge();
-            code.end();
-            this.closeBigDyn(false);
+            this.emitDynRelLocals(op, a, b);
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
             return;
@@ -35635,6 +35590,9 @@ class Assembler {
             // `dyn.strictEq()` call — the SAME, already-tested machinery
             // the checked-dynamic world's own `===` already uses; no new
             // coercion logic needed at all for this op.
+            // U8a (loop-num.ts): `x === null` / `x === undefined` is a
+            // kind test, with no call.
+            if (this.loopNum.emitNullishEq(op === "neq", e.args)) return;
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
@@ -36757,72 +36715,79 @@ class Assembler {
           const dynT = this.dyn.dynT();
           const dynRef = this.dyn.dynRef();
           const d = this.acquireScratch(dynRef);
-          this.walkExpr(e.value);
-          code.localSet(d);
-          code.localGet(d);
-          code.structGet(dynT, DYN_KIND);
-          code.i32Const(wantDK);
-          code.i32Eq();
           const resT: ValType = t.kind === "f64" ? F64 : t.kind === "string" ? this.strRef : I32;
-          this.openIfResult(resT);
-          code.localGet(d);
-          if (t.kind === "string") {
-            code.structGet(dynT, DYN_REF);
-            emitFlatCast(code, this.strType);
-          } else {
-            code.structGet(dynT, DYN_NUM);
-            if (t.kind === "bool") {
-              code.f64Const(0);
-              code.f64Ne();
-            }
-          }
-          code.else_();
-          // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
-          if (this.undefSlots) {
+          const check = (): void => {
             code.localGet(d);
             code.structGet(dynT, DYN_KIND);
-            code.i32Const(DK.UNDEF);
+            code.i32Const(wantDK);
             code.i32Eq();
             this.openIfResult(resT);
-            if (t.kind === "string") code.refNull(this.strType);
-            else this.emitSlotUndef(t, e.loc);
-            code.else_();
-          }
-          const urlExit = t.kind === "string" && this.urlDynLive;
-          if (urlExit) {
-            // Unit I: a URL held in a dynamic value reaching a string slot
-            // (`new URL(u)`, a string parameter): Node ToStrings it where
-            // the API does (`new URL(u)` reads its href) and holds the
-            // object where the slot is only a type, so neither the href
-            // nor the boundary's TypeError is right for every site — it
-            // refuses by name.
             code.localGet(d);
-            code.structGet(dynT, DYN_KIND);
-            code.i32Const(DK.OBJ);
-            code.i32Eq();
-            code.ifResult(I32);
-            this.dyn.objPayload(code, (c) => c.localGet(d));
-            code.refTest(this.dyn.objUrlT());
+            if (t.kind === "string") {
+              code.structGet(dynT, DYN_REF);
+              emitFlatCast(code, this.strType);
+            } else {
+              code.structGet(dynT, DYN_NUM);
+              if (t.kind === "bool") {
+                code.f64Const(0);
+                code.f64Ne();
+              }
+            }
             code.else_();
-            code.i32Const(0);
-            code.end();
-            code.ifVoid();
-            this.emitFenceFatal(code, (c) =>
-              this.pushStrLitInto(c, "passing a URL held in a dynamic value where a string is expected is not supported yet"), null);
-            code.else_();
+            // Unit U (SEMANTICS.md S119): the typed slot holds undefined.
+            if (this.undefSlots) {
+              code.localGet(d);
+              code.structGet(dynT, DYN_KIND);
+              code.i32Const(DK.UNDEF);
+              code.i32Eq();
+              this.openIfResult(resT);
+              if (t.kind === "string") code.refNull(this.strType);
+              else this.emitSlotUndef(t, e.loc);
+              code.else_();
+            }
+            const urlExit = t.kind === "string" && this.urlDynLive;
+            if (urlExit) {
+              // Unit I: a URL held in a dynamic value reaching a string slot
+              // (`new URL(u)`, a string parameter): Node ToStrings it where
+              // the API does (`new URL(u)` reads its href) and holds the
+              // object where the slot is only a type, so neither the href
+              // nor the boundary's TypeError is right for every site — it
+              // refuses by name.
+              code.localGet(d);
+              code.structGet(dynT, DYN_KIND);
+              code.i32Const(DK.OBJ);
+              code.i32Eq();
+              code.ifResult(I32);
+              this.dyn.objPayload(code, (c) => c.localGet(d));
+              code.refTest(this.dyn.objUrlT());
+              code.else_();
+              code.i32Const(0);
+              code.end();
+              code.ifVoid();
+              this.emitFenceFatal(code, (c) =>
+                this.pushStrLitInto(c, "passing a URL held in a dynamic value where a string is expected is not supported yet"), null);
+              code.else_();
+            }
+            // GH #86 review (SEMANTICS.md S122): the island exit's type check
+            // is tsinter's own (Node has no boundary) — it ends the program.
+            this.emitFenceFatal(code, (c) => {
+              this.pushStrLitInto(c, `expected ${wantDesc}, got `);
+              c.localGet(d);
+              c.call(this.dyn.typeOf());
+              c.call(this.concatHelper());
+            }, "SC1100");
+            if (urlExit) code.end();
+            this.emitUnwind();
+            if (this.undefSlots) this.close();
+            this.close();
+          };
+          // U8a (loop-num.ts): `const n: number = xs.length` reads an
+          // island array's length unboxed; `check` runs for the rest.
+          if (t.kind !== "f64" || !this.loopNum.emitLengthExit(e.value, d, check)) {
+            this.walkExpr(e.value);
+            code.localSet(d);
+            check();
           }
-          // GH #86 review (SEMANTICS.md S122): the island exit's type check
-          // is tsinter's own (Node has no boundary) — it ends the program.
-          this.emitFenceFatal(code, (c) => {
-            this.pushStrLitInto(c, `expected ${wantDesc}, got `);
-            c.localGet(d);
-            c.call(this.dyn.typeOf());
-            c.call(this.concatHelper());
-          }, "SC1100");
-          if (urlExit) code.end();
-          this.emitUnwind();
-          if (this.undefSlots) this.close();
-          this.close();
           this.releaseScratch(dynRef, d);
           return;
         }
@@ -37405,6 +37370,131 @@ class Assembler {
   }
 
 
+
+  /** U8a (loop-num.ts): the LoopNum operator plumbing, built on first use. */
+  private loopNumField: LoopNum | null = null;
+
+  private get loopNum(): LoopNum {
+    this.loopNumField ??= new LoopNum({
+      code: () => this.fn.code,
+      dyn: this.dyn,
+      viewsLive: () => this.viewsLive,
+      tplLive: () => this.tplLive,
+      walkExpr: (x) => this.walkExpr(x),
+      acquireScratch: (t) => this.acquireScratch(t),
+      releaseScratch: (t, i) => this.releaseScratch(t, i),
+      openIfResult: (t) => this.openIfResult(t),
+      openIf: () => this.openIf(),
+      close: () => this.close(),
+      genericLength: (c, loc) => this.emitDynGetProp(c, "length", this.ctorKeepsUndefined(loc), loc),
+      emitPendingCheck: () => this.emitPendingCheck(),
+      genericRel: (op, a, b) => this.emitDynRelLocals(op, a, b),
+      genericArith: (op, a, b) => this.emitDynArithLocals(op, a, b),
+      fmod: () => this.fmodHelper(),
+    });
+    return this.loopNumField;
+  }
+
+  /** jsOp add / sub / mul / div / mod over the two evaluated operand
+   * boxes in locals `a` and `b` (replaced by their ToPrimitive), leaving
+   * the result box. */
+  private emitDynArithLocals(op: NumArithOp, a: number, b: number): void {
+    const code = this.fn.code;
+    if (op === "add") {
+      // Board #251: both operands evaluate, then each runs ToPrimitive (an
+      // own valueOf / toString is called, its throw propagates) left to
+      // right, before the string-or-number decision.
+      this.emitDynToPrimInPlace(a);
+      this.emitDynToPrimInPlace(b);
+      this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn("add")));
+      code.localGet(a);
+      code.call(this.jsIsStrLikeHelper());
+      code.localGet(b);
+      code.call(this.jsIsStrLikeHelper());
+      code.i32Or();
+      code.ifResult(this.dyn.dynRef());
+      this.dyn.boxStr(code, (c) => {
+        c.localGet(a);
+        c.call(this.dyn.toStr());
+        c.localGet(b);
+        c.call(this.dyn.toStr());
+        c.call(this.concatHelper());
+      });
+      code.else_();
+      this.dyn.boxNum(code, (c) => {
+        c.localGet(a);
+        c.call(this.jsToNumberHelper());
+        c.localGet(b);
+        c.call(this.jsToNumberHelper());
+        c.f64Add();
+      });
+      code.end();
+      this.closeBigDyn(true);
+      return;
+    }
+    // Board #251: ToPrimitive with the object protocol, left then
+    // right (an own valueOf / toString is called, its throw
+    // propagates before the right operand converts).
+    this.emitDynToPrimInPlace(a);
+    this.emitDynToPrimInPlace(b);
+    this.openBigDyn(a, b, this.dyn.dynRef(), () => code.call(this.bigDynArithFn(op)));
+    this.dyn.boxNum(code, (c) => {
+      c.localGet(a);
+      c.call(this.jsToNumberHelper());
+      c.localGet(b);
+      c.call(this.jsToNumberHelper());
+      if (op === "sub") c.f64Sub();
+      else if (op === "mul") c.f64Mul();
+      else if (op === "div") c.f64Div();
+      else c.call(this.fmodHelper()); // JS % is C fmod, ported already
+    });
+    this.closeBigDyn(true);
+  }
+
+  /** jsOp lt / le / gt / ge over the two evaluated operand boxes in locals
+   * `a` and `b` (replaced by their ToPrimitive), leaving the i32 answer. */
+  private emitDynRelLocals(op: NumRelOp, a: number, b: number): void {
+    const code = this.fn.code;
+    // Board #251: ToPrimitive (number hint) on the left operand,
+    // then the right — for `>` / `>=` too (IsLessThan with
+    // LeftFirst false still converts the source-left one first).
+    this.emitDynToPrimInPlace(a);
+    this.emitDynToPrimInPlace(b);
+    this.openBigDyn(a, b, I32, () => code.call(this.bigDynCmpFn(op)));
+    // Abstract Relational Comparison (7.2.14): both operands are
+    // strings (post-ToPrimitive) → code-UNIT order (strCmpU16,
+    // S005's own comparator); otherwise numeric — IEEE f64
+    // compares already answer `false` for any NaN operand, which
+    // is JS's own "undefined → false" rule for relational ops,
+    // no separate check needed.
+    code.localGet(a);
+    code.call(this.jsIsStrLikeHelper());
+    code.localGet(b);
+    code.call(this.jsIsStrLikeHelper());
+    code.i32And();
+    code.ifResult(I32);
+    code.localGet(a);
+    code.call(this.dyn.toStr());
+    code.localGet(b);
+    code.call(this.dyn.toStr());
+    code.call(this.strCmpHelper(true));
+    code.i32Const(0);
+    if (op === "lt") code.i32LtS();
+    else if (op === "le") code.i32LeS();
+    else if (op === "gt") code.i32GtS();
+    else code.i32GeS();
+    code.else_();
+    code.localGet(a);
+    code.call(this.jsToNumberHelper());
+    code.localGet(b);
+    code.call(this.jsToNumberHelper());
+    if (op === "lt") code.f64Lt();
+    else if (op === "le") code.f64Le();
+    else if (op === "gt") code.f64Gt();
+    else code.f64Ge();
+    code.end();
+    this.closeBigDyn(false);
+  }
 
   /** BigInt in the one dynamic world's operators (a module that uses
    * BigInt only): when either operand (locals a, b) holds a BIGINT, the
@@ -43245,154 +43335,6 @@ class Assembler {
    * dyn.toStr() too, which is spec-honest for the "ToPrimitive already
    * ran" object/array/etc. cases dyn.toStr() itself renders — untested
    * by any stage-A target program, flagged rather than silently trusted. */
-  /** jsOp getIdx (`value` null) / setIdx over a NUMBER index (unit H —
-   * `any[]` loops): receiver and index evaluate once, in order (then the
-   * value, for a write); an ARR receiver with an integral index in
-   * [0, length) reads or writes its slot directly (a hole slot reads
-   * undefined), and every other case — other kinds, fractions, negatives,
-   * NaN, out-of-range (a write past the end grows the array there) — runs
-   * the generic keyed route over the number's ToString, exactly what
-   * emitJsvalIndexKeyString would hand it. Same answers, no key string on
-   * the hot path. */
-  private emitIslandNumIndex(recvExpr: WExpr, indexExpr: WExpr, value: WExpr | null, keepRecv = -1): void {
-    const code = this.fn.code;
-    const dynT = this.dyn.dynT();
-    const dynRef = this.dyn.dynRef();
-    const r = this.acquireScratch(dynRef);
-    const f = this.acquireScratch(F64);
-    const v = value !== null ? this.acquireScratch(dynRef) : -1;
-    this.walkExpr(recvExpr);
-    code.localSet(r);
-    if (keepRecv >= 0) {
-      // GH #133: an element call keeps the receiver for its `this`.
-      code.localGet(r);
-      code.localSet(keepRecv);
-    }
-    this.walkExpr(indexExpr);
-    code.localSet(f);
-    if (value !== null) {
-      this.walkExpr(value);
-      code.localSet(v);
-    }
-    const vec = (c: Code): void => this.dyn.arrPayload(c, (x) => x.localGet(r));
-    const slow = (): void => {
-      code.localGet(r);
-      this.dyn.boxNum(code, (c) => c.localGet(f));
-      code.call(this.dyn.toStr());
-      if (value === null) {
-        code.i32Const(0);
-        code.call(this.dyn.keyGet());
-      } else {
-        code.localGet(v);
-        code.call(this.dyn.islandSetIdx());
-      }
-    };
-    if (this.viewsLive) {
-      // An array VIEW with an integral non-negative index: straight to its
-      // element accessor (which answers undefined past the end, and owns
-      // the hole / type refusals on a write) — no key string, no length
-      // call. Every other index takes the keyed route's view front.
-      code.localGet(r);
-      code.structGet(dynT, DYN_KIND);
-      code.i32Const(DK.ARR);
-      code.i32Eq();
-      this.dyn.isView(code, (c) => c.localGet(r));
-      code.i32And();
-      code.localGet(f);
-      code.f64Const(0);
-      code.f64Ge();
-      code.i32And();
-      code.localGet(f);
-      code.f64Const(2147483647);
-      code.f64Le();
-      code.i32And();
-      code.localGet(f);
-      code.localGet(f);
-      code.f64Trunc();
-      code.f64Eq();
-      code.i32And();
-      if (value === null) this.openIfResult(dynRef);
-      else this.openIf();
-      code.localGet(r);
-      code.localGet(f);
-      code.i32TruncF64S();
-      if (value === null) {
-        code.call(this.dyn.viewGetI());
-      } else {
-        code.localGet(v);
-        code.call(this.dyn.viewSetI());
-      }
-      code.else_();
-    }
-    code.localGet(r);
-    code.structGet(dynT, DYN_KIND);
-    code.i32Const(DK.ARR);
-    code.i32Eq();
-    if (this.viewsLive) {
-      // A view reads and writes through its accessors (the keyed route's
-      // view fronts), never a vector slot.
-      this.dyn.isView(code, (c) => c.localGet(r));
-      code.i32Eqz();
-      code.i32And();
-    }
-    if (value !== null && this.tplLive) {
-      // S080: a tag call's FROZEN strings array (or its raw, a `$dynTpl`
-      // box) is never written in place: the keyed route's write guard
-      // throws Node's TypeError (strict code — a sloppy write never takes
-      // this path).
-      code.localGet(r);
-      code.refTest(this.dyn.tplT());
-      code.i32Eqz();
-      code.i32And();
-    }
-    if (value === null) this.openIfResult(dynRef);
-    else this.openIf();
-    code.localGet(f);
-    code.f64Const(0);
-    code.f64Ge();
-    code.localGet(f);
-    this.dyn.arrLen(code, vec);
-    code.f64ConvertI32U();
-    code.f64Lt();
-    code.i32And();
-    code.localGet(f);
-    code.localGet(f);
-    code.f64Trunc();
-    code.f64Eq();
-    code.i32And();
-    if (value === null) {
-      this.openIfResult(dynRef);
-      this.dyn.arrAt(code, vec, (c) => {
-        c.localGet(f);
-        c.i32TruncF64U();
-      });
-      code.localTee(r);
-      code.refIsNull();
-      this.openIfResult(dynRef);
-      code.globalGet(this.dyn.undefinedGlobal());
-      code.else_();
-      code.localGet(r);
-      this.close();
-    } else {
-      this.openIf();
-      this.dyn.arrSet(code, vec, (c) => {
-        c.localGet(f);
-        c.i32TruncF64U();
-      }, (c) => c.localGet(v));
-    }
-    code.else_();
-    slow();
-    this.close();
-    code.else_();
-    slow();
-    this.close();
-    if (this.viewsLive) this.close();
-    if (value !== null) this.releaseScratch(dynRef, v);
-    this.releaseScratch(F64, f);
-    this.releaseScratch(dynRef, r);
-    this.emitPendingCheck();
-  }
-
   /** GH #133: an element call's callee — the keyed read (`keyedReadRecv`'s
    * shapes, each exactly as its node emits) leaving the member on
    * the stack and its receiver, evaluated once, in local `recv` for the
@@ -43402,7 +43344,7 @@ class Assembler {
     if (read.kind === "jsOp" && read.op === "getIdx") {
       const key = read.args[1]!;
       if (key.kind === "jsMarshal" && key.value.type.kind === "f64") {
-        this.emitIslandNumIndex(read.args[0]!, key.value, null, recv);
+        this.loopNum.emitNumIndex(read.args[0]!, key.value, null, recv);
         return;
       }
       this.walkExpr(read.args[0]!);

@@ -3,6 +3,7 @@
  * (numfmt.ts). Declaration-level bytes live in ModuleBuilder; integer
  * encodings in ByteWriter. */
 import { ByteWriter } from "./bytes.js";
+import { countDynAlloc } from "./ic-stats.js";
 import type { ValType } from "./module.js";
 
 /** The memory index of the module's OWN linear memory: 0, except in a
@@ -743,6 +744,7 @@ export class Code {
     this.w.u8(0xd4);
   }
   structNew(typeIndex: number): void {
+    countDynAlloc(this, typeIndex); // SCRIPTC_WASM_IC_STATS=1 only (ic-stats.ts)
     if (zeroTail.has(typeIndex)) {
       this.w.u8(0x41); // i32.const 0 — the identity-hash slot (zeroTail)
       this.w.sleb(0);
