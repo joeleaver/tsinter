@@ -350,7 +350,6 @@ export class LoopNum {
   emitNumIndex(recvExpr: WExpr, indexExpr: WExpr, value: WExpr | null, keepRecv = -1): void {
     const code = this.deps.code();
     const dyn = this.deps.dyn;
-    const dynT = dyn.dynT();
     const dynRef = dyn.dynRef();
     const views = this.deps.viewsLive();
     const r = this.deps.acquireScratch(dynRef);
