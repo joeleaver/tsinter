@@ -2718,7 +2718,7 @@ export class ObjModel {
   setProto(): number {
     const dynT = this.d.dynT();
     const L = this.d.objLinkedT();
-    return this.fn("setProto", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), I32], (c) => {
+    return this.fn("setProto", [this.d.dynRef(), this.d.dynRef()], [this.d.dynRef()], [I32, this.d.dynRef(), I32, this.d.dynRef(), this.linkedRef(), this.d.shapes.shapeRef()], (c) => {
         this.tplFence(c, "Object.setPrototypeOf", (x) => x.globalGet(this.d.undefinedGlobal()));
       this.d.errMirrorGuard(c, (x) => x.localGet(0), null, "Object.setPrototypeOf");
       // GH #238 (review): an object linked to an error prototype is an
@@ -2821,8 +2821,9 @@ export class ObjModel {
       c.br(0);
       c.end();
       c.end();
-      this.d.objPayload(c, (x) => x.localGet(0));
-      c.refCast(L);
+      const LK = 5;
+      const O = 6;
+      const SH = 7;
       c.localGet(PK);
       c.i32Const(DK.NULL);
       c.i32Eq();
@@ -2841,9 +2842,16 @@ export class ObjModel {
       c.localGet(1);
       c.end();
       c.end();
+      c.localSet(LK);
+      this.d.objPayload(c, (x) => x.localGet(0));
+      c.refCast(L);
+      c.localTee(O);
+      c.localGet(LK);
       c.structSet(L, this.d.olProto());
-      // U8b: a shape never outlives a change of its object's prototype.
-      this.d.shapes.drop(c, (x) => this.d.objPayload(x, (y) => y.localGet(0)));
+      // U8b + U8d: a shape never outlives a change of its object's
+      // prototype; an empty plain object moves to the new prototype's
+      // root, and a new prototype is marked as one (shapes.ts emitRelink).
+      this.d.shapes.emitRelink(c, (x) => x.localGet(O), LK, SH);
       c.localGet(0);
     });
   }

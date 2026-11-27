@@ -42650,16 +42650,7 @@ class Assembler {
    * stack; leaves keyGet's answer (the caller owns the pending check). */
   private emitIcGet(code: Code, key: string, optional: boolean, locals: IcLocals): void {
     this.readIc ??= new ReadIc(this.dyn, { pushStrLit: (c, v) => this.pushStrLitInto(c, v) });
-    const dynRef = this.dyn.dynRef();
-    const objRef = this.dyn.objRef();
-    const shRef = this.dyn.shapes.shapeRef();
-    const r = locals.get(dynRef);
-    const p = locals.get(objRef);
-    const sh = locals.get(shRef);
-    this.readIc.emitGet(code, key, optional, r, p, sh);
-    locals.put?.(shRef, sh);
-    locals.put?.(objRef, p);
-    locals.put?.(dynRef, r);
+    this.readIc.emitGet(code, key, optional, locals);
   }
 
   private writeIc: WriteIc | null = null;

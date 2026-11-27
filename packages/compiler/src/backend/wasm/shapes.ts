@@ -42,14 +42,22 @@
  * 65,536 shapes in all make the append drop to dictionary mode instead.
  * Shapes live as long as the program (J4).
  *
- * One root serves every prototype. The U8b caches answer only OWN data
- * entries, which depend on the receiver's table alone; per-prototype roots
- * are U8d's (§5), where a cache answers from the chain.
+ * Roots (U8d, §5). A shape implies its object's prototype: a plain
+ * object (prototype code 0, no link, or the link that means
+ * Object.prototype) starts at the root, a null-prototype object (code 1)
+ * at the null root, and an object linked to a prototype object P at P's
+ * own root, made the first time anything links to P and kept in P's
+ * `proot` field (protoRoot). A non-null `proot` is also the mark that P
+ * is a prototype, whose key-structure changes move the prototype epoch
+ * (proto-ic.ts). Past the shape cap P's `proot` is the no-shape sentinel:
+ * still marked, and its objects stay in dictionary mode. A prototype
+ * change keeps a shape only for an empty plain object, which moves to its
+ * new prototype's root (emitRelink); any other drops to dictionary mode.
  *
  * Nothing here is observable: the table, its order and its keys' contents
  * are unchanged, and string identity is not observable (SEMANTICS.md
  * S002). */
-import { OBJ_LEN, type DynBuilder } from "./dyn.js";
+import { DK, DYN_KIND, DYN_REF, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL, OBJ_PROTO_PLAIN, type DynBuilder } from "./dyn.js";
 import { Code } from "./code.js";
 import { countShape } from "./ic-stats.js";
 import { I32, type ValType } from "./module.js";
@@ -71,6 +79,7 @@ export const SHAPE_MAX_TOTAL = 65536;
 export class Shapes {
   private shapeType: number | null = null;
   private rootGl: number | null = null;
+  private nullRootGl: number | null = null;
   private noShapeGl: number | null = null;
   private totalGl: number | null = null;
 
@@ -121,6 +130,16 @@ export class Shapes {
     return this.rootGl;
   }
 
+  /** The null root: the shape of every null-prototype object (prototype
+   * code 1) with no key yet, where prototype links exist (the chain caches
+   * tell the two chain ends apart by it, proto-ic.ts); elsewhere only own
+   * reads are cached, which no prototype changes, so it is the root. */
+  nullRootG(): number {
+    if (!this.d.protoLinkLive) return this.rootG();
+    this.nullRootGl ??= this.nodeGlobal();
+    return this.nullRootGl;
+  }
+
   /** A node no object ever carries: the empty way of a read cache, so an
    * empty cache never matches (a dictionary object's null shape included). */
   noShapeG(): number {
@@ -136,17 +155,154 @@ export class Shapes {
     return this.totalGl;
   }
 
-  /** The `shape` field of a fresh payload: the root, or null. */
-  pushInitial(c: Code, shaped: boolean): void {
-    if (shaped) c.globalGet(this.rootG());
+  /** The `shape` field of a fresh unlinked payload of prototype code
+   * `code`: its code's root, or null. */
+  pushInitial(c: Code, shaped: boolean, code: number): void {
+    if (shaped) c.globalGet(code === OBJ_PROTO_NULL ? this.nullRootG() : this.rootG());
     else c.refNull(this.shapeT());
   }
 
-  /** Moves the payload `pushObj` pushes to dictionary mode. */
+  /** Moves the payload `pushObj` pushes to dictionary mode. Every caller
+   * is a key-structure change (an attribute, a hidden key, a reorder, a
+   * prototype write, preventExtensions, an accessor value), so a
+   * prototype's moves the prototype epoch too (proto-ic.ts). `pushObj`
+   * runs twice where links exist. */
   drop(c: Code, pushObj: (c: Code) => void): void {
+    this.d.protoIc.emitBump(c, pushObj);
     pushObj(c);
     c.refNull(this.shapeT());
     c.structSet(this.d.objT(), this.d.objShapeField());
+  }
+
+  /** %w.dyn.protoRoot(payload) → the root shape of the objects linked to
+   * this payload, made (and the payload marked a prototype) on first use;
+   * null past the shape cap, where the payload is marked with the
+   * no-shape sentinel instead. Only where prototype links exist. */
+  protoRoot(): number {
+    const S = this.shapeT();
+    const objT = this.d.objT();
+    return this.k.cached("protoRoot", [this.d.objRef()], [this.shapeRef()], (idx) => {
+      const c = new Code();
+      const R = 1;
+      const field = this.d.objProotField();
+      c.localGet(0);
+      c.structGet(objT, field);
+      c.localTee(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.globalGet(this.totalG());
+      c.i32Const(SHAPE_MAX_TOTAL);
+      c.i32GeU();
+      c.ifVoid();
+      c.localGet(0);
+      c.globalGet(this.noShapeG());
+      c.structSet(objT, field);
+      c.refNull(S);
+      c.return_();
+      c.end();
+      c.structNewDefault(S);
+      c.localSet(R);
+      c.localGet(0);
+      c.localGet(R);
+      c.structSet(objT, field);
+      c.globalGet(this.totalG());
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(this.totalG());
+      countShape(c);
+      c.localGet(R);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      c.globalGet(this.noShapeG());
+      c.refEq();
+      c.ifVoid();
+      c.refNull(S);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      this.k.mb.setBody(idx, [this.shapeRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.protoRootOf(box) → protoRoot of an OBJ box's `$dynObj`
+   * payload; null for any other box (a view's payload is a snapshot, so
+   * an object linked to a view stays in dictionary mode). */
+  protoRootOf(): number {
+    const dynT = this.d.dynT();
+    const objT = this.d.objT();
+    return this.k.cached("protoRootOf", [this.d.dynRef()], [this.shapeRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      c.refTest(objT);
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(objT);
+      c.call(this.protoRoot());
+      c.return_();
+      c.end();
+      c.end();
+      c.refNull(this.shapeT());
+      this.k.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** objmodel.ts setProto, after the link of the linked payload `pushObj`
+   * pushes was written with the box in local `link` (null for the link
+   * that means Object.prototype): an empty plain object keeps a shape,
+   * its new prototype's root (the root for the Object.prototype link,
+   * protoRoot for an object); anything else drops to dictionary mode. The
+   * object's own epoch move (it may be a prototype) comes first. `sh` is
+   * a scratch local of shapeRef(); `pushObj` must be a plain read. */
+  emitRelink(c: Code, pushObj: (c: Code) => void, link: number, sh: number): void {
+    const objT = this.d.objT();
+    const field = this.d.objShapeField();
+    const dynT = this.d.dynT();
+    this.d.protoIc.emitBump(c, pushObj);
+    // the new link's root (null: no shape)
+    c.localGet(link);
+    c.refIsNull();
+    c.ifResult(this.shapeRef());
+    c.globalGet(this.rootG());
+    c.else_();
+    c.localGet(link);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(this.shapeRef());
+    c.localGet(link);
+    c.call(this.protoRootOf());
+    c.else_();
+    c.refNull(this.shapeT());
+    c.end();
+    c.end();
+    c.localSet(sh);
+    // kept only for an empty shaped plain object
+    pushObj(c);
+    c.structGet(objT, field);
+    c.refIsNull();
+    pushObj(c);
+    c.structGet(objT, OBJ_LEN);
+    c.i32Or();
+    pushObj(c);
+    c.structGet(objT, OBJ_PROTO);
+    c.i32Const(OBJ_PROTO_PLAIN);
+    c.i32Ne();
+    c.i32Or();
+    c.ifVoid();
+    c.refNull(this.shapeT());
+    c.localSet(sh);
+    c.end();
+    pushObj(c);
+    c.localGet(sh);
+    c.structSet(objT, field);
   }
 
   /** %w.dyn.shapeNext(shape, key) → the child of `shape` for `key`, made on
@@ -318,12 +474,14 @@ export class Shapes {
   }
 
   /** objmodel.ts removeAt, before the entry at code `idx` (>= 0: the main
-   * table) leaves the payload in local `obj`: removing the last-added key
+   * table, <= -2 the hidden one) leaves the payload in local `obj`: removing the last-added key
    * rolls the shape back to its parent; any other removal drops it. `sh`
    * is a scratch local of shapeRef(). */
   emitRemove(c: Code, obj: number, idx: number, sh: number): void {
     const objT = this.d.objT();
     const field = this.d.objShapeField();
+    // U8d: a key gone from a prototype moves the prototype epoch.
+    this.d.protoIc.emitBump(c, (x) => x.localGet(obj));
     c.localGet(obj);
     c.structGet(objT, field);
     c.localTee(sh);

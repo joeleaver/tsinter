@@ -7,7 +7,7 @@
 // instantiation and start-up cancel out. For people to read, never a CI gate:
 // the CI speed checks count boxes (wasm-u8a-loop.test.ts).
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import ts from "typescript";
@@ -30,16 +30,19 @@ for (const [variant, rounds] of [["hi", 5000], ["lo", 0]]) {
   execFileSync(process.execPath, [join(import.meta.dirname, "gen.mjs"), String(rounds), join(values.out, variant)]);
 }
 const names = readdirSync(join(values.out, "hi"))
-  .filter((f) => f.endsWith(".ts"))
+  .filter((f) => f.endsWith(".ts") || f.endsWith(".js"))
   .map((f) => f.slice(0, -3))
   .filter((n) => !only || only.includes(n));
 
 /* the command line per lane, or { refused } */
 function prep(variant, name) {
-  const file = join(values.out, variant, `${name}.ts`);
+  // a probe is TypeScript (transpiled for Node) or, U8d's, JavaScript
+  const tsFile = join(values.out, variant, `${name}.ts`);
+  const isJs = existsSync(join(values.out, variant, `${name}.js`));
+  const file = isJs ? join(values.out, variant, `${name}.js`) : tsFile;
   const js = join(values.out, variant, `${name}.mjs`);
   const src = readFileSync(file, "utf8");
-  writeFileSync(js, ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText);
+  writeFileSync(js, isJs ? src : ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText);
   const r = { node: [process.execPath, [js]] };
   for (const lane of ["wasm", "wasm-native"]) {
     if (!lanes.includes(lane)) continue;

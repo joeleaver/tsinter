@@ -15,6 +15,7 @@
  *   tsinter-stats: set-hits <n>
  *   tsinter-stats: set-misses <n>
  *   tsinter-stats: lit-hits <n>
+ *   tsinter-stats: proto-bumps <n>
  *
  *   - dyn-allocs counts every `$dyn` box the program allocated: each
  *     `struct.new` of the box type (dyn.ts dynT), wherever it is emitted,
@@ -33,6 +34,8 @@
  *     miss helper or through keySet.
  *   - lit-hits counts the object literals built on their site's cached
  *     final shape (lit-shape.ts).
+ *   - proto-bumps counts the moves of the prototype epoch (proto-ic.ts):
+ *     key-structure changes of objects that are prototypes.
  *
  * Every counter's global is made when the module starts (the Assembler's
  * constructor), so a counter reads 0 in a module that never reaches it.
@@ -47,7 +50,7 @@ export function icStatsOn(): boolean {
 }
 
 /** The counters, in report order. */
-const COUNTERS = ["dyn-allocs", "ic-hits", "ic-misses", "shapes", "ic-megas", "set-hits", "set-misses", "lit-hits"] as const;
+const COUNTERS = ["dyn-allocs", "ic-hits", "ic-misses", "shapes", "ic-megas", "set-hits", "set-misses", "lit-hits", "proto-bumps"] as const;
 type Counter = (typeof COUNTERS)[number];
 
 /** The module being built's counter globals, and the `$dyn` type index
@@ -123,6 +126,11 @@ export function countSetMiss(c: Code): void {
 /** lit-shape.ts: an object literal built on its cached final shape. */
 export function countLitHit(c: Code): void {
   bump(c, "lit-hits");
+}
+
+/** proto-ic.ts: a move of the prototype epoch. */
+export function countProtoBump(c: Code): void {
+  bump(c, "proto-bumps");
 }
 
 /** shapes.ts: a shape made. */

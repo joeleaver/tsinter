@@ -139,7 +139,8 @@ $shape { parent: ref null $shape, key: str, count: i32,
   which covers both the one-entry cache and the small array above.
 - There is **one root for every prototype**. U8b caches only own data reads, and an
   own data entry answers whatever the prototype is, so the root does not need to
-  name the prototype yet. Per-prototype roots arrive with the prototype ICs (U8d).
+  name the prototype yet. Per-prototype roots arrive with the prototype ICs (U8d,
+  §5 "As built in U8d").
 - A cache site is three plain mutable globals (its shape, its entry index and a
   fill count; a site stops refilling after 16 fills, so a polymorphic site does not
   pay a GC write barrier on every miss; U8c replaced the count with four ways and a
@@ -299,6 +300,77 @@ The epoch is coarse: one prototype write invalidates every proto IC. ES5 code fi
 its prototypes at start-up and then leaves them alone. A program that keeps mutating
 prototypes falls back to the slow path, at today's speed plus one compare. Modules
 without the object model have no mutable links, so they need no epoch at all.
+
+**As built in U8d** (proto-ic.ts, shapes.ts roots, ic-read.ts, ic-write.ts,
+ic-check.ts). Where it differs from the plan above:
+- **The mark and the root are one field.** Every OBJ payload gains a `proot` field
+  (dyn.ts `objProotField`), but only in modules where prototype links exist
+  (`protoLinkLive`, which the object model implies); other modules are
+  byte-identical. It is null until something links to the object, then holds the
+  root shape of the objects linked to it, or the no-shape sentinel past the shape
+  cap. So "is a prototype" and "has a root" cannot disagree. The plan's flag bit in
+  the object-model flags word and root on the linked payload did not fit: without
+  the object model, prototypes (Object.create's) are unlinked `$dynObj` payloads with
+  no flags word.
+- **Roots.** R0 for the objects with no link (Object.prototype), R1 for null-prototype
+  objects (proto code 1), and one per prototype object, made on first link. Linking
+  no longer always drops: setProto (`shapes.ts emitRelink`) moves an *empty* shaped
+  plain object to its new prototype's root, which is what `new F` does to every
+  instance, and drops anything else. A fresh linked payload (`pushNewLinkedObj`)
+  starts on its prototype's root.
+- **The epoch** is one i64 global. It moves on every key-structure change of a
+  marked object, at three chokepoints: `emitEntryPush` (every append, the store
+  cache's included), `shapes.drop` (every dictionary drop: defineProperty, an
+  attributed entry, a hidden key, a reorder, preventExtensions and freeze, an
+  accessor value) and `emitRemove` (delete), plus `emitRelink` (a link write). A
+  value replaced in place does not move it. The instrumented build counts the moves
+  (`proto-bumps`).
+- **Proving a way.** No way is built from the plan's static reasoning. After the
+  uncached read has answered, the miss helper walks the chain (`protoWalk`): every
+  object on it must be a marked `$dynObj` (never a view), and the key must be absent
+  from each, or found on one as a data entry in its main table. The way is offered
+  only if keyGet threw nothing, moved no epoch, the receiver kept its shape, and the
+  walked answer is the very box keyGet returned (the holder's entry, or undefined).
+  An accessor, a hidden key, an unmarked or exotic prototype proves nothing, so the
+  site stays unfilled for that shape. The walk ends where `protoBox` ends it, at the
+  Object.prototype stand-in, whose members keyGet does not model either (GH #277 is
+  unchanged: writes to it are still accepted and ignored, by both paths alike).
+- **Read sites.** A chain way is a way whose index is -1 - k, with a per-way global
+  `pw_k` holding an immutable `$protoWay { holder or null, index, epoch }`. The hit
+  path is the own way match, then (for a negative index) a `br_table` to the way's
+  `$protoWay`, one i64 compare against the epoch, and the holder's entry (or
+  undefined). A way whose epoch is stale misses, and the miss re-proves it in place;
+  a site does this at most 16 times (`IC_PROTO_REFRESHES`), then reads stale ways
+  uncached, so a program that writes its prototypes in a loop pays no fill per
+  read. Keys starting with `%` or U+D800 (internal names, symbols) get no chain ways.
+- **Append ways under links.** The store miss helper now offers an append for a
+  linked receiver when, after keySet appended, the walk proves the key absent up the
+  whole chain (so no setter and no read-only key). The way keeps the epoch it was
+  proved at (`e_k`); the append helper writes nothing and answers 0 when a linked
+  receiver's way is stale, and the site takes the miss, which re-proves it within the
+  same refresh budget. A shape under R0 is never a linked receiver's, so unlinked
+  appends need no epoch.
+- **Shape check.** `SCRIPTC_WASM_SHAPE_CHECK=1` now also checks that every shaped
+  payload it verifies descends from the root its link implies (R1 for code 1, R0 for
+  no link, the prototype's `proot` otherwise), and every chain hit is re-proved
+  against keyGet like an own hit.
+- The object model's `setProto` (objmodel.ts, already over 700 lines) changed by a few
+  lines only, to call `emitRelink`; splitting objmodel.ts is not part of this unit.
+- Measured. Hits (SCRIPTC_WASM_IC_STATS, e5 at 200 rounds, 800,000 prototype reads):
+  799,996 hits and 9 misses, **99.999%**; the constructor's `this.k = v` appends hit
+  too (3,996 of 4,004). Loop ms (nico, bench.mjs, median of 5, two interleaved
+  cycles against main `a16f988e` in the same job): e5 wasm 1209.6 / 1184.5 ->
+  258.1 / 252.0, native 926.5 / 1061.9 -> 231.0 / 224.4; e5own (the same loop over
+  own keys) wasm 709.8 / 711.7 -> 216.0 / 216.6, native 495.9 / 487.1 -> 217.7 /
+  213.4, because `new F` instances now keep a shape. **e5 is 1.17x e5own on wasm and
+  1.05x on native** (target 2x). b1, b2, poly2 and w have no links, so their modules
+  are byte-identical to main's (b2 checked with `cmp`). b2 still read 108 -> 114 ms
+  in both cycles, which is the job's run order (this branch always ran second), not
+  the code.
+- Code size: 101 sampled corpus programs are byte-identical (no links, so none of
+  this is built). Of the 21 corpus programs that mention a prototype, the 2 with
+  links grew: 2590-object-create-dynamic.js +3.6%, 1300-errors-basics.ts +0.2%;
+  the 21 together +0.26%.
 
 ## 6. What must stay Node-exact
 

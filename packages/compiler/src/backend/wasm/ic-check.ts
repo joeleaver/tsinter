@@ -14,13 +14,15 @@
  *     checks the box it answers; a store hit (ic-write.ts) checks the box
  *     it stored, after storing it, so a write the uncached [[Set]] would
  *     have refused or sent elsewhere reads back differently and traps;
+ *   - (U8d) the payload's shape descends from its prototype's root, so
+ *     the shape implies the prototype the chain caches stand on;
  *   - an object literal built on its cached final shape (lit-shape.ts)
  *     checks its promise.
  *
  * keyGet runs no code here: a shaped receiver's own data entry answers
  * before any getter or fence. */
 import type { DynBuilder } from "./dyn.js";
-import { ENTRY_KEY, ENTRY_VALUE, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
+import { DK, DYN_KIND, DYN_REF, ENTRY_KEY, ENTRY_VALUE, OBJ_ENTRIES, OBJ_LEN, OBJ_PROTO, OBJ_PROTO_NULL } from "./dyn.js";
 import { Code } from "./code.js";
 import { I32 } from "./module.js";
 import { SHAPE_COUNT, SHAPE_KEY, SHAPE_PARENT } from "./shapes.js";
@@ -135,7 +137,78 @@ export class IcCheck {
       c.br(0);
       c.end();
       c.end();
+      // U8d: the walk ends at the root, which is the prototype's
+      if (this.d.protoLinkLive) {
+        c.localGet(NODE);
+        this.pushExpectedRoot(c);
+        c.refEq();
+        c.i32Eqz();
+        trapIf();
+      }
       this.k.mb.setBody(idx, [I32, this.d.shapes.shapeRef(), this.d.entryRef()], c.bytes());
+    });
+  }
+
+  /** The root a shaped payload (local 0) must descend from (shapes.ts
+   * roots): the null-prototype root for code 1; for code 0, the root of
+   * the objects with no link (Object.prototype), or the linked
+   * prototype's own root (its `proot`; a prototype that is not a
+   * `$dynObj` pushes the no-shape sentinel, which no walk ends at). */
+  private pushExpectedRoot(c: Code): void {
+    const objT = this.d.objT();
+    const L = this.d.objLinkedT();
+    const sh = this.d.shapes;
+    c.localGet(0);
+    c.structGet(objT, OBJ_PROTO);
+    c.i32Const(OBJ_PROTO_NULL);
+    c.i32Eq();
+    c.ifResult(sh.shapeRef());
+    c.globalGet(sh.nullRootG());
+    c.else_();
+    c.localGet(0);
+    c.refTest(L);
+    c.ifResult(sh.shapeRef());
+    c.localGet(0);
+    c.refCast(L);
+    c.structGet(L, this.d.olProto());
+    c.call(this.linkRootFn());
+    c.else_();
+    c.globalGet(sh.rootG());
+    c.end();
+    c.end();
+  }
+
+  /** %w.ic.linkRoot(link box or null) → the root its objects carry. */
+  private linkRootFn(): number {
+    const objT = this.d.objT();
+    const dynT = this.d.dynT();
+    const sh = this.d.shapes;
+    return this.k.cached("icLinkRoot", [this.d.dynRef()], [sh.shapeRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      c.globalGet(sh.rootG());
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      c.refTest(objT);
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(objT);
+      c.structGet(objT, this.d.objProotField());
+      c.return_();
+      c.end();
+      c.end();
+      c.globalGet(sh.noShapeG());
+      this.k.mb.setBody(idx, [], c.bytes());
     });
   }
 

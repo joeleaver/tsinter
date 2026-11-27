@@ -4,7 +4,9 @@
 // with ROUNDS rounds over 1,000 records: 5,000 rounds is 20M operations.
 // tests/bench/programs holds the 5,000-round forms with the prefix "u8-"
 // (regenerate with `node tests/bench/u8/gen.mjs 5000 tests/bench/programs u8-`);
-// tests/bench/u8/bench.mjs generates its own 5,000- and 0-round forms.
+// tests/bench/u8/bench.mjs generates its own 5,000- and 0-round forms. The
+// JavaScript probes (e5, e5own) are run by bench.mjs; scripts/bench-lanes.mjs
+// runs the .ts programs only.
 import { mkdirSync, writeFileSync } from "node:fs";
 
 const R = Number(process.argv[2]);
@@ -114,4 +116,31 @@ console.log(s);`,
   ],
 };
 
+// U8d: the prototype probes are JavaScript (an ES5 constructor's `this`
+// is a script's construct, which TypeScript code refuses, SC1080).
+const es5 = `function P(i) { this.a = i; this.b = i * 2; this.c = i + 1; this.d = i % 7; }
+P.prototype.f = function () { return 1; };
+P.prototype.g = function () { return 2; };
+P.prototype.h = function () { return 3; };
+P.prototype.k = function () { return 4; };
+const xs = [];
+for (let i = 0; i < 1000; i++) xs.push(new P(i));
+const n = xs.length;
+let s = 0;`;
+const PJ = {
+  e5: [
+    "U8 e5: an ES5 constructor's instances, 4 prototype-method reads per record",
+    `${es5}
+for (let r = 0; r < ${R}; r++) for (let i = 0; i < n; i++) { const p = xs[i]; if (p.f !== undefined) s++; if (p.g !== undefined) s++; if (p.h !== undefined) s++; if (p.k !== undefined) s++; }
+console.log(s);`,
+  ],
+  e5own: [
+    "U8 e5own: the e5 loop reading the instances' own keys (e5's reference)",
+    `${es5}
+for (let r = 0; r < ${R}; r++) for (let i = 0; i < n; i++) { const p = xs[i]; if (p.a !== undefined) s++; if (p.b !== undefined) s++; if (p.c !== undefined) s++; if (p.d !== undefined) s++; }
+console.log(s);`,
+  ],
+};
+
 for (const [name, [what, src]] of Object.entries(P)) writeFileSync(`${out}/${prefix}${name}.ts`, `// ${what}\n${src}\n`);
+for (const [name, [what, src]] of Object.entries(PJ)) writeFileSync(`${out}/${prefix}${name}.js`, `// ${what}\n${src}\n`);

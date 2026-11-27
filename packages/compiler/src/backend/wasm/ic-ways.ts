@@ -31,6 +31,12 @@ import { I32 } from "./module.js";
 export const IC_WAYS = 4;
 export const IC_MEGA = IC_WAYS + 1;
 
+/** U8d: a site's chain-proved ways (a read's prototype or absent way, a
+ * linked receiver's append way) go stale when the prototype epoch moves
+ * and are re-proved in place on the miss, at most this many times per
+ * site; past it a stale way takes the uncached path. */
+export const IC_PROTO_REFRESHES = 16;
+
 export interface IcSite {
   /** The ways' shape globals. */
   s: number[];

@@ -139,6 +139,7 @@ import { ObjModel } from "./objmodel.js";
 import { TplFrozen } from "./tpl-frozen.js";
 import { ErrOwnKeys } from "./err-own.js";
 import { Shapes } from "./shapes.js";
+import { ProtoIc } from "./proto-ic.js";
 import { emitNumberCompareDefault, type ArraySort, type SortInstance } from "./sort.js";
 import { emitFlatCast } from "./strings.js";
 import { RE_F_DYN_BOX, RE_F_LAST_INDEX } from "./regex-value.js";
@@ -871,7 +872,9 @@ export class DynBuilder {
 
   /** `$dynObj`'s fields, which every payload subtype repeats first: len,
    * entries, the prototype code, the identity-hash slot where the module
-   * has one (OBJ_IDH), and U8b's shape (objShapeField, shapes.ts). */
+   * has one (OBJ_IDH), U8b's shape (objShapeField, shapes.ts) and, where
+   * prototype links exist, U8d's prototype root (objProotField,
+   * proto-ic.ts). */
   private objBaseFields(): FieldType[] {
     return [
       { storage: I32, mutable: true },
@@ -879,6 +882,7 @@ export class DynBuilder {
       { storage: I32, mutable: false },
       ...(this.deps.idSlot === true ? [{ storage: I32, mutable: true } as FieldType] : []),
       { storage: this.shapes.shapeRef(), mutable: true },
+      ...(this.protoLinkLive ? [{ storage: this.shapes.shapeRef(), mutable: true } as FieldType] : []),
     ];
   }
 
@@ -891,23 +895,39 @@ export class DynBuilder {
 
   /** The number of `$dynObj` fields; a subtype's own fields follow them. */
   private objBaseCount(): number {
-    return this.deps.idSlot === true ? 5 : 4;
+    return this.objShapeField() + (this.protoLinkLive ? 2 : 1);
   }
 
   /** U8b: the `shape` field of every OBJ payload (shapes.ts). */
   objShapeField(): number {
-    return this.objBaseCount() - 1;
+    return this.deps.idSlot === true ? 4 : 3;
+  }
+
+  /** U8d: the `proot` field of every OBJ payload where prototype links
+   * exist: null until the object becomes a prototype, then the root shape
+   * of the objects it is the prototype of (proto-ic.ts). */
+  objProotField(): number {
+    if (!this.protoLinkLive) throw new Error("objProotField: no prototype links in this module");
+    return this.objShapeField() + 1;
   }
 
   /** Pushes a fresh payload's `$dynObj` fields: no entries, prototype code
-   * `proto`, identity hash 0, and the root shape when `shaped` (a plain
-   * object), else null (dictionary mode: the exotic payloads). */
-  private pushObjBase(c: Code, proto: number, shaped: boolean): void {
+   * `proto`, identity hash 0, the shape `pushShape` pushes, and (where
+   * links exist) no prototype root yet. */
+  private pushObjBaseWith(c: Code, proto: number, pushShape: (c: Code) => void): void {
     c.i32Const(0);
     c.refNull(this.entriesArrayType());
     c.i32Const(proto);
     if (this.deps.idSlot === true) c.i32Const(0); // OBJ_IDH
-    this.shapes.pushInitial(c, shaped);
+    pushShape(c);
+    if (this.protoLinkLive) c.refNull(this.shapes.shapeT());
+  }
+
+  /** pushObjBaseWith with the shape of a fresh unlinked payload: its
+   * prototype code's root when `shaped` (a plain object), else null
+   * (dictionary mode: the exotic payloads). */
+  private pushObjBase(c: Code, proto: number, shaped: boolean): void {
+    this.pushObjBaseWith(c, proto, (x) => this.shapes.pushInitial(x, shaped, proto));
   }
 
   private shapesInst: Shapes | null = null;
@@ -916,6 +936,15 @@ export class DynBuilder {
   get shapes(): Shapes {
     this.shapesInst ??= new Shapes(this);
     return this.shapesInst;
+  }
+
+  private protoIcInst: ProtoIc | null = null;
+
+  /** U8d: the prototype epoch and chain walk of the prototype caches
+   * (proto-ic.ts). */
+  get protoIc(): ProtoIc {
+    this.protoIcInst ??= new ProtoIc(this);
+    return this.protoIcInst;
   }
 
   /** The builder internals shapes.ts and ic-read.ts emit with. */
@@ -2395,10 +2424,20 @@ export class DynBuilder {
     return this.objBaseCount();
   }
 
-  /** A fresh empty linked OBJ payload whose prototype box the caller
-   * pushes; `shaped` false for an exotic payload (an error prototype). */
+  /** A fresh empty linked OBJ payload whose prototype box (an OBJ box)
+   * the caller pushes; `shaped` false for an exotic payload (an error
+   * prototype). A shaped one starts at its prototype's root (U8d,
+   * shapes.ts protoRoot), which also marks the prototype as one; so
+   * `pushProto` runs twice when `shaped` and must be a plain read. */
   pushNewLinkedObj(c: Code, pushProto: (c: Code) => void, shaped = true): void {
-    this.pushObjBase(c, OBJ_PROTO_PLAIN, shaped);
+    this.pushObjBaseWith(c, OBJ_PROTO_PLAIN, (x) => {
+      if (!shaped) {
+        x.refNull(this.shapes.shapeT());
+        return;
+      }
+      pushProto(x);
+      x.call(this.shapes.protoRootOf());
+    });
     pushProto(c);
     this.pushOmTail(c);
     c.structNew(this.objLinkedT());
@@ -3137,6 +3176,8 @@ export class DynBuilder {
     c.i32Const(1);
     c.i32Add();
     c.structSet(objT, OBJ_LEN);
+    // U8d: a new key on a prototype moves the prototype epoch.
+    this.protoIc.emitBump(c, (x) => x.localGet(obj));
   }
 
   /* ── the FUNC payload ───────────────────────────────────────────────── */

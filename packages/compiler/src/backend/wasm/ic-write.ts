@@ -24,11 +24,17 @@
  *     (objPut), whatever the prototype holds;
  *   - an absent key: [[Set]] walks the prototype chain for a setter or a
  *     read-only key of that name before it appends. An append way is
- *     therefore filled, and hits, only for a receiver with no linked
- *     prototype (a payload that is not `$dynObjLinked`, or one whose link
- *     is null), whose chain ends at once: nothing up it can hold a setter
- *     or a read-only key. A linked receiver at an append way's shape takes
- *     keySet itself (U8d adds the prototype epoch that lets it hit).
+ *     therefore filled for a receiver with no linked prototype (a
+ *     payload that is not `$dynObjLinked`, or one whose link is null),
+ *     whose chain ends at once: nothing up it can hold a setter or a
+ *     read-only key; and (U8d) for a linked one whose whole chain the walk
+ *     proves holds no such key at all (proto-ic.ts). Such a way records
+ *     the prototype epoch it was proved at (its global e_k) and hits only
+ *     while the epoch is unchanged, since no object on the chain can gain
+ *     the key without moving it; a stale way takes the miss path, which
+ *     re-proves it in place (at most IC_PROTO_REFRESHES times per site).
+ *     The shape tells the two apart: a shape under the root of the objects
+ *     with no link is never a linked receiver's (shapes.ts roots).
  *
  * The value must not be an accessor cell (the in-place replace drops the
  * shape for one, shapes.ts emitReplace): where accessors are live, a
@@ -38,7 +44,7 @@
  * receiver's shape before the write and after it and offers a way when the
  * write was one of the two above (the shape unchanged and holding the key:
  * existing-key; the new shape the old one's child for the key, with no
- * linked prototype: append). A write that threw offers nothing. Nullish
+ * linked prototype or a chain proved free of the key: append). A write that threw offers nothing. Nullish
  * receivers, frozen, sealed and non-extensible objects, setters,
  * read-only keys, arrays, views and every fence keep keySet's paths and
  * messages, because none of those receivers is shaped.
@@ -64,8 +70,9 @@ import { DK, DYN_KIND, DYN_REF, ENTRY_VALUE, OBJ_ENTRIES, OBJ_LEN } from "./dyn.
 import { Code } from "./code.js";
 import { IcCheck, shapeCheckOn } from "./ic-check.js";
 import { countSetHit, countSetMiss } from "./ic-stats.js";
-import { emitFill, emitMayFill, emitWayMatch, IC_WAYS, newIcSite } from "./ic-ways.js";
-import { I32 } from "./module.js";
+import { emitFill, emitMayFill, emitWayMatch, IC_PROTO_REFRESHES, IC_WAYS, newIcSite } from "./ic-ways.js";
+import { I32, I64 } from "./module.js";
+import { WALK_ABSENT } from "./proto-ic.js";
 import { SHAPE_COUNT, SHAPE_KEY, SHAPE_PARENT } from "./shapes.js";
 
 export interface WriteIcDeps {
@@ -84,10 +91,14 @@ export interface WriteIcLocals {
   i: number;
 }
 
+/** A store site's way code before the match: no way matched. */
+const NO_WAY = -0x80000000;
+
 export class WriteIc {
   private fillSG: number | null = null;
   private fillIG: number | null = null;
   private fillTG: number | null = null;
+  private fillEG: number | null = null;
   private readonly check = shapeCheckOn();
   private readonly checks: IcCheck;
 
@@ -130,10 +141,25 @@ export class WriteIc {
     return this.fillTG;
   }
 
+  /** The epoch an append offer was proved at (U8d). */
+  private fillE(): number {
+    this.fillEG ??= this.i64Global();
+    return this.fillEG;
+  }
+
+  private i64Global(): number {
+    return this.k.mb.addGlobal(I64, true, (w) => {
+      w.u8(0x42); // i64.const 0
+      w.sleb64(0n);
+    });
+  }
+
   /** May a linked payload's prototype link hold something (a setter, a
-   * read-only key) an append must see? Only where links exist. */
+   * read-only key) an append must see? Only where links exist (the object
+   * model's modules are among them, emitter.ts objCreateLive), and there
+   * the prototype epoch guards linked appends. */
   private get linksLive(): boolean {
-    return this.d.protoLinkLive || this.d.objModelLive;
+    return this.d.protoLinkLive;
   }
 
   /** With an OBJ payload in local `p`, leaves i32: does it have a linked
@@ -165,10 +191,18 @@ export class WriteIc {
   emitSet(c: Code, key: string, sloppy: boolean, ls: WriteIcLocals): void {
     const site = newIcSite(this.d);
     const t: number[] = Array.from({ length: IC_WAYS }, () => this.shapeGlobal());
+    const links = this.linksLive;
+    const e: number[] = links ? Array.from({ length: IC_WAYS }, () => this.i64Global()) : [];
+    const rf = links ? this.i32Global() : -1;
     const dynT = this.d.dynT();
     const objT = this.d.objT();
     c.block(); // $out
     c.block(); // $miss
+    if (links) {
+      // no way matched (a stale append way leaves its code -1 - k here)
+      c.i32Const(NO_WAY);
+      c.localSet(ls.i);
+    }
     if (this.d.accessorsLive) {
       // an accessor cell is never stored by the cache (see the header)
       c.localGet(ls.v);
@@ -232,17 +266,41 @@ export class WriteIc {
     for (let k = 0; k < IC_WAYS - 1; k++) c.end();
     c.localGet(ls.v);
     this.deps.pushStrLit(c, key);
-    c.call(this.appendFn(sloppy));
+    if (links) {
+      this.emitPickEpoch(c, e, ls.i);
+      c.call(this.appendFn(sloppy));
+      // a stale way wrote nothing: the miss
+      c.i32Eqz();
+      c.brIf(1);
+    } else {
+      c.call(this.appendFn(sloppy));
+    }
     c.end();
     c.br(1);
     c.end();
-    // the miss: fill while the site may, else keySet
+    // the miss: fill while the site may (not megamorphic; a stale append
+    // way within its refresh budget), else keySet
     emitMayFill(c, site);
+    if (links) {
+      this.emitStale(c, ls.i);
+      c.globalGet(rf);
+      c.i32Const(IC_PROTO_REFRESHES);
+      c.i32GeU();
+      c.i32And();
+      c.i32Eqz();
+      c.i32And();
+    }
     c.ifVoid();
     c.localGet(ls.r);
     this.deps.pushStrLit(c, key);
     c.localGet(ls.v);
     c.call(this.missFn(sloppy));
+    if (links) {
+      this.emitStale(c, ls.i);
+      c.ifVoid();
+      this.emitRefresh(c, { t, e, rf, sh: ls.sh, i: ls.i });
+      c.else_();
+    }
     c.globalGet(this.fillS());
     c.refIsNull();
     c.i32Eqz();
@@ -261,8 +319,13 @@ export class WriteIc {
       x.globalSet(site.i[k]!);
       x.globalGet(this.fillT());
       x.globalSet(t[k]!);
+      if (links) {
+        x.globalGet(this.fillE());
+        x.globalSet(e[k]!);
+      }
     });
     c.end();
+    if (links) c.end();
     c.else_();
     countSetMiss(c);
     c.localGet(ls.r);
@@ -273,29 +336,35 @@ export class WriteIc {
     c.end();
   }
 
-  /** %w.dyn.icAppend(recv, payload, after, value, key): an append way's
-   * write. The payload carries the way's shape, `after` is that shape's
-   * child for `key`. With no linked prototype, appends the entry under
-   * `after`'s canonical key and moves the payload to `after`; a linked
-   * receiver writes through keySet instead. */
+  /** %w.dyn.icAppend(recv, payload, after, value, key[, epoch]): an
+   * append way's write. The payload carries the way's shape, `after` is
+   * that shape's child for `key`: appends the entry under `after`'s
+   * canonical key and moves the payload to `after`. Where links exist it
+   * takes the way's epoch and answers i32: 0, writing nothing, when the
+   * receiver is linked and the epoch has moved since the way was proved
+   * (the site then misses); 1 for the write done. */
   private appendFn(sloppy: boolean): number {
     const objT = this.d.objT();
     const S = this.d.shapes.shapeT();
+    const links = this.linksLive;
     const params = [this.d.dynRef(), this.d.objRef(), this.d.shapes.shapeRef(), this.d.dynRef(), this.k.deps.strRef()];
-    return this.k.cached(sloppy ? "icAppend:sloppy" : "icAppend", params, [], (idx) => {
+    if (links) params.push(I64);
+    return this.k.cached(sloppy ? "icAppend:sloppy" : "icAppend", params, links ? [I32] : [], (idx) => {
       const c = new Code();
-      const N = 5;
-      const NB = 6;
-      const K = 7;
-      if (this.linksLive) {
+      const base = links ? 6 : 5;
+      const N = base;
+      const NB = base + 1;
+      const K = base + 2;
+      if (links) {
         this.emitHasLink(c, 1);
         c.ifVoid();
-        countSetMiss(c);
-        c.localGet(0);
-        c.localGet(4);
-        c.localGet(3);
-        c.call(this.setter(sloppy));
+        c.localGet(5);
+        c.globalGet(this.d.protoIc.epochG());
+        c.i64Ne();
+        c.ifVoid();
+        c.i32Const(0);
         c.return_();
+        c.end();
         c.end();
       }
       c.localGet(1);
@@ -317,6 +386,7 @@ export class WriteIc {
         c.drop();
       }
       countSetHit(c);
+      if (links) c.i32Const(1);
       this.k.mb.setBody(
         idx,
         [I32, { kind: "ref", nullable: true, typeIndex: this.d.entriesArrayType() }, this.k.deps.strRef()],
@@ -409,9 +479,21 @@ export class WriteIc {
       c.localGet(1);
       c.call(this.k.deps.strEq());
       if (this.linksLive) {
+        // no link, or (U8d) a chain proved free of the key, now
+        c.ifResult(I32);
         this.emitHasLink(c, P);
-        c.i32Eqz();
-        c.i32And();
+        c.ifResult(I32);
+        c.localGet(P);
+        c.localGet(1);
+        c.call(this.d.protoIc.walkFn());
+        c.i32Const(WALK_ABSENT);
+        c.i32Eq();
+        c.else_();
+        c.i32Const(1);
+        c.end();
+        c.else_();
+        c.i32Const(0);
+        c.end();
       }
       c.ifVoid();
       c.localGet(B);
@@ -420,10 +502,78 @@ export class WriteIc {
       c.globalSet(this.fillI());
       c.localGet(A);
       c.globalSet(this.fillT());
+      if (this.linksLive) {
+        c.globalGet(this.d.protoIc.epochG());
+        c.globalSet(this.fillE());
+      }
       c.end();
       c.end();
       this.k.mb.setBody(idx, [this.d.objRef(), this.d.shapes.shapeRef(), this.d.shapes.shapeRef(), I32], c.bytes());
     });
+  }
+
+  private i32Global(): number {
+    return this.k.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+  }
+
+  /** Pushes the epoch global of the append way whose code -1 - k is in
+   * local `i`. */
+  private emitPickEpoch(c: Code, e: number[], i: number): void {
+    for (let k = 0; k < IC_WAYS - 1; k++) {
+      c.localGet(i);
+      c.i32Const(-1 - k);
+      c.i32Eq();
+      c.ifResult(I64);
+      c.globalGet(e[k]!);
+      c.else_();
+    }
+    c.globalGet(e[IC_WAYS - 1]!);
+    for (let k = 0; k < IC_WAYS - 1; k++) c.end();
+  }
+
+  /** Leaves i32: did the miss come from a stale append way (local `i`
+   * holds a way's code -1 - k, not NO_WAY)? */
+  private emitStale(c: Code, i: number): void {
+    c.localGet(i);
+    c.i32Const(0);
+    c.i32LtS();
+    c.localGet(i);
+    c.i32Const(NO_WAY);
+    c.i32Ne();
+    c.i32And();
+  }
+
+  /** A stale append way -1 - k (local `i`) after the miss helper ran: one
+   * attempt of the site's refresh budget; when the offer is an append for
+   * the same shape, way k takes its transition and new epoch. */
+  private emitRefresh(c: Code, l: { t: number[]; e: number[]; rf: number; sh: number; i: number }): void {
+    c.globalGet(l.rf);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalSet(l.rf);
+    c.globalGet(this.fillI());
+    c.i32Const(0);
+    c.i32LtS();
+    c.localGet(l.sh);
+    c.globalGet(this.fillS());
+    c.refEq();
+    c.i32And();
+    c.ifVoid();
+    for (let k = 0; k < IC_WAYS; k++) {
+      c.localGet(l.i);
+      c.i32Const(-1 - k);
+      c.i32Eq();
+      c.ifVoid();
+      c.globalGet(this.fillT());
+      c.globalSet(l.t[k]!);
+      c.globalGet(this.fillE());
+      c.globalSet(l.e[k]!);
+      c.end();
+    }
+    c.end();
   }
 
   /** %w.dyn.shapeIndex(shape, key) → i32: the entry index `key` has under
